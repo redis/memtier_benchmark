@@ -147,6 +147,7 @@ private:
     void process_subsequent_requests(void);
     void process_first_request();
     void fill_pipeline(void);
+    void flush_bulk(void);
 
     void handle_event(short evtype);
     void handle_timer_event();

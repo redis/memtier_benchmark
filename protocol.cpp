@@ -23,18 +23,21 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <queue>
+#include <unistd.h>
 #ifdef HAVE_ASSERT_H
 #include <assert.h>
 #endif
 
 #include "protocol.h"
 #include "memtier_benchmark.h"
+#include "shard_connection.h"
 #include "libmemcached_protocol/binary.h"
 
 /////////////////////////////////////////////////////////////////////////
 
 abstract_protocol::abstract_protocol() :
-    m_read_buf(NULL), m_write_buf(NULL), m_keep_value(false)
+    m_read_buf(NULL), m_write_buf(NULL), m_keep_value(false), m_read_limit(0)
 {
 }
 
@@ -51,6 +54,15 @@ void abstract_protocol::set_buffers(struct evbuffer* read_buf, struct evbuffer* 
 void abstract_protocol::set_keep_value(bool flag)
 {
     m_keep_value = flag;
+}
+
+size_t abstract_protocol::get_available_bytes()
+{
+    size_t available = evbuffer_get_length(m_read_buf);
+    if (m_read_limit > 0 && available > m_read_limit) {
+        return m_read_limit;
+    }
+    return available;
 }
 
 /////////////////////////////////////////////////////////////////////////
@@ -189,6 +201,577 @@ public:
     int write_arbitrary_command(const command_arg *arg);
     int write_arbitrary_command(const char *val, int val_len);
 };
+
+// Fast header protocol - prepends a 10-byte header before RESP3 payload
+// Header format: designator(1) | length(4) | ncmd(1) | slot(2) | client_idx(2)
+#define FAST_HEADER_DESIGNATOR 0x80
+#define FAST_HEADER_SIZE 10
+#define MAX_CLUSTER_HSLOT 16383
+
+// CRC16 lookup table for Redis cluster slot calculation
+static const uint16_t fast_header_crc16tab[256] = {
+    0x0000,0x1021,0x2042,0x3063,0x4084,0x50a5,0x60c6,0x70e7,
+    0x8108,0x9129,0xa14a,0xb16b,0xc18c,0xd1ad,0xe1ce,0xf1ef,
+    0x1231,0x0210,0x3273,0x2252,0x52b5,0x4294,0x72f7,0x62d6,
+    0x9339,0x8318,0xb37b,0xa35a,0xd3bd,0xc39c,0xf3ff,0xe3de,
+    0x2462,0x3443,0x0420,0x1401,0x64e6,0x74c7,0x44a4,0x5485,
+    0xa56a,0xb54b,0x8528,0x9509,0xe5ee,0xf5cf,0xc5ac,0xd58d,
+    0x3653,0x2672,0x1611,0x0630,0x76d7,0x66f6,0x5695,0x46b4,
+    0xb75b,0xa77a,0x9719,0x8738,0xf7df,0xe7fe,0xd79d,0xc7bc,
+    0x48c4,0x58e5,0x6886,0x78a7,0x0840,0x1861,0x2802,0x3823,
+    0xc9cc,0xd9ed,0xe98e,0xf9af,0x8948,0x9969,0xa90a,0xb92b,
+    0x5af5,0x4ad4,0x7ab7,0x6a96,0x1a71,0x0a50,0x3a33,0x2a12,
+    0xdbfd,0xcbdc,0xfbbf,0xeb9e,0x9b79,0x8b58,0xbb3b,0xab1a,
+    0x6ca6,0x7c87,0x4ce4,0x5cc5,0x2c22,0x3c03,0x0c60,0x1c41,
+    0xedae,0xfd8f,0xcdec,0xddcd,0xad2a,0xbd0b,0x8d68,0x9d49,
+    0x7e97,0x6eb6,0x5ed5,0x4ef4,0x3e13,0x2e32,0x1e51,0x0e70,
+    0xff9f,0xefbe,0xdfdd,0xcffc,0xbf1b,0xaf3a,0x9f59,0x8f78,
+    0x9188,0x81a9,0xb1ca,0xa1eb,0xd10c,0xc12d,0xf14e,0xe16f,
+    0x1080,0x00a1,0x30c2,0x20e3,0x5004,0x4025,0x7046,0x6067,
+    0x83b9,0x9398,0xa3fb,0xb3da,0xc33d,0xd31c,0xe37f,0xf35e,
+    0x02b1,0x1290,0x22f3,0x32d2,0x4235,0x5214,0x6277,0x7256,
+    0xb5ea,0xa5cb,0x95a8,0x8589,0xf56e,0xe54f,0xd52c,0xc50d,
+    0x34e2,0x24c3,0x14a0,0x0481,0x7466,0x6447,0x5424,0x4405,
+    0xa7db,0xb7fa,0x8799,0x97b8,0xe75f,0xf77e,0xc71d,0xd73c,
+    0x26d3,0x36f2,0x0691,0x16b0,0x6657,0x7676,0x4615,0x5634,
+    0xd94c,0xc96d,0xf90e,0xe92f,0x99c8,0x89e9,0xb98a,0xa9ab,
+    0x5844,0x4865,0x7806,0x6827,0x18c0,0x08e1,0x3882,0x28a3,
+    0xcb7d,0xdb5c,0xeb3f,0xfb1e,0x8bf9,0x9bd8,0xabbb,0xbb9a,
+    0x4a75,0x5a54,0x6a37,0x7a16,0x0af1,0x1ad0,0x2ab3,0x3a92,
+    0xfd2e,0xed0f,0xdd6c,0xcd4d,0xbdaa,0xad8b,0x9de8,0x8dc9,
+    0x7c26,0x6c07,0x5c64,0x4c45,0x3ca2,0x2c83,0x1ce0,0x0cc1,
+    0xef1f,0xff3e,0xcf5d,0xdf7c,0xaf9b,0xbfba,0x8fd9,0x9ff8,
+    0x6e17,0x7e36,0x4e55,0x5e74,0x2e93,0x3eb2,0x0ed1,0x1ef0
+};
+
+class fast_header_protocol : public redis_protocol {
+private:
+    uint16_t m_client_idx;
+
+    // Bulk support state
+    uint8_t m_accumulated_commands;      // Number of commands accumulated in current bulk
+    uint32_t m_bulk_payload_size;        // Total size of commands in current bulk
+    uint16_t m_current_slot;             // Slot ID for current bulk
+    struct evbuffer* m_bulk_buffer;      // Temporary buffer for accumulating commands in current bulk
+    uint8_t m_bulk_size;                 // Target bulk size (from config)
+    bool m_no_header;                    // Whether to skip header when sending bulk
+
+    // Response header support
+    struct pending_request {
+        uint16_t client_idx;
+        uint8_t expected_responses;
+        struct timeval sent_time;
+    };
+    std::queue<pending_request> m_pending_requests;
+
+    // Response parsing state
+    enum response_header_state { rhs_initial, rhs_read_header, rhs_read_payload };
+    response_header_state m_response_header_state;
+    uint32_t m_response_payload_length;
+    uint8_t m_response_ncmd_flags;
+    uint16_t m_response_client_idx;
+    uint8_t m_responses_to_parse;  // Number of RESP responses to parse from current header
+    uint32_t m_payload_bytes_consumed;  // Bytes consumed from current fast header payload
+
+    // Track setup commands that don't use fast header protocol
+    bool m_expecting_setup_response;     // True when expecting auth/select_db/hello response
+
+    static inline uint16_t fast_header_crc16(const char *buf, size_t len) {
+        size_t counter;
+        uint16_t crc = 0;
+        for (counter = 0; counter < len; counter++)
+            crc = (crc << 8) ^ fast_header_crc16tab[((crc >> 8) ^ *buf++) & 0x00FF];
+        return crc;
+    }
+
+    static inline uint16_t fast_header_calc_slot(const char *key, size_t key_len) {
+        // Handle Redis hash tags: if key contains {}, only hash the part inside {}
+        const char *hash_tag_start = (const char *)memchr(key, '{', key_len);
+
+        if (hash_tag_start != NULL) {
+            // Found opening brace, look for closing brace
+            size_t offset_from_start = hash_tag_start - key;
+            size_t remaining_len = key_len - offset_from_start;
+
+            const char *hash_tag_end = (const char *)memchr(hash_tag_start + 1, '}', remaining_len - 1);
+
+            if (hash_tag_end != NULL && hash_tag_end > hash_tag_start + 1) {
+                // Found valid hash tag, hash only the content between { and }
+                size_t hash_tag_len = hash_tag_end - hash_tag_start - 1;
+                return (uint16_t)(fast_header_crc16(hash_tag_start + 1, hash_tag_len) & MAX_CLUSTER_HSLOT);
+            }
+        }
+
+        // No valid hash tag found, hash the entire key
+        return (uint16_t)(fast_header_crc16(key, key_len) & MAX_CLUSTER_HSLOT);
+    }
+
+    int write_fast_header(uint16_t slot, uint32_t payload_size, uint8_t batch_count = 1) {
+        unsigned char header[FAST_HEADER_SIZE];
+
+        // New 10-byte header format: designator(1) | length(4) | ncmd(1) | slot(2) | client_idx(2)
+        header[0] = FAST_HEADER_DESIGNATOR;
+        header[1] = (payload_size >> 24) & 0xFF;  // length (4 bytes, network byte order)
+        header[2] = (payload_size >> 16) & 0xFF;
+        header[3] = (payload_size >> 8) & 0xFF;
+        header[4] = payload_size & 0xFF;
+        header[5] = batch_count;                  // ncmd (1 byte)
+        header[6] = (slot >> 8) & 0xFF;          // slot (2 bytes, network byte order)
+        header[7] = slot & 0xFF;
+        header[8] = (m_client_idx >> 8) & 0xFF;  // client_idx (2 bytes, network byte order)
+        header[9] = m_client_idx & 0xFF;
+
+        // Increment client_idx for next request
+        m_client_idx++;
+
+        return evbuffer_add(m_write_buf, header, FAST_HEADER_SIZE);
+    }
+
+public:
+    fast_header_protocol() : redis_protocol(), m_client_idx(rand() & 0xFFFF),
+                             m_accumulated_commands(0), m_bulk_payload_size(0),
+                             m_current_slot(0),
+                             m_bulk_buffer(NULL), m_bulk_size(1), m_no_header(false),
+                             m_response_header_state(rhs_initial), m_response_payload_length(0),
+                             m_response_ncmd_flags(0), m_response_client_idx(0), m_responses_to_parse(0),
+                             m_payload_bytes_consumed(0),
+                             m_expecting_setup_response(false) {
+        m_bulk_buffer = evbuffer_new();
+    }
+
+    virtual ~fast_header_protocol() {
+        if (m_bulk_buffer) {
+            evbuffer_free(m_bulk_buffer);
+        }
+    }
+    virtual fast_header_protocol* clone(void) {
+        fast_header_protocol* cloned = new fast_header_protocol();
+        cloned->m_bulk_size = m_bulk_size;
+        cloned->m_no_header = m_no_header;
+        // Don't copy m_client_idx - let each clone start with its own random value
+        return cloned;
+    }
+
+    virtual int parse_response(void);
+
+    // Override setup commands to track when we expect non-fast-header responses
+    virtual int authenticate(const char *credentials);
+    virtual int select_db(int db);
+    virtual int configure_protocol(enum PROTOCOL_TYPE type);
+
+    virtual int write_command_set(const char *key, int key_len, const char *value, int value_len, int expiry, unsigned int offset);
+    virtual int write_command_get(const char *key, int key_len, unsigned int offset);
+    virtual int write_command_multi_get(const keylist *keylist);
+    virtual int write_arbitrary_command(const command_arg *arg);
+    virtual int write_arbitrary_command(const char *val, int val_len);
+
+    // Bulk support methods
+    virtual bool has_partial_bulk() { return m_accumulated_commands > 0; }
+    virtual void finalize_partial_bulk();
+    virtual void set_bulk_size(unsigned int bulk_size) { m_bulk_size = bulk_size; }
+    virtual void set_no_header(bool no_header) { m_no_header = no_header; }
+};
+
+int fast_header_protocol::write_command_set(const char *key, int key_len, const char *value, int value_len, int expiry, unsigned int offset) {
+    assert(key != NULL);
+    assert(key_len > 0);
+    assert(value != NULL);
+    assert(value_len > 0);
+
+    uint16_t slot = fast_header_calc_slot(key, key_len);
+
+    // Always use bulk accumulation path for fast-header protocol
+    // If this is the first command in a new bulk, initialize bulk state
+    if (m_accumulated_commands == 0) {
+        m_current_slot = slot;
+        m_bulk_payload_size = 0;
+        evbuffer_drain(m_bulk_buffer, evbuffer_get_length(m_bulk_buffer));
+    }
+
+    // Write the RESP3 command to the temporary bulk buffer
+    struct evbuffer *orig_buf = m_write_buf;
+    m_write_buf = m_bulk_buffer;
+    int command_size = redis_protocol::write_command_set(key, key_len, value, value_len, expiry, offset);
+    m_write_buf = orig_buf;
+
+    m_bulk_payload_size += command_size;
+    m_accumulated_commands++;
+
+    // If bulk is full, finalize it
+    if (m_accumulated_commands >= m_bulk_size) {
+        finalize_partial_bulk();
+    }
+
+    // Return the command size only (not including header)
+    // The header will be added when the bulk is finalized
+    return command_size;
+}
+
+int fast_header_protocol::write_command_get(const char *key, int key_len, unsigned int offset) {
+    assert(key != NULL);
+    assert(key_len > 0);
+
+    uint16_t slot = fast_header_calc_slot(key, key_len);
+
+    // Always use bulk accumulation path for fast-header protocol
+    // If this is the first command in a new bulk, initialize bulk state
+    if (m_accumulated_commands == 0) {
+        m_current_slot = slot;
+        m_bulk_payload_size = 0;
+        evbuffer_drain(m_bulk_buffer, evbuffer_get_length(m_bulk_buffer));
+    }
+
+    // Write the RESP3 command to the temporary bulk buffer
+    struct evbuffer *orig_buf = m_write_buf;
+    m_write_buf = m_bulk_buffer;
+    int command_size = redis_protocol::write_command_get(key, key_len, offset);
+    m_write_buf = orig_buf;
+
+    m_bulk_payload_size += command_size;
+    m_accumulated_commands++;
+
+    // If bulk is full, finalize it
+    if (m_accumulated_commands >= m_bulk_size) {
+        finalize_partial_bulk();
+    }
+
+    // Return the command size only (not including header)
+    // The header will be added when the bulk is finalized
+    return command_size;
+}
+
+void fast_header_protocol::finalize_partial_bulk() {
+    if (m_accumulated_commands == 0) {
+        return;  // No partial bulk to finalize
+    }
+
+    // Track this request for response validation
+    pending_request req;
+    req.expected_responses = m_accumulated_commands;
+    gettimeofday(&req.sent_time, NULL);
+
+    // If no_header is set, skip writing the header
+    if (!m_no_header) {
+        // Create header with actual batch_count and payload_size
+        unsigned char header[FAST_HEADER_SIZE];
+
+        // New 10-byte header format: designator(1) | length(4) | ncmd(1) | slot(2) | client_idx(2)
+        header[0] = FAST_HEADER_DESIGNATOR;
+        header[1] = (m_bulk_payload_size >> 24) & 0xFF;  // length (4 bytes, network byte order)
+        header[2] = (m_bulk_payload_size >> 16) & 0xFF;
+        header[3] = (m_bulk_payload_size >> 8) & 0xFF;
+        header[4] = m_bulk_payload_size & 0xFF;
+        header[5] = m_accumulated_commands;              // ncmd (1 byte)
+        header[6] = (m_current_slot >> 8) & 0xFF;        // slot (2 bytes, network byte order)
+        header[7] = m_current_slot & 0xFF;
+        header[8] = (m_client_idx >> 8) & 0xFF;          // client_idx (2 bytes, network byte order)
+        header[9] = m_client_idx & 0xFF;
+
+        // Store client_idx for this request
+        req.client_idx = m_client_idx;
+
+        // Increment client_idx for next request
+        m_client_idx++;
+
+        // Write header to main buffer
+        evbuffer_add(m_write_buf, header, FAST_HEADER_SIZE);
+    } else {
+        // When no header is sent, we don't expect headers in responses
+        req.client_idx = 0;  // No client_idx to validate
+    }
+
+    // Add request to tracking queue
+    m_pending_requests.push(req);
+
+    // Write all accumulated commands from bulk buffer to main buffer
+    evbuffer_add_buffer(m_write_buf, m_bulk_buffer);
+
+    // Reset bulk state for next bulk
+    m_accumulated_commands = 0;
+    m_bulk_payload_size = 0;
+}
+
+int fast_header_protocol::write_command_multi_get(const keylist *keylist) {
+    // MGET can be bulked like any other command
+    // If this is the first command in a new bulk, initialize bulk state
+    if (m_accumulated_commands == 0) {
+        m_current_slot = 0;  // MGET doesn't have a specific slot
+        m_bulk_payload_size = 0;
+        evbuffer_drain(m_bulk_buffer, evbuffer_get_length(m_bulk_buffer));
+    }
+
+    // Write the RESP3 command to the temporary bulk buffer
+    struct evbuffer *orig_buf = m_write_buf;
+    m_write_buf = m_bulk_buffer;
+    int command_size = redis_protocol::write_command_multi_get(keylist);
+    m_write_buf = orig_buf;
+
+    m_bulk_payload_size += command_size;
+    m_accumulated_commands++;
+
+    // If bulk is full, finalize it
+    if (m_accumulated_commands >= m_bulk_size) {
+        finalize_partial_bulk();
+    }
+
+    // Return the command size only (not including header)
+    return command_size;
+}
+
+int fast_header_protocol::write_arbitrary_command(const command_arg *arg) {
+    // Arbitrary commands can be bulked like any other command
+    // If this is the first command in a new bulk, initialize bulk state
+    if (m_accumulated_commands == 0) {
+        m_current_slot = 0;  // Arbitrary commands don't have a specific slot
+        m_bulk_payload_size = 0;
+        evbuffer_drain(m_bulk_buffer, evbuffer_get_length(m_bulk_buffer));
+    }
+
+    // Write the RESP3 command to the temporary bulk buffer
+    struct evbuffer *orig_buf = m_write_buf;
+    m_write_buf = m_bulk_buffer;
+    int command_size = redis_protocol::write_arbitrary_command(arg);
+    m_write_buf = orig_buf;
+
+    m_bulk_payload_size += command_size;
+    m_accumulated_commands++;
+
+    // If bulk is full, finalize it
+    if (m_accumulated_commands >= m_bulk_size) {
+        finalize_partial_bulk();
+    }
+
+    // Return the command size only (not including header)
+    return command_size;
+}
+
+int fast_header_protocol::write_arbitrary_command(const char *val, int val_len) {
+    // Arbitrary commands can be bulked like any other command
+    // If this is the first command in a new bulk, initialize bulk state
+    if (m_accumulated_commands == 0) {
+        m_current_slot = 0;  // Arbitrary commands don't have a specific slot
+        m_bulk_payload_size = 0;
+        evbuffer_drain(m_bulk_buffer, evbuffer_get_length(m_bulk_buffer));
+    }
+
+    // Write the RESP3 command to the temporary bulk buffer
+    struct evbuffer *orig_buf = m_write_buf;
+    m_write_buf = m_bulk_buffer;
+    int command_size = redis_protocol::write_arbitrary_command(val, val_len);
+    m_write_buf = orig_buf;
+
+    m_bulk_payload_size += command_size;
+    m_accumulated_commands++;
+
+    // If bulk is full, finalize it
+    if (m_accumulated_commands >= m_bulk_size) {
+        finalize_partial_bulk();
+    }
+
+    // Return the command size only (not including header)
+    return command_size;
+}
+
+// Override setup commands to set flag for expecting non-fast-header responses
+int fast_header_protocol::authenticate(const char *credentials) {
+    m_expecting_setup_response = true;
+    return redis_protocol::authenticate(credentials);
+}
+
+int fast_header_protocol::select_db(int db) {
+    m_expecting_setup_response = true;
+    return redis_protocol::select_db(db);
+}
+
+int fast_header_protocol::configure_protocol(enum PROTOCOL_TYPE type) {
+    m_expecting_setup_response = true;
+    return redis_protocol::configure_protocol(type);
+}
+
+int fast_header_protocol::parse_response(void) {
+    // If we're expecting a setup response (auth/select_db/hello), use regular RESP parsing
+    if (m_expecting_setup_response) {
+        int result = redis_protocol::parse_response();
+        if (result > 0) {
+            // Setup response parsed successfully, reset flag
+            m_expecting_setup_response = false;
+        }
+        return result;
+    }
+
+    while (true) {
+        switch (m_response_header_state) {
+            case rhs_initial:
+                // Clear last response
+                m_last_response.clear();
+                m_response_len = 0;
+                m_response_header_state = rhs_read_header;
+                break;
+
+            case rhs_read_header: {
+                // If no_header is set, we don't expect response headers
+                if (m_no_header) {
+                    // Use parent redis_protocol parsing directly
+                    return redis_protocol::parse_response();
+                }
+
+                // Check if we have enough data for header (8 bytes for response)
+                if (evbuffer_get_length(m_read_buf) < 8) {
+                    return 0;  // Need more data
+                }
+
+                // Read the 8-byte response header
+                unsigned char header[8];
+                int ret = evbuffer_remove(m_read_buf, header, 8);
+                if (ret != 8) {
+                    return -1;
+                }
+
+                // Parse header fields
+                uint8_t desig = header[0];
+                m_response_payload_length = (header[1] << 24) | (header[2] << 16) | (header[3] << 8) | header[4];
+                m_response_ncmd_flags = header[5];
+                m_response_client_idx = (header[6] << 8) | header[7];
+
+                // Validate designator
+                if (desig != FAST_HEADER_DESIGNATOR) {
+                    return -1;
+                }
+
+                // Validate client_idx against pending requests
+                if (m_pending_requests.empty()) {
+                    return -1;
+                }
+
+                pending_request& expected = m_pending_requests.front();
+
+                if (m_response_client_idx != expected.client_idx) {
+                    return -1;
+                }
+
+                // Check protocol error flag
+                if (m_response_ncmd_flags & 0x80) {
+                    m_last_response.set_error();
+                }
+
+                // Extract number of replies (mask out error bit)
+                uint8_t num_replies = m_response_ncmd_flags & 0x7F;
+
+                if (num_replies == 0 || num_replies > expected.expected_responses) {
+                    return -1;
+                }
+
+                // Store how many RESP responses we need to parse from this header
+                m_responses_to_parse = num_replies;
+                m_payload_bytes_consumed = 0;  // Reset payload byte counter for new header
+
+                // Update expected responses count
+                expected.expected_responses -= num_replies;
+                if (expected.expected_responses == 0) {
+                    m_pending_requests.pop();  // This request is complete
+                }
+
+                m_response_len += 8;  // Count header bytes
+                m_response_header_state = rhs_read_payload;
+
+                // Initialize RESP parser state for the first response in this payload
+                m_response_state = rs_initial;
+                break;
+            }
+
+            case rhs_read_payload: {
+                // Parse RESP responses incrementally from the payload
+                // We need to physically limit the buffer to prevent evbuffer_readln from reading beyond the payload
+
+                size_t bytes_remaining_in_payload = m_response_payload_length - m_payload_bytes_consumed;
+                size_t available = evbuffer_get_length(m_read_buf);
+
+                // If buffer has more data than the remaining payload, we need to temporarily swap buffers
+                struct evbuffer* original_buf = NULL;
+                if (available > bytes_remaining_in_payload) {
+                    // Strategy: Swap m_read_buf with a new buffer containing only the payload
+                    // 1. Save the original m_read_buf pointer
+                    // 2. Create a new buffer with only the payload data
+                    // 3. Set m_read_buf to point to the new buffer
+                    // 4. Parse
+                    // 5. Restore m_read_buf to the original, with consumed bytes drained
+
+                    original_buf = m_read_buf;
+
+                    // Create new buffer with only the payload
+                    m_read_buf = evbuffer_new();
+                    if (m_read_buf == NULL) {
+                        m_read_buf = original_buf;
+                        return -1;
+                    }
+
+                    // Copy only the payload bytes to the new buffer
+                    char* payload_data = (char*)malloc(bytes_remaining_in_payload);
+                    if (payload_data == NULL) {
+                        evbuffer_free(m_read_buf);
+                        m_read_buf = original_buf;
+                        return -1;
+                    }
+
+                    evbuffer_copyout(original_buf, payload_data, bytes_remaining_in_payload);
+                    evbuffer_add(m_read_buf, payload_data, bytes_remaining_in_payload);
+                    free(payload_data);
+                }
+
+                // Track buffer size before parsing
+                size_t buffer_before = evbuffer_get_length(m_read_buf);
+
+                // Use the parent redis_protocol to parse individual RESP responses
+                // Note: We DON'T reset m_response_state here because the RESP parser
+                // might be in the middle of parsing a response (e.g., waiting for more bulk data)
+                // The state will be reset to rs_initial after each successful parse below
+
+                int parse_result = redis_protocol::parse_response();
+
+                // Track how many bytes were consumed by this RESP parse
+                size_t buffer_after = evbuffer_get_length(m_read_buf);
+                size_t bytes_consumed_this_parse = buffer_before - buffer_after;
+
+                // Restore the original buffer if we swapped it
+                if (original_buf != NULL) {
+                    // Free the temporary buffer we created
+                    evbuffer_free(m_read_buf);
+
+                    // Restore the original buffer
+                    m_read_buf = original_buf;
+
+                    // Drain the consumed bytes from the original buffer
+                    evbuffer_drain(m_read_buf, bytes_consumed_this_parse);
+                }
+
+                // IMPORTANT: Always update payload bytes consumed, even if parse_result <= 0
+                // The RESP parser may consume bytes even when it returns 0 (need more data)
+                m_payload_bytes_consumed += bytes_consumed_this_parse;
+
+                if (parse_result <= 0) {
+                    return parse_result;  // Error or need more data
+                }
+
+                // One RESP response parsed successfully
+                m_responses_to_parse--;
+
+                // Check if we need to parse more RESP responses from this header
+                if (m_responses_to_parse > 0) {
+                    // More responses to parse, stay in payload state but reset for next RESP
+                    m_response_state = rs_initial;
+                } else {
+                    // All responses from this header parsed, reset to initial state
+                    m_response_header_state = rhs_initial;
+                }
+
+                return 1;
+            }
+
+            default:
+                return -1;
+        }
+    }
+}
 
 int redis_protocol::select_db(int db)
 {
@@ -603,7 +1186,7 @@ int redis_protocol::parse_response(void)
                 }
                 break;
             case rs_read_bulk:
-                if (evbuffer_get_length(m_read_buf) >= (unsigned long)(m_bulk_len + 2)) {
+                if (get_available_bytes() >= (unsigned long)(m_bulk_len + 2)) {
                     m_response_len += m_bulk_len + 2;
 
                     /*
@@ -1248,7 +1831,9 @@ int memcache_binary_protocol::write_arbitrary_command(const char *val, int val_l
 
 class abstract_protocol *protocol_factory(enum PROTOCOL_TYPE type)
 {
-    if (is_redis_protocol(type)) {
+    if (type == PROTOCOL_REDIS_FAST_HEADER) {
+        return new fast_header_protocol();
+    } else if (is_redis_protocol(type)) {
         return new redis_protocol();
     } else if (type == PROTOCOL_MEMCACHE_TEXT) {
         return new memcache_text_protocol();

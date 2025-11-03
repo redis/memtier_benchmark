@@ -540,6 +540,11 @@ void shard_connection::fill_pipeline(void)
         m_conns_manager->create_request(now, m_id);
     }
 
+    // Flush any partial bulk when test finishes
+    if (m_conns_manager->finished()) {
+        flush_bulk();
+    }
+
     // update events
     if (m_bev != NULL) {
         // no pending response (nothing to read) and output buffer empty (nothing to write)
@@ -550,6 +555,14 @@ void shard_connection::fill_pipeline(void)
                 event_del(m_event_timer);
             }
         }
+    }
+}
+
+void shard_connection::flush_bulk(void)
+{
+    // If there's a partial bulk in progress, finalize it
+    if (m_protocol->has_partial_bulk()) {
+        m_protocol->finalize_partial_bulk();
     }
 }
 

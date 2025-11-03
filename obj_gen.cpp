@@ -161,7 +161,16 @@ object_generator::object_generator(size_t n_key_iterators/*= OBJECT_GENERATOR_KE
     m_value_buffer(NULL),
     m_random_fd(-1),
     m_value_buffer_size(0),
-    m_value_buffer_mutation_pos(0)
+    m_value_buffer_mutation_pos(0),
+    m_use_bulk_key_format(false),
+    m_bulk_slots(0),
+    m_bulk_size(0),
+    m_current_command_count(0),
+    m_initial_slot_id(0),
+    m_initial_key_suffix(0),
+    m_key_suffix_width(0),
+    m_key_slot_part_size(0),
+    m_key_rest_size(0)
 {
     m_next_key.resize(n_key_iterators, 0);
 
@@ -191,7 +200,16 @@ object_generator::object_generator(const object_generator& copy) :
     m_value_buffer(NULL),
     m_random_fd(-1),
     m_value_buffer_size(0),
-    m_value_buffer_mutation_pos(0)
+    m_value_buffer_mutation_pos(0),
+    m_use_bulk_key_format(copy.m_use_bulk_key_format),
+    m_bulk_slots(copy.m_bulk_slots),
+    m_bulk_size(copy.m_bulk_size),
+    m_current_command_count(0),
+    m_initial_slot_id(0),
+    m_initial_key_suffix(0),
+    m_key_suffix_width(copy.m_key_suffix_width),
+    m_key_slot_part_size(copy.m_key_slot_part_size),
+    m_key_rest_size(copy.m_key_rest_size)
 {
     if (m_data_size_type == data_size_weighted &&
         m_data_size.size_list != NULL) {
@@ -200,6 +218,10 @@ object_generator::object_generator(const object_generator& copy) :
     alloc_value_buffer(copy.m_value_buffer);
 
     m_next_key.resize(copy.m_next_key.size(), 0);
+
+    // Note: Random initial values for bulk format are NOT generated here.
+    // They will be generated later via randomize_bulk_initial_values() after set_random_seed()
+    // is called, ensuring each client gets different random values.
 }
 
 object_generator::~object_generator()
@@ -405,6 +427,112 @@ void object_generator::set_key_zipf_distribution(double key_exp)
     }
 }
 
+void object_generator::set_bulk_slots(unsigned int bulk_slots)
+{
+    m_bulk_slots = bulk_slots;
+
+    // Calculate key_suffix width based on keys_per_slot
+    if (bulk_slots > 0 && m_key_max >= m_key_min) {
+        unsigned long long total_keys = m_key_max - m_key_min + 1;
+        unsigned long long keys_per_slot = total_keys / bulk_slots;
+
+        // Calculate width needed to represent (keys_per_slot - 1)
+        m_key_suffix_width = 0;
+        unsigned long long temp = keys_per_slot - 1;
+        while (temp > 0) {
+            m_key_suffix_width++;
+            temp /= 10;
+        }
+        if (m_key_suffix_width == 0)
+            m_key_suffix_width = 1;
+    }
+}
+
+void object_generator::set_bulk_size(unsigned int bulk_size)
+{
+    m_bulk_size = bulk_size;
+}
+
+void object_generator::set_use_bulk_key_format(bool use_bulk_key_format)
+{
+    m_use_bulk_key_format = use_bulk_key_format;
+
+    // Initialize random starting values if bulk format is enabled
+    if (use_bulk_key_format && m_bulk_slots > 0) {
+        m_initial_slot_id = random_range(0, m_bulk_slots - 1);
+        unsigned long long keys_per_slot = (m_key_max - m_key_min + 1) / m_bulk_slots;
+        if (keys_per_slot > 0) {
+            m_initial_key_suffix = random_range(0, keys_per_slot - 1);
+        }
+    }
+}
+
+bool object_generator::set_key_slot_part_size(unsigned int size)
+{
+    if (size == 0) {
+        m_key_slot_part_size = 0;
+        return true;
+    }
+
+    // Validate that size is large enough for the maximum slot_id
+    if (m_bulk_slots > 0) {
+        unsigned long long max_slot_id = m_bulk_slots - 1;
+
+        // Count digits in max_slot_id
+        int num_digits = 0;
+        unsigned long long temp = max_slot_id;
+        if (temp == 0) {
+            num_digits = 1;
+        } else {
+            while (temp > 0) {
+                num_digits++;
+                temp /= 10;
+            }
+        }
+
+        if (size < (unsigned int)num_digits) {
+            return false;
+        }
+    }
+
+    m_key_slot_part_size = size;
+    return true;
+}
+
+bool object_generator::set_key_rest_size(unsigned int size)
+{
+    if (size == 0) {
+        m_key_rest_size = 0;
+        return true;
+    }
+
+    // Validate that size is large enough for the maximum key_suffix
+    if (m_bulk_slots > 0 && m_key_max > m_key_min) {
+        // Count digits in max_key_suffix (considering zero-padding width)
+        int num_digits = m_key_suffix_width;
+
+        if (size < (unsigned int)num_digits) {
+            return false;
+        }
+    }
+
+    m_key_rest_size = size;
+    return true;
+}
+
+void object_generator::randomize_bulk_initial_values()
+{
+    // Generate random initial values for bulk key format
+    // This should be called after set_random_seed() to ensure different clients get different values
+    if (m_use_bulk_key_format && m_bulk_slots > 0) {
+        m_initial_slot_id = random_range(0, m_bulk_slots - 1);
+        unsigned long long keys_per_slot = (m_key_max - m_key_min + 1) / m_bulk_slots;
+        if (keys_per_slot > 0) {
+            m_initial_key_suffix = random_range(0, keys_per_slot - 1);
+        }
+    }
+}
+
 // return a random number between r_min and r_max
 unsigned long long object_generator::random_range(unsigned long long r_min, unsigned long long  r_max)
 {
@@ -487,8 +615,83 @@ unsigned long long object_generator::get_key_index(int iter)
 }
 
 void object_generator::generate_key(unsigned long long key_index) {
-    m_key_len = snprintf(m_key_buffer, sizeof(m_key_buffer)-1, "%s%llu", m_key_prefix, key_index);
-    m_key = m_key_buffer;
+    if (m_use_bulk_key_format && m_bulk_slots > 0) {
+        // Bulk key generation: {slot_id}:key_suffix with optional padding
+        unsigned long long total_keys = m_key_max - m_key_min + 1;
+        unsigned long long keys_per_slot = total_keys / m_bulk_slots;
+
+        // Calculate current bulk number and key_suffix
+        unsigned long long bulk_number = m_current_command_count / m_bulk_size;
+        unsigned long long key_suffix = (m_initial_key_suffix + m_current_command_count) % keys_per_slot;
+        unsigned long long slot_id = (m_initial_slot_id + bulk_number) % m_bulk_slots;
+
+        // Build the key with optional padding - optimized version
+        char *buf = m_key_buffer;
+        char *buf_end = m_key_buffer + sizeof(m_key_buffer) - 1;
+
+        // Start with opening brace
+        *buf++ = '{';
+
+        // Format slot_id part with optional left padding using 'x'
+        if (m_key_slot_part_size > 0) {
+            // Format number to temporary buffer
+            char num_str[32];
+            int num_len = snprintf(num_str, sizeof(num_str), "%llu", slot_id);
+
+            // Pad with 'x' on the left
+            int padding = m_key_slot_part_size - num_len;
+            if (padding > 0) {
+                memset(buf, 'x', padding);
+                buf += padding;
+                memcpy(buf, num_str, num_len);
+                buf += num_len;
+            } else {
+                memcpy(buf, num_str, num_len);
+                buf += num_len;
+            }
+        } else {
+            // No padding - format directly to buffer
+            buf += snprintf(buf, buf_end - buf, "%llu", slot_id);
+        }
+
+        // Add closing brace and colon
+        *buf++ = '}';
+        *buf++ = ':';
+
+        // Format key_suffix part with optional left padding using 'x'
+        if (m_key_rest_size > 0) {
+            // Format number with zero-padding to temporary buffer
+            char num_str[32];
+            int num_len = snprintf(num_str, sizeof(num_str), "%0*llu", m_key_suffix_width, key_suffix);
+
+            // Pad with 'x' on the left
+            int padding = m_key_rest_size - num_len;
+            if (padding > 0) {
+                memset(buf, 'x', padding);
+                buf += padding;
+                memcpy(buf, num_str, num_len);
+                buf += num_len;
+            } else {
+                memcpy(buf, num_str, num_len);
+                buf += num_len;
+            }
+        } else {
+            // No padding - format directly to buffer
+            buf += snprintf(buf, buf_end - buf, "%0*llu", m_key_suffix_width, key_suffix);
+        }
+
+        // Null terminate and calculate length
+        *buf = '\0';
+        m_key_len = buf - m_key_buffer;
+        m_key = m_key_buffer;
+
+        // Increment command count for next key
+        m_current_command_count++;
+    } else {
+        // Standard key generation: key_prefix + key_index
+        m_key_len = snprintf(m_key_buffer, sizeof(m_key_buffer)-1, "%s%llu", m_key_prefix, key_index);
+        m_key = m_key_buffer;
+    }
 }
 
 const char* object_generator::get_key_prefix() {

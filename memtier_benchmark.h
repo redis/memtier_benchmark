@@ -45,6 +45,7 @@ enum PROTOCOL_TYPE {
     PROTOCOL_REDIS_DEFAULT,
     PROTOCOL_RESP2,
     PROTOCOL_RESP3,
+    PROTOCOL_REDIS_FAST_HEADER,
     PROTOCOL_MEMCACHE_TEXT,
     PROTOCOL_MEMCACHE_BINARY,
 };
@@ -110,6 +111,12 @@ struct benchmark_config {
     unsigned int request_rate;
     unsigned int request_per_interval;
     unsigned int request_interval_microsecond;
+    // Bulk support configuration
+    unsigned int bulk_size;
+    unsigned int bulk_slots;
+    bool no_header;
+    unsigned int key_slot_part_size;
+    unsigned int key_rest_size;
 #ifdef USE_TLS
     bool tls;
     const char *tls_cert;

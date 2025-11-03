@@ -175,12 +175,14 @@ protected:
 
     bool m_keep_value;
     struct protocol_response m_last_response;
+    size_t m_read_limit;  // If > 0, limit reads from m_read_buf to this many bytes
 public:
     abstract_protocol();
     virtual ~abstract_protocol();
     virtual abstract_protocol* clone(void) = 0;
     void set_buffers(struct evbuffer* read_buf, struct evbuffer* write_buf);
     void set_keep_value(bool flag);
+    size_t get_available_bytes();  // Get available bytes respecting m_read_limit
 
     virtual int select_db(int db) = 0;
     virtual int authenticate(const char *credentials) = 0;
@@ -196,6 +198,12 @@ public:
     virtual bool format_arbitrary_command(arbitrary_command &cmd) = 0;
     virtual int write_arbitrary_command(const command_arg *arg) = 0;
     virtual int write_arbitrary_command(const char *val, int val_len) = 0;
+
+    // Bulk support methods
+    virtual bool has_partial_bulk() { return false; }
+    virtual void finalize_partial_bulk() {}
+    virtual void set_bulk_size(unsigned int bulk_size) {}
+    virtual void set_no_header(bool no_header) {}
 
     struct protocol_response* get_response(void) { return &m_last_response; }
 };

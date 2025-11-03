@@ -72,6 +72,10 @@ bool client::setup_client(benchmark_config *config, abstract_protocol *protocol,
     else if (config->distinct_client_seed)
         m_obj_gen->set_random_seed(config->next_client_idx);
 
+    // Randomize bulk initial values after setting random seed
+    // This ensures each client gets different random starting slot_id and key_suffix
+    m_obj_gen->randomize_bulk_initial_values();
+
     // Setup first arbitrary command
     if (config->arbitrary_commands->is_defined())
         advance_arbitrary_command_index();
@@ -208,10 +212,14 @@ int client::connect(void)
 
 bool client::finished(void)
 {
-    if (m_config->requests > 0 && m_reqs_processed >= m_config->requests)
+    if (m_config->requests > 0 && m_reqs_generated >= m_config->requests) {
         return true;
-    if (m_config->test_time > 0 && m_stats.get_duration() >= m_config->test_time)
-        return true;
+    }
+    if (m_config->test_time > 0) {
+        double duration = m_stats.get_duration();
+        if (duration >= m_config->test_time)
+            return true;
+    }
     return false;
 }
 
