@@ -1,0 +1,13 @@
+# Grafana datasource provisioning for Graphite
+apiVersion: 1
+
+datasources:
+  - name: Graphite
+    type: graphite
+    access: proxy
+    url: http://graphite:80
+    isDefault: true
+    editable: true
+    jsonData:
+      graphiteVersion: "1.1"
+

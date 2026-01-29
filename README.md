@@ -180,3 +180,30 @@ Sample Visual Feel of the full latency spectrum using an [online formatter](http
 
 
 [sample_visual_histogram]: ./docs/sample_visual_histogram.png "Sample Full Latency Spectrum Histogram"
+
+### Real-Time Metrics Visualization
+
+memtier_benchmark can stream live metrics to a StatsD server for real-time visualization in Grafana. This is useful for monitoring performance during long-running tests or observing behavior during scaling events.
+
+#### Quick Start
+
+```bash
+# Start the included Graphite + Grafana stack
+docker-compose -f docker-compose.statsd.yml up -d
+
+# Run a benchmark with metrics streaming
+./memtier_benchmark -s <redis-host> --statsd-host=localhost --test-time=60
+
+# Open Grafana at http://localhost:3000 (admin/admin)
+```
+
+#### StatsD Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--statsd-host=HOST` | *(disabled)* | StatsD server hostname. Enables metrics when set. |
+| `--statsd-port=PORT` | `8125` | StatsD server UDP port. |
+| `--statsd-prefix=PREFIX` | `memtier` | Prefix for metric names. |
+| `--statsd-run-label=LABEL` | `default` | Label to identify/compare benchmark runs. |
+
+For detailed setup instructions, dashboard usage, and troubleshooting, see [Real-Time Metrics Guide](docs/REALTIME_METRICS.md).

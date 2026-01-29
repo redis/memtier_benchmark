@@ -158,6 +158,9 @@ public:
                           unsigned long int& total_get_ops,
                           unsigned long int& total_set_ops,
                           unsigned long int& total_wait_ops);
+
+    // Get instantaneous total latency histogram for aggregation
+    hdr_histogram* get_inst_totals_histogram() const;
     void save_csv_one_sec_cluster(FILE *f);
     void save_csv_set_get_commands(FILE *f, bool cluster_mode);
     void save_csv_arbitrary_commands_one_sec(FILE *f,

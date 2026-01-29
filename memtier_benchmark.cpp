@@ -77,6 +77,7 @@
 #include "JSON_handler.h"
 #include "obj_gen.h"
 #include "memtier_benchmark.h"
+#include "statsd.h"
 
 
 static int log_level = 0;
@@ -588,6 +589,14 @@ static void config_init_defaults(struct benchmark_config *cfg)
     if (!cfg->print_percentiles.is_defined())
         cfg->print_percentiles = config_quantiles("50,99,99.9");
 
+    // StatsD defaults - port only matters if host is set
+    if (!cfg->statsd_port)
+        cfg->statsd_port = 8125;
+    if (!cfg->statsd_prefix)
+        cfg->statsd_prefix = "memtier";
+    if (!cfg->statsd_run_label)
+        cfg->statsd_run_label = "default";
+
 #ifdef USE_TLS
     if (!cfg->tls_protocols)
         cfg->tls_protocols = REDIS_TLS_PROTO_DEFAULT;
@@ -712,6 +721,10 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_hdr_file_prefix,
         o_rate_limiting,
         o_uri,
+        o_statsd_host,
+        o_statsd_port,
+        o_statsd_prefix,
+        o_statsd_run_label,
         o_help
     };
 
@@ -790,6 +803,10 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         { "command-ratio",              1, 0, o_command_ratio },
         { "rate-limiting",              1, 0, o_rate_limiting },
         { "uri",                        1, 0, o_uri },
+        { "statsd-host",                1, 0, o_statsd_host },
+        { "statsd-port",                1, 0, o_statsd_port },
+        { "statsd-prefix",              1, 0, o_statsd_prefix },
+        { "statsd-run-label",           1, 0, o_statsd_run_label },
         { NULL,                         0, 0, 0 }
     };
 
@@ -1304,6 +1321,23 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                     break;
                 }
 #endif
+                case o_statsd_host:
+                    cfg->statsd_host = optarg;
+                    break;
+                case o_statsd_port:
+                    endptr = NULL;
+                    cfg->statsd_port = (unsigned short) strtoul(optarg, &endptr, 10);
+                    if (cfg->statsd_port == 0 || !endptr || *endptr != '\0') {
+                        fprintf(stderr, "error: statsd-port must be a valid port number.\n");
+                        return -1;
+                    }
+                    break;
+                case o_statsd_prefix:
+                    cfg->statsd_prefix = optarg;
+                    break;
+                case o_statsd_run_label:
+                    cfg->statsd_run_label = optarg;
+                    break;
             default:
                     return -1;
                     break;
@@ -1361,6 +1395,10 @@ void usage() {
             "      --print-percentiles        Specify which percentiles info to print on the results table (by default prints percentiles: 50,99,99.9)\n"
             "      --print-all-runs           When performing multiple test iterations, print and save results for all iterations\n"
             "      --cluster-mode             Run client in cluster mode\n"
+            "      --statsd-host=HOST         StatsD server hostname to send real-time metrics (default: none, disabled)\n"
+            "      --statsd-port=PORT         StatsD server UDP port (default: 8125)\n"
+            "      --statsd-prefix=PREFIX     Prefix for StatsD metric names (default: memtier)\n"
+            "      --statsd-run-label=LABEL   Label for this benchmark run, used to distinguish runs in dashboards (default: default)\n"
             "  -h, --help                     Display this help\n"
             "  -v, --version                  Display version information\n"
             "\n"
@@ -1682,6 +1720,15 @@ run_stats run_benchmark(int run_id, benchmark_config* cfg, object_generator* obj
         (*i)->start();
     }
 
+    // Send "run started" annotation to Graphite
+    if (cfg->statsd != NULL && cfg->statsd->is_enabled()) {
+        char event_data[256];
+        snprintf(event_data, sizeof(event_data) - 1,
+            "threads=%u connections=%u run=%u",
+            cfg->threads, cfg->clients, run_id);
+        cfg->statsd->event("Benchmark Started", event_data, "memtier,start");
+    }
+
     unsigned long int prev_ops = 0;
     unsigned long int prev_bytes = 0;
     unsigned long int prev_duration = 0;
@@ -1794,7 +1841,79 @@ run_stats run_benchmark(int run_id, benchmark_config* cfg, object_generator* obj
             fprintf(stderr, "[RUN #%u %.0f%%, %3u secs] %2u threads %2u conns: %11lu ops, %7lu (avg: %7lu) ops/sec, %s/sec (avg: %s/sec), %5.2f (avg: %5.2f) msec latency\r",
                 run_id, progress, (unsigned int) (duration / 1000000), active_threads, cfg->clients, total_ops, cur_ops_sec, ops_sec, cur_bytes_str, bytes_str, cur_latency, avg_latency);
         }
+
+        // Send metrics to StatsD if configured
+        if (cfg->statsd != NULL && cfg->statsd->is_enabled()) {
+            cfg->statsd->gauge("ops_sec", (long)cur_ops_sec);
+            cfg->statsd->gauge("ops_sec_avg", (long)ops_sec);
+            cfg->statsd->gauge("bytes_sec", (long)cur_bytes_sec);
+            cfg->statsd->gauge("bytes_sec_avg", (long)bytes_sec);
+            cfg->statsd->timing("latency_ms", cur_latency);
+            cfg->statsd->timing("latency_avg_ms", avg_latency);
+            cfg->statsd->gauge("connections", (long)(cfg->clients * active_threads));
+            cfg->statsd->gauge("progress_pct", progress);
+            if (total_connection_errors > 0) {
+                cfg->statsd->gauge("connection_errors", (long)total_connection_errors);
+            }
+
+            // Calculate and send percentile metrics from instantaneous histograms
+            // Allocate a temporary histogram to aggregate all threads' instantaneous histograms
+            hdr_histogram* temp_histogram = NULL;
+            if (hdr_init(LATENCY_HDR_MIN_VALUE, LATENCY_HDR_SEC_MAX_VALUE, LATENCY_HDR_SEC_SIGDIGTS, &temp_histogram) == 0) {
+                // Aggregate instantaneous histograms from all threads
+                for (std::vector<cg_thread*>::iterator i = threads.begin(); i != threads.end(); i++) {
+                    if (!(*i)->m_finished) {
+                        (*i)->m_cg->aggregate_inst_histogram(temp_histogram);
+                    }
+                }
+
+                // Only calculate percentiles if we have samples
+                if (hdr_total_count(temp_histogram) > 0) {
+                    // Get the configured percentiles from config
+                    const std::vector<float>& quantiles = cfg->print_percentiles.quantile_list;
+
+                    // Calculate and send each configured percentile
+                    for (std::size_t i = 0; i < quantiles.size(); i++) {
+                        double percentile = quantiles[i];
+                        int64_t value = hdr_value_at_percentile(temp_histogram, percentile);
+                        double value_ms = value / (double)LATENCY_HDR_RESULTS_MULTIPLIER;
+
+                        // Format the metric name (e.g., "latency_p50", "latency_p99", "latency_p99_9")
+                        char metric_name[32];
+                        if (percentile == (int)percentile) {
+                            snprintf(metric_name, sizeof(metric_name), "latency_p%d", (int)percentile);
+                        } else {
+                            // Replace decimal point with underscore for metric name
+                            snprintf(metric_name, sizeof(metric_name), "latency_p%.1f", percentile);
+                            // Replace '.' with '_' in the metric name
+                            for (char* p = metric_name; *p; p++) {
+                                if (*p == '.') *p = '_';
+                            }
+                        }
+
+                        cfg->statsd->gauge(metric_name, value_ms);
+                    }
+                }
+
+                // Clean up the temporary histogram
+                hdr_close(temp_histogram);
+            }
+        }
     } while (active_threads > 0);
+
+    // Send "run completed" annotation and zero out gauges so graphs drop to 0
+    if (cfg->statsd != NULL && cfg->statsd->is_enabled()) {
+        char event_data[64];
+        snprintf(event_data, sizeof(event_data) - 1, "run=%u", run_id);
+        cfg->statsd->event("Benchmark Completed", event_data, "memtier,end");
+
+        // Zero out gauges so the graph shows the run has ended
+        cfg->statsd->gauge("ops_sec", (long)0);
+        cfg->statsd->gauge("ops_sec_avg", (long)0);
+        cfg->statsd->gauge("bytes_sec", (long)0);
+        cfg->statsd->gauge("bytes_sec_avg", (long)0);
+        cfg->statsd->gauge("progress_pct", (long)0);
+    }
 
     fprintf(stderr, "\n\n");
 
@@ -1974,6 +2093,18 @@ int main(int argc, char *argv[])
     }
 
     log_level = cfg.debug;
+
+    // Initialize StatsD client if configured
+    cfg.statsd = NULL;
+    if (cfg.statsd_host != NULL) {
+        cfg.statsd = new statsd_client();
+        if (!cfg.statsd->init(cfg.statsd_host, cfg.statsd_port, cfg.statsd_prefix, cfg.statsd_run_label)) {
+            fprintf(stderr, "warning: failed to initialize StatsD client, metrics will not be sent\n");
+            delete cfg.statsd;
+            cfg.statsd = NULL;
+        }
+    }
+
     if (cfg.show_config) {
         fprintf(stderr, "============== Configuration values: ==============\n");
         config_print(stdout, &cfg);
@@ -2408,6 +2539,13 @@ int main(int argc, char *argv[])
         if (cfg.authenticate) {
             free((void*)cfg.authenticate);
         }
+    }
+
+    // Clean up StatsD client
+    if (cfg.statsd != NULL) {
+        cfg.statsd->close();
+        delete cfg.statsd;
+        cfg.statsd = NULL;
     }
 
 #ifdef USE_TLS

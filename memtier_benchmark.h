@@ -26,6 +26,9 @@
 #include <openssl/ssl.h>
 #endif
 
+// Forward declaration
+class statsd_client;
+
 #define LOGLEVEL_ERROR 0
 #define LOGLEVEL_DEBUG 1
 
@@ -116,6 +119,12 @@ struct benchmark_config {
     unsigned int request_rate;
     unsigned int request_per_interval;
     unsigned int request_interval_microsecond;
+    // StatsD metrics export
+    const char *statsd_host;
+    unsigned short statsd_port;
+    const char *statsd_prefix;
+    const char *statsd_run_label;
+    statsd_client *statsd;
 #ifdef USE_TLS
     bool tls;
     const char *tls_cert;

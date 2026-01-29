@@ -171,6 +171,10 @@ void run_stats::summarize_current_second(){
     hdr_reset(inst_m_totals_latency_histogram);
 }
 
+hdr_histogram* run_stats::get_inst_totals_histogram() const {
+    return inst_m_totals_latency_histogram;
+}
+
 void run_stats::roll_cur_stats(struct timeval* ts)
 {
     const unsigned int sec = ts_diff(m_start_time, *ts) / 1000000;

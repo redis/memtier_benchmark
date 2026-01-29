@@ -235,6 +235,7 @@ public:
     unsigned long int get_total_connection_errors(void);
 
     void merge_run_stats(run_stats* target);
+    void aggregate_inst_histogram(hdr_histogram* target);
 };
 
 
