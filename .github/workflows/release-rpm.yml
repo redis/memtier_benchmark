@@ -1,0 +1,343 @@
+name: Build and Publish RPM Packages
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    paths-ignore:
+      - '**.md'
+      - 'debian/**'
+  pull_request:
+    branches:
+      - master
+      - main
+    paths-ignore:
+      - '**.md'
+      - 'debian/**'
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag name for testing (e.g., 2.1.2)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  build-srpm:
+    runs-on: ubuntu-latest
+    container: rockylinux:9
+    steps:
+    - name: Install git and basic tools
+      run: |
+        dnf install -y git rpm-build rpmdevtools rsync
+
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup RPM build tree
+      run: rpmdev-setuptree
+
+    - name: Get version
+      id: version
+      run: |
+        # Extract version from configure.ac (source of truth)
+        SOURCE_VERSION=$(awk -F'[(),]' '/AC_INIT/ {gsub(/ /, "", $3); print $3}' configure.ac)
+
+        # Use tag if available, otherwise use source version
+        if [ -n "${{ github.event.inputs.tag_name }}" ]; then
+          VERSION="${{ github.event.inputs.tag_name }}"
+        elif [ -n "${{ github.event.release.tag_name }}" ]; then
+          VERSION="${{ github.event.release.tag_name }}"
+        else
+          VERSION="$SOURCE_VERSION"
+        fi
+
+        # Validate tag matches source version on releases
+        if [ -n "${{ github.event.release.tag_name }}" ] && [ "$VERSION" != "$SOURCE_VERSION" ]; then
+          echo "::warning::Release tag ($VERSION) does not match configure.ac version ($SOURCE_VERSION)"
+        fi
+
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "Building version: $VERSION (source: $SOURCE_VERSION)"
+
+    - name: Create source tarball
+      run: |
+        VERSION=${{ steps.version.outputs.version }}
+        mkdir -p memtier-benchmark-$VERSION
+        rsync -a --exclude='.git' --exclude='memtier-benchmark-*' . memtier-benchmark-$VERSION/
+        tar czf ~/rpmbuild/SOURCES/memtier-benchmark-$VERSION.tar.gz memtier-benchmark-$VERSION
+
+    - name: Update spec file version
+      run: |
+        VERSION=${{ steps.version.outputs.version }}
+        sed -i "s/^Version:.*/Version:        $VERSION/" rpm/memtier-benchmark.spec
+        cp rpm/memtier-benchmark.spec ~/rpmbuild/SPECS/
+
+    - name: Build SRPM
+      run: |
+        rpmbuild -bs ~/rpmbuild/SPECS/memtier-benchmark.spec
+
+    - name: Upload SRPM artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: srpm
+        path: ~/rpmbuild/SRPMS/*.src.rpm
+        retention-days: 5
+
+  build-rpm:
+    needs: build-srpm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x86_64 builds
+          - distro: el8
+            image: rockylinux:8
+            arch: x86_64
+            runner: ubuntu-latest
+          - distro: el9
+            image: rockylinux:9
+            arch: x86_64
+            runner: ubuntu-latest
+          - distro: el10
+            image: rockylinux/rockylinux:10
+            arch: x86_64
+            runner: ubuntu-latest
+          - distro: amzn2023
+            image: amazonlinux:2023
+            arch: x86_64
+            runner: ubuntu-latest
+          # arm64 builds
+          - distro: el8
+            image: rockylinux:8
+            arch: aarch64
+            runner: ubuntu24-arm64-2-8
+          - distro: el9
+            image: rockylinux:9
+            arch: aarch64
+            runner: ubuntu24-arm64-2-8
+          - distro: el10
+            image: rockylinux/rockylinux:10
+            arch: aarch64
+            runner: ubuntu24-arm64-2-8
+          - distro: amzn2023
+            image: amazonlinux:2023
+            arch: aarch64
+            runner: ubuntu24-arm64-2-8
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    name: Build RPM (${{ matrix.distro }}-${{ matrix.arch }})
+    steps:
+    - name: Install build dependencies
+      run: |
+        if command -v dnf &> /dev/null; then
+          dnf install -y rpm-build gcc-c++ make autoconf automake libtool \
+            libevent-devel openssl-devel zlib-devel pkgconfig
+        else
+          yum install -y rpm-build gcc-c++ make autoconf automake libtool \
+            libevent-devel openssl-devel zlib-devel pkgconfig
+        fi
+
+    - name: Download SRPM
+      uses: actions/download-artifact@v4
+      with:
+        name: srpm
+
+    - name: Install SRPM
+      run: rpm -ivh *.src.rpm
+
+    - name: Build RPM
+      run: |
+        rpmbuild -bb ~/rpmbuild/SPECS/memtier-benchmark.spec
+
+    - name: Upload RPM artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: rpm-${{ matrix.distro }}-${{ matrix.arch }}
+        path: ~/rpmbuild/RPMS/**/*.rpm
+        retention-days: 5
+
+    - name: Upload as release assets
+      if: github.event_name == 'release'
+      uses: softprops/action-gh-release@v1
+      with:
+        files: ~/rpmbuild/RPMS/**/*.rpm
+
+  smoke-test-packages:
+    needs: build-rpm
+    # Only smoke test on master/main push or release (not on PRs)
+    if: github.event_name == 'push' || github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x86_64 tests
+          - distro: el8
+            image: rockylinux:8
+            arch: x86_64
+            runner: ubuntu-latest
+          - distro: el9
+            image: rockylinux:9
+            arch: x86_64
+            runner: ubuntu-latest
+          - distro: el10
+            image: rockylinux/rockylinux:10
+            arch: x86_64
+            runner: ubuntu-latest
+          - distro: amzn2023
+            image: amazonlinux:2023
+            arch: x86_64
+            runner: ubuntu-latest
+          # arm64 tests
+          - distro: el8
+            image: rockylinux:8
+            arch: aarch64
+            runner: ubuntu24-arm64-2-8
+          - distro: el9
+            image: rockylinux:9
+            arch: aarch64
+            runner: ubuntu24-arm64-2-8
+          - distro: el10
+            image: rockylinux/rockylinux:10
+            arch: aarch64
+            runner: ubuntu24-arm64-2-8
+          - distro: amzn2023
+            image: amazonlinux:2023
+            arch: aarch64
+            runner: ubuntu24-arm64-2-8
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    name: Smoke test (${{ matrix.distro }}-${{ matrix.arch }})
+    steps:
+    - name: Download RPM
+      uses: actions/download-artifact@v4
+      with:
+        name: rpm-${{ matrix.distro }}-${{ matrix.arch }}
+        path: rpms
+
+    - name: Install dependencies and RPM
+      run: |
+        # Find RPM file (globstar not enabled by default)
+        RPM_FILE=$(find ./rpms -name "*.rpm" -type f ! -name "*debug*" | head -1)
+        if [ -z "$RPM_FILE" ]; then
+          echo "::error::No RPM file found in ./rpms"
+          find ./rpms -type f
+          exit 1
+        fi
+        echo "Installing: $RPM_FILE"
+
+        if command -v dnf &> /dev/null; then
+          dnf install -y libevent openssl
+          dnf install -y "$RPM_FILE"
+        else
+          yum install -y libevent openssl
+          yum install -y "$RPM_FILE"
+        fi
+
+    - name: Verify installation
+      run: |
+        memtier_benchmark --version
+        echo "✓ memtier_benchmark (${{ matrix.distro }}-${{ matrix.arch }}) installed and runs successfully"
+
+  publish-to-yum:
+    runs-on: ubuntu-latest
+    needs: smoke-test-packages
+    environment: build
+    # Only publish on actual releases (not prereleases or workflow_dispatch)
+    if: github.event_name == 'release' && github.event.release.prerelease == false
+    steps:
+    - name: Setup RPM Signing key
+      run: |
+        mkdir -m 0700 -p ~/.gnupg
+        echo "$APT_SIGNING_KEY" | gpg --import
+      env:
+        APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+
+    - name: Download all RPM artifacts
+      uses: actions/download-artifact@v4
+      with:
+        pattern: rpm-*
+        path: rpms
+        merge-multiple: false
+
+    - name: Install createrepo and AWS CLI
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y createrepo-c awscli rpm
+
+    - name: Sign RPMs
+      run: |
+        echo "%_gpg_name oss@redis.com" >> ~/.rpmmacros
+        # Use find instead of globstar (not enabled by default in bash)
+        find rpms -name "*.rpm" -type f | while read -r rpm_file; do
+          echo "Signing: $rpm_file"
+          rpm --addsign "$rpm_file"
+        done
+
+    - name: Sync existing repo from S3
+      run: |
+        # Create repo dir first, then sync (don't use || to avoid masking errors)
+        mkdir -p ./repo
+        # Sync existing repo; if bucket path doesn't exist yet, this is a no-op
+        aws s3 sync "s3://${{ secrets.APT_S3_BUCKET }}/rpm" ./repo || echo "No existing repo found, starting fresh"
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.APT_S3_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.APT_S3_SECRET_ACCESS_KEY }}
+        AWS_DEFAULT_REGION: ${{ secrets.APT_S3_REGION }}
+
+    - name: Organize RPMs by distro and architecture
+      run: |
+        # Artifact names are rpm-{distro}-{arch}, e.g., rpm-el9-x86_64
+        for artifact_dir in rpms/rpm-*; do
+          artifact_name=$(basename "$artifact_dir")
+          # Extract distro and arch from artifact name (rpm-el9-x86_64 -> el9, x86_64)
+          distro=$(echo "$artifact_name" | sed 's/rpm-//' | rev | cut -d'-' -f2- | rev)
+          arch=$(echo "$artifact_name" | rev | cut -d'-' -f1 | rev)
+
+          mkdir -p "repo/$distro/$arch"
+          # Use find instead of globstar
+          find "$artifact_dir" -name "*.rpm" -type f -exec cp {} "repo/$distro/$arch/" \;
+
+          echo "Organized: $artifact_name -> repo/$distro/$arch/"
+        done
+
+    - name: Verify RPMs were organized
+      run: |
+        RPM_COUNT=$(find repo -name "*.rpm" -type f | wc -l)
+        if [ "$RPM_COUNT" -eq 0 ]; then
+          echo "::error::No RPMs found in repo directory. Aborting to prevent wiping S3."
+          exit 1
+        fi
+        echo "Found $RPM_COUNT RPMs to publish"
+
+    - name: Create/Update YUM repository metadata
+      run: |
+        for distro_dir in repo/*/; do
+          for arch_dir in "$distro_dir"*/; do
+            if [ -d "$arch_dir" ] && ls "$arch_dir"/*.rpm 1>/dev/null 2>&1; then
+              echo "Creating repo metadata for: $arch_dir"
+              createrepo_c --update "$arch_dir"
+            fi
+          done
+        done
+
+    - name: Upload repo to S3
+      run: |
+        # Use --delete to keep repo clean, but we verified RPMs exist above
+        aws s3 sync ./repo "s3://${{ secrets.APT_S3_BUCKET }}/rpm" --delete
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.APT_S3_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.APT_S3_SECRET_ACCESS_KEY }}
+        AWS_DEFAULT_REGION: ${{ secrets.APT_S3_REGION }}
+
+    - name: List uploaded packages
+      run: |
+        echo "📦 Packages uploaded to YUM repository:"
+        find repo -name "*.rpm" -type f
+

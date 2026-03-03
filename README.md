@@ -45,6 +45,30 @@ Once configured, to install memtier_benchmark use:
 sudo apt-get install memtier-benchmark
 ```
 
+### Installing on RHEL, Rocky Linux, AlmaLinux, and Amazon Linux
+
+Pre-compiled binaries are available for RHEL 8/9/10 compatible distributions and Amazon Linux 2023
+from the packages.redis.io YUM repository. To configure this repository, use the following steps:
+
+```
+curl -fsSL https://packages.redis.io/gpg | sudo gpg --dearmor -o /etc/pki/rpm-gpg/redis-archive-keyring.gpg
+
+sudo tee /etc/yum.repos.d/redis.repo <<'EOF'
+[redis]
+name=Redis
+baseurl=https://packages.redis.io/rpm/el$releasever/$basearch
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/redis-archive-keyring.gpg
+EOF
+```
+
+Once configured, to install memtier_benchmark use:
+
+```
+sudo dnf install -y memtier-benchmark
+```
+
 ### Installing on MacOS
 
 To install memtier_benchmark on MacOS, use Homebrew:
