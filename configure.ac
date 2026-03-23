@@ -37,6 +37,7 @@ AC_HEADER_STDC
 AC_HEADER_DIRENT
 AC_CHECK_HEADERS([stdlib.h string.h sys/time.h getopt.h limits.h malloc.h stdlib.h unistd.h utime.h assert.h sys/socket.h sys/types.h])
 AC_CHECK_HEADERS([fcntl.h netinet/tcp.h])
+AC_CHECK_HEADERS([execinfo.h])
 AC_CHECK_HEADERS([pthread.h])
 AC_CHECK_HEADERS([zlib.h])
 AC_CHECK_HEADERS([event2/event.h])
