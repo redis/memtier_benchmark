@@ -41,7 +41,9 @@
 #include <sys/time.h>
 #include <sys/resource.h>
 #include <signal.h>
+#ifdef HAVE_EXECINFO_H
 #include <execinfo.h>
+#endif
 #include <ucontext.h>
 #include <time.h>
 #include <ctype.h>
@@ -1819,6 +1821,7 @@ static void print_all_threads_stack_trace(FILE *fp, int pid, const char *timestr
     // Print main/crashing thread first
     fprintf(fp, "[%d] %s # Thread %lu (current/crashing thread):\n", pid, timestr, (unsigned long) current_thread);
 
+#ifdef HAVE_EXECINFO_H
     void *trace[100];
     int trace_size = backtrace(trace, 100);
     char **messages = backtrace_symbols(trace, trace_size);
@@ -1826,6 +1829,9 @@ static void print_all_threads_stack_trace(FILE *fp, int pid, const char *timestr
         fprintf(fp, "[%d] %s #   %s\n", pid, timestr, messages[i]);
     }
     free(messages);
+#else
+    fprintf(fp, "[%d] %s #   (backtrace not available on this platform)\n", pid, timestr);
+#endif
 
     // Now print stack traces for worker threads if available
     if (g_threads != NULL) {

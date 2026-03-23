@@ -358,6 +358,38 @@ jobs:
         make code-coverage-capture
         bash <(curl -s https://codecov.io/bash) -f memtier_benchmark-*-coverage.info || echo "Codecov did not collect coverage reports"
 
+  build-alpine:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        alpine_version:
+          - "alpine:3.17"
+          - "alpine:3.18"
+          - "alpine:3.19"
+          - "alpine:3.20"
+          - "alpine:3.21"
+          - "alpine:latest"
+    container: ${{ matrix.alpine_version }}
+    name: Build ${{ matrix.alpine_version }}
+    steps:
+    - name: Install git
+      run: apk add --no-cache git
+
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install build dependencies
+      run: |
+        apk add --no-cache \
+          make g++ autoconf automake libtool pkgconfig \
+          libevent-dev zlib-dev openssl-dev
+
+    - name: Build
+      run: autoreconf -ivf && ./configure && make -j
+
+    - name: Verify version
+      run: ./memtier_benchmark --version
+
   build-macos:
     strategy:
       matrix:
