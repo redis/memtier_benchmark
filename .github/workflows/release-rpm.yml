@@ -240,6 +240,17 @@ jobs:
     container: ${{ matrix.image }}
     name: Smoke test (${{ matrix.distro }}-${{ matrix.arch }})
     steps:
+    - name: Install minimal shell tools
+      # Minimal Rocky 8/10 and AL2023 base images ship without findutils
+      # (and sometimes without diff/which). Install up-front so the rest of
+      # the job can use `find` etc.
+      run: |
+        if command -v dnf >/dev/null 2>&1; then
+          dnf install -y findutils
+        else
+          yum install -y findutils
+        fi
+
     - name: Download RPM
       uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
       with:
