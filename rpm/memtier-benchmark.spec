@@ -55,6 +55,6 @@ autoreconf -ivf
 %{_datadir}/bash-completion/completions/memtier_benchmark
 
 %changelog
-* %(date "+%a %b %d %Y") Redis Team <oss@redis.com> - %{version}-%{release}
-- See https://github.com/redis/memtier_benchmark/releases
+* Thu Apr 30 2026 Redis Team <oss@redis.com> - 0.0.0-1
+- See https://github.com/redis/memtier_benchmark/releases for per-release notes.
 

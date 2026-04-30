@@ -24,8 +24,9 @@ on:
         required: false
         default: ""
 
+# Default to least-privilege; jobs that need write opt in below.
 permissions:
-  contents: write
+  contents: read
   actions: read
 
 jobs:
@@ -38,7 +39,7 @@ jobs:
         dnf install -y git rpm-build rpmdevtools rsync
 
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
     - name: Setup RPM build tree
       run: rpmdev-setuptree
@@ -84,7 +85,7 @@ jobs:
         rpmbuild -bs ~/rpmbuild/SPECS/memtier-benchmark.spec
 
     - name: Upload SRPM artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
       with:
         name: srpm
         path: ~/rpmbuild/SRPMS/*.src.rpm
@@ -92,6 +93,9 @@ jobs:
 
   build-rpm:
     needs: build-srpm
+    # Needs contents: write only to attach RPMs as release assets (release event).
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -145,19 +149,36 @@ jobs:
         fi
 
     - name: Download SRPM
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
       with:
         name: srpm
 
     - name: Install SRPM
+      # SRPM is produced by the prior job from this repo's own spec;
+      # re-installing it here unpacks sources and the spec into ~/rpmbuild/.
       run: rpm -ivh *.src.rpm
 
     - name: Build RPM
       run: |
         rpmbuild -bb ~/rpmbuild/SPECS/memtier-benchmark.spec
 
+    - name: Static check with rpmlint (advisory)
+      continue-on-error: true
+      run: |
+        # rpmlint lives in different repos across distros; try a few then skip if unavailable.
+        if command -v dnf &>/dev/null; then
+          dnf install -y rpmlint \
+            || dnf install -y --enablerepo=crb rpmlint \
+            || dnf install -y --enablerepo=powertools rpmlint \
+            || dnf install -y --enablerepo=epel rpmlint \
+            || echo "rpmlint unavailable on ${{ matrix.distro }}"
+        fi
+        if command -v rpmlint &>/dev/null; then
+          find ~/rpmbuild/RPMS -name '*.rpm' -type f -print0 | xargs -0 rpmlint || true
+        fi
+
     - name: Upload RPM artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
       with:
         name: rpm-${{ matrix.distro }}-${{ matrix.arch }}
         path: ~/rpmbuild/RPMS/**/*.rpm
@@ -165,7 +186,7 @@ jobs:
 
     - name: Upload as release assets
       if: github.event_name == 'release'
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
       with:
         files: ~/rpmbuild/RPMS/**/*.rpm
 
@@ -216,14 +237,14 @@ jobs:
     name: Smoke test (${{ matrix.distro }}-${{ matrix.arch }})
     steps:
     - name: Download RPM
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
       with:
         name: rpm-${{ matrix.distro }}-${{ matrix.arch }}
         path: rpms
 
-    - name: Install dependencies and RPM
+    - name: Install RPM directly (sanity check)
       run: |
-        # Find RPM file (globstar not enabled by default)
+        # First pass: install the file directly to confirm the RPM itself is sound.
         RPM_FILE=$(find ./rpms -name "*.rpm" -type f ! -name "*debug*" | head -1)
         if [ -z "$RPM_FILE" ]; then
           echo "::error::No RPM file found in ./rpms"
@@ -231,36 +252,98 @@ jobs:
           exit 1
         fi
         echo "Installing: $RPM_FILE"
-
+        # Rely on the package's auto-deps to pull libevent/openssl — manually
+        # pre-installing them would mask a missing Requires:.
         if command -v dnf &> /dev/null; then
-          dnf install -y libevent openssl
           dnf install -y "$RPM_FILE"
         else
-          yum install -y libevent openssl
           yum install -y "$RPM_FILE"
         fi
 
-    - name: Verify installation
+    - name: Verify direct install
       run: |
         memtier_benchmark --version
-        echo "✓ memtier_benchmark (${{ matrix.distro }}-${{ matrix.arch }}) installed and runs successfully"
+        memtier_benchmark --help > /dev/null
+        # Man page is referenced from the spec %files; assert it actually shipped.
+        test -f /usr/share/man/man1/memtier_benchmark.1.gz \
+          || test -f /usr/share/man/man1/memtier_benchmark.1
+        # Bash completion file must be syntactically loadable.
+        bash -n /usr/share/bash-completion/completions/memtier_benchmark
+        echo "✓ direct install (${{ matrix.distro }}-${{ matrix.arch }}) verified"
+
+    - name: Test install via local YUM repo (mirrors README path layout)
+      run: |
+        # This step mirrors what users actually do: install via repo metadata
+        # using the same baseurl pattern documented in README.md. It catches
+        # createrepo / Requires / baseurl bugs that direct-file install misses,
+        # including $releasever-vs-distro mismatches like the AL2023 case.
+        set -euo pipefail
+        if command -v dnf &>/dev/null; then
+          dnf remove -y memtier-benchmark
+          dnf install -y createrepo_c || dnf install -y createrepo
+        else
+          yum remove -y memtier-benchmark
+          yum install -y createrepo_c || yum install -y createrepo
+        fi
+
+        DISTRO="${{ matrix.distro }}"
+        ARCH="${{ matrix.arch }}"
+        REPO_ROOT=/tmp/localrepo
+        mkdir -p "$REPO_ROOT/$DISTRO/$ARCH"
+        find ./rpms -name '*.rpm' -type f ! -name '*debug*' \
+          -exec cp {} "$REPO_ROOT/$DISTRO/$ARCH/" \;
+
+        if command -v createrepo_c &>/dev/null; then
+          createrepo_c "$REPO_ROOT/$DISTRO/$ARCH"
+        else
+          createrepo "$REPO_ROOT/$DISTRO/$ARCH"
+        fi
+
+        # Match the README baseurl pattern. \$releasever and \$basearch are
+        # passed through to dnf; only $REPO_ROOT is shell-expanded here.
+        if [ "$DISTRO" = "amzn2023" ]; then
+          BASEURL="file://$REPO_ROOT/amzn2023/\$basearch"
+        else
+          BASEURL="file://$REPO_ROOT/el\$releasever/\$basearch"
+        fi
+
+        cat > /etc/yum.repos.d/local-test.repo <<EOF
+        [local-test]
+        name=Local Test
+        baseurl=$BASEURL
+        enabled=1
+        gpgcheck=0
+        EOF
+
+        if command -v dnf &>/dev/null; then
+          dnf install -y memtier-benchmark
+        else
+          yum install -y memtier-benchmark
+        fi
+
+        memtier_benchmark --version
+        echo "✓ repo install (${{ matrix.distro }}-${{ matrix.arch }}) verified via $BASEURL"
 
   publish-to-yum:
     runs-on: ubuntu-latest
     needs: smoke-test-packages
     environment: build
+    permissions:
+      contents: read
     # Only publish on actual releases (not prereleases or workflow_dispatch)
     if: github.event_name == 'release' && github.event.release.prerelease == false
     steps:
     - name: Setup RPM Signing key
+      # Same key used for the DEB pipeline (APT_SIGNING_KEY); name retained
+      # for parity with existing secret naming.
       run: |
         mkdir -m 0700 -p ~/.gnupg
-        echo "$APT_SIGNING_KEY" | gpg --import
+        echo "$APT_SIGNING_KEY" | gpg --batch --import
       env:
         APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
 
     - name: Download all RPM artifacts
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
       with:
         pattern: rpm-*
         path: rpms
@@ -280,12 +363,52 @@ jobs:
           rpm --addsign "$rpm_file"
         done
 
+    - name: Verify RPM signatures
+      # Fail fast if signing silently produced unsigned/invalid RPMs.
+      run: |
+        set -euo pipefail
+        # Import the public half of the signing key into rpm's keyring so
+        # `rpm -K` can verify, not just check the digest.
+        gpg --export --armor oss@redis.com > /tmp/redis-pub.asc
+        sudo rpm --import /tmp/redis-pub.asc
+
+        bad=0
+        while read -r rpm_file; do
+          # Two checks because `rpm -K` exits 0 on unsigned packages (digest OK).
+          # 1. Header field must contain a PGP signature, not "(none)".
+          sig=$(rpm -qp --queryformat '%{SIGPGP:pgpsig}\n' "$rpm_file")
+          if [ "$sig" = "(none)" ] || [ -z "$sig" ]; then
+            echo "::error::RPM unsigned: $rpm_file (SIGPGP=$sig)"
+            bad=$((bad + 1))
+            continue
+          fi
+          # 2. The signature must verify against the imported key.
+          if ! rpm -K "$rpm_file"; then
+            echo "::error::RPM signature does not verify: $rpm_file"
+            bad=$((bad + 1))
+            continue
+          fi
+          echo "✓ signed: $rpm_file ($sig)"
+        done < <(find rpms -name "*.rpm" -type f)
+
+        if [ "$bad" -gt 0 ]; then
+          echo "::error::$bad RPM(s) failed signature verification"
+          exit 1
+        fi
+
     - name: Sync existing repo from S3
       run: |
-        # Create repo dir first, then sync (don't use || to avoid masking errors)
+        set -euo pipefail
         mkdir -p ./repo
-        # Sync existing repo; if bucket path doesn't exist yet, this is a no-op
-        aws s3 sync "s3://${{ secrets.APT_S3_BUCKET }}/rpm" ./repo || echo "No existing repo found, starting fresh"
+        # Distinguish "bucket path is empty (first-ever publish)" from "sync
+        # failed for any other reason". A blanket `|| echo` masks transient
+        # errors and lets the later `--delete` upload wipe prior releases.
+        if aws s3 ls "s3://${{ secrets.APT_S3_BUCKET }}/rpm/" >/dev/null 2>&1; then
+          # Path exists with at least one object — a sync failure now is real.
+          aws s3 sync "s3://${{ secrets.APT_S3_BUCKET }}/rpm" ./repo
+        else
+          echo "No existing rpm/ prefix in s3://${{ secrets.APT_S3_BUCKET }}, starting fresh"
+        fi
       env:
         AWS_ACCESS_KEY_ID: ${{ secrets.APT_S3_ACCESS_KEY_ID }}
         AWS_SECRET_ACCESS_KEY: ${{ secrets.APT_S3_SECRET_ACCESS_KEY }}
