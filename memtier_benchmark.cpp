@@ -263,6 +263,8 @@ static const char *get_protocol_name(enum PROTOCOL_TYPE type)
         return "memcache_text";
     else if (type == PROTOCOL_MEMCACHE_BINARY)
         return "memcache_binary";
+    else if (type == PROTOCOL_MEMCACHE_META)
+        return "memcache_meta";
     else
         return "none";
 }
@@ -2771,7 +2773,7 @@ int main(int argc, char *argv[])
     }
 
     if (cfg.authenticate) {
-        if (cfg.protocol == PROTOCOL_MEMCACHE_TEXT) {
+        if (cfg.protocol == PROTOCOL_MEMCACHE_TEXT || cfg.protocol == PROTOCOL_MEMCACHE_META) {
             fprintf(stderr, "error: authenticate can only be used with redis or memcache_binary.\n");
             usage();
         }
