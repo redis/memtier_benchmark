@@ -51,7 +51,7 @@ Pre-compiled binaries are available for RHEL 8/9/10 compatible distributions
 from the packages.redis.io YUM repository. To configure this repository, use the following steps:
 
 ```
-curl -fsSL https://packages.redis.io/gpg | sudo gpg --dearmor -o /etc/pki/rpm-gpg/redis-archive-keyring.gpg
+sudo curl -fsSL https://packages.redis.io/gpg -o /etc/pki/rpm-gpg/redis-archive-keyring.gpg
 
 sudo tee /etc/yum.repos.d/redis.repo <<'EOF'
 [redis]
@@ -75,7 +75,7 @@ Amazon Linux 2023 uses a separate repository path because `$releasever` on AL202
 not an `el<n>` value:
 
 ```
-curl -fsSL https://packages.redis.io/gpg | sudo gpg --dearmor -o /etc/pki/rpm-gpg/redis-archive-keyring.gpg
+sudo curl -fsSL https://packages.redis.io/gpg -o /etc/pki/rpm-gpg/redis-archive-keyring.gpg
 
 sudo tee /etc/yum.repos.d/redis.repo <<'EOF'
 [redis]
