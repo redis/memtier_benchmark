@@ -59,9 +59,12 @@ jobs:
           VERSION="$SOURCE_VERSION"
         fi
 
-        # Validate tag matches source version on releases
+        # Hard-fail on releases if the tag and configure.ac drift apart —
+        # publishing RPMs labeled with a tag that doesn't match the source
+        # version is worse than failing the build.
         if [ -n "${{ github.event.release.tag_name }}" ] && [ "$VERSION" != "$SOURCE_VERSION" ]; then
-          echo "::warning::Release tag ($VERSION) does not match configure.ac version ($SOURCE_VERSION)"
+          echo "::error::Release tag ($VERSION) does not match configure.ac version ($SOURCE_VERSION). Update configure.ac or retag the release."
+          exit 1
         fi
 
         echo "version=$VERSION" >> $GITHUB_OUTPUT
@@ -367,9 +370,14 @@ jobs:
       # Fail fast if signing silently produced unsigned/invalid RPMs.
       run: |
         set -euo pipefail
-        # Import the public half of the signing key into rpm's keyring so
-        # `rpm -K` can verify, not just check the digest.
-        gpg --export --armor oss@redis.com > /tmp/redis-pub.asc
+        # Import the public half of whatever key is in the keyring (avoids
+        # coupling to a specific UID). Empty output here means the earlier
+        # APT_SIGNING_KEY import didn't actually populate the keyring.
+        gpg --export --armor > /tmp/redis-pub.asc
+        if [ ! -s /tmp/redis-pub.asc ]; then
+          echo "::error::Public key export is empty — APT_SIGNING_KEY import likely failed"
+          exit 1
+        fi
         sudo rpm --import /tmp/redis-pub.asc
 
         bad=0
