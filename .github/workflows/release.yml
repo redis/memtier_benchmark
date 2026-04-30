@@ -33,7 +33,7 @@ jobs:
       matrix:
         dist: ${{ fromJSON(vars.BUILD_DISTS) }}
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
       with:
         path: repo
     - name: Copy source code to build dir
@@ -85,7 +85,7 @@ jobs:
       run: |
           cd sources && dpkg-buildpackage -S
     - name: Upload source package artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: source-${{ matrix.dist }}
         path: |
@@ -104,7 +104,7 @@ jobs:
         exclude: ${{ fromJSON(vars.BUILD_EXCLUDE) }}
     needs: build-source-package
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     - name: Determine build architecture
       run: |
           if [ ${{ matrix.arch }} = "i386" ]; then
@@ -128,7 +128,7 @@ jobs:
     - name: Prepare sbuild environment
       run: sudo ./debian/setup_sbuild.sh ${{ matrix.dist }} ${{ env.BUILD_ARCH }}
     - name: Get source package
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v5
       with:
         name: source-${{ matrix.dist }}
     - name: Build binary package
@@ -139,7 +139,7 @@ jobs:
             --build ${{ env.BUILD_ARCH }} \
             --dist ${{ matrix.dist }} *.dsc
     - name: Upload binary package artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: binary-${{ matrix.dist }}-${{ matrix.arch }}
         path: |
@@ -171,7 +171,7 @@ jobs:
         fi
         echo "BUILD_ARCH=$BUILD_ARCH" >> $GITHUB_ENV
     - name: Get binary packages
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v5
       with:
         name: binary-${{ env.BUILD_ARCH }}-${{ env.ARCH }}
         path: binary-${{ env.BUILD_ARCH }}-${{ env.ARCH }}
@@ -194,7 +194,7 @@ jobs:
       env:
         APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
     - name: Get binary packages
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v5
     - name: Setup ruby
       uses: ruby/setup-ruby@v1
       with:
