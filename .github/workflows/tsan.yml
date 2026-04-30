@@ -20,7 +20,7 @@ jobs:
     name: Build with TSAN
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
 
     - name: Install build dependencies
       run: |
@@ -46,7 +46,7 @@ jobs:
         echo "✓ ThreadSanitizer is linked"
 
     - name: Upload build artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: memtier-tsan-build
         path: |
@@ -73,10 +73,10 @@ jobs:
     name: TSAN ${{ matrix.test-config.name }}
     continue-on-error: true  # Don't fail build on known races
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
 
     - name: Download build artifact
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v5
       with:
         name: memtier-tsan-build
 
@@ -89,7 +89,7 @@ jobs:
         sudo apt-get install -y pkg-config libevent-dev libssl-dev
 
     - name: Setup Python
-      uses: actions/setup-python@v2
+      uses: actions/setup-python@v6
       with:
         python-version: '3.10'
         architecture: x64
