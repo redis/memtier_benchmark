@@ -95,8 +95,8 @@ $PKG install -y "$RPM_FILE"
 
 memtier_benchmark --version
 # memtier_benchmark exits non-zero on --help; do not gate on its rc.
-test -f /usr/share/man/man1/memtier_benchmark.1.gz \
-  || test -f /usr/share/man/man1/memtier_benchmark.1
+# Query the RPM for the man page: el10 ships .zst, others ship .gz.
+rpm -ql memtier-benchmark | grep -qE "/man1/memtier_benchmark\.1(\..+)?$"
 bash -n /usr/share/bash-completion/completions/memtier_benchmark
 
 # Repo-install verification (mirrors smoke-test local-YUM-repo step).

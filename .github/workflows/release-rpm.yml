@@ -280,9 +280,10 @@ jobs:
         # --version is the binary-loads check. Don't run --help here:
         # memtier_benchmark exits non-zero on --help, which aborts `sh -e`.
         memtier_benchmark --version
-        # Man page is referenced from the spec %files; assert it actually shipped.
-        test -f /usr/share/man/man1/memtier_benchmark.1.gz \
-          || test -f /usr/share/man/man1/memtier_benchmark.1
+        # Man page is referenced from the spec %files. Query the RPM
+        # rather than testing fixed paths — el10 uses zstd (.zst) instead
+        # of gzip (.gz), and other distros may diverge again later.
+        rpm -ql memtier-benchmark | grep -qE "/man1/memtier_benchmark\.1(\..+)?$"
         # Bash completion file must be syntactically loadable.
         bash -n /usr/share/bash-completion/completions/memtier_benchmark
         echo "✓ direct install (${{ matrix.distro }}-${{ matrix.arch }}) verified"
