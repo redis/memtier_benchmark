@@ -46,40 +46,60 @@ jobs:
 
     - name: Get version
       id: version
+      # Pass user-controlled inputs through env: rather than ${{ }} expansion
+      # so they cannot inject shell syntax. configure.ac is editable by
+      # forked-PR authors; AC_INIT() containing backticks or $() would
+      # otherwise be evaluated when the version flows back through
+      # `${{ steps.version.outputs.version }}` in later steps.
+      env:
+        INPUT_TAG: ${{ github.event.inputs.tag_name }}
+        RELEASE_TAG: ${{ github.event.release.tag_name }}
       run: |
+        set -eu
         # Extract version from configure.ac (source of truth)
         SOURCE_VERSION=$(awk -F'[(),]' '/AC_INIT/ {gsub(/ /, "", $3); print $3}' configure.ac)
 
-        # Use tag if available, otherwise use source version
-        if [ -n "${{ github.event.inputs.tag_name }}" ]; then
-          VERSION="${{ github.event.inputs.tag_name }}"
-        elif [ -n "${{ github.event.release.tag_name }}" ]; then
-          VERSION="${{ github.event.release.tag_name }}"
+        if [ -n "$INPUT_TAG" ]; then
+          VERSION="$INPUT_TAG"
+        elif [ -n "$RELEASE_TAG" ]; then
+          VERSION="$RELEASE_TAG"
         else
           VERSION="$SOURCE_VERSION"
         fi
 
+        # Defense in depth: reject anything that is not a simple semver-ish
+        # token. Blocks backticks, $(...), /, &, spaces, etc. before the
+        # value is reused in sed replacements or file paths.
+        case "$VERSION" in
+          ""|*[!A-Za-z0-9._-]*)
+            echo "::error::Invalid version string: $VERSION"
+            exit 1
+            ;;
+        esac
+
         # Hard-fail on releases if the tag and configure.ac drift apart —
         # publishing RPMs labeled with a tag that doesn't match the source
         # version is worse than failing the build.
-        if [ -n "${{ github.event.release.tag_name }}" ] && [ "$VERSION" != "$SOURCE_VERSION" ]; then
+        if [ -n "$RELEASE_TAG" ] && [ "$VERSION" != "$SOURCE_VERSION" ]; then
           echo "::error::Release tag ($VERSION) does not match configure.ac version ($SOURCE_VERSION). Update configure.ac or retag the release."
           exit 1
         fi
 
-        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
         echo "Building version: $VERSION (source: $SOURCE_VERSION)"
 
     - name: Create source tarball
+      env:
+        VERSION: ${{ steps.version.outputs.version }}
       run: |
-        VERSION=${{ steps.version.outputs.version }}
-        mkdir -p memtier-benchmark-$VERSION
-        rsync -a --exclude='.git' --exclude='memtier-benchmark-*' . memtier-benchmark-$VERSION/
-        tar czf ~/rpmbuild/SOURCES/memtier-benchmark-$VERSION.tar.gz memtier-benchmark-$VERSION
+        mkdir -p "memtier-benchmark-$VERSION"
+        rsync -a --exclude='.git' --exclude='memtier-benchmark-*' . "memtier-benchmark-$VERSION/"
+        tar czf "$HOME/rpmbuild/SOURCES/memtier-benchmark-$VERSION.tar.gz" "memtier-benchmark-$VERSION"
 
     - name: Update spec file version
+      env:
+        VERSION: ${{ steps.version.outputs.version }}
       run: |
-        VERSION=${{ steps.version.outputs.version }}
         sed -i "s/^Version:.*/Version:        $VERSION/" rpm/memtier-benchmark.spec
         cp rpm/memtier-benchmark.spec ~/rpmbuild/SPECS/
 
