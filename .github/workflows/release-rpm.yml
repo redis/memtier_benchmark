@@ -195,8 +195,9 @@ jobs:
 
   smoke-test-packages:
     needs: build-rpm
-    # Only smoke test on master/main push or release (not on PRs)
-    if: github.event_name == 'push' || github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    # Run on PRs too: the smoke test exercises install + repo-resolved install,
+    # which is exactly the user-facing path we want to protect against
+    # regressions before merging.
     strategy:
       fail-fast: false
       matrix:
