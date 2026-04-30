@@ -94,7 +94,7 @@ RPM_FILE=$(find ~/rpmbuild/RPMS -name "*.rpm" -type f ! -name "*debug*" | head -
 $PKG install -y "$RPM_FILE"
 
 memtier_benchmark --version
-memtier_benchmark --help > /dev/null
+# memtier_benchmark exits non-zero on --help; do not gate on its rc.
 test -f /usr/share/man/man1/memtier_benchmark.1.gz \
   || test -f /usr/share/man/man1/memtier_benchmark.1
 bash -n /usr/share/bash-completion/completions/memtier_benchmark
