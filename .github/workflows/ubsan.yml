@@ -16,7 +16,7 @@ jobs:
     name: Build with UBSan
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
 
     - name: Install build dependencies
       run: |
@@ -37,7 +37,7 @@ jobs:
         make -j
 
     - name: Upload build artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: memtier-ubsan-build
         path: |
@@ -71,10 +71,10 @@ jobs:
     runs-on: ubuntu-latest
     name: UBSan ${{ matrix.test-config.name }}
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
 
     - name: Download build artifact
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v5
       with:
         name: memtier-ubsan-build
 
@@ -87,7 +87,7 @@ jobs:
         sudo apt-get install -y pkg-config libevent-dev libssl-dev
 
     - name: Setup Python
-      uses: actions/setup-python@v2
+      uses: actions/setup-python@v6
       with:
         python-version: '3.10'
         architecture: x64
