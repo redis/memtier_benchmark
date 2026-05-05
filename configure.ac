@@ -16,7 +16,7 @@ dnl You should have received a copy of the GNU General Public License
 dnl along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 AC_PREREQ(2.59)
-AC_INIT(memtier_benchmark,2.3.0,oss@redis.com)
+AC_INIT(memtier_benchmark,2.3.1,oss@redis.com)
 AC_CONFIG_SRCDIR([memtier_benchmark.cpp])
 AC_CONFIG_HEADER([config.h])
 AM_INIT_AUTOMAKE
