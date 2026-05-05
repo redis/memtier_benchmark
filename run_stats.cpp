@@ -895,11 +895,12 @@ void run_stats::summarize(totals &result) const
 
     // total/sec
     result.m_ops_sec = (double) result.m_ops / test_duration_usec * 1000000;
+    const unsigned long long int total_latency_sum =
+        totals.m_set_cmd.m_total_latency + totals.m_get_cmd.m_total_latency + totals.m_wait_cmd.m_total_latency +
+        totals.m_ar_commands.total_latency();
+    result.m_total_latency = total_latency_sum;
     if (result.m_ops > 0) {
-        result.m_latency = (double) ((totals.m_set_cmd.m_total_latency + totals.m_get_cmd.m_total_latency +
-                                      totals.m_wait_cmd.m_total_latency + totals.m_ar_commands.total_latency()) /
-                                     result.m_ops) /
-                           1000;
+        result.m_latency = (double) total_latency_sum / (double) result.m_ops / 1000.0;
     } else {
         result.m_latency = 0;
     }
