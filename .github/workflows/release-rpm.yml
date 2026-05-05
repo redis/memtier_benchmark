@@ -386,10 +386,14 @@ jobs:
         path: rpms
         merge-multiple: false
 
-    - name: Install createrepo and AWS CLI
+    - name: Install createrepo and verify AWS CLI
       run: |
         sudo apt-get update
-        sudo apt-get install -y createrepo-c awscli rpm
+        # awscli is no longer in apt on Ubuntu 24.04 (noble); the GitHub-hosted
+        # ubuntu-latest runner ships AWS CLI v2 pre-installed at
+        # /usr/local/bin/aws, so we only need to install the rpm tooling here.
+        sudo apt-get install -y createrepo-c rpm
+        aws --version
 
     - name: Sign RPMs
       run: |
