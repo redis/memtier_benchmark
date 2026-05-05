@@ -376,7 +376,7 @@ unsigned long int run_stats::get_total_ops(void)
     return m_totals.m_ops;
 }
 
-unsigned long int run_stats::get_total_latency(void)
+double run_stats::get_total_latency(void)
 {
     return m_totals.m_latency;
 }
