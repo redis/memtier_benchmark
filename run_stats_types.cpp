@@ -345,7 +345,7 @@ void totals::add(const totals &other)
     m_bytes_rx += other.m_bytes_rx;
     m_bytes_tx += other.m_bytes_tx;
     m_latency += other.m_latency;
-    m_total_latency += other.m_latency;
+    m_total_latency += other.m_total_latency;
     m_ops += other.m_ops;
     m_connection_errors += other.m_connection_errors;
     m_connection_errors_sec += other.m_connection_errors_sec;
