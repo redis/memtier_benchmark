@@ -2,9 +2,9 @@ name: Code Style
 
 on:
   push:
-    branches: [master, main]
+    branches: [master, main, 2.3]
   pull_request:
-    branches: [master, main]
+    branches: [master, main, 2.3]
 
 jobs:
   cpp-format-check:
