@@ -1045,9 +1045,9 @@ unsigned long int client_group::get_total_ops(void)
     return total_ops;
 }
 
-unsigned long int client_group::get_total_latency(void)
+double client_group::get_total_latency(void)
 {
-    unsigned long int total_latency = 0;
+    double total_latency = 0;
     unsigned int count = active_client_count();
     for (unsigned int i = 0; i < count; i++) {
         total_latency += m_clients[i]->get_stats()->get_total_latency();

@@ -1985,7 +1985,7 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         unsigned long int total_bytes = 0;
         unsigned long int duration = 0;
         unsigned int thread_counter = 0;
-        unsigned long int total_latency = 0;
+        double total_latency = 0;
         unsigned long int total_connection_errors = 0;
 
         for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
