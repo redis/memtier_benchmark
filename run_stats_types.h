@@ -202,7 +202,7 @@ public:
     double m_misses_sec;
     double m_moved_sec;
     double m_ask_sec;
-    unsigned long long int m_latency;
+    double m_latency;
     unsigned long long int m_total_latency;
     // number of bytes received
     unsigned long int m_bytes_rx;
