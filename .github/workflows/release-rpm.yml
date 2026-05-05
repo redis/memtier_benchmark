@@ -5,6 +5,7 @@ on:
     branches:
       - master
       - main
+      - '2.3'
     paths-ignore:
       - '**.md'
       - 'debian/**'
@@ -12,6 +13,7 @@ on:
     branches:
       - master
       - main
+      - '2.3'
     paths-ignore:
       - '**.md'
       - 'debian/**'
