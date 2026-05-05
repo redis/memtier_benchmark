@@ -257,7 +257,7 @@ public:
     unsigned long int get_duration_usec(void);
     unsigned long int get_total_bytes(void);
     unsigned long int get_total_ops(void);
-    unsigned long int get_total_latency(void);
+    double get_total_latency(void);
     unsigned long int get_total_connection_errors(void);
 
     // Returns true if set_start_time() was called, indicating the client
