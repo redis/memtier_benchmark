@@ -436,21 +436,32 @@ jobs:
 
         bad=0
         while read -r rpm_file; do
-          # Two checks because `rpm -K` exits 0 on unsigned packages (digest OK).
-          # 1. Header field must contain a PGP signature, not "(none)".
-          sig=$(rpm -qp --queryformat '%{SIGPGP:pgpsig}\n' "$rpm_file")
-          if [ "$sig" = "(none)" ] || [ -z "$sig" ]; then
-            echo "::error::RPM unsigned: $rpm_file (SIGPGP=$sig)"
+          # `rpm --addsign` on rpm >= 4.13 produces a V4 header signature,
+          # stored in `%{RSAHEADER}` / `%{DSAHEADER}`. The legacy `%{SIGPGP}`
+          # tag is `(none)` on V4-signed packages, so querying it falsely
+          # reports modern RPMs as unsigned. Use `rpm -Kv` instead — it
+          # prints a per-component verification line (`Header V4 RSA/SHA512
+          # Signature, key ID xxxx: OK`) and exits 0 only when every
+          # component checks out against the imported key, covering both
+          # V3 (legacy SIGPGP) and V4 (RSAHEADER/DSAHEADER) signatures.
+          # `|| true` so a non-zero rpm exit (unsigned / NOKEY / BAD) does
+          # not abort the script under `set -e` before our grep-based
+          # diagnostics can run. We classify the result via the captured
+          # output below, not via the exit code.
+          verify_output=$(rpm -Kv "$rpm_file" 2>&1 || true)
+          if ! echo "$verify_output" | grep -qE 'Header V[34] (RSA|DSA)/.*: OK'; then
+            echo "::error::RPM unsigned or signature does not verify: $rpm_file"
+            echo "$verify_output"
             bad=$((bad + 1))
             continue
           fi
-          # 2. The signature must verify against the imported key.
-          if ! rpm -K "$rpm_file"; then
-            echo "::error::RPM signature does not verify: $rpm_file"
+          if echo "$verify_output" | grep -qE 'NOKEY|NOTTRUSTED|BAD'; then
+            echo "::error::RPM signature problem: $rpm_file"
+            echo "$verify_output"
             bad=$((bad + 1))
             continue
           fi
-          echo "✓ signed: $rpm_file ($sig)"
+          echo "✓ signed: $rpm_file"
         done < <(find rpms -name "*.rpm" -type f)
 
         if [ "$bad" -gt 0 ]; then
