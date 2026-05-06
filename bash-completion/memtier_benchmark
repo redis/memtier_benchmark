@@ -77,7 +77,7 @@ _memtier_completions()
     "-P")
     ;&
     "--protocol")
-      all_options="redis resp2 resp3 memcache_text memcache_binary"
+      all_options="redis resp2 resp3 memcache_text memcache_binary memcache_meta"
     ;;
     "--data-size-pattern=")
       cur=${cur#"--data-size-pattern="}
