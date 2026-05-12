@@ -164,6 +164,10 @@ object_generator::object_generator(size_t n_key_iterators /*= OBJECT_GENERATOR_K
     m_next_key.resize(n_key_iterators, 0);
 
     m_data_size.size_list = NULL;
+
+    // Ensure m_key_buffer is allocated even before set_key_prefix() is called,
+    // since cluster_client::get_key_for_conn invokes generate_key() unconditionally.
+    set_key_prefix(NULL);
 }
 
 object_generator::object_generator(const object_generator &copy) :
@@ -196,9 +200,8 @@ object_generator::object_generator(const object_generator &copy) :
         m_data_size.size_list = new config_weight_list(*m_data_size.size_list);
     }
     alloc_value_buffer();
-    if (m_key_prefix != NULL) {
-        set_key_prefix(m_key_prefix);
-    }
+    // Allocate m_key_buffer unconditionally; NULL prefix is treated as empty.
+    set_key_prefix(m_key_prefix);
 
     m_next_key.resize(copy.m_next_key.size(), 0);
 }
@@ -440,7 +443,8 @@ unsigned long long object_generator::get_key_index(int iter)
 
 void object_generator::generate_key(unsigned long long key_index)
 {
-    m_key_len = snprintf(m_key_buffer, m_key_buffer_size, "%s%llu", m_key_prefix, key_index);
+    const char *prefix = (m_key_prefix != NULL) ? m_key_prefix : "";
+    m_key_len = snprintf(m_key_buffer, m_key_buffer_size, "%s%llu", prefix, key_index);
     m_key = m_key_buffer;
 }
 
