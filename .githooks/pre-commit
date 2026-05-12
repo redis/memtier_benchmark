@@ -1,0 +1,38 @@
+#!/bin/sh
+# memtier_benchmark pre-commit hook.
+#
+# Delegates to `make format-check` so the rule lives in one place
+# (Makefile.am) and matches what CI runs. Runs only when the staged
+# changeset touches C/C++ files, to avoid overhead on doc-only commits.
+#
+# Enable in a fresh clone:
+#     make install-hooks
+#
+# Bypass (don't make a habit of it):
+#     git commit --no-verify
+
+set -e
+
+# Look at staged additions/copies/modifications/renames.
+staged_cxx=$(git diff --cached --name-only --diff-filter=ACMR \
+             | grep -E '\.(cpp|cc|cxx|h|hpp|hxx)$' \
+             | grep -v '^deps/' || true)
+
+if [ -z "$staged_cxx" ]; then
+    exit 0
+fi
+
+echo "[pre-commit] running 'make format-check' on staged C/C++ changes..."
+
+if ! make format-check >/dev/null 2>&1; then
+    echo
+    echo "✗ Code style check failed."
+    echo "  Fix with:"
+    echo "      make format && git add -u && git commit"
+    echo "  Or rerun manually to see which files differ:"
+    echo "      make format-check"
+    echo "  Bypass (not recommended): git commit --no-verify"
+    exit 1
+fi
+
+echo "[pre-commit] format-check passed."

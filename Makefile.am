@@ -94,3 +94,10 @@ format-check:
 		exit 1; \
 	fi; \
 	echo "All C++ files are properly formatted!"
+
+# Git hooks
+.PHONY: install-hooks
+install-hooks:
+	@git config core.hooksPath .githooks
+	@echo "Git hooks enabled (core.hooksPath = .githooks)."
+	@echo "Pre-commit hook will run 'make format-check' on staged C/C++ changes."
