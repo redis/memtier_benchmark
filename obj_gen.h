@@ -110,7 +110,8 @@ protected:
     std::vector<unsigned long long> m_next_key;
 
     unsigned long long m_key_index;
-    char m_key_buffer[250];
+    char *m_key_buffer;
+    size_t m_key_buffer_size;
     const char *m_key;
     int m_key_len;
     char *m_value_buffer;
