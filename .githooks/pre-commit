@@ -1,9 +1,10 @@
 #!/bin/sh
 # memtier_benchmark pre-commit hook.
 #
-# Delegates to `make format-check` so the rule lives in one place
-# (Makefile.am) and matches what CI runs. Runs only when the staged
-# changeset touches C/C++ files, to avoid overhead on doc-only commits.
+# Delegates to `make format-check-staged`, which inspects the staged blobs
+# in the git index (not the working tree) so the rule lives in Makefile.am,
+# matches what CI runs, and is immune to the working-tree-vs-index drift
+# (e.g. `make format` without `git add -u`).
 #
 # Enable in a fresh clone:
 #     make install-hooks
@@ -13,26 +14,12 @@
 
 set -e
 
-# Look at staged additions/copies/modifications/renames.
-staged_cxx=$(git diff --cached --name-only --diff-filter=ACMR \
-             | grep -E '\.(cpp|cc|cxx|h|hpp|hxx)$' \
-             | grep -v '^deps/' || true)
-
-if [ -z "$staged_cxx" ]; then
-    exit 0
-fi
-
-echo "[pre-commit] running 'make format-check' on staged C/C++ changes..."
-
-if ! make format-check >/dev/null 2>&1; then
+# format-check-staged is a no-op when no C/C++ file is staged, and emits its
+# own remediation guidance on failure; we only need to translate the exit
+# code into a friendly hook-level message.
+if ! make format-check-staged; then
     echo
-    echo "✗ Code style check failed."
-    echo "  Fix with:"
-    echo "      make format && git add -u && git commit"
-    echo "  Or rerun manually to see which files differ:"
-    echo "      make format-check"
+    echo "✗ Pre-commit format check failed (see remediation above)."
     echo "  Bypass (not recommended): git commit --no-verify"
     exit 1
 fi
-
-echo "[pre-commit] format-check passed."

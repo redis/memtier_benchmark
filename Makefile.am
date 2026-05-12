@@ -95,9 +95,39 @@ format-check:
 	fi; \
 	echo "All C++ files are properly formatted!"
 
+# Like format-check, but inspects the staged blobs in the git index rather than
+# the working tree. Used by the pre-commit hook so that:
+#  - mis-formatted *staged* content cannot slip past when `make format` was run
+#    against the working tree but the result was never re-staged, and
+#  - unrelated mis-formatted files lying in the working tree do not block an
+#    otherwise-clean commit.
+.PHONY: format-check-staged
+format-check-staged:
+	@STAGED=$$(git diff --cached --name-only --diff-filter=ACMR \
+	            | grep -E '\.(cpp|cc|cxx|h|hpp|hxx)$$' \
+	            | grep -v '^deps/' || true); \
+	if [ -z "$$STAGED" ]; then \
+		exit 0; \
+	fi; \
+	echo "Checking staged C/C++ source file formatting..."; \
+	FAILED=0; \
+	for file in $$STAGED; do \
+		if ! git show ":$$file" | clang-format --assume-filename="$$file" --dry-run --Werror 2>/dev/null; then \
+			echo "Needs formatting (staged): $$file"; \
+			FAILED=1; \
+		fi; \
+	done; \
+	if [ $$FAILED -eq 1 ]; then \
+		echo ""; \
+		echo "Some staged files need formatting. Stage the formatted version:"; \
+		echo "    make format && git add -u"; \
+		exit 1; \
+	fi; \
+	echo "All staged C/C++ files are properly formatted!"
+
 # Git hooks
 .PHONY: install-hooks
 install-hooks:
 	@git config core.hooksPath .githooks
 	@echo "Git hooks enabled (core.hooksPath = .githooks)."
-	@echo "Pre-commit hook will run 'make format-check' on staged C/C++ changes."
+	@echo "Pre-commit hook will run 'make format-check-staged' on staged C/C++ changes."

@@ -95,8 +95,11 @@ CI will automatically check that all C++ files are properly formatted on every p
 #### Pre-commit hook
 
 The repository ships a `pre-commit` hook under `.githooks/` that runs `make
-format-check` on staged C/C++ files before each commit, so style violations
-are caught locally instead of in CI. Enable it once per clone:
+format-check-staged` before each commit. That target inspects the *staged
+blobs* in the git index (not the working tree), so style violations are
+caught locally instead of in CI and the check is immune to working-tree
+vs. index drift (e.g. running `make format` without `git add -u`). Enable
+it once per clone:
 
 ```
 $ make install-hooks
