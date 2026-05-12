@@ -303,7 +303,7 @@ void object_generator::set_key_prefix(const char *key_prefix)
     size_t prefix_len = (key_prefix != NULL) ? strlen(key_prefix) : 0;
     size_t required = prefix_len + 21;
     if (required > m_key_buffer_size) {
-        char *new_buf = (char *)realloc(m_key_buffer, required);
+        char *new_buf = (char *) realloc(m_key_buffer, required);
         if (new_buf == NULL) {
             fprintf(stderr, "error: failed to allocate %zu bytes for key buffer\n", required);
             exit(1);
