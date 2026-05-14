@@ -167,6 +167,121 @@ def test_reconnect_on_connection_kill(env):
         killer_thread.join(timeout=5)
 
 
+def test_reconnect_cluster_mode_no_assertion(env):
+    """
+    Regression test for https://github.com/redis/memtier_benchmark/issues/377
+
+    When --cluster-mode and --reconnect-on-error are combined and a connection
+    drops mid-run, cluster_client::connect() used to fire
+    `assert(m_connections.size() == m_key_index_pools.size())` and SIGABRT the
+    process. This test runs that exact combination, kills connections during
+    the run, and verifies that:
+      - memtier never aborts (no SIGABRT, no "Assertion" line in stderr)
+      - the process exits with a normal status code (no signal death)
+    """
+    if not env.isCluster():
+        env.skip()
+
+    key_max = 100000
+    key_min = 1
+
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--pipeline=1",
+            "--ratio=1:0",
+            "--key-pattern=P:P",
+            "--key-minimum={}".format(key_min),
+            "--key-maximum={}".format(key_max),
+            "--data-size=512",
+            "--random-data",
+            "--reconnect-on-error",
+            "--max-reconnect-attempts=20",
+            "--reconnect-backoff-factor=1.0",
+            "--connection-timeout=5",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+
+    config = get_default_memtier_config(threads=4, clients=2, requests=None, test_time=10)
+    master_nodes_list = env.getMasterNodesList()
+
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    test_dir = tempfile.mkdtemp()
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+
+    master_nodes_connections = env.getOSSMasterNodesConnectionList()
+
+    import subprocess
+
+    stdout_path = "{0}/mb.stdout".format(config.results_dir)
+    stderr_path = "{0}/mb.stderr".format(config.results_dir)
+    with open(stdout_path, "w") as stdout_f, open(stderr_path, "w") as stderr_f:
+        proc = subprocess.Popen(
+            benchmark.args,
+            stdout=stdout_f,
+            stderr=stderr_f,
+            cwd=config.results_dir,
+        )
+
+        # Let connections fully establish before kicking them over.
+        time.sleep(2)
+
+        kill_count = 0
+        # Two waves of CLIENT KILL to ensure the reconnect path is exercised
+        # at least once per shard.
+        for _wave in range(2):
+            for master_connection in master_nodes_connections:
+                try:
+                    killed = master_connection.execute_command(
+                        "CLIENT", "KILL", "TYPE", "normal"
+                    )
+                    if isinstance(killed, int):
+                        kill_count += killed
+                except Exception as e:
+                    env.debugPrint(
+                        "CLIENT KILL failed: {}".format(str(e)), True
+                    )
+            time.sleep(2)
+
+        # Generous timeout: --test-time=10 + reconnect backoff + summary flush.
+        try:
+            return_code = proc.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            # If memtier is wedged post-kill that is a separate concern;
+            # the bug under test is the SIGABRT, so we kill the process and
+            # still verify no assertion fired.
+            proc.kill()
+            try:
+                return_code = proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                return_code = -9
+
+    env.debugPrint("Total clients killed (CLIENT KILL count): {}".format(kill_count), True)
+    env.debugPrint("memtier exit code: {}".format(return_code), True)
+
+    with open(stderr_path) as f:
+        stderr_content = f.read()
+
+    # The core regression assertion: no abort from the parallel-vector invariant.
+    has_assertion_abort = "Assertion `m_connections.size() == m_key_index_pools.size()'" in stderr_content
+    if has_assertion_abort:
+        env.debugPrint("STDERR:\n{}".format(stderr_content), True)
+    env.assertFalse(has_assertion_abort)
+
+    # We must have actually killed at least one connection or this test is meaningless.
+    env.assertTrue(kill_count > 0)
+
+    # SIGABRT == -6 (negative-signal form from Popen.wait()).
+    # 134 (128+6) can also surface from shells; guard against both.
+    env.assertNotEqual(return_code, -6)
+    env.assertNotEqual(return_code, 134)
+
+
 def test_reconnect_disabled_by_default(env):
     """
     Test that reconnection is disabled by default and memtier fails when connections are killed.

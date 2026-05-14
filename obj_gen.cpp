@@ -155,6 +155,8 @@ object_generator::object_generator(size_t n_key_iterators /*= OBJECT_GENERATOR_K
         m_key_zipf_Hmin(0),
         m_key_zipf_Hmax(0),
         m_key_zipf_s(0),
+        m_key_buffer(NULL),
+        m_key_buffer_size(0),
         m_value_buffer(NULL),
         m_value_buffer_size(0),
         m_value_buffer_mutation_pos(0)
@@ -162,6 +164,10 @@ object_generator::object_generator(size_t n_key_iterators /*= OBJECT_GENERATOR_K
     m_next_key.resize(n_key_iterators, 0);
 
     m_data_size.size_list = NULL;
+
+    // Ensure m_key_buffer is allocated even before set_key_prefix() is called,
+    // since cluster_client::get_key_for_conn invokes generate_key() unconditionally.
+    set_key_prefix(NULL);
 }
 
 object_generator::object_generator(const object_generator &copy) :
@@ -184,6 +190,8 @@ object_generator::object_generator(const object_generator &copy) :
         m_key_zipf_Hmin(copy.m_key_zipf_Hmin),
         m_key_zipf_Hmax(copy.m_key_zipf_Hmax),
         m_key_zipf_s(copy.m_key_zipf_s),
+        m_key_buffer(NULL),
+        m_key_buffer_size(0),
         m_value_buffer(NULL),
         m_value_buffer_size(0),
         m_value_buffer_mutation_pos(0)
@@ -192,6 +200,8 @@ object_generator::object_generator(const object_generator &copy) :
         m_data_size.size_list = new config_weight_list(*m_data_size.size_list);
     }
     alloc_value_buffer();
+    // Allocate m_key_buffer unconditionally; NULL prefix is treated as empty.
+    set_key_prefix(m_key_prefix);
 
     m_next_key.resize(copy.m_next_key.size(), 0);
 }
@@ -199,6 +209,7 @@ object_generator::object_generator(const object_generator &copy) :
 object_generator::~object_generator()
 {
     if (m_value_buffer != NULL) free(m_value_buffer);
+    if (m_key_buffer != NULL) free(m_key_buffer);
     if (m_data_size_type == data_size_weighted && m_data_size.size_list != NULL) {
         delete m_data_size.size_list;
     }
@@ -290,6 +301,19 @@ void object_generator::set_expiry_range(unsigned int expiry_min, unsigned int ex
 void object_generator::set_key_prefix(const char *key_prefix)
 {
     m_key_prefix = key_prefix;
+
+    // Ensure m_key_buffer can hold prefix + 20 digits (max for unsigned long long) + NUL.
+    size_t prefix_len = (key_prefix != NULL) ? strlen(key_prefix) : 0;
+    size_t required = prefix_len + 21;
+    if (required > m_key_buffer_size) {
+        char *new_buf = (char *) realloc(m_key_buffer, required);
+        if (new_buf == NULL) {
+            fprintf(stderr, "error: failed to allocate %zu bytes for key buffer\n", required);
+            exit(1);
+        }
+        m_key_buffer = new_buf;
+        m_key_buffer_size = required;
+    }
 }
 
 void object_generator::set_key_range(unsigned long long key_min, unsigned long long key_max)
@@ -419,7 +443,8 @@ unsigned long long object_generator::get_key_index(int iter)
 
 void object_generator::generate_key(unsigned long long key_index)
 {
-    m_key_len = snprintf(m_key_buffer, sizeof(m_key_buffer) - 1, "%s%llu", m_key_prefix, key_index);
+    const char *prefix = (m_key_prefix != NULL) ? m_key_prefix : "";
+    m_key_len = snprintf(m_key_buffer, m_key_buffer_size, "%s%llu", prefix, key_index);
     m_key = m_key_buffer;
 }
 
