@@ -115,9 +115,14 @@ int cluster_client::connect(void)
     // set main connection to send 'CLUSTER SLOTS' command
     sc->set_cluster_slots();
 
-    // create key index pool for main connection
-    key_index_pool *key_idx_pool = new key_index_pool;
-    m_key_index_pools.push_back(key_idx_pool);
+    // create key index pool for main connection only on the first connect.
+    // On reconnects (e.g. via --reconnect-on-error), the main connection's
+    // key_index_pool already exists and m_connections is unchanged, so
+    // pushing again would break the invariant the assertion enforces.
+    if (m_key_index_pools.empty()) {
+        key_index_pool *key_idx_pool = new key_index_pool;
+        m_key_index_pools.push_back(key_idx_pool);
+    }
     assert(m_connections.size() == m_key_index_pools.size());
 
     // continue with base class
