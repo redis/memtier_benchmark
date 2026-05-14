@@ -260,8 +260,10 @@ public:
     double get_total_latency(void);
     unsigned long int get_total_connection_errors(void);
 
-    // Cumulative hits/misses on GET ops since the run started. Walks per-second
-    // history; benign race with worker writes (used only for live progress display).
+    // Cumulative hits/misses on GET ops since the run started. Reads scalar
+    // counters in m_totals incremented per-op by the owning worker. Same
+    // benign-race pattern as get_total_ops()/get_total_bytes() — used only
+    // for live progress display.
     unsigned long int get_total_hits(void);
     unsigned long int get_total_misses(void);
 

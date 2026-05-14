@@ -207,7 +207,7 @@ void run_stats::update_get_op(struct timeval *ts, unsigned int bytes_rx, unsigne
     roll_cur_stats(ts);
     m_cur_stats.m_get_cmd.update_op(bytes_rx, bytes_tx, latency, hits, misses);
     m_cur_stats.m_total_cmd.update_op(bytes_rx, bytes_tx, latency, hits, misses);
-    m_totals.update_op(bytes_rx, bytes_tx, latency);
+    m_totals.update_op(bytes_rx, bytes_tx, latency, hits, misses);
     hdr_record_value_capped(m_get_latency_histogram, latency);
     hdr_record_value_capped(inst_m_get_latency_histogram, latency);
     hdr_record_value_capped(m_totals_latency_histogram, latency);
@@ -387,20 +387,12 @@ unsigned long int run_stats::get_total_connection_errors(void)
 
 unsigned long int run_stats::get_total_hits(void)
 {
-    unsigned long int total = m_cur_stats.m_get_cmd.m_hits;
-    for (std::list<one_second_stats>::const_iterator i = m_stats.begin(); i != m_stats.end(); ++i) {
-        total += i->m_get_cmd.m_hits;
-    }
-    return total;
+    return m_totals.m_hits;
 }
 
 unsigned long int run_stats::get_total_misses(void)
 {
-    unsigned long int total = m_cur_stats.m_get_cmd.m_misses;
-    for (std::list<one_second_stats>::const_iterator i = m_stats.begin(); i != m_stats.end(); ++i) {
-        total += i->m_get_cmd.m_misses;
-    }
-    return total;
+    return m_totals.m_misses;
 }
 
 #define AVERAGE(total, count) ((unsigned int) ((count) > 0 ? (total) / (count) : 0))

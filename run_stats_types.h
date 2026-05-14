@@ -209,12 +209,19 @@ public:
     // number of bytes sent
     unsigned long int m_bytes_tx;
     unsigned long int m_ops;
+    // Lock-free running totals for live progress display. Workers bump these
+    // from update_op() without synchronization; the main thread reads via
+    // get_total_hits()/get_total_misses(). Same benign-race pattern as m_ops.
+    unsigned long int m_hits;
+    unsigned long int m_misses;
     unsigned long int m_connection_errors;
     double m_connection_errors_sec;
     totals();
     void setup_arbitrary_commands(size_t n_arbitrary_commands);
     void add(const totals &other);
     void update_op(unsigned long int bytes_rx, unsigned long int bytes_tx, unsigned int latency);
+    void update_op(unsigned long int bytes_rx, unsigned long int bytes_tx, unsigned int latency, unsigned int hits,
+                   unsigned int misses);
     void update_connection_error();
 };
 

@@ -318,6 +318,8 @@ totals::totals() :
         m_bytes_rx(0),
         m_bytes_tx(0),
         m_ops(0),
+        m_hits(0),
+        m_misses(0),
         m_connection_errors(0),
         m_connection_errors_sec(0)
 {
@@ -347,6 +349,8 @@ void totals::add(const totals &other)
     m_latency += other.m_latency;
     m_total_latency += other.m_total_latency;
     m_ops += other.m_ops;
+    m_hits += other.m_hits;
+    m_misses += other.m_misses;
     m_connection_errors += other.m_connection_errors;
     m_connection_errors_sec += other.m_connection_errors_sec;
 
@@ -362,6 +366,14 @@ void totals::update_op(unsigned long int bytes_rx, unsigned long int bytes_tx, u
     m_latency += latency;
     m_total_latency += latency;
     hdr_record_value_capped(latency_histogram, latency);
+}
+
+void totals::update_op(unsigned long int bytes_rx, unsigned long int bytes_tx, unsigned int latency, unsigned int hits,
+                       unsigned int misses)
+{
+    update_op(bytes_rx, bytes_tx, latency);
+    m_hits += hits;
+    m_misses += misses;
 }
 
 void totals::update_connection_error()

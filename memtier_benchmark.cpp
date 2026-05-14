@@ -1757,6 +1757,30 @@ static void *cg_thread_start(void *t)
     return t;
 }
 
+// Render an unsigned integer with thousands-grouping commas, e.g.
+// 1234567 -> "1,234,567". Falls back to bare digits if the destination
+// buffer is too small. Used by --realtime-latencies to make per-second
+// throughput readable at a glance.
+static void format_with_commas(unsigned long int n, char *out, size_t sz)
+{
+    char raw[32];
+    snprintf(raw, sizeof(raw), "%lu", n);
+    size_t len = strlen(raw);
+    size_t commas = (len > 0) ? (len - 1) / 3 : 0;
+    if (len + commas + 1 > sz) {
+        snprintf(out, sz, "%lu", n);
+        return;
+    }
+    char *w = out + len + commas;
+    *w-- = '\0';
+    int dc = 0;
+    for (ssize_t r = (ssize_t) len - 1; r >= 0; r--) {
+        if (dc > 0 && dc % 3 == 0) *w-- = ',';
+        *w-- = raw[r];
+        dc++;
+    }
+}
+
 void size_to_str(unsigned long int size, char *buf, int buf_len)
 {
     if (size >= 1024 * 1024 * 1024) {
@@ -2121,28 +2145,9 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             snprintf(tag, sizeof(tag), "[RUN #%u %3.0f%% %3lus]", run_id, progress,
                      (unsigned long) (duration / 1000000));
 
-            // Comma-grouped ops/sec for readability.
-            auto comma_fmt = [](unsigned long int n, char *out, size_t sz) {
-                char raw[32];
-                snprintf(raw, sizeof(raw), "%lu", n);
-                size_t len = strlen(raw);
-                size_t commas = (len > 0) ? (len - 1) / 3 : 0;
-                if (len + commas + 1 > sz) {
-                    snprintf(out, sz, "%lu", n);
-                    return;
-                }
-                char *w = out + len + commas;
-                *w-- = '\0';
-                int dc = 0;
-                for (ssize_t r = (ssize_t) len - 1; r >= 0; r--) {
-                    if (dc > 0 && dc % 3 == 0) *w-- = ',';
-                    *w-- = raw[r];
-                    dc++;
-                }
-            };
             char cur_ops_str[32], avg_ops_str[32];
-            comma_fmt(cur_ops_sec, cur_ops_str, sizeof(cur_ops_str));
-            comma_fmt(ops_sec, avg_ops_str, sizeof(avg_ops_str));
+            format_with_commas(cur_ops_sec, cur_ops_str, sizeof(cur_ops_str));
+            format_with_commas(ops_sec, avg_ops_str, sizeof(avg_ops_str));
 
             // Miss ratio: per-second (delta) and cumulative.
             unsigned long int cur_lookups = (total_hits - prev_hits) + (total_misses - prev_misses);
