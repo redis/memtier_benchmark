@@ -52,12 +52,12 @@ struct config_ratio
 
 struct config_quantiles
 {
-    std::vector<float> quantile_list;
+    std::vector<double> quantile_list;
     config_quantiles();
     config_quantiles(const char *ratio_str);
     bool is_defined(void);
-    inline std::vector<float>::iterator begin() { return quantile_list.begin(); }
-    inline std::vector<float>::iterator end() { return quantile_list.end(); }
+    inline std::vector<double>::iterator begin() { return quantile_list.begin(); }
+    inline std::vector<double>::iterator end() { return quantile_list.end(); }
 };
 
 struct config_weight_list

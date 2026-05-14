@@ -94,9 +94,9 @@ config_quantiles::config_quantiles(const char *str)
     assert(str != NULL);
 
     do {
-        float quantile;
+        double quantile;
         char *p = NULL;
-        quantile = strtof(str, &p);
+        quantile = strtod(str, &p);
         if (!p || (*p != ',' && *p != '\0')) {
             quantile_list.clear();
             return;

@@ -69,6 +69,7 @@ struct benchmark_config
     int hide_histogram;
     config_quantiles print_percentiles;
     bool print_all_runs;
+    bool realtime_latencies;
     int distinct_client_seed;
     int randomize;
     int next_client_idx;

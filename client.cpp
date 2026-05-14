@@ -1082,6 +1082,26 @@ unsigned long int client_group::get_total_connection_errors(void)
     return total_errors;
 }
 
+unsigned long int client_group::get_total_hits(void)
+{
+    unsigned long int total = 0;
+    unsigned int count = active_client_count();
+    for (unsigned int i = 0; i < count; i++) {
+        total += m_clients[i]->get_stats()->get_total_hits();
+    }
+    return total;
+}
+
+unsigned long int client_group::get_total_misses(void)
+{
+    unsigned long int total = 0;
+    unsigned int count = active_client_count();
+    for (unsigned int i = 0; i < count; i++) {
+        total += m_clients[i]->get_stats()->get_total_misses();
+    }
+    return total;
+}
+
 void client_group::merge_run_stats(run_stats *target)
 {
     assert(target != NULL);

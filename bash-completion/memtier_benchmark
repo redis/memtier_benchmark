@@ -36,7 +36,7 @@ _memtier_completions()
   options_no_args=("--debug" "--show-config" "--hide-histogram" "--distinct-client-seed" "--randomize"\
                    "--random-data" "--data-verify" "--verify-only" "--generate-keys" "--key-stddev"\
                    "--key-median" "--key-zipf-exp" "--no-expiry" "--cluster-mode" "--scan-incremental-iteration"\
-                   "--print-all-runs" "--tls" "--tls-skip-verify" "--reconnect-on-error"\
+                   "--print-all-runs" "--realtime-latencies" "--tls" "--tls-skip-verify" "--reconnect-on-error"\
                    "--help" "--version"\
                    "-D" "-R" "-h" "-v" "-4" "-6")
 

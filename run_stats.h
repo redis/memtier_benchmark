@@ -260,6 +260,11 @@ public:
     double get_total_latency(void);
     unsigned long int get_total_connection_errors(void);
 
+    // Cumulative hits/misses on GET ops since the run started. Walks per-second
+    // history; benign race with worker writes (used only for live progress display).
+    unsigned long int get_total_hits(void);
+    unsigned long int get_total_misses(void);
+
     // Returns true if set_start_time() was called, indicating the client
     // produced (or was ready to produce) meaningful stats data.
     bool has_started(void) const { return m_started.flag.load(std::memory_order_acquire); }

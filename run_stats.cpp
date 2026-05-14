@@ -126,9 +126,8 @@ run_stats::run_stats(benchmark_config *config) : m_config(config), m_interrupted
 {
     memset(&m_start_time, 0, sizeof(m_start_time));
     memset(&m_end_time, 0, sizeof(m_end_time));
-    std::vector<float> quantiles_list_float = config->print_percentiles.quantile_list;
-    std::sort(quantiles_list_float.begin(), quantiles_list_float.end());
-    quantiles_list = std::vector<double>(quantiles_list_float.begin(), quantiles_list_float.end());
+    quantiles_list = config->print_percentiles.quantile_list;
+    std::sort(quantiles_list.begin(), quantiles_list.end());
     if (config->arbitrary_commands->is_defined()) {
         setup_arbitrary_commands(config->arbitrary_commands->size());
     }
@@ -384,6 +383,24 @@ double run_stats::get_total_latency(void)
 unsigned long int run_stats::get_total_connection_errors(void)
 {
     return m_totals.m_connection_errors;
+}
+
+unsigned long int run_stats::get_total_hits(void)
+{
+    unsigned long int total = m_cur_stats.m_get_cmd.m_hits;
+    for (std::list<one_second_stats>::const_iterator i = m_stats.begin(); i != m_stats.end(); ++i) {
+        total += i->m_get_cmd.m_hits;
+    }
+    return total;
+}
+
+unsigned long int run_stats::get_total_misses(void)
+{
+    unsigned long int total = m_cur_stats.m_get_cmd.m_misses;
+    for (std::list<one_second_stats>::const_iterator i = m_stats.begin(); i != m_stats.end(); ++i) {
+        total += i->m_get_cmd.m_misses;
+    }
+    return total;
 }
 
 #define AVERAGE(total, count) ((unsigned int) ((count) > 0 ? (total) / (count) : 0))
@@ -972,8 +989,10 @@ void result_print_to_json(json_handler *jsonhandler, const char *type, double op
                 jsonhandler->write_obj("Max Latency", "%.3f", cmd_stats.m_max_latency);
                 for (std::size_t i = 0; i < quantile_list.size(); i++) {
                     if (i < cmd_stats.summarized_quantile_values.size()) {
-                        const float quantile = quantile_list[i];
+                        const double quantile = quantile_list[i];
                         char quantile_header[8];
+                        // Backwards-compat JSON key shape "pNN.NN" (legacy
+                        // consumers and tests expect this exact format).
                         snprintf(quantile_header, sizeof(quantile_header) - 1, "p%.2f", quantile);
                         const double value = cmd_stats.summarized_quantile_values[i];
                         jsonhandler->write_obj((char *) quantile_header, "%.3f", value);
@@ -985,8 +1004,9 @@ void result_print_to_json(json_handler *jsonhandler, const char *type, double op
         jsonhandler->close_nesting();
         jsonhandler->open_nesting("Percentile Latencies");
         for (std::size_t i = 0; i < quantile_list.size(); i++) {
-            const float quantile = quantile_list[i];
+            const double quantile = quantile_list[i];
             char quantile_header[8];
+            // Backwards-compat JSON key shape "pNN.NNN".
             snprintf(quantile_header, sizeof(quantile_header) - 1, "p%.3f", quantile);
             const double value =
                 hdr_value_at_percentile(latency_histogram, quantile) / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
@@ -1303,29 +1323,43 @@ void run_stats::print_quantile_latency_column(output_table &table, double quanti
                                               const std::vector<aggregated_command_type_stats> *aggregated)
 {
     table_el el;
-    table_column column(15);
+
+    // Auto-size the column to fit the label (e.g. "p99.999999 Latency" is 18
+    // chars). Floor at 15 preserves alignment for the common p50/p99/p99.9
+    // case, which is exactly 15 wide. Without this, long deep-tail percentile
+    // headers spill into adjacent columns and break the table separators.
+    size_t label_len = (label != NULL) ? strlen(label) : 0;
+    unsigned int col_w = (unsigned int) (label_len > 15 ? label_len : 15);
+    table_column column(col_w);
+
+    char str_fmt[16], dbl_fmt[16], dashes[64];
+    snprintf(str_fmt, sizeof(str_fmt), "%%%us ", col_w);
+    snprintf(dbl_fmt, sizeof(dbl_fmt), "%%%u.05f ", col_w);
+    size_t dash_len = (size_t) col_w + 1;
+    if (dash_len >= sizeof(dashes)) dash_len = sizeof(dashes) - 1;
+    memset(dashes, '-', dash_len);
+    dashes[dash_len] = '\0';
 
     safe_hdr_histogram m_totals_latency_histogram;
     hdr_add(m_totals_latency_histogram, m_set_latency_histogram);
     hdr_add(m_totals_latency_histogram, m_get_latency_histogram);
     hdr_add(m_totals_latency_histogram, m_wait_latency_histogram);
 
-    column.elements.push_back(*el.init_str("%15s ", label));
-    column.elements.push_back(*el.init_str("%s", "----------------"));
+    column.elements.push_back(*el.init_str(str_fmt, label));
+    column.elements.push_back(*el.init_str("%s", dashes));
 
     if (print_arbitrary_commands_results()) {
         if (aggregated != nullptr) {
             for (const auto &agg : *aggregated) {
-                column.elements.push_back(
-                    *el.init_double("%15.05f ", hdr_value_at_percentile(agg.latency_hist, quantile) /
-                                                    (double) LATENCY_HDR_RESULTS_MULTIPLIER));
+                column.elements.push_back(*el.init_double(dbl_fmt, hdr_value_at_percentile(agg.latency_hist, quantile) /
+                                                                       (double) LATENCY_HDR_RESULTS_MULTIPLIER));
                 hdr_add(m_totals_latency_histogram, agg.latency_hist);
             }
         } else {
             for (unsigned int i = 0; i < m_totals.m_ar_commands.size(); i++) {
                 column.elements.push_back(
-                    *el.init_double("%15.05f ", hdr_value_at_percentile(m_ar_commands_latency_histograms[i], quantile) /
-                                                    (double) LATENCY_HDR_RESULTS_MULTIPLIER));
+                    *el.init_double(dbl_fmt, hdr_value_at_percentile(m_ar_commands_latency_histograms[i], quantile) /
+                                                 (double) LATENCY_HDR_RESULTS_MULTIPLIER));
                 hdr_add(m_totals_latency_histogram, m_ar_commands_latency_histograms[i]);
             }
         }
@@ -1335,30 +1369,29 @@ void run_stats::print_quantile_latency_column(output_table &table, double quanti
         const bool has_wait_ops = hdr_total_count(m_wait_latency_histogram) > 0;
         if (has_set_ops) {
             column.elements.push_back(
-                *el.init_double("%15.05f ", hdr_value_at_percentile(m_set_latency_histogram, quantile) /
-                                                (double) LATENCY_HDR_RESULTS_MULTIPLIER));
+                *el.init_double(dbl_fmt, hdr_value_at_percentile(m_set_latency_histogram, quantile) /
+                                             (double) LATENCY_HDR_RESULTS_MULTIPLIER));
         } else {
-            column.elements.push_back(*el.init_str("%15s ", "---"));
+            column.elements.push_back(*el.init_str(str_fmt, "---"));
         }
         if (has_get_ops) {
             column.elements.push_back(
-                *el.init_double("%15.05f ", hdr_value_at_percentile(m_get_latency_histogram, quantile) /
-                                                (double) LATENCY_HDR_RESULTS_MULTIPLIER));
+                *el.init_double(dbl_fmt, hdr_value_at_percentile(m_get_latency_histogram, quantile) /
+                                             (double) LATENCY_HDR_RESULTS_MULTIPLIER));
         } else {
-            column.elements.push_back(*el.init_str("%15s ", "---"));
+            column.elements.push_back(*el.init_str(str_fmt, "---"));
         }
         if (has_wait_ops) {
             column.elements.push_back(
-                *el.init_double("%15.05f ", hdr_value_at_percentile(m_wait_latency_histogram, quantile) /
-                                                (double) LATENCY_HDR_RESULTS_MULTIPLIER));
+                *el.init_double(dbl_fmt, hdr_value_at_percentile(m_wait_latency_histogram, quantile) /
+                                             (double) LATENCY_HDR_RESULTS_MULTIPLIER));
         } else {
-            column.elements.push_back(*el.init_str("%15s ", "---"));
+            column.elements.push_back(*el.init_str(str_fmt, "---"));
         }
     }
 
-    column.elements.push_back(
-        *el.init_double("%15.05f ", hdr_value_at_percentile(m_totals_latency_histogram, quantile) /
-                                        (double) LATENCY_HDR_RESULTS_MULTIPLIER));
+    column.elements.push_back(*el.init_double(dbl_fmt, hdr_value_at_percentile(m_totals_latency_histogram, quantile) /
+                                                           (double) LATENCY_HDR_RESULTS_MULTIPLIER));
 
     table.add_column(column);
 }
@@ -1655,17 +1688,13 @@ void run_stats::print(FILE *out, benchmark_config *config, const char *header /*
     print_avg_latency_column(table, aggregated_ptr);
 
     for (std::size_t i = 0; i < config->print_percentiles.quantile_list.size(); i++) {
-        float quantile = config->print_percentiles.quantile_list[i];
+        double quantile = config->print_percentiles.quantile_list[i];
         char average_header[50];
-        int ndigts = 0;
-        float num = abs(quantile);
-        num = num - int(num);
-        while (abs(num) > 0.001 && ndigts < 3) {
-            num = num * 10;
-            ndigts++;
-            num = num - int(num);
-        }
-        snprintf(average_header, sizeof(average_header) - 1, "p%.*f Latency", ndigts, quantile);
+        // %.10g preserves the user's quantile precision up to 10 significant
+        // digits without rounding tail values (e.g. 99.99999) up to 100. The
+        // previous %.*f formatter capped at 3 fractional digits and silently
+        // rounded any deeper percentile, producing duplicate "p100" columns.
+        snprintf(average_header, sizeof(average_header) - 1, "p%.10g Latency", quantile);
         print_quantile_latency_column(table, quantile, (char *) average_header, aggregated_ptr);
     }
 

@@ -667,6 +667,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_hide_histogram,
         o_print_percentiles,
         o_print_all_runs,
+        o_realtime_latencies,
         o_distinct_client_seed,
         o_randomize,
         o_client_stats,
@@ -741,6 +742,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         {"hide-histogram", 0, 0, o_hide_histogram},
         {"print-percentiles", 1, 0, o_print_percentiles},
         {"print-all-runs", 0, 0, o_print_all_runs},
+        {"realtime-latencies", 0, 0, o_realtime_latencies},
         {"distinct-client-seed", 0, 0, o_distinct_client_seed},
         {"randomize", 0, 0, o_randomize},
         {"requests", 1, 0, 'n'},
@@ -917,6 +919,9 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             break;
         case o_print_all_runs:
             cfg->print_all_runs = true;
+            break;
+        case o_realtime_latencies:
+            cfg->realtime_latencies = true;
             break;
         case o_distinct_client_seed:
             cfg->distinct_client_seed++;
@@ -1503,6 +1508,10 @@ void usage()
         "prints percentiles: 50,99,99.9)\n"
         "      --print-all-runs           When performing multiple test iterations, print and save results for all "
         "iterations\n"
+        "      --realtime-latencies       Replace the periodic single-line progress output with a per-tick block: "
+        "line 1 = throughput + miss ratio, then one or more latency lines carrying the percentiles configured by "
+        "--print-percentiles (immediate and overall, side-by-side). Redraws in place on a TTY; appends cleanly when "
+        "stderr is redirected to a file.\n"
         "      --command-stats-breakdown=command|line\n"
         "                                 How to group command statistics in the output (default: command)\n"
         "                                 command: aggregate by command name (first word, e.g., SET, GET)\n"
@@ -1952,6 +1961,21 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     double prev_latency = 0, cur_latency = 0;
     unsigned long int cur_ops_sec = 0;
     unsigned long int cur_bytes_sec = 0;
+    unsigned long int prev_hits = 0;
+    unsigned long int prev_misses = 0;
+
+    // Detect once whether stderr is a real terminal. --realtime-latencies uses
+    // this to choose between in-place cursor-up redraw and plain-append output.
+    bool stderr_is_tty = isatty(fileno(stderr)) != 0;
+    bool first_rtl_frame = true;
+
+    // Cumulative latency histogram for --realtime-latencies "overall" percentiles.
+    // We hdr_add each tick's aggregated inst histogram into this so the percentiles
+    // shown in '(avg: X.XXX)' reflect the whole run, not just the last second.
+    hdr_histogram *rtl_totals_hist = NULL;
+    if (cfg->realtime_latencies) {
+        hdr_init(LATENCY_HDR_MIN_VALUE, LATENCY_HDR_SEC_MAX_VALUE, LATENCY_HDR_SEC_SIGDIGTS, &rtl_totals_hist);
+    }
 
     // provide some feedback...
     // NOTE: Reading stats from worker threads without synchronization is a benign race.
@@ -1987,6 +2011,8 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         unsigned int thread_counter = 0;
         double total_latency = 0;
         unsigned long int total_connection_errors = 0;
+        unsigned long int total_hits = 0;
+        unsigned long int total_misses = 0;
 
         for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
             // Check if thread needs restart
@@ -2011,6 +2037,10 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             total_bytes += (*i)->m_cg->get_total_bytes();
             total_latency += (*i)->m_cg->get_total_latency();
             total_connection_errors += (*i)->m_cg->get_total_connection_errors();
+            if (cfg->realtime_latencies) {
+                total_hits += (*i)->m_cg->get_total_hits();
+                total_misses += (*i)->m_cg->get_total_misses();
+            }
             thread_counter++;
             float factor = ((float) (thread_counter - 1) / thread_counter);
             duration = factor * duration + (float) (*i)->m_cg->get_duration_usec() / thread_counter;
@@ -2066,8 +2096,145 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         } else
             progress = 100.0 * (duration / 1000000.0) / cfg->test_time;
 
-        // Only show connection errors if there are any (backwards compatible output)
-        if (total_connection_errors > 0) {
+        // Aggregate per-thread instantaneous latency histograms once if either
+        // --realtime-latencies or StatsD percentile export needs them. Owned and
+        // freed at the end of this iteration.
+        hdr_histogram *inst_hist_agg = NULL;
+        bool need_inst_hist = cfg->realtime_latencies || (cfg->statsd != NULL && cfg->statsd->is_enabled());
+        if (need_inst_hist) {
+            if (hdr_init(LATENCY_HDR_MIN_VALUE, LATENCY_HDR_SEC_MAX_VALUE, LATENCY_HDR_SEC_SIGDIGTS, &inst_hist_agg) ==
+                0) {
+                for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
+                    if (!(*i)->m_finished) {
+                        (*i)->m_cg->aggregate_inst_histogram(inst_hist_agg);
+                    }
+                }
+            }
+        }
+
+        if (cfg->realtime_latencies) {
+            // Two-line, time-series-friendly block. On a TTY we move the cursor
+            // back up 2 lines so the block redraws in place; on a non-TTY (file
+            // capture / piped log) we just keep appending, which turns the
+            // stderr stream into a clean 2-rows-per-second time series.
+            char tag[40];
+            snprintf(tag, sizeof(tag), "[RUN #%u %3.0f%% %3lus]", run_id, progress,
+                     (unsigned long) (duration / 1000000));
+
+            // Comma-grouped ops/sec for readability.
+            auto comma_fmt = [](unsigned long int n, char *out, size_t sz) {
+                char raw[32];
+                snprintf(raw, sizeof(raw), "%lu", n);
+                size_t len = strlen(raw);
+                size_t commas = (len > 0) ? (len - 1) / 3 : 0;
+                if (len + commas + 1 > sz) {
+                    snprintf(out, sz, "%lu", n);
+                    return;
+                }
+                char *w = out + len + commas;
+                *w-- = '\0';
+                int dc = 0;
+                for (ssize_t r = (ssize_t) len - 1; r >= 0; r--) {
+                    if (dc > 0 && dc % 3 == 0) *w-- = ',';
+                    *w-- = raw[r];
+                    dc++;
+                }
+            };
+            char cur_ops_str[32], avg_ops_str[32];
+            comma_fmt(cur_ops_sec, cur_ops_str, sizeof(cur_ops_str));
+            comma_fmt(ops_sec, avg_ops_str, sizeof(avg_ops_str));
+
+            // Miss ratio: per-second (delta) and cumulative.
+            unsigned long int cur_lookups = (total_hits - prev_hits) + (total_misses - prev_misses);
+            unsigned long int tot_lookups = total_hits + total_misses;
+            char cur_miss_str[16], avg_miss_str[16];
+            if (cur_lookups > 0)
+                snprintf(cur_miss_str, sizeof(cur_miss_str), "%5.2f%%",
+                         100.0 * (double) (total_misses - prev_misses) / (double) cur_lookups);
+            else
+                snprintf(cur_miss_str, sizeof(cur_miss_str), "  -  ");
+            if (tot_lookups > 0)
+                snprintf(avg_miss_str, sizeof(avg_miss_str), "%5.2f%%",
+                         100.0 * (double) total_misses / (double) tot_lookups);
+            else
+                snprintf(avg_miss_str, sizeof(avg_miss_str), "  -  ");
+
+            char line1[400];
+            if (total_connection_errors > 0) {
+                snprintf(line1, sizeof(line1),
+                         "%s throughput %s (avg: %s) ops/sec   %s/sec (avg: %s/sec)   miss %s (avg: %s)   conn_err %lu",
+                         tag, cur_ops_str, avg_ops_str, cur_bytes_str, bytes_str, cur_miss_str, avg_miss_str,
+                         total_connection_errors);
+            } else {
+                snprintf(line1, sizeof(line1),
+                         "%s throughput %s (avg: %s) ops/sec   %s/sec (avg: %s/sec)   miss %s (avg: %s)", tag,
+                         cur_ops_str, avg_ops_str, cur_bytes_str, bytes_str, cur_miss_str, avg_miss_str);
+            }
+
+            // Accumulate this tick's instantaneous percentile samples into the
+            // run-lifetime histogram so '(avg: X.XXX)' on the latency line covers
+            // the whole run so far, not just the last second.
+            if (rtl_totals_hist != NULL && inst_hist_agg != NULL && hdr_total_count(inst_hist_agg) > 0) {
+                hdr_add(rtl_totals_hist, inst_hist_agg);
+            }
+
+            // Latency lines: per-configured-percentile "cur (avg: avg)", chunked
+            // to at most kPctPerLine entries per line so a long --print-percentiles
+            // list (e.g. 50,99,99.9,99.99,99.99999,99.999999) doesn't blow out the
+            // terminal. Line count is deterministic given the configured list,
+            // which keeps the in-place cursor-up redraw stable across ticks.
+            const std::vector<double> &quantiles = cfg->print_percentiles.quantile_list;
+            const size_t kPctPerLine = 3;
+            size_t num_latency_lines = quantiles.empty() ? 1 : ((quantiles.size() + kPctPerLine - 1) / kPctPerLine);
+            std::vector<std::string> lat_chunks(num_latency_lines);
+            bool any_samples = (rtl_totals_hist != NULL && hdr_total_count(rtl_totals_hist) > 0);
+            bool cur_samples = (inst_hist_agg != NULL && hdr_total_count(inst_hist_agg) > 0);
+            for (std::size_t i = 0; i < quantiles.size(); i++) {
+                char cur_p[16], avg_p[16];
+                if (cur_samples) {
+                    double ms =
+                        hdr_value_at_percentile(inst_hist_agg, quantiles[i]) / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
+                    snprintf(cur_p, sizeof(cur_p), "%6.3f", ms);
+                } else {
+                    snprintf(cur_p, sizeof(cur_p), "   -  ");
+                }
+                if (any_samples) {
+                    double ms = hdr_value_at_percentile(rtl_totals_hist, quantiles[i]) /
+                                (double) LATENCY_HDR_RESULTS_MULTIPLIER;
+                    snprintf(avg_p, sizeof(avg_p), "%6.3f", ms);
+                } else {
+                    snprintf(avg_p, sizeof(avg_p), "   -  ");
+                }
+                char entry[96];
+                snprintf(entry, sizeof(entry), "  p%.10g %s (avg: %s)", quantiles[i], cur_p, avg_p);
+                lat_chunks[i / kPctPerLine] += entry;
+            }
+            if (quantiles.empty()) lat_chunks[0] = "  (no samples this tick)";
+
+            size_t total_lines = 1 + num_latency_lines;
+            // The ms unit applies to every value on the latency lines (both cur
+            // and avg are in milliseconds), so we always append it to the last
+            // chunk — even when the last tick had no fresh samples.
+            bool show_ms = cur_samples || any_samples;
+            if (stderr_is_tty && !first_rtl_frame) {
+                // Move cursor up the number of lines we last emitted, then
+                // overwrite each with \033[K to wipe residue from a wider frame.
+                fprintf(stderr, "\033[%zuA\r", total_lines);
+                fprintf(stderr, "%s\033[K\n", line1);
+                for (size_t k = 0; k < num_latency_lines; k++) {
+                    const char *unit_suffix = (k + 1 == num_latency_lines && show_ms) ? " ms" : "";
+                    fprintf(stderr, "%s latency%s%s\033[K\n", tag, lat_chunks[k].c_str(), unit_suffix);
+                }
+            } else {
+                fprintf(stderr, "%s\n", line1);
+                for (size_t k = 0; k < num_latency_lines; k++) {
+                    const char *unit_suffix = (k + 1 == num_latency_lines && show_ms) ? " ms" : "";
+                    fprintf(stderr, "%s latency%s%s\n", tag, lat_chunks[k].c_str(), unit_suffix);
+                }
+            }
+            first_rtl_frame = false;
+        } else if (total_connection_errors > 0) {
+            // Only show connection errors if there are any (backwards compatible output)
             fprintf(stderr,
                     "[RUN #%u %.0f%%, %3u secs] %2u threads %2u conns %lu conn errors: %11lu ops, %7lu (avg: %7lu) "
                     "ops/sec, %s/sec (avg: %s/sec), %5.2f (avg: %5.2f) msec latency\r",
@@ -2081,6 +2248,9 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
                     run_id, progress, (unsigned int) (duration / 1000000), active_threads, display_clients, total_ops,
                     cur_ops_sec, ops_sec, cur_bytes_str, bytes_str, cur_latency, avg_latency);
         }
+
+        prev_hits = total_hits;
+        prev_misses = total_misses;
 
         // Send metrics to StatsD if configured
         if (cfg->statsd != NULL && cfg->statsd->is_enabled()) {
@@ -2096,49 +2266,35 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
                 cfg->statsd->gauge("connection_errors", (long) total_connection_errors);
             }
 
-            // Calculate and send percentile metrics from instantaneous histograms
-            // Allocate a temporary histogram to aggregate all threads' instantaneous histograms
-            hdr_histogram *temp_histogram = NULL;
-            if (hdr_init(LATENCY_HDR_MIN_VALUE, LATENCY_HDR_SEC_MAX_VALUE, LATENCY_HDR_SEC_SIGDIGTS, &temp_histogram) ==
-                0) {
-                // Aggregate instantaneous histograms from all threads
-                for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
-                    if (!(*i)->m_finished) {
-                        (*i)->m_cg->aggregate_inst_histogram(temp_histogram);
+            // Send percentile metrics derived from the aggregated instantaneous
+            // histogram (allocated above; shared with the TUI renderer when enabled).
+            if (inst_hist_agg != NULL && hdr_total_count(inst_hist_agg) > 0) {
+                const std::vector<double> &quantiles = cfg->print_percentiles.quantile_list;
+                for (std::size_t i = 0; i < quantiles.size(); i++) {
+                    double percentile = quantiles[i];
+                    int64_t value = hdr_value_at_percentile(inst_hist_agg, percentile);
+                    double value_ms = value / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
+
+                    // Format the metric name (e.g., "latency_p50", "latency_p99", "latency_p99_9",
+                    // "latency_p99_99"). %.10g preserves up to 10 significant digits so deep-tail
+                    // percentiles (99.99999, 99.999999) don't round to 100 and collide.
+                    char metric_name[40];
+                    char pct_str[24];
+                    snprintf(pct_str, sizeof(pct_str), "%.10g", percentile);
+                    for (char *p = pct_str; *p; p++) {
+                        if (*p == '.') *p = '_';
                     }
+                    snprintf(metric_name, sizeof(metric_name), "latency_p%s", pct_str);
+
+                    cfg->statsd->gauge(metric_name, value_ms);
                 }
-
-                // Only calculate percentiles if we have samples
-                if (hdr_total_count(temp_histogram) > 0) {
-                    // Get the configured percentiles from config
-                    const std::vector<float> &quantiles = cfg->print_percentiles.quantile_list;
-
-                    // Calculate and send each configured percentile
-                    for (std::size_t i = 0; i < quantiles.size(); i++) {
-                        double percentile = quantiles[i];
-                        int64_t value = hdr_value_at_percentile(temp_histogram, percentile);
-                        double value_ms = value / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
-
-                        // Format the metric name (e.g., "latency_p50", "latency_p99", "latency_p99_9",
-                        // "latency_p99_99"). %g gives the shortest exact representation with no trailing
-                        // zeros, avoiding truncation and collisions for high-precision percentiles.
-                        char metric_name[32];
-                        char pct_str[24];
-                        snprintf(pct_str, sizeof(pct_str), "%g", percentile);
-                        for (char *p = pct_str; *p; p++) {
-                            if (*p == '.') *p = '_';
-                        }
-                        snprintf(metric_name, sizeof(metric_name), "latency_p%s", pct_str);
-
-                        cfg->statsd->gauge(metric_name, value_ms);
-                    }
-                }
-
-                // Clean up the temporary histogram
-                hdr_close(temp_histogram);
             }
         }
+
+        if (inst_hist_agg != NULL) hdr_close(inst_hist_agg);
     } while (active_threads > 0);
+
+    if (rtl_totals_hist != NULL) hdr_close(rtl_totals_hist);
 
     // Send "run completed" annotation and zero out gauges so graphs drop to 0
     if (cfg->statsd != NULL && cfg->statsd->is_enabled()) {
