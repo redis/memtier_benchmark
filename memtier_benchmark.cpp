@@ -2569,6 +2569,16 @@ int main(int argc, char *argv[])
     // Install signal handler for Ctrl+C
     signal(SIGINT, sigint_handler);
 
+    // Ignore SIGPIPE so a peer-initiated TCP/TLS close mid-write returns
+    // EPIPE from send()/SSL_write() instead of killing the process. Without
+    // this, a single half-closed socket among hundreds can tear down the
+    // entire run with exit 141 before --reconnect-on-error / --retry-on-error
+    // get a chance to handle EPIPE. libevent's bufferevent uses MSG_NOSIGNAL
+    // on plain-TCP send(), but TLS writes via OpenSSL's SSL_write() do not
+    // (and ARM Linux ignores MSG_NOSIGNAL on writev in some configurations),
+    // so a process-wide SIG_IGN is the robust fix. See PERF-501 / GH #382.
+    signal(SIGPIPE, SIG_IGN);
+
     // Install crash handlers for debugging
     setup_crash_handlers();
 
