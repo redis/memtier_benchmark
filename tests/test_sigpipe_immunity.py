@@ -60,27 +60,38 @@ def test_sigpipe_ignored(env):
         try:
             # Wait for memtier to fully start its event loop.
             time.sleep(1.5)
-            env.assertIsNone(proc.poll(),
-                             "memtier exited before SIGPIPE was sent (startup failure?)")
+            # NB: RLTest's assertion methods take (value, depth=0, message=None);
+            # the message MUST be passed as a keyword arg or RLTest treats it as
+            # `depth` and crashes with TypeError when it does `1 + depth`.
+            env.assertIsNone(
+                proc.poll(),
+                message="memtier exited before SIGPIPE was sent (startup failure?)",
+            )
 
             # First SIGPIPE — without SIG_IGN this delivers SIG_DFL and exits 141.
             os.kill(proc.pid, signal.SIGPIPE)
             time.sleep(0.5)
-            env.assertIsNone(proc.poll(),
-                             "memtier died from SIGPIPE — SIG_IGN regression")
+            env.assertIsNone(
+                proc.poll(),
+                message="memtier died from SIGPIPE — SIG_IGN regression",
+            )
 
             # Second SIGPIPE — just to prove SIG_IGN persists, not a fluke.
             os.kill(proc.pid, signal.SIGPIPE)
             time.sleep(0.5)
-            env.assertIsNone(proc.poll(),
-                             "memtier died from a second SIGPIPE — SIG_IGN regression")
+            env.assertIsNone(
+                proc.poll(),
+                message="memtier died from a second SIGPIPE — SIG_IGN regression",
+            )
 
             # Clean shutdown via SIGINT (which IS handled separately).
             proc.send_signal(signal.SIGINT)
             rc = proc.wait(timeout=10)
             # Either 0 (clean) or 130 (SIGINT-driven shutdown after wrap-up).
-            env.assertTrue(rc in (0, 130, -signal.SIGINT),
-                           "unexpected exit code after SIGINT: {}".format(rc))
+            env.assertTrue(
+                rc in (0, 130, -signal.SIGINT),
+                message="unexpected exit code after SIGINT: {}".format(rc),
+            )
         finally:
             if proc.poll() is None:
                 proc.kill()

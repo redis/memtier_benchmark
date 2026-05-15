@@ -210,17 +210,26 @@ def test_sigpipe_tls_rst_does_not_kill_process(env):
             # exit 141 = 128 + SIGPIPE; on Python's wait(), this is reported
             # as either 141 (positive) or -signal.SIGPIPE (negative, if it
             # was killed by signal). Either form indicates the regression.
+            #
+            # NB: RLTest's assertion methods take (value, depth=0, message=None);
+            # the message MUST be passed as a keyword arg or RLTest treats it
+            # as `depth` and crashes with TypeError when it does `1 + depth`.
+            # RLTest also doesn't expose `assertNotIn`, so we use `assertTrue`
+            # over a `not in` expression.
             sigpipe_codes = {141, -signal.SIGPIPE}
-            env.assertNotIn(
-                rc, sigpipe_codes,
-                "memtier died from SIGPIPE (rc={}); SIG_IGN regression. "
-                "stderr at {}".format(rc, stderr_path),
+            env.assertTrue(
+                rc not in sigpipe_codes,
+                message=(
+                    "memtier died from SIGPIPE (rc={}); SIG_IGN regression. "
+                    "stderr at {}".format(rc, stderr_path)
+                ),
             )
 
             # The tarpit should have torn down at least one TLS session.
             env.assertGreater(
-                tarpit.reset_count, 0,
-                "TLS tarpit never accepted a memtier session — test harness broken",
+                tarpit.reset_count,
+                0,
+                message="TLS tarpit never accepted a memtier session — test harness broken",
             )
 
             # And the runtime error path should have logged at least one
@@ -229,10 +238,13 @@ def test_sigpipe_tls_rst_does_not_kill_process(env):
             with open(stderr_path) as f:
                 stderr = f.read()
             env.assertTrue(
-                "Connection error" in stderr or "TLS connection error" in stderr
+                "Connection error" in stderr
+                or "TLS connection error" in stderr
                 or "connection dropped" in stderr,
-                "memtier never logged a connection error despite many TLS RSTs "
-                "(stderr at {})".format(stderr_path),
+                message=(
+                    "memtier never logged a connection error despite many TLS RSTs "
+                    "(stderr at {})".format(stderr_path)
+                ),
             )
         finally:
             tarpit.stop()
