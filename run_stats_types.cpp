@@ -321,7 +321,10 @@ totals::totals() :
         m_hits(0),
         m_misses(0),
         m_connection_errors(0),
-        m_connection_errors_sec(0)
+        m_connection_errors_sec(0),
+        m_retry_attempts(0),
+        m_retried_ops(0),
+        m_errors(0)
 {
 }
 
@@ -353,6 +356,9 @@ void totals::add(const totals &other)
     m_misses += other.m_misses;
     m_connection_errors += other.m_connection_errors;
     m_connection_errors_sec += other.m_connection_errors_sec;
+    m_retry_attempts += other.m_retry_attempts;
+    m_retried_ops += other.m_retried_ops;
+    m_errors += other.m_errors;
 
     // aggregate latency data
     hdr_add(latency_histogram, other.latency_histogram);

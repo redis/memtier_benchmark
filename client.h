@@ -266,6 +266,9 @@ public:
     unsigned long int get_total_connection_errors(void);
     unsigned long int get_total_hits(void);
     unsigned long int get_total_misses(void);
+    unsigned long int get_total_retry_attempts(void);
+    unsigned long int get_total_retried_ops(void);
+    unsigned long int get_total_errors(void);
 
     void merge_run_stats(run_stats *target);
     void aggregate_inst_histogram(hdr_histogram *target);

@@ -180,6 +180,17 @@ public:
     void update_set_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency);
     void update_connection_error(struct timeval *ts);
 
+    // Retry/error counters. Bumped by client::handle_response on the retry
+    // path. Lock-free relaxed bumps on a per-thread instance; aggregated when
+    // run_stats are merged across threads.
+    void inc_retry_attempt() { m_totals.m_retry_attempts++; }
+    void inc_retried_op() { m_totals.m_retried_ops++; }
+    void inc_error() { m_totals.m_errors++; }
+
+    unsigned long int get_total_retry_attempts() const { return m_totals.m_retry_attempts; }
+    unsigned long int get_total_retried_ops() const { return m_totals.m_retried_ops; }
+    unsigned long int get_total_errors() const { return m_totals.m_errors; }
+
     void update_moved_get_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency);
     void update_moved_set_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency);
     void update_moved_arbitrary_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx,

@@ -52,6 +52,7 @@
 #include "client.h"
 #include "cluster_client.h"
 #include "config_types.h"
+#include "retry_policy.h"
 
 
 bool client::setup_client(benchmark_config *config, abstract_protocol *protocol, object_generator *objgen)
@@ -652,6 +653,23 @@ int client::prepare(void)
     return 0;
 }
 
+// Maps internal request_type to a short uppercase string for failed-keys logs.
+static const char *request_type_to_name(request_type t)
+{
+    switch (t) {
+    case rt_get:
+        return "GET";
+    case rt_set:
+        return "SET";
+    case rt_wait:
+        return "WAIT";
+    case rt_arbitrary:
+        return "ARBITRARY";
+    default:
+        return "UNKNOWN";
+    }
+}
+
 void client::handle_response(unsigned int conn_id, struct timeval timestamp, request *request,
                              protocol_response *response)
 {
@@ -659,29 +677,58 @@ void client::handle_response(unsigned int conn_id, struct timeval timestamp, req
         benchmark_error_log("server %s handle error response: %s\n", m_connections[conn_id]->get_readable_id(),
                             response->get_status());
 
+        // Retry path: only when --retry-on-error is enabled. We intercept the
+        // failed response and re-enqueue the request; stats are NOT updated
+        // until the request reaches a terminal outcome (success or retries
+        // exhausted). The shard_connection's retry queue handles backoff and
+        // hard-cap; if it refuses, we fall through to permanent-failure
+        // accounting below.
+        if (m_config->retry_on_error && is_retryable_error(response->get_status(), m_config->retry_on_filter)) {
+            shard_connection *sc = m_connections[conn_id];
+            m_stats.inc_retry_attempt();
+            if (sc->enqueue_retry(request)) {
+                // Ownership transferred to the retry queue (signalled by
+                // request->m_claimed_by_retry = true). process_response skips
+                // its delete; the request is freed when the retry queue or
+                // replay path drains it.
+                if (request->m_retries == 0) m_stats.inc_retried_op();
+                return;
+            }
+        }
+
+        // Permanent failure path: log to failed-keys file (if configured),
+        // bump the error counter, and fall through to stats.
+        if (m_config->failed_keys_file) {
+            global_failed_keys_logger().log_failure(timestamp, request_type_to_name(request->m_type), request->m_key,
+                                                    request->m_key_len, response->get_status(), request->m_retries);
+        }
+        m_stats.inc_error();
+
         // On SCAN error, reset cursor to restart iteration
         if (m_config->scan_incremental_iteration && request->m_type == rt_arbitrary) {
             m_scan_cursor = "0";
             m_scan_iteration_count = 0;
         }
     }
+    // Stats use the first-attempt send time so retries appear as one op with
+    // total latency from first send to final outcome. For non-retry runs,
+    // m_first_sent_time == m_sent_time, so this is a no-op behavior change.
+    struct timeval ref_sent = request->m_first_sent_time;
     switch (request->m_type) {
     case rt_get:
-        m_stats.update_get_op(&timestamp, response->get_total_len(), request->m_size,
-                              ts_diff(request->m_sent_time, timestamp), response->get_hits(),
-                              request->m_keys - response->get_hits());
+        m_stats.update_get_op(&timestamp, response->get_total_len(), request->m_size, ts_diff(ref_sent, timestamp),
+                              response->get_hits(), request->m_keys - response->get_hits());
         break;
     case rt_set:
-        m_stats.update_set_op(&timestamp, response->get_total_len(), request->m_size,
-                              ts_diff(request->m_sent_time, timestamp));
+        m_stats.update_set_op(&timestamp, response->get_total_len(), request->m_size, ts_diff(ref_sent, timestamp));
         break;
     case rt_wait:
-        m_stats.update_wait_op(&timestamp, ts_diff(request->m_sent_time, timestamp));
+        m_stats.update_wait_op(&timestamp, ts_diff(ref_sent, timestamp));
         break;
     case rt_arbitrary: {
         arbitrary_request *ar = static_cast<arbitrary_request *>(request);
         m_stats.update_arbitrary_op(&timestamp, response->get_total_len(), request->m_size,
-                                    ts_diff(request->m_sent_time, timestamp), ar->index);
+                                    ts_diff(ref_sent, timestamp), ar->index);
 
         // Extract cursor from SCAN response for incremental iteration
         if (m_config->scan_incremental_iteration && !response->is_error()) {
@@ -712,6 +759,13 @@ void client::handle_response(unsigned int conn_id, struct timeval timestamp, req
     default:
         assert(0);
         break;
+    }
+
+    // On success after one or more retries: reset the per-connection backoff
+    // so a transient burst of errors doesn't keep us in slow-retry mode after
+    // the SUT recovers.
+    if (m_config->retry_on_error && !response->is_error() && request->m_retries > 0) {
+        m_connections[conn_id]->reset_retry_backoff();
     }
 }
 
@@ -790,8 +844,23 @@ void verify_client::handle_response(unsigned int conn_id, struct timeval timesta
 
     assert(vr->m_type == rt_get);
     if (response->is_error()) {
+        // Same retry policy as the normal client: retry transient errors;
+        // permanent errors (and value-mismatch below) always count.
+        if (m_config->retry_on_error && is_retryable_error(response->get_status(), m_config->retry_on_filter)) {
+            shard_connection *sc = m_connections[conn_id];
+            m_stats.inc_retry_attempt();
+            if (sc->enqueue_retry(request)) {
+                if (request->m_retries == 0) m_stats.inc_retried_op();
+                return;
+            }
+        }
+        if (m_config->failed_keys_file) {
+            global_failed_keys_logger().log_failure(timestamp, "GET", vr->m_key, vr->m_key_len, response->get_status(),
+                                                    vr->m_retries);
+        }
         benchmark_error_log("error: request for key [%.*s] failed: %s\n", vr->m_key_len, vr->m_key,
                             response->get_status());
+        m_stats.inc_error();
         m_errors++;
     } else {
         if (!rvalue || rvalue_len != vr->m_value_len || memcmp(rvalue, vr->m_value, rvalue_len) != 0) {
@@ -1098,6 +1167,36 @@ unsigned long int client_group::get_total_misses(void)
     unsigned int count = active_client_count();
     for (unsigned int i = 0; i < count; i++) {
         total += m_clients[i]->get_stats()->get_total_misses();
+    }
+    return total;
+}
+
+unsigned long int client_group::get_total_retry_attempts(void)
+{
+    unsigned long int total = 0;
+    unsigned int count = active_client_count();
+    for (unsigned int i = 0; i < count; i++) {
+        total += m_clients[i]->get_stats()->get_total_retry_attempts();
+    }
+    return total;
+}
+
+unsigned long int client_group::get_total_retried_ops(void)
+{
+    unsigned long int total = 0;
+    unsigned int count = active_client_count();
+    for (unsigned int i = 0; i < count; i++) {
+        total += m_clients[i]->get_stats()->get_total_retried_ops();
+    }
+    return total;
+}
+
+unsigned long int client_group::get_total_errors(void)
+{
+    unsigned long int total = 0;
+    unsigned int count = active_client_count();
+    for (unsigned int i = 0; i < count; i++) {
+        total += m_clients[i]->get_stats()->get_total_errors();
     }
     return total;
 }

@@ -64,12 +64,38 @@ enum request_type
 struct request
 {
     request_type m_type;
-    struct timeval m_sent_time;
+    struct timeval m_sent_time; // most-recent attempt; updated on each replay
+    // First-attempt send time. Stats are computed against this so retries appear
+    // as a single op spanning first-send to final outcome.
+    struct timeval m_first_sent_time;
     unsigned int m_size;
     unsigned int m_keys;
 
+    // Retry bookkeeping. Populated by the retry path; ignored when --retry-on-error is off.
+    unsigned int m_retries; // number of resends so far (0 = first attempt)
+    // Set true by enqueue_retry when ownership has transferred to the retry
+    // queue. process_response checks this flag and skips its delete, leaving
+    // the request to be freed when the retry queue drains.
+    bool m_claimed_by_retry;
+
+    // Captured serialized command bytes for resend. Owned; freed in dtor.
+    // NULL/0 when retry is disabled or capture failed. Stored as opaque protocol
+    // bytes so any command type can be replayed without per-type re-serialization.
+    char *m_serialized;
+    size_t m_serialized_len;
+
+    // Optional key string for failed-keys logging. NULL/0 for commands without
+    // a key (WAIT, setup) or when key capture was not attempted.
+    char *m_key;
+    unsigned int m_key_len;
+
     request(request_type type, unsigned int size, struct timeval *sent_time, unsigned int keys);
-    virtual ~request(void) {}
+    virtual ~request(void);
+
+    // Attach serialized command bytes (takes ownership). Safe to call once.
+    void set_serialized(const char *data, size_t len);
+    // Attach a key for failed-keys logging (copies bytes; takes ownership).
+    void set_key_for_log(const char *key, unsigned int key_len);
 };
 
 struct arbitrary_request : public request
@@ -82,8 +108,6 @@ struct arbitrary_request : public request
 
 struct verify_request : public request
 {
-    char *m_key;
-    unsigned int m_key_len;
     char *m_value;
     unsigned int m_value_len;
 
@@ -145,6 +169,29 @@ public:
     void handle_reconnect_timer_event();
     void handle_connection_timeout_event();
 
+    // Reset retry backoff after a successful response (so a recovered SUT
+    // returns to immediate retries on the next transient burst).
+    void reset_retry_backoff() { m_current_retry_backoff_ms = (double) m_config->retry_backoff_ms; }
+
+    // Retry / replay machinery.
+    void handle_retry_drain_event();
+    // Push `req` back onto the wire (or onto the retry queue if a backoff is
+    // configured). Caller must guarantee req->m_serialized is non-NULL.
+    // Returns false if max_retries exceeded or queue full (caller must finalize).
+    bool enqueue_retry(request *req);
+    // Replay a request (write the captured bytes to the output buffer + push_req).
+    // Bumps req->m_retries and updates req->m_sent_time.
+    void replay_request(request *req);
+    // Drain any pending replay-on-reconnect requests back into the pipeline.
+    void drain_replay_queue_after_reconnect();
+    // Capture bytes added between `before_pos` and the current evbuffer length
+    // into req->m_serialized. No-op when retry is globally disabled.
+    void capture_serialized_bytes(size_t before_pos, request *req);
+
+    // Hard cap on retry queue depth. True == cap hit, caller must hold the
+    // pipeline until the queue drains.
+    bool retry_queue_full() const;
+
 private:
     void setup_event(int sockfd);
     int setup_socket(struct connect_info *addr);
@@ -199,6 +246,20 @@ private:
 
     // Connection timeout tracking
     struct event *m_connection_timeout_timer;
+
+    // Retry plumbing.
+    //   m_retry_queue       requests waiting for backoff before resending
+    //   m_replay_queue      requests that were in-flight when the socket died,
+    //                       to be replayed after reconnect succeeds
+    //   m_retry_drain_timer single libevent timer that drains m_retry_queue
+    //                       (avoids one-timer-per-request)
+    //   m_current_retry_backoff_ms  next-retry backoff delay (exponential per
+    //                       retry-backoff-factor; resets to retry_backoff_ms
+    //                       on a successful response)
+    std::queue<request *> *m_retry_queue;
+    std::queue<request *> *m_replay_queue;
+    struct event *m_retry_drain_timer;
+    double m_current_retry_backoff_ms;
 };
 
 #endif // MEMTIER_BENCHMARK_SHARD_CONNECTION_H

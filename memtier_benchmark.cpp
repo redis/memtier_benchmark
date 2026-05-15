@@ -81,6 +81,7 @@
 #include "JSON_handler.h"
 #include "obj_gen.h"
 #include "memtier_benchmark.h"
+#include "retry_policy.h"
 #include "statsd.h"
 
 
@@ -315,6 +316,13 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             "key_stddev = %f\n"
             "key_median = %f\n"
             "reconnect_interval = %u\n"
+            "retry_on_error = %s\n"
+            "max_retries = %d\n"
+            "retry_backoff_ms = %u\n"
+            "retry_backoff_factor = %f\n"
+            "retry_on = %s\n"
+            "max_retry_queue = %u\n"
+            "failed_keys_file = %s\n"
             "connection_timeout = %u\n"
             "thread_conn_start_min_jitter_micros = %u\n"
             "thread_conn_start_max_jitter_micros = %u\n"
@@ -342,7 +350,10 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             cfg->data_size_list.print(tmpbuf, sizeof(tmpbuf) - 1), cfg->data_size_pattern, cfg->expiry_range.min,
             cfg->expiry_range.max, cfg->data_import, cfg->data_verify ? "yes" : "no", cfg->verify_only ? "yes" : "no",
             cfg->generate_keys ? "yes" : "no", cfg->key_prefix, cfg->key_minimum, cfg->key_maximum, cfg->key_pattern,
-            cfg->key_stddev, cfg->key_median, cfg->reconnect_interval, cfg->connection_timeout,
+            cfg->key_stddev, cfg->key_median, cfg->reconnect_interval, cfg->retry_on_error ? "yes" : "no",
+            cfg->max_retries, cfg->retry_backoff_ms, cfg->retry_backoff_factor,
+            cfg->retry_on_filter ? cfg->retry_on_filter : "", cfg->max_retry_queue,
+            cfg->failed_keys_file ? cfg->failed_keys_file : "", cfg->connection_timeout,
             cfg->thread_conn_start_min_jitter_micros, cfg->thread_conn_start_max_jitter_micros, cfg->multi_key_get,
             cfg->authenticate ? cfg->authenticate : "", cfg->select_db, cfg->no_expiry ? "yes" : "no",
             cfg->wait_ratio.a, cfg->wait_ratio.b, cfg->num_slaves.min, cfg->num_slaves.max, cfg->wait_timeout.min,
@@ -402,6 +413,13 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
     jsonhandler->write_obj("key_median", "%f", cfg->key_median);
     jsonhandler->write_obj("key_zipf_exp", "%f", cfg->key_zipf_exp);
     jsonhandler->write_obj("reconnect_interval", "%u", cfg->reconnect_interval);
+    jsonhandler->write_obj("retry_on_error", "\"%s\"", cfg->retry_on_error ? "true" : "false");
+    jsonhandler->write_obj("max_retries", "%d", cfg->max_retries);
+    jsonhandler->write_obj("retry_backoff_ms", "%u", cfg->retry_backoff_ms);
+    jsonhandler->write_obj("retry_backoff_factor", "%f", cfg->retry_backoff_factor);
+    jsonhandler->write_obj("retry_on", "\"%s\"", cfg->retry_on_filter ? cfg->retry_on_filter : "");
+    jsonhandler->write_obj("max_retry_queue", "%u", cfg->max_retry_queue);
+    jsonhandler->write_obj("failed_keys_file", "\"%s\"", cfg->failed_keys_file ? cfg->failed_keys_file : "");
     jsonhandler->write_obj("connection_timeout", "%u", cfg->connection_timeout);
     jsonhandler->write_obj("thread_conn_start_min_jitter_micros", "%u", cfg->thread_conn_start_min_jitter_micros);
     jsonhandler->write_obj("thread_conn_start_max_jitter_micros", "%u", cfg->thread_conn_start_max_jitter_micros);
@@ -675,6 +693,13 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_reconnect_on_error,
         o_max_reconnect_attempts,
         o_reconnect_backoff_factor,
+        o_retry_on_error,
+        o_max_retries,
+        o_retry_backoff_ms,
+        o_retry_backoff_factor,
+        o_retry_on,
+        o_max_retry_queue,
+        o_failed_keys_file,
         o_connection_timeout,
         o_thread_conn_start_min_jitter_micros,
         o_thread_conn_start_max_jitter_micros,
@@ -773,6 +798,13 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         {"reconnect-on-error", 0, 0, o_reconnect_on_error},
         {"max-reconnect-attempts", 1, 0, o_max_reconnect_attempts},
         {"reconnect-backoff-factor", 1, 0, o_reconnect_backoff_factor},
+        {"retry-on-error", 0, 0, o_retry_on_error},
+        {"max-retries", 1, 0, o_max_retries},
+        {"retry-backoff-ms", 1, 0, o_retry_backoff_ms},
+        {"retry-backoff-factor", 1, 0, o_retry_backoff_factor},
+        {"retry-on", 1, 0, o_retry_on},
+        {"max-retry-queue", 1, 0, o_max_retry_queue},
+        {"failed-keys-file", 1, 0, o_failed_keys_file},
         {"connection-timeout", 1, 0, o_connection_timeout},
         {"thread-conn-start-min-jitter-micros", 1, 0, o_thread_conn_start_min_jitter_micros},
         {"thread-conn-start-max-jitter-micros", 1, 0, o_thread_conn_start_max_jitter_micros},
@@ -1136,6 +1168,53 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 fprintf(stderr, "error: reconnect-backoff-factor must be greater than zero.\n");
                 return -1;
             }
+            break;
+        case o_retry_on_error:
+            cfg->retry_on_error = true;
+            break;
+        case o_max_retries: {
+            endptr = NULL;
+            long parsed = strtol(optarg, &endptr, 10);
+            if (!endptr || *endptr != '\0' || parsed < -1) {
+                fprintf(stderr, "error: max-retries must be an integer >= -1 (-1 means unlimited).\n");
+                return -1;
+            }
+            cfg->max_retries = (int) parsed;
+            break;
+        }
+        case o_retry_backoff_ms:
+            endptr = NULL;
+            cfg->retry_backoff_ms = (unsigned int) strtoul(optarg, &endptr, 10);
+            if (!endptr || *endptr != '\0') {
+                fprintf(stderr, "error: retry-backoff-ms must be a valid number.\n");
+                return -1;
+            }
+            break;
+        case o_retry_backoff_factor:
+            endptr = NULL;
+            cfg->retry_backoff_factor = strtod(optarg, &endptr);
+            if (cfg->retry_backoff_factor < 0.0 || !endptr || *endptr != '\0') {
+                fprintf(stderr, "error: retry-backoff-factor must be >= 0 (0 = no exponential, constant backoff).\n");
+                return -1;
+            }
+            break;
+        case o_retry_on:
+            cfg->retry_on_filter = optarg;
+            break;
+        case o_max_retry_queue:
+            endptr = NULL;
+            cfg->max_retry_queue = (unsigned int) strtoul(optarg, &endptr, 10);
+            if (!endptr || *endptr != '\0') {
+                fprintf(stderr, "error: max-retry-queue must be a valid number.\n");
+                return -1;
+            }
+            break;
+        case o_failed_keys_file:
+            if (!optarg || !*optarg) {
+                fprintf(stderr, "error: failed-keys-file requires a non-empty path.\n");
+                return -1;
+            }
+            cfg->failed_keys_file = optarg;
             break;
         case o_connection_timeout:
             endptr = NULL;
@@ -1544,6 +1623,24 @@ void usage()
         "      --reconnect-on-error       Enable automatic reconnection on connection errors (default: disabled)\n"
         "      --max-reconnect-attempts=NUM Maximum number of reconnection attempts (default: 0, unlimited)\n"
         "      --reconnect-backoff-factor=NUM Backoff factor for reconnection delays (default: 0, no backoff)\n"
+        "      --retry-on-error           Resend a request when the server returns a transient error or the\n"
+        "                                 connection drops mid-flight. Excludes permanent errors (WRONGTYPE,\n"
+        "                                 NOAUTH, NOPERM, syntax/argcount/unknown-command). Default: disabled.\n"
+        "      --max-retries=N            Maximum retries per request when --retry-on-error is set.\n"
+        "                                 -1 = unlimited (default), 0 = disable retries even with the master\n"
+        "                                 switch on, N>0 = bounded. MOVED/ASK redirects count toward this.\n"
+        "      --retry-backoff-ms=NUM     Delay between retries in milliseconds (default: 0, immediate).\n"
+        "      --retry-backoff-factor=NUM Exponential multiplier applied to retry-backoff-ms on each\n"
+        "                                 successive retry (default: 0, constant backoff).\n"
+        "      --retry-on=LIST            Restrict retries to error-status prefixes in this comma list\n"
+        "                                 (e.g. LOADING,BUSY,TRYAGAIN). Default: retry everything not\n"
+        "                                 classified as permanent.\n"
+        "      --max-retry-queue=NUM      Hard cap on per-connection retry queue depth. When full, the\n"
+        "                                 pipeline stops accepting new work until the queue drains.\n"
+        "                                 Default: 0 (auto = max(pipeline * 4, 64)).\n"
+        "      --failed-keys-file=PATH    Append every request that ultimately fails (retries exhausted or\n"
+        "                                 permanent error) as CSV: timestamp,command,key,status,retries.\n"
+        "                                 Off by default. The benchmark continues if the file is unwritable.\n"
         "      --connection-timeout=SECS  Connection timeout in seconds, 0 to disable (default: 0)\n"
         "      --thread-conn-start-min-jitter-micros=NUM Minimum jitter in microseconds between connection creation "
         "(default: 0)\n"
@@ -1987,6 +2084,8 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     unsigned long int cur_bytes_sec = 0;
     unsigned long int prev_hits = 0;
     unsigned long int prev_misses = 0;
+    unsigned long int prev_errors = 0;
+    unsigned long int prev_retry_attempts = 0;
 
     // Detect once whether stderr is a real terminal. --realtime-latencies uses
     // this to choose between in-place cursor-up redraw and plain-append output.
@@ -2037,6 +2136,9 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         unsigned long int total_connection_errors = 0;
         unsigned long int total_hits = 0;
         unsigned long int total_misses = 0;
+        unsigned long int total_errors = 0;
+        unsigned long int total_retry_attempts = 0;
+        unsigned long int total_retried_ops = 0;
 
         for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
             // Check if thread needs restart
@@ -2061,6 +2163,11 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             total_bytes += (*i)->m_cg->get_total_bytes();
             total_latency += (*i)->m_cg->get_total_latency();
             total_connection_errors += (*i)->m_cg->get_total_connection_errors();
+            if (cfg->retry_on_error) {
+                total_errors += (*i)->m_cg->get_total_errors();
+                total_retry_attempts += (*i)->m_cg->get_total_retry_attempts();
+                total_retried_ops += (*i)->m_cg->get_total_retried_ops();
+            }
             if (cfg->realtime_latencies) {
                 total_hits += (*i)->m_cg->get_total_hits();
                 total_misses += (*i)->m_cg->get_total_misses();
@@ -2164,16 +2271,28 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             else
                 snprintf(avg_miss_str, sizeof(avg_miss_str), "  -  ");
 
-            char line1[400];
+            char line1[640];
+            int line1_used = 0;
             if (total_connection_errors > 0) {
-                snprintf(line1, sizeof(line1),
-                         "%s throughput %s (avg: %s) ops/sec   %s/sec (avg: %s/sec)   miss %s (avg: %s)   conn_err %lu",
-                         tag, cur_ops_str, avg_ops_str, cur_bytes_str, bytes_str, cur_miss_str, avg_miss_str,
-                         total_connection_errors);
+                line1_used = snprintf(
+                    line1, sizeof(line1),
+                    "%s throughput %s (avg: %s) ops/sec   %s/sec (avg: %s/sec)   miss %s (avg: %s)   conn_err %lu", tag,
+                    cur_ops_str, avg_ops_str, cur_bytes_str, bytes_str, cur_miss_str, avg_miss_str,
+                    total_connection_errors);
             } else {
-                snprintf(line1, sizeof(line1),
-                         "%s throughput %s (avg: %s) ops/sec   %s/sec (avg: %s/sec)   miss %s (avg: %s)", tag,
-                         cur_ops_str, avg_ops_str, cur_bytes_str, bytes_str, cur_miss_str, avg_miss_str);
+                line1_used =
+                    snprintf(line1, sizeof(line1),
+                             "%s throughput %s (avg: %s) ops/sec   %s/sec (avg: %s/sec)   miss %s (avg: %s)", tag,
+                             cur_ops_str, avg_ops_str, cur_bytes_str, bytes_str, cur_miss_str, avg_miss_str);
+            }
+            // Retry/error tail: only printed when --retry-on-error is enabled
+            // so existing CI / log-scraping is unaffected by default.
+            if (cfg->retry_on_error && line1_used > 0 && (size_t) line1_used < sizeof(line1)) {
+                unsigned long int cur_errors = total_errors - prev_errors;
+                unsigned long int cur_retries = total_retry_attempts - prev_retry_attempts;
+                snprintf(line1 + line1_used, sizeof(line1) - line1_used,
+                         "   errors %lu (+%lu)   retries %lu (+%lu)   retried_ops %lu", total_errors, cur_errors,
+                         total_retry_attempts, cur_retries, total_retried_ops);
             }
 
             // Accumulate this tick's instantaneous percentile samples into the
@@ -2242,10 +2361,26 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             // Only show connection errors if there are any (backwards compatible output)
             fprintf(stderr,
                     "[RUN #%u %.0f%%, %3u secs] %2u threads %2u conns %lu conn errors: %11lu ops, %7lu (avg: %7lu) "
-                    "ops/sec, %s/sec (avg: %s/sec), %5.2f (avg: %5.2f) msec latency\r",
+                    "ops/sec, %s/sec (avg: %s/sec), %5.2f (avg: %5.2f) msec latency",
                     run_id, progress, (unsigned int) (duration / 1000000), active_threads, display_clients,
                     total_connection_errors, total_ops, cur_ops_sec, ops_sec, cur_bytes_str, bytes_str, cur_latency,
                     avg_latency);
+            if (cfg->retry_on_error) {
+                fprintf(stderr, "   errors %lu (+%lu)   retries %lu (+%lu)   retried_ops %lu", total_errors,
+                        total_errors - prev_errors, total_retry_attempts, total_retry_attempts - prev_retry_attempts,
+                        total_retried_ops);
+            }
+            fprintf(stderr, "\r");
+        } else if (cfg->retry_on_error && (total_errors > 0 || total_retry_attempts > 0)) {
+            // Quick path when only request-level errors / retries are non-zero.
+            fprintf(stderr,
+                    "[RUN #%u %.0f%%, %3u secs] %2u threads %2u conns: %11lu ops, %7lu (avg: %7lu) ops/sec, %s/sec "
+                    "(avg: %s/sec), %5.2f (avg: %5.2f) msec latency   errors %lu (+%lu)   retries %lu (+%lu)   "
+                    "retried_ops %lu\r",
+                    run_id, progress, (unsigned int) (duration / 1000000), active_threads, display_clients, total_ops,
+                    cur_ops_sec, ops_sec, cur_bytes_str, bytes_str, cur_latency, avg_latency, total_errors,
+                    total_errors - prev_errors, total_retry_attempts, total_retry_attempts - prev_retry_attempts,
+                    total_retried_ops);
         } else {
             fprintf(stderr,
                     "[RUN #%u %.0f%%, %3u secs] %2u threads %2u conns: %11lu ops, %7lu (avg: %7lu) ops/sec, %s/sec "
@@ -2256,6 +2391,8 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
 
         prev_hits = total_hits;
         prev_misses = total_misses;
+        prev_errors = total_errors;
+        prev_retry_attempts = total_retry_attempts;
 
         // Send metrics to StatsD if configured
         if (cfg->statsd != NULL && cfg->statsd->is_enabled()) {
@@ -2448,6 +2585,10 @@ int main(int argc, char *argv[])
     cfg.arbitrary_commands = new arbitrary_command_list();
     cfg.monitor_commands = new monitor_command_list();
     cfg.command_stats_by_type = true; // Default: aggregate by command type
+    // Retry default: -1 = unlimited (only consulted when --retry-on-error is set).
+    // 0 must remain a valid user-specified "disabled" value, so initialize the
+    // sentinel before parsing args.
+    cfg.max_retries = -1;
 
     if (config_parse_args(argc, argv, &cfg) < 0) {
         usage();
@@ -2620,6 +2761,12 @@ int main(int argc, char *argv[])
     }
 
     config_init_defaults(&cfg);
+
+    // Open the failed-keys log if requested. Failure is reported but doesn't
+    // abort the benchmark.
+    if (cfg.failed_keys_file) {
+        global_failed_keys_logger().open(cfg.failed_keys_file);
+    }
 
     // Validate staircase options (after defaults are applied)
     if (cfg.clients_start > 0) {

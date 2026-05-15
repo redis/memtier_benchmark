@@ -452,6 +452,35 @@ void cluster_client::handle_ask(unsigned int conn_id, struct timeval timestamp, 
     }
 }
 
+// Try to resend the request to the connection that now owns the key's slot.
+// Falls back to retrying on the same connection if the key is not captured
+// (e.g. arbitrary command without --retry-on-error key plumbing). Returns true
+// if ownership of `req` was transferred to a retry queue.
+bool cluster_client::retry_after_redirect(unsigned int conn_id, request *req)
+{
+    if (!m_config->retry_on_error) return false;
+    if (!req || !req->m_serialized || req->m_serialized_len == 0) return false;
+
+    unsigned int target = conn_id;
+    if (req->m_key && req->m_key_len > 0) {
+        unsigned int hslot = calc_hslot_crc16_cluster(req->m_key, req->m_key_len);
+        unsigned int mapped = m_slot_to_shard[hslot];
+        // Only route to a different connection if it's actually ready; otherwise
+        // fall back to the same connection (CLUSTER SLOTS may still be in flight).
+        if (mapped < m_connections.size() && m_connections[mapped]->get_connection_state() == conn_connected &&
+            m_connections[mapped]->get_cluster_slots_state() == setup_done) {
+            target = mapped;
+        }
+    }
+
+    m_stats.inc_retry_attempt();
+    if (m_connections[target]->enqueue_retry(req)) {
+        if (req->m_retries == 0) m_stats.inc_retried_op();
+        return true;
+    }
+    return false;
+}
+
 void cluster_client::handle_response(unsigned int conn_id, struct timeval timestamp, request *request,
                                      protocol_response *response)
 {
@@ -461,12 +490,16 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
         // handle "-MOVED"
         if (strncmp(response->get_status(), MOVED_MSG_PREFIX, MOVED_MSG_PREFIX_LEN) == 0) {
             handle_moved(conn_id, timestamp, request, response);
+            // With --retry-on-error, the captured command bytes are resent on
+            // the slot-owning connection. MOVED/ASK count toward max_retries.
+            (void) retry_after_redirect(conn_id, request);
             return;
         }
 
         // handle "-ASK"
         if (strncmp(response->get_status(), ASK_MSG_PREFIX, ASK_MSG_PREFIX_LEN) == 0) {
             handle_ask(conn_id, timestamp, request, response);
+            (void) retry_after_redirect(conn_id, request);
             return;
         }
     }

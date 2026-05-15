@@ -28,6 +28,8 @@ _memtier_completions()
                    "--statsd-host" "--statsd-port" "--statsd-prefix" "--statsd-run-label" "--graphite-port"\
                    "--monitor-input" "--hdr-file-prefix"\
                    "--max-reconnect-attempts" "--reconnect-backoff-factor" "--connection-timeout"\
+                   "--max-retries" "--retry-backoff-ms" "--retry-backoff-factor" "--retry-on"\
+                   "--max-retry-queue" "--failed-keys-file"\
                    "--thread-conn-start-min-jitter-micros" "--thread-conn-start-max-jitter-micros"\
                    "--print-percentiles" "--uri" "--sni"\
                    "--cert" "--key" "--cacert" "--tls-protocols"\
@@ -37,6 +39,7 @@ _memtier_completions()
                    "--random-data" "--data-verify" "--verify-only" "--generate-keys" "--key-stddev"\
                    "--key-median" "--key-zipf-exp" "--no-expiry" "--cluster-mode" "--scan-incremental-iteration"\
                    "--print-all-runs" "--realtime-latencies" "--tls" "--tls-skip-verify" "--reconnect-on-error"\
+                   "--retry-on-error"\
                    "--help" "--version"\
                    "-D" "-R" "-h" "-v" "-4" "-6")
 

@@ -101,6 +101,25 @@ struct benchmark_config
     bool reconnect_on_error;
     unsigned int max_reconnect_attempts;
     double reconnect_backoff_factor;
+    // Per-command retry (independent of reconnect_on_error):
+    //   retry_on_error      master switch (default: off)
+    //   max_retries         -1 = unlimited (default), 0 = disabled even with switch on, N>0 = bounded
+    //   retry_backoff_ms    delay between retries, in milliseconds (default 0, immediate)
+    //   retry_backoff_factor   exponential multiplier on retry_backoff_ms (default 0.0 = constant)
+    //   retry_on_filter     NULL = built-in classifier (retry everything except permanent set);
+    //                       non-NULL = comma-list of error-status prefixes to restrict retries to
+    //   max_retry_queue     hard cap on per-connection retry queue (0 = pipeline * 4 default)
+    bool retry_on_error;
+    int max_retries;
+    unsigned int retry_backoff_ms;
+    double retry_backoff_factor;
+    const char *retry_on_filter;
+    unsigned int max_retry_queue;
+    // When non-NULL, every request that ultimately fails (max_retries exhausted,
+    // or permanent error like WRONGTYPE) is appended as a line of CSV to this
+    // file. Off by default. Robust on errors: a failure to open or write is
+    // logged once and the benchmark continues.
+    const char *failed_keys_file;
     unsigned int connection_timeout;
     unsigned int thread_conn_start_min_jitter_micros;
     unsigned int thread_conn_start_max_jitter_micros;

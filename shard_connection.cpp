@@ -49,6 +49,7 @@
 #include "memtier_benchmark.h"
 #include "connections_manager.h"
 #include "client.h"
+#include "retry_policy.h"
 #include "event2/bufferevent.h"
 
 #ifdef USE_TLS
@@ -78,6 +79,13 @@ void cluster_client_connection_timeout_handler(evutil_socket_t fd, short what, v
     sc->handle_connection_timeout_event();
 }
 
+void cluster_client_retry_drain_handler(evutil_socket_t fd, short what, void *ctx)
+{
+    shard_connection *sc = (shard_connection *) ctx;
+    assert(sc != NULL);
+    sc->handle_retry_drain_event();
+}
+
 void cluster_client_read_handler(bufferevent *bev, void *ctx)
 {
     shard_connection *sc = (shard_connection *) ctx;
@@ -93,13 +101,64 @@ void cluster_client_event_handler(bufferevent *bev, short events, void *ctx)
 }
 
 request::request(request_type type, unsigned int size, struct timeval *sent_time, unsigned int keys) :
-        m_type(type), m_size(size), m_keys(keys)
+        m_type(type),
+        m_size(size),
+        m_keys(keys),
+        m_retries(0),
+        m_claimed_by_retry(false),
+        m_serialized(NULL),
+        m_serialized_len(0),
+        m_key(NULL),
+        m_key_len(0)
 {
     if (sent_time != NULL)
         m_sent_time = *sent_time;
     else {
         gettimeofday(&m_sent_time, NULL);
     }
+    m_first_sent_time = m_sent_time;
+}
+
+request::~request(void)
+{
+    if (m_serialized) {
+        free(m_serialized);
+        m_serialized = NULL;
+        m_serialized_len = 0;
+    }
+    if (m_key) {
+        free(m_key);
+        m_key = NULL;
+        m_key_len = 0;
+    }
+}
+
+void request::set_serialized(const char *data, size_t len)
+{
+    if (m_serialized) {
+        free(m_serialized);
+        m_serialized = NULL;
+        m_serialized_len = 0;
+    }
+    if (!data || len == 0) return;
+    m_serialized = (char *) malloc(len);
+    if (!m_serialized) return; // best-effort capture; replay just won't work
+    memcpy(m_serialized, data, len);
+    m_serialized_len = len;
+}
+
+void request::set_key_for_log(const char *key, unsigned int key_len)
+{
+    if (m_key) {
+        free(m_key);
+        m_key = NULL;
+        m_key_len = 0;
+    }
+    if (!key || key_len == 0) return;
+    m_key = (char *) malloc(key_len);
+    if (!m_key) return;
+    memcpy(m_key, key, key_len);
+    m_key_len = key_len;
 }
 
 arbitrary_request::arbitrary_request(size_t request_index, request_type type, unsigned int size,
@@ -110,12 +169,10 @@ arbitrary_request::arbitrary_request(size_t request_index, request_type type, un
 
 verify_request::verify_request(request_type type, unsigned int size, struct timeval *sent_time, unsigned int keys,
                                const char *key, unsigned int key_len, const char *value, unsigned int value_len) :
-        request(type, size, sent_time, keys), m_key(NULL), m_key_len(0), m_value(NULL), m_value_len(0)
+        request(type, size, sent_time, keys), m_value(NULL), m_value_len(0)
 {
-    m_key_len = key_len;
-    m_key = (char *) malloc(key_len);
-    memcpy(m_key, key, m_key_len);
-
+    // base class holds the key for both verification + failed-keys logging.
+    set_key_for_log(key, key_len);
     m_value_len = value_len;
     m_value = (char *) malloc(value_len);
     memcpy(m_value, value, m_value_len);
@@ -123,10 +180,6 @@ verify_request::verify_request(request_type type, unsigned int size, struct time
 
 verify_request::~verify_request(void)
 {
-    if (m_key != NULL) {
-        free((void *) m_key);
-        m_key = NULL;
-    }
     if (m_value != NULL) {
         free((void *) m_value);
         m_value = NULL;
@@ -151,7 +204,11 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_current_backoff_delay(1.0),
         m_reconnect_timer(NULL),
         m_reconnecting(false),
-        m_connection_timeout_timer(NULL)
+        m_connection_timeout_timer(NULL),
+        m_retry_queue(NULL),
+        m_replay_queue(NULL),
+        m_retry_drain_timer(NULL),
+        m_current_retry_backoff_ms(0.0)
 {
     m_id = id;
     m_conns_manager = conns_man;
@@ -172,6 +229,12 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
 
     m_pipeline = new std::queue<request *>;
     assert(m_pipeline != NULL);
+
+    if (m_config->retry_on_error) {
+        m_retry_queue = new std::queue<request *>;
+        m_replay_queue = new std::queue<request *>;
+        m_current_retry_backoff_ms = (double) m_config->retry_backoff_ms;
+    }
 }
 
 shard_connection::~shard_connection()
@@ -219,6 +282,29 @@ shard_connection::~shard_connection()
     if (m_pipeline != NULL) {
         delete m_pipeline;
         m_pipeline = NULL;
+    }
+
+    if (m_retry_drain_timer != NULL) {
+        event_free(m_retry_drain_timer);
+        m_retry_drain_timer = NULL;
+    }
+
+    if (m_retry_queue != NULL) {
+        while (!m_retry_queue->empty()) {
+            delete m_retry_queue->front();
+            m_retry_queue->pop();
+        }
+        delete m_retry_queue;
+        m_retry_queue = NULL;
+    }
+
+    if (m_replay_queue != NULL) {
+        while (!m_replay_queue->empty()) {
+            delete m_replay_queue->front();
+            m_replay_queue->pop();
+        }
+        delete m_replay_queue;
+        m_replay_queue = NULL;
     }
 }
 
@@ -364,9 +450,29 @@ void shard_connection::disconnect()
         m_connection_timeout_timer = NULL;
     }
 
-    // empty pipeline
-    while (m_pending_resp)
-        delete pop_req();
+    // Drain pipeline. With --retry-on-error, move in-flight requests into the
+    // replay queue so they get resent after reconnect. Otherwise, discard them
+    // as before.
+    if (m_config->retry_on_error && m_replay_queue != NULL) {
+        while (m_pending_resp) {
+            request *req = pop_req();
+            // Only setup commands have no serialized capture (we never attempt
+            // capture for those) — drop those.
+            if (req->m_type == rt_auth || req->m_type == rt_select_db || req->m_type == rt_cluster_slots ||
+                req->m_type == rt_hello) {
+                delete req;
+                continue;
+            }
+            if (req->m_serialized && req->m_serialized_len > 0) {
+                m_replay_queue->push(req);
+            } else {
+                delete req;
+            }
+        }
+    } else {
+        while (m_pending_resp)
+            delete pop_req();
+    }
 
     m_connection_state = conn_disconnected;
 
@@ -500,6 +606,178 @@ void shard_connection::push_req(request *req)
     }
 }
 
+void shard_connection::capture_serialized_bytes(size_t before_pos, request *req)
+{
+    if (!m_config->retry_on_error || !m_bev || !req) return;
+
+    struct evbuffer *out = bufferevent_get_output(m_bev);
+    size_t after_pos = evbuffer_get_length(out);
+    if (after_pos <= before_pos) return;
+    size_t len = after_pos - before_pos;
+
+    char *buf = (char *) malloc(len);
+    if (!buf) {
+        benchmark_debug_log("retry: failed to allocate %zu bytes for capture (conn %u)\n", len, m_id);
+        return;
+    }
+
+    struct evbuffer_ptr p;
+    if (evbuffer_ptr_set(out, &p, before_pos, EVBUFFER_PTR_SET) != 0) {
+        free(buf);
+        return;
+    }
+
+    struct evbuffer_iovec vecs[8];
+    int n = evbuffer_peek(out, (ev_ssize_t) len, &p, vecs, 8);
+    if (n < 0) {
+        free(buf);
+        return;
+    }
+    if (n > 8) {
+        struct evbuffer_iovec *dyn = (struct evbuffer_iovec *) malloc((size_t) n * sizeof(*dyn));
+        if (!dyn) {
+            free(buf);
+            return;
+        }
+        int n2 = evbuffer_peek(out, (ev_ssize_t) len, &p, dyn, n);
+        if (n2 == n) {
+            size_t off = 0;
+            for (int i = 0; i < n2 && off < len; i++) {
+                size_t take = dyn[i].iov_len;
+                if (off + take > len) take = len - off;
+                memcpy(buf + off, dyn[i].iov_base, take);
+                off += take;
+            }
+            req->m_serialized = buf;
+            req->m_serialized_len = len;
+            buf = NULL; // ownership transferred
+        }
+        free(dyn);
+        if (buf) free(buf);
+        return;
+    }
+
+    size_t off = 0;
+    for (int i = 0; i < n && off < len; i++) {
+        size_t take = vecs[i].iov_len;
+        if (off + take > len) take = len - off;
+        memcpy(buf + off, vecs[i].iov_base, take);
+        off += take;
+    }
+    req->m_serialized = buf;
+    req->m_serialized_len = len;
+}
+
+bool shard_connection::retry_queue_full() const
+{
+    if (!m_retry_queue) return false;
+    unsigned int cap = m_config->max_retry_queue;
+    if (cap == 0) {
+        // Auto cap: pipeline * 4, floor of 64.
+        cap = m_config->pipeline * 4;
+        if (cap < 64) cap = 64;
+    }
+    return m_retry_queue->size() >= cap;
+}
+
+bool shard_connection::enqueue_retry(request *req)
+{
+    if (!m_config->retry_on_error || !m_retry_queue) return false;
+    if (!req || !req->m_serialized || req->m_serialized_len == 0) return false;
+
+    // Honor max_retries (always counts; MOVED/ASK count too).
+    if (m_config->max_retries >= 0 && (int) req->m_retries >= m_config->max_retries) {
+        return false;
+    }
+
+    if (retry_queue_full()) {
+        // Caller treats this as terminal: log + finalize.
+        return false;
+    }
+
+    req->m_claimed_by_retry = true;
+    m_retry_queue->push(req);
+
+    // (Re)schedule the drain timer if we have a backoff configured. With zero
+    // backoff we still go through the timer with a 0 ms delay to keep the
+    // ordering predictable and the libevent integration simple.
+    if (m_retry_drain_timer == NULL) {
+        m_retry_drain_timer = event_new(m_event_base, -1, 0, cluster_client_retry_drain_handler, (void *) this);
+    }
+    if (m_retry_drain_timer != NULL) {
+        // Only (re)add if not pending.
+        if (!evtimer_pending(m_retry_drain_timer, NULL)) {
+            double ms = m_current_retry_backoff_ms;
+            struct timeval delay;
+            delay.tv_sec = (long) (ms / 1000.0);
+            delay.tv_usec = (long) ((ms - delay.tv_sec * 1000.0) * 1000.0);
+            event_add(m_retry_drain_timer, &delay);
+        }
+    }
+
+    // Exponential backoff for the *next* retry on this connection.
+    if (m_config->retry_backoff_factor > 0.0) {
+        m_current_retry_backoff_ms *= m_config->retry_backoff_factor;
+    }
+
+    return true;
+}
+
+void shard_connection::replay_request(request *req)
+{
+    if (!req || !req->m_serialized || !m_bev) return;
+    struct evbuffer *out = bufferevent_get_output(m_bev);
+    evbuffer_add(out, req->m_serialized, req->m_serialized_len);
+    gettimeofday(&req->m_sent_time, NULL);
+    req->m_retries++;
+    // Back in the pipeline: ownership returns to the normal flow.
+    req->m_claimed_by_retry = false;
+    push_req(req);
+}
+
+void shard_connection::handle_retry_drain_event()
+{
+    if (!m_retry_queue || m_retry_queue->empty()) return;
+    // Only drain if the connection is actually usable.
+    if (m_connection_state != conn_connected || !m_bev) {
+        // Will retry once we reconnect (handled by drain_replay_queue_after_reconnect).
+        return;
+    }
+    while (!m_retry_queue->empty()) {
+        request *req = m_retry_queue->front();
+        m_retry_queue->pop();
+        replay_request(req);
+    }
+}
+
+void shard_connection::drain_replay_queue_after_reconnect()
+{
+    if (!m_replay_queue) return;
+    while (!m_replay_queue->empty()) {
+        request *req = m_replay_queue->front();
+        m_replay_queue->pop();
+        // Each replay counts toward max_retries.
+        if (m_config->max_retries >= 0 && (int) req->m_retries >= m_config->max_retries) {
+            struct timeval now;
+            gettimeofday(&now, NULL);
+            global_failed_keys_logger().log_failure(now, "REPLAY", req->m_key, req->m_key_len, "connection-dropped",
+                                                    req->m_retries);
+            delete req;
+            continue;
+        }
+        if (!req->m_serialized || req->m_serialized_len == 0) {
+            // Can't replay — capture failed earlier. Drop with a log line.
+            struct timeval now;
+            gettimeofday(&now, NULL);
+            global_failed_keys_logger().log_failure(now, "REPLAY", req->m_key, req->m_key_len,
+                                                    "no-captured-bytes-for-replay", req->m_retries);
+            delete req;
+            continue;
+        }
+        replay_request(req);
+    }
+}
+
 bool shard_connection::is_conn_setup_done()
 {
     return m_authentication == setup_done && m_db_selection == setup_done && m_cluster_slots == setup_done &&
@@ -603,7 +881,11 @@ void shard_connection::process_response(void)
             responses_handled = true;
             break;
         }
-        delete req;
+        // The retry path may have claimed ownership of req for resend; in that
+        // case the retry queue / replay path is responsible for freeing it.
+        if (!req->m_claimed_by_retry) {
+            delete req;
+        }
         if (error) {
             return;
         }
@@ -656,6 +938,13 @@ void shard_connection::fill_pipeline(void)
 
         // don't exceed requests
         if (m_conns_manager->hold_pipeline(m_id)) {
+            break;
+        }
+
+        // Hold new work while the retry queue is at its hard cap. The drain
+        // timer will reschedule fill_pipeline via the event loop once it makes
+        // progress.
+        if (retry_queue_full()) {
             break;
         }
 
@@ -715,6 +1004,14 @@ void shard_connection::handle_event(short events)
             m_request_per_cur_interval = m_config->request_per_interval;
             m_event_timer = event_new(m_event_base, -1, EV_PERSIST, cluster_client_timer_handler, (void *) this);
             event_add(m_event_timer, &interval);
+        }
+
+        // After (re)connect: replay any in-flight requests that survived the
+        // disconnect. This must happen *before* fill_pipeline() so the old
+        // requests get back on the wire first; otherwise pipeline ordering
+        // would shuffle replayed work behind fresh work.
+        if (m_config->retry_on_error && m_replay_queue && !m_replay_queue->empty()) {
+            drain_replay_queue_after_reconnect();
         }
 
         if (!m_conns_manager->get_reqs_processed()) {
@@ -873,8 +1170,11 @@ void shard_connection::send_wait_command(struct timeval *sent_time, unsigned int
 
     benchmark_debug_log("WAIT num_slaves=%u timeout=%u\n", num_slaves, timeout);
 
+    size_t before = (m_bev && m_config->retry_on_error) ? evbuffer_get_length(bufferevent_get_output(m_bev)) : 0;
     cmd_size = m_protocol->write_command_wait(num_slaves, timeout);
-    push_req(new request(rt_wait, cmd_size, sent_time, 0));
+    request *req = new request(rt_wait, cmd_size, sent_time, 0);
+    if (m_config->retry_on_error) capture_serialized_bytes(before, req);
+    push_req(req);
 }
 
 void shard_connection::send_set_command(struct timeval *sent_time, const char *key, int key_len, const char *value,
@@ -885,9 +1185,15 @@ void shard_connection::send_set_command(struct timeval *sent_time, const char *k
     benchmark_debug_log("server %s: SET key=[%.*s] value_len=%u expiry=%u\n", get_readable_id(), key_len, key,
                         value_len, expiry);
 
+    size_t before = (m_bev && m_config->retry_on_error) ? evbuffer_get_length(bufferevent_get_output(m_bev)) : 0;
     cmd_size = m_protocol->write_command_set(key, key_len, value, value_len, expiry, offset);
 
-    push_req(new request(rt_set, cmd_size, sent_time, 1));
+    request *req = new request(rt_set, cmd_size, sent_time, 1);
+    if (m_config->retry_on_error) {
+        capture_serialized_bytes(before, req);
+        if (key_len > 0) req->set_key_for_log(key, (unsigned int) key_len);
+    }
+    push_req(req);
 }
 
 
@@ -896,9 +1202,15 @@ void shard_connection::send_get_command(struct timeval *sent_time, const char *k
     int cmd_size = 0;
 
     benchmark_debug_log("server %s: GET key=[%.*s]\n", get_readable_id(), key_len, key);
+    size_t before = (m_bev && m_config->retry_on_error) ? evbuffer_get_length(bufferevent_get_output(m_bev)) : 0;
     cmd_size = m_protocol->write_command_get(key, key_len, offset);
 
-    push_req(new request(rt_get, cmd_size, sent_time, 1));
+    request *req = new request(rt_get, cmd_size, sent_time, 1);
+    if (m_config->retry_on_error) {
+        capture_serialized_bytes(before, req);
+        if (key_len > 0) req->set_key_for_log(key, (unsigned int) key_len);
+    }
+    push_req(req);
 }
 
 void shard_connection::send_mget_command(struct timeval *sent_time, const keylist *key_list)
@@ -913,8 +1225,15 @@ void shard_connection::send_mget_command(struct timeval *sent_time, const keylis
     benchmark_debug_log("MGET %d keys [%.*s] .. [%.*s]\n", key_list->get_keys_count(), first_key_len, first_key,
                         last_key_len, last_key);
 
+    size_t before = (m_bev && m_config->retry_on_error) ? evbuffer_get_length(bufferevent_get_output(m_bev)) : 0;
     cmd_size = m_protocol->write_command_multi_get(key_list);
-    push_req(new request(rt_get, cmd_size, sent_time, key_list->get_keys_count()));
+    request *req = new request(rt_get, cmd_size, sent_time, key_list->get_keys_count());
+    if (m_config->retry_on_error) {
+        capture_serialized_bytes(before, req);
+        // Log the first key only — MGET keys are listed in the same record.
+        if (first_key_len > 0) req->set_key_for_log(first_key, first_key_len);
+    }
+    push_req(req);
 }
 
 void shard_connection::send_verify_get_command(struct timeval *sent_time, const char *key, int key_len,
@@ -924,8 +1243,12 @@ void shard_connection::send_verify_get_command(struct timeval *sent_time, const 
 
     benchmark_debug_log("Verify GET key=[%.*s] value_len=%u\n", key_len, key, value_len);
 
+    size_t before = (m_bev && m_config->retry_on_error) ? evbuffer_get_length(bufferevent_get_output(m_bev)) : 0;
     cmd_size = m_protocol->write_command_get(key, key_len, offset);
-    push_req(new verify_request(rt_get, cmd_size, sent_time, 1, key, key_len, value, value_len));
+    verify_request *vr = new verify_request(rt_get, cmd_size, sent_time, 1, key, key_len, value, value_len);
+    // verify_request constructor already stored the key via base set_key_for_log.
+    if (m_config->retry_on_error) capture_serialized_bytes(before, vr);
+    push_req(vr);
 }
 
 /*
@@ -966,5 +1289,14 @@ int shard_connection::send_arbitrary_command(const command_arg *arg, const char 
 
 void shard_connection::send_arbitrary_command_end(size_t command_index, struct timeval *sent_time, int cmd_size)
 {
-    push_req(new arbitrary_request(command_index, rt_arbitrary, cmd_size, sent_time));
+    arbitrary_request *req = new arbitrary_request(command_index, rt_arbitrary, cmd_size, sent_time);
+    if (m_config->retry_on_error && m_bev && cmd_size > 0) {
+        // Bytes were written across N calls to send_arbitrary_command; use
+        // cmd_size to recover the start offset.
+        size_t after = evbuffer_get_length(bufferevent_get_output(m_bev));
+        if (after >= (size_t) cmd_size) {
+            capture_serialized_bytes(after - (size_t) cmd_size, req);
+        }
+    }
+    push_req(req);
 }
