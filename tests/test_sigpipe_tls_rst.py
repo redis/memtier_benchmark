@@ -29,7 +29,6 @@ import shutil
 import signal
 import socket
 import ssl
-import struct
 import subprocess
 import tempfile
 import threading
@@ -118,21 +117,37 @@ class _TlsRstTarpit:
             except socket.timeout:
                 continue
             try:
-                tls = ctx.wrap_socket(raw, server_side=True, do_handshake_on_connect=True)
+                tls = ctx.wrap_socket(
+                    raw, server_side=True, do_handshake_on_connect=True
+                )
                 try:
-                    tls.settimeout(0.05)
-                    tls.recv(8192)
+                    tls.settimeout(0.3)
+                    tls.recv(65536)  # let memtier pipeline several writes
                 except Exception:
                     pass
-                # Force RST on close: SO_LINGER {l_onoff=1, l_linger=0}.
+                # SIGPIPE-triggering close sequence:
+                #
+                # Skip TLS close_notify and skip SO_LINGER. Just close the
+                # underlying fd. The kernel sends a graceful FIN. memtier
+                # has --pipeline=N writes queued; libevent's openssl
+                # bufferevent flushes them via SSL_write. The first writes
+                # after FIN succeed locally (data goes into the wire), but
+                # the peer kernel sees them on a fully-closed socket and
+                # responds with RST. memtier's NEXT SSL_write (still
+                # pipelined) then hits an RST-marked fd: write() returns
+                # EPIPE AND the kernel raises SIGPIPE in the writer thread
+                # (SSL_write doesn't pass MSG_NOSIGNAL). Without
+                # signal(SIGPIPE, SIG_IGN), SIG_DFL kills the process with
+                # exit 141 before EPIPE is observed.
+                #
+                # Forcing RST directly via SO_LINGER (pre-wrap on raw, or
+                # post-wrap on a re-wrapped fd via tls.detach()) RSTs
+                # *during* handshake completion, which never gives memtier
+                # a chance to build up a pipeline -- the natural close
+                # path above is the one that exercises the production
+                # race.
                 try:
-                    raw.setsockopt(
-                        socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
-                    )
-                except Exception:
-                    pass
-                try:
-                    raw.close()
+                    tls.close()
                 except Exception:
                     pass
                 self.reset_count += 1
