@@ -47,6 +47,7 @@
 #include "cluster_client.h"
 #include "memtier_benchmark.h"
 #include "obj_gen.h"
+#include "retry_policy.h"
 #include "shard_connection.h"
 
 #define KEY_INDEX_QUEUE_MAX_SIZE 1000000
@@ -473,12 +474,38 @@ bool cluster_client::retry_after_redirect(unsigned int conn_id, request *req)
         }
     }
 
-    m_stats.inc_retry_attempt();
     if (m_connections[target]->enqueue_retry(req)) {
+        m_stats.inc_retry_attempt();
         if (req->m_retries == 0) m_stats.inc_retried_op();
         return true;
     }
     return false;
+}
+
+// Terminal accounting for a MOVED/ASK request whose retry was refused (e.g.
+// max_retries exhausted or retry queue full). Without this, the request would
+// disappear from all accounting silently.
+void cluster_client::finalize_dropped_redirect(struct timeval timestamp, request *req, protocol_response *response)
+{
+    if (m_config->failed_keys_file) {
+        const char *cmd = "REDIRECT";
+        switch (req->m_type) {
+        case rt_get:
+            cmd = "GET";
+            break;
+        case rt_set:
+            cmd = "SET";
+            break;
+        case rt_arbitrary:
+            cmd = "ARBITRARY";
+            break;
+        default:
+            break;
+        }
+        global_failed_keys_logger().log_failure(timestamp, cmd, req->m_key, req->m_key_len, response->get_status(),
+                                                req->m_retries);
+    }
+    m_stats.inc_error();
 }
 
 void cluster_client::handle_response(unsigned int conn_id, struct timeval timestamp, request *request,
@@ -492,14 +519,21 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
             handle_moved(conn_id, timestamp, request, response);
             // With --retry-on-error, the captured command bytes are resent on
             // the slot-owning connection. MOVED/ASK count toward max_retries.
-            (void) retry_after_redirect(conn_id, request);
+            // If the retry is refused (budget exhausted / queue full / no
+            // captured bytes), account it as a terminal error so the request
+            // doesn't silently disappear from the stats.
+            if (m_config->retry_on_error && !retry_after_redirect(conn_id, request)) {
+                finalize_dropped_redirect(timestamp, request, response);
+            }
             return;
         }
 
         // handle "-ASK"
         if (strncmp(response->get_status(), ASK_MSG_PREFIX, ASK_MSG_PREFIX_LEN) == 0) {
             handle_ask(conn_id, timestamp, request, response);
-            (void) retry_after_redirect(conn_id, request);
+            if (m_config->retry_on_error && !retry_after_redirect(conn_id, request)) {
+                finalize_dropped_redirect(timestamp, request, response);
+            }
             return;
         }
     }

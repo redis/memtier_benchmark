@@ -469,6 +469,26 @@ void shard_connection::disconnect()
                 delete req;
             }
         }
+        // Also rescue requests sitting in the per-connection retry queue
+        // (waiting for a backoff timer to fire). Without this, the backoff
+        // timer's connection check (handle_retry_drain_event) would silently
+        // leave them stranded after reconnect.
+        if (m_retry_queue != NULL) {
+            while (!m_retry_queue->empty()) {
+                request *req = m_retry_queue->front();
+                m_retry_queue->pop();
+                if (req->m_serialized && req->m_serialized_len > 0) {
+                    m_replay_queue->push(req);
+                } else {
+                    delete req;
+                }
+            }
+        }
+        // Cancel any pending drain timer — it has nothing to drain now and
+        // will be re-armed after reconnect by drain_replay_queue_after_reconnect.
+        if (m_retry_drain_timer != NULL && evtimer_pending(m_retry_drain_timer, NULL)) {
+            evtimer_del(m_retry_drain_timer);
+        }
     } else {
         while (m_pending_resp)
             delete pop_req();

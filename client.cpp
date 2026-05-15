@@ -685,15 +685,17 @@ void client::handle_response(unsigned int conn_id, struct timeval timestamp, req
         // accounting below.
         if (m_config->retry_on_error && is_retryable_error(response->get_status(), m_config->retry_on_filter)) {
             shard_connection *sc = m_connections[conn_id];
-            m_stats.inc_retry_attempt();
             if (sc->enqueue_retry(request)) {
                 // Ownership transferred to the retry queue (signalled by
                 // request->m_claimed_by_retry = true). process_response skips
                 // its delete; the request is freed when the retry queue or
                 // replay path drains it.
+                m_stats.inc_retry_attempt();
                 if (request->m_retries == 0) m_stats.inc_retried_op();
                 return;
             }
+            // enqueue_retry refused (max retries exceeded / queue full / no
+            // captured bytes). Fall through to permanent-failure accounting.
         }
 
         // Permanent failure path: log to failed-keys file (if configured),
@@ -848,11 +850,12 @@ void verify_client::handle_response(unsigned int conn_id, struct timeval timesta
         // permanent errors (and value-mismatch below) always count.
         if (m_config->retry_on_error && is_retryable_error(response->get_status(), m_config->retry_on_filter)) {
             shard_connection *sc = m_connections[conn_id];
-            m_stats.inc_retry_attempt();
             if (sc->enqueue_retry(request)) {
+                m_stats.inc_retry_attempt();
                 if (request->m_retries == 0) m_stats.inc_retried_op();
                 return;
             }
+            // enqueue refused — fall through to terminal-failure accounting.
         }
         if (m_config->failed_keys_file) {
             global_failed_keys_logger().log_failure(timestamp, "GET", vr->m_key, vr->m_key_len, response->get_status(),
@@ -870,6 +873,14 @@ void verify_client::handle_response(unsigned int conn_id, struct timeval timesta
         } else {
             benchmark_debug_log("key: [%.*s] verified successfuly.\n", vr->m_key_len, vr->m_key);
             m_verified_keys++;
+        }
+        // Reset retry backoff after a non-error protocol response, matching
+        // client::handle_response. A value mismatch is a successful round-trip
+        // from the server's perspective, so the backoff should reset on either
+        // branch — without this, a transient error burst keeps the
+        // per-connection backoff inflated.
+        if (m_config->retry_on_error && request->m_retries > 0) {
+            m_connections[conn_id]->reset_retry_backoff();
         }
     }
 }
