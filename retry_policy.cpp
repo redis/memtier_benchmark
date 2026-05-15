@@ -162,32 +162,43 @@ void failed_keys_logger::close()
 // Escape `in` for CSV: wrap in quotes, double inner quotes, hex-escape any
 // non-printable byte. Writes into `out` (size out_sz) and returns the number
 // of bytes written (excluding trailing NUL). Always NUL-terminates if out_sz > 0.
+//
+// Plain control-flow only (no C++11 lambdas) so older macOS Apple Clang
+// images on CI compile cleanly.
 static size_t csv_escape(const char *in, unsigned int in_len, char *out, size_t out_sz)
 {
     if (out_sz == 0) return 0;
-    size_t o = 0;
-    auto put = [&](char c) -> bool {
-        if (o + 1 >= out_sz) return false;
-        out[o++] = c;
-        return true;
-    };
-    if (!put('"')) {
+    if (out_sz < 3) {
+        // Not enough room even for an empty quoted string: write what we can
+        // and bail. out[0] = '\0' guarantees a valid C string.
         out[0] = '\0';
         return 0;
     }
+    size_t o = 0;
+    out[o++] = '"';
     for (unsigned int i = 0; i < in_len; i++) {
         unsigned char c = (unsigned char) in[i];
         if (c == '"') {
-            if (!put('"') || !put('"')) break;
+            // Need 2 bytes for "" + 1 for trailing quote + 1 for NUL.
+            if (o + 3 >= out_sz) break;
+            out[o++] = '"';
+            out[o++] = '"';
         } else if (c >= 0x20 && c <= 0x7e) {
-            if (!put((char) c)) break;
+            if (o + 2 >= out_sz) break;
+            out[o++] = (char) c;
         } else {
-            // hex-escape: \xHH
-            if (o + 4 >= out_sz) break;
-            o += snprintf(out + o, out_sz - o, "\\x%02x", c);
+            // hex-escape: \xHH (4 bytes) + 1 trailing quote + 1 NUL = need 6 free.
+            if (o + 5 >= out_sz) break;
+            int n = snprintf(out + o, out_sz - o, "\\x%02x", c);
+            if (n < 0 || (size_t) n >= out_sz - o) break;
+            o += (size_t) n;
         }
     }
-    if (o + 1 >= out_sz) o = out_sz - 2;
+    if (o + 1 >= out_sz) {
+        // Should not happen given the per-iteration checks, but defensively
+        // bail to keep room for the trailing quote and NUL.
+        o = out_sz - 2;
+    }
     out[o++] = '"';
     out[o] = '\0';
     return o;
