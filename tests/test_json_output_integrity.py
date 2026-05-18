@@ -106,7 +106,14 @@ def _assert_time_series_consistent(env, section_name, section):
         avg = float(bucket["Average Latency"])
         acc = float(bucket["Accumulated Latency"])
         derived = acc / count
-        tolerance = max(ABS_TOLERANCE_MS, REL_TOLERANCE * derived)
+        # Tolerance must include the quantization error on Accumulated Latency:
+        # it's emitted with %lld (1 ms precision), so the reported value can
+        # differ from the true sum by up to 1 ms. The derived avg is therefore
+        # off by up to (1 / count) ms. For low-count buckets — e.g. the trailing
+        # second of a short --test-time run with --reconnect-interval=1 — that
+        # term dominates and the static 2% relative + 0.01 ms absolute floor
+        # would false-positive (RED-197205 regression-test CI surfaced this).
+        tolerance = max(ABS_TOLERANCE_MS, REL_TOLERANCE * derived, 1.0 / count)
         if acc > 0:
             env.assertGreater(
                 avg, 0.0,
