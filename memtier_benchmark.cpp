@@ -2414,8 +2414,11 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             rows[row_idx].hist = rtl_totals_hist;
             rows[row_idx].has_data = overall_has_data;
 
-            // Build chunked strings for every row.
-            std::vector<std::vector<std::string>> row_chunks(num_rows, std::vector<std::string>(chunks_per_row));
+            // Build chunked strings for every row. typedef avoids the nested
+            // '>>' template-close token so legacy macOS openssl-1.0.2 / 1.1
+            // builds (which don't pick up -std=c++11) still parse this.
+            typedef std::vector<std::string> row_chunks_t;
+            std::vector<row_chunks_t> row_chunks(num_rows, row_chunks_t(chunks_per_row));
             bool any_row_has_data = false;
             for (size_t r = 0; r < num_rows; r++) {
                 if (rows[r].has_data) any_row_has_data = true;
