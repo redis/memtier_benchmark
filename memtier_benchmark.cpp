@@ -583,6 +583,7 @@ static void config_init_defaults(struct benchmark_config *cfg)
     if (!cfg->requests && !cfg->test_time) cfg->requests = 10000;
     if (!cfg->hdr_prefix) cfg->hdr_prefix = "";
     if (!cfg->print_percentiles.is_defined()) cfg->print_percentiles = config_quantiles("50,99,99.9");
+    // latency_window_secs default is set pre-parse so 0 stays a valid user "disabled" value.
     if (!cfg->monitor_pattern) cfg->monitor_pattern = 'S';
 
     // StatsD defaults - port only matters if host is set
@@ -686,6 +687,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_print_percentiles,
         o_print_all_runs,
         o_realtime_latencies,
+        o_latency_window,
         o_distinct_client_seed,
         o_randomize,
         o_client_stats,
@@ -768,6 +770,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         {"print-percentiles", 1, 0, o_print_percentiles},
         {"print-all-runs", 0, 0, o_print_all_runs},
         {"realtime-latencies", 0, 0, o_realtime_latencies},
+        {"latency-window", 1, 0, o_latency_window},
         {"distinct-client-seed", 0, 0, o_distinct_client_seed},
         {"randomize", 0, 0, o_randomize},
         {"requests", 1, 0, 'n'},
@@ -954,6 +957,21 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             break;
         case o_realtime_latencies:
             cfg->realtime_latencies = true;
+            break;
+        case o_latency_window:
+            endptr = NULL;
+            cfg->latency_window_secs = (unsigned int) strtoul(optarg, &endptr, 10);
+            if (!endptr || *endptr != '\0') {
+                fprintf(stderr, "error: latency-window must be a non-negative integer (seconds).\n");
+                return -1;
+            }
+            // Cap the ring size to avoid runaway memory: each snapshot is a full
+            // hdr_histogram (~tens of KB). 3600 lets you express a 1-hour
+            // tail-latency window, well past load1/5/15 territory.
+            if (cfg->latency_window_secs > 3600) {
+                fprintf(stderr, "error: latency-window must be <= 3600 seconds.\n");
+                return -1;
+            }
             break;
         case o_distinct_client_seed:
             cfg->distinct_client_seed++;
@@ -1588,9 +1606,13 @@ void usage()
         "      --print-all-runs           When performing multiple test iterations, print and save results for all "
         "iterations\n"
         "      --realtime-latencies       Replace the periodic single-line progress output with a per-tick block: "
-        "line 1 = throughput + miss ratio, then one or more latency lines carrying the percentiles configured by "
-        "--print-percentiles (immediate and overall, side-by-side). Redraws in place on a TTY; appends cleanly when "
-        "stderr is redirected to a file.\n"
+        "line 1 = throughput + miss ratio, then three labeled latency rows per percentile - inst (last tick), "
+        "win<N>s (sliding window, see --latency-window) and overall (full run). Redraws in place on a TTY; "
+        "appends cleanly when stderr is redirected to a file.\n"
+        "      --latency-window=SECS      Sliding-window size for the win<N>s tail-latency row in "
+        "--realtime-latencies output. Acts like load1/5/15 for tail latency: each tick the per-second histogram "
+        "is pushed into a ring of N snapshots and percentiles are computed over the live ring. Default: 60. "
+        "Set to 0 to disable the windowed row. Max: 3600.\n"
         "      --command-stats-breakdown=command|line\n"
         "                                 How to group command statistics in the output (default: command)\n"
         "                                 command: aggregate by command name (first word, e.g., SET, GET)\n"
@@ -2094,10 +2116,25 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
 
     // Cumulative latency histogram for --realtime-latencies "overall" percentiles.
     // We hdr_add each tick's aggregated inst histogram into this so the percentiles
-    // shown in '(avg: X.XXX)' reflect the whole run, not just the last second.
+    // shown for the 'overall' row reflect the whole run, not just the last second.
     hdr_histogram *rtl_totals_hist = NULL;
     if (cfg->realtime_latencies) {
         hdr_init(LATENCY_HDR_MIN_VALUE, LATENCY_HDR_SEC_MAX_VALUE, LATENCY_HDR_SEC_SIGDIGTS, &rtl_totals_hist);
+    }
+
+    // Sliding-window ring of per-second snapshots. Each tick we clone
+    // inst_hist_agg into rtl_window_ring[next_slot]; the displaced snapshot is
+    // freed before being overwritten. We compute the windowed percentile by
+    // hdr_reset-ing a scratch histogram, hdr_add-ing every live slot, and
+    // querying. O(W) per tick (microseconds for W<=3600); see --latency-window.
+    const unsigned int win_secs =
+        (cfg->realtime_latencies && cfg->latency_window_secs > 0) ? cfg->latency_window_secs : 0;
+    std::vector<hdr_histogram *> rtl_window_ring(win_secs, NULL);
+    unsigned int rtl_window_next = 0;         // index of the next slot to write into
+    unsigned int rtl_window_filled = 0;       // count of live slots (caps at win_secs)
+    hdr_histogram *rtl_window_scratch = NULL; // reused materialized window histogram
+    if (win_secs > 0) {
+        hdr_init(LATENCY_HDR_MIN_VALUE, LATENCY_HDR_SEC_MAX_VALUE, LATENCY_HDR_SEC_SIGDIGTS, &rtl_window_scratch);
     }
 
     // provide some feedback...
@@ -2296,64 +2333,136 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             }
 
             // Accumulate this tick's instantaneous percentile samples into the
-            // run-lifetime histogram so '(avg: X.XXX)' on the latency line covers
-            // the whole run so far, not just the last second.
-            if (rtl_totals_hist != NULL && inst_hist_agg != NULL && hdr_total_count(inst_hist_agg) > 0) {
+            // run-lifetime histogram so the 'overall' row covers the whole run
+            // so far, not just the last second.
+            bool inst_has_data = (inst_hist_agg != NULL && hdr_total_count(inst_hist_agg) > 0);
+            if (rtl_totals_hist != NULL && inst_has_data) {
                 hdr_add(rtl_totals_hist, inst_hist_agg);
             }
 
-            // Latency lines: per-configured-percentile "cur (avg: avg)", chunked
-            // to at most kPctPerLine entries per line so a long --print-percentiles
-            // list (e.g. 50,99,99.9,99.99,99.99999,99.999999) doesn't blow out the
-            // terminal. Line count is deterministic given the configured list,
-            // which keeps the in-place cursor-up redraw stable across ticks.
+            // Push this tick's snapshot into the sliding-window ring. We clone
+            // the per-tick aggregate so the ring owns its memory independent of
+            // inst_hist_agg's lifetime. Empty ticks still consume a slot so the
+            // window measures wall-clock seconds, not "seconds with traffic".
+            if (win_secs > 0 && inst_hist_agg != NULL) {
+                hdr_histogram *snap = NULL;
+                if (hdr_init(LATENCY_HDR_MIN_VALUE, LATENCY_HDR_SEC_MAX_VALUE, LATENCY_HDR_SEC_SIGDIGTS, &snap) == 0) {
+                    if (inst_has_data) hdr_add(snap, inst_hist_agg);
+                    if (rtl_window_ring[rtl_window_next] != NULL) hdr_close(rtl_window_ring[rtl_window_next]);
+                    rtl_window_ring[rtl_window_next] = snap;
+                    rtl_window_next = (rtl_window_next + 1) % win_secs;
+                    if (rtl_window_filled < win_secs) rtl_window_filled++;
+                }
+            }
+
+            // Materialize the windowed histogram by hdr_add-ing every live slot
+            // into a reused scratch. Cost O(W) per tick. Skipped when window is
+            // disabled or no slot has data yet.
+            bool win_has_data = false;
+            if (win_secs > 0 && rtl_window_scratch != NULL) {
+                hdr_reset(rtl_window_scratch);
+                for (unsigned int s = 0; s < rtl_window_filled; s++) {
+                    if (rtl_window_ring[s] != NULL && hdr_total_count(rtl_window_ring[s]) > 0) {
+                        hdr_add(rtl_window_scratch, rtl_window_ring[s]);
+                    }
+                }
+                win_has_data = (hdr_total_count(rtl_window_scratch) > 0);
+            }
+
+            // Latency lines: emit three labeled rows per percentile group -
+            //   inst   : last-tick percentiles (from inst_hist_agg)
+            //   winNs  : sliding-window percentiles (from rtl_window_scratch)
+            //   overall: full-run percentiles (from rtl_totals_hist)
+            // Each row's percentile values are chunked at kPctPerLine to keep
+            // line width bounded for long --print-percentiles lists. Line count
+            // per row is deterministic given the configured list, which keeps
+            // the in-place cursor-up redraw stable across ticks.
             const std::vector<double> &quantiles = cfg->print_percentiles.quantile_list;
             const size_t kPctPerLine = 3;
-            size_t num_latency_lines = quantiles.empty() ? 1 : ((quantiles.size() + kPctPerLine - 1) / kPctPerLine);
-            std::vector<std::string> lat_chunks(num_latency_lines);
-            bool any_samples = (rtl_totals_hist != NULL && hdr_total_count(rtl_totals_hist) > 0);
-            bool cur_samples = (inst_hist_agg != NULL && hdr_total_count(inst_hist_agg) > 0);
-            for (std::size_t i = 0; i < quantiles.size(); i++) {
-                char cur_p[16], avg_p[16];
-                if (cur_samples) {
-                    double ms =
-                        hdr_value_at_percentile(inst_hist_agg, quantiles[i]) / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
-                    snprintf(cur_p, sizeof(cur_p), "%6.3f", ms);
-                } else {
-                    snprintf(cur_p, sizeof(cur_p), "   -  ");
-                }
-                if (any_samples) {
-                    double ms = hdr_value_at_percentile(rtl_totals_hist, quantiles[i]) /
-                                (double) LATENCY_HDR_RESULTS_MULTIPLIER;
-                    snprintf(avg_p, sizeof(avg_p), "%6.3f", ms);
-                } else {
-                    snprintf(avg_p, sizeof(avg_p), "   -  ");
-                }
-                char entry[96];
-                snprintf(entry, sizeof(entry), "  p%.10g %s (avg: %s)", quantiles[i], cur_p, avg_p);
-                lat_chunks[i / kPctPerLine] += entry;
+            size_t chunks_per_row = quantiles.empty() ? 1 : ((quantiles.size() + kPctPerLine - 1) / kPctPerLine);
+            // Three rows when window is enabled, otherwise two (inst + overall).
+            const size_t num_rows = (win_secs > 0) ? 3 : 2;
+            // Row label width 8 chars accommodates "win3600s" and keeps
+            // p-columns vertically aligned across rows.
+            const char *row_label_inst = "inst    ";
+            char row_label_win[16];
+            {
+                char tmp[16];
+                snprintf(tmp, sizeof(tmp), "win%us", win_secs);
+                snprintf(row_label_win, sizeof(row_label_win), "%-8s", tmp);
             }
-            if (quantiles.empty()) lat_chunks[0] = "  (no samples this tick)";
+            const char *row_label_overall = "overall ";
+            bool overall_has_data = (rtl_totals_hist != NULL && hdr_total_count(rtl_totals_hist) > 0);
+            struct
+            {
+                const char *label;
+                hdr_histogram *hist;
+                bool has_data;
+            } rows[3];
+            size_t row_idx = 0;
+            rows[row_idx].label = row_label_inst;
+            rows[row_idx].hist = inst_hist_agg;
+            rows[row_idx].has_data = inst_has_data;
+            row_idx++;
+            if (win_secs > 0) {
+                rows[row_idx].label = row_label_win;
+                rows[row_idx].hist = rtl_window_scratch;
+                rows[row_idx].has_data = win_has_data;
+                row_idx++;
+            }
+            rows[row_idx].label = row_label_overall;
+            rows[row_idx].hist = rtl_totals_hist;
+            rows[row_idx].has_data = overall_has_data;
 
-            size_t total_lines = 1 + num_latency_lines;
-            // The ms unit applies to every value on the latency lines (both cur
-            // and avg are in milliseconds), so we always append it to the last
-            // chunk — even when the last tick had no fresh samples.
-            bool show_ms = cur_samples || any_samples;
+            // Build chunked strings for every row.
+            std::vector<std::vector<std::string>> row_chunks(num_rows, std::vector<std::string>(chunks_per_row));
+            bool any_row_has_data = false;
+            for (size_t r = 0; r < num_rows; r++) {
+                if (rows[r].has_data) any_row_has_data = true;
+                for (std::size_t i = 0; i < quantiles.size(); i++) {
+                    char val_p[16];
+                    if (rows[r].has_data && rows[r].hist != NULL) {
+                        double ms = hdr_value_at_percentile(rows[r].hist, quantiles[i]) /
+                                    (double) LATENCY_HDR_RESULTS_MULTIPLIER;
+                        snprintf(val_p, sizeof(val_p), "%6.3f", ms);
+                    } else {
+                        snprintf(val_p, sizeof(val_p), "   -  ");
+                    }
+                    char entry[64];
+                    snprintf(entry, sizeof(entry), "  p%.10g %s", quantiles[i], val_p);
+                    row_chunks[r][i / kPctPerLine] += entry;
+                }
+                if (quantiles.empty()) row_chunks[r][0] = "  (no samples this tick)";
+            }
+
+            size_t total_latency_lines = num_rows * chunks_per_row;
+            size_t total_lines = 1 + total_latency_lines;
+            // The ms unit applies to every value on the latency lines, so we
+            // always append it to the very last chunk of the last row - even
+            // when the tick had no fresh samples.
+            bool show_ms = any_row_has_data;
             if (stderr_is_tty && !first_rtl_frame) {
                 // Move cursor up the number of lines we last emitted, then
                 // overwrite each with \033[K to wipe residue from a wider frame.
                 fprintf(stderr, "\033[%zuA\r", total_lines);
                 fprintf(stderr, "%s\033[K\n", line1);
-                for (size_t k = 0; k < num_latency_lines; k++) {
-                    const char *unit_suffix = (k + 1 == num_latency_lines && show_ms) ? " ms" : "";
-                    fprintf(stderr, "%s latency%s%s\033[K\n", tag, lat_chunks[k].c_str(), unit_suffix);
+                for (size_t r = 0; r < num_rows; r++) {
+                    for (size_t k = 0; k < chunks_per_row; k++) {
+                        bool last = (r + 1 == num_rows) && (k + 1 == chunks_per_row);
+                        const char *unit_suffix = (last && show_ms) ? " ms" : "";
+                        fprintf(stderr, "%s latency [%s]%s%s\033[K\n", tag, rows[r].label, row_chunks[r][k].c_str(),
+                                unit_suffix);
+                    }
                 }
             } else {
                 fprintf(stderr, "%s\n", line1);
-                for (size_t k = 0; k < num_latency_lines; k++) {
-                    const char *unit_suffix = (k + 1 == num_latency_lines && show_ms) ? " ms" : "";
-                    fprintf(stderr, "%s latency%s%s\n", tag, lat_chunks[k].c_str(), unit_suffix);
+                for (size_t r = 0; r < num_rows; r++) {
+                    for (size_t k = 0; k < chunks_per_row; k++) {
+                        bool last = (r + 1 == num_rows) && (k + 1 == chunks_per_row);
+                        const char *unit_suffix = (last && show_ms) ? " ms" : "";
+                        fprintf(stderr, "%s latency [%s]%s%s\n", tag, rows[r].label, row_chunks[r][k].c_str(),
+                                unit_suffix);
+                    }
                 }
             }
             first_rtl_frame = false;
@@ -2437,6 +2546,10 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     } while (active_threads > 0);
 
     if (rtl_totals_hist != NULL) hdr_close(rtl_totals_hist);
+    if (rtl_window_scratch != NULL) hdr_close(rtl_window_scratch);
+    for (size_t s = 0; s < rtl_window_ring.size(); s++) {
+        if (rtl_window_ring[s] != NULL) hdr_close(rtl_window_ring[s]);
+    }
 
     // Send "run completed" annotation and zero out gauges so graphs drop to 0
     if (cfg->statsd != NULL && cfg->statsd->is_enabled()) {
@@ -2599,6 +2712,9 @@ int main(int argc, char *argv[])
     // 0 must remain a valid user-specified "disabled" value, so initialize the
     // sentinel before parsing args.
     cfg.max_retries = -1;
+    // Sliding-window default: 60s. Initialize before parsing so an explicit
+    // --latency-window=0 (disabled) survives config_init_defaults.
+    cfg.latency_window_secs = 60;
 
     if (config_parse_args(argc, argv, &cfg) < 0) {
         usage();

@@ -70,6 +70,11 @@ struct benchmark_config
     config_quantiles print_percentiles;
     bool print_all_runs;
     bool realtime_latencies;
+    // Sliding-window tail latency for --realtime-latencies output. Each tick the
+    // per-second aggregated inst histogram is pushed into a ring of N snapshots
+    // (N = latency_window_secs) and percentiles are computed over the live ring,
+    // mirroring load1/5/15 semantics for tail latency. 0 disables the column.
+    unsigned int latency_window_secs;
     int distinct_client_seed;
     int randomize;
     int next_client_idx;

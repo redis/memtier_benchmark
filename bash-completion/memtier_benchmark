@@ -31,7 +31,7 @@ _memtier_completions()
                    "--max-retries" "--retry-backoff-ms" "--retry-backoff-factor" "--retry-on"\
                    "--max-retry-queue" "--failed-keys-file"\
                    "--thread-conn-start-min-jitter-micros" "--thread-conn-start-max-jitter-micros"\
-                   "--print-percentiles" "--uri" "--sni"\
+                   "--print-percentiles" "--latency-window" "--uri" "--sni"\
                    "--cert" "--key" "--cacert" "--tls-protocols"\
                    "-s" "-p" "-S" "-o" "-x" "-c" "-n" "-t" "-d" "-a" "-u")
 
