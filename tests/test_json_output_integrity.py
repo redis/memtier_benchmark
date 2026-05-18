@@ -276,6 +276,14 @@ def test_reconnect_interval_does_not_zero_out_rates(env):
     Latency invariants are also re-checked in case a future fix in this
     area accidentally re-introduces the integer-truncation pattern.
     """
+    # memtier refuses --reconnect-interval together with --cluster-mode:
+    # "error: cluster mode dose not support reconnect-interval option".
+    # The RED-197205 regression is not cluster-specific, so we only run
+    # this check in single-endpoint mode.
+    if env.isCluster():
+        env.skip()
+        return
+
     test_dir = tempfile.mkdtemp()
     try:
         # NB: the bug fires reliably with --test-time, not with -n. With
