@@ -2489,8 +2489,11 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
 
 #ifdef USE_TLS
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-function"
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+// OpenSSL < 1.1.0 requires the application to register its own locking
+// callbacks for thread safety. Since 1.1.0 the library handles its own
+// internal locking and these APIs are no-ops; they are slated for removal
+// in OpenSSL 4.0 (see issue #387).
 static pthread_mutex_t *__openssl_locks;
 
 static void __openssl_locking_callback(int mode, int type, const char *file, int line)
@@ -2509,7 +2512,6 @@ static unsigned long __openssl_thread_id(void)
     id = (unsigned long) pthread_self();
     return id;
 }
-#pragma GCC diagnostic pop
 
 static void init_openssl_threads(void)
 {
@@ -2536,30 +2538,32 @@ static void cleanup_openssl_threads(void)
     }
     OPENSSL_free(__openssl_locks);
 }
+#endif
 
 static void init_openssl(void)
 {
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
     SSL_library_init();
     SSL_load_error_strings();
+#endif
     if (!RAND_poll()) {
         fprintf(stderr, "Failed to initialize OpenSSL random entropy.\n");
         exit(1);
     }
 
-// Enable memtier benchmark to load an OpenSSL config file.
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
     OPENSSL_config(NULL);
+    init_openssl_threads();
 #else
     OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CONFIG, NULL);
 #endif
-
-
-    init_openssl_threads();
 }
 
 static void cleanup_openssl(void)
 {
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
     cleanup_openssl_threads();
+#endif
 }
 
 #endif
@@ -2943,7 +2947,11 @@ int main(int argc, char *argv[])
     if (cfg.tls) {
         init_openssl();
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
         cfg.openssl_ctx = SSL_CTX_new(SSLv23_client_method());
+#else
+        cfg.openssl_ctx = SSL_CTX_new(TLS_client_method());
+#endif
         SSL_CTX_set_options(cfg.openssl_ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
 
         if (!(cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1)) SSL_CTX_set_options(cfg.openssl_ctx, SSL_OP_NO_TLSv1);
