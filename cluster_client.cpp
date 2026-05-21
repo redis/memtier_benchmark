@@ -389,6 +389,15 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
      * cleared when the rotation wraps back to index 0 (detected here via index
      * 0 + ratio counter 0). */
     if (m_config->transaction) {
+        // The cluster-mode startup guard at memtier_benchmark.cpp rejects
+        // arbitrary commands with keys_count > 1, so every keyed command we
+        // see here has exactly one key_type arg. The pool layout below pairs
+        // one command_index with one key_index (or the KEY_INDEX_NONE
+        // sentinel for keyless) on that assumption. If cluster mode ever
+        // grows multi-key arbitrary command support, both this path and the
+        // existing non-transaction path will need to push one key per arg.
+        assert(cmd.keys_count <= 1);
+
         if (m_arbitrary_command_rotation_seq != m_txn_observed_rotation_seq) {
             m_txn_observed_rotation_seq = m_arbitrary_command_rotation_seq;
             m_txn_pinned_conn_id = -1;

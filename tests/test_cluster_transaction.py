@@ -27,6 +27,7 @@ from include import (
     get_default_memtier_config,
 )
 from mb import Benchmark, RunConfig
+from redis.cluster import key_slot
 
 # Server-side error fragments that indicate the transaction state machine
 # has been torn between two connections — the exact symptoms from #389.
@@ -213,3 +214,205 @@ def test_transaction_requires_command(env):
         b"--transaction requires" in proc.stderr,
         message="expected stderr to mention requirement on --command; "
                 "got: {!r}".format(proc.stderr[:400]))
+
+
+# ---------------------------------------------------------------------------
+# Ingestion + slot-coverage tests
+#
+# The five tests above only check the absence of server-side transaction
+# errors. The tests below take it further: they flush the cluster, run a
+# write workload through MULTI/EXEC, then inspect the cluster to confirm
+# that
+#   1. the actual write side-effects landed in Redis (ingestion happened),
+#   2. they landed on the SLOT OWNER of the chosen hash tag and nowhere
+#      else (pin correctness),
+#   3. multiple distinct keys were touched within that slot (not just one
+#      key getting overwritten),
+#   4. memtier can correctly target hash tags whose slots span every shard
+#      of the cluster (general routing, not hardcoded to shard 0).
+# ---------------------------------------------------------------------------
+
+def _master_conns_by_port(env):
+    """Return {port:int -> Redis connection} for every master in the
+    cluster. Keying by port avoids the pitfall that two distinct Redis
+    client instances pointing at the same server don't compare/hash as
+    equal."""
+    return {
+        int(conn.connection_pool.connection_kwargs["port"]): conn
+        for conn in env.getOSSMasterNodesConnectionList()
+    }
+
+
+def _flush_cluster(env):
+    for conn in env.getOSSMasterNodesConnectionList():
+        conn.execute_command("FLUSHALL")
+
+
+def _dbsize_per_shard(env):
+    """Map of port:int -> integer DBSIZE."""
+    return {port: int(conn.execute_command("DBSIZE"))
+            for port, conn in _master_conns_by_port(env).items()}
+
+
+def _owning_port(env, hash_tag):
+    """Return the port of the master that owns the slot for the given hash
+    tag, using CLUSTER SLOTS as the source of truth (so the test stays
+    correct under any shard count or non-default slot layout)."""
+    slot = key_slot(hash_tag.encode())
+    any_master = next(iter(env.getOSSMasterNodesConnectionList()))
+    slots_view = any_master.execute_command("CLUSTER", "SLOTS")
+    for entry in slots_view:
+        slot_start, slot_end = int(entry[0]), int(entry[1])
+        if slot_start <= slot <= slot_end:
+            owner_port = int(entry[2][1])
+            return owner_port
+    raise AssertionError(
+        "no master found for slot {} of hash tag {!r}".format(slot, hash_tag))
+
+
+def _pick_hash_tags_one_per_shard(env, candidates=None):
+    """Return [(hash_tag, owner_port)] with one short hash tag per master
+    shard, each tag chosen so its slot is owned by a distinct master."""
+    if candidates is None:
+        # Compact, distinct hash tags that span the typical 3-shard split
+        # 0-5461 / 5462-10923 / 10924-16383. The pool is intentionally
+        # larger so the helper still finds one per shard under alternate
+        # cluster layouts.
+        candidates = ['b', 'c', 'a', 'f', 'g', 'd', 'j', 'k', 'h']
+    master_count = len(env.getOSSMasterNodesConnectionList())
+    seen = set()
+    chosen = []
+    for tag in candidates:
+        port = _owning_port(env, tag)
+        if port in seen:
+            continue
+        seen.add(port)
+        chosen.append((tag, port))
+        if len(seen) == master_count:
+            break
+    env.assertEqual(
+        len(chosen), master_count,
+        message="couldn't find a hash-tag tag per shard (got {} for {} "
+                "shards). Extend the candidate list.".format(
+                    len(chosen), master_count))
+    return chosen
+
+
+def _run_ingestion(env, hash_tag, requests, threads=1, clients=1,
+                   key_max=None):
+    """Run a --transaction MULTI/SET/EXEC workload that writes
+    `{tag}-key-<n>` keys. Returns (ok, run_config, stderr_text)."""
+    if key_max is None:
+        # Default: cover the request count so every request can land on a
+        # distinct key value (--key-pattern=R picks randomly, so duplicates
+        # are fine — the cluster-side count check uses set semantics).
+        key_max = requests
+    cmds = [
+        '--command=MULTI',
+        '--command=SET {' + hash_tag + '}-key-__key__ memtier-ingest-data',
+        '--command=EXEC',
+        '--command-key-pattern=R',
+        '--key-minimum=1',
+        '--key-maximum={}'.format(key_max),
+    ]
+    return _run_transaction_workload(env, cmds, threads=threads,
+                                     clients=clients, requests=requests)
+
+
+def test_transaction_ingestion_lands_on_pinned_shard(env):
+    """Ingestion through MULTI/EXEC must (a) actually write keys to Redis,
+    (b) put every key on the slot owner of the hash tag, (c) leave the
+    other shards empty, and (d) touch more than one distinct key value
+    inside the slot."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    _flush_cluster(env)
+    hash_tag = 'ing'
+    requests = 200
+    ok, run_config, stderr = _run_ingestion(env, hash_tag, requests=requests,
+                                            key_max=50)
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier_benchmark exited non-zero")
+        _assert_no_transaction_breakage(env, stderr)
+
+        sizes = _dbsize_per_shard(env)
+        owner_port = _owning_port(env, hash_tag)
+        owner_size = sizes[owner_port]
+
+        # (a) ingestion happened: at least one key landed.
+        env.assertGreater(
+            owner_size, 0,
+            message="no keys landed on the slot owner of {{{}}} (port {}); "
+                    "the transaction pin is broken".format(
+                        hash_tag, owner_port))
+
+        # (d) multiple distinct keys touched — we expect close to key_max
+        # unique keys for requests=200, key_max=50, --key-pattern=R.
+        # Allow some slack for unlikely RNG collisions; require at least
+        # half the range to be exercised.
+        env.assertGreater(
+            owner_size, 25,
+            message="only {} distinct keys present on owner — expected the "
+                    "rotation to touch most of key_max=50 unique keys".format(
+                        owner_size))
+
+        # (b)+(c) every other shard is empty: no MOVED leakage, no
+        # cross-shard writes from misrouted SETs.
+        for port, sz in sizes.items():
+            if port == owner_port:
+                continue
+            env.assertEqual(
+                sz, 0,
+                message="non-owner shard on port {} unexpectedly has {} "
+                        "keys — keyed commands escaped the pin".format(
+                            port, sz))
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_routes_correctly_for_every_shard(env):
+    """--transaction must work for *any* slot, not just the slot that
+    happens to hash to shard 0. For each shard in the cluster, pick a hash
+    tag whose slot Redis assigns to that shard, run a small ingestion,
+    and verify the keys land exclusively on the expected shard."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    tags_per_shard = _pick_hash_tags_one_per_shard(env)
+
+    for hash_tag, expected_port in tags_per_shard:
+        _flush_cluster(env)
+        ok, run_config, stderr = _run_ingestion(env, hash_tag, requests=60,
+                                                key_max=20)
+
+        failed = env.getNumberOfFailedAssertion()
+        try:
+            env.assertTrue(
+                ok,
+                message="memtier exited non-zero for hash tag '{}' (expected "
+                        "owner on port {})".format(hash_tag, expected_port))
+            _assert_no_transaction_breakage(env, stderr)
+
+            sizes = _dbsize_per_shard(env)
+            env.assertGreater(
+                sizes[expected_port], 0,
+                message="hash tag '{}' produced no keys on its owner port "
+                        "{} — slot routing broken for this shard".format(
+                            hash_tag, expected_port))
+            for port, sz in sizes.items():
+                if port == expected_port:
+                    continue
+                env.assertEqual(
+                    sz, 0,
+                    message="hash tag '{}' (owner port {}) leaked {} keys "
+                            "onto port {}".format(hash_tag, expected_port,
+                                                  sz, port))
+        finally:
+            if env.getNumberOfFailedAssertion() > failed:
+                debugPrintMemtierOnError(run_config, env)
