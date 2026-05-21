@@ -80,6 +80,11 @@ protected:
     unsigned int m_get_ratio_count;               // number of gets counter (overlaps on ratio)
     unsigned int m_arbitrary_command_ratio_count; // number of arbitrary commands counter (overlaps on ratio)
     unsigned int m_executed_command_index;        // current arbitrary command executed
+    // Increments every time the arbitrary-command rotation wraps back to
+    // index 0. Subclasses (notably cluster_client in --transaction mode) use
+    // this to detect "we just started a fresh rotation" without having to
+    // mirror the ratio-counter state machine.
+    unsigned long long m_arbitrary_command_rotation_seq;
 
     unsigned long long m_tot_set_ops;  // Total number of SET ops
     unsigned long long m_tot_wait_ops; // Total number of WAIT ops
@@ -152,6 +157,7 @@ public:
                 m_executed_command_index++;
                 if (m_executed_command_index == m_config->arbitrary_commands->size()) {
                     m_executed_command_index = 0;
+                    m_arbitrary_command_rotation_seq++;
                 }
                 continue;
             }
@@ -164,6 +170,7 @@ public:
                 m_executed_command_index++;
                 if (m_executed_command_index == m_config->arbitrary_commands->size()) {
                     m_executed_command_index = 0;
+                    m_arbitrary_command_rotation_seq++;
                 }
             }
         }

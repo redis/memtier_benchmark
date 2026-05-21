@@ -24,6 +24,11 @@
 
 typedef std::queue<unsigned long long> key_index_pool;
 
+// Sentinel pushed in the key-index slot of a pool entry that has no
+// associated key (a keyless arbitrary command queued by --transaction).
+// Real key indexes are obj_gen counters; ULLONG_MAX is unreachable in practice.
+#define KEY_INDEX_NONE ULLONG_MAX
+
 // forward decleration
 class shard_connection;
 
@@ -32,6 +37,13 @@ class cluster_client : public client
 protected:
     std::vector<key_index_pool *> m_key_index_pools;
     unsigned int m_slot_to_shard[16384];
+    // --transaction: shard connection that owns the in-flight rotation of
+    // --command entries. -1 = no pin (rotation has not started or just ended).
+    // The pin is established when the first command of a fresh rotation is
+    // processed and cleared when m_arbitrary_command_rotation_seq advances
+    // past m_txn_observed_rotation_seq (i.e. the previous rotation wrapped).
+    int m_txn_pinned_conn_id;
+    unsigned long long m_txn_observed_rotation_seq;
 
     virtual int connect(void);
     virtual void disconnect(void);

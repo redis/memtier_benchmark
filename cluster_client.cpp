@@ -94,9 +94,34 @@ static uint32_t calc_hslot_crc16_cluster(const char *str, size_t length)
     return rv;
 }
 
+// Hash-tag-aware variant of calc_hslot_crc16_cluster. Mirrors Redis' rule
+// (https://redis.io/docs/reference/cluster-spec/#hash-tags): if the key
+// contains a {tag} substring with at least one byte between the braces, only
+// the bytes inside the first such {tag} are hashed; otherwise the whole key
+// is hashed. memtier's default slot computation skips this rule because the
+// generic routing path only sees obj_gen->get_key() — never the literal
+// affixes like "{mx}-" that the user wrote in --command. This helper is used
+// by --transaction to pin to the actual slot owner.
+static uint32_t calc_hslot_crc16_with_hash_tag(const char *str, size_t length)
+{
+    const char *open = (const char *) memchr(str, '{', length);
+    if (open != NULL) {
+        size_t remaining = length - (open - str) - 1;
+        const char *close = (const char *) memchr(open + 1, '}', remaining);
+        if (close != NULL && close > open + 1) {
+            size_t tag_len = close - open - 1;
+            return (uint32_t) crc16(open + 1, tag_len) & MAX_CLUSTER_HSLOT;
+        }
+    }
+    return (uint32_t) crc16(str, length) & MAX_CLUSTER_HSLOT;
+}
+
 ///////////////////////////////////////////////////////////////////////////////////////////////////////
 
-cluster_client::cluster_client(client_group *group) : client(group) {}
+cluster_client::cluster_client(client_group *group) :
+        client(group), m_txn_pinned_conn_id(-1), m_txn_observed_rotation_seq(0)
+{
+}
 
 cluster_client::~cluster_client()
 {
@@ -355,8 +380,111 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
      * if the generated key belongs to this connection before starting to send it */
     assert(m_key_index_pools[conn_id]->empty());
 
+    const arbitrary_command &cmd = get_arbitrary_command(command_index);
+
+    /* --transaction: one full rotation of --command entries = one transactional
+     * unit (e.g. WATCH/MULTI/.../EXEC). Pin every command in the rotation to a
+     * single shard connection so keyless commands stay on the same connection
+     * as the keyed ones. The pin is set on the first command of a rotation and
+     * cleared when the rotation wraps back to index 0 (detected here via index
+     * 0 + ratio counter 0). */
+    if (m_config->transaction) {
+        if (m_arbitrary_command_rotation_seq != m_txn_observed_rotation_seq) {
+            m_txn_observed_rotation_seq = m_arbitrary_command_rotation_seq;
+            m_txn_pinned_conn_id = -1;
+        }
+
+        if (m_txn_pinned_conn_id == -1) {
+            /* Pin the rotation to the shard that owns the first KEYED command
+             * in this rotation. A rotation that starts with one or more
+             * keyless commands (e.g. MULTI before SET) must still be routed to
+             * the slot of the upcoming keyed command, otherwise the keyless
+             * commands land on an arbitrary shard and the keyed commands then
+             * MOVED-back to the right one — breaking transaction state. If
+             * the rotation has no keyed commands at all, fall back to the
+             * current connection (any pin is fine; there's no slot to align). */
+            int target_conn = -1;
+            unsigned int total = m_config->arbitrary_commands->size();
+            for (unsigned int off = 0; off < total; off++) {
+                unsigned int look_idx = (m_executed_command_index + off) % total;
+                const arbitrary_command &look = get_arbitrary_command(look_idx);
+                if (look.stats_only) continue;
+                if (look.keys_count == 0) continue;
+
+                /* Generate a key just to compute its slot; the key is
+                 * discarded and will be regenerated when this command's turn
+                 * comes around. With hash-tagged keys (the intended
+                 * --transaction usage) every key in the rotation maps to the
+                 * same slot, so the discarded key still picks the right
+                 * shard. With random non-tagged keys the user is misusing the
+                 * flag and will see CROSSSLOT errors regardless. */
+                unsigned long long key_index;
+                client::get_key_for_conn(look_idx, conn_id, &key_index);
+
+                /* Reconstruct the actual key string that would be sent on the
+                 * wire — data_prefix + obj_gen.get_key() + data_suffix — and
+                 * hash it the way Redis does (honoring {tag} substrings). The
+                 * default memtier slot computation only sees the generated
+                 * portion of the key, so it would route to a random shard
+                 * when the keyed argument carries hash-tag affixes. */
+                const command_arg *key_arg = NULL;
+                for (size_t a = 0; a < look.command_args.size(); a++) {
+                    if (look.command_args[a].type == key_type) {
+                        key_arg = &look.command_args[a];
+                        break;
+                    }
+                }
+                const char *gen_key = m_obj_gen->get_key();
+                unsigned int gen_key_len = m_obj_gen->get_key_len();
+                unsigned int hslot;
+                if (key_arg != NULL && key_arg->has_key_affixes) {
+                    std::string full;
+                    full.reserve(key_arg->data_prefix.size() + gen_key_len + key_arg->data_suffix.size());
+                    full.append(key_arg->data_prefix);
+                    full.append(gen_key, gen_key_len);
+                    full.append(key_arg->data_suffix);
+                    hslot = calc_hslot_crc16_with_hash_tag(full.data(), full.size());
+                } else {
+                    hslot = calc_hslot_crc16_with_hash_tag(gen_key, gen_key_len);
+                }
+                target_conn = (int) m_slot_to_shard[hslot];
+                break;
+            }
+            if (target_conn == -1) target_conn = (int) conn_id;
+            m_txn_pinned_conn_id = target_conn;
+        }
+
+        if ((unsigned int) m_txn_pinned_conn_id == conn_id) {
+            if (cmd.keys_count > 0) {
+                unsigned long long key_index;
+                client::get_key_for_conn(command_index, conn_id, &key_index);
+                m_key_index_pools[conn_id]->push(key_index);
+            }
+            client::create_arbitrary_request(command_index, timestamp, conn_id);
+            return true;
+        }
+
+        /* Not the pin — queue this command on the pin's pool so it runs on the
+         * same connection as the rest of the rotation. Keyless entries use the
+         * KEY_INDEX_NONE sentinel so the consumer in create_request() knows to
+         * skip the key-index slot. */
+        key_index_pool *pin_pool = m_key_index_pools[m_txn_pinned_conn_id];
+        if (pin_pool->size() + 2 > KEY_INDEX_QUEUE_MAX_SIZE) return false;
+
+        if (cmd.keys_count > 0) {
+            unsigned long long key_index;
+            client::get_key_for_conn(command_index, conn_id, &key_index);
+            pin_pool->push(command_index);
+            pin_pool->push(key_index);
+        } else {
+            pin_pool->push(command_index);
+            pin_pool->push(KEY_INDEX_NONE);
+        }
+        return true;
+    }
+
     /* keyless command can be used by any connection */
-    if (get_arbitrary_command(command_index).keys_count == 0) {
+    if (cmd.keys_count == 0) {
         client::create_arbitrary_request(command_index, timestamp, conn_id);
         return true;
     }
@@ -389,6 +517,15 @@ void cluster_client::create_request(struct timeval timestamp, unsigned int conn_
     unsigned int pool_size = m_key_index_pools[conn_id]->size();
     unsigned int command_index = m_key_index_pools[conn_id]->front();
     m_key_index_pools[conn_id]->pop();
+
+    /* A keyless arbitrary entry (queued by --transaction) has a sentinel in the
+     * key-index slot that the regular create_arbitrary_request path will not
+     * consume — drop it here so the assertion below still holds. */
+    if (m_config->arbitrary_commands->is_defined() && get_arbitrary_command(command_index).keys_count == 0) {
+        assert(!m_key_index_pools[conn_id]->empty());
+        assert(m_key_index_pools[conn_id]->front() == KEY_INDEX_NONE);
+        m_key_index_pools[conn_id]->pop();
+    }
 
     if (m_config->arbitrary_commands->is_defined())
         client::create_arbitrary_request(command_index, timestamp, conn_id);

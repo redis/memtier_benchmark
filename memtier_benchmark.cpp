@@ -712,6 +712,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_wait_timeout,
         o_json_out_file,
         o_cluster_mode,
+        o_transaction,
         o_command,
         o_command_key_pattern,
         o_command_ratio,
@@ -817,6 +818,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         {"wait-timeout", 1, 0, o_wait_timeout},
         {"json-out-file", 1, 0, o_json_out_file},
         {"cluster-mode", 0, 0, o_cluster_mode},
+        {"transaction", 0, 0, o_transaction},
         {"help", 0, 0, o_help},
         {"version", 0, 0, 'v'},
         {"command", 1, 0, o_command},
@@ -1295,6 +1297,9 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         case o_cluster_mode:
             cfg->cluster_mode = true;
             break;
+        case o_transaction:
+            cfg->transaction = true;
+            break;
         case o_command: {
             // Check if this is a monitor placeholder
             const char *cmd_str = optarg;
@@ -1523,6 +1528,16 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         }
     }
 
+    // --transaction needs at least one --command to operate on. In
+    // --cluster-mode the flag changes routing; in standalone it is a no-op
+    // (each client has a single connection, so the rotation already runs
+    // through one socket in order), but we accept it so scripts that toggle
+    // --cluster-mode don't have to also toggle --transaction.
+    if (cfg->transaction && !cfg->arbitrary_commands->is_defined()) {
+        fprintf(stderr, "error: --transaction requires at least one --command.\n");
+        return -1;
+    }
+
     if ((cfg->cluster_mode && !verify_cluster_option(cfg)) ||
         (cfg->arbitrary_commands->is_defined() && !verify_arbitrary_command_option(cfg))) {
         return -1;
@@ -1572,6 +1587,13 @@ void usage()
         "  -x, --run-count=NUMBER         Number of full-test iterations to perform\n"
         "  -D, --debug                    Print debug output\n"
         "      --cluster-mode             Run client in cluster mode\n"
+        "      --transaction              In --cluster-mode, pin one full rotation of --command entries to\n"
+        "                                 a single shard connection so that keyless commands (MULTI/EXEC/\n"
+        "                                 UNWATCH) stay on the same connection as the keyed ones. Hash-tag\n"
+        "                                 your keys so they map to the same slot, otherwise the cross-slot\n"
+        "                                 keyed commands of the same rotation will get MOVED back. In\n"
+        "                                 standalone mode this flag is a no-op (each client already runs\n"
+        "                                 through a single connection). Requires at least one --command.\n"
         "  -h, --help                     Display this help\n"
         "  -v, --version                  Display version information\n"
         "\n"

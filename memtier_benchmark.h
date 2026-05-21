@@ -136,6 +136,11 @@ struct benchmark_config
     // JSON additions
     const char *json_out_file;
     bool cluster_mode;
+    // When set together with --cluster-mode, every full rotation of --command
+    // entries (one logical transactional unit, e.g. WATCH/MULTI/.../EXEC) is
+    // pinned to a single shard connection so that keyless commands stay on
+    // the same connection as the keyed ones.
+    bool transaction;
     struct arbitrary_command_list *arbitrary_commands;
     const char *monitor_input;
     struct monitor_command_list *monitor_commands;
