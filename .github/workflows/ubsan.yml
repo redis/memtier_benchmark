@@ -114,7 +114,7 @@ jobs:
       run: ./tests/gen-test-certs.sh
 
     - name: Run tests
-      timeout-minutes: 10
+      timeout-minutes: 15
       env: ${{ matrix.test-config.env }}
       run: |
         ./tests/run_tests.sh

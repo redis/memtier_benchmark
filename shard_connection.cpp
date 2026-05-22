@@ -1125,6 +1125,19 @@ void shard_connection::attempt_reconnect(const char *error_context)
         m_reconnect_timer = event_new(m_event_base, -1, 0, cluster_client_reconnect_timer_handler, (void *) this);
         event_add(m_reconnect_timer, &delay);
         m_reconnecting = true;
+    } else if (m_config->reconnect_on_error && m_reconnecting) {
+        // A reconnect is already pending for this connection. The event loop
+        // can deliver multiple connection-error callbacks per dead connection
+        // (e.g. an EOF followed by stray TLS read errors during a node
+        // failover storm), and every one of them lands here while the first
+        // one's reconnect timer is still pending.
+        //
+        // Treat the duplicates as no-ops — the in-flight reconnect will run
+        // and decide what to do. Tearing the thread down here would mean a
+        // single dead connection always kills the whole benchmark thread
+        // under realistic failover conditions, regardless of how high
+        // --max-reconnect-attempts is set.
+        return;
     } else {
         benchmark_error_log("Maximum reconnection attempts (%u) exceeded for %s, triggering thread restart.\n",
                             m_config->max_reconnect_attempts, error_context);

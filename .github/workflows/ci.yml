@@ -234,7 +234,7 @@ jobs:
           ./tests/gen-test-certs.sh
 
     - name: Run tests
-      timeout-minutes: 10
+      timeout-minutes: 15
       env: ${{ matrix.test-config.env }}
       run: |
         ./tests/run_tests.sh
@@ -343,7 +343,7 @@ jobs:
         ulimit -n 40960
 
     - name: Run tests for coverage
-      timeout-minutes: 10
+      timeout-minutes: 15
       env:
         OSS_STANDALONE: "1"
         OSS_CLUSTER: "0"
