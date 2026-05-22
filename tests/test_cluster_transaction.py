@@ -504,7 +504,7 @@ def test_transaction_sequential_ingestion_full_population(env):
 
 
 def test_transaction_appears_in_config_and_json_output(env):
-    """--transaction must be reflected in both the printed config (stderr)
+    """--transaction must be reflected in both the printed config (stdout)
     and the JSON output file so tooling that parses memtier output can
     detect the mode without re-parsing the command line."""
     if not env.isCluster():
@@ -519,16 +519,19 @@ def test_transaction_appears_in_config_and_json_output(env):
     ]
     ok, run_config, stderr = _run_transaction_workload(env, cmds, requests=60)
 
+    stdout_path = os.path.join(run_config.results_dir, "mb.stdout")
+    stdout = open(stdout_path).read() if os.path.isfile(stdout_path) else ""
+
     failed = env.getNumberOfFailedAssertion()
     try:
         env.assertTrue(ok, message="memtier_benchmark exited non-zero")
 
-        # Printed config block (emitted to stderr before [RUN #1]) must
+        # Printed config block (emitted to stdout before [RUN #1]) must
         # contain "transaction = yes".
         env.assertTrue(
-            "transaction = yes" in stderr,
-            message="'transaction = yes' not found in memtier stderr config block; "
-                    "got stderr excerpt: {!r}".format(stderr[:600]))
+            "transaction = yes" in stdout,
+            message="'transaction = yes' not found in memtier stdout config block; "
+                    "got stdout excerpt: {!r}".format(stdout[:600]))
 
         # JSON output file must have configuration.transaction == "true".
         json_path = os.path.join(run_config.results_dir, "mb.json")
