@@ -2930,7 +2930,7 @@ int main(int argc, char *argv[])
 
     if (cfg.show_config) {
         fprintf(stderr, "============== Configuration values: ==============\n");
-        config_print(stdout, &cfg);
+        config_print(stderr, &cfg);
         fprintf(stderr, "===================================================\n");
     }
 

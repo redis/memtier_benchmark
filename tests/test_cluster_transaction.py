@@ -512,6 +512,7 @@ def test_transaction_appears_in_config_and_json_output(env):
         return
 
     cmds = [
+        '--show-config',
         '--command=MULTI',
         '--command=SET {cfg}-__key__ __data__',
         '--command=EXEC',
