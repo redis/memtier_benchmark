@@ -452,7 +452,7 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
             /* Wake up connections that were held back by hold_pipeline so
              * they can participate in the new rotation's lookahead. */
             for (size_t i = 0; i < m_connections.size(); i++) {
-                if ((unsigned int) i != conn_id) {
+                if ((unsigned int) i != conn_id && m_connections[i]->get_connection_state() != conn_disconnected) {
                     m_connections[i]->schedule_fill();
                 }
             }
@@ -529,7 +529,10 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
             if (target_conn < 0 || target_conn >= (int) m_connections.size() ||
                 m_connections[target_conn]->get_connection_state() == conn_disconnected) {
                 target_conn = (int) conn_id;
-                have_staged_key = false; // discard, can't push to invalid pool
+                // keep have_staged_key: the key was already generated and the
+                // sequential counter advanced, so we must reuse it here (on
+                // the fallback conn_id pool) rather than discarding it and
+                // leaving a gap in the sequential key range.
             }
             m_txn_pinned_conn_id = target_conn;
             if (have_staged_key) {
