@@ -321,6 +321,14 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
             benchmark_error_log("warning: --transaction pin connection (id=%u) disconnected mid-rotation; "
                                 "transaction stats for the interrupted rotation will be inaccurate.\n",
                                 conn_id);
+            // Release the pin so non-pin connections can resume the rotation.
+            m_txn_pinned_conn_id = -1;
+            m_txn_has_staged_key = false;
+            for (size_t i = 0; i < m_connections.size(); i++) {
+                if (i != conn_id && m_connections[i]->get_connection_state() != conn_disconnected) {
+                    m_connections[i]->schedule_fill();
+                }
+            }
         }
         return true;
     }
