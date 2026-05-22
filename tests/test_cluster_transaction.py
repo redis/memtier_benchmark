@@ -10,13 +10,13 @@ connection (the slot owner of the first keyed command in the rotation) so
 that a `WATCH`/`MULTI`/.../`EXEC` block stays together on one connection.
 
 These tests run only against the OSS-CLUSTER environment; they assert that
-memtier exits cleanly and that the Redis-side stderr never reports a
+memtier exits cleanly and that memtier's own stderr (where Redis error
+responses are echoed via benchmark_error_log) never contains a
 broken-transaction error (`unwatch inside MULTI`, `EXEC without MULTI`,
 `MULTI calls can not be nested`, `EXECABORT`).
 """
 
 import os
-import re
 import tempfile
 
 from include import (
@@ -455,6 +455,7 @@ def test_transaction_sequential_ingestion_full_population(env):
         '--command=SET {' + hash_tag + '}-key-__key__ memtier-seq-data',
         '--command-key-pattern=S',  # must follow --command=SET so it applies to SET, not EXEC
         '--command=EXEC',
+        '--key-prefix=',            # empty prefix so keys are bare integers: {seq}-key-1, {seq}-key-2, …
         '--key-minimum=1',
         '--key-maximum={}'.format(n),
     ]
