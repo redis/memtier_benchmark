@@ -965,6 +965,12 @@ void shard_connection::fill_pipeline(void)
     struct timeval now;
     gettimeofday(&now, NULL);
 
+    // Re-enable I/O in case a prior idle period disabled the bufferevent
+    // (e.g. a --transaction non-pin connection that was held by hold_pipeline).
+    if (m_bev != NULL && get_connection_state() == conn_connected) {
+        bufferevent_enable(m_bev, EV_READ | EV_WRITE);
+    }
+
     while (!m_conns_manager->finished() && m_pipeline->size() < m_config->pipeline) {
         if (!is_conn_setup_done()) {
             send_conn_setup_commands(now);
