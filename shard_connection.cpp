@@ -1098,8 +1098,17 @@ void shard_connection::handle_timer_event(void)
 
 void shard_connection::schedule_fill(void)
 {
+    if (m_connection_state != conn_connected || m_bev == NULL) {
+        return;
+    }
+    // Re-enable I/O in case fill_pipeline silenced this connection while it
+    // was blocked by transaction-mode hold_pipeline.
+    bufferevent_enable(m_bev, EV_READ | EV_WRITE);
     if (m_deferred_fill_timer == NULL) {
         m_deferred_fill_timer = event_new(m_event_base, -1, 0, deferred_fill_pipeline_cb, this);
+        if (m_deferred_fill_timer == NULL) {
+            return;
+        }
     }
     if (!evtimer_pending(m_deferred_fill_timer, NULL)) {
         struct timeval zero = {0, 0};

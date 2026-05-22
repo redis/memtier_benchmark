@@ -334,9 +334,16 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
 
     /* In transaction mode the pin connection drives the entire rotation.
      * Non-pin connections must not spin in fill_pipeline; they will be
-     * rescheduled via schedule_fill() when the pin is cleared. */
+     * rescheduled via schedule_fill() when the pin is cleared. If the pin
+     * connection has disconnected, release it so the remaining connections
+     * are not blocked indefinitely. */
     if (m_config->transaction && m_txn_pinned_conn_id != -1 && m_txn_pinned_conn_id != (int) conn_id) {
-        return true;
+        if (m_connections[m_txn_pinned_conn_id]->get_connection_state() == conn_disconnected) {
+            m_txn_pinned_conn_id = -1;
+            m_txn_has_staged_key = false;
+        } else {
+            return true;
+        }
     }
 
     return false;
