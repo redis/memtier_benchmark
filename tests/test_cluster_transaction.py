@@ -453,8 +453,8 @@ def test_transaction_sequential_ingestion_full_population(env):
     cmds = [
         '--command=MULTI',
         '--command=SET {' + hash_tag + '}-key-__key__ memtier-seq-data',
+        '--command-key-pattern=S',  # must follow --command=SET so it applies to SET, not EXEC
         '--command=EXEC',
-        '--command-key-pattern=S',
         '--key-minimum=1',
         '--key-maximum={}'.format(n),
     ]

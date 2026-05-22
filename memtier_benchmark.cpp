@@ -298,6 +298,7 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             "test_time = %u\n"
             "ratio = %u:%u\n"
             "pipeline = %u\n"
+            "transaction = %s\n"
             "data_size = %u\n"
             "data_offset = %u\n"
             "random_data = %s\n"
@@ -345,14 +346,14 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             cfg->tls_sni,
 #endif
             cfg->out_file, cfg->client_stats, cfg->run_count, cfg->debug, cfg->requests, cfg->request_rate,
-            cfg->clients, cfg->threads, cfg->test_time, cfg->ratio.a, cfg->ratio.b, cfg->pipeline, cfg->data_size,
-            cfg->data_offset, cfg->random_data ? "yes" : "no", cfg->data_size_range.min, cfg->data_size_range.max,
-            cfg->data_size_list.print(tmpbuf, sizeof(tmpbuf) - 1), cfg->data_size_pattern, cfg->expiry_range.min,
-            cfg->expiry_range.max, cfg->data_import, cfg->data_verify ? "yes" : "no", cfg->verify_only ? "yes" : "no",
-            cfg->generate_keys ? "yes" : "no", cfg->key_prefix, cfg->key_minimum, cfg->key_maximum, cfg->key_pattern,
-            cfg->key_stddev, cfg->key_median, cfg->reconnect_interval, cfg->retry_on_error ? "yes" : "no",
-            cfg->max_retries, cfg->retry_backoff_ms, cfg->retry_backoff_factor,
-            cfg->retry_on_filter ? cfg->retry_on_filter : "", cfg->max_retry_queue,
+            cfg->clients, cfg->threads, cfg->test_time, cfg->ratio.a, cfg->ratio.b, cfg->pipeline,
+            cfg->transaction ? "yes" : "no", cfg->data_size, cfg->data_offset, cfg->random_data ? "yes" : "no",
+            cfg->data_size_range.min, cfg->data_size_range.max, cfg->data_size_list.print(tmpbuf, sizeof(tmpbuf) - 1),
+            cfg->data_size_pattern, cfg->expiry_range.min, cfg->expiry_range.max, cfg->data_import,
+            cfg->data_verify ? "yes" : "no", cfg->verify_only ? "yes" : "no", cfg->generate_keys ? "yes" : "no",
+            cfg->key_prefix, cfg->key_minimum, cfg->key_maximum, cfg->key_pattern, cfg->key_stddev, cfg->key_median,
+            cfg->reconnect_interval, cfg->retry_on_error ? "yes" : "no", cfg->max_retries, cfg->retry_backoff_ms,
+            cfg->retry_backoff_factor, cfg->retry_on_filter ? cfg->retry_on_filter : "", cfg->max_retry_queue,
             cfg->failed_keys_file ? cfg->failed_keys_file : "", cfg->connection_timeout,
             cfg->thread_conn_start_min_jitter_micros, cfg->thread_conn_start_max_jitter_micros, cfg->multi_key_get,
             cfg->authenticate ? cfg->authenticate : "", cfg->select_db, cfg->no_expiry ? "yes" : "no",
@@ -394,6 +395,7 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
     jsonhandler->write_obj("test_time", "%u", cfg->test_time);
     jsonhandler->write_obj("ratio", "\"%u:%u\"", cfg->ratio.a, cfg->ratio.b);
     jsonhandler->write_obj("pipeline", "%u", cfg->pipeline);
+    jsonhandler->write_obj("transaction", "\"%s\"", cfg->transaction ? "true" : "false");
     jsonhandler->write_obj("data_size", "%u", cfg->data_size);
     jsonhandler->write_obj("data_offset", "%u", cfg->data_offset);
     jsonhandler->write_obj("random_data", "\"%s\"", cfg->random_data ? "true" : "false");

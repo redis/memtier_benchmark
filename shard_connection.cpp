@@ -213,7 +213,8 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_retry_queue(NULL),
         m_replay_queue(NULL),
         m_retry_drain_timer(NULL),
-        m_current_retry_backoff_ms(0.0)
+        m_current_retry_backoff_ms(0.0),
+        m_deferred_fill_timer(NULL)
 {
     m_id = id;
     m_conns_manager = conns_man;
@@ -292,6 +293,11 @@ shard_connection::~shard_connection()
     if (m_retry_drain_timer != NULL) {
         event_free(m_retry_drain_timer);
         m_retry_drain_timer = NULL;
+    }
+
+    if (m_deferred_fill_timer != NULL) {
+        event_free(m_deferred_fill_timer);
+        m_deferred_fill_timer = NULL;
     }
 
     if (m_retry_queue != NULL) {
@@ -497,6 +503,10 @@ void shard_connection::disconnect()
     } else {
         while (m_pending_resp)
             delete pop_req();
+    }
+
+    if (m_deferred_fill_timer != NULL && evtimer_pending(m_deferred_fill_timer, NULL)) {
+        evtimer_del(m_deferred_fill_timer);
     }
 
     m_connection_state = conn_disconnected;
@@ -1088,8 +1098,13 @@ void shard_connection::handle_timer_event(void)
 
 void shard_connection::schedule_fill(void)
 {
-    struct timeval zero = {0, 0};
-    event_base_once(m_event_base, -1, EV_TIMEOUT, deferred_fill_pipeline_cb, this, &zero);
+    if (m_deferred_fill_timer == NULL) {
+        m_deferred_fill_timer = event_new(m_event_base, -1, 0, deferred_fill_pipeline_cb, this);
+    }
+    if (!evtimer_pending(m_deferred_fill_timer, NULL)) {
+        struct timeval zero = {0, 0};
+        event_add(m_deferred_fill_timer, &zero);
+    }
 }
 
 void shard_connection::attempt_reconnect(const char *error_context)

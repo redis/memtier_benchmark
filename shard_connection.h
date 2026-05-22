@@ -262,6 +262,10 @@ private:
     std::queue<request *> *m_replay_queue;
     struct event *m_retry_drain_timer;
     double m_current_retry_backoff_ms;
+
+    // Cancelable timer for deferred fill_pipeline (replaces event_base_once to
+    // avoid UAF when the connection is freed before the callback fires).
+    struct event *m_deferred_fill_timer;
 };
 
 #endif // MEMTIER_BENCHMARK_SHARD_CONNECTION_H
