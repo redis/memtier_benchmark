@@ -416,3 +416,91 @@ def test_transaction_routes_correctly_for_every_shard(env):
         finally:
             if env.getNumberOfFailedAssertion() > failed:
                 debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_sequential_ingestion_full_population(env):
+    """Sequential key pattern over a large range must land every key in
+    the cluster exactly once. With --transaction MULTI/SET/EXEC,
+    --key-pattern=S, --key-minimum=1 --key-maximum=N and --requests=N on
+    a single client/single thread, memtier walks the key range in order:
+    keys 1..N are each written exactly once, so the cluster ends up with
+    DBSIZE == N keys all on the slot owner of the hash tag.
+
+    This is the strict regression check the issue #389 repro really
+    needs — the looser ingestion test above only verifies that ~half
+    of a small range was touched; this one pins down the exact count
+    against a large range, catching off-by-one and silently-dropped-
+    transactions regressions.
+    """
+    if not env.isCluster():
+        env.skip()
+        return
+
+    _flush_cluster(env)
+    hash_tag = 'seq'
+    # Keep this large enough to exercise the pin across many rotations
+    # but small enough that CI doesn't time out (memtier on a local
+    # 3-shard cluster does roughly ~20-40k req/sec for a 3-command
+    # MULTI/SET/EXEC rotation, so 100k unique keys completes well under
+    # a minute even under sanitizers).
+    #
+    # --requests counts every individual command, not rotations. The
+    # rotation is 3 commands (MULTI / SET / EXEC), so to actually emit N
+    # SET commands and hit every value in --key-pattern=S range 1..N, we
+    # need --requests = 3*N.
+    n = 100000
+
+    cmds = [
+        '--command=MULTI',
+        '--command=SET {' + hash_tag + '}-key-__key__ memtier-seq-data',
+        '--command=EXEC',
+        '--command-key-pattern=S',
+        '--key-minimum=1',
+        '--key-maximum={}'.format(n),
+    ]
+    ok, run_config, stderr = _run_transaction_workload(
+        env, cmds, threads=1, clients=1, requests=3 * n)
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier_benchmark exited non-zero")
+        _assert_no_transaction_breakage(env, stderr)
+
+        sizes = _dbsize_per_shard(env)
+        owner_port = _owning_port(env, hash_tag)
+
+        # Exact match: every requested key value 1..n was written once.
+        env.assertEqual(
+            sizes[owner_port], n,
+            message="expected DBSIZE={} on owner port {} after sequential "
+                    "ingestion, got {}".format(n, owner_port,
+                                               sizes[owner_port]))
+
+        # And every other shard is still empty.
+        for port, sz in sizes.items():
+            if port == owner_port:
+                continue
+            env.assertEqual(
+                sz, 0,
+                message="non-owner shard on port {} has {} keys after "
+                        "single-slot sequential ingestion".format(port, sz))
+
+        # Sanity-check the actual key/value of a few entries to make sure
+        # we wrote the expected payload (not just empty placeholders or
+        # MULTI-discarded keys). Use direct GETs against the owning
+        # master.
+        owner_conn = next(c for c in env.getOSSMasterNodesConnectionList()
+                          if int(c.connection_pool.connection_kwargs[
+                              "port"]) == owner_port)
+        for key_idx in (1, n // 2, n):
+            key = "{{{}}}-key-{}".format(hash_tag, key_idx)
+            value = owner_conn.execute_command("GET", key)
+            env.assertEqual(
+                value, b"memtier-seq-data",
+                message="GET {!r} on port {} returned {!r}, expected "
+                        "'memtier-seq-data' — transaction commit may have "
+                        "been silently dropped".format(
+                            key, owner_port, value))
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)

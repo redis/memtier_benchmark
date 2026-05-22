@@ -119,6 +119,7 @@ struct verify_request : public request
 class shard_connection
 {
     friend void cluster_client_timer_handler(evutil_socket_t fd, short what, void *ctx);
+    friend void deferred_fill_pipeline_cb(evutil_socket_t fd, short what, void *ctx);
     friend void cluster_client_read_handler(bufferevent *bev, void *ctx);
     friend void cluster_client_event_handler(bufferevent *bev, short events, void *ctx);
 
@@ -145,6 +146,7 @@ public:
     void send_arbitrary_command_end(size_t command_index, struct timeval *sent_time, int cmd_size);
 
     void set_cluster_slots() { m_cluster_slots = setup_none; }
+    void schedule_fill(void);
 
     enum setup_state get_cluster_slots_state() { return m_cluster_slots; }
 

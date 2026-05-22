@@ -72,6 +72,11 @@ void cluster_client_reconnect_timer_handler(evutil_socket_t fd, short what, void
     sc->handle_reconnect_timer_event();
 }
 
+void deferred_fill_pipeline_cb(evutil_socket_t, short, void *ctx)
+{
+    static_cast<shard_connection *>(ctx)->fill_pipeline();
+}
+
 void cluster_client_connection_timeout_handler(evutil_socket_t fd, short what, void *ctx)
 {
     shard_connection *sc = (shard_connection *) ctx;
@@ -1079,6 +1084,12 @@ void shard_connection::handle_timer_event(void)
     }
 
     fill_pipeline();
+}
+
+void shard_connection::schedule_fill(void)
+{
+    struct timeval zero = {0, 0};
+    event_base_once(m_event_base, -1, EV_TIMEOUT, deferred_fill_pipeline_cb, this, &zero);
 }
 
 void shard_connection::attempt_reconnect(const char *error_context)
