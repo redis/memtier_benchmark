@@ -123,7 +123,8 @@ cluster_client::cluster_client(client_group *group) :
         m_txn_pinned_conn_id(-1),
         m_txn_observed_rotation_seq(0),
         m_txn_staged_key_index(0),
-        m_txn_has_staged_key(false)
+        m_txn_has_staged_key(false),
+        m_txn_pin_lost_warned(false)
 {
 }
 
@@ -315,6 +316,12 @@ void cluster_client::handle_cluster_slots(protocol_response *r)
 bool cluster_client::hold_pipeline(unsigned int conn_id)
 {
     if (m_connections[conn_id]->get_connection_state() == conn_disconnected) {
+        if (m_config->transaction && m_txn_pinned_conn_id == (int) conn_id && !m_txn_pin_lost_warned) {
+            m_txn_pin_lost_warned = true;
+            benchmark_error_log("warning: --transaction pin connection (id=%u) disconnected mid-rotation; "
+                                "transaction stats for the interrupted rotation will be inaccurate.\n",
+                                conn_id);
+        }
         return true;
     }
 
@@ -411,6 +418,7 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
             m_txn_observed_rotation_seq = m_arbitrary_command_rotation_seq;
             m_txn_pinned_conn_id = -1;
             m_txn_has_staged_key = false;
+            m_txn_pin_lost_warned = false;
             /* Wake up connections that were held back by hold_pipeline so
              * they can participate in the new rotation's lookahead. */
             for (size_t i = 0; i < m_connections.size(); i++) {

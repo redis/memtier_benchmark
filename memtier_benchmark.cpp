@@ -1540,6 +1540,20 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         return -1;
     }
 
+    if (cfg->transaction && cfg->pipeline > 1 && cfg->arbitrary_commands->is_defined()) {
+        for (size_t i = 0; i < cfg->arbitrary_commands->size(); i++) {
+            const arbitrary_command &cmd = cfg->arbitrary_commands->at(i);
+            if (strcasecmp(cmd.command_name.c_str(), "WATCH") == 0) {
+                fprintf(stderr,
+                        "warning: --transaction with WATCH and --pipeline=%u: multiple in-flight "
+                        "rotations share a connection so WATCH state leaks across pipeline slots "
+                        "and breaks optimistic-concurrency semantics. Use --pipeline=1 with WATCH.\n",
+                        cfg->pipeline);
+                break;
+            }
+        }
+    }
+
     if ((cfg->cluster_mode && !verify_cluster_option(cfg)) ||
         (cfg->arbitrary_commands->is_defined() && !verify_arbitrary_command_option(cfg))) {
         return -1;
@@ -1596,6 +1610,10 @@ void usage()
         "                                 keyed commands of the same rotation will get MOVED back. In\n"
         "                                 standalone mode this flag is a no-op (each client already runs\n"
         "                                 through a single connection). Requires at least one --command.\n"
+        "                                 Note: if --reconnect-on-error triggers mid-rotation, the\n"
+        "                                 interrupted rotation's stats will be inaccurate (server-side\n"
+        "                                 WATCH/MULTI state is lost on reconnect). Use --pipeline=1\n"
+        "                                 with WATCH to avoid cross-slot pipeline interference.\n"
         "  -h, --help                     Display this help\n"
         "  -v, --version                  Display version information\n"
         "\n"
