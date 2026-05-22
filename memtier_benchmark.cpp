@@ -298,6 +298,7 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             "test_time = %u\n"
             "ratio = %u:%u\n"
             "pipeline = %u\n"
+            "transaction = %s\n"
             "data_size = %u\n"
             "data_offset = %u\n"
             "random_data = %s\n"
@@ -345,7 +346,8 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             cfg->tls_sni,
 #endif
             cfg->out_file, cfg->client_stats, cfg->run_count, cfg->debug, cfg->requests, cfg->request_rate,
-            cfg->clients, cfg->threads, cfg->test_time, cfg->ratio.a, cfg->ratio.b, cfg->pipeline, cfg->data_size,
+            cfg->clients, cfg->threads, cfg->test_time, cfg->ratio.a, cfg->ratio.b, cfg->pipeline,
+            cfg->transaction ? "yes" : "no", cfg->data_size,
             cfg->data_offset, cfg->random_data ? "yes" : "no", cfg->data_size_range.min, cfg->data_size_range.max,
             cfg->data_size_list.print(tmpbuf, sizeof(tmpbuf) - 1), cfg->data_size_pattern, cfg->expiry_range.min,
             cfg->expiry_range.max, cfg->data_import, cfg->data_verify ? "yes" : "no", cfg->verify_only ? "yes" : "no",
@@ -394,6 +396,7 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
     jsonhandler->write_obj("test_time", "%u", cfg->test_time);
     jsonhandler->write_obj("ratio", "\"%u:%u\"", cfg->ratio.a, cfg->ratio.b);
     jsonhandler->write_obj("pipeline", "%u", cfg->pipeline);
+    jsonhandler->write_obj("transaction", "\"%s\"", cfg->transaction ? "true" : "false");
     jsonhandler->write_obj("data_size", "%u", cfg->data_size);
     jsonhandler->write_obj("data_offset", "%u", cfg->data_offset);
     jsonhandler->write_obj("random_data", "\"%s\"", cfg->random_data ? "true" : "false");
@@ -1538,6 +1541,20 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         return -1;
     }
 
+    if (cfg->transaction && cfg->pipeline > 1 && cfg->arbitrary_commands->is_defined()) {
+        for (size_t i = 0; i < cfg->arbitrary_commands->size(); i++) {
+            const arbitrary_command &cmd = cfg->arbitrary_commands->at(i);
+            if (strcasecmp(cmd.command_name.c_str(), "WATCH") == 0) {
+                fprintf(stderr,
+                        "warning: --transaction with WATCH and --pipeline=%u: multiple in-flight "
+                        "rotations share a connection so WATCH state leaks across pipeline slots "
+                        "and breaks optimistic-concurrency semantics. Use --pipeline=1 with WATCH.\n",
+                        cfg->pipeline);
+                break;
+            }
+        }
+    }
+
     if ((cfg->cluster_mode && !verify_cluster_option(cfg)) ||
         (cfg->arbitrary_commands->is_defined() && !verify_arbitrary_command_option(cfg))) {
         return -1;
@@ -1594,6 +1611,10 @@ void usage()
         "                                 keyed commands of the same rotation will get MOVED back. In\n"
         "                                 standalone mode this flag is a no-op (each client already runs\n"
         "                                 through a single connection). Requires at least one --command.\n"
+        "                                 Note: if --reconnect-on-error triggers mid-rotation, the\n"
+        "                                 interrupted rotation's stats will be inaccurate (server-side\n"
+        "                                 WATCH/MULTI state is lost on reconnect). Use --pipeline=1\n"
+        "                                 with WATCH to avoid cross-slot pipeline interference.\n"
         "  -h, --help                     Display this help\n"
         "  -v, --version                  Display version information\n"
         "\n"

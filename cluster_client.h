@@ -44,6 +44,9 @@ protected:
     // corrupting the pool's (command_index, key_index) pair invariant.
     unsigned long long m_txn_staged_key_index;
     bool m_txn_has_staged_key;
+    // Set when we emit the "pin connection lost mid-rotation" warning so we
+    // don't spam it on every hold_pipeline() call during the outage.
+    bool m_txn_pin_lost_warned;
 
     virtual int connect(void);
     virtual void disconnect(void);
