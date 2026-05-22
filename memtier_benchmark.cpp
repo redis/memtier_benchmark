@@ -1540,6 +1540,12 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         return -1;
     }
 
+    if (cfg->transaction && !cfg->cluster_mode) {
+        fprintf(stderr, "warning: --transaction has no effect without --cluster-mode. "
+                        "In standalone mode every client uses a single connection so commands "
+                        "are already serialized in order.\n");
+    }
+
     if (cfg->transaction && cfg->pipeline > 1 && cfg->arbitrary_commands->is_defined()) {
         for (size_t i = 0; i < cfg->arbitrary_commands->size(); i++) {
             const arbitrary_command &cmd = cfg->arbitrary_commands->at(i);

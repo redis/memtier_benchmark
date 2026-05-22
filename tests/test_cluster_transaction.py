@@ -97,7 +97,6 @@ def test_transaction_watch_multi_exec_unwatch(env):
         '--command=SET   {tx}-__key__ __data__',
         '--command=EXEC',
         '--command=UNWATCH',
-        '--command-key-pattern=R',
     ]
     ok, run_config, stderr = _run_transaction_workload(env, cmds)
 
@@ -122,7 +121,6 @@ def test_transaction_minimal_multi_exec(env):
         '--command=SET   {mx}-__key__ __data__',
         '--command=INCR  {mx}-counter',
         '--command=EXEC',
-        '--command-key-pattern=R',
     ]
     ok, run_config, stderr = _run_transaction_workload(env, cmds)
 
@@ -146,7 +144,6 @@ def test_transaction_with_discard(env):
         '--command=MULTI',
         '--command=SET   {dx}-__key__ __data__',
         '--command=DISCARD',
-        '--command-key-pattern=R',
     ]
     ok, run_config, stderr = _run_transaction_workload(env, cmds)
 
@@ -174,7 +171,6 @@ def test_transaction_in_standalone_is_noop(env):
         '--command=SET   __key__ __data__',
         '--command=INCR  counter',
         '--command=EXEC',
-        '--command-key-pattern=R',
     ]
     ok, run_config, stderr = _run_transaction_workload(env, cmds)
 
@@ -311,7 +307,6 @@ def _run_ingestion(env, hash_tag, requests, threads=1, clients=1,
         '--command=MULTI',
         '--command=SET {' + hash_tag + '}-key-__key__ memtier-ingest-data',
         '--command=EXEC',
-        '--command-key-pattern=R',
         '--key-minimum=1',
         '--key-maximum={}'.format(key_max),
     ]

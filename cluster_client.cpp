@@ -126,6 +126,7 @@ cluster_client::cluster_client(client_group *group) :
         m_txn_has_staged_key(false),
         m_txn_pin_lost_warned(false)
 {
+    memset(m_slot_to_shard, 0, sizeof(m_slot_to_shard));
 }
 
 cluster_client::~cluster_client()
@@ -164,6 +165,13 @@ int cluster_client::connect(void)
 
 void cluster_client::disconnect(void)
 {
+    // Reset transaction pin state so a post-reconnect topology with fewer
+    // shards doesn't leave m_txn_pinned_conn_id pointing past the end of
+    // m_connections (which would be an out-of-bounds access).
+    m_txn_pinned_conn_id = -1;
+    m_txn_has_staged_key = false;
+    m_txn_pin_lost_warned = false;
+
     unsigned int conn_size = m_connections.size();
     unsigned int i;
 
@@ -347,8 +355,15 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
      * are not blocked indefinitely. */
     if (m_config->transaction && m_txn_pinned_conn_id != -1 && m_txn_pinned_conn_id != (int) conn_id) {
         if (m_connections[m_txn_pinned_conn_id]->get_connection_state() == conn_disconnected) {
+            // Pin dropped; clear it and wake sibling connections so they are
+            // not left blocked indefinitely waiting for the disconnected pin.
             m_txn_pinned_conn_id = -1;
             m_txn_has_staged_key = false;
+            for (size_t i = 0; i < m_connections.size(); i++) {
+                if ((unsigned int) i != conn_id && m_connections[i]->get_connection_state() != conn_disconnected) {
+                    m_connections[i]->schedule_fill();
+                }
+            }
         } else {
             return true;
         }
@@ -526,8 +541,14 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
          * (rather than queueing onto the pin's pool) keeps the pin's
          * pipeline depth honest — otherwise late-rotation MULTI/SET
          * fragments would pile up in the pool and get dropped at
-         * shutdown, silently losing committed-side data. */
+         * shutdown, silently losing committed-side data.
+         *
+         * If the pin was just assigned to a different connection, wake it
+         * up explicitly. Without this, a pin whose bufferevent was silenced
+         * by the idle path (e.g. it was a non-pin held by hold_pipeline)
+         * would never call fill_pipeline again and the benchmark deadlocks. */
         if ((unsigned int) m_txn_pinned_conn_id != conn_id) {
+            m_connections[m_txn_pinned_conn_id]->schedule_fill();
             return false;
         }
 
