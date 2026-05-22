@@ -521,9 +521,13 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
                 break;
             }
             /* If we couldn't find a keyed cmd, or the slot mapping isn't
-             * populated yet (target_conn out of range), fall back to the
-             * current conn for the rotation. */
-            if (target_conn < 0 || target_conn >= (int) m_connections.size()) {
+             * populated yet (target_conn out of range), or the elected shard
+             * is currently disconnected (e.g. pin just dropped and hasn't
+             * reconnected yet), fall back to the current conn so the rotation
+             * can proceed rather than re-pinning to a dead connection and
+             * permanently stalling all other conns via hold_pipeline. */
+            if (target_conn < 0 || target_conn >= (int) m_connections.size() ||
+                m_connections[target_conn]->get_connection_state() == conn_disconnected) {
                 target_conn = (int) conn_id;
                 have_staged_key = false; // discard, can't push to invalid pool
             }
@@ -731,12 +735,32 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
         // handle "-MOVED"
         if (strncmp(response->get_status(), MOVED_MSG_PREFIX, MOVED_MSG_PREFIX_LEN) == 0) {
             handle_moved(conn_id, timestamp, request, response);
-            // With --retry-on-error, the captured command bytes are resent on
-            // the slot-owning connection. MOVED/ASK count toward max_retries.
-            // If the retry is refused (budget exhausted / queue full / no
-            // captured bytes), account it as a terminal error so the request
-            // doesn't silently disappear from the stats.
-            if (m_config->retry_on_error && !retry_after_redirect(conn_id, request)) {
+            // With --transaction, retrying a mid-rotation command on the new
+            // slot owner would split the MULTI/EXEC block across two shard
+            // connections. Drop the rotation instead, reset the pin so the
+            // next rotation can start fresh on the updated topology, and warn
+            // once about stat inaccuracy.
+            if (m_config->transaction && (int) conn_id == m_txn_pinned_conn_id) {
+                if (!m_txn_pin_lost_warned) {
+                    m_txn_pin_lost_warned = true;
+                    benchmark_error_log("warning: --transaction pin connection (id=%u) received MOVED "
+                                        "mid-rotation; topology changed; transaction stats for the "
+                                        "interrupted rotation will be inaccurate.\n",
+                                        conn_id);
+                }
+                m_txn_pinned_conn_id = -1;
+                m_txn_has_staged_key = false;
+                for (size_t i = 0; i < m_connections.size(); i++) {
+                    if (i != conn_id && m_connections[i]->get_connection_state() != conn_disconnected)
+                        m_connections[i]->schedule_fill();
+                }
+                finalize_dropped_redirect(timestamp, request, response);
+            } else if (m_config->retry_on_error && !retry_after_redirect(conn_id, request)) {
+                // With --retry-on-error, the captured command bytes are resent
+                // on the slot-owning connection. MOVED/ASK count toward
+                // max_retries. If the retry is refused (budget exhausted /
+                // queue full / no captured bytes), account it as a terminal
+                // error so the request doesn't silently disappear from stats.
                 finalize_dropped_redirect(timestamp, request, response);
             }
             return;
@@ -745,7 +769,22 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
         // handle "-ASK"
         if (strncmp(response->get_status(), ASK_MSG_PREFIX, ASK_MSG_PREFIX_LEN) == 0) {
             handle_ask(conn_id, timestamp, request, response);
-            if (m_config->retry_on_error && !retry_after_redirect(conn_id, request)) {
+            if (m_config->transaction && (int) conn_id == m_txn_pinned_conn_id) {
+                if (!m_txn_pin_lost_warned) {
+                    m_txn_pin_lost_warned = true;
+                    benchmark_error_log("warning: --transaction pin connection (id=%u) received ASK "
+                                        "mid-rotation; topology changed; transaction stats for the "
+                                        "interrupted rotation will be inaccurate.\n",
+                                        conn_id);
+                }
+                m_txn_pinned_conn_id = -1;
+                m_txn_has_staged_key = false;
+                for (size_t i = 0; i < m_connections.size(); i++) {
+                    if (i != conn_id && m_connections[i]->get_connection_state() != conn_disconnected)
+                        m_connections[i]->schedule_fill();
+                }
+                finalize_dropped_redirect(timestamp, request, response);
+            } else if (m_config->retry_on_error && !retry_after_redirect(conn_id, request)) {
                 finalize_dropped_redirect(timestamp, request, response);
             }
             return;

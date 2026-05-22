@@ -16,6 +16,7 @@ broken-transaction error (`unwatch inside MULTI`, `EXEC without MULTI`,
 `MULTI calls can not be nested`, `EXECABORT`).
 """
 
+import json
 import os
 import tempfile
 
@@ -497,6 +498,80 @@ def test_transaction_sequential_ingestion_full_population(env):
                         "'memtier-seq-data' — transaction commit may have "
                         "been silently dropped".format(
                             key, owner_port, value))
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_appears_in_config_and_json_output(env):
+    """--transaction must be reflected in both the printed config (stderr)
+    and the JSON output file so tooling that parses memtier output can
+    detect the mode without re-parsing the command line."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    cmds = [
+        '--command=MULTI',
+        '--command=SET {cfg}-__key__ __data__',
+        '--command=EXEC',
+        '--command-key-pattern=R',
+    ]
+    ok, run_config, stderr = _run_transaction_workload(env, cmds, requests=60)
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier_benchmark exited non-zero")
+
+        # Printed config block (emitted to stderr before [RUN #1]) must
+        # contain "transaction = yes".
+        env.assertTrue(
+            "transaction = yes" in stderr,
+            message="'transaction = yes' not found in memtier stderr config block; "
+                    "got stderr excerpt: {!r}".format(stderr[:600]))
+
+        # JSON output file must have configuration.transaction == "true".
+        json_path = os.path.join(run_config.results_dir, "mb.json")
+        env.assertTrue(
+            os.path.isfile(json_path),
+            message="mb.json not found at {}".format(json_path))
+        with open(json_path) as f:
+            doc = json.load(f)
+        cfg_section = doc.get("configuration", {})
+        env.assertEqual(
+            cfg_section.get("transaction"), "true",
+            message="JSON configuration.transaction expected 'true', got {!r}".format(
+                cfg_section.get("transaction")))
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_keyless_only_rotation(env):
+    """A rotation whose only commands are keyless (MULTI + EXEC with no
+    keyed command inside) must complete without hanging or asserting.
+
+    Without a keyed command the lookahead falls back to the current
+    connection for the pin and never generates a staged key. All non-pin
+    connections get schedule_fill() wakeups on every rotation boundary but
+    are immediately re-blocked by hold_pipeline(). This exercises the
+    liveness of that fast-block/wake path."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    cmds = [
+        '--command=MULTI',
+        '--command=EXEC',
+    ]
+    ok, run_config, stderr = _run_transaction_workload(env, cmds,
+                                                       threads=2, clients=2,
+                                                       requests=200)
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier_benchmark exited non-zero (possible hang or crash)")
+        _assert_no_transaction_breakage(env, stderr)
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)
