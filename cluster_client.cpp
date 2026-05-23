@@ -163,6 +163,19 @@ int cluster_client::connect(void)
     return 0;
 }
 
+void cluster_client::txn_release_pin()
+{
+    if (m_txn_has_staged_key) {
+        // Return the staged key to the pin connection's pool so the next
+        // rotation can reuse it. Without this, every mid-rotation pin reset
+        // (MOVED, disconnect) silently burns one key from the sequential
+        // iterator, permanently skipping that index under --key-pattern=S.
+        m_key_index_pools[m_txn_pinned_conn_id]->push(m_txn_staged_key_index);
+        m_txn_has_staged_key = false;
+    }
+    m_txn_pinned_conn_id = -1;
+}
+
 void cluster_client::disconnect(void)
 {
     // Reset transaction pin state so a post-reconnect topology with fewer
@@ -330,8 +343,7 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
                                 "transaction stats for the interrupted rotation will be inaccurate.\n",
                                 conn_id);
             // Release the pin so non-pin connections can resume the rotation.
-            m_txn_pinned_conn_id = -1;
-            m_txn_has_staged_key = false;
+            txn_release_pin();
             for (size_t i = 0; i < m_connections.size(); i++) {
                 if (i != conn_id && m_connections[i]->get_connection_state() != conn_disconnected) {
                     m_connections[i]->schedule_fill();
@@ -357,8 +369,7 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         if (m_connections[m_txn_pinned_conn_id]->get_connection_state() == conn_disconnected) {
             // Pin dropped; clear it and wake sibling connections so they are
             // not left blocked indefinitely waiting for the disconnected pin.
-            m_txn_pinned_conn_id = -1;
-            m_txn_has_staged_key = false;
+            txn_release_pin();
             for (size_t i = 0; i < m_connections.size(); i++) {
                 if ((unsigned int) i != conn_id && m_connections[i]->get_connection_state() != conn_disconnected) {
                     m_connections[i]->schedule_fill();
@@ -685,7 +696,11 @@ bool cluster_client::retry_after_redirect(unsigned int conn_id, request *req)
 
     unsigned int target = conn_id;
     if (req->m_key && req->m_key_len > 0) {
-        unsigned int hslot = calc_hslot_crc16_cluster(req->m_key, req->m_key_len);
+        // Use the hash-tag-aware variant so a retry of an arbitrary command
+        // whose key carries a {tag} prefix (e.g. "{foo}-key-5") routes to
+        // the correct shard. calc_hslot_crc16_cluster hashes the full string
+        // and would map to a different slot, causing an infinite MOVED loop.
+        unsigned int hslot = calc_hslot_crc16_with_hash_tag(req->m_key, req->m_key_len);
         unsigned int mapped = m_slot_to_shard[hslot];
         // Only route to a different connection if it's actually ready; otherwise
         // fall back to the same connection (CLUSTER SLOTS may still be in flight).
@@ -751,8 +766,7 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
                                         "interrupted rotation will be inaccurate.\n",
                                         conn_id);
                 }
-                m_txn_pinned_conn_id = -1;
-                m_txn_has_staged_key = false;
+                txn_release_pin();
                 for (size_t i = 0; i < m_connections.size(); i++) {
                     if (i != conn_id && m_connections[i]->get_connection_state() != conn_disconnected)
                         m_connections[i]->schedule_fill();
@@ -780,8 +794,7 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
                                         "interrupted rotation will be inaccurate.\n",
                                         conn_id);
                 }
-                m_txn_pinned_conn_id = -1;
-                m_txn_has_staged_key = false;
+                txn_release_pin();
                 for (size_t i = 0; i < m_connections.size(); i++) {
                     if (i != conn_id && m_connections[i]->get_connection_state() != conn_disconnected)
                         m_connections[i]->schedule_fill();

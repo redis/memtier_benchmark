@@ -64,6 +64,10 @@ protected:
     // to --failed-keys-file if configured and increments the error counter,
     // so the request doesn't silently disappear from the stats.
     void finalize_dropped_redirect(struct timeval timestamp, request *req, protocol_response *response);
+    // Release the transaction pin and return any staged key to the pool so the
+    // key index is not silently burned when a mid-rotation MOVED or disconnect
+    // forces the rotation to restart.
+    void txn_release_pin();
 
 public:
     cluster_client(client_group *group);
