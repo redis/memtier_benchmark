@@ -88,7 +88,7 @@ public:
     virtual get_key_response get_key_for_conn(unsigned int command_index, unsigned int conn_id,
                                               unsigned long long *key_index);
     virtual bool create_arbitrary_request(unsigned int command_index, struct timeval &timestamp, unsigned int conn_id);
-    virtual bool create_mget_request(struct timeval &timestamp, unsigned int conn_id) override;
+    virtual bool create_mget_request(struct timeval &timestamp, unsigned int conn_id);
 
     // client manager api's
     virtual void handle_cluster_slots(protocol_response *r);
