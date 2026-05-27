@@ -3,6 +3,10 @@
 
 BasedOnStyle: LLVM
 
+# C++ standard: keep Cpp03 so nested templates use "> >" (not ">>"),
+# which is required for the macOS C++03-compatible build.
+Standard: Cpp03
+
 # Indentation
 IndentWidth: 4
 TabWidth: 4
