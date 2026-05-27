@@ -696,6 +696,7 @@ bool cluster_client::create_mget_request(struct timeval &timestamp, unsigned int
     // build_mget_slot_cache() at the end of handle_cluster_slots().
     unsigned int keys_count = m_config->ratio.b - m_get_ratio_count;
     if ((int) keys_count > m_config->multi_key_get) keys_count = m_config->multi_key_get;
+    if (keys_count == 0) return false;
 
     if (conn_id >= m_mget_conn_slots.size() || m_mget_conn_slots[conn_id].empty()) {
         // Cache not ready or no key in the configured range maps to this shard.
