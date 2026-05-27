@@ -585,8 +585,7 @@ bool client::create_mget_request(struct timeval &timestamp, unsigned int conn_id
     m_keylist->clear();
     for (unsigned int i = 0; i < keys_count; i++) {
         get_key_response res = get_key_for_conn(GET_CMD_IDX, conn_id, &key_index);
-        /* Not supported in cluster mode */
-        assert(res == available_for_conn);
+        if (res != available_for_conn) continue;
 
         m_keylist->add_key(m_obj_gen->get_key(), m_obj_gen->get_key_len());
     }

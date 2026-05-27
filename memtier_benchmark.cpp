@@ -616,9 +616,6 @@ static bool verify_cluster_option(struct benchmark_config *cfg)
     if (cfg->reconnect_interval) {
         fprintf(stderr, "error: cluster mode dose not support reconnect-interval option.\n");
         return false;
-    } else if (cfg->multi_key_get) {
-        fprintf(stderr, "error: cluster mode dose not support multi-key-get option.\n");
-        return false;
     } else if (cfg->wait_ratio.is_defined()) {
         fprintf(stderr, "error: cluster mode dose not support wait-ratio option.\n");
         return false;
@@ -1724,7 +1721,8 @@ void usage()
         "(default: 0)\n"
         "      --thread-conn-start-max-jitter-micros=NUM Maximum jitter in microseconds between connection creation "
         "(default: 0)\n"
-        "      --multi-key-get=NUM        Enable multi-key get commands, up to NUM keys (default: 0)\n"
+        "      --multi-key-get=NUM        Enable multi-key get commands, up to NUM keys (default: 0).\n"
+        "                                 In cluster mode, keys are hash-tagged to guarantee same-slot routing.\n"
         "      --select-db=DB             DB number to select, when testing a redis server\n"
         "      --distinct-client-seed     Use a different random seed for each client\n"
         "      --randomize                random seed based on timestamp (default is constant value)\n"

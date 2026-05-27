@@ -58,6 +58,11 @@ protected:
     // Set when we emit the "pin connection lost mid-rotation" warning so we
     // don't spam it on every hold_pipeline() call during the outage.
     bool m_txn_pin_lost_warned;
+    // Rolling integer used to derive a hash tag whose slot maps to the current
+    // connection for MGET requests. Cluster MGET requires all keys to live on
+    // the same shard, so each generated key is wrapped in a "{TAG}" hash tag
+    // that pins it to this connection's slot.
+    unsigned long long m_mget_slot_group;
 
     virtual int connect(void);
     virtual void disconnect(void);
@@ -89,6 +94,7 @@ public:
     virtual get_key_response get_key_for_conn(unsigned int command_index, unsigned int conn_id,
                                               unsigned long long *key_index);
     virtual bool create_arbitrary_request(unsigned int command_index, struct timeval &timestamp, unsigned int conn_id);
+    virtual bool create_mget_request(struct timeval &timestamp, unsigned int conn_id) override;
 
     // client manager api's
     virtual void handle_cluster_slots(protocol_response *r);
