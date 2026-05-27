@@ -5,12 +5,13 @@ Background
 ----------
 `redis_protocol::write_command_multi_get()` is used by the `--multi-key-get N`
 option to batch multiple GETs into a single MGET command.  In cluster mode the
-keys generated for a single MGET are hash-tagged with a rotating group tag so
-that every key in the list belongs to the same hash slot, which lets MGET be
-served by a single shard while still distributing load across all shards.  MGET
-is also available via the `--command='MGET ...'` arbitrary-command path: the
-caller is then responsible for using hash-tagged keys to keep all arguments in
-the same slot.
+keys are selected from a pre-built per-slot cache: memtier scans `[key_min,
+key_max]` once at startup, groups key indices by their exact CRC16 hash slot,
+and at request time picks N keys from the same slot as the target shard.  This
+guarantees every MGET is served by a single shard without using hash-tag
+prefixes, while still distributing load across all shards.  MGET is also
+available via the `--command='MGET ...'` arbitrary-command path: the caller is
+then responsible for ensuring all keys belong to the same slot.
 
 Test matrix
 -----------
