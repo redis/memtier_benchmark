@@ -59,16 +59,16 @@ def add_required_env_arguments(benchmark_specs, config, env, master_nodes_list):
 
 
 def debugPrintMemtierOnError(config, env):
-    with open('{0}/mb.stderr'.format(config.results_dir)) as stderr:
-        env.debugPrint("### PRINTING STDERR OUTPUT OF MEMTIER ON FAILURE ###", True)
-        env.debugPrint("### mb.stderr file location: {0}".format('{0}/mb.stderr'.format(config.results_dir)), True)
-        for line in stderr:
-            env.debugPrint(line.rstrip(), True)
-    with open('{0}/mb.stdout'.format(config.results_dir)) as stderr:
-        env.debugPrint("### PRINTING STDOUT OUTPUT OF MEMTIER ON FAILURE ###", True)
-        env.debugPrint("### mb.stdout file location: {0}".format('{0}/mb.stdout'.format(config.results_dir)), True)
-        for line in stderr:
-            env.debugPrint(line.rstrip(), True)
+    for fname, label in [('mb.stderr', 'STDERR'), ('mb.stdout', 'STDOUT')]:
+        path = '{0}/{1}'.format(config.results_dir, fname)
+        if not os.path.isfile(path):
+            env.debugPrint("### {0} not found (memtier may have exited before writing output): {1}".format(label, path), True)
+            continue
+        with open(path) as f:
+            env.debugPrint("### PRINTING {0} OUTPUT OF MEMTIER ON FAILURE ###".format(label), True)
+            env.debugPrint("### {0} file location: {1}".format(fname, path), True)
+            for line in f:
+                env.debugPrint(line.rstrip(), True)
 
     if not env.isCluster():
         if env.envRunner is not None:

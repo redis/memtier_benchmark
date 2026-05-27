@@ -319,8 +319,9 @@ def test_mget_cluster_no_crossslot_errors(env):
 # ---------------------------------------------------------------------------
 
 def test_mget_arbitrary_single_slot(env):
-    """MGET via --command with hash-tagged keys (all 3 keys in the same slot)
-    must complete successfully and show calls in INFO COMMANDSTATS."""
+    """MGET via --command with a hash-tagged key must complete successfully
+    and show calls in INFO COMMANDSTATS.  Cluster mode restricts arbitrary
+    commands to a single __key__ token, so we use MGET {mg}-__key__."""
     if not env.isCluster():
         env.skip()
         return
@@ -328,7 +329,7 @@ def test_mget_arbitrary_single_slot(env):
     _reset_stats(env)
 
     extra_args = [
-        "--command=MGET {mg}-__key__ {mg}-__key__ {mg}-__key__",
+        "--command=MGET {mg}-__key__",
         "--key-minimum=1",
         "--key-maximum=100",
     ]
@@ -372,7 +373,7 @@ def test_mget_arbitrary_single_slot_each_shard(env):
         _reset_stats(env)
 
         extra_args = [
-            "--command=MGET {" + hash_tag + "}-__key__ {" + hash_tag + "}-__key__",
+            "--command=MGET {" + hash_tag + "}-__key__",
             "--key-minimum=1",
             "--key-maximum=50",
         ]
@@ -520,7 +521,7 @@ def test_mget_arbitrary_cluster_hits_land_on_shard(env):
     _reset_stats(env)
 
     mget_extra_args = [
-        "--command=MGET {" + hash_tag + "}-__key__ {" + hash_tag + "}-__key__ {" + hash_tag + "}-__key__",
+        "--command=MGET {" + hash_tag + "}-__key__",
         "--command-key-pattern=R",
         "--key-minimum={}".format(key_min),
         "--key-maximum={}".format(key_max),
