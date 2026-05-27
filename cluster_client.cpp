@@ -125,8 +125,7 @@ cluster_client::cluster_client(client_group *group) :
         m_txn_observed_rotation_seq(0),
         m_txn_staged_key_index(0),
         m_txn_has_staged_key(false),
-        m_txn_pin_lost_warned(false),
-        m_mget_probe_index(0)
+        m_txn_pin_lost_warned(false)
 {
     memset(m_slot_to_shard, 0, sizeof(m_slot_to_shard));
 }
@@ -280,6 +279,32 @@ bool cluster_client::connect_shard_connection(shard_connection *sc, char *addres
     return res == 0;
 }
 
+void cluster_client::build_mget_slot_cache()
+{
+    if (!m_config->multi_key_get) return;
+
+    unsigned int num_conns = (unsigned int) m_connections.size();
+    unsigned long long key_min = m_config->key_minimum;
+    unsigned long long key_max = m_config->key_maximum;
+
+    m_mget_slot_keys.assign(MAX_CLUSTER_HSLOT + 1, std::vector<unsigned long long>());
+    m_mget_slot_cursor.assign(MAX_CLUSTER_HSLOT + 1, 0);
+    m_mget_conn_slots.assign(num_conns, std::vector<unsigned int>());
+    m_mget_conn_slot_cursor.assign(num_conns, 0);
+
+    for (unsigned long long idx = key_min; idx <= key_max; idx++) {
+        m_obj_gen->generate_key(idx);
+        unsigned int slot = calc_hslot_crc16_with_hash_tag(m_obj_gen->get_key(), m_obj_gen->get_key_len());
+        m_mget_slot_keys[slot].push_back(idx);
+    }
+
+    for (unsigned int slot = 0; slot <= MAX_CLUSTER_HSLOT; slot++) {
+        if (m_mget_slot_keys[slot].empty()) continue;
+        unsigned int cid = m_slot_to_shard[slot];
+        if (cid < num_conns) m_mget_conn_slots[cid].push_back(slot);
+    }
+}
+
 void cluster_client::handle_cluster_slots(protocol_response *r)
 {
     /*
@@ -363,6 +388,9 @@ void cluster_client::handle_cluster_slots(protocol_response *r)
             }
         }
     }
+
+    // Rebuild same-slot key index cache for MGET if enabled.
+    build_mget_slot_cache();
 }
 
 bool cluster_client::hold_pipeline(unsigned int conn_id)
@@ -652,34 +680,33 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
 
 bool cluster_client::create_mget_request(struct timeval &timestamp, unsigned int conn_id)
 {
-    // Only reached when --multi-key-get is set. Probe the key space to collect
-    // keys that naturally hash to conn_id's shard — no hash-tag prefix needed,
-    // so keys are identical to those written by a normal SET preload.
-    // Expected probes per key: O(num_shards) — negligible vs. network RTT.
+    // Only reached when --multi-key-get is set.
+    // Use the pre-built slot cache so all N keys in this MGET share one hash
+    // slot — Redis requires exact same-slot (not just same-node) for MGET in
+    // cluster mode. Cache is rebuilt on every topology change via
+    // build_mget_slot_cache() at the end of handle_cluster_slots().
     unsigned int keys_count = m_config->ratio.b - m_get_ratio_count;
     if ((int) keys_count > m_config->multi_key_get) keys_count = m_config->multi_key_get;
 
-    unsigned long long key_min = m_config->key_minimum;
-    unsigned long long range = m_config->key_maximum - key_min + 1;
-    if (range == 0) range = 1; // guard against key_maximum < key_minimum misconfiguration
+    if (conn_id >= m_mget_conn_slots.size() || m_mget_conn_slots[conn_id].empty()) {
+        // Cache not ready or no key in the configured range maps to this shard.
+        return false;
+    }
+
+    // Round-robin over the slots owned by this connection.
+    size_t &sc = m_mget_conn_slot_cursor[conn_id];
+    unsigned int target_slot = m_mget_conn_slots[conn_id][sc % m_mget_conn_slots[conn_id].size()];
+    sc++;
+
+    std::vector<unsigned long long> &slot_keys = m_mget_slot_keys[target_slot];
+    size_t &kc = m_mget_slot_cursor[target_slot];
 
     m_keylist->clear();
-    unsigned int found = 0;
-    while (found < keys_count) {
-        unsigned long long idx = key_min + (m_mget_probe_index % range);
-        m_mget_probe_index++;
-
+    for (unsigned int i = 0; i < keys_count; i++) {
+        unsigned long long idx = slot_keys[kc % slot_keys.size()];
+        kc++;
         m_obj_gen->generate_key(idx);
-        const char *key = m_obj_gen->get_key();
-        int key_len = m_obj_gen->get_key_len();
-        // Use the hash-tag-aware variant so that a --key-prefix containing
-        // {braces} is hashed the same way Redis itself hashes it.
-        unsigned int slot = calc_hslot_crc16_with_hash_tag(key, key_len);
-
-        if (m_slot_to_shard[slot] == conn_id) {
-            m_keylist->add_key(key, key_len);
-            found++;
-        }
+        m_keylist->add_key(m_obj_gen->get_key(), m_obj_gen->get_key_len());
     }
 
     m_connections[conn_id]->send_mget_command(&timestamp, m_keylist);
