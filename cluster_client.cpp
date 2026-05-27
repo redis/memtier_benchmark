@@ -124,7 +124,8 @@ cluster_client::cluster_client(client_group *group) :
         m_txn_observed_rotation_seq(0),
         m_txn_staged_key_index(0),
         m_txn_has_staged_key(false),
-        m_txn_pin_lost_warned(false)
+        m_txn_pin_lost_warned(false),
+        m_mget_slot_keys_built(false)
 {
     memset(m_slot_to_shard, 0, sizeof(m_slot_to_shard));
 }
@@ -267,19 +268,27 @@ void cluster_client::build_mget_slot_cache()
     if (!m_config->multi_key_get) return;
 
     unsigned int num_conns = (unsigned int) m_connections.size();
-    unsigned long long key_min = m_config->key_minimum;
-    unsigned long long key_max = m_config->key_maximum;
 
-    m_mget_slot_keys.assign(MAX_CLUSTER_HSLOT + 1, std::vector<unsigned long long>());
-    m_mget_slot_cursor.assign(MAX_CLUSTER_HSLOT + 1, 0);
+    // Slot→key mapping is topology-independent: build it once.
+    if (!m_mget_slot_keys_built) {
+        unsigned long long key_min = m_config->key_minimum;
+        unsigned long long key_max = m_config->key_maximum;
+
+        m_mget_slot_keys.assign(MAX_CLUSTER_HSLOT + 1, std::vector<unsigned long long>());
+        m_mget_slot_cursor.assign(MAX_CLUSTER_HSLOT + 1, 0);
+
+        for (unsigned long long idx = key_min; idx <= key_max; idx++) {
+            m_obj_gen->generate_key(idx);
+            unsigned int slot = calc_hslot_crc16_with_hash_tag(m_obj_gen->get_key(), m_obj_gen->get_key_len());
+            m_mget_slot_keys[slot].push_back(idx);
+        }
+
+        m_mget_slot_keys_built = true;
+    }
+
+    // Conn→slot mapping depends on topology: rebuild on every refresh.
     m_mget_conn_slots.assign(num_conns, std::vector<unsigned int>());
     m_mget_conn_slot_cursor.assign(num_conns, 0);
-
-    for (unsigned long long idx = key_min; idx <= key_max; idx++) {
-        m_obj_gen->generate_key(idx);
-        unsigned int slot = calc_hslot_crc16_with_hash_tag(m_obj_gen->get_key(), m_obj_gen->get_key_len());
-        m_mget_slot_keys[slot].push_back(idx);
-    }
 
     for (unsigned int slot = 0; slot <= MAX_CLUSTER_HSLOT; slot++) {
         if (m_mget_slot_keys[slot].empty()) continue;
