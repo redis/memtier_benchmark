@@ -141,7 +141,7 @@ def _preload_keys(env, key_min, key_max):
     benchmark = Benchmark.from_json(run_config, benchmark_specs)
     ok = benchmark.run()
     debugPrintMemtierOnError(run_config, env)
-    env.assertTrue(ok, "preload SET pass failed")
+    env.assertTrue(ok, message="preload SET pass failed")
 
 
 def _reset_commandstats(env):
@@ -207,7 +207,7 @@ def test_mget_resp_array_size(env):
     env.assertEqual(
         len(mget_entries),
         requests,
-        "Expected exactly {} MGET wire commands, got {}".format(
+        message="Expected exactly {} MGET wire commands, got {}".format(
             requests, len(mget_entries)
         ),
     )
@@ -218,7 +218,7 @@ def test_mget_resp_array_size(env):
         env.assertEqual(
             actual_keys,
             key_count,
-            "MGET #{}: expected {} key arguments, got {}. Command: {}".format(
+            message="MGET #{}: expected {} key arguments, got {}. Command: {}".format(
                 i, key_count, actual_keys, " ".join(parts)
             ),
         )
@@ -268,7 +268,7 @@ def test_mget_resp_array_size_72(env):
     env.assertEqual(
         len(mget_entries),
         requests,
-        "Expected exactly {} MGET wire commands, got {}".format(
+        message="Expected exactly {} MGET wire commands, got {}".format(
             requests, len(mget_entries)
         ),
     )
@@ -278,7 +278,7 @@ def test_mget_resp_array_size_72(env):
         env.assertEqual(
             actual_keys,
             key_count,
-            "MGET #{}: expected {} key arguments, got {}".format(
+            message="MGET #{}: expected {} key arguments, got {}".format(
                 i, key_count, actual_keys
             ),
         )
@@ -339,7 +339,7 @@ def test_mget_key_uniqueness_in_command(env):
     )
     env.assertTrue(
         unique_mgets >= min_unique_mgets,
-        "Expected at least {}/{} MGETs with distinct keys, got {}".format(
+        message="Expected at least {}/{} MGETs with distinct keys, got {}".format(
             min_unique_mgets, requests, unique_mgets
         ),
     )
@@ -383,13 +383,13 @@ def test_mget_key_prefix(env):
 
         _stop_monitor(conn, t, stop_event)
         debugPrintMemtierOnError(run_config, env)
-        env.assertTrue(ok, "benchmark failed for prefix='{}'".format(prefix))
+        env.assertTrue(ok, message="benchmark failed for prefix='{}'".format(prefix))
 
         mget_entries = _filter_mget(results)
         env.assertEqual(
             len(mget_entries),
             requests,
-            "prefix='{}': expected {} MGETs, got {}".format(
+            message="prefix='{}': expected {} MGETs, got {}".format(
                 prefix, requests, len(mget_entries)
             ),
         )
@@ -398,7 +398,7 @@ def test_mget_key_prefix(env):
             for key in parts[1:]:
                 env.assertTrue(
                     key.startswith(prefix),
-                    "prefix='{}': MGET #{} contains key '{}' that does not "
+                    message="prefix='{}': MGET #{} contains key '{}' that does not "
                     "start with '{}'".format(prefix, i, key, prefix),
                 )
 
@@ -448,12 +448,12 @@ def test_mget_response_array_parsing(env):
     env.assertGreater(
         gets.get("Hits/sec", 0),
         0,
-        "Expected Hits/sec > 0 when all keys were preloaded",
+        message="Expected Hits/sec > 0 when all keys were preloaded",
     )
     env.assertEqual(
         gets.get("Misses/sec", -1),
         0,
-        "Expected Misses/sec == 0 when all keys were preloaded",
+        message="Expected Misses/sec == 0 when all keys were preloaded",
     )
 
 
@@ -492,7 +492,7 @@ def test_mget_vs_get_same_keyspace(env):
         requests=200,
     )
     debugPrintMemtierOnError(run_config_a, env)
-    env.assertTrue(ok_a, "Benchmark A (GET) failed")
+    env.assertTrue(ok_a, message="Benchmark A (GET) failed")
 
     results_a = _read_json(run_config_a)
     gets_a = results_a["ALL STATS"]["Gets"]
@@ -500,12 +500,12 @@ def test_mget_vs_get_same_keyspace(env):
     env.assertGreater(
         gets_a.get("Hits/sec", 0),
         0,
-        "Benchmark A: expected Hits/sec > 0",
+        message="Benchmark A: expected Hits/sec > 0",
     )
     env.assertEqual(
         gets_a.get("Misses/sec", -1),
         0,
-        "Benchmark A: expected Misses/sec == 0",
+        message="Benchmark A: expected Misses/sec == 0",
     )
 
     # --- Benchmark B: MGET with 10 keys ---
@@ -525,7 +525,7 @@ def test_mget_vs_get_same_keyspace(env):
         requests=20,
     )
     debugPrintMemtierOnError(run_config_b, env)
-    env.assertTrue(ok_b, "Benchmark B (MGET) failed")
+    env.assertTrue(ok_b, message="Benchmark B (MGET) failed")
 
     results_b = _read_json(run_config_b)
     gets_b = results_b["ALL STATS"]["Gets"]
@@ -533,12 +533,12 @@ def test_mget_vs_get_same_keyspace(env):
     env.assertGreater(
         gets_b.get("Hits/sec", 0),
         0,
-        "Benchmark B: expected Hits/sec > 0",
+        message="Benchmark B: expected Hits/sec > 0",
     )
     env.assertEqual(
         gets_b.get("Misses/sec", -1),
         0,
-        "Benchmark B: expected Misses/sec == 0",
+        message="Benchmark B: expected Misses/sec == 0",
     )
 
 
@@ -586,14 +586,14 @@ def test_mget_single_key(env):
     env.assertEqual(
         len(mget_entries),
         requests,
-        "Expected {} MGET wire commands, got {}".format(requests, len(mget_entries)),
+        message="Expected {} MGET wire commands, got {}".format(requests, len(mget_entries)),
     )
     for i, parts in enumerate(mget_entries):
         actual_keys = len(parts) - 1
         env.assertEqual(
             actual_keys,
             key_count,
-            "MGET #{}: expected 1 key argument, got {}".format(i, actual_keys),
+            message="MGET #{}: expected 1 key argument, got {}".format(i, actual_keys),
         )
 
     # (b) commandstats check
@@ -608,11 +608,11 @@ def test_mget_single_key(env):
     env.assertEqual(
         mget_calls,
         requests,
-        "cmdstat_mget.calls: expected {}, got {}".format(requests, mget_calls),
+        message="cmdstat_mget.calls: expected {}, got {}".format(requests, mget_calls),
     )
     env.assertEqual(
         get_calls,
         0,
-        "cmdstat_get.calls: expected 0 (MGET should not fall back to GET), "
+        message="cmdstat_get.calls: expected 0 (MGET should not fall back to GET), "
         "got {}".format(get_calls),
     )

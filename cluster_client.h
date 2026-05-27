@@ -64,9 +64,9 @@ protected:
     // all N keys in one MGET come from the same hash slot so Redis never
     // returns CROSSSLOT. m_mget_conn_slots[conn_id] lists the slots owned
     // by that connection that have at least one key in the configured range.
-    std::vector<std::vector<unsigned long long>> m_mget_slot_keys; // [slot] → key indices
-    std::vector<size_t> m_mget_slot_cursor;                        // [slot] → round-robin cursor
-    std::vector<std::vector<unsigned int>> m_mget_conn_slots;      // [conn] → owned slot list
+    std::vector<std::vector<unsigned long long> > m_mget_slot_keys; // [slot] → key indices
+    std::vector<size_t> m_mget_slot_cursor;                         // [slot] → round-robin cursor
+    std::vector<std::vector<unsigned int> > m_mget_conn_slots;      // [conn] → owned slot list
     std::vector<size_t> m_mget_conn_slot_cursor;                   // [conn] → slot round-robin cursor
     void build_mget_slot_cache();
 
