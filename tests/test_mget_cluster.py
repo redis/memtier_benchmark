@@ -564,9 +564,11 @@ def test_mget_arbitrary_cluster_hits_land_on_shard(env):
                 doc = json.load(f)
             all_stats = doc.get("ALL STATS", {})
             # Arbitrary-command workloads report under the command name
-            # ("MGET") or under "Totals".
+            # ("MGET").  "Totals" is intentionally excluded: it always carries
+            # Hits/sec=0 for arbitrary commands (hit tracking is not wired
+            # up for the --command path), which would produce a false failure.
             hits_sec = None
-            for section_key in ("MGET", "Gets", "Totals"):
+            for section_key in ("MGET", "Gets"):
                 section = all_stats.get(section_key, {})
                 if "Hits/sec" in section:
                     hits_sec = float(section["Hits/sec"])

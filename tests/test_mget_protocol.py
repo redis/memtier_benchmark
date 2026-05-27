@@ -22,6 +22,9 @@ import time
 import redis
 
 from include import (
+    TLS_CACERT,
+    TLS_CERT,
+    TLS_KEY,
     add_required_env_arguments,
     addTLSArgs,
     debugPrintMemtierOnError,
@@ -40,7 +43,18 @@ def _get_redis_conn(env):
     master_nodes_list = env.getMasterNodesList()
     if env.isUnixSocket():
         return redis.Redis(unix_socket_path=master_nodes_list[0]["unix_socket_path"])
-    return redis.Redis(host="127.0.0.1", port=master_nodes_list[0]["port"])
+    kwargs = {"host": "127.0.0.1", "port": master_nodes_list[0]["port"]}
+    if getattr(env, "useTLS", False):
+        kwargs["ssl"] = True
+        if TLS_CACERT:
+            kwargs["ssl_ca_certs"] = TLS_CACERT
+        else:
+            kwargs["ssl_cert_reqs"] = "none"
+        if TLS_CERT:
+            kwargs["ssl_certfile"] = TLS_CERT
+        if TLS_KEY:
+            kwargs["ssl_keyfile"] = TLS_KEY
+    return redis.Redis(**kwargs)
 
 
 def _capture_monitor(conn, results, stop_event):
