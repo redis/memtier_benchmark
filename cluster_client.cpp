@@ -621,7 +621,7 @@ bool cluster_client::create_mget_request(struct timeval &timestamp, unsigned int
     if ((int) keys_count > m_config->multi_key_get) keys_count = m_config->multi_key_get;
 
     unsigned long long key_min = m_config->key_minimum;
-    unsigned long long range   = m_config->key_maximum - key_min + 1;
+    unsigned long long range = m_config->key_maximum - key_min + 1;
     if (range == 0) range = 1; // guard against key_maximum < key_minimum misconfiguration
 
     m_keylist->clear();
@@ -631,11 +631,11 @@ bool cluster_client::create_mget_request(struct timeval &timestamp, unsigned int
         m_mget_probe_index++;
 
         m_obj_gen->generate_key(idx);
-        const char *key     = m_obj_gen->get_key();
-        int         key_len = m_obj_gen->get_key_len();
+        const char *key = m_obj_gen->get_key();
+        int key_len = m_obj_gen->get_key_len();
         // Use the hash-tag-aware variant so that a --key-prefix containing
         // {braces} is hashed the same way Redis itself hashes it.
-        unsigned int slot   = calc_hslot_crc16_with_hash_tag(key, key_len);
+        unsigned int slot = calc_hslot_crc16_with_hash_tag(key, key_len);
 
         if (m_slot_to_shard[slot] == conn_id) {
             m_keylist->add_key(key, key_len);
