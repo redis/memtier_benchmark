@@ -45,11 +45,11 @@ def _get_redis_conn(env):
         return redis.Redis(unix_socket_path=master_nodes_list[0]["unix_socket_path"])
     kwargs = {"host": "127.0.0.1", "port": master_nodes_list[0]["port"]}
     if getattr(env, "useTLS", False):
+        # Skip server cert verification: test certs are self-signed and the CN
+        # rarely matches "127.0.0.1", which would cause hostname-check failure.
+        # The server still verifies the client cert via ssl_certfile/ssl_keyfile.
         kwargs["ssl"] = True
-        if TLS_CACERT:
-            kwargs["ssl_ca_certs"] = TLS_CACERT
-        else:
-            kwargs["ssl_cert_reqs"] = "none"
+        kwargs["ssl_cert_reqs"] = "none"
         if TLS_CERT:
             kwargs["ssl_certfile"] = TLS_CERT
         if TLS_KEY:
