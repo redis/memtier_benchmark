@@ -20,6 +20,7 @@
 #define MEMTIER_BENCHMARK_CLUSTER_CLIENT_H
 
 #include <set>
+#include <vector>
 #include "client.h"
 
 typedef std::queue<unsigned long long> key_index_pool;
@@ -47,9 +48,16 @@ protected:
     // Set when we emit the "pin connection lost mid-rotation" warning so we
     // don't spam it on every hold_pipeline() call during the outage.
     bool m_txn_pin_lost_warned;
-    // Probe cursor for cluster MGET key selection. Only advanced inside
-    // create_mget_request(), which is only called when --multi-key-get is set.
-    unsigned long long m_mget_probe_index;
+    // Per-slot key index cache for cluster MGET. Built once after topology
+    // loads (only when --multi-key-get > 0). Guarantees same-slot routing:
+    // all N keys in one MGET come from the same hash slot so Redis never
+    // returns CROSSSLOT. m_mget_conn_slots[conn_id] lists the slots owned
+    // by that connection that have at least one key in the configured range.
+    std::vector<std::vector<unsigned long long>> m_mget_slot_keys; // [slot] → key indices
+    std::vector<size_t> m_mget_slot_cursor;                        // [slot] → round-robin cursor
+    std::vector<std::vector<unsigned int>> m_mget_conn_slots;      // [conn] → owned slot list
+    std::vector<size_t> m_mget_conn_slot_cursor;                   // [conn] → slot round-robin cursor
+    void build_mget_slot_cache();
 
     virtual int connect(void);
     virtual void disconnect(void);
