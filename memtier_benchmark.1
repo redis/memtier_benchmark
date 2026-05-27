@@ -106,7 +106,10 @@ Specify which percentiles info to print on the results table (by default prints 
 When performing multiple test iterations, print and save results for all iterations
 .TP
 \fB\-\-realtime\-latencies\fR
-Replace the periodic single\-line progress output with a per\-tick block: line 1 = throughput + miss ratio, then one or more latency lines carrying the percentiles configured by \fB\-\-print\-percentiles\fR (immediate and overall, side\-by\-side). Redraws in place on a TTY; appends cleanly when stderr is redirected to a file.
+Replace the periodic single\-line progress output with a per\-tick block: line 1 = throughput + miss ratio, then three labeled latency rows per percentile \- inst (last tick), win<N>s (sliding window, see \fB\-\-latency\-window\fR) and overall (full run). Redraws in place on a TTY; appends cleanly when stderr is redirected to a file.
+.TP
+\fB\-\-latency\-window\fR=\fI\,SECS\/\fR
+Sliding\-window size for the win<N>s tail\-latency row in \fB\-\-realtime\-latencies\fR output. Acts like load1/5/15 for tail latency: each tick the per\-second histogram is pushed into a ring of N snapshots and percentiles are computed over the live ring. Default: 60. Set to 0 to disable the windowed row. Max: 3600.
 .TP
 \fB\-\-command\-stats\-breakdown\fR=\fI\,command\/\fR|line
 How to group command statistics in the output (default: command)
