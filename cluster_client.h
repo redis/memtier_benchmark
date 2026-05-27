@@ -67,7 +67,8 @@ protected:
     std::vector<std::vector<unsigned long long> > m_mget_slot_keys; // [slot] → key indices
     std::vector<size_t> m_mget_slot_cursor;                         // [slot] → round-robin cursor
     std::vector<std::vector<unsigned int> > m_mget_conn_slots;      // [conn] → owned slot list
-    std::vector<size_t> m_mget_conn_slot_cursor;                   // [conn] → slot round-robin cursor
+    std::vector<size_t> m_mget_conn_slot_cursor;                    // [conn] → slot round-robin cursor
+    bool m_mget_slot_keys_built;                                    // slot→key scan runs once
     void build_mget_slot_cache();
 
     virtual int connect(void);

@@ -590,6 +590,8 @@ bool client::create_mget_request(struct timeval &timestamp, unsigned int conn_id
         m_keylist->add_key(m_obj_gen->get_key(), m_obj_gen->get_key_len());
     }
 
+    if (m_keylist->get_keys_count() == 0) return false;
+
     m_connections[conn_id]->send_mget_command(&timestamp, m_keylist);
     return true;
 }
