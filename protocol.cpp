@@ -368,8 +368,31 @@ int redis_protocol::write_command_set(const char *key, int key_len, const char *
 
 int redis_protocol::write_command_multi_get(const keylist *keylist)
 {
-    fprintf(stderr, "error: multi get not implemented for redis yet!\n");
-    assert(0);
+    assert(keylist != NULL);
+    assert(keylist->get_keys_count() > 0);
+
+    int size = 0;
+    unsigned int keys_count = keylist->get_keys_count();
+
+    // *<1+keys_count>\r\n$4\r\nMGET\r\n
+    size = evbuffer_add_printf(m_write_buf,
+                               "*%u\r\n"
+                               "$4\r\n"
+                               "MGET\r\n",
+                               1 + keys_count);
+
+    for (unsigned int i = 0; i < keys_count; i++) {
+        unsigned int key_len;
+        const char *key = keylist->get_key(i, &key_len);
+        assert(key != NULL);
+
+        size += evbuffer_add_printf(m_write_buf, "$%u\r\n", key_len);
+        evbuffer_add(m_write_buf, key, key_len);
+        evbuffer_add(m_write_buf, "\r\n", 2);
+        size += key_len + 2;
+    }
+
+    return size;
 }
 
 int redis_protocol::write_command_get(const char *key, int key_len, unsigned int offset)
