@@ -448,33 +448,6 @@ void object_generator::generate_key(unsigned long long key_index)
     m_key = m_key_buffer;
 }
 
-void object_generator::generate_key_with_hashtag(unsigned long long key_index,
-                                                 const char *tag, int tag_len)
-{
-    generate_key(key_index);
-
-    int orig_len = m_key_len;
-    size_t required = (size_t) 1 + tag_len + 1 + orig_len + 1;
-    if (required > m_key_buffer_size) {
-        char *new_buf = (char *) realloc(m_key_buffer, required);
-        if (new_buf == NULL) {
-            fprintf(stderr, "error: failed to allocate %zu bytes for key buffer\n", required);
-            exit(1);
-        }
-        m_key_buffer = new_buf;
-        m_key_buffer_size = required;
-        m_key = m_key_buffer;
-    }
-
-    memmove(m_key_buffer + 1 + tag_len + 1, m_key_buffer, orig_len);
-    m_key_buffer[0] = '{';
-    memcpy(m_key_buffer + 1, tag, tag_len);
-    m_key_buffer[1 + tag_len] = '}';
-    m_key_len = 1 + tag_len + 1 + orig_len;
-    m_key_buffer[m_key_len] = '\0';
-    m_key = m_key_buffer;
-}
-
 const char *object_generator::get_key_prefix()
 {
     return m_key_prefix;

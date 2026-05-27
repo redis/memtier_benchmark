@@ -147,8 +147,6 @@ public:
     void fill_value_buffer();
     unsigned long long get_key_index(int iter);
     void generate_key(unsigned long long key_index);
-    void generate_key_with_hashtag(unsigned long long key_index,
-                                   const char *tag, int tag_len);
     const char *get_key() { return m_key; }
     int get_key_len() { return m_key_len; }
 

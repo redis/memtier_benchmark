@@ -125,7 +125,7 @@ cluster_client::cluster_client(client_group *group) :
         m_txn_staged_key_index(0),
         m_txn_has_staged_key(false),
         m_txn_pin_lost_warned(false),
-        m_mget_slot_group(0)
+        m_mget_probe_index(0)
 {
     memset(m_slot_to_shard, 0, sizeof(m_slot_to_shard));
 }
@@ -613,47 +613,31 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
 
 bool cluster_client::create_mget_request(struct timeval &timestamp, unsigned int conn_id)
 {
-    // Cluster MGET requires every key in the request to hash to the same shard
-    // (the one owning this connection). We achieve this by wrapping each key in
-    // a "{TAG}" hash tag whose slot maps to conn_id. Redis hashes only the bytes
-    // inside the first {tag}, so all the wrapped keys land on the same slot.
+    // Only reached when --multi-key-get is set. Probe the key space to collect
+    // keys that naturally hash to conn_id's shard — no hash-tag prefix needed,
+    // so keys are identical to those written by a normal SET preload.
+    // Expected probes per key: O(num_shards) — negligible vs. network RTT.
     unsigned int keys_count = m_config->ratio.b - m_get_ratio_count;
     if ((int) keys_count > m_config->multi_key_get) keys_count = m_config->multi_key_get;
 
-    // Find a group tag whose slot belongs to conn_id. With N shards this takes
-    // O(N) tries on average.
-    char tag_str[64];
-    unsigned int slot;
-    do {
-        snprintf(tag_str, sizeof(tag_str), "%llu", m_mget_slot_group);
-        m_mget_slot_group++;
-        slot = crc16(tag_str, strlen(tag_str)) & MAX_CLUSTER_HSLOT;
-    } while (m_slot_to_shard[slot] != conn_id);
-
-    // Build the literal "{TAG}" prefix string (with braces).
-    char tag_prefix[64];
-    int prefix_len = snprintf(tag_prefix, sizeof(tag_prefix), "{%s}", tag_str);
+    unsigned long long key_min = m_config->key_minimum;
+    unsigned long long range   = m_config->key_maximum - key_min + 1;
 
     m_keylist->clear();
-    for (unsigned int i = 0; i < keys_count; i++) {
-        unsigned long long key_index;
-        // Use the BASE class get_key_for_conn explicitly: the cluster override
-        // would distribute keys to different shards, but here we deliberately
-        // pin all keys to this connection via the hash tag.
-        client::get_key_for_conn(GET_CMD_IDX, conn_id, &key_index);
+    unsigned int found = 0;
+    while (found < keys_count) {
+        unsigned long long idx = key_min + (m_mget_probe_index % range);
+        m_mget_probe_index++;
 
-        // Build tagged key: "{TAG}" + plain_key
-        const char *base = m_obj_gen->get_key();
-        int base_len = m_obj_gen->get_key_len();
-        int total_len = prefix_len + base_len;
+        m_obj_gen->generate_key(idx);
+        const char *key     = m_obj_gen->get_key();
+        int         key_len = m_obj_gen->get_key_len();
+        unsigned int slot   = crc16(key, key_len) & MAX_CLUSTER_HSLOT;
 
-        char tagged[256];
-        assert(total_len < (int) sizeof(tagged));
-        memcpy(tagged, tag_prefix, prefix_len);
-        memcpy(tagged + prefix_len, base, base_len);
-        tagged[total_len] = '\0';
-
-        m_keylist->add_key(tagged, total_len);
+        if (m_slot_to_shard[slot] == conn_id) {
+            m_keylist->add_key(key, key_len);
+            found++;
+        }
     }
 
     m_connections[conn_id]->send_mget_command(&timestamp, m_keylist);
