@@ -424,9 +424,10 @@ def test_mget_json_output_structure(env):
     env.assertTrue(gets["Misses/sec"] >= 0,
                    message="ALL STATS.Gets.Misses/sec must be >= 0")
 
-    # No SETs in a ratio=0:N run.
-    env.assertTrue("Sets" not in all_stats,
-                   message="ALL STATS.Sets must not exist for ratio=0:N workloads")
+    # No SETs in a ratio=0:N run — JSON always includes the key, but Count must be 0.
+    if "Sets" in all_stats:
+        env.assertEqual(all_stats["Sets"].get("Count", 0), 0,
+                        message="ALL STATS.Sets.Count must be 0 for ratio=0:N workloads")
 
 
 # ---------------------------------------------------------------------------
