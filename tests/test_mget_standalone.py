@@ -70,7 +70,7 @@ def _preload_keys(env, test_dir, key_min, key_max):
     ok = benchmark.run()
     # Surface preload errors immediately so test failures are easier to debug.
     debugPrintMemtierOnError(run_config, env)
-    env.assertTrue(ok, "preload SET pass failed")
+    env.assertTrue(ok, message="preload SET pass failed")
 
 
 def _reset_commandstats(env):
@@ -220,12 +220,12 @@ def test_mget_various_key_counts(env):
         # Surface which key_count failed, if any.
         env.assertTrue(
             memtier_ok,
-            "memtier exit non-zero for key_count={}".format(key_count),
+            message="memtier exit non-zero for key_count={}".format(key_count),
         )
         env.assertEqual(
             expected_mget_calls,
             merged["cmdstat_mget"]["calls"],
-            "key_count={}: expected {} MGET calls, got {}".format(
+            message="key_count={}: expected {} MGET calls, got {}".format(
                 key_count,
                 expected_mget_calls,
                 merged["cmdstat_mget"]["calls"],
@@ -274,9 +274,9 @@ def test_mget_all_hits(env):
     gets = results["ALL STATS"]["Gets"]
 
     env.assertGreater(gets["Hits/sec"], 0,
-                      "Expected Hits/sec > 0 when all keys exist")
+                      message="Expected Hits/sec > 0 when all keys exist")
     env.assertEqual(gets["Misses/sec"], 0,
-                    "Expected Misses/sec == 0 when all keys exist")
+                    message="Expected Misses/sec == 0 when all keys exist")
 
 
 # ---------------------------------------------------------------------------
@@ -316,9 +316,9 @@ def test_mget_all_misses(env):
     gets = results["ALL STATS"]["Gets"]
 
     env.assertEqual(gets["Hits/sec"], 0,
-                    "Expected Hits/sec == 0 when keyspace is empty")
+                    message="Expected Hits/sec == 0 when keyspace is empty")
     env.assertGreater(gets["Misses/sec"], 0,
-                      "Expected Misses/sec > 0 when keyspace is empty")
+                      message="Expected Misses/sec > 0 when keyspace is empty")
 
 
 # ---------------------------------------------------------------------------
@@ -363,9 +363,9 @@ def test_mget_partial_hits(env):
     gets = results["ALL STATS"]["Gets"]
 
     env.assertGreater(gets["Hits/sec"], 0,
-                      "Expected some hits when partial keyspace is populated")
+                      message="Expected some hits when partial keyspace is populated")
     env.assertGreater(gets["Misses/sec"], 0,
-                      "Expected some misses when partial keyspace is populated")
+                      message="Expected some misses when partial keyspace is populated")
 
 
 # ---------------------------------------------------------------------------
@@ -405,28 +405,28 @@ def test_mget_json_output_structure(env):
     all_stats = results["ALL STATS"]
 
     # Gets section must exist.
-    env.assertTrue("Gets" in all_stats, "ALL STATS.Gets missing from JSON")
+    env.assertTrue("Gets" in all_stats, message="ALL STATS.Gets missing from JSON")
     gets = all_stats["Gets"]
 
     env.assertGreater(gets.get("Ops/sec", 0), 0,
-                      "ALL STATS.Gets.Ops/sec must be > 0")
+                      message="ALL STATS.Gets.Ops/sec must be > 0")
     env.assertGreater(gets.get("Count", 0), 0,
-                      "ALL STATS.Gets.Count must be > 0")
+                      message="ALL STATS.Gets.Count must be > 0")
 
     # Hits/sec and Misses/sec must be present (value can be 0).
     env.assertTrue("Hits/sec" in gets,
-                   "ALL STATS.Gets.Hits/sec key missing from JSON")
+                   message="ALL STATS.Gets.Hits/sec key missing from JSON")
     env.assertTrue(gets["Hits/sec"] >= 0,
-                   "ALL STATS.Gets.Hits/sec must be >= 0")
+                   message="ALL STATS.Gets.Hits/sec must be >= 0")
 
     env.assertTrue("Misses/sec" in gets,
-                   "ALL STATS.Gets.Misses/sec key missing from JSON")
+                   message="ALL STATS.Gets.Misses/sec key missing from JSON")
     env.assertTrue(gets["Misses/sec"] >= 0,
-                   "ALL STATS.Gets.Misses/sec must be >= 0")
+                   message="ALL STATS.Gets.Misses/sec must be >= 0")
 
     # No SETs in a ratio=0:N run.
     env.assertTrue("Sets" not in all_stats,
-                   "ALL STATS.Sets must not exist for ratio=0:N workloads")
+                   message="ALL STATS.Sets must not exist for ratio=0:N workloads")
 
 
 # ---------------------------------------------------------------------------
@@ -470,9 +470,9 @@ def test_mget_ratio_alignment(env):
     agg_info_commandstats(master_nodes_connections, merged)
 
     env.assertGreater(merged["cmdstat_set"]["calls"], 0,
-                      "Expected SET calls > 0 with ratio=1:72")
+                      message="Expected SET calls > 0 with ratio=1:72")
     env.assertGreater(merged["cmdstat_mget"]["calls"], 0,
-                      "Expected MGET calls > 0 with ratio=1:72")
+                      message="Expected MGET calls > 0 with ratio=1:72")
 
 
 # ---------------------------------------------------------------------------
@@ -509,11 +509,11 @@ def test_mget_key_range_multislot(env):
     memtier_ok = benchmark.run()
     debugPrintMemtierOnError(run_config, env)
     env.assertTrue(memtier_ok,
-                   "Benchmark must exit 0 for multi-slot key range on standalone")
+                   message="Benchmark must exit 0 for multi-slot key range on standalone")
 
     master_nodes_connections = env.getOSSMasterNodesConnectionList()
     merged = {"cmdstat_mget": {"calls": 0}}
     agg_info_commandstats(master_nodes_connections, merged)
 
     env.assertGreater(merged["cmdstat_mget"]["calls"], 0,
-                      "Expected at least one MGET to reach Redis")
+                      message="Expected at least one MGET to reach Redis")
