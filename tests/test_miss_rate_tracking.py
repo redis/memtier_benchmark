@@ -106,7 +106,7 @@ def test_hits_misses_columns_in_text_output(env):
     env.skipOnCluster()
     _preload_strings(env)
 
-    ok, stdout, _stderr, _js = _run_benchmark(
+    ok, stdout, _stderr, js = _run_benchmark(
         env,
         [
             "--command=GET __key__",
@@ -125,18 +125,27 @@ def test_hits_misses_columns_in_text_output(env):
     env.assertTrue(len(hits_lines) > 0, message="Hits/sec column missing from text output")
     env.assertTrue(len(misses_lines) > 0, message="Misses/sec column missing from text output")
 
-    # At least one data row (not just the header) should carry a non-zero value.
-    # The header row contains "Hits/sec" as a column label; data rows start with
-    # a command name like "Gets" and end with a numeric Hits/sec value.
-    data_rows_with_hits = [
+    # Parse the Gets data row. Columns are:
+    # Type | Ops/sec | Hits/sec | Misses/sec | Avg.Latency | ... | KB/sec
+    gets_rows = [
         l for l in lines
-        if l.strip() and not l.strip().startswith("Type") and "Hits/sec" not in l
-        and "Gets" in l
+        if l.strip().startswith("Gets") and "Hits/sec" not in l
     ]
-    env.assertTrue(
-        len(data_rows_with_hits) > 0,
-        message="Expected a 'Gets' data row in text output",
-    )
+    env.assertTrue(len(gets_rows) == 1, message="Expected exactly one 'Gets' data row")
+    fields = gets_rows[0].split()
+    # fields[0]="Gets", fields[1]=Ops/sec, fields[2]=Hits/sec, fields[3]=Misses/sec
+    text_hits_sec = float(fields[2])
+    text_misses_sec = float(fields[3])
+    env.assertTrue(text_hits_sec > 0, message="text Gets Hits/sec={} expected > 0".format(text_hits_sec))
+    env.assertTrue(text_misses_sec > 0, message="text Gets Misses/sec={} expected > 0".format(text_misses_sec))
+
+    # Numeric parity: the text-table Gets Hits/sec must match the JSON value
+    # (same source, same denominator). %.2f text rounding -> small delta.
+    json_gets = js.get("ALL STATS", {}).get("Gets", {})
+    env.assertAlmostEqual(text_hits_sec, json_gets.get("Hits/sec", -1), 1.0,
+                          message="text vs JSON Hits/sec disagree")
+    env.assertAlmostEqual(text_misses_sec, json_gets.get("Misses/sec", -1), 1.0,
+                          message="text vs JSON Misses/sec disagree")
 
 
 # ---------------------------------------------------------------------------
@@ -241,21 +250,25 @@ def test_monitor_random_hits_sec_nonzero(env):
     env.assertTrue(ok)
 
     all_stats = js.get("ALL STATS", {})
-    # The GET stats slot should carry non-zero Hits/sec because mon-key1 exists.
-    gets = all_stats.get("Gets", {})
+    env.assertContains("Gets", all_stats)
+    gets = all_stats["Gets"]
+    env.assertTrue("Hits/sec" in gets, message="Gets.Hits/sec missing in monitor-random mode")
+    # mon-key1 is preloaded and is one of two GET targets, so over 200 requests
+    # with random selection at least one GET hit is statistically certain. A
+    # zero here would mean MONITOR_RANDOM miss tracking is dead (the bug this
+    # whole slot-stamping fix addresses).
     env.assertTrue(
-        "Hits/sec" in gets,
-        message="Gets.Hits/sec missing from JSON in monitor-random mode",
+        gets["Hits/sec"] > 0,
+        message="Gets.Hits/sec={} expected > 0 (mon-key1 preloaded)".format(gets["Hits/sec"]),
     )
+    # JSON Totals must reflect the same non-zero hits.
+    env.assertContains("Totals", all_stats)
+    totals = all_stats["Totals"]
     env.assertTrue(
-        gets["Hits/sec"] >= 0,
-        message="Gets.Hits/sec must not be negative",
-    )
-    # Total Hits/sec in JSON Totals must also be non-negative.
-    totals = all_stats.get("Totals", {})
-    env.assertTrue(
-        totals.get("Hits/sec", -1) >= 0,
-        message="Totals.Hits/sec must not be negative in monitor-random mode",
+        totals.get("Hits/sec", 0) > 0,
+        message="Totals.Hits/sec={} expected > 0 in monitor-random mode".format(
+            totals.get("Hits/sec")
+        ),
     )
 
 
@@ -282,20 +295,31 @@ def test_run_count_average_hits_sec_nonzero(env):
     )
     env.assertTrue(ok)
 
-    avg_stats = js.get("AVERAGE RESULTS", {})
-    if not avg_stats:
-        # Some older JSON layouts nest under ALL STATS; skip gracefully.
-        env.debugPrint("AVERAGE RESULTS section absent; skipping sub-check", True)
-        return
+    # The averaged section header is "AGGREGATED AVERAGE RESULTS (N runs)";
+    # locate it dynamically rather than guessing the run count.
+    avg_keys = [k for k in js if k.startswith("AGGREGATED AVERAGE RESULTS")]
+    env.assertTrue(
+        len(avg_keys) == 1,
+        message="Expected exactly one 'AGGREGATED AVERAGE RESULTS' section; got keys: {}".format(
+            list(js.keys())
+        ),
+    )
+    avg_stats = js[avg_keys[0]]
 
     gets = avg_stats.get("Gets", {})
     env.assertTrue(
         "Hits/sec" in gets,
-        message="Gets.Hits/sec missing from AVERAGE RESULTS",
+        message="Gets.Hits/sec missing from {}".format(avg_keys[0]),
     )
+    # This is the assertion that actually exercises the aggregate_average()
+    # synthetic-duration fix: without it the averaged Hits/sec is 0.0.
     env.assertTrue(
         gets["Hits/sec"] > 0,
         message="AVERAGE Gets.Hits/sec={} expected > 0".format(gets["Hits/sec"]),
+    )
+    env.assertTrue(
+        gets.get("Misses/sec", 0) > 0,
+        message="AVERAGE Gets.Misses/sec={} expected > 0".format(gets.get("Misses/sec")),
     )
 
 

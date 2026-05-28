@@ -857,6 +857,20 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
         for (size_t j = 0; j < i->m_arbitrary_misses.size(); ++j) {
             m_arbitrary_misses[j].total_hits += i->m_arbitrary_misses[j].total_hits;
             m_arbitrary_misses[j].total_misses += i->m_arbitrary_misses[j].total_misses;
+            // Accumulate per-key buckets too, so the AVERAGE report's
+            // "Per-Key Misses" JSON section is populated like BEST/WORST.
+            const std::vector<unsigned long long> &src_hits = i->m_arbitrary_misses[j].per_key_hits;
+            if (!src_hits.empty()) {
+                arbitrary_misses_total &dst = m_arbitrary_misses[j];
+                if (dst.per_key_hits.size() < src_hits.size()) {
+                    dst.per_key_hits.resize(src_hits.size(), 0);
+                    dst.per_key_misses.resize(src_hits.size(), 0);
+                }
+                for (size_t k = 0; k < src_hits.size(); ++k) {
+                    dst.per_key_hits[k] += src_hits[k];
+                    dst.per_key_misses[k] += i->m_arbitrary_misses[j].per_key_misses[k];
+                }
+            }
         }
 
         total_duration_usec += ts_diff(i->m_start_time, i->m_end_time);
@@ -874,11 +888,15 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
     m_totals.m_ask_sec /= all_stats.size();
     m_totals.m_bytes_sec /= all_stats.size();
     m_totals.m_latency /= all_stats.size();
-    // Average the accumulated hit/miss counts
+    // Average the accumulated hit/miss counts (totals and per-key buckets)
     if (!all_stats.empty()) {
         for (size_t j = 0; j < m_arbitrary_misses.size(); ++j) {
             m_arbitrary_misses[j].total_hits /= all_stats.size();
             m_arbitrary_misses[j].total_misses /= all_stats.size();
+            for (size_t k = 0; k < m_arbitrary_misses[j].per_key_hits.size(); ++k) {
+                m_arbitrary_misses[j].per_key_hits[k] /= all_stats.size();
+                m_arbitrary_misses[j].per_key_misses[k] /= all_stats.size();
+            }
         }
     }
 
@@ -1290,12 +1308,15 @@ void run_stats::print_hits_sec_column(output_table &table, const std::vector<agg
                 total_hits += agg.total_hits;
             }
         } else {
-            for (size_t i = 0; i < m_arbitrary_misses.size(); i++) {
-                double hits_sec = test_duration_usec > 0 ? (double) m_arbitrary_misses[i].total_hits /
-                                                               (double) test_duration_usec * 1000000.0
-                                                         : 0.0;
+            // Iterate the same row count as the other per-line columns
+            // (Type/Ops/sec use m_ar_commands.size()) so the table stays aligned
+            // even if m_arbitrary_misses ever diverges in size.
+            for (size_t i = 0; i < m_totals.m_ar_commands.size(); i++) {
+                unsigned long long hits = i < m_arbitrary_misses.size() ? m_arbitrary_misses[i].total_hits : 0;
+                double hits_sec =
+                    test_duration_usec > 0 ? (double) hits / (double) test_duration_usec * 1000000.0 : 0.0;
                 column.elements.push_back(*el.init_double("%12.2f ", hits_sec));
-                total_hits += m_arbitrary_misses[i].total_hits;
+                total_hits += hits;
             }
         }
         double total_hits_sec =
@@ -1331,12 +1352,14 @@ void run_stats::print_missess_sec_column(output_table &table,
                 total_misses += agg.total_misses;
             }
         } else {
-            for (size_t i = 0; i < m_arbitrary_misses.size(); i++) {
-                double misses_sec = test_duration_usec > 0 ? (double) m_arbitrary_misses[i].total_misses /
-                                                                 (double) test_duration_usec * 1000000.0
-                                                           : 0.0;
+            // Iterate the same row count as the other per-line columns so the
+            // table stays aligned even if m_arbitrary_misses ever diverges.
+            for (size_t i = 0; i < m_totals.m_ar_commands.size(); i++) {
+                unsigned long long misses = i < m_arbitrary_misses.size() ? m_arbitrary_misses[i].total_misses : 0;
+                double misses_sec =
+                    test_duration_usec > 0 ? (double) misses / (double) test_duration_usec * 1000000.0 : 0.0;
                 column.elements.push_back(*el.init_double("%12.2f ", misses_sec));
-                total_misses += m_arbitrary_misses[i].total_misses;
+                total_misses += misses;
             }
         }
         double total_misses_sec =
@@ -1717,6 +1740,12 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
         if (dur_usec > 0) {
             unsigned long long all_hits = 0, all_misses = 0;
             for (size_t j = 0; j < m_arbitrary_misses.size(); ++j) {
+                // Skip the MONITOR_RANDOM placeholder slot to mirror the text /
+                // aggregated Totals path (the placeholder never accrues counts,
+                // but skipping it keeps the two paths provably identical).
+                if (j < command_list.size() && command_list[j].command_type == "MONITOR_RANDOM") {
+                    continue;
+                }
                 all_hits += m_arbitrary_misses[j].total_hits;
                 all_misses += m_arbitrary_misses[j].total_misses;
             }

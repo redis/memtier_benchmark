@@ -1689,6 +1689,7 @@ void usage()
         "      --miss-rate-threshold=PERCENTAGE\n"
         "                                 Warn when miss rate exceeds this percentage (default: 1.0).\n"
         "                                 Accepts fractional values, e.g. 0.5 for half a percent.\n"
+        "                                 0 warns on any miss.\n"
         "      --statsd-host=HOST         StatsD server hostname to send real-time metrics (default: none, disabled)\n"
         "      --statsd-port=PORT         StatsD server UDP port (default: 8125)\n"
         "      --statsd-prefix=PREFIX     Prefix for StatsD metric names (default: memtier)\n"
