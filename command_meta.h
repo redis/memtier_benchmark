@@ -91,5 +91,25 @@ const CommandSpec *lookup(const char *name);
 // Number of commands compiled into the static table.
 size_t count();
 
+inline const char *reply_shape_name(ReplyShape shape)
+{
+    switch (shape) {
+    case ReplyShape::NotMissable:
+        return "NotMissable";
+    case ReplyShape::SingleNullBulk:
+        return "SingleNullBulk";
+    case ReplyShape::ArrayPerElementNulls:
+        return "ArrayPerElementNulls";
+    case ReplyShape::EmptyCollection:
+        return "EmptyCollection";
+    case ReplyShape::IntegerMembership:
+        return "IntegerMembership";
+    case ReplyShape::Unknown:
+        return "Unknown";
+    default:
+        return "?";
+    }
+}
+
 } // namespace command_meta
 } // namespace memtier

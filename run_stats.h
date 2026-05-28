@@ -112,6 +112,9 @@ struct aggregated_command_type_stats
     safe_hdr_histogram latency_hist;                 // merged histogram
     std::vector<size_t> command_indices;             // indices of commands with this type
     std::vector<one_sec_cmd_stats> per_second_stats; // aggregated per-second stats for JSON time series
+    unsigned long long total_hits;
+    unsigned long long total_misses;
+    aggregated_command_type_stats() : total_hits(0), total_misses(0) {}
 };
 
 class run_stats
@@ -270,8 +273,10 @@ public:
                            const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
     void print_ops_sec_column(output_table &table,
                               const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
-    void print_hits_sec_column(output_table &table);
-    void print_missess_sec_column(output_table &table);
+    void print_hits_sec_column(output_table &table,
+                               const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
+    void print_missess_sec_column(output_table &table,
+                                  const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
     void print_moved_sec_column(output_table &table,
                                 const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
     void print_ask_sec_column(output_table &table,

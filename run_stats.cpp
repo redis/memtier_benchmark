@@ -846,6 +846,16 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
         for (unsigned int j = 0; j < i->m_ar_commands_latency_histograms.size(); j++) {
             hdr_add(m_ar_commands_latency_histograms.at(j), i->m_ar_commands_latency_histograms.at(j));
         }
+
+        // Accumulate per-arbitrary-command hit/miss totals across runs so that
+        // the AVERAGE report shows correct Hits/sec and Misses/sec columns.
+        if (m_arbitrary_misses.size() < i->m_arbitrary_misses.size()) {
+            m_arbitrary_misses.resize(i->m_arbitrary_misses.size());
+        }
+        for (size_t j = 0; j < i->m_arbitrary_misses.size(); ++j) {
+            m_arbitrary_misses[j].total_hits += i->m_arbitrary_misses[j].total_hits;
+            m_arbitrary_misses[j].total_misses += i->m_arbitrary_misses[j].total_misses;
+        }
     }
 
     m_totals.m_set_cmd.aggregate_average(all_stats.size());
@@ -860,6 +870,13 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
     m_totals.m_ask_sec /= all_stats.size();
     m_totals.m_bytes_sec /= all_stats.size();
     m_totals.m_latency /= all_stats.size();
+    // Average the accumulated hit/miss counts
+    if (!all_stats.empty()) {
+        for (size_t j = 0; j < m_arbitrary_misses.size(); ++j) {
+            m_arbitrary_misses[j].total_hits /= all_stats.size();
+            m_arbitrary_misses[j].total_misses /= all_stats.size();
+        }
+    }
 }
 
 void run_stats::merge(const run_stats &other, int iteration)
@@ -1112,6 +1129,9 @@ run_stats::build_aggregated_command_stats(arbitrary_command_list &command_list)
         // Get per-second stats for this command
         std::vector<one_sec_cmd_stats> cmd_per_sec = get_one_sec_cmd_stats_arbitrary_command(i);
 
+        unsigned long long cmd_hits = i < m_arbitrary_misses.size() ? m_arbitrary_misses[i].total_hits : 0;
+        unsigned long long cmd_misses = i < m_arbitrary_misses.size() ? m_arbitrary_misses[i].total_misses : 0;
+
         auto it = type_map.find(cmd_type);
         if (it == type_map.end()) {
             // First command of this type
@@ -1121,12 +1141,16 @@ run_stats::build_aggregated_command_stats(arbitrary_command_list &command_list)
             hdr_add(agg.latency_hist, m_ar_commands_latency_histograms[i]);
             agg.command_indices.push_back(i);
             agg.per_second_stats = cmd_per_sec;
+            agg.total_hits = cmd_hits;
+            agg.total_misses = cmd_misses;
             type_map[cmd_type] = agg;
         } else {
             // Aggregate with existing stats
             it->second.stats.add(m_totals.m_ar_commands[i]);
             hdr_add(it->second.latency_hist, m_ar_commands_latency_histograms[i]);
             it->second.command_indices.push_back(i);
+            it->second.total_hits += cmd_hits;
+            it->second.total_misses += cmd_misses;
             // Merge per-second stats
             for (size_t s = 0; s < cmd_per_sec.size() && s < it->second.per_second_stats.size(); s++) {
                 it->second.per_second_stats[s].merge(cmd_per_sec[s]);
@@ -1232,32 +1256,83 @@ void run_stats::print_ops_sec_column(output_table &table, const std::vector<aggr
 
     table.add_column(column);
 }
-void run_stats::print_hits_sec_column(output_table &table)
+void run_stats::print_hits_sec_column(output_table &table, const std::vector<aggregated_command_type_stats> *aggregated)
 {
     table_el el;
     table_column column(12);
 
     column.elements.push_back(*el.init_str("%12s ", "Hits/sec"));
     column.elements.push_back(*el.init_str("%s", "-------------"));
-    column.elements.push_back(*el.init_str("%12s ", "---"));
-    column.elements.push_back(*el.init_double("%12.2f ", m_totals.m_hits_sec));
-    column.elements.push_back(*el.init_str("%12s ", "---"));
-    column.elements.push_back(*el.init_double("%12.2f ", m_totals.m_hits_sec));
+
+    if (print_arbitrary_commands_results()) {
+        unsigned long int test_duration_usec = ts_diff(m_start_time, m_end_time);
+        unsigned long long total_hits = 0;
+        if (aggregated != nullptr) {
+            for (const auto &agg : *aggregated) {
+                double hits_sec =
+                    test_duration_usec > 0 ? (double) agg.total_hits / (double) test_duration_usec * 1000000.0 : 0.0;
+                column.elements.push_back(*el.init_double("%12.2f ", hits_sec));
+                total_hits += agg.total_hits;
+            }
+        } else {
+            for (size_t i = 0; i < m_arbitrary_misses.size(); i++) {
+                double hits_sec = test_duration_usec > 0 ? (double) m_arbitrary_misses[i].total_hits /
+                                                               (double) test_duration_usec * 1000000.0
+                                                         : 0.0;
+                column.elements.push_back(*el.init_double("%12.2f ", hits_sec));
+                total_hits += m_arbitrary_misses[i].total_hits;
+            }
+        }
+        double total_hits_sec =
+            test_duration_usec > 0 ? (double) total_hits / (double) test_duration_usec * 1000000.0 : 0.0;
+        column.elements.push_back(*el.init_double("%12.2f ", total_hits_sec));
+    } else {
+        column.elements.push_back(*el.init_str("%12s ", "---"));
+        column.elements.push_back(*el.init_double("%12.2f ", m_totals.m_hits_sec));
+        column.elements.push_back(*el.init_str("%12s ", "---"));
+        column.elements.push_back(*el.init_double("%12.2f ", m_totals.m_hits_sec));
+    }
 
     table.add_column(column);
 }
 
-void run_stats::print_missess_sec_column(output_table &table)
+void run_stats::print_missess_sec_column(output_table &table,
+                                         const std::vector<aggregated_command_type_stats> *aggregated)
 {
     table_el el;
     table_column column(12);
 
     column.elements.push_back(*el.init_str("%12s ", "Misses/sec"));
     column.elements.push_back(*el.init_str("%s", "-------------"));
-    column.elements.push_back(*el.init_str("%12s ", "---"));
-    column.elements.push_back(*el.init_double("%12.2f ", m_totals.m_misses_sec));
-    column.elements.push_back(*el.init_str("%12s ", "---"));
-    column.elements.push_back(*el.init_double("%12.2f ", m_totals.m_misses_sec));
+
+    if (print_arbitrary_commands_results()) {
+        unsigned long int test_duration_usec = ts_diff(m_start_time, m_end_time);
+        unsigned long long total_misses = 0;
+        if (aggregated != nullptr) {
+            for (const auto &agg : *aggregated) {
+                double misses_sec =
+                    test_duration_usec > 0 ? (double) agg.total_misses / (double) test_duration_usec * 1000000.0 : 0.0;
+                column.elements.push_back(*el.init_double("%12.2f ", misses_sec));
+                total_misses += agg.total_misses;
+            }
+        } else {
+            for (size_t i = 0; i < m_arbitrary_misses.size(); i++) {
+                double misses_sec = test_duration_usec > 0 ? (double) m_arbitrary_misses[i].total_misses /
+                                                                 (double) test_duration_usec * 1000000.0
+                                                           : 0.0;
+                column.elements.push_back(*el.init_double("%12.2f ", misses_sec));
+                total_misses += m_arbitrary_misses[i].total_misses;
+            }
+        }
+        double total_misses_sec =
+            test_duration_usec > 0 ? (double) total_misses / (double) test_duration_usec * 1000000.0 : 0.0;
+        column.elements.push_back(*el.init_double("%12.2f ", total_misses_sec));
+    } else {
+        column.elements.push_back(*el.init_str("%12s ", "---"));
+        column.elements.push_back(*el.init_double("%12.2f ", m_totals.m_misses_sec));
+        column.elements.push_back(*el.init_str("%12s ", "---"));
+        column.elements.push_back(*el.init_double("%12.2f ", m_totals.m_misses_sec));
+    }
 
     table.add_column(column);
 }
@@ -1617,7 +1692,24 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
                              quantiles_list, m_wait_latency_histogram, timestamps, wait_stats);
     }
     std::vector<one_sec_cmd_stats> total_stats = get_one_sec_cmd_stats_totals();
-    result_print_to_json(jsonhandler, "Totals", m_totals.m_ops_sec, m_totals.m_hits_sec, m_totals.m_misses_sec,
+    // For arbitrary-command runs, m_totals.m_hits_sec / m_misses_sec are always 0
+    // (summarize() only reads GET hit counters). Compute the correct aggregate from
+    // m_arbitrary_misses so JSON Totals matches the text table Totals row.
+    double totals_hits_sec = m_totals.m_hits_sec;
+    double totals_misses_sec = m_totals.m_misses_sec;
+    if (print_arbitrary_commands_results()) {
+        unsigned long int dur_usec = ts_diff(m_start_time, m_end_time);
+        if (dur_usec > 0) {
+            unsigned long long all_hits = 0, all_misses = 0;
+            for (size_t j = 0; j < m_arbitrary_misses.size(); ++j) {
+                all_hits += m_arbitrary_misses[j].total_hits;
+                all_misses += m_arbitrary_misses[j].total_misses;
+            }
+            totals_hits_sec = (double) all_hits / (double) dur_usec * 1000000.0;
+            totals_misses_sec = (double) all_misses / (double) dur_usec * 1000000.0;
+        }
+    }
+    result_print_to_json(jsonhandler, "Totals", m_totals.m_ops_sec, totals_hits_sec, totals_misses_sec,
                          cluster_mode ? m_totals.m_moved_sec : -1, cluster_mode ? m_totals.m_ask_sec : -1,
                          m_totals.m_bytes_sec, m_totals.m_bytes_sec_rx, m_totals.m_bytes_sec_tx, m_totals.m_latency,
                          m_totals.m_total_latency, m_totals.m_ops, m_totals.m_connection_errors_sec,
@@ -1776,15 +1868,11 @@ void run_stats::print(FILE *out, benchmark_config *config, const char *header /*
     // Ops/sec column
     print_ops_sec_column(table, aggregated_ptr);
 
-    // Hits/sec column (not relevant for arbitrary commands)
-    if (!print_arbitrary_commands_results()) {
-        print_hits_sec_column(table);
-    }
+    // Hits/sec column
+    print_hits_sec_column(table, aggregated_ptr);
 
-    // Misses/sec column (not relevant for arbitrary commands)
-    if (!print_arbitrary_commands_results()) {
-        print_missess_sec_column(table);
-    }
+    // Misses/sec column
+    print_missess_sec_column(table, aggregated_ptr);
 
     // Moved & ASK column (relevant only for cluster mode)
     if (config->cluster_mode) {
@@ -1811,6 +1899,47 @@ void run_stats::print(FILE *out, benchmark_config *config, const char *header /*
 
     // print results
     table.print(out, header);
+
+    // Warn when miss rate exceeds the configured threshold. Goes to stderr
+    // so it doesn't corrupt piped / redirected table output.
+    const double miss_threshold = config->miss_rate_threshold;
+    if (print_arbitrary_commands_results()) {
+        if (aggregated_ptr != nullptr) {
+            for (const auto &agg : *aggregated_ptr) {
+                unsigned long long total = agg.total_hits + agg.total_misses;
+                if (total == 0) continue;
+                double miss_rate = (double) agg.total_misses / (double) total;
+                if (miss_rate > miss_threshold) {
+                    fprintf(stderr, "warning: %s miss rate %.2f%% above target %.2f%% (%llu misses / %llu ops)\n",
+                            agg.command_type.c_str(), miss_rate * 100.0, miss_threshold * 100.0, agg.total_misses,
+                            total);
+                }
+            }
+        } else {
+            for (size_t i = 0; i < m_arbitrary_misses.size(); i++) {
+                const arbitrary_misses_total &am = m_arbitrary_misses[i];
+                unsigned long long total = am.total_hits + am.total_misses;
+                if (total == 0) continue;
+                double miss_rate = (double) am.total_misses / (double) total;
+                if (miss_rate > miss_threshold) {
+                    const char *cmd_name = i < config->arbitrary_commands->size()
+                                               ? config->arbitrary_commands->at(i).command_type.c_str()
+                                               : "unknown";
+                    fprintf(stderr, "warning: %s miss rate %.2f%% above target %.2f%% (%llu misses / %llu ops)\n",
+                            cmd_name, miss_rate * 100.0, miss_threshold * 100.0, am.total_misses, total);
+                }
+            }
+        }
+    } else {
+        unsigned long long total = m_totals.m_hits + m_totals.m_misses;
+        if (total > 0) {
+            double miss_rate = (double) m_totals.m_misses / (double) total;
+            if (miss_rate > miss_threshold) {
+                fprintf(stderr, "warning: GET miss rate %.2f%% above target %.2f%% (%lu misses / %llu ops)\n",
+                        miss_rate * 100.0, miss_threshold * 100.0, m_totals.m_misses, total);
+            }
+        }
+    }
 
     ////////////////////////////////////////
     // JSON print handling

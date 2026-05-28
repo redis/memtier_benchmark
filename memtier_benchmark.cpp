@@ -72,7 +72,9 @@
 
 #endif
 
+#include <cmath>
 #include <cstring>
+#include <set>
 #include <stdexcept>
 #include <atomic>
 #include <algorithm>
@@ -587,6 +589,7 @@ static void config_init_defaults(struct benchmark_config *cfg)
     if (!cfg->hdr_prefix) cfg->hdr_prefix = "";
     if (!cfg->print_percentiles.is_defined()) cfg->print_percentiles = config_quantiles("50,99,99.9");
     if (!cfg->monitor_pattern) cfg->monitor_pattern = 'S';
+    if (cfg->miss_rate_threshold < 0.0) cfg->miss_rate_threshold = 0.01; // Default: warn above 1%
 
     // StatsD defaults - port only matters if host is set
     if (!cfg->statsd_port) cfg->statsd_port = 8125;
@@ -720,6 +723,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_monitor_pattern,
         o_command_stats_breakdown,
         o_command_miss_tracking,
+        o_miss_rate_threshold,
         o_tls,
         o_tls_cert,
         o_tls_key,
@@ -829,6 +833,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         {"monitor-pattern", 1, 0, o_monitor_pattern},
         {"command-stats-breakdown", 1, 0, o_command_stats_breakdown},
         {"command-miss-tracking", 1, 0, o_command_miss_tracking},
+        {"miss-rate-threshold", 1, 0, o_miss_rate_threshold},
         {"rate-limiting", 1, 0, o_rate_limiting},
         {"uri", 1, 0, o_uri},
         {"statsd-host", 1, 0, o_statsd_host},
@@ -1404,6 +1409,16 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             }
             break;
         }
+        case o_miss_rate_threshold: {
+            endptr = NULL;
+            double pct = strtod(optarg, &endptr);
+            if (endptr == optarg || !endptr || *endptr != '\0' || !std::isfinite(pct) || pct < 0.0 || pct > 100.0) {
+                fprintf(stderr, "error: --miss-rate-threshold must be a percentage between 0 and 100.\n");
+                return -1;
+            }
+            cfg->miss_rate_threshold = pct / 100.0;
+            break;
+        }
         case o_rate_limiting: {
             endptr = NULL;
             cfg->request_rate = (unsigned int) strtoul(optarg, &endptr, 10);
@@ -1671,6 +1686,9 @@ void usage()
         "HGET, HMGET, GETEX, EXISTS, ...)\n"
         "                                 off:  disable; mb.json will not contain per-arbitrary-command "
         "Hits/Misses fields\n"
+        "      --miss-rate-threshold=PERCENTAGE\n"
+        "                                 Warn when miss rate exceeds this percentage (default: 1.0).\n"
+        "                                 Accepts fractional values, e.g. 0.5 for half a percent.\n"
         "      --statsd-host=HOST         StatsD server hostname to send real-time metrics (default: none, disabled)\n"
         "      --statsd-port=PORT         StatsD server UDP port (default: 8125)\n"
         "      --statsd-prefix=PREFIX     Prefix for StatsD metric names (default: memtier)\n"
@@ -2693,6 +2711,7 @@ int main(int argc, char *argv[])
     // 0 must remain a valid user-specified "disabled" value, so initialize the
     // sentinel before parsing args.
     cfg.max_retries = -1;
+    cfg.miss_rate_threshold = -1.0;   // sentinel; config_init_defaults replaces with 0.01
     cfg.command_miss_tracking = true; // Default: auto-track misses for known shapes
 
     if (config_parse_args(argc, argv, &cfg) < 0) {
@@ -2709,6 +2728,11 @@ int main(int argc, char *argv[])
 
         if (!cfg.monitor_commands->load_from_file(cfg.monitor_input)) {
             exit(1);
+        }
+
+        if (cfg.arbitrary_commands->size() == 0) {
+            fprintf(stderr, "warning: --monitor-input specified but no --command was given; "
+                            "the monitor file will be ignored and a standard SET/GET benchmark will run.\n");
         }
 
         // Expand monitor placeholders in commands
@@ -2738,6 +2762,28 @@ int main(int argc, char *argv[])
                     // Mark it as a stats-only slot (no actual command to send)
                     stats_cmd.command_args.clear();
                     stats_cmd.stats_only = true;
+                    // resolve_command_meta() returns early for empty argv, so look up
+                    // spec directly and stamp miss_tracking_enabled so runtime hit/miss
+                    // accounting actually fires for this slot.
+                    {
+                        using memtier::command_meta::ReplyShape;
+                        const memtier::command_meta::CommandSpec *cmd_spec =
+                            memtier::command_meta::lookup(cmd_type.c_str());
+                        stats_cmd.spec = cmd_spec;
+                        if (cmd_spec != nullptr) {
+                            switch (cmd_spec->reply_shape) {
+                            case ReplyShape::SingleNullBulk:
+                            case ReplyShape::ArrayPerElementNulls:
+                            case ReplyShape::EmptyCollection:
+                            case ReplyShape::IntegerMembership:
+                                stats_cmd.miss_tracking_enabled = true;
+                                break;
+                            default:
+                                stats_cmd.miss_tracking_enabled = false;
+                                break;
+                            }
+                        }
+                    }
                     cfg.arbitrary_commands->add_command(stats_cmd);
                 }
 
@@ -2835,6 +2881,37 @@ int main(int argc, char *argv[])
     if (!cfg.command_miss_tracking) {
         for (unsigned int i = 0; i < cfg.arbitrary_commands->size(); i++) {
             cfg.arbitrary_commands->at(i).miss_tracking_enabled = false;
+        }
+    }
+
+    // Log resolved command metadata once per unique command type. Gated behind
+    // --debug to avoid startup noise in normal runs.
+    if (cfg.debug && cfg.arbitrary_commands->size() > 0) {
+        std::set<std::string> logged_types;
+        for (size_t i = 0; i < cfg.arbitrary_commands->size(); i++) {
+            const arbitrary_command &cmd = cfg.arbitrary_commands->at(i);
+            if (cmd.command_type == "MONITOR_RANDOM") continue;
+            if (!logged_types.insert(cmd.command_type).second) continue;
+            // stats-only slots (created for __monitor_line@__ expansion) don't go through
+            // resolve_command_meta(), so look up the spec directly from the command type.
+            const memtier::command_meta::CommandSpec *spec =
+                cmd.spec != nullptr ? cmd.spec : memtier::command_meta::lookup(cmd.command_type.c_str());
+            bool miss_tracking = cmd.miss_tracking_enabled;
+            if (cmd.stats_only && spec != nullptr) {
+                using memtier::command_meta::ReplyShape;
+                miss_tracking = cfg.command_miss_tracking && (spec->reply_shape == ReplyShape::SingleNullBulk ||
+                                                              spec->reply_shape == ReplyShape::ArrayPerElementNulls ||
+                                                              spec->reply_shape == ReplyShape::EmptyCollection ||
+                                                              spec->reply_shape == ReplyShape::IntegerMembership);
+            }
+            if (spec != nullptr) {
+                fprintf(stderr, "Command meta: %s reply_shape=%s key_specs=%u miss_tracking=%s\n",
+                        cmd.command_type.c_str(), memtier::command_meta::reply_shape_name(spec->reply_shape),
+                        spec->num_key_specs, miss_tracking ? "enabled" : "disabled");
+            } else {
+                fprintf(stderr, "Command meta: %s not found in static table, miss_tracking=disabled\n",
+                        cmd.command_type.c_str());
+            }
         }
     }
 
