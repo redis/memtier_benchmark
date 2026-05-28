@@ -1346,21 +1346,21 @@ bool keylist::add_key(const char *key, unsigned int key_len)
     // have room?
     if (m_keys_count >= m_keys_size) return false;
 
-    // have buffer?
-    if (m_buffer_ptr + key_len >= m_buffer + m_buffer_size) {
+    // have buffer? (+1 for the NUL terminator written after the key bytes)
+    if (m_buffer_ptr + key_len + 1 > m_buffer + m_buffer_size) {
         ptrdiff_t offset = m_buffer_ptr - m_buffer;
-        char *old_buffer = m_buffer;
-        while (m_buffer_ptr + key_len >= m_buffer + m_buffer_size) {
+        while (m_buffer_ptr + key_len + 1 > m_buffer + m_buffer_size) {
             m_buffer_size *= 2;
         }
         m_buffer = (char *) realloc(m_buffer, m_buffer_size);
         assert(m_buffer != NULL);
-        // If realloc moved the buffer, re-base all key_ptr entries stored so
-        // far so they point into the new allocation instead of the freed one.
-        if (m_buffer != old_buffer) {
-            for (unsigned int k = 0; k < m_keys_count; k++) {
-                m_keys[k].key_ptr = m_buffer + (m_keys[k].key_ptr - old_buffer);
-            }
+        // Re-base all key_ptr entries into the new allocation. Keys are packed
+        // contiguously (key bytes + NUL terminator), so we can recompute each
+        // pointer from m_keys[k].key_len without touching the old allocation.
+        char *p = m_buffer;
+        for (unsigned int k = 0; k < m_keys_count; k++) {
+            m_keys[k].key_ptr = p;
+            p += m_keys[k].key_len + 1;
         }
         m_buffer_ptr = m_buffer + offset;
     }

@@ -656,7 +656,14 @@ void client::create_request(struct timeval timestamp, unsigned int conn_id)
         }
 
         // MGET command
-        if (!create_mget_request(timestamp, conn_id)) return;
+        if (!create_mget_request(timestamp, conn_id)) {
+            // No MGET could be sent (e.g. this cluster connection owns no
+            // slots that map to the configured key range). Force the ratio
+            // counter past the threshold so the next create_request() call
+            // resets both counters instead of busy-spinning here forever.
+            m_get_ratio_count = m_config->ratio.b;
+            return;
+        }
 
         m_get_ratio_count += m_keylist->get_keys_count();
         m_reqs_generated++;
