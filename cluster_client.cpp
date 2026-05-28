@@ -291,6 +291,9 @@ void cluster_client::build_mget_slot_cache()
         unsigned long long key_min = m_config->key_minimum;
         unsigned long long key_max = m_config->key_maximum;
 
+        benchmark_error_log("Building MGET slot cache for key range [%llu, %llu] (%llu keys)...\n",
+                            key_min, key_max, key_max - key_min + 1);
+
         m_mget_slot_keys.assign(MAX_CLUSTER_HSLOT + 1, std::vector<unsigned long long>());
         m_mget_slot_cursor.assign(MAX_CLUSTER_HSLOT + 1, 0);
 
@@ -301,6 +304,8 @@ void cluster_client::build_mget_slot_cache()
         }
 
         m_mget_slot_keys_built = true;
+        benchmark_error_log("MGET slot cache built: %llu keys mapped across %u slots.\n",
+                            key_max - key_min + 1, MAX_CLUSTER_HSLOT + 1);
     }
 
     // Conn→slot mapping depends on topology: rebuild on every refresh.
