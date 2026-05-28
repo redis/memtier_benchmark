@@ -125,8 +125,7 @@ cluster_client::cluster_client(client_group *group) :
         m_txn_observed_rotation_seq(0),
         m_txn_staged_key_index(0),
         m_txn_has_staged_key(false),
-        m_txn_pin_lost_warned(false),
-        m_mget_slot_keys_built(false)
+        m_txn_pin_lost_warned(false)
 {
     memset(m_slot_to_shard, 0, sizeof(m_slot_to_shard));
 }
@@ -284,36 +283,59 @@ void cluster_client::build_mget_slot_cache()
 {
     if (!m_config->multi_key_get) return;
 
+    mget_slot_cache *cache = m_config->mget_cache;
+    assert(cache != NULL);
+
     unsigned int num_conns = (unsigned int) m_connections.size();
 
-    // Slot→key mapping is topology-independent: build it once.
-    if (!m_mget_slot_keys_built) {
+    // Slot→key mapping is topology-independent: build it once across all threads.
+    pthread_mutex_lock(&cache->mutex);
+    if (!cache->built) {
         unsigned long long key_min = m_config->key_minimum;
         unsigned long long key_max = m_config->key_maximum;
 
-        benchmark_error_log("Building MGET slot cache for key range [%llu, %llu] (%llu keys)...\n",
-                            key_min, key_max, key_max - key_min + 1);
+        // Cap per-slot storage: multi_key_get * 4, bounded to [multi_key_get, 4096].
+        // This bounds both memory and scan time regardless of key range size.
+        unsigned int cap = (unsigned int) m_config->multi_key_get * 4;
+        if (cap > 4096) cap = 4096;
+        if (cap < (unsigned int) m_config->multi_key_get) cap = (unsigned int) m_config->multi_key_get;
 
-        m_mget_slot_keys.assign(MAX_CLUSTER_HSLOT + 1, std::vector<unsigned long long>());
-        m_mget_slot_cursor.assign(MAX_CLUSTER_HSLOT + 1, 0);
+        benchmark_error_log("Building MGET slot cache for key range [%llu, %llu] "
+                            "(cap %u keys/slot)...\n",
+                            key_min, key_max, cap);
 
-        for (unsigned long long idx = key_min; idx <= key_max; idx++) {
+        cache->slot_keys.assign(MAX_CLUSTER_HSLOT + 1, std::vector<unsigned long long>());
+
+        unsigned int filled_slots = 0;
+        for (unsigned long long idx = key_min; idx <= key_max && filled_slots < MAX_CLUSTER_HSLOT + 1; idx++) {
             m_obj_gen->generate_key(idx);
             unsigned int slot = calc_hslot_crc16_with_hash_tag(m_obj_gen->get_key(), m_obj_gen->get_key_len());
-            m_mget_slot_keys[slot].push_back(idx);
+            if (cache->slot_keys[slot].size() < cap) {
+                cache->slot_keys[slot].push_back(idx);
+                if (cache->slot_keys[slot].size() == cap) filled_slots++;
+            }
         }
 
-        m_mget_slot_keys_built = true;
-        benchmark_error_log("MGET slot cache built: %llu keys mapped across %u slots.\n",
-                            key_max - key_min + 1, MAX_CLUSTER_HSLOT + 1);
+        cache->built = true;
+
+        // Count slots that ended up with at least one key (informational).
+        unsigned int populated = 0;
+        for (unsigned int s = 0; s <= MAX_CLUSTER_HSLOT; s++) {
+            if (!cache->slot_keys[s].empty()) populated++;
+        }
+        benchmark_error_log("MGET slot cache built: %u/%u slots populated.\n", populated, MAX_CLUSTER_HSLOT + 1);
     }
+    pthread_mutex_unlock(&cache->mutex);
+
+    // Per-thread cursor: one entry per slot, sized to match the shared table.
+    m_mget_slot_cursor.assign(MAX_CLUSTER_HSLOT + 1, 0);
 
     // Conn→slot mapping depends on topology: rebuild on every refresh.
     m_mget_conn_slots.assign(num_conns, std::vector<unsigned int>());
     m_mget_conn_slot_cursor.assign(num_conns, 0);
 
     for (unsigned int slot = 0; slot <= MAX_CLUSTER_HSLOT; slot++) {
-        if (m_mget_slot_keys[slot].empty()) continue;
+        if (cache->slot_keys[slot].empty()) continue;
         unsigned int cid = m_slot_to_shard[slot];
         if (cid < num_conns) m_mget_conn_slots[cid].push_back(slot);
     }
@@ -713,7 +735,7 @@ bool cluster_client::create_mget_request(struct timeval &timestamp, unsigned int
     unsigned int target_slot = m_mget_conn_slots[conn_id][sc % m_mget_conn_slots[conn_id].size()];
     sc++;
 
-    std::vector<unsigned long long> &slot_keys = m_mget_slot_keys[target_slot];
+    std::vector<unsigned long long> &slot_keys = m_config->mget_cache->slot_keys[target_slot];
     size_t &kc = m_mget_slot_cursor[target_slot];
 
     m_keylist->clear();

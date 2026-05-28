@@ -59,16 +59,14 @@ protected:
     // Set when we emit the "pin connection lost mid-rotation" warning so we
     // don't spam it on every hold_pipeline() call during the outage.
     bool m_txn_pin_lost_warned;
-    // Per-slot key index cache for cluster MGET. Built once after topology
-    // loads (only when --multi-key-get > 0). Guarantees same-slot routing:
-    // all N keys in one MGET come from the same hash slot so Redis never
-    // returns CROSSSLOT. m_mget_conn_slots[conn_id] lists the slots owned
-    // by that connection that have at least one key in the configured range.
-    std::vector<std::vector<unsigned long long> > m_mget_slot_keys; // [slot] → key indices
-    std::vector<size_t> m_mget_slot_cursor;                         // [slot] → round-robin cursor
-    std::vector<std::vector<unsigned int> > m_mget_conn_slots;      // [conn] → owned slot list
-    std::vector<size_t> m_mget_conn_slot_cursor;                    // [conn] → slot round-robin cursor
-    bool m_mget_slot_keys_built;                                    // slot→key scan runs once
+    // Per-slot key index cache for cluster MGET. The slot→key table
+    // (slot_keys) is shared across threads via m_config->mget_cache and is
+    // read-only after the first thread builds it.  Only the per-slot
+    // round-robin cursor (m_mget_slot_cursor) and the per-connection slot
+    // list (m_mget_conn_slots) are per-thread.
+    std::vector<size_t> m_mget_slot_cursor;                    // [slot] → per-thread round-robin cursor
+    std::vector<std::vector<unsigned int> > m_mget_conn_slots; // [conn] → owned slot list
+    std::vector<size_t> m_mget_conn_slot_cursor;               // [conn] → slot round-robin cursor
     void build_mget_slot_cache();
 
     virtual int connect(void);

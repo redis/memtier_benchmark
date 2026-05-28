@@ -21,6 +21,7 @@
 
 #include <vector>
 #include <sys/time.h>
+#include <pthread.h>
 #include "config_types.h"
 
 #ifdef USE_TLS
@@ -51,6 +52,23 @@ enum PROTOCOL_TYPE
     PROTOCOL_RESP3,
     PROTOCOL_MEMCACHE_TEXT,
     PROTOCOL_MEMCACHE_BINARY,
+};
+
+// Shared MGET slot cache: built once (lazily, on first topology load) and
+// read concurrently by all cluster_client threads.  m_mget_slot_keys is
+// identical for every thread — only the per-slot round-robin cursors differ.
+struct mget_slot_cache
+{
+    std::vector<std::vector<unsigned long long> > slot_keys; // [slot] → key indices; read-only after built
+    bool built;
+    pthread_mutex_t mutex;
+
+    mget_slot_cache() : built(false) { pthread_mutex_init(&mutex, NULL); }
+    ~mget_slot_cache() { pthread_mutex_destroy(&mutex); }
+
+private:
+    mget_slot_cache(const mget_slot_cache &);
+    mget_slot_cache &operator=(const mget_slot_cache &);
 };
 
 struct benchmark_config
@@ -124,6 +142,7 @@ struct benchmark_config
     unsigned int thread_conn_start_min_jitter_micros;
     unsigned int thread_conn_start_max_jitter_micros;
     int multi_key_get;
+    struct mget_slot_cache *mget_cache; // NULL unless cluster_mode && multi_key_get > 0
     const char *authenticate;
     int select_db;
     const char *uri;

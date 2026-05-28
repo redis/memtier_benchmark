@@ -561,6 +561,7 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg)
 
 static void config_init_defaults(struct benchmark_config *cfg)
 {
+    cfg->mget_cache = NULL;
     if (!cfg->server && !cfg->unix_socket) cfg->server = "localhost";
     if (!cfg->port && !cfg->unix_socket) cfg->port = 6379;
     if (!cfg->resolution) cfg->resolution = AF_UNSPEC;
@@ -2116,6 +2117,13 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
 {
     fprintf(stderr, "[RUN #%u] Preparing benchmark client...\n", run_id);
 
+    // Shared MGET slot cache: allocate fresh for this run so the lazy build
+    // inside build_mget_slot_cache() fires again (topology may have changed).
+    if (cfg->cluster_mode && cfg->multi_key_get > 0) {
+        delete cfg->mget_cache;
+        cfg->mget_cache = new mget_slot_cache();
+    }
+
     // prepare threads data
     std::vector<cg_thread *> threads;
     g_threads = &threads; // Set global pointer for crash handler
@@ -2560,6 +2568,9 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     }
 
     g_threads = NULL; // Clear global pointer
+
+    delete cfg->mget_cache;
+    cfg->mget_cache = NULL;
 
     return stats;
 }
