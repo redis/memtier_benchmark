@@ -57,10 +57,6 @@ AllowShortFunctionsOnASingleLine: Inline
 AllowShortIfStatementsOnASingleLine: WithoutElse
 AllowShortLoopsOnASingleLine: false
 
-# C++ standard: keep Cpp03 so nested templates use "> >" (not ">>"),
-# which is required for the macOS C++03-compatible build.
-Standard: Cpp03
-
 # Other
 AlignTrailingComments: true
 AlwaysBreakAfterReturnType: None

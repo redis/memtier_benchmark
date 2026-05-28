@@ -1249,7 +1249,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         case o_multi_key_get:
             endptr = NULL;
             cfg->multi_key_get = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (cfg->multi_key_get <= 0 || !endptr || *endptr != '\0') {
+            if (cfg->multi_key_get < 1 || !endptr || *endptr != '\0') {
                 fprintf(stderr, "error: multi-key-get must be greater than zero.\n");
                 return -1;
             }
@@ -3193,6 +3193,14 @@ int main(int argc, char *argv[])
 
     if (cfg.select_db > 0 && !is_redis_protocol(cfg.protocol)) {
         fprintf(stderr, "error: select-db can only be used with redis protocol.\n");
+        usage();
+    }
+    if (cfg.multi_key_get > 0 && !is_redis_protocol(cfg.protocol)) {
+        fprintf(stderr, "error: --multi-key-get is only supported with Redis protocols (redis, resp2, resp3).\n");
+        usage();
+    }
+    if (cfg.multi_key_get > 0 && cfg.arbitrary_commands->is_defined()) {
+        fprintf(stderr, "error: --multi-key-get cannot be combined with --command.\n");
         usage();
     }
     if (cfg.data_offset > 0) {

@@ -1348,11 +1348,13 @@ bool keylist::add_key(const char *key, unsigned int key_len)
 
     // have buffer?
     if (m_buffer_ptr + key_len >= m_buffer + m_buffer_size) {
+        ptrdiff_t offset = m_buffer_ptr - m_buffer;
         while (m_buffer_ptr + key_len >= m_buffer + m_buffer_size) {
             m_buffer_size *= 2;
         }
         m_buffer = (char *) realloc(m_buffer, m_buffer_size);
         assert(m_buffer != NULL);
+        m_buffer_ptr = m_buffer + offset;
     }
 
     // copy key

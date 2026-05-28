@@ -658,7 +658,7 @@ void client::create_request(struct timeval timestamp, unsigned int conn_id)
         // MGET command
         if (!create_mget_request(timestamp, conn_id)) return;
 
-        m_get_ratio_count += m_config->multi_key_get;
+        m_get_ratio_count += m_keylist->get_keys_count();
         m_reqs_generated++;
     } else {
         // overlap counters
