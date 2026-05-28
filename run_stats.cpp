@@ -830,6 +830,8 @@ bool one_second_stats_predicate(const one_second_stats &a, const one_second_stat
 
 void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
 {
+    unsigned long long total_duration_usec = 0;
+
     for (std::vector<run_stats>::const_iterator i = all_stats.begin(); i != all_stats.end(); i++) {
         totals i_totals;
         i_totals.setup_arbitrary_commands(m_totals.m_ar_commands.size());
@@ -856,6 +858,8 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
             m_arbitrary_misses[j].total_hits += i->m_arbitrary_misses[j].total_hits;
             m_arbitrary_misses[j].total_misses += i->m_arbitrary_misses[j].total_misses;
         }
+
+        total_duration_usec += ts_diff(i->m_start_time, i->m_end_time);
     }
 
     m_totals.m_set_cmd.aggregate_average(all_stats.size());
@@ -876,6 +880,17 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
             m_arbitrary_misses[j].total_hits /= all_stats.size();
             m_arbitrary_misses[j].total_misses /= all_stats.size();
         }
+    }
+
+    // Set a synthetic duration so ts_diff(m_start_time, m_end_time) returns the
+    // average run duration. Without this, print_hits_sec_column and print_json see
+    // a zero duration and suppress Hits/sec / Misses/sec in the AVERAGE report.
+    if (!all_stats.empty() && total_duration_usec > 0) {
+        unsigned long long avg_usec = total_duration_usec / all_stats.size();
+        m_start_time.tv_sec = 0;
+        m_start_time.tv_usec = 0;
+        m_end_time.tv_sec = (time_t) (avg_usec / 1000000);
+        m_end_time.tv_usec = (suseconds_t) (avg_usec % 1000000);
     }
 }
 
