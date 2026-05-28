@@ -888,27 +888,21 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
     m_totals.m_ask_sec /= all_stats.size();
     m_totals.m_bytes_sec /= all_stats.size();
     m_totals.m_latency /= all_stats.size();
-    // Average the accumulated hit/miss counts (totals and per-key buckets)
-    if (!all_stats.empty()) {
-        for (size_t j = 0; j < m_arbitrary_misses.size(); ++j) {
-            m_arbitrary_misses[j].total_hits /= all_stats.size();
-            m_arbitrary_misses[j].total_misses /= all_stats.size();
-            for (size_t k = 0; k < m_arbitrary_misses[j].per_key_hits.size(); ++k) {
-                m_arbitrary_misses[j].per_key_hits[k] /= all_stats.size();
-                m_arbitrary_misses[j].per_key_misses[k] /= all_stats.size();
-            }
-        }
-    }
 
-    // Set a synthetic duration so ts_diff(m_start_time, m_end_time) returns the
-    // average run duration. Without this, print_hits_sec_column and print_json see
-    // a zero duration and suppress Hits/sec / Misses/sec in the AVERAGE report.
+    // m_arbitrary_misses now holds the SUMMED hit/miss counts across all runs,
+    // and the synthetic duration below is the SUMMED run duration. The rate the
+    // print paths compute, count / ts_diff(m_start_time, m_end_time), is then the
+    // exact time-weighted average Σhits / Σduration — mathematically equal to
+    // dividing both the count and the duration by N, but without the integer
+    // truncation that dividing the unsigned counts by N would introduce (which
+    // could otherwise zero out small miss counts and suppress the miss-rate
+    // warning). Counts are left summed deliberately: the JSON "Per-Key Misses"
+    // section reports cumulative Total Hits/Misses across the runs.
     if (!all_stats.empty() && total_duration_usec > 0) {
-        unsigned long long avg_usec = total_duration_usec / all_stats.size();
         m_start_time.tv_sec = 0;
         m_start_time.tv_usec = 0;
-        m_end_time.tv_sec = (time_t) (avg_usec / 1000000);
-        m_end_time.tv_usec = (suseconds_t) (avg_usec % 1000000);
+        m_end_time.tv_sec = (time_t) (total_duration_usec / 1000000);
+        m_end_time.tv_usec = (suseconds_t) (total_duration_usec % 1000000);
     }
 }
 
