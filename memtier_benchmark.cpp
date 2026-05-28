@@ -3195,8 +3195,8 @@ int main(int argc, char *argv[])
         fprintf(stderr, "error: select-db can only be used with redis protocol.\n");
         usage();
     }
-    if (cfg.multi_key_get > 0 && !is_redis_protocol(cfg.protocol)) {
-        fprintf(stderr, "error: --multi-key-get is only supported with Redis protocols (redis, resp2, resp3).\n");
+    if (cfg.multi_key_get > 0 && cfg.protocol == PROTOCOL_MEMCACHE_BINARY) {
+        fprintf(stderr, "error: --multi-key-get is not supported with memcache_binary.\n");
         usage();
     }
     if (cfg.multi_key_get > 0 && cfg.arbitrary_commands->is_defined()) {

@@ -103,31 +103,8 @@ def test_multi_key_get_zero_rejected(env):
     )
 
 
-def test_multi_key_get_memcache_text_rejected(env):
-    """--multi-key-get is a Redis-only feature; memcache_text must be rejected."""
-    env.skipOnCluster()
-
-    master = env.getMasterNodesList()[0]
-    result = _run_memtier([
-        "-s", "127.0.0.1",
-        "-p", str(master["port"]),
-        "--protocol=memcache_text",
-        "--multi-key-get=5",
-        "-n", "1",
-    ])
-
-    env.assertNotEqual(
-        result.returncode, 0,
-        message="--multi-key-get with memcache_text must exit non-zero",
-    )
-    env.assertTrue(
-        "only supported with Redis protocols" in result.stderr,
-        message="Expected protocol-restriction message in stderr",
-    )
-
-
 def test_multi_key_get_memcache_binary_rejected(env):
-    """--multi-key-get is a Redis-only feature; memcache_binary must be rejected."""
+    """--multi-key-get is not supported with memcache_binary (no wire-level implementation)."""
     env.skipOnCluster()
 
     master = env.getMasterNodesList()[0]
@@ -144,8 +121,8 @@ def test_multi_key_get_memcache_binary_rejected(env):
         message="--multi-key-get with memcache_binary must exit non-zero",
     )
     env.assertTrue(
-        "only supported with Redis protocols" in result.stderr,
-        message="Expected protocol-restriction message in stderr",
+        "not supported with memcache_binary" in result.stderr,
+        message="Expected rejection message in stderr for memcache_binary",
     )
 
 
