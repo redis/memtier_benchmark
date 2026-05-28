@@ -457,6 +457,17 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         }
     }
 
+    /* In GET-only MGET mode, a connection whose slots own no keys in the
+     * configured key range can never generate a request.  Returning true here
+     * breaks the fill_pipeline while-loop for that connection so it does not
+     * spin consuming CPU.  Other connections (which do have eligible slots)
+     * continue to operate normally. */
+    if (m_config->multi_key_get > 0 && m_config->ratio.a == 0 && m_config->mget_cache != NULL &&
+        m_config->mget_cache->built.load(std::memory_order_acquire) && conn_id < m_mget_conn_slots.size() &&
+        m_mget_conn_slots[conn_id].empty()) {
+        return true;
+    }
+
     /* In transaction mode the pin connection drives the entire rotation.
      * Non-pin connections must not spin in fill_pipeline; they will be
      * rescheduled via schedule_fill() when the pin is cleared. If the pin
