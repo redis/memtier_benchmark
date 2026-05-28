@@ -427,6 +427,16 @@ void cluster_client::handle_cluster_slots(protocol_response *r)
 
     // Rebuild same-slot key index cache for MGET if enabled.
     build_mget_slot_cache();
+
+    // Wake all connected shard connections so each one re-evaluates hold_pipeline()
+    // with the freshly-built m_mget_conn_slots.  Without this, a connection that
+    // was bufferevent_disable()'d before the cache existed would never re-run
+    // fill_pipeline() and would stay permanently idle.
+    if (m_config->multi_key_get > 0) {
+        for (size_t i = 0; i < m_connections.size(); i++) {
+            if (m_connections[i]->get_connection_state() != conn_disconnected) m_connections[i]->schedule_fill();
+        }
+    }
 }
 
 bool cluster_client::hold_pipeline(unsigned int conn_id)
@@ -464,7 +474,7 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
      * continue to operate normally. */
     if (m_config->multi_key_get > 0 && m_config->ratio.a == 0 && m_config->mget_cache != NULL &&
         m_config->mget_cache->built.load(std::memory_order_acquire) && conn_id < m_mget_conn_slots.size() &&
-        m_mget_conn_slots[conn_id].empty()) {
+        m_mget_conn_slots[conn_id].empty() && m_staged_monitor_commands[conn_id].empty()) {
         return true;
     }
 
