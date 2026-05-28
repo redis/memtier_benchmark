@@ -2134,6 +2134,8 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
 
         if (t->prepare() < 0) {
             benchmark_error_log("error: failed to prepare thread %u for test.\n", i);
+            delete cfg->mget_cache;
+            cfg->mget_cache = NULL;
             exit(1);
         }
         threads.push_back(t);

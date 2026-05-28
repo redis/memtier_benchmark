@@ -973,7 +973,7 @@ int memcache_text_protocol::parse_response(void)
                     assert(value != NULL);
 
                     int ret = evbuffer_remove(m_read_buf, value, m_value_len);
-                    assert((unsigned int) ret == 0);
+                    assert(ret != -1); // evbuffer_remove returns bytes read on success, not 0
 
                     m_last_response.set_value(value, m_value_len);
                 } else {

@@ -19,6 +19,7 @@
 #ifndef _MEMTIER_BENCHMARK_H
 #define _MEMTIER_BENCHMARK_H
 
+#include <atomic>
 #include <vector>
 #include <sys/time.h>
 #include <pthread.h>
@@ -60,7 +61,7 @@ enum PROTOCOL_TYPE
 struct mget_slot_cache
 {
     std::vector<std::vector<unsigned long long> > slot_keys; // [slot] → key indices; read-only after built
-    bool built;
+    std::atomic<bool> built;
     pthread_mutex_t mutex;
 
     mget_slot_cache() : built(false) { pthread_mutex_init(&mutex, NULL); }

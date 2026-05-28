@@ -290,7 +290,7 @@ void cluster_client::build_mget_slot_cache()
 
     // Slot→key mapping is topology-independent: build it once across all threads.
     pthread_mutex_lock(&cache->mutex);
-    if (!cache->built) {
+    if (!cache->built.load(std::memory_order_relaxed)) {
         unsigned long long key_min = m_config->key_minimum;
         unsigned long long key_max = m_config->key_maximum;
 
@@ -316,7 +316,7 @@ void cluster_client::build_mget_slot_cache()
             }
         }
 
-        cache->built = true;
+        cache->built.store(true, std::memory_order_release);
 
         // Count slots that ended up with at least one key (informational).
         unsigned int populated = 0;
