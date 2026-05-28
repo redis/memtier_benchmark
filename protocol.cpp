@@ -1349,11 +1349,19 @@ bool keylist::add_key(const char *key, unsigned int key_len)
     // have buffer?
     if (m_buffer_ptr + key_len >= m_buffer + m_buffer_size) {
         ptrdiff_t offset = m_buffer_ptr - m_buffer;
+        char *old_buffer = m_buffer;
         while (m_buffer_ptr + key_len >= m_buffer + m_buffer_size) {
             m_buffer_size *= 2;
         }
         m_buffer = (char *) realloc(m_buffer, m_buffer_size);
         assert(m_buffer != NULL);
+        // If realloc moved the buffer, re-base all key_ptr entries stored so
+        // far so they point into the new allocation instead of the freed one.
+        if (m_buffer != old_buffer) {
+            for (unsigned int k = 0; k < m_keys_count; k++) {
+                m_keys[k].key_ptr = m_buffer + (m_keys[k].key_ptr - old_buffer);
+            }
+        }
         m_buffer_ptr = m_buffer + offset;
     }
 

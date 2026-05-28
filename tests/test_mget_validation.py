@@ -97,9 +97,8 @@ def test_multi_key_get_zero_rejected(env):
         result.returncode, 0,
         message="--multi-key-get=0 must exit non-zero",
     )
-    env.assertIn(
-        "multi-key-get must be greater than zero",
-        result.stderr,
+    env.assertTrue(
+        "multi-key-get must be greater than zero" in result.stderr,
         message="Expected rejection message in stderr for --multi-key-get=0",
     )
 
@@ -121,9 +120,8 @@ def test_multi_key_get_memcache_text_rejected(env):
         result.returncode, 0,
         message="--multi-key-get with memcache_text must exit non-zero",
     )
-    env.assertIn(
-        "only supported with Redis protocols",
-        result.stderr,
+    env.assertTrue(
+        "only supported with Redis protocols" in result.stderr,
         message="Expected protocol-restriction message in stderr",
     )
 
@@ -145,9 +143,8 @@ def test_multi_key_get_memcache_binary_rejected(env):
         result.returncode, 0,
         message="--multi-key-get with memcache_binary must exit non-zero",
     )
-    env.assertIn(
-        "only supported with Redis protocols",
-        result.stderr,
+    env.assertTrue(
+        "only supported with Redis protocols" in result.stderr,
         message="Expected protocol-restriction message in stderr",
     )
 
@@ -170,9 +167,8 @@ def test_multi_key_get_command_incompatible_rejected(env):
         result.returncode, 0,
         message="--multi-key-get with --command must exit non-zero",
     )
-    env.assertIn(
-        "cannot be combined with --command",
-        result.stderr,
+    env.assertTrue(
+        "cannot be combined with --command" in result.stderr,
         message="Expected incompatibility message in stderr",
     )
 
@@ -184,28 +180,32 @@ def test_multi_key_get_command_incompatible_rejected(env):
 def test_multi_key_get_keylist_buffer_realloc(env):
     """
     A key prefix long enough to overflow the initial keylist buffer forces
-    a realloc() inside keylist::add_key().
+    a realloc() inside keylist::add_key() while previously added keys are
+    already stored in m_keys[].
 
-    keylist is initialised with buffer_size = 256 * (multi_key_get + 1).
-    With --multi-key-get=1 that is 512 bytes.  A 512-character prefix
-    produces keys like 'A*512 + :1' = 514 bytes, which exceeds the initial
-    capacity and triggers buffer growth on the very first add_key() call.
+    keylist buffer_size = 256 * (multi_key_get + 1).  With --multi-key-get=3
+    that is 1024 bytes.  A 340-character prefix produces keys of ~342 bytes
+    each.  After two keys (684 bytes) the third add_key() call overflows:
+    684 + 342 = 1026 >= 1024 triggering realloc with m_keys_count == 2.
 
-    Before the fix, m_buffer_ptr was not adjusted after realloc, leaving it
-    dangling.  The subsequent memcpy/write would corrupt memory.  ASAN
-    detects this reliably; a plain run may also crash with SIGABRT from the
-    assert(m_buffer != NULL) guard or produce garbled keys.
+    Before the full fix, only m_buffer_ptr was updated after realloc.  The
+    already-stored m_keys[0].key_ptr and m_keys[1].key_ptr still pointed into
+    the freed old allocation.  Any subsequent read of those pointers when
+    building the MGET wire command produced a use-after-free.  ASAN detects
+    this reliably; without ASAN a crash or silently garbled keys may result.
     """
     env.skipOnCluster()
 
     test_dir = tempfile.mkdtemp()
-    long_prefix = "A" * 512
+    # 340-char prefix: each key is ~342 bytes; initial buffer (1024 bytes)
+    # overflows on the third add_key() call when two keys are already stored.
+    long_prefix = "A" * 340
 
     benchmark, run_config = _build_benchmark(
         env, test_dir,
         extra_args=[
-            "--ratio=0:1",
-            "--multi-key-get=1",
+            "--ratio=0:3",
+            "--multi-key-get=3",
             "--key-prefix={}".format(long_prefix),
             "--key-minimum=1",
             "--key-maximum=100",
@@ -239,13 +239,15 @@ def test_multi_key_get_partial_ratio_cycle(env):
     When ratio.b is not a multiple of multi_key_get, the final MGET in each
     ratio cycle carries fewer keys than the configured maximum.
 
-    Before the fix, m_get_ratio_count was advanced by the *configured*
-    multi_key_get instead of the actual keys sent by that MGET.  When those
-    differ (e.g. ratio=1:5 multi-key-get=4: the second MGET carries only 1
-    key but the counter was bumped by 4), the ratio counter overshoots ratio.b
-    on that iteration.
-
-    The benchmark must complete and produce non-zero Get and Set counts.
+    With ratio=1:5 multi-key-get=4: the first MGET carries 4 keys, the
+    second carries 1 key (ratio.b - 4 = 1 remaining slot).  The m_get_ratio_
+    count fix ensures the counter is advanced by the actual keys sent (1) not
+    the configured max (4).  In both old and new code the cycle reset fires at
+    the same request boundary (both reach >= ratio.b on the same call), so
+    this combination does not produce a measurable difference in aggregated
+    stats.  The test verifies the benchmark completes and both SETs and GETs
+    are recorded, which would fail if the partial cycle caused an infinite loop
+    or a crash.
     """
     env.skipOnCluster()
 
@@ -287,18 +289,15 @@ def test_multi_key_get_partial_ratio_cycle(env):
 
 def test_multi_key_get_narrow_key_range(env):
     """
-    When key-maximum - key-minimum + 1 is smaller than multi_key_get,
-    get_keys_count() returns fewer keys than the configured maximum.
+    Completion test: benchmark must not crash or hang when the key range
+    (key-maximum - key-minimum + 1 = 3) is smaller than multi_key_get (10).
 
-    Before the ratio-counter fix, m_get_ratio_count could be advanced by the
-    configured multi_key_get (e.g. 10) even when only, say, 3 keys were
-    available.  With --ratio=0:10, advancing by 10 on the first MGET makes
-    m_get_ratio_count equal ratio.b immediately, which is correct, but with
-    any ratio where ratio.b != multi_key_get the counter would be wrong.
-
-    This test uses ratio=0:1 (so keys_count = min(1, multi_key_get) = 1
-    regardless) with a key range smaller than multi_key_get to ensure the
-    benchmark completes without error.
+    With ratio=0:1 the ratio slot available per cycle is 1, so keys_count =
+    min(1, 10) = 1 regardless of key range.  This means old and new code
+    advance m_get_ratio_count by the same amount (1) and produce identical
+    observable output, so this test does not distinguish the ratio-counter
+    fix.  Its value is ensuring no assert, crash, or infinite loop occurs
+    when the key range is much smaller than the configured multi_key_get.
     """
     env.skipOnCluster()
 
