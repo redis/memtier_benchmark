@@ -197,6 +197,11 @@ struct benchmark_config
     const char *tls_sni;
     int tls_protocols;
     SSL_CTX *openssl_ctx;
+    // Negotiated TLS protocol/cipher, captured once on the first completed
+    // handshake (static OpenSSL strings; NULL until then). Written under a
+    // call_once on a worker thread, read on the main thread post-join.
+    const char *tls_negotiated_version;
+    const char *tls_negotiated_cipher;
 #endif
 };
 

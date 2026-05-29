@@ -3395,6 +3395,19 @@ int main(int argc, char *argv[])
             jsonhandler->close_nesting();
         }
 
+#ifdef USE_TLS
+        // Record the negotiated TLS protocol/cipher (captured once on the first
+        // handshake during the run; config_print_to_json runs too early to know
+        // it). One object for the whole run, mirroring the single stderr line.
+        if (jsonhandler != NULL && cfg.tls && cfg.tls_negotiated_version != NULL) {
+            jsonhandler->open_nesting("TLS");
+            jsonhandler->write_obj("negotiated_version", "\"%s\"", cfg.tls_negotiated_version);
+            jsonhandler->write_obj("negotiated_cipher", "\"%s\"",
+                                   cfg.tls_negotiated_cipher ? cfg.tls_negotiated_cipher : "");
+            jsonhandler->close_nesting();
+        }
+#endif
+
         // If more than 1 run was used, compute best, worst and average
         // Furthermore, if print_all_runs is enabled we save separate histograms per run
         if (cfg.run_count > 1) {

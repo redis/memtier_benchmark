@@ -53,6 +53,7 @@
 #include "event2/bufferevent.h"
 
 #ifdef USE_TLS
+#include <mutex>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include "event2/bufferevent_ssl.h"
@@ -1033,6 +1034,28 @@ void shard_connection::handle_event(short events)
     if ((get_connection_state() == conn_in_progress) && (events & BEV_EVENT_CONNECTED)) {
         m_connection_state = conn_connected;
         bufferevent_enable(m_bev, EV_READ | EV_WRITE);
+
+#ifdef USE_TLS
+        // Log the negotiated TLS version and cipher exactly once for the whole
+        // run (not per connection/thread/shard) on the first completed handshake.
+        // All connections share one SSL_CTX and hit the same server config, so
+        // one line is representative. std::call_once makes this thread-safe
+        // across the per-thread event loops.
+        if (m_config->openssl_ctx != NULL && m_bev != NULL) {
+            static std::once_flag tls_info_logged;
+            std::call_once(tls_info_logged, [this]() {
+                SSL *ssl = bufferevent_openssl_get_ssl(m_bev);
+                if (ssl != NULL) {
+                    // SSL_get_version/SSL_get_cipher return stable static strings;
+                    // safe to stash on the (shared) config for the JSON output.
+                    m_config->tls_negotiated_version = SSL_get_version(ssl);
+                    m_config->tls_negotiated_cipher = SSL_get_cipher(ssl);
+                    fprintf(stderr, "TLS connection established: protocol %s, cipher %s\n",
+                            m_config->tls_negotiated_version, m_config->tls_negotiated_cipher);
+                }
+            });
+        }
+#endif
 
         // Cancel connection timeout timer on successful connection
         if (m_connection_timeout_timer != NULL) {
