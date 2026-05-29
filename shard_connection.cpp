@@ -211,6 +211,7 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_event_timer(NULL),
         m_request_per_cur_interval(0),
         m_pending_resp(0),
+        m_last_pushed_req_type(-1),
         m_connection_state(conn_disconnected),
         m_hello(setup_done),
         m_authentication(setup_done),
@@ -592,19 +593,12 @@ int shard_connection::get_local_port()
 
 const char *shard_connection::get_last_request_type()
 {
-    if (!m_pipeline || m_pipeline->empty()) {
-        return "none";
-    }
-
-    // Get the last request in the pipeline (the one at the back)
-    // Note: We can't directly access the back of a std::queue, so we need to check the front
-    // which represents the oldest pending request
-    request *req = m_pipeline->front();
-    if (!req) {
-        return "unknown";
-    }
-
-    switch (req->m_type) {
+    // Read the cached most-recently-pushed type set by push_req(). This is
+    // signal-safe diagnostic output: an aligned `volatile int` read can't tear
+    // on the platforms we support, and we never deref the queue's request*
+    // (which a worker thread might be popping/freeing concurrently).
+    int t = m_last_pushed_req_type;
+    switch (t) {
     case rt_set:
         return "SET";
     case rt_get:
@@ -622,7 +616,7 @@ const char *shard_connection::get_last_request_type()
     case rt_hello:
         return "HELLO";
     default:
-        return "unknown";
+        return "none";
     }
 }
 
@@ -641,6 +635,9 @@ void shard_connection::push_req(request *req)
 {
     m_pipeline->push(req);
     m_pending_resp++;
+    // Snapshot the type for the crash handler (which can't safely deref the
+    // queue front without racing with worker-thread pops/destructors).
+    m_last_pushed_req_type = (int) req->m_type;
     if (m_config->request_rate) {
         // Handle race condition during reconnection - don't assert if interval is 0
         if (m_request_per_cur_interval > 0) {
