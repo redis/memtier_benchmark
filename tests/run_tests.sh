@@ -24,6 +24,10 @@ help() {
 		VERBOSE=1           Print commands
 		LOG_LEVEL=level     RLTest log level (default: debug)
 		TEST_TIMEOUT=n      Test timeout in seconds (default: 300)
+		PARALLELISM=n       Run n tests concurrently (RLTest --parallelism); each
+		                    worker gets its own redis env on a distinct port range.
+		                    Unset = serial. Used to keep the slow sanitizer cluster
+		                    cells under the CI step timeout.
 		RLTEST_VERBOSE=1    Enable RLTest verbose mode
 		RLTEST_DEBUG=1      Enable RLTest debug print
 
@@ -76,6 +80,7 @@ MEMTIER_BINARY=$ROOT/memtier_benchmark
 
 RLTEST_ARGS=" --cluster-start-timeout 180 --oss-redis-path $REDIS_SERVER --enable-debug-command --cluster_node_timeout 15000"
 [[ "$TEST" != "" ]] && RLTEST_ARGS+=" --test $TEST"
+[[ -n "$PARALLELISM" ]] && RLTEST_ARGS+=" --parallelism $PARALLELISM"
 [[ $VERBOSE == 1 ]] && RLTEST_ARGS+=" -v"
 [[ $TLS == 1 ]] && RLTEST_ARGS+=" --tls-cert-file $TLS_CERT --tls-key-file $TLS_KEY --tls-ca-cert-file $TLS_CACERT --tls"
 

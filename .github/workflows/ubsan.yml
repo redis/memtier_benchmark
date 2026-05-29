@@ -63,10 +63,10 @@ jobs:
             env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", TLS_PROTOCOLS: "TLSv1.3", VERBOSE: "1", UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1" }
             tls: true
           - name: "OSS-CLUSTER API: TCP Plaintext"
-            env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", VERBOSE: "1", UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1" }
+            env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", VERBOSE: "1", UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1", PARALLELISM: "2" }
             tls: false
           - name: "OSS-CLUSTER API: TCP TLS"
-            env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", TLS: "1", VERBOSE: "1", UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1" }
+            env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", TLS: "1", VERBOSE: "1", UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1", PARALLELISM: "2" }
             tls: true
     runs-on: ubuntu-latest
     name: UBSan ${{ matrix.test-config.name }}

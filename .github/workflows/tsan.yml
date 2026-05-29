@@ -67,7 +67,7 @@ jobs:
             env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", VERBOSE: "1" }
             tls: true
           - name: "OSS-CLUSTER API: TCP Plaintext"
-            env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", VERBOSE: "1" }
+            env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", VERBOSE: "1", PARALLELISM: "2" }
             tls: false
     runs-on: ubuntu-latest
     name: TSAN ${{ matrix.test-config.name }}
