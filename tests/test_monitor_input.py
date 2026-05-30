@@ -779,3 +779,83 @@ def test_monitor_input_malformed_command_skipped(env):
             "warning: skipping" in stderr_content.lower()
             or "Loaded" in stderr_content  # At minimum, the file was loaded
         )
+
+
+def test_monitor_input_large_line_no_stack_overflow(env):
+    """
+    Regression test for the VLA stack-overflow in
+    arbitrary_command::split_command_to_args (config_types.cpp).
+
+    Before the fix the function declared `char buffer[command_len]` on the
+    stack and was called per-request from shard_connection::fill_pipeline ->
+    client::create_arbitrary_request. Any MONITOR-replay line larger than
+    the worker thread's stack (default 8-12 MB on Linux) blew the stack the
+    moment the random/sequential picker selected it -> SIGSEGV (or, when
+    glibc's canary caught it first, "*** stack smashing detected ***").
+
+    The fix moves the buffer to the heap (std::vector<char>); this test
+    feeds memtier a single SET line whose value is comfortably larger than
+    the default per-thread stack and asserts memtier completes the run
+    without crashing.
+    """
+    # --monitor-input does not support cluster mode (see other tests).
+    env.skipOnCluster()
+
+    # 16 MiB value: comfortably larger than the typical 8-12 MB Linux
+    # per-thread stack on CI runners and dev boxes, smaller than redis'
+    # default proto-max-bulk-len (512 MB). Pre-fix this crashed
+    # deterministically on the very first request that selected the line.
+    test_dir = tempfile.mkdtemp()
+    monitor_file = os.path.join(test_dir, "monitor_huge.txt")
+    big_value = "A" * (16 * 1024 * 1024)
+    with open(monitor_file, "w") as f:
+        f.write('"SET" "regression_key" "' + big_value + '"\n')
+
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--monitor-input={}".format(monitor_file),
+            "--command=__monitor_line@__",
+            "--hide-histogram",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+
+    # Small request count: 10 SETs of 16 MiB is ~160 MB on loopback - fast
+    # enough for CI, and 10 calls is well past the first one that would have
+    # crashed pre-fix.
+    config = get_default_memtier_config(threads=1, clients=1, requests=10)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    memtier_ok = benchmark.run()
+
+    debugPrintMemtierOnError(config, env)
+    env.assertTrue(memtier_ok == True,
+                   message="memtier crashed (likely VLA stack overflow regression) "
+                           "while replaying a large --monitor-input line")
+    # Sanity: stderr must not carry the canary message.
+    with open("{0}/mb.stderr".format(config.results_dir)) as stderr:
+        stderr_content = stderr.read()
+        env.assertFalse("stack smashing detected" in stderr_content,
+                        message="glibc stack canary tripped: {}".format(
+                            stderr_content[-500:]))
+
+    # Sanity: the value made it to the server.
+    master_nodes_connections = env.getOSSMasterNodesConnectionList()
+    found = False
+    for master_connection in master_nodes_connections:
+        try:
+            result = master_connection.execute_command("STRLEN", "regression_key")
+        except Exception:
+            continue
+        if result == len(big_value):
+            found = True
+            break
+    env.assertTrue(found,
+                   message="SET with 16 MiB value did not land in redis "
+                           "- memtier may have crashed before sending it")

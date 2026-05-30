@@ -517,7 +517,11 @@ bool arbitrary_command::split_command_to_args()
     const char *p = command.c_str();
     size_t command_len = command.length();
 
-    char buffer[command_len];
+    // Heap-allocated scratch buffer; we used to declare `char buffer[command_len]`
+    // here, but with --monitor-input replays this is called per request with
+    // attacker-controlled length, so a multi-MB MONITOR-captured value (e.g.
+    // an HSET storing a gzipped blob) would blow the worker thread's stack.
+    std::vector<char> buffer(command_len);
     unsigned int buffer_len = 0;
 
     while (1) {
@@ -641,7 +645,7 @@ bool arbitrary_command::split_command_to_args()
             }
 
             // add new arg
-            command_arg arg(buffer, buffer_len);
+            command_arg arg(buffer.data(), buffer_len);
             command_args.push_back(arg);
         } else {
             return true;
