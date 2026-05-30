@@ -31,7 +31,7 @@ help() {
 		RLTEST_VERBOSE=1    Enable RLTest verbose mode
 		RLTEST_DEBUG=1      Enable RLTest debug print
 		MEMTIER_FUZZ=1      Run the pytest-driven Hypothesis CLI fuzzer after the
-		                    RLTest suites (see tests/test_cli_fuzz.py, issue #410).
+		                    RLTest suites (see tests/cli_fuzz.py, issue #410).
 		MEMTIER_FUZZ_SEED=n Hypothesis seed (default: 0).
 
 	END
@@ -107,14 +107,14 @@ E=0
 	((E |= $?))
 } || true
 
-# Optional pytest-driven Hypothesis CLI fuzzer (see tests/test_cli_fuzz.py
+# Optional pytest-driven Hypothesis CLI fuzzer (see tests/cli_fuzz.py
 # and issue #410). Off by default so the standard suite stays fast; opt in
 # with MEMTIER_FUZZ=1, which is also the gate that the test itself checks.
 # Intended to run nightly under ASAN/UBSan builds.
 [[ $MEMTIER_FUZZ == 1 ]] && {
 	printf "\nRunning CLI hypothesis fuzzer (MEMTIER_FUZZ=1):\n\n"
 	(cd $ROOT/tests && MEMTIER_BINARY=$MEMTIER_BINARY \
-		python3 -m pytest -p no:asyncio test_cli_fuzz.py \
+		python3 -m pytest -p no:asyncio cli_fuzz.py \
 		--hypothesis-seed=${MEMTIER_FUZZ_SEED:-0} -v)
 	((E |= $?))
 } || true

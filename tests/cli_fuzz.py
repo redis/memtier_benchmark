@@ -19,7 +19,7 @@ Out of scope (per issue #410): --tls*, --uri, --data-import,
 
 Usage:
     MEMTIER_FUZZ=1 MEMTIER_BINARY=$PWD/memtier_benchmark \\
-        pytest tests/test_cli_fuzz.py --hypothesis-seed=0 -x -v
+        pytest tests/cli_fuzz.py --hypothesis-seed=0 -x -v
 """
 
 import os
