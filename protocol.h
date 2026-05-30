@@ -59,11 +59,28 @@ public:
     mbulk_size_el() : mbulk_element(mbulk_element_mbulk_size), upper_level(NULL), bulks_count(0) { ; }
     virtual ~mbulk_size_el()
     {
-        for (unsigned int i = 0; i < mbulks_elements.size(); i++) {
-            mbulk_element *el = mbulks_elements[i];
+        // Iterative teardown. A naive recursive `delete el` on each child
+        // would blow the stack when a (malicious or buggy) server sends
+        // deeply nested arrays (`*1\r\n*1\r\n*1\r\n…`). We walk the tree
+        // non-recursively by stealing each visited node's children into a
+        // worklist; once a node's `mbulks_elements` has been swapped out
+        // its destructor's body is a no-op so the eventual `delete` does
+        // not recurse.
+        std::vector<mbulk_element *> worklist;
+        worklist.swap(mbulks_elements);
+        for (size_t i = 0; i < worklist.size(); i++) {
+            mbulk_element *el = worklist[i];
+            if (el == NULL) continue;
+            if (el->is_mbulk_size()) {
+                mbulk_size_el *m = el->as_mbulk_size();
+                std::vector<mbulk_element *> stolen;
+                stolen.swap(m->mbulks_elements);
+                for (size_t j = 0; j < stolen.size(); j++) {
+                    worklist.push_back(stolen[j]);
+                }
+            }
             delete el;
         }
-        mbulks_elements.clear();
     }
 
     virtual mbulk_size_el *as_mbulk_size() { return this; }

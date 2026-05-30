@@ -29,7 +29,11 @@ LT_INIT
 # working without Python installed.
 AM_PATH_PYTHON([3.6],, [:])
 
-CXXFLAGS="-O2 -g -Wall -std=c++11 $CXXFLAGS"
+dnl -Werror=vla rejects variable-length arrays at compile time. VLAs on the
+dnl worker-thread stack are how PR #405 / issue #404 shipped: an input-sized
+dnl `char buffer[N]` blew an 8-12 MB stack the moment a 20 MB MONITOR-replay
+dnl line was selected. Keep this hard-error to prevent the next one.
+CXXFLAGS="-O2 -g -Wall -Werror=vla -std=c++11 $CXXFLAGS"
 
 # Checks for programs.
 AC_PROG_CXX

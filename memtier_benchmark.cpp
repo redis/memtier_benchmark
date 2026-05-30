@@ -230,8 +230,14 @@ void benchmark_log_file_line(int level, const char *filename, unsigned int line,
     va_list args;
     char fmtbuf[1024];
 
-    snprintf(fmtbuf, sizeof(fmtbuf) - 1, "%s:%u: ", filename, line);
-    strcat(fmtbuf, fmt);
+    // Bound the concatenation so a future refactor that lets `fmt` reach this
+    // function from a user-controlled source can't overflow `fmtbuf`. Today
+    // every caller passes a literal, but the previous strcat() relied on that
+    // invariant silently.
+    int n = snprintf(fmtbuf, sizeof(fmtbuf), "%s:%u: ", filename, line);
+    if (n < 0) n = 0;
+    if ((size_t) n >= sizeof(fmtbuf)) n = (int) sizeof(fmtbuf) - 1;
+    snprintf(fmtbuf + n, sizeof(fmtbuf) - (size_t) n, "%s", fmt);
 
     va_start(args, fmt);
     vfprintf(stderr, fmtbuf, args);

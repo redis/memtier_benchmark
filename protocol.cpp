@@ -946,7 +946,12 @@ int memcache_text_protocol::parse_response(void)
                 unsigned int flags;
                 unsigned int cas;
 
-                int res = sscanf(line, "%s %s %u %u %u", prefix, key, &flags, &m_value_len, &cas);
+                // Width specifiers cap %s at sizeof(buf)-1; a malicious/buggy
+                // memcached server sending "VALUE <very-long-key> ..." cannot
+                // overflow `key[256]` or `prefix[50]` and corrupt the worker
+                // stack. Same class of bug as the VLA in arbitrary_command
+                // (PR #405).
+                int res = sscanf(line, "%49s %255s %u %u %u", prefix, key, &flags, &m_value_len, &cas);
                 if (res < 4 || res > 5) {
                     benchmark_debug_log("unexpected VALUE response: %s\n", line);
                     if (m_last_response.get_status() != line) free(line);
