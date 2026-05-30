@@ -181,3 +181,60 @@ commands-meta-check:
 	fi; \
 	rm -f $$TMP; \
 	echo "command_meta_data.h is up to date."
+
+# ----------------------------------------------------------------------------
+# libFuzzer harnesses for in-process parsers (--enable-fuzz).
+#
+# These are noinst_PROGRAMS — they're built only on demand and never installed.
+# We re-compile config_types.cpp / protocol.cpp / command_meta.cpp into the
+# fuzz target rather than reusing the memtier_benchmark objects so the
+# fuzz-only sanitizer flags (-fsanitize=fuzzer,address,undefined) don't leak
+# into the main binary's build.
+#
+# A tiny shim (fuzz_stubs.cpp) provides the logging entry points expected by
+# protocol.cpp (defined in memtier_benchmark.cpp in the real build) so we
+# don't have to drag main() and the entire async stack in.
+# ----------------------------------------------------------------------------
+if FUZZ_ENABLED
+
+memtier_fuzz_cxxflags   = -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer -g -O1 -std=c++11 -Wall \
+                  -I$(srcdir) $(LIBEVENT_CFLAGS)
+memtier_fuzz_ldflags    = -fsanitize=fuzzer,address,undefined
+memtier_fuzz_ldadd      = $(LIBEVENT_LIBS) -lpthread -lz
+
+memtier_fuzz_shared_sources = \
+    config_types.cpp config_types.h \
+    protocol.cpp protocol.h \
+    command_meta.cpp command_meta.h command_meta_data.h \
+    tests/fuzz/fuzz_stubs.cpp
+
+noinst_PROGRAMS = \
+    split_command_to_args_fuzz \
+    monitor_input_fuzz \
+    redis_protocol_fuzz
+
+split_command_to_args_fuzz_SOURCES = \
+    tests/fuzz/split_command_to_args_fuzz.cpp \
+    $(memtier_fuzz_shared_sources)
+split_command_to_args_fuzz_CPPFLAGS = $(memtier_fuzz_cxxflags)
+split_command_to_args_fuzz_CXXFLAGS = $(memtier_fuzz_cxxflags)
+split_command_to_args_fuzz_LDFLAGS  = $(memtier_fuzz_ldflags)
+split_command_to_args_fuzz_LDADD    = $(memtier_fuzz_ldadd)
+
+monitor_input_fuzz_SOURCES = \
+    tests/fuzz/monitor_input_fuzz.cpp \
+    $(memtier_fuzz_shared_sources)
+monitor_input_fuzz_CPPFLAGS = $(memtier_fuzz_cxxflags)
+monitor_input_fuzz_CXXFLAGS = $(memtier_fuzz_cxxflags)
+monitor_input_fuzz_LDFLAGS  = $(memtier_fuzz_ldflags)
+monitor_input_fuzz_LDADD    = $(memtier_fuzz_ldadd)
+
+redis_protocol_fuzz_SOURCES = \
+    tests/fuzz/redis_protocol_fuzz.cpp \
+    $(memtier_fuzz_shared_sources)
+redis_protocol_fuzz_CPPFLAGS = $(memtier_fuzz_cxxflags)
+redis_protocol_fuzz_CXXFLAGS = $(memtier_fuzz_cxxflags)
+redis_protocol_fuzz_LDFLAGS  = $(memtier_fuzz_ldflags)
+redis_protocol_fuzz_LDADD    = $(memtier_fuzz_ldadd)
+
+endif

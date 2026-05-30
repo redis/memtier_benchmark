@@ -108,6 +108,22 @@ AS_IF([test "x$enable_thread_sanitizer" = "xyes"], [
        LDFLAGS="$LDFLAGS -fsanitize=thread"
        ], [])
 
+# libFuzzer-based in-process fuzz harnesses (requires clang++).
+# When enabled, builds tests/fuzz/*_fuzz binaries under noinst_PROGRAMS.
+# Does not perturb the main memtier_benchmark binary's build flags.
+AC_ARG_ENABLE([fuzz],
+  [AS_HELP_STRING([--enable-fuzz],
+                  [Build libFuzzer harnesses under tests/fuzz/ (requires clang++)])])
+AS_IF([test "x$enable_fuzz" = "xyes"], [
+       AC_MSG_CHECKING([whether $CXX is clang++])
+       AS_CASE(["`$CXX --version 2>/dev/null | head -n 1`"],
+               [*clang*], [AC_MSG_RESULT([yes])],
+               [AC_MSG_RESULT([no])
+                AC_MSG_ERROR([--enable-fuzz requires clang++; re-run configure with CXX=clang++ CC=clang])])
+       AC_MSG_NOTICE([Enabling libFuzzer fuzz harnesses (tests/fuzz/)])
+       ], [])
+AM_CONDITIONAL([FUZZ_ENABLED], [test "x$enable_fuzz" = "xyes"])
+
 # clock_gettime requires -lrt on old glibc only.
 AC_SEARCH_LIBS([clock_gettime], [rt], , AC_MSG_ERROR([rt is required libevent.]))
 

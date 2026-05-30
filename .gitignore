@@ -55,3 +55,12 @@ appendonlydir/
 *.conf
 
 tests/.env/
+
+# libFuzzer fuzz harness build artifacts and crash dumps
+/split_command_to_args_fuzz
+/monitor_input_fuzz
+/redis_protocol_fuzz
+crash-*
+leak-*
+timeout-*
+oom-*
