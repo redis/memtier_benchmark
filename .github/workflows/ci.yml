@@ -179,10 +179,10 @@ jobs:
             env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", TLS_PROTOCOLS: "TLSv1.3", VERBOSE: "1" }
             tls: true
           - name: "OSS-CLUSTER API: TCP Plaintext"
-            env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", VERBOSE: "1" }
+            env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", VERBOSE: "1", PARALLELISM: "2" }
             tls: false
           - name: "OSS-CLUSTER API: TCP TLS"
-            env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", TLS: "1", VERBOSE: "1" }
+            env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", TLS: "1", VERBOSE: "1", PARALLELISM: "2" }
             tls: true
           - name: "OSS-CLUSTER API 49 shards: TCP TLS"
             env: { RLTEST_DEBUG: "1", LOG_LEVEL: "notice", OSS_STANDALONE: "0", OSS_CLUSTER: "1", TLS: "1", VERBOSE: "1", SHARDS: "49", TEST: "tests_oss_simple_flow:test_rate_limited_completion_no_hang" }
