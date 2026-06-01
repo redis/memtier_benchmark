@@ -1268,8 +1268,20 @@ void client_group::interrupt(void)
 {
     // Mark all clients as interrupted
     set_all_clients_interrupted();
-    // Break the event loop to stop processing
+    // Break the event loop to stop processing.
+    //
+    // We pair loopbreak() (terminate after the current iteration) with a
+    // loopexit(timeval{0,0}) (schedule an immediate timer that wakes the
+    // poll). Without the loopexit wake-up, a worker that is sitting idle
+    // in epoll_wait() with no live event sources (e.g. a connection that
+    // failed setup but never disconnected) will block forever, so
+    // pthread_join() in the parent hangs indefinitely. This is the same
+    // pattern libevent recommends for terminating an idle loop from
+    // another thread; loopbreak alone is documented to only take effect
+    // *between* iterations.
     event_base_loopbreak(m_base);
+    struct timeval zero = {0, 0};
+    event_base_loopexit(m_base, &zero);
     // Set end time for all clients as close as possible to the loop break
     finalize_all_clients();
 }

@@ -142,6 +142,17 @@ PKG_CHECK_MODULES(LIBEVENT,
     AC_SUBST(LIBEVENT_CFLAGS) AC_SUBST(LIBEVENT_LIBS)
 )
 
+# libevent_pthreads: needed for evthread_use_pthreads(). Without this,
+# event_base_loopbreak() / event_base_loopexit() called from a *different*
+# thread than the one running event_base_dispatch() do not wake the
+# epoll_wait(), so an idle worker hangs after a cross-thread shutdown
+# request (Phase 1 of #426 / Ctrl+C). The pthreads bindings ship as a
+# separate .so since libevent 2.0, so we have to depend on it explicitly.
+PKG_CHECK_MODULES(LIBEVENT_PTHREADS,
+    [libevent_pthreads >= 2.0.10],
+    AC_SUBST(LIBEVENT_PTHREADS_CFLAGS) AC_SUBST(LIBEVENT_PTHREADS_LIBS)
+)
+
 # bash completion
 PKG_CHECK_MODULES([BASH_COMPLETION], [bash-completion >= 2.0],
     [BASH_COMPLETION_DIR="`pkg-config --variable=completionsdir bash-completion`"],

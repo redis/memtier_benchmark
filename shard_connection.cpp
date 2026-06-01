@@ -880,6 +880,15 @@ void shard_connection::process_response(void)
         case rt_auth:
             if (r->is_error()) {
                 benchmark_error_log("error: authentication failed [%s]\n", r->get_status());
+                {
+                    // Forward the server-side status to the connection-stage
+                    // supervisor so --connection-stage-timeout has actionable
+                    // context to surface (e.g. "called without any password
+                    // configured for the default user.").
+                    char buf[256];
+                    snprintf(buf, sizeof(buf), "AUTH failed: %s", r->get_status() ? r->get_status() : "");
+                    report_connection_stage_failure(buf);
+                }
                 error = true;
             } else {
                 m_authentication = setup_done;
@@ -889,6 +898,11 @@ void shard_connection::process_response(void)
         case rt_select_db:
             if (strcmp(r->get_status(), "+OK") != 0) {
                 benchmark_error_log("database selection failed.\n");
+                {
+                    char buf[256];
+                    snprintf(buf, sizeof(buf), "SELECT failed: %s", r->get_status() ? r->get_status() : "");
+                    report_connection_stage_failure(buf);
+                }
                 error = true;
             } else {
                 benchmark_debug_log("database selection successful.\n");
@@ -898,6 +912,8 @@ void shard_connection::process_response(void)
         case rt_cluster_slots:
             if (r->get_mbulk_value() == NULL || r->get_mbulk_value()->mbulks_elements.size() == 0) {
                 benchmark_error_log("cluster slot failed.\n");
+                report_connection_stage_failure("CLUSTER SLOTS failed (server returned empty or non-cluster reply; "
+                                                "is the server actually cluster-enabled?)");
                 error = true;
             } else {
                 // parse response
@@ -911,6 +927,11 @@ void shard_connection::process_response(void)
         case rt_hello:
             if (r->is_error()) {
                 benchmark_error_log("error: HELLO failed [%s]\n", r->get_status());
+                {
+                    char buf[256];
+                    snprintf(buf, sizeof(buf), "HELLO failed: %s", r->get_status() ? r->get_status() : "");
+                    report_connection_stage_failure(buf);
+                }
                 error = true;
             } else {
                 m_hello = setup_done;
@@ -923,6 +944,22 @@ void shard_connection::process_response(void)
 
             m_conns_manager->handle_response(m_id, now, req, r);
             m_conns_manager->inc_reqs_processed();
+            // First *successful* post-setup response observed: tell the
+            // supervisor we reached steady state. Idempotent.
+            //
+            // We deliberately do NOT count error responses as steady state
+            // — a -ERR can fire on the very first request (e.g. the
+            // 'invalid bulk length' loop from #426 #8) and then close the
+            // connection, dropping the worker into an infinite reconnect
+            // loop that the supervisor would otherwise be disarmed against.
+            if (!r->is_error()) {
+                report_connection_stage_success();
+            } else {
+                // Forward the error so a later abort can attribute it.
+                char buf[256];
+                snprintf(buf, sizeof(buf), "server error: %s", r->get_status() ? r->get_status() : "");
+                report_connection_stage_failure(buf);
+            }
             responses_handled = true;
             break;
         }
@@ -938,6 +975,13 @@ void shard_connection::process_response(void)
 
     if (ret == -1) {
         benchmark_error_log("error: response parsing failed.\n");
+        // A parser failure during the initial probe (e.g. talking memcache_text
+        // to a Redis server, or memcache_binary to redis) puts the worker
+        // into an unrecoverable spin: the bytes never align, the response
+        // never completes, and we never call inc_reqs_processed(). Report it
+        // as a connection-stage failure so the supervisor bounds the spin.
+        // Once steady state is reached this is a no-op.
+        report_connection_stage_failure("response parsing failed (protocol mismatch?)");
     }
 
     if (m_config->reconnect_interval > 0 && responses_handled) {

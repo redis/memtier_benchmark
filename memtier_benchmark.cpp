@@ -51,6 +51,7 @@
 #include <sys/utsname.h>
 #include <dirent.h>
 #include <event2/event.h>
+#include <event2/thread.h>
 
 #ifdef USE_TLS
 #include <openssl/crypto.h>
@@ -93,6 +94,11 @@ int log_level = 0;
 // Global flag for signal handling
 static volatile sig_atomic_t g_interrupted = 0;
 
+// Set when run_benchmark() aborts because --connection-stage-timeout
+// elapsed without any thread reaching steady state. main() reads it after
+// the run loop to decide between exit(0) and exit(2).
+static std::atomic<bool> g_connection_stage_aborted{false};
+
 // Forward declarations
 struct cg_thread;
 static void print_client_list(FILE *fp, int pid, const char *timestr);
@@ -100,6 +106,118 @@ static void print_all_threads_stack_trace(FILE *fp, int pid, const char *timestr
 
 // Global pointer to threads for crash handler access
 static std::vector<cg_thread *> *g_threads = NULL;
+
+// ---------------------------------------------------------------------------
+// Connection-stage supervisor state (declarations in memtier_benchmark.h)
+// ---------------------------------------------------------------------------
+//
+// Worker threads call report_connection_stage_failure/success() lock-free
+// (except for the last-error string update, which uses a tiny mutex). The
+// main thread polls connection_stage_should_abort() once per second from
+// run_benchmark() while waiting for active_threads to drain.
+//
+// Lifetimes:
+//   - reset by connection_stage_supervisor_reset() at the start of every
+//     run_benchmark() invocation; --run-count > 1 must restart the policy
+//     because a previous run's success latch is meaningless for the next.
+//   - g_conn_stage_run_start tracks the time of that reset; we measure
+//     "elapsed in setup phase" from there, NOT from each individual
+//     failure, so a single late failure can still trigger the timeout.
+static std::atomic<bool> g_conn_stage_steady_state{false};
+static std::atomic<long> g_conn_stage_streak_start_sec{0}; // 0 = no failure yet
+static std::atomic<long> g_conn_stage_run_start_sec{0};
+static std::atomic<unsigned long long> g_conn_stage_failure_count{0};
+static pthread_mutex_t g_conn_stage_err_mutex = PTHREAD_MUTEX_INITIALIZER;
+static std::string g_conn_stage_last_err; // guarded by g_conn_stage_err_mutex
+
+void connection_stage_supervisor_reset(void)
+{
+    g_conn_stage_steady_state.store(false, std::memory_order_release);
+    g_conn_stage_streak_start_sec.store(0, std::memory_order_release);
+    g_conn_stage_failure_count.store(0, std::memory_order_release);
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    g_conn_stage_run_start_sec.store(now.tv_sec, std::memory_order_release);
+    pthread_mutex_lock(&g_conn_stage_err_mutex);
+    g_conn_stage_last_err.clear();
+    pthread_mutex_unlock(&g_conn_stage_err_mutex);
+}
+
+void report_connection_stage_failure(const char *err)
+{
+    // Once any thread has reached steady state we stop policing setup; a
+    // late "auth failed" log line during a normal --reconnect-on-error
+    // cycle must not bring the run down.
+    if (g_conn_stage_steady_state.load(std::memory_order_acquire)) return;
+
+    struct timeval now;
+    gettimeofday(&now, NULL);
+
+    // First failure in a streak: stamp the wall-clock start. Subsequent
+    // failures only update the last-error string. CAS on 0 keeps this
+    // race-free without a mutex.
+    long zero = 0;
+    g_conn_stage_streak_start_sec.compare_exchange_strong(zero, now.tv_sec, std::memory_order_acq_rel);
+    g_conn_stage_failure_count.fetch_add(1, std::memory_order_relaxed);
+
+    if (err != NULL && *err != '\0') {
+        pthread_mutex_lock(&g_conn_stage_err_mutex);
+        g_conn_stage_last_err.assign(err);
+        pthread_mutex_unlock(&g_conn_stage_err_mutex);
+    }
+}
+
+void report_connection_stage_success(void)
+{
+    // First call wins; subsequent calls are no-ops. We don't reset the
+    // failure_count / last_err — they may be useful in JSON output and
+    // they're only read by the supervisor, which is now disarmed.
+    bool expected = false;
+    if (g_conn_stage_steady_state.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        g_conn_stage_streak_start_sec.store(0, std::memory_order_release);
+    }
+}
+
+bool connection_stage_should_abort(unsigned int timeout_secs, std::string *out_last_err, unsigned int *out_elapsed)
+{
+    if (timeout_secs == 0) return false; // operator opt-out
+    if (g_conn_stage_steady_state.load(std::memory_order_acquire)) return false;
+
+    struct timeval now;
+    gettimeofday(&now, NULL);
+
+    long streak_start = g_conn_stage_streak_start_sec.load(std::memory_order_acquire);
+    long run_start = g_conn_stage_run_start_sec.load(std::memory_order_acquire);
+
+    // Two trip conditions:
+    //   (a) a failure streak has been live for >= timeout_secs (covers
+    //       AUTH-fail / SELECT-fail / CLUSTER-SLOTS-fail / -ERR reconnect
+    //       loops),
+    //   (b) no failure has ever been observed but the run has been alive
+    //       for >= timeout_secs without anyone reaching steady state
+    //       (covers --wait-ratio 0:1 with no slaves — the connection
+    //       handshakes but the very first WAIT command never returns).
+    long elapsed_streak = (streak_start > 0) ? (now.tv_sec - streak_start) : 0;
+    long elapsed_run = (run_start > 0) ? (now.tv_sec - run_start) : 0;
+
+    bool trip_streak = (streak_start > 0 && elapsed_streak >= (long) timeout_secs);
+    bool trip_run = (run_start > 0 && elapsed_run >= (long) timeout_secs);
+    if (!trip_streak && !trip_run) return false;
+
+    if (out_elapsed != NULL) {
+        *out_elapsed = (unsigned int) (trip_streak ? elapsed_streak : elapsed_run);
+    }
+    if (out_last_err != NULL) {
+        pthread_mutex_lock(&g_conn_stage_err_mutex);
+        if (!g_conn_stage_last_err.empty()) {
+            *out_last_err = g_conn_stage_last_err;
+        } else {
+            out_last_err->assign("no response from server during setup");
+        }
+        pthread_mutex_unlock(&g_conn_stage_err_mutex);
+    }
+    return true;
+}
 
 // Per-thread alternate signal stack. Without this, SA_ONSTACK is a no-op
 // and a SIGSEGV caused by stack-overflow is unrecoverable (the handler
@@ -427,6 +545,7 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             "max_retry_queue = %u\n"
             "failed_keys_file = %s\n"
             "connection_timeout = %u\n"
+            "connection_stage_timeout = %u\n"
             "thread_conn_start_min_jitter_micros = %u\n"
             "thread_conn_start_max_jitter_micros = %u\n"
             "multi_key_get = %u\n"
@@ -456,7 +575,7 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             cfg->key_prefix, cfg->key_minimum, cfg->key_maximum, cfg->key_pattern, cfg->key_stddev, cfg->key_median,
             cfg->reconnect_interval, cfg->retry_on_error ? "yes" : "no", cfg->max_retries, cfg->retry_backoff_ms,
             cfg->retry_backoff_factor, cfg->retry_on_filter ? cfg->retry_on_filter : "", cfg->max_retry_queue,
-            cfg->failed_keys_file ? cfg->failed_keys_file : "", cfg->connection_timeout,
+            cfg->failed_keys_file ? cfg->failed_keys_file : "", cfg->connection_timeout, cfg->connection_stage_timeout,
             cfg->thread_conn_start_min_jitter_micros, cfg->thread_conn_start_max_jitter_micros, cfg->multi_key_get,
             cfg->authenticate ? cfg->authenticate : "", cfg->select_db, cfg->no_expiry ? "yes" : "no",
             cfg->wait_ratio.a, cfg->wait_ratio.b, cfg->num_slaves.min, cfg->num_slaves.max, cfg->wait_timeout.min,
@@ -525,6 +644,7 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
     jsonhandler->write_obj("max_retry_queue", "%u", cfg->max_retry_queue);
     jsonhandler->write_obj("failed_keys_file", "\"%s\"", cfg->failed_keys_file ? cfg->failed_keys_file : "");
     jsonhandler->write_obj("connection_timeout", "%u", cfg->connection_timeout);
+    jsonhandler->write_obj("connection_stage_timeout", "%u", cfg->connection_stage_timeout);
     jsonhandler->write_obj("thread_conn_start_min_jitter_micros", "%u", cfg->thread_conn_start_min_jitter_micros);
     jsonhandler->write_obj("thread_conn_start_max_jitter_micros", "%u", cfg->thread_conn_start_max_jitter_micros);
     jsonhandler->write_obj("multi_key_get", "%u", cfg->multi_key_get);
@@ -690,6 +810,8 @@ static void config_init_defaults(struct benchmark_config *cfg)
     if (!cfg->print_percentiles.is_defined()) cfg->print_percentiles = config_quantiles("50,99,99.9");
     if (!cfg->monitor_pattern) cfg->monitor_pattern = 'S';
     if (cfg->miss_rate_threshold < 0.0) cfg->miss_rate_threshold = 0.01; // Default: warn above 1%
+    // Default --connection-stage-timeout to 30 s; 0 means "operator disabled".
+    if (cfg->connection_stage_timeout == UINT_MAX) cfg->connection_stage_timeout = 30;
 
     // StatsD defaults - port only matters if host is set
     if (!cfg->statsd_port) cfg->statsd_port = 8125;
@@ -804,6 +926,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_max_retry_queue,
         o_failed_keys_file,
         o_connection_timeout,
+        o_connection_stage_timeout,
         o_thread_conn_start_min_jitter_micros,
         o_thread_conn_start_max_jitter_micros,
         o_generate_keys,
@@ -912,6 +1035,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         {"max-retry-queue", 1, 0, o_max_retry_queue},
         {"failed-keys-file", 1, 0, o_failed_keys_file},
         {"connection-timeout", 1, 0, o_connection_timeout},
+        {"connection-stage-timeout", 1, 0, o_connection_stage_timeout},
         {"thread-conn-start-min-jitter-micros", 1, 0, o_thread_conn_start_min_jitter_micros},
         {"thread-conn-start-max-jitter-micros", 1, 0, o_thread_conn_start_max_jitter_micros},
         {"multi-key-get", 1, 0, o_multi_key_get},
@@ -1330,6 +1454,16 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             cfg->connection_timeout = (unsigned int) strtoul(optarg, &endptr, 10);
             if (!endptr || *endptr != '\0') {
                 fprintf(stderr, "error: connection-timeout must be a valid number.\n");
+                return -1;
+            }
+            break;
+        case o_connection_stage_timeout:
+            endptr = NULL;
+            cfg->connection_stage_timeout = (unsigned int) strtoul(optarg, &endptr, 10);
+            // 0 is allowed and disables the supervisor (opt-out for users
+            // running long pre-warmed handshakes against slow servers).
+            if (!endptr || *endptr != '\0') {
+                fprintf(stderr, "error: connection-stage-timeout must be a valid number (seconds, 0 disables).\n");
                 return -1;
             }
             break;
@@ -1823,6 +1957,13 @@ void usage()
         "                                 permanent error) as CSV: timestamp,command,key,status,retries.\n"
         "                                 Off by default. The benchmark continues if the file is unwritable.\n"
         "      --connection-timeout=SECS  Connection timeout in seconds, 0 to disable (default: 0)\n"
+        "      --connection-stage-timeout=SECS\n"
+        "                                 Abort with exit code 2 if no thread reaches steady state within\n"
+        "                                 SECS, or if connection-setup failures (AUTH / HELLO / SELECT /\n"
+        "                                 CLUSTER SLOTS / -ERR during initial probe) persist for SECS\n"
+        "                                 without a successful handshake. Bounds the *startup* phase;\n"
+        "                                 --test-time still bounds the steady-state run. Default: 30,\n"
+        "                                 0 disables the supervisor.\n"
         "      --thread-conn-start-min-jitter-micros=NUM Minimum jitter in microseconds between connection creation "
         "(default: 0)\n"
         "      --thread-conn-start-max-jitter-micros=NUM Maximum jitter in microseconds between connection creation "
@@ -2022,7 +2163,14 @@ static void *cg_thread_start(void *t)
 
         // Check if we should restart due to connection failures
         // If the thread finished but still has time left and connection errors, request restart
-        if (thread->m_cg->get_total_connection_errors() > 0) {
+        //
+        // Exception: do NOT request restart if the connection-stage
+        // supervisor already gave up. Restarting would re-enter the same
+        // doomed handshake (AUTH against no-auth server, SELECT against
+        // missing DB, etc.) and silently re-trigger the same failure mode
+        // we just aborted on, masking the abort code from exit.
+        if (thread->m_cg->get_total_connection_errors() > 0 &&
+            !g_connection_stage_aborted.load(std::memory_order_acquire)) {
             benchmark_error_log("Thread %u finished due to connection failures, requesting restart.\n",
                                 thread->m_thread_id);
             thread->m_restart_requested = true;
@@ -2032,11 +2180,15 @@ static void *cg_thread_start(void *t)
     } catch (const std::exception &e) {
         benchmark_error_log("Thread %u caught exception: %s\n", thread->m_thread_id, e.what());
         thread->m_finished = true;
-        thread->m_restart_requested = true;
+        if (!g_connection_stage_aborted.load(std::memory_order_acquire)) {
+            thread->m_restart_requested = true;
+        }
     } catch (...) {
         benchmark_error_log("Thread %u caught unknown exception\n", thread->m_thread_id);
         thread->m_finished = true;
-        thread->m_restart_requested = true;
+        if (!g_connection_stage_aborted.load(std::memory_order_acquire)) {
+            thread->m_restart_requested = true;
+        }
     }
 
     return t;
@@ -2267,6 +2419,11 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     // Record benchmark start time (used for staircase global deadline)
     gettimeofday(&cfg->benchmark_start_time, NULL);
 
+    // Arm the connection-stage supervisor. Must happen *before* threads
+    // start so the first failure timestamp is meaningful (some servers
+    // reply to AUTH on the same TCP RTT as the connect).
+    connection_stage_supervisor_reset();
+
     // launch threads
     fprintf(stderr, "[RUN #%u] Launching threads now...\n", run_id);
     for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
@@ -2331,6 +2488,30 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
                 (*i)->m_cg->interrupt();
             }
             break;
+        }
+
+        // Phase 1 of #426: bound the startup phase.
+        //
+        // Workers report failures (AUTH / HELLO / SELECT / CLUSTER SLOTS /
+        // -ERR / parse-error during initial probe) and the first post-setup
+        // success into the supervisor. If neither has happened within
+        // --connection-stage-timeout seconds, abort the run rather than
+        // letting the reconnect / "stuck WAIT" loop ignore --test-time.
+        // 0 = supervisor disabled.
+        {
+            std::string last_err;
+            unsigned int elapsed = 0;
+            if (connection_stage_should_abort(cfg->connection_stage_timeout, &last_err, &elapsed)) {
+                fprintf(stderr,
+                        "\nmemtier_benchmark: aborting after %u seconds of connection-stage failures "
+                        "(last error: %s). See --connection-stage-timeout.\n",
+                        elapsed, last_err.c_str());
+                g_connection_stage_aborted.store(true, std::memory_order_release);
+                for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
+                    (*i)->m_cg->interrupt();
+                }
+                break;
+            }
         }
 
         unsigned long int total_ops = 0;
@@ -2778,6 +2959,18 @@ static void cleanup_openssl(void)
 
 int main(int argc, char *argv[])
 {
+    // Enable libevent's pthreads bindings so event_base_loopbreak() /
+    // event_base_loopexit() called from the main thread reliably wake a
+    // worker thread that is blocked in epoll_wait() with no live events.
+    // Without this, an idle event base never notices a cross-thread break
+    // request and the parent's pthread_join() hangs after a
+    // --connection-stage-timeout abort (Phase 1 of #426) or a Ctrl+C.
+    // Must run before any event_base is created so the locking callbacks
+    // are installed for every subsequent base.
+    if (evthread_use_pthreads() < 0) {
+        fprintf(stderr, "warning: evthread_use_pthreads() failed; cross-thread loop wakeups may stall.\n");
+    }
+
     // Install signal handler for Ctrl+C
     signal(SIGINT, sigint_handler);
 
@@ -2813,6 +3006,11 @@ int main(int argc, char *argv[])
     cfg.max_retries = -1;
     cfg.miss_rate_threshold = -1.0;   // sentinel; config_init_defaults replaces with 0.01
     cfg.command_miss_tracking = true; // Default: auto-track misses for known shapes
+    // Sentinel for --connection-stage-timeout: UINT_MAX means "operator did
+    // not specify"; config_init_defaults replaces with 30 s. We can't reuse 0
+    // as the unset marker because 0 is a valid user-specified "disable the
+    // supervisor entirely" value.
+    cfg.connection_stage_timeout = UINT_MAX;
 
     if (config_parse_args(argc, argv, &cfg) < 0) {
         usage();
@@ -3641,4 +3839,14 @@ int main(int argc, char *argv[])
         cleanup_openssl();
     }
 #endif
+
+    // Phase 1 of #426: propagate the connection-stage abort up to the shell.
+    // We still ran every teardown above (stats output, JSON, etc.) so the
+    // operator can read why the abort fired. exit(2) keeps the failure
+    // distinguishable from a successful test (0) and from --help (also 2 via
+    // usage(), but those exits happen before main reaches this point).
+    if (g_connection_stage_aborted.load(std::memory_order_acquire)) {
+        return 2;
+    }
+    return 0;
 }
