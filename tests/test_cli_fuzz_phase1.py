@@ -32,8 +32,19 @@ from include import MEMTIER_BINARY
 # Short timeout so the regression suite finishes in seconds, not 30 s per
 # case. The supervisor's *default* is 30; we pass an explicit override to
 # the CLI in every test so we don't grow the suite by a minute.
-SUPERVISOR_TIMEOUT_SECS = 3
-WALL_BUDGET_SECS = SUPERVISOR_TIMEOUT_SECS + 5
+#
+# Sanitizer cells (TSAN especially) slow memtier startup + libevent
+# scheduling enough that a 3-s supervisor + 5-s outer budget is too tight:
+# TSAN added ~3 s of overhead per case on the OSS-TLS cells, tipping
+# case #8 (--data-size-range with the reconnect-loop server reply) past
+# the budget. Detect sanitizer instrumentation via the runtime env hooks
+# the CI workflows set (`ASAN_OPTIONS`, `TSAN_OPTIONS`, `UBSAN_OPTIONS`)
+# and double the supervisor + outer budgets when any of them is present.
+_SANITIZER_ACTIVE = any(
+    os.environ.get(k) for k in ("ASAN_OPTIONS", "TSAN_OPTIONS", "UBSAN_OPTIONS")
+)
+SUPERVISOR_TIMEOUT_SECS = 6 if _SANITIZER_ACTIVE else 3
+WALL_BUDGET_SECS = SUPERVISOR_TIMEOUT_SECS + (10 if _SANITIZER_ACTIVE else 5)
 
 DIAGNOSTIC_PREFIX = "memtier_benchmark: aborting after"
 DIAGNOSTIC_FLAG_HINT = "See --connection-stage-timeout."
