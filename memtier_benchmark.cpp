@@ -3065,16 +3065,34 @@ int main(int argc, char *argv[])
 
     config_init_defaults(&cfg);
 
-    // Reject Gaussian (G) key-pattern over a degenerate 1-key range: the sampler
-    // requires `median > min && median < max`, which is impossible when the range
-    // has fewer than 2 buckets. Without this check, the Gaussian path trips an
-    // assert (SIGABRT). Issue #426.
+    // Reject Gaussian (G) key-pattern over a degenerate range. The sampler
+    // (gaussian_noise::gaussian_distribution_range) handles `min == max` by
+    // returning `min` directly, but the user almost certainly didn't mean a
+    // single-key Gaussian -- it's a no-op, indistinguishable from
+    // --key-pattern=R on a 1-key range. The actual SIGABRT path was a user
+    // also passing a `--key-median` outside (min, max) on a tiny range; the
+    // default `len/2.0 + min + 0.5` lands strictly inside even for the 2-key
+    // case (min=1, max=2 → median=1.5), so reject only `max <= min`.
+    // (Review-pass fix: the original `(max - min) < 2` cutoff was too strict
+    // and rejected the perfectly valid 2-key case.)
     if (cfg.key_pattern && (cfg.key_pattern[key_pattern_set] == 'G' || cfg.key_pattern[key_pattern_get] == 'G')) {
-        if (cfg.key_maximum < cfg.key_minimum || (cfg.key_maximum - cfg.key_minimum) < 2) {
+        if (cfg.key_maximum <= cfg.key_minimum) {
             fprintf(stderr,
-                    "error: key-pattern=G requires a key range spanning at least 3 keys "
-                    "(key-maximum - key-minimum >= 2); got key-minimum=%llu key-maximum=%llu.\n",
+                    "error: key-pattern=G requires key-maximum > key-minimum (a non-empty range "
+                    "for the Gaussian sampler); got key-minimum=%llu key-maximum=%llu.\n",
                     cfg.key_minimum, cfg.key_maximum);
+            exit(2);
+        }
+        // If the user supplied a non-zero median, it must land strictly inside
+        // (min, max) -- otherwise the sampler's `assert(median > min && median
+        // < max)` SIGABRTs. Default median=0 means "auto-compute" and is
+        // always valid because the auto-compute keeps it strictly inside.
+        if (cfg.key_median != 0.0 &&
+            (cfg.key_median <= (double) cfg.key_minimum || cfg.key_median >= (double) cfg.key_maximum)) {
+            fprintf(stderr,
+                    "error: --key-median=%g must be strictly inside (key-minimum=%llu, key-maximum=%llu) "
+                    "for the Gaussian sampler.\n",
+                    cfg.key_median, cfg.key_minimum, cfg.key_maximum);
             exit(2);
         }
     }
