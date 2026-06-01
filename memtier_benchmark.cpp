@@ -126,7 +126,6 @@ static std::vector<cg_thread *> *g_threads = NULL;
 static std::atomic<bool> g_conn_stage_steady_state{false};
 static std::atomic<long> g_conn_stage_streak_start_sec{0}; // 0 = no failure yet
 static std::atomic<long> g_conn_stage_run_start_sec{0};
-static std::atomic<unsigned long long> g_conn_stage_failure_count{0};
 static pthread_mutex_t g_conn_stage_err_mutex = PTHREAD_MUTEX_INITIALIZER;
 static std::string g_conn_stage_last_err; // guarded by g_conn_stage_err_mutex
 
@@ -134,7 +133,11 @@ void connection_stage_supervisor_reset(void)
 {
     g_conn_stage_steady_state.store(false, std::memory_order_release);
     g_conn_stage_streak_start_sec.store(0, std::memory_order_release);
-    g_conn_stage_failure_count.store(0, std::memory_order_release);
+    // Must reset g_connection_stage_aborted as well: with --run-count > 1, a
+    // run-1 abort would otherwise leave the flag latched into run 2,
+    // suppressing legitimate thread restarts in cg_thread_start() and
+    // forcing main() to exit with code 2 even after subsequent runs succeed.
+    g_connection_stage_aborted.store(false, std::memory_order_release);
     struct timeval now;
     gettimeofday(&now, NULL);
     g_conn_stage_run_start_sec.store(now.tv_sec, std::memory_order_release);
@@ -158,7 +161,6 @@ void report_connection_stage_failure(const char *err)
     // race-free without a mutex.
     long zero = 0;
     g_conn_stage_streak_start_sec.compare_exchange_strong(zero, now.tv_sec, std::memory_order_acq_rel);
-    g_conn_stage_failure_count.fetch_add(1, std::memory_order_relaxed);
 
     if (err != NULL && *err != '\0') {
         pthread_mutex_lock(&g_conn_stage_err_mutex);
@@ -169,9 +171,9 @@ void report_connection_stage_failure(const char *err)
 
 void report_connection_stage_success(void)
 {
-    // First call wins; subsequent calls are no-ops. We don't reset the
-    // failure_count / last_err — they may be useful in JSON output and
-    // they're only read by the supervisor, which is now disarmed.
+    // First call wins; subsequent calls are no-ops. We don't reset
+    // last_err — it's only read by the supervisor (which is now disarmed)
+    // and can be useful for post-mortem diagnostics.
     bool expected = false;
     if (g_conn_stage_steady_state.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
         g_conn_stage_streak_start_sec.store(0, std::memory_order_release);
