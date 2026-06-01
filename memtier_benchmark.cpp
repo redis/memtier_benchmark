@@ -90,6 +90,15 @@
 
 int log_level = 0;
 
+// Upper bound for --run-count.  main() allocates several per-run vectors
+// (run_stats, cmd_stats histograms, HDR histograms) that grow linearly with
+// run_count; values in the tens of thousands push tens of MiB of metadata
+// before a single op has been sent, and INT_MAX trivially OOMs the allocator
+// (issue #426).  1024 covers every realistic benchmarking use case (the
+// default is 1) while keeping pre-run allocations comfortably under 100 MiB
+// even on memory-constrained hosts.
+#define MAX_RUN_COUNT 1024
+
 // Global flag for signal handling
 static volatile sig_atomic_t g_interrupted = 0;
 
@@ -1034,14 +1043,32 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         case o_client_stats:
             cfg->client_stats = optarg;
             break;
-        case 'x':
+        case 'x': {
+            // Parse via signed strtol so negative values do not silently wrap
+            // through the unsigned cast (e.g. -1 -> ~4.3B -> vector::reserve
+            // throwing std::bad_alloc).  Also cap at MAX_RUN_COUNT because the
+            // aggregated best/worst/average path in main() allocates several
+            // per-run vectors of run_stats / cmd_stats that grow linearly with
+            // run_count; values in the hundreds of millions are not a useful
+            // benchmark configuration and just OOM the allocator.
             endptr = NULL;
-            cfg->run_count = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!cfg->run_count || !endptr || *endptr != '\0') {
+            errno = 0;
+            long parsed_run_count = strtol(optarg, &endptr, 10);
+            if (optarg[0] == '\0' || !endptr || *endptr != '\0' || errno == ERANGE) {
+                fprintf(stderr, "error: run count must be a positive integer.\n");
+                return -1;
+            }
+            if (parsed_run_count <= 0) {
                 fprintf(stderr, "error: run count must be greater than zero.\n");
                 return -1;
             }
+            if (parsed_run_count > MAX_RUN_COUNT) {
+                fprintf(stderr, "error: run count must be <= %d (got %ld).\n", MAX_RUN_COUNT, parsed_run_count);
+                return -1;
+            }
+            cfg->run_count = (unsigned int) parsed_run_count;
             break;
+        }
         case 'D':
             cfg->debug++;
             break;
