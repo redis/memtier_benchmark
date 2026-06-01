@@ -503,12 +503,31 @@ bool arbitrary_command::set_key_pattern(const char *pattern_str)
 
 bool arbitrary_command::set_ratio(const char *ratio_str)
 {
-    char *q = NULL;
-    ratio = strtoul(ratio_str, &q, 10);
-    if (!q || *q != '\0') {
+    // Reject empty / null / whitespace-only / negative input. strtoul()
+    // silently accepts the empty string (returns 0) and wraps negatives to
+    // a huge unsigned value, both of which lead to a worker loop that never
+    // picks this command and hangs forever (issue #426 item 14).
+    if (ratio_str == NULL || *ratio_str == '\0') {
+        return false;
+    }
+    const char *first = ratio_str;
+    while (*first && isspace((unsigned char) *first)) {
+        first++;
+    }
+    if (*first == '\0' || *first == '-' || *first == '+') {
         return false;
     }
 
+    char *q = NULL;
+    unsigned long parsed = strtoul(ratio_str, &q, 10);
+    if (!q || *q != '\0') {
+        return false;
+    }
+    if (parsed == 0) {
+        return false;
+    }
+
+    ratio = (unsigned int) parsed;
     return true;
 }
 
