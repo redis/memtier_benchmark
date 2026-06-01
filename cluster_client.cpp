@@ -370,6 +370,13 @@ void cluster_client::handle_cluster_slots(protocol_response *r)
         return;
     }
 
+    // Track whether any shard in the reply passed validation. If every shard
+    // is malformed and we fall through the loop with no `close_sc[j] = false`
+    // anywhere, the close-stale-connections pass below would tear down EVERY
+    // existing connection (including the bootstrap), which contradicts the
+    // documented "bootstrap stays in service" invariant. (Cursor bugbot.)
+    bool any_valid_shard = false;
+
     // run over response and create connections
     for (unsigned int i = 0; i < r->get_mbulk_value()->mbulks_elements.size(); i++) {
         mbulk_element *shard_el = r->get_mbulk_value()->mbulks_elements[i];
@@ -468,8 +475,18 @@ void cluster_client::handle_cluster_slots(protocol_response *r)
             m_slot_to_shard[j] = sc->get_id();
         }
 
+        any_valid_shard = true;
         free(addr);
         free(port);
+    }
+
+    // If every shard in the reply was malformed and skipped, treat the reply
+    // as unusable -- skip the close-stale pass below so we don't disconnect
+    // the bootstrap and any other currently-live connections (cursor bugbot).
+    if (!any_valid_shard) {
+        benchmark_error_log("warning: CLUSTER SLOTS: every shard in the reply was malformed; "
+                            "leaving existing connections in service\n");
+        return;
     }
 
     // check if some connections left with no slots, and need to be closed
