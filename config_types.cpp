@@ -519,11 +519,17 @@ bool arbitrary_command::set_ratio(const char *ratio_str)
     }
 
     char *q = NULL;
+    errno = 0;
     unsigned long parsed = strtoul(ratio_str, &q, 10);
     if (!q || *q != '\0') {
         return false;
     }
-    if (parsed == 0) {
+    // ERANGE catches the strtoul overflow case; the narrow-to-unsigned-int
+    // check catches values above UINT_MAX that strtoul accepted on a 64-bit
+    // unsigned long without ERANGE (e.g. "4294967296" on x86_64). Without
+    // either guard a too-large value silently truncates and a wrap-to-0
+    // value re-introduces the very hang we're guarding against.
+    if (errno == ERANGE || parsed == 0 || parsed > UINT_MAX) {
         return false;
     }
 

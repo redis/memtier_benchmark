@@ -742,15 +742,19 @@ static bool verify_cluster_option(struct benchmark_config *cfg)
 // the user gets a readable error instead of SIGABRT.
 static bool first_arg_is_placeholder(const std::string &token)
 {
-    if (token == KEY_PLACEHOLDER || token == DATA_PLACEHOLDER || token == SCAN_CURSOR_PLACEHOLDER ||
-        token == MONITOR_RANDOM_PLACEHOLDER) {
+    // The runtime assert in protocol.cpp ("first arg is not command name?")
+    // fires on substring containment via memmem(), not exact equality, so
+    // a literal like `FOO__key__` or `setkey__key__` still SIGABRTs without
+    // this guard. Mirror the same substring contract here at parse time so
+    // the user gets a readable error instead of an abort.
+    if (token.find(KEY_PLACEHOLDER) != std::string::npos || token.find(DATA_PLACEHOLDER) != std::string::npos ||
+        token.find(SCAN_CURSOR_PLACEHOLDER) != std::string::npos ||
+        token.find(MONITOR_RANDOM_PLACEHOLDER) != std::string::npos) {
         return true;
     }
-    // __monitor_lineN__ (any digits / @) - the placeholder prefix is the
-    // recognised marker. The whole-command monitor placeholder path is
-    // handled separately upstream; here we just guard against it leaking
-    // into the first-arg slot of a regular --command.
-    if (token.compare(0, strlen(MONITOR_PLACEHOLDER_PREFIX), MONITOR_PLACEHOLDER_PREFIX) == 0) {
+    // __monitor_lineN__ (any digits / @) -- the placeholder prefix is the
+    // recognised marker; same substring rule.
+    if (token.find(MONITOR_PLACEHOLDER_PREFIX) != std::string::npos) {
         return true;
     }
     return false;
