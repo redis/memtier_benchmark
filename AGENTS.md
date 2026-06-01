@@ -57,6 +57,7 @@ make
 - Run `make format-check` to verify formatting
 - CI enforces formatting on all PRs
 - **Always run `make format` after modifying C++ files and before committing.** Verify with `make format-check` that no formatting issues remain.
+- Run `make install-hooks` once per clone to enable the `.githooks/pre-commit` hook, which runs `make format-check-staged` automatically on staged C/C++ blobs (the content in the index, not the working tree).
 
 ## Testing
 

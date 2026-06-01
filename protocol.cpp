@@ -368,8 +368,31 @@ int redis_protocol::write_command_set(const char *key, int key_len, const char *
 
 int redis_protocol::write_command_multi_get(const keylist *keylist)
 {
-    fprintf(stderr, "error: multi get not implemented for redis yet!\n");
-    assert(0);
+    assert(keylist != NULL);
+    assert(keylist->get_keys_count() > 0);
+
+    int size = 0;
+    unsigned int keys_count = keylist->get_keys_count();
+
+    // *<1+keys_count>\r\n$4\r\nMGET\r\n
+    size = evbuffer_add_printf(m_write_buf,
+                               "*%u\r\n"
+                               "$4\r\n"
+                               "MGET\r\n",
+                               1 + keys_count);
+
+    for (unsigned int i = 0; i < keys_count; i++) {
+        unsigned int key_len;
+        const char *key = keylist->get_key(i, &key_len);
+        assert(key != NULL);
+
+        size += evbuffer_add_printf(m_write_buf, "$%u\r\n", key_len);
+        evbuffer_add(m_write_buf, key, key_len);
+        evbuffer_add(m_write_buf, "\r\n", 2);
+        size += key_len + 2;
+    }
+
+    return size;
 }
 
 int redis_protocol::write_command_get(const char *key, int key_len, unsigned int offset)
@@ -923,7 +946,12 @@ int memcache_text_protocol::parse_response(void)
                 unsigned int flags;
                 unsigned int cas;
 
-                int res = sscanf(line, "%s %s %u %u %u", prefix, key, &flags, &m_value_len, &cas);
+                // Width specifiers cap %s at sizeof(buf)-1; a malicious/buggy
+                // memcached server sending "VALUE <very-long-key> ..." cannot
+                // overflow `key[256]` or `prefix[50]` and corrupt the worker
+                // stack. Same class of bug as the VLA in arbitrary_command
+                // (PR #405).
+                int res = sscanf(line, "%49s %255s %u %u %u", prefix, key, &flags, &m_value_len, &cas);
                 if (res < 4 || res > 5) {
                     benchmark_debug_log("unexpected VALUE response: %s\n", line);
                     if (m_last_response.get_status() != line) free(line);
@@ -950,7 +978,7 @@ int memcache_text_protocol::parse_response(void)
                     assert(value != NULL);
 
                     int ret = evbuffer_remove(m_read_buf, value, m_value_len);
-                    assert((unsigned int) ret == 0);
+                    assert(ret != -1); // evbuffer_remove returns bytes read on success, not 0
 
                     m_last_response.set_value(value, m_value_len);
                 } else {
@@ -1323,13 +1351,23 @@ bool keylist::add_key(const char *key, unsigned int key_len)
     // have room?
     if (m_keys_count >= m_keys_size) return false;
 
-    // have buffer?
-    if (m_buffer_ptr + key_len >= m_buffer + m_buffer_size) {
-        while (m_buffer_ptr + key_len >= m_buffer + m_buffer_size) {
+    // have buffer? (+1 for the NUL terminator written after the key bytes)
+    if (m_buffer_ptr + key_len + 1 > m_buffer + m_buffer_size) {
+        ptrdiff_t offset = m_buffer_ptr - m_buffer;
+        while (m_buffer_ptr + key_len + 1 > m_buffer + m_buffer_size) {
             m_buffer_size *= 2;
         }
         m_buffer = (char *) realloc(m_buffer, m_buffer_size);
         assert(m_buffer != NULL);
+        // Re-base all key_ptr entries into the new allocation. Keys are packed
+        // contiguously (key bytes + NUL terminator), so we can recompute each
+        // pointer from m_keys[k].key_len without touching the old allocation.
+        char *p = m_buffer;
+        for (unsigned int k = 0; k < m_keys_count; k++) {
+            m_keys[k].key_ptr = p;
+            p += m_keys[k].key_len + 1;
+        }
+        m_buffer_ptr = m_buffer + offset;
     }
 
     // copy key

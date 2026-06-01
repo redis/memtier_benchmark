@@ -69,8 +69,23 @@ jobs:
           - name: "Single Endpoint: TCP TLS"
             env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", VERBOSE: "1" }
             tls: true
+          - name: "OSS TCP TLS v1.2"
+            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", TLS_PROTOCOLS: "TLSv1.2", VERBOSE: "1" }
+            tls: true
+          - name: "OSS TCP TLS v1.3"
+            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", TLS_PROTOCOLS: "TLSv1.3", VERBOSE: "1" }
+            tls: true
           - name: "OSS-CLUSTER API: TCP Plaintext"
-            env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", VERBOSE: "1" }
+            env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", VERBOSE: "1", PARALLELISM: "2" }
+            tls: false
+          - name: "OSS-CLUSTER API: TCP TLS"
+            env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", TLS: "1", VERBOSE: "1", PARALLELISM: "2" }
+            tls: true
+          - name: "STRESS: Standalone TCP Plaintext"
+            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "0", VERBOSE: "1", STRESS: "1" }
+            tls: false
+          - name: "STRESS: OSS-CLUSTER API: TCP Plaintext"
+            env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", VERBOSE: "1", STRESS: "1" }
             tls: false
     runs-on: ubuntu-latest
     name: TSAN ${{ matrix.test-config.name }}
@@ -119,7 +134,7 @@ jobs:
       run: ./tests/gen-test-certs.sh
 
     - name: Run tests
-      timeout-minutes: 15
+      timeout-minutes: 45
       env: ${{ matrix.test-config.env }}
       run: |
         # Use setarch to disable ASLR (workaround for TSAN on kernel 6.6+)

@@ -71,11 +71,17 @@ jobs:
             env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", TLS_PROTOCOLS: "TLSv1.3", VERBOSE: "1", ASAN_OPTIONS: "detect_leaks=1" }
             tls: true
           - name: "OSS-CLUSTER API: TCP Plaintext"
-            env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", VERBOSE: "1", ASAN_OPTIONS: "detect_leaks=1" }
+            env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", VERBOSE: "1", ASAN_OPTIONS: "detect_leaks=1", PARALLELISM: "2" }
             tls: false
           - name: "OSS-CLUSTER API: TCP TLS"
-            env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", TLS: "1", VERBOSE: "1", ASAN_OPTIONS: "detect_leaks=1" }
+            env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", TLS: "1", VERBOSE: "1", ASAN_OPTIONS: "detect_leaks=1", PARALLELISM: "2" }
             tls: true
+          - name: "STRESS: Standalone TCP Plaintext"
+            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "0", VERBOSE: "1", ASAN_OPTIONS: "detect_leaks=1", STRESS: "1" }
+            tls: false
+          - name: "STRESS: OSS-CLUSTER API: TCP Plaintext"
+            env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", VERBOSE: "1", ASAN_OPTIONS: "detect_leaks=1", STRESS: "1" }
+            tls: false
     runs-on: ubuntu-latest
     name: ASAN ${{ matrix.test-config.name }}
     steps:
@@ -122,7 +128,7 @@ jobs:
       run: ./tests/gen-test-certs.sh
 
     - name: Run tests
-      timeout-minutes: 10
+      timeout-minutes: 45
       env: ${{ matrix.test-config.env }}
       run: |
         ./tests/run_tests.sh

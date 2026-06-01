@@ -30,6 +30,8 @@
 #include <atomic>
 #include <map>
 
+#include "command_meta.h"
+
 struct config_range
 {
     int min;
@@ -159,6 +161,18 @@ struct arbitrary_command
     bool set_ratio(const char *pattern_str);
     bool split_command_to_args();
 
+    // Looks up the command in the static command_meta registry (built from the
+    // vendored redis commands.json), evaluates each key_spec against the parsed
+    // argv to populate spec_key_positions, and stamps the resolved reply_shape.
+    // Emits a warning when the user's __key__ placeholder count disagrees with
+    // the spec. Safe to call even when no metadata is available (memcached,
+    // module commands) - in that case spec stays nullptr.
+    void resolve_command_meta();
+
+    // Number of user-supplied __key__ placeholders, by direct scan over args.
+    // Stable regardless of whether format_arbitrary_command has been called yet.
+    unsigned int count_user_key_placeholders() const;
+
     std::vector<command_arg> command_args;
     std::string command;
     std::string command_name; // Display name (e.g., "SET (Line 1)" or "SET")
@@ -167,6 +181,16 @@ struct arbitrary_command
     unsigned int keys_count;
     unsigned int ratio;
     bool stats_only; // If true, this is a stats-only slot (not executed, just for stats tracking)
+
+    // Resolved at startup by resolve_command_meta(); see command_meta.h.
+    const memtier::command_meta::CommandSpec *spec;
+    // 1-based argv positions where keys are expected per the spec. Empty if
+    // spec is null or the spec couldn't be evaluated against argv.
+    std::vector<size_t> spec_key_positions;
+    // True when miss tracking should be performed for this command's replies.
+    // Set by resolve_command_meta() (true iff spec exists and reply_shape is
+    // miss-bearing). May be cleared later by the --command-miss-tracking flag.
+    bool miss_tracking_enabled;
 };
 
 struct arbitrary_command_list

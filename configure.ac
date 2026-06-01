@@ -24,7 +24,16 @@ AM_SILENT_RULES([yes])
 AC_CONFIG_MACRO_DIR([m4])
 LT_INIT
 
-CXXFLAGS="-O2 -g -Wall $CXXFLAGS"
+# Python is only required for the maintainer-only `make commands-meta` target.
+# Resolve to ":" (the no-op shell builtin) when absent so end-user builds keep
+# working without Python installed.
+AM_PATH_PYTHON([3.6],, [:])
+
+dnl -Werror=vla rejects variable-length arrays at compile time. VLAs on the
+dnl worker-thread stack are how PR #405 / issue #404 shipped: an input-sized
+dnl `char buffer[N]` blew an 8-12 MB stack the moment a 20 MB MONITOR-replay
+dnl line was selected. Keep this hard-error to prevent the next one.
+CXXFLAGS="-O2 -g -Wall -Werror=vla -std=c++11 $CXXFLAGS"
 
 # Checks for programs.
 AC_PROG_CXX
@@ -103,6 +112,22 @@ AS_IF([test "x$enable_thread_sanitizer" = "xyes"], [
        LDFLAGS="$LDFLAGS -fsanitize=thread"
        ], [])
 
+# libFuzzer-based in-process fuzz harnesses (requires clang++).
+# When enabled, builds tests/fuzz/*_fuzz binaries under noinst_PROGRAMS.
+# Does not perturb the main memtier_benchmark binary's build flags.
+AC_ARG_ENABLE([fuzz],
+  [AS_HELP_STRING([--enable-fuzz],
+                  [Build libFuzzer harnesses under tests/fuzz/ (requires clang++)])])
+AS_IF([test "x$enable_fuzz" = "xyes"], [
+       AC_MSG_CHECKING([whether $CXX is clang++])
+       AS_CASE(["`$CXX --version 2>/dev/null | head -n 1`"],
+               [*clang*], [AC_MSG_RESULT([yes])],
+               [AC_MSG_RESULT([no])
+                AC_MSG_ERROR([--enable-fuzz requires clang++; re-run configure with CXX=clang++ CC=clang])])
+       AC_MSG_NOTICE([Enabling libFuzzer fuzz harnesses (tests/fuzz/)])
+       ], [])
+AM_CONDITIONAL([FUZZ_ENABLED], [test "x$enable_fuzz" = "xyes"])
+
 # clock_gettime requires -lrt on old glibc only.
 AC_SEARCH_LIBS([clock_gettime], [rt], , AC_MSG_ERROR([rt is required libevent.]))
 
@@ -115,6 +140,17 @@ AC_CHECK_LIB([socket], [gai_strerror])
 PKG_CHECK_MODULES(LIBEVENT,
     [libevent >= 2.0.10],
     AC_SUBST(LIBEVENT_CFLAGS) AC_SUBST(LIBEVENT_LIBS)
+)
+
+# libevent_pthreads: needed for evthread_use_pthreads(). Without this,
+# event_base_loopbreak() / event_base_loopexit() called from a *different*
+# thread than the one running event_base_dispatch() do not wake the
+# epoll_wait(), so an idle worker hangs after a cross-thread shutdown
+# request (Phase 1 of #426 / Ctrl+C). The pthreads bindings ship as a
+# separate .so since libevent 2.0, so we have to depend on it explicitly.
+PKG_CHECK_MODULES(LIBEVENT_PTHREADS,
+    [libevent_pthreads >= 2.0.10],
+    AC_SUBST(LIBEVENT_PTHREADS_CFLAGS) AC_SUBST(LIBEVENT_PTHREADS_LIBS)
 )
 
 # bash completion

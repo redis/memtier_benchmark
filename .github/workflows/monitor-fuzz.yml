@@ -1,0 +1,85 @@
+name: Monitor-Input Fuzz
+
+# Black-box fuzz driver for arbitrary_command::split_command_to_args() +
+# monitor_command_list::load_from_file(). Mutates the in-tree seed corpus
+# (tests/fuzz/monitor_input_corpus/) and runs memtier_benchmark
+# --monitor-input=<mutated> --command="__monitor_line@__" against a local
+# redis. Flags SIGSEGV, glibc "stack smashing detected", AddressSanitizer
+# reports, and 30-second timeouts. (Fixes #408 partial -- CI wiring
+# follow-up to the in-tree driver.)
+#
+# Trigger surface:
+#   * nightly cron with FUZZ_ITER=2000 (high-iteration smoke for new
+#     regressions; budget ~30 min)
+#   * workflow_dispatch (manual; honours optional FUZZ_ITER input)
+#   * PR with the `run-fuzz` label -- lets a PR author opt in when the
+#     change plausibly affects the monitor-input parser, the arbitrary-
+#     command splitter, or the RESP-encoded request path:
+#         gh pr edit <num> --add-label run-fuzz
+#     Smaller iteration count (300) so PR feedback is fast (~3-4 min).
+
+on:
+  schedule:
+    - cron: '37 3 * * *'
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: 'FUZZ_ITER override (default 2000)'
+        required: false
+        default: '2000'
+  pull_request:
+    types: [labeled, synchronize, reopened]
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+jobs:
+  monitor-fuzz:
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'run-fuzz')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get install -y \
+            build-essential autoconf automake pkg-config \
+            libevent-dev libssl-dev zlib1g-dev redis-server
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Build memtier_benchmark (ASAN+UBSan to catch silent corruptions)
+        run: |
+          autoreconf -ivf
+          ./configure --enable-sanitizers --enable-ubsan
+          make -j
+
+      - name: Start local redis
+        run: |
+          redis-server --daemonize yes --port 6379 --save "" --logfile redis.log
+
+      - name: Run fuzz driver
+        env:
+          MEMTIER: ${{ github.workspace }}/memtier_benchmark
+          REDIS_HOST: 127.0.0.1
+          REDIS_PORT: "6379"
+          # Smaller corpus pass on PR-label runs; larger on nightly/manual.
+          FUZZ_ITER: ${{ github.event_name == 'pull_request' && '300' || (inputs.iterations || '2000') }}
+          FUZZ_TIMEOUT: "30"
+        run: python3 tests/fuzz/fuzz_monitor_input.py
+
+      - name: Upload reproducers on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monitor-fuzz-repros
+          path: /tmp/fuzz_monitor_*
+          retention-days: 14
+          if-no-files-found: ignore

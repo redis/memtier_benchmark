@@ -1,0 +1,5 @@
+[ proxy1 ] OK
+[ proxy2 ] OK
+[ proxy3 ] OK
+[ proxy4 ] PONG
+[ proxy5 ] ready

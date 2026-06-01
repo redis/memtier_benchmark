@@ -112,6 +112,9 @@ struct aggregated_command_type_stats
     safe_hdr_histogram latency_hist;                 // merged histogram
     std::vector<size_t> command_indices;             // indices of commands with this type
     std::vector<one_sec_cmd_stats> per_second_stats; // aggregated per-second stats for JSON time series
+    unsigned long long total_hits;
+    unsigned long long total_misses;
+    aggregated_command_type_stats() : total_hits(0), total_misses(0) {}
 };
 
 class run_stats
@@ -165,6 +168,20 @@ protected:
     // this mutex serializes hdr_reset and hdr_add from the main thread.
     reinit_mutex_t m_inst_histogram_mutex;
 
+    // Cumulative hits/misses bookkeeping for arbitrary commands. Indexed by
+    // arbitrary command index. Per-key vectors are sized to the spec-resolved
+    // key count for that command (or 1 when the command has no spec key
+    // positions); empty otherwise.
+    struct arbitrary_misses_total
+    {
+        unsigned long long total_hits;
+        unsigned long long total_misses;
+        std::vector<unsigned long long> per_key_hits;
+        std::vector<unsigned long long> per_key_misses;
+        arbitrary_misses_total() : total_hits(0), total_misses(0) {}
+    };
+    std::vector<arbitrary_misses_total> m_arbitrary_misses;
+
     void roll_cur_stats(struct timeval *ts);
 
 public:
@@ -180,6 +197,17 @@ public:
     void update_set_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency);
     void update_connection_error(struct timeval *ts);
 
+    // Retry/error counters. Bumped by client::handle_response on the retry
+    // path. Lock-free relaxed bumps on a per-thread instance; aggregated when
+    // run_stats are merged across threads.
+    void inc_retry_attempt() { m_totals.m_retry_attempts++; }
+    void inc_retried_op() { m_totals.m_retried_ops++; }
+    void inc_error() { m_totals.m_errors++; }
+
+    unsigned long int get_total_retry_attempts() const { return m_totals.m_retry_attempts; }
+    unsigned long int get_total_retried_ops() const { return m_totals.m_retried_ops; }
+    unsigned long int get_total_errors() const { return m_totals.m_errors; }
+
     void update_moved_get_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency);
     void update_moved_set_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency);
     void update_moved_arbitrary_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx,
@@ -193,6 +221,16 @@ public:
     void update_wait_op(struct timeval *ts, unsigned int latency);
     void update_arbitrary_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency,
                              size_t arbitrary_index);
+
+    // Records hits/misses for a single arbitrary-command response. Aggregates
+    // are mirrored into the per-second m_ar_commands slot (the existing 5-arg
+    // update_op overload) so per-second JSON time series and the global
+    // Hits/sec, Misses/sec totals stay in sync. The per_key_hit vector size
+    // must equal num_key_buckets for that command (one entry per spec key
+    // position; values are 1=hit, 0=miss). Safe to call with an empty vector
+    // when shape doesn't carry per-position info.
+    void update_arbitrary_op_misses(size_t arbitrary_index, unsigned int hits, unsigned int misses,
+                                    const std::vector<bool> &per_key_hit);
 
     void aggregate_average(const std::vector<run_stats> &all_stats);
     void summarize(totals &result) const;
@@ -235,8 +273,10 @@ public:
                            const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
     void print_ops_sec_column(output_table &table,
                               const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
-    void print_hits_sec_column(output_table &table);
-    void print_missess_sec_column(output_table &table);
+    void print_hits_sec_column(output_table &table,
+                               const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
+    void print_missess_sec_column(output_table &table,
+                                  const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
     void print_moved_sec_column(output_table &table,
                                 const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
     void print_ask_sec_column(output_table &table,

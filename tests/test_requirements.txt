@@ -1,2 +1,7 @@
 redis>=3.0.0
 git+https://github.com/RedisLabsModules/RLTest.git@master
+# pytest + hypothesis power the CLI argument fuzzer (tests/test_cli_fuzz.py,
+# issue #410). The fuzzer is gated by MEMTIER_FUZZ=1 so it's only pulled in
+# on demand; pinning them here keeps the bootstrap reproducible.
+pytest>=7.0
+hypothesis>=6.0

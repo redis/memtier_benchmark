@@ -1,0 +1,83 @@
+name: Fuzz smoke (libFuzzer)
+
+# Per-PR coverage-guided smoke fuzz over the in-process parser harnesses
+# wired in tests/fuzz/. Each target runs for a short bounded budget so the
+# job completes in well under the CI timeout while still catching low-hanging
+# regressions; the heavy lifting (long runs, jobs=$(nproc), corpus expansion)
+# is intended for a separate nightly companion workflow.
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - name: split_command_to_args_fuzz
+            corpus: tests/fuzz/corpus/split
+          - name: monitor_input_fuzz
+            corpus: tests/fuzz/corpus/monitor
+          - name: redis_protocol_fuzz
+            corpus: tests/fuzz/corpus/resp
+    name: ${{ matrix.target.name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get install -y \
+            build-essential \
+            autoconf \
+            automake \
+            pkg-config \
+            libevent-dev \
+            zlib1g-dev \
+            libssl-dev \
+            clang
+
+      - name: Configure with --enable-fuzz
+        run: |
+          autoreconf -ivf
+          CC=clang CXX=clang++ ./configure --enable-fuzz
+
+      - name: Build ${{ matrix.target.name }}
+        run: make ${{ matrix.target.name }} -j"$(nproc)"
+
+      - name: Smoke fuzz ${{ matrix.target.name }} (60s)
+        env:
+          ASAN_OPTIONS: "detect_leaks=1:abort_on_error=0"
+          UBSAN_OPTIONS: "print_stacktrace=1"
+        run: |
+          set +e
+          # -max_len=33554432 (32 MiB) so the original 19.97 MB MONITOR line
+          # is reachable - see issue #407 for the acceptance criterion.
+          ./${{ matrix.target.name }} \
+            ${{ matrix.target.corpus }} \
+            -max_total_time=60 \
+            -rss_limit_mb=2048 \
+            -timeout=25 \
+            -max_len=33554432
+          rc=$?
+          echo "fuzzer exit code: $rc"
+          exit "$rc"
+
+      - name: Upload crash artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ matrix.target.name }}-crashes
+          path: |
+            crash-*
+            leak-*
+            timeout-*
+            oom-*
+          if-no-files-found: ignore
+          retention-days: 7

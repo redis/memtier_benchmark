@@ -1,3 +1,11 @@
 * text=auto
 * text eol=lf
 *.png binary
+
+# libFuzzer corpus seeds are binary blobs (RESP frames, embedded NULs, etc.).
+# Don't let git normalize line endings or charset.
+tests/fuzz/corpus/** binary
+
+# Adversarial RESP-server fuzzer fixtures are exact byte sequences -- do not
+# touch line endings.
+tests/fixtures/resp_payloads/*.bin binary

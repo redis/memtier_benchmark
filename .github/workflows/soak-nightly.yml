@@ -1,0 +1,136 @@
+name: Soak / Stress
+
+# Long-running soak / stress / chaos suite for memtier_benchmark.
+# Trigger surface:
+#   * nightly cron (always-on baseline)
+#   * manual workflow_dispatch (oncall can run a subset)
+#   * PR with the `run-soak` label -- lets a PR author opt in to running
+#     the soak suite against their change before merge. Use this when the
+#     PR plausibly affects soak-tracked surface (memory growth, retry /
+#     reconnect, cluster). Add it via:
+#         gh pr edit <num> --add-label run-soak
+#     Removing the label and re-pushing skips it again.
+
+on:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+  pull_request:
+    types: [labeled, synchronize, reopened]
+    branches: [master, main]
+
+jobs:
+  build:
+    # On pull_request: only fire when the PR carries the `run-soak` label.
+    # On schedule / workflow_dispatch: always fire.
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'run-soak')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get install -y \
+            build-essential autoconf automake pkg-config \
+            libevent-dev libssl-dev zlib1g-dev
+
+      - name: Build release memtier_benchmark
+        run: autoreconf -ivf && ./configure && make -j
+
+      - name: Smoke-test binary
+        run: ./memtier_benchmark --version
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: memtier-soak-binary
+          path: |
+            memtier_benchmark
+          retention-days: 2
+
+  soak:
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          # `test` is the path passed to RLTest --test, relative to tests/
+          # (run_tests.sh cds into tests/ before invoking RLTest).
+          - { id: S1, test: soak/test_long_run_memory.py,    minutes: 35, cluster: 0 }
+          - { id: S2, test: soak/test_large_payloads.py,     minutes: 10, cluster: 0 }
+          - { id: S3, test: soak/test_high_concurrency.py,   minutes: 10, cluster: 0 }
+          - { id: S4, test: soak/test_connection_churn.py,   minutes: 10, cluster: 0 }
+          - { id: S5, test: soak/test_cluster_turbulence.py, minutes: 15, cluster: 1 }
+          - { id: S6, test: soak/test_retry_storm.py,        minutes: 10, cluster: 0 }
+          - { id: S7, test: soak/test_slow_network.py,       minutes: 10, cluster: 0 }
+    name: ${{ matrix.scenario.id }} ${{ matrix.scenario.test }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download memtier binary
+        uses: actions/download-artifact@v4
+        with:
+          name: memtier-soak-binary
+
+      - name: Restore executable permissions
+        run: chmod +x memtier_benchmark
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get install -y \
+            libevent-dev libssl-dev iproute2
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          architecture: x64
+
+      - name: Install Python dependencies
+        run: pip install -r ./tests/test_requirements.txt
+
+      - name: Install Redis
+        run: |
+          curl -fsSL https://packages.redis.io/gpg | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/redis.list
+          sudo apt-get -qq update
+          sudo apt-get install -y redis
+          sudo service redis-server stop || true
+
+      - name: Tune kernel for soak workloads
+        # `ulimit` set here is scoped to this step's shell only; GitHub
+        # Actions spawns a fresh shell per `run:` block, so it doesn't
+        # persist to the test step. Sysctls do persist (they're kernel
+        # state); ulimit is re-set inside the run-scenario step below.
+        run: |
+          sudo sysctl -w net.ipv4.tcp_fin_timeout=10
+          sudo sysctl -w net.ipv4.tcp_tw_reuse=1
+
+      - name: Run scenario ${{ matrix.scenario.id }}
+        timeout-minutes: ${{ matrix.scenario.minutes }}
+        env:
+          OSS_STANDALONE: ${{ matrix.scenario.cluster == 0 && '1' || '0' }}
+          OSS_CLUSTER: ${{ matrix.scenario.cluster == 1 && '1' || '0' }}
+          VERBOSE: "1"
+          TEST: ${{ matrix.scenario.test }}
+        run: |
+          ulimit -n 65536
+          ./tests/run_tests.sh
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-${{ matrix.scenario.id }}-logs
+          path: |
+            tests/logs/
+            /tmp/RLTest_*
+          retention-days: 7
+          if-no-files-found: ignore

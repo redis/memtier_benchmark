@@ -282,6 +282,108 @@ def test_reconnect_cluster_mode_no_assertion(env):
     env.assertNotEqual(return_code, 134)
 
 
+def test_reconnect_unlimited_no_spurious_thread_restart(env):
+    """
+    Regression test for https://github.com/redis/memtier_benchmark/issues/391.
+
+    With --max-reconnect-attempts=0 (unlimited) and --reconnect-on-error,
+    libevent can deliver a storm of connection-error callbacks per dead
+    connection (EOF + stray read errors). Before the fix, every callback
+    after the first (which set m_reconnecting=true) fell into the terminal
+    else branch and called event_base_loopbreak(), killing the benchmark
+    thread. This produced the misleading log line:
+
+        Maximum reconnection attempts (0) exceeded for ..., triggering thread restart.
+
+    …even though the user had explicitly requested unlimited reconnects.
+
+    This test verifies that:
+    1. The misleading "Maximum reconnection attempts (0) exceeded" message
+       does NOT appear in stderr.
+    2. memtier_benchmark completes successfully (threads survive the kills).
+    """
+    import subprocess
+
+    key_max = 10000
+    key_min = 1
+
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--pipeline=1",
+            "--ratio=1:1",
+            "--key-pattern=R:R",
+            "--key-minimum={}".format(key_min),
+            "--key-maximum={}".format(key_max),
+            "--reconnect-on-error",
+            "--max-reconnect-attempts=0",   # unlimited
+            "--reconnect-backoff-factor=1.0",
+            "--connection-timeout=5",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+
+    config = get_default_memtier_config(threads=2, clients=2, requests=5000)
+    master_nodes_list = env.getMasterNodesList()
+
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    test_dir = tempfile.mkdtemp()
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    master_nodes_connections = env.getOSSMasterNodesConnectionList()
+
+    stdout_path = "{0}/mb.stdout".format(config.results_dir)
+    stderr_path = "{0}/mb.stderr".format(config.results_dir)
+    with open(stdout_path, "w") as stdout_f, open(stderr_path, "w") as stderr_f:
+        proc = subprocess.Popen(
+            benchmark.args,
+            stdout=stdout_f,
+            stderr=stderr_f,
+            cwd=config.results_dir,
+        )
+
+        # Let connections establish, then kill them twice in rapid succession
+        # to maximise the chance that libevent delivers multiple error callbacks
+        # per dead connection while a reconnect timer is already pending.
+        time.sleep(1)
+        for _wave in range(3):
+            for conn in master_nodes_connections:
+                try:
+                    conn.execute_command("CLIENT", "KILL", "TYPE", "normal")
+                except Exception:
+                    pass
+            time.sleep(0.5)
+
+        try:
+            return_code = proc.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            return_code = proc.wait(timeout=10)
+
+    with open(stderr_path) as f:
+        stderr_content = f.read()
+
+    env.debugPrint("memtier exit code: {}".format(return_code), True)
+    env.debugPrint("STDERR:\n{}".format(stderr_content[:2000]), True)
+
+    # Core regression assertion: the misleading terminal message must not appear.
+    # Before the fix, duplicate error callbacks while m_reconnecting==True landed
+    # in the terminal else and printed this with the configured cap (0) rather
+    # than the actual attempt count, then killed the thread.
+    env.assertFalse(
+        "Maximum reconnection attempts (0) exceeded" in stderr_content,
+        message="Spurious thread-kill message found: duplicate error callback while "
+        "reconnect already pending incorrectly triggered event_base_loopbreak()",
+    )
+
+    # Benchmark must have completed; if threads were killed spuriously it would
+    # exit non-zero or stall.
+    env.assertEqual(return_code, 0)
+
+
 def test_reconnect_disabled_by_default(env):
     """
     Test that reconnection is disabled by default and memtier fails when connections are killed.

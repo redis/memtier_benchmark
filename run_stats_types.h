@@ -216,6 +216,17 @@ public:
     unsigned long int m_misses;
     unsigned long int m_connection_errors;
     double m_connection_errors_sec;
+    // Retry/error counters. Same benign-race pattern as m_ops: incremented
+    // lock-free by workers, read from the main thread for progress display.
+    //   m_retry_attempts   total number of resends across all requests
+    //   m_retried_ops      number of distinct requests that needed at least
+    //                      one retry (regardless of final outcome)
+    //   m_errors           number of requests that ultimately failed (retries
+    //                      exhausted or permanent error). Excludes connection
+    //                      errors which already have their own counter.
+    unsigned long int m_retry_attempts;
+    unsigned long int m_retried_ops;
+    unsigned long int m_errors;
     totals();
     void setup_arbitrary_commands(size_t n_arbitrary_commands);
     void add(const totals &other);

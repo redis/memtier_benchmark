@@ -52,6 +52,7 @@
 #include "client.h"
 #include "cluster_client.h"
 #include "config_types.h"
+#include "retry_policy.h"
 
 
 bool client::setup_client(benchmark_config *config, abstract_protocol *protocol, object_generator *objgen)
@@ -82,6 +83,29 @@ bool client::setup_client(benchmark_config *config, abstract_protocol *protocol,
     // Enable value keeping for SCAN incremental iteration (needed to extract cursor from response)
     if (config->scan_incremental_iteration) {
         MAIN_CONNECTION->get_protocol()->set_keep_value(true);
+    }
+
+    // Enable value keeping for arbitrary-command miss tracking when any
+    // configured command needs reply-array inspection (ArrayPerElementNulls or
+    // EmptyCollection). SingleNullBulk and IntegerMembership use the parser's
+    // existing scalar counters so no materialization is required for them.
+    if (config->arbitrary_commands->is_defined()) {
+        bool needs_array_walk = false;
+        for (size_t i = 0; i < config->arbitrary_commands->size(); ++i) {
+            const arbitrary_command &cmd = config->arbitrary_commands->at(i);
+            if (!cmd.miss_tracking_enabled || cmd.spec == NULL) continue;
+            using memtier::command_meta::ReplyShape;
+            if (cmd.spec->reply_shape == ReplyShape::ArrayPerElementNulls ||
+                cmd.spec->reply_shape == ReplyShape::EmptyCollection) {
+                needs_array_walk = true;
+                break;
+            }
+        }
+        if (needs_array_walk) {
+            for (size_t i = 0; i < m_connections.size(); ++i) {
+                m_connections[i]->get_protocol()->set_keep_value(true);
+            }
+        }
     }
 
     // Parallel key-pattern determined according to the first command
@@ -120,6 +144,7 @@ client::client(client_group *group) :
         m_get_ratio_count(0),
         m_arbitrary_command_ratio_count(0),
         m_executed_command_index(0),
+        m_arbitrary_command_rotation_seq(0),
         m_tot_set_ops(0),
         m_tot_wait_ops(0),
         m_scan_cursor("0"),
@@ -149,6 +174,7 @@ client::client(struct event_base *event_base, benchmark_config *config, abstract
         m_get_ratio_count(0),
         m_arbitrary_command_ratio_count(0),
         m_executed_command_index(0),
+        m_arbitrary_command_rotation_seq(0),
         m_tot_set_ops(0),
         m_tot_wait_ops(0),
         m_scan_cursor("0"),
@@ -559,11 +585,12 @@ bool client::create_mget_request(struct timeval &timestamp, unsigned int conn_id
     m_keylist->clear();
     for (unsigned int i = 0; i < keys_count; i++) {
         get_key_response res = get_key_for_conn(GET_CMD_IDX, conn_id, &key_index);
-        /* Not supported in cluster mode */
-        assert(res == available_for_conn);
+        if (res != available_for_conn) continue;
 
         m_keylist->add_key(m_obj_gen->get_key(), m_obj_gen->get_key_len());
     }
+
+    if (m_keylist->get_keys_count() == 0) return false;
 
     m_connections[conn_id]->send_mget_command(&timestamp, m_keylist);
     return true;
@@ -629,9 +656,16 @@ void client::create_request(struct timeval timestamp, unsigned int conn_id)
         }
 
         // MGET command
-        if (!create_mget_request(timestamp, conn_id)) return;
+        if (!create_mget_request(timestamp, conn_id)) {
+            // No MGET could be sent (e.g. this cluster connection owns no
+            // slots that map to the configured key range). Force the ratio
+            // counter past the threshold so the next create_request() call
+            // resets both counters instead of busy-spinning here forever.
+            m_get_ratio_count = m_config->ratio.b;
+            return;
+        }
 
-        m_get_ratio_count += m_config->multi_key_get;
+        m_get_ratio_count += m_keylist->get_keys_count();
         m_reqs_generated++;
     } else {
         // overlap counters
@@ -652,6 +686,23 @@ int client::prepare(void)
     return 0;
 }
 
+// Maps internal request_type to a short uppercase string for failed-keys logs.
+static const char *request_type_to_name(request_type t)
+{
+    switch (t) {
+    case rt_get:
+        return "GET";
+    case rt_set:
+        return "SET";
+    case rt_wait:
+        return "WAIT";
+    case rt_arbitrary:
+        return "ARBITRARY";
+    default:
+        return "UNKNOWN";
+    }
+}
+
 void client::handle_response(unsigned int conn_id, struct timeval timestamp, request *request,
                              protocol_response *response)
 {
@@ -659,29 +710,218 @@ void client::handle_response(unsigned int conn_id, struct timeval timestamp, req
         benchmark_error_log("server %s handle error response: %s\n", m_connections[conn_id]->get_readable_id(),
                             response->get_status());
 
+        // Retry path: only when --retry-on-error is enabled. We intercept the
+        // failed response and re-enqueue the request; stats are NOT updated
+        // until the request reaches a terminal outcome (success or retries
+        // exhausted). The shard_connection's retry queue handles backoff and
+        // hard-cap; if it refuses, we fall through to permanent-failure
+        // accounting below.
+        if (m_config->retry_on_error && is_retryable_error(response->get_status(), m_config->retry_on_filter)) {
+            shard_connection *sc = m_connections[conn_id];
+            if (sc->enqueue_retry(request)) {
+                // Ownership transferred to the retry queue (signalled by
+                // request->m_claimed_by_retry = true). process_response skips
+                // its delete; the request is freed when the retry queue or
+                // replay path drains it.
+                m_stats.inc_retry_attempt();
+                if (request->m_retries == 0) m_stats.inc_retried_op();
+                return;
+            }
+            // enqueue_retry refused (max retries exceeded / queue full / no
+            // captured bytes). Fall through to permanent-failure accounting.
+        }
+
+        // Permanent failure path: log to failed-keys file (if configured),
+        // bump the error counter, and fall through to stats.
+        if (m_config->failed_keys_file) {
+            global_failed_keys_logger().log_failure(timestamp, request_type_to_name(request->m_type), request->m_key,
+                                                    request->m_key_len, response->get_status(), request->m_retries);
+        }
+        m_stats.inc_error();
+
         // On SCAN error, reset cursor to restart iteration
         if (m_config->scan_incremental_iteration && request->m_type == rt_arbitrary) {
             m_scan_cursor = "0";
             m_scan_iteration_count = 0;
         }
     }
+    // Stats use the first-attempt send time so retries appear as one op with
+    // total latency from first send to final outcome. For non-retry runs,
+    // m_first_sent_time == m_sent_time, so this is a no-op behavior change.
+    struct timeval ref_sent = request->m_first_sent_time;
     switch (request->m_type) {
     case rt_get:
-        m_stats.update_get_op(&timestamp, response->get_total_len(), request->m_size,
-                              ts_diff(request->m_sent_time, timestamp), response->get_hits(),
-                              request->m_keys - response->get_hits());
+        m_stats.update_get_op(&timestamp, response->get_total_len(), request->m_size, ts_diff(ref_sent, timestamp),
+                              response->get_hits(), request->m_keys - response->get_hits());
         break;
     case rt_set:
-        m_stats.update_set_op(&timestamp, response->get_total_len(), request->m_size,
-                              ts_diff(request->m_sent_time, timestamp));
+        m_stats.update_set_op(&timestamp, response->get_total_len(), request->m_size, ts_diff(ref_sent, timestamp));
         break;
     case rt_wait:
-        m_stats.update_wait_op(&timestamp, ts_diff(request->m_sent_time, timestamp));
+        m_stats.update_wait_op(&timestamp, ts_diff(ref_sent, timestamp));
         break;
     case rt_arbitrary: {
         arbitrary_request *ar = static_cast<arbitrary_request *>(request);
         m_stats.update_arbitrary_op(&timestamp, response->get_total_len(), request->m_size,
-                                    ts_diff(request->m_sent_time, timestamp), ar->index);
+                                    ts_diff(ref_sent, timestamp), ar->index);
+
+        // Per-key miss accounting. Only fires when:
+        //   1. the command resolved to a registry entry (spec != NULL)
+        //   2. miss tracking wasn't disabled by --command-miss-tracking=off
+        //   3. the reply isn't an error (errors are recorded separately by the
+        //      protocol layer; counting them as misses would double-book).
+        if (ar->m_cmd_meta != NULL && ar->m_cmd_meta->miss_tracking_enabled && ar->m_cmd_meta->spec != NULL &&
+            !response->is_error()) {
+            unsigned int num_keys = request->m_keys;
+            unsigned int hits = 0;
+            unsigned int misses = 0;
+            // Each case allocates per_key_hit at the right size once. Avoiding
+            // a pre-resize here means SingleNullBulk pays only for a 1-bucket
+            // vector and ArrayPerElementNulls pays for one assign() instead of
+            // a resize-then-assign pair on the hot reply path.
+            std::vector<bool> per_key_hit;
+
+            using memtier::command_meta::ReplyShape;
+            switch (ar->m_cmd_meta->spec->reply_shape) {
+            case ReplyShape::SingleNullBulk: {
+                // Hit iff the top-level reply isn't a null sentinel. We can't
+                // use response->get_hits() here: the parser increments it for
+                // every non-null bulk it walks, which overcounts for blocking
+                // pop commands (BLPOP/BRPOP/BZPOPMAX/BZPOPMIN return [key,
+                // value] arrays on success — get_hits() returns 2) and for
+                // multi-element pops (LPOP key COUNT N returns an N-element
+                // array). The status line carries the top-level RESP type
+                // header, which is what we actually care about: $-1 (null
+                // bulk), *-1 (null array), or anything else (a value).
+                const char *status = response->get_status();
+                // Miss sentinels: $-1 (null bulk), *-1 (null array, RESP2),
+                // and *0 (empty array - returned by SPOP/SRANDMEMBER with a
+                // count argument when the key is absent). Anything else is
+                // a value (or a non-empty container) and counts as a hit.
+                bool is_null = (status != NULL && (strcmp(status, "$-1") == 0 || strcmp(status, "*-1") == 0 ||
+                                                   strcmp(status, "*0") == 0));
+                // Always one bucket for SingleNullBulk: variadic-key blocking
+                // commands like BLPOP carry the winning key in the reply but
+                // we don't parse it, so per-key attribution beyond hit/miss
+                // isn't available.
+                per_key_hit.assign(1, false);
+                num_keys = 1;
+                hits = is_null ? 0 : 1;
+                misses = is_null ? 1 : 0;
+                if (!is_null) per_key_hit[0] = true;
+                break;
+            }
+            case ReplyShape::ArrayPerElementNulls: {
+                // Walk the top-level mbulk array. Bucket count is the reply
+                // element count, not the spec key count: HMGET / ZMSCORE
+                // have 1 Redis key but produce one reply element per
+                // field/member, so capping to num_keys (==1) would lose all
+                // but the first position. MGET (multi-key spec) naturally
+                // matches reply size 1:1.
+                mbulk_size_el *top = response->get_mbulk_value();
+                if (top != NULL) {
+                    size_t n = top->mbulks_elements.size();
+                    per_key_hit.assign(n, false);
+                    num_keys = (unsigned int) n;
+                    for (size_t i = 0; i < n; ++i) {
+                        mbulk_element *el = top->mbulks_elements[i];
+                        bool h = false;
+                        if (el != NULL) {
+                            // ArrayPerElementNulls covers two reply shapes:
+                            //   - array of (bulk | null bulk): MGET, HMGET,
+                            //     ZMSCORE. Null bulk ($-1) materializes as a
+                            //     bulk_el with value==NULL/value_len==0.
+                            //   - array of (nested-array | null array):
+                            //     GEOPOS, COMMAND INFO, SORT_RO. Null array
+                            //     (*-1) materializes as an mbulk_size_el with
+                            //     no children (indistinguishable from *0,
+                            //     which is also "no value here" in practice).
+                            // is_bulk()/is_mbulk_size() avoid the assert that
+                            // as_bulk()/as_mbulk_size() raise on the wrong
+                            // kind.
+                            if (el->is_bulk()) {
+                                bulk_el *bel = el->as_bulk();
+                                // Hit = the bulk slot carries a value. Use
+                                // value!=NULL (the parser zero-allocates the
+                                // pointer only for $-1 null bulks) so that
+                                // empty-string values ($0\r\n\r\n) count as
+                                // hits when the parser is later extended to
+                                // preserve them. Today the redis_protocol
+                                // parser collapses $0 and $-1 into the same
+                                // representation (value=NULL, value_len=0),
+                                // matching the existing GET path's m_hits
+                                // convention; the value-pointer check is the
+                                // semantically correct one and is forward-
+                                // compatible with a parser that distinguishes.
+                                if (bel != NULL && bel->value != NULL) {
+                                    h = true;
+                                }
+                            } else if (el->is_mbulk_size()) {
+                                mbulk_size_el *sub = el->as_mbulk_size();
+                                if (sub != NULL && !sub->mbulks_elements.empty()) {
+                                    h = true;
+                                }
+                            }
+                        }
+                        per_key_hit[i] = h;
+                        if (h) hits++;
+                    }
+                    misses = (num_keys > hits) ? (num_keys - hits) : 0;
+                } else {
+                    // Top-level reply isn't an mbulk (could be +OK, -ERR, a
+                    // single bulk for a misshape, or any non-array reply).
+                    // Account uniformly: a single miss bucket so per-key and
+                    // aggregate counters stay in sync.
+                    per_key_hit.assign(1, false);
+                    num_keys = 1;
+                    misses = 1;
+                }
+                break;
+            }
+            case ReplyShape::EmptyCollection: {
+                // Heuristic: empty array == missing key. EmptyCollection
+                // commands (SMEMBERS, LRANGE, HGETALL, ...) virtually always
+                // carry exactly 1 key.
+                mbulk_size_el *top = response->get_mbulk_value();
+                bool empty = (top == NULL || top->mbulks_elements.empty());
+                per_key_hit.assign(num_keys, !empty);
+                hits = empty ? 0 : num_keys;
+                misses = empty ? num_keys : 0;
+                break;
+            }
+            case ReplyShape::IntegerMembership: {
+                // Reply is ":N\r\n" where N is the count of present keys.
+                // Per-position attribution is impossible from this reply, so
+                // we mark the first N buckets as hits and the rest as misses;
+                // the aggregate is correct, the per-position is conventional.
+                const char *status = response->get_status();
+                unsigned int n = 0;
+                if (status != NULL && status[0] == ':') {
+                    long v = strtol(status + 1, NULL, 10);
+                    if (v > 0) n = (unsigned int) v;
+                }
+                if (n > num_keys) n = num_keys;
+                hits = n;
+                misses = num_keys - n;
+                per_key_hit.assign(num_keys, false);
+                for (unsigned int i = 0; i < hits; ++i)
+                    per_key_hit[i] = true;
+                break;
+            }
+            default:
+                // Unreachable today: miss_tracking_enabled is only set for the
+                // four miss-bearing shapes above. Skip the stats call entirely
+                // here so a future shape addition doesn't silently record
+                // zero-valued hits/misses with an empty per_key_hit; the build
+                // will fail to compile (missing case label) only if -Wswitch
+                // catches it, so the guard makes the intent explicit.
+                break;
+            }
+
+            if (!per_key_hit.empty()) {
+                m_stats.update_arbitrary_op_misses(ar->index, hits, misses, per_key_hit);
+            }
+        }
 
         // Extract cursor from SCAN response for incremental iteration
         if (m_config->scan_incremental_iteration && !response->is_error()) {
@@ -712,6 +952,13 @@ void client::handle_response(unsigned int conn_id, struct timeval timestamp, req
     default:
         assert(0);
         break;
+    }
+
+    // On success after one or more retries: reset the per-connection backoff
+    // so a transient burst of errors doesn't keep us in slow-retry mode after
+    // the SUT recovers.
+    if (m_config->retry_on_error && !response->is_error() && request->m_retries > 0) {
+        m_connections[conn_id]->reset_retry_backoff();
     }
 }
 
@@ -790,8 +1037,24 @@ void verify_client::handle_response(unsigned int conn_id, struct timeval timesta
 
     assert(vr->m_type == rt_get);
     if (response->is_error()) {
+        // Same retry policy as the normal client: retry transient errors;
+        // permanent errors (and value-mismatch below) always count.
+        if (m_config->retry_on_error && is_retryable_error(response->get_status(), m_config->retry_on_filter)) {
+            shard_connection *sc = m_connections[conn_id];
+            if (sc->enqueue_retry(request)) {
+                m_stats.inc_retry_attempt();
+                if (request->m_retries == 0) m_stats.inc_retried_op();
+                return;
+            }
+            // enqueue refused — fall through to terminal-failure accounting.
+        }
+        if (m_config->failed_keys_file) {
+            global_failed_keys_logger().log_failure(timestamp, "GET", vr->m_key, vr->m_key_len, response->get_status(),
+                                                    vr->m_retries);
+        }
         benchmark_error_log("error: request for key [%.*s] failed: %s\n", vr->m_key_len, vr->m_key,
                             response->get_status());
+        m_stats.inc_error();
         m_errors++;
     } else {
         if (!rvalue || rvalue_len != vr->m_value_len || memcmp(rvalue, vr->m_value, rvalue_len) != 0) {
@@ -801,6 +1064,14 @@ void verify_client::handle_response(unsigned int conn_id, struct timeval timesta
         } else {
             benchmark_debug_log("key: [%.*s] verified successfuly.\n", vr->m_key_len, vr->m_key);
             m_verified_keys++;
+        }
+        // Reset retry backoff after a non-error protocol response, matching
+        // client::handle_response. A value mismatch is a successful round-trip
+        // from the server's perspective, so the backoff should reset on either
+        // branch — without this, a transient error burst keeps the
+        // per-connection backoff inflated.
+        if (m_config->retry_on_error && request->m_retries > 0) {
+            m_connections[conn_id]->reset_retry_backoff();
         }
     }
 }
@@ -997,8 +1268,20 @@ void client_group::interrupt(void)
 {
     // Mark all clients as interrupted
     set_all_clients_interrupted();
-    // Break the event loop to stop processing
+    // Break the event loop to stop processing.
+    //
+    // We pair loopbreak() (terminate after the current iteration) with a
+    // loopexit(timeval{0,0}) (schedule an immediate timer that wakes the
+    // poll). Without the loopexit wake-up, a worker that is sitting idle
+    // in epoll_wait() with no live event sources (e.g. a connection that
+    // failed setup but never disconnected) will block forever, so
+    // pthread_join() in the parent hangs indefinitely. This is the same
+    // pattern libevent recommends for terminating an idle loop from
+    // another thread; loopbreak alone is documented to only take effect
+    // *between* iterations.
     event_base_loopbreak(m_base);
+    struct timeval zero = {0, 0};
+    event_base_loopexit(m_base, &zero);
     // Set end time for all clients as close as possible to the loop break
     finalize_all_clients();
 }
@@ -1098,6 +1381,36 @@ unsigned long int client_group::get_total_misses(void)
     unsigned int count = active_client_count();
     for (unsigned int i = 0; i < count; i++) {
         total += m_clients[i]->get_stats()->get_total_misses();
+    }
+    return total;
+}
+
+unsigned long int client_group::get_total_retry_attempts(void)
+{
+    unsigned long int total = 0;
+    unsigned int count = active_client_count();
+    for (unsigned int i = 0; i < count; i++) {
+        total += m_clients[i]->get_stats()->get_total_retry_attempts();
+    }
+    return total;
+}
+
+unsigned long int client_group::get_total_retried_ops(void)
+{
+    unsigned long int total = 0;
+    unsigned int count = active_client_count();
+    for (unsigned int i = 0; i < count; i++) {
+        total += m_clients[i]->get_stats()->get_total_retried_ops();
+    }
+    return total;
+}
+
+unsigned long int client_group::get_total_errors(void)
+{
+    unsigned long int total = 0;
+    unsigned int count = active_client_count();
+    for (unsigned int i = 0; i < count; i++) {
+        total += m_clients[i]->get_stats()->get_total_errors();
     }
     return total;
 }

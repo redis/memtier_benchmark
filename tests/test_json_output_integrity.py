@@ -106,7 +106,14 @@ def _assert_time_series_consistent(env, section_name, section):
         avg = float(bucket["Average Latency"])
         acc = float(bucket["Accumulated Latency"])
         derived = acc / count
-        tolerance = max(ABS_TOLERANCE_MS, REL_TOLERANCE * derived)
+        # Tolerance must include the quantization error on Accumulated Latency:
+        # it's emitted with %lld (1 ms precision), so the reported value can
+        # differ from the true sum by up to 1 ms. The derived avg is therefore
+        # off by up to (1 / count) ms. For low-count buckets — e.g. the trailing
+        # second of a short --test-time run with --reconnect-interval=1 — that
+        # term dominates and the static 2% relative + 0.01 ms absolute floor
+        # would false-positive (RED-197205 regression-test CI surfaced this).
+        tolerance = max(ABS_TOLERANCE_MS, REL_TOLERANCE * derived, 1.0 / count)
         if acc > 0:
             env.assertGreater(
                 avg, 0.0,
@@ -132,9 +139,13 @@ def _validate_run_section(env, run_label, run_section):
 
 
 def _build_benchmark(env, test_dir, extra_args, threads=2, clients=5,
-                     requests=5000):
+                     requests=5000, test_time=None):
+    # memtier doesn't accept both --test-time and --requests; when the test
+    # is time-bounded, drop the request count.
+    if test_time is not None:
+        requests = None
     config = get_default_memtier_config(threads=threads, clients=clients,
-                                        requests=requests)
+                                        requests=requests, test_time=test_time)
     benchmark_specs = {"name": env.testName, "args": extra_args}
     addTLSArgs(benchmark_specs, env)
     add_required_env_arguments(benchmark_specs, config, env,
@@ -235,6 +246,100 @@ def test_json_totals_latency_matches_accumulated_get_only(env):
                                 message="Expected zero SETs in GET-only run")
             env.assertGreater(run["Totals"]["Count"], 0)
             env.assertGreater(run["Totals"]["Latency"], 0.0)
+        finally:
+            if env.getNumberOfFailedAssertion() > failed_asserts:
+                debugPrintMemtierOnError(run_config, env)
+    finally:
+        pass
+
+
+def test_reconnect_interval_does_not_zero_out_rates(env):
+    """RED-197205: --reconnect-interval N must not zero out throughput rates.
+
+    On v2.2.1 (and earlier), running with --reconnect-interval=1 produced a
+    final summary where Ops/sec, Hits/sec, Misses/sec and KB/sec all rendered
+    as 0.00 even though Count and Latency were correct. Root cause:
+    client_group::merge_run_stats() iterated all clients (including those
+    that were prepare()-d but never reached set_start_time()) and merged
+    their zeroed m_start_time into the factorial average, dragging the
+    aggregate m_start_time toward the epoch. With m_end_time correct but
+    m_start_time near 0, test_duration_usec became a huge value and every
+    `ops / test_duration_usec * 1000000` division collapsed to ~0.
+
+    Fix (master, PR #350 / commit 0228bac): a run_stats::m_started atomic
+    flag plus a has_started() guard in merge_run_stats() and
+    aggregate_inst_histogram() that skips clients that never started.
+
+    This test exercises the exact failing configuration from the bug report
+    (multiple threads, multiple clients per thread, --reconnect-interval=1,
+    --ratio=1:1) and asserts the rate fields are strictly positive. The
+    Latency invariants are also re-checked in case a future fix in this
+    area accidentally re-introduces the integer-truncation pattern.
+    """
+    # memtier refuses --reconnect-interval together with --cluster-mode:
+    # "error: cluster mode dose not support reconnect-interval option".
+    # The RED-197205 regression is not cluster-specific, so we only run
+    # this check in single-endpoint mode.
+    if env.isCluster():
+        env.skip()
+        return
+
+    test_dir = tempfile.mkdtemp()
+    try:
+        # NB: the bug fires reliably with --test-time, not with -n. With
+        # -n, all clients run to completion and set_start_time was reached
+        # on every one of them, so the zero-state merge never happened.
+        # With --test-time, the wall-clock cutoff occasionally leaves
+        # late-spawning / reconnect-stuck clients in the zero-init state,
+        # which is exactly the path PR #350 fixed.
+        benchmark, run_config = _build_benchmark(
+            env, test_dir,
+            extra_args=["--ratio=1:1", "--key-pattern=R:R", "--pipeline=1",
+                        "--reconnect-interval=1"],
+            threads=4, clients=4, requests=None, test_time=5)
+        ok = benchmark.run()
+        failed_asserts = env.getNumberOfFailedAssertion()
+        try:
+            env.assertTrue(ok, message="memtier_benchmark exited non-zero")
+            results = _read_json(run_config, env)
+            env.assertTrue("ALL STATS" in results,
+                           message="Expected 'ALL STATS' in JSON output")
+            run = results["ALL STATS"]
+            _validate_run_section(env, "ALL STATS", run)
+
+            # Core regression assertions: with --reconnect-interval=1, the
+            # rate fields must be > 0 (not the all-zero footprint of
+            # RED-197205). We assert against the Totals section, which is
+            # what the bug report cited verbatim.
+            totals = run["Totals"]
+            env.assertGreater(
+                totals["Count"], 0,
+                message="Totals.Count must be > 0 with --reconnect-interval=1")
+            env.assertGreater(
+                totals["Ops/sec"], 0.0,
+                message="RED-197205 regression: Totals.Ops/sec is 0 with "
+                        "--reconnect-interval=1 (Count={}, Latency={})".format(
+                            totals.get("Count"), totals.get("Latency")))
+            env.assertGreater(
+                totals["KB/sec"], 0.0,
+                message="RED-197205 regression: Totals.KB/sec is 0 with "
+                        "--reconnect-interval=1")
+            # With ratio=1:1 there's at least one GET per SET, so Misses/sec
+            # must also be > 0 (keys are random and the SUT starts empty).
+            env.assertGreater(
+                totals["Misses/sec"], 0.0,
+                message="RED-197205 regression: Totals.Misses/sec is 0 with "
+                        "--reconnect-interval=1 and ratio=1:1")
+
+            # And the per-command sections should also have non-zero rates,
+            # since the bug zeroed everything uniformly via the shared
+            # test_duration_usec.
+            for cmd in ("Sets", "Gets"):
+                if cmd in run and run[cmd].get("Count", 0) > 0:
+                    env.assertGreater(
+                        run[cmd]["Ops/sec"], 0.0,
+                        message="RED-197205 regression: {}.Ops/sec is 0 with "
+                                "--reconnect-interval=1".format(cmd))
         finally:
             if env.getNumberOfFailedAssertion() > failed_asserts:
                 debugPrintMemtierOnError(run_config, env)

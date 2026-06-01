@@ -1,0 +1,81 @@
+name: Differential (memtier vs reference clients)
+
+# Differential test harness: drives memtier_benchmark and a reference
+# client (redis-benchmark + redis-cli) against the same redis with
+# equivalent workloads, then asserts observable counters agree within
+# explicit tolerances. See tests/differential_redis_benchmark.py for the
+# 5 checks currently implemented (Fixes #414 partial).
+#
+# Trigger surface:
+#   * workflow_dispatch (manual)
+#   * PR with the `run-differential` label -- lets a PR author opt in
+#     when their change plausibly affects the protocol formatter, the
+#     RESP parser, MGET pipelining, latency accounting, or hit/miss
+#     bookkeeping. Add via:
+#         gh pr edit <num> --add-label run-differential
+#
+# Not on every PR by default: tolerances are wide enough to absorb cloud-
+# runner jitter, but the comparison still spins up its own redis-server
+# per test and pays a few hundred ms each. ~3-5 minutes total wall.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [labeled, synchronize, reopened]
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+jobs:
+  differential:
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'run-differential')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get install -y \
+            build-essential autoconf automake pkg-config \
+            libevent-dev libssl-dev zlib1g-dev
+
+      - name: Install redis-server + redis-tools (for redis-benchmark / redis-cli)
+        run: |
+          sudo apt-get install -y redis-server redis-tools
+          sudo service redis-server stop || true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install test deps
+        run: pip install -r tests/test_requirements.txt
+
+      - name: Build release memtier_benchmark
+        run: autoreconf -ivf && ./configure && make -j
+
+      - name: Run differential suite
+        env:
+          RUN_DIFFERENTIAL: "1"
+          MEMTIER_BINARY: ${{ github.workspace }}/memtier_benchmark
+          # Generous tolerances for cloud-runner jitter.
+          DIFF_OPS_REL_TOL: "0.05"
+          DIFF_LAT_REL_TOL: "0.80"
+          DIFF_THR_REL_TOL: "0.60"
+        run: pytest tests/differential_redis_benchmark.py -v --maxfail=1
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: differential-logs
+          path: |
+            /tmp/diff_*
+            /tmp/pytest-*
+          retention-days: 7
+          if-no-files-found: ignore

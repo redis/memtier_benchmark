@@ -92,6 +92,26 @@ $ make format-check
 
 CI will automatically check that all C++ files are properly formatted on every push and pull request.
 
+#### Pre-commit hook
+
+The repository ships a `pre-commit` hook under `.githooks/` that runs `make
+format-check-staged` before each commit. That target inspects the *staged
+blobs* in the git index (not the working tree), so style violations are
+caught locally instead of in CI and the check is immune to working-tree
+vs. index drift (e.g. running `make format` without `git add -u`). Enable
+it once per clone:
+
+```
+$ make install-hooks
+```
+
+This sets `core.hooksPath` to `.githooks` for this repository. To bypass the
+hook for a single commit (avoid making a habit of it):
+
+```
+$ git commit --no-verify
+```
+
 ## Testing
 
 The project includes a basic set of integration tests.
@@ -170,6 +190,35 @@ To verify TSAN is enabled:
     $ ldd ./memtier_benchmark | grep tsan
 
 **Note:** TSAN and ASAN are mutually exclusive and cannot be used together. A suppression file (`tsan_suppressions.txt`) is provided to ignore known benign data races that do not affect correctness.
+
+### On-demand fuzzers and extra suites (PR labels)
+
+A few longer-running test suites do not run on every PR by default — their wall-clock cost outweighs the per-PR signal — but you can opt a PR into running them by attaching a label:
+
+| Label | Workflow | What it runs | When to use |
+|---|---|---|---|
+| `run-fuzz` | `.github/workflows/monitor-fuzz.yml` | Black-box fuzz driver (`tests/fuzz/fuzz_monitor_input.py`) against `--monitor-input` / `arbitrary_command::split_command_to_args`, ASAN+UBSan build, `FUZZ_ITER=300` (~3-4 min). | Any PR that touches the monitor-input parser, the arbitrary-command splitter, or the RESP-encoded request path. |
+| `run-differential` | `.github/workflows/differential.yml` | Differential harness (`tests/differential_redis_benchmark.py`) — memtier vs `redis-benchmark` / `redis-cli` against the same redis, asserts total ops / hits / p99 latency / throughput / server-killed diagnostics agree within explicit tolerances. | Any PR that plausibly affects the protocol formatter, the RESP parser, MGET pipelining, latency accounting, or hit/miss bookkeeping. |
+| `run-soak` | `.github/workflows/soak-nightly.yml` | Seven-scenario soak / stress / chaos matrix (`tests/soak/`): 30 min memory soak (RSS slope), giant MONITOR-input payloads, 32t/256c high concurrency + FD hygiene, `CLIENT KILL` churn, cluster failover + reshard mid-run, `-ERR`-only retry storm, `tc netem` slow network. ~30-35 min total under a 60-min matrix cap. | Any PR that plausibly affects memory growth, retry / reconnect, cluster handling, or large-payload paths. |
+
+Attach a label via the CLI:
+
+    $ gh pr edit <num> --add-label run-fuzz
+    $ gh pr edit <num> --add-label run-differential
+    $ gh pr edit <num> --add-label run-soak
+
+Removing the label and pushing a new commit skips the workflow again. All three also run on `workflow_dispatch`; `run-fuzz` runs nightly with `FUZZ_ITER=2000` and `run-soak` runs nightly via cron. Failures upload reproducers / logs / `tests/logs/` as workflow artifacts.
+
+Local runs:
+
+    $ MEMTIER=$(pwd)/memtier_benchmark FUZZ_ITER=200 \
+          python3 tests/fuzz/fuzz_monitor_input.py
+
+    $ RUN_DIFFERENTIAL=1 MEMTIER_BINARY=$(pwd)/memtier_benchmark \
+          pytest tests/differential_redis_benchmark.py -v
+
+    $ MEMTIER_BINARY=$(pwd)/memtier_benchmark \
+          python3 -m RLTest --test tests/soak/test_large_payloads.py -v
 
 ## Crash Handling and Debugging
 

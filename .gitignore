@@ -38,6 +38,10 @@ __pycache__
 *.csv
 *.json
 
+# Vendored Redis commands.json snapshot (refreshed via `make commands-meta`)
+!deps/commands_json/*.json
+!deps/commands_json/REDIS_TAG.txt
+
 # Code coverage with lcov/gcov
 *.gcno
 *.gcov
@@ -51,3 +55,12 @@ appendonlydir/
 *.conf
 
 tests/.env/
+
+# libFuzzer fuzz harness build artifacts and crash dumps
+/split_command_to_args_fuzz
+/monitor_input_fuzz
+/redis_protocol_fuzz
+crash-*
+leak-*
+timeout-*
+oom-*

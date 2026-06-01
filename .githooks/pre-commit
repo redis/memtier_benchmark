@@ -1,0 +1,25 @@
+#!/bin/sh
+# memtier_benchmark pre-commit hook.
+#
+# Delegates to `make format-check-staged`, which inspects the staged blobs
+# in the git index (not the working tree) so the rule lives in Makefile.am,
+# matches what CI runs, and is immune to the working-tree-vs-index drift
+# (e.g. `make format` without `git add -u`).
+#
+# Enable in a fresh clone:
+#     make install-hooks
+#
+# Bypass (don't make a habit of it):
+#     git commit --no-verify
+
+set -e
+
+# format-check-staged is a no-op when no C/C++ file is staged, and emits its
+# own remediation guidance on failure; we only need to translate the exit
+# code into a friendly hook-level message.
+if ! make format-check-staged; then
+    echo
+    echo "✗ Pre-commit format check failed (see remediation above)."
+    echo "  Bypass (not recommended): git commit --no-verify"
+    exit 1
+fi
