@@ -154,7 +154,14 @@ def test_key_pattern_g_one_key_range_rejected(env):
 
 def test_key_pattern_g_valid_range_accepted(env):
     """``--key-pattern G:G --key-minimum=1 --key-maximum=1000 --key-stddev=100``
-    must still parse and run cleanly (no regression on the happy path)."""
+    must still parse cleanly (no regression on the happy path).
+
+    The point of this test is to verify the *parser* accepts the config; the
+    sub-second workload that follows is incidental. ASAN TLS cells under
+    high CI load have been observed dropping the first connection mid-
+    handshake (Connection reset by peer), so we run with --reconnect-on-error
+    + --max-reconnect-attempts to absorb that transient and ensure the rc==0
+    check measures the parse path, not TLS flake."""
     env.skipOnCluster()
 
     result = _run_memtier(_common_args(env) + [
@@ -162,7 +169,13 @@ def test_key_pattern_g_valid_range_accepted(env):
         "--key-minimum=1",
         "--key-maximum=1000",
         "--key-stddev=100",
-        "--test-time=1",
+        "--requests=10",
+        "--threads=1",
+        "--clients=1",
+        "--pipeline=1",
+        "--hide-histogram",
+        "--reconnect-on-error",
+        "--max-reconnect-attempts=5",
     ])
 
     env.assertEqual(
