@@ -762,6 +762,29 @@ static bool verify_arbitrary_command_option(struct benchmark_config *cfg)
     return true;
 }
 
+// Validation caps for size-related CLI options (Refs #426 phase 2b).
+//   PIPELINE_MAX:  upper bound on --pipeline.  A 1024-deep pipeline already
+//                  saturates most NICs; values beyond that almost always
+//                  reflect a typo (e.g. negative input cast to unsigned).
+//   DATA_SIZE_MAX: upper bound on --data-size (and per-entry size in
+//                  --data-size-list).  Matches Redis' default proto-max-bulk-len
+//                  (512 MiB), past which the server rejects the bulk anyway.
+#define MEMTIER_PIPELINE_MAX 1024u
+#define MEMTIER_DATA_SIZE_MAX (512u * 1024u * 1024u)
+
+// True if optarg's first non-space character is '-'.  strtoul() silently
+// accepts a leading minus and underflows the result to a huge unsigned, which
+// then sails past the >0 check downstream and only manifests as a hang or
+// SIGABRT deep in the run loop.  Catching it at parse time keeps the error
+// message close to the offending flag.
+static bool optarg_is_negative(const char *s)
+{
+    if (s == NULL) return false;
+    while (*s == ' ' || *s == '\t')
+        s++;
+    return *s == '-';
+}
+
 static int config_parse_args(int argc, char *argv[], struct benchmark_config *cfg)
 {
     enum extended_options
@@ -1122,22 +1145,42 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 return -1;
             }
             break;
-        case o_pipeline:
+        case o_pipeline: {
             endptr = NULL;
-            cfg->pipeline = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!cfg->pipeline || !endptr || *endptr != '\0') {
+            if (optarg_is_negative(optarg)) {
                 fprintf(stderr, "error: pipeline must be greater than zero.\n");
                 return -1;
             }
+            unsigned long pipeline_val = strtoul(optarg, &endptr, 10);
+            if (!pipeline_val || !endptr || *endptr != '\0') {
+                fprintf(stderr, "error: pipeline must be greater than zero.\n");
+                return -1;
+            }
+            if (pipeline_val > MEMTIER_PIPELINE_MAX) {
+                fprintf(stderr, "error: pipeline must be <= %u.\n", MEMTIER_PIPELINE_MAX);
+                return -1;
+            }
+            cfg->pipeline = (unsigned int) pipeline_val;
             break;
-        case 'd':
+        }
+        case 'd': {
             endptr = NULL;
-            cfg->data_size = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!cfg->data_size || !endptr || *endptr != '\0') {
+            if (optarg_is_negative(optarg)) {
                 fprintf(stderr, "error: data-size must be greater than zero.\n");
                 return -1;
             }
+            unsigned long data_size_val = strtoul(optarg, &endptr, 10);
+            if (!data_size_val || !endptr || *endptr != '\0') {
+                fprintf(stderr, "error: data-size must be greater than zero.\n");
+                return -1;
+            }
+            if (data_size_val > MEMTIER_DATA_SIZE_MAX) {
+                fprintf(stderr, "error: data-size must be <= %u bytes (512 MiB).\n", MEMTIER_DATA_SIZE_MAX);
+                return -1;
+            }
+            cfg->data_size = (unsigned int) data_size_val;
             break;
+        }
         case 'R':
             cfg->random_data = true;
             break;
@@ -1161,6 +1204,27 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             if (!cfg->data_size_list.is_defined()) {
                 fprintf(stderr, "error: data-size-list must be expressed as [size1:weight1],...[sizeN:weightN].\n");
                 return -1;
+            }
+            // Reject zero-SIZE entries (e.g. "0:50") -- they trip the
+            // value_len > 0 assert in protocol.cpp at first SET.  Zero-WEIGHT
+            // entries (e.g. "8:0") are a separate sampler-safety issue tracked
+            // for phase 3.
+            for (std::vector<config_weight_list::weight_item>::iterator it = cfg->data_size_list.item_list.begin();
+                 it != cfg->data_size_list.item_list.end(); ++it) {
+                if (it->size == 0) {
+                    fprintf(stderr,
+                            "error: data-size-list entries must have size > 0 "
+                            "(got 0 in '%s').\n",
+                            optarg);
+                    return -1;
+                }
+                if (it->size > MEMTIER_DATA_SIZE_MAX) {
+                    fprintf(stderr,
+                            "error: data-size-list entry size must be <= %u bytes "
+                            "(512 MiB), got %u.\n",
+                            MEMTIER_DATA_SIZE_MAX, it->size);
+                    return -1;
+                }
             }
             break;
         case o_expiry_range:
