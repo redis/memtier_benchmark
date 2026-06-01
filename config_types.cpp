@@ -503,12 +503,37 @@ bool arbitrary_command::set_key_pattern(const char *pattern_str)
 
 bool arbitrary_command::set_ratio(const char *ratio_str)
 {
-    char *q = NULL;
-    ratio = strtoul(ratio_str, &q, 10);
-    if (!q || *q != '\0') {
+    // Reject empty / null / whitespace-only / negative input. strtoul()
+    // silently accepts the empty string (returns 0) and wraps negatives to
+    // a huge unsigned value, both of which lead to a worker loop that never
+    // picks this command and hangs forever (issue #426 item 14).
+    if (ratio_str == NULL || *ratio_str == '\0') {
+        return false;
+    }
+    const char *first = ratio_str;
+    while (*first && isspace((unsigned char) *first)) {
+        first++;
+    }
+    if (*first == '\0' || *first == '-' || *first == '+') {
         return false;
     }
 
+    char *q = NULL;
+    errno = 0;
+    unsigned long parsed = strtoul(ratio_str, &q, 10);
+    if (!q || *q != '\0') {
+        return false;
+    }
+    // ERANGE catches the strtoul overflow case; the narrow-to-unsigned-int
+    // check catches values above UINT_MAX that strtoul accepted on a 64-bit
+    // unsigned long without ERANGE (e.g. "4294967296" on x86_64). Without
+    // either guard a too-large value silently truncates and a wrap-to-0
+    // value re-introduces the very hang we're guarding against.
+    if (errno == ERANGE || parsed == 0 || parsed > UINT_MAX) {
+        return false;
+    }
+
+    ratio = (unsigned int) parsed;
     return true;
 }
 

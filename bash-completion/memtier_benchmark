@@ -28,6 +28,7 @@ _memtier_completions()
                    "--statsd-host" "--statsd-port" "--statsd-prefix" "--statsd-run-label" "--graphite-port"\
                    "--monitor-input" "--hdr-file-prefix"\
                    "--max-reconnect-attempts" "--reconnect-backoff-factor" "--connection-timeout"\
+                   "--connection-stage-timeout"\
                    "--max-retries" "--retry-backoff-ms" "--retry-backoff-factor" "--retry-on"\
                    "--max-retry-queue" "--failed-keys-file"\
                    "--thread-conn-start-min-jitter-micros" "--thread-conn-start-max-jitter-micros"\

@@ -350,22 +350,96 @@ void cluster_client::handle_cluster_slots(protocol_response *r)
     unsigned long prev_connections_size = m_connections.size();
     std::vector<bool> close_sc(prev_connections_size, true);
 
+    // Validate the top-level reply shape before walking it. as_mbulk_size()
+    // and as_bulk() both call assert(0) on type mismatch, and bare
+    // mbulks_elements[N] indexing is UB past-end. A malformed CLUSTER SLOTS
+    // reply from a misbehaving / hostile server (#417: fixture
+    // `cluster_slots_malformed.bin` from #409) hit both. Drop malformed
+    // shards instead of crashing; if the entire reply is unusable, the
+    // existing bootstrap connection stays in service.
+    if (r->get_mbulk_value() == NULL) {
+        benchmark_error_log("warning: CLUSTER SLOTS: server returned non-array; ignoring reply\n");
+        return;
+    }
+
+    // A *valid* zero-shard reply would silently retire every existing
+    // connection (the close_sc[] loop further down). That's worse than
+    // crashing -- the benchmark continues with no shards. Reject it.
+    if (r->get_mbulk_value()->mbulks_elements.size() == 0) {
+        benchmark_error_log("warning: CLUSTER SLOTS: server returned empty topology; ignoring reply\n");
+        return;
+    }
+
+    // Track whether any shard in the reply passed validation. If every shard
+    // is malformed and we fall through the loop with no `close_sc[j] = false`
+    // anywhere, the close-stale-connections pass below would tear down EVERY
+    // existing connection (including the bootstrap), which contradicts the
+    // documented "bootstrap stays in service" invariant. (Cursor bugbot.)
+    bool any_valid_shard = false;
+
     // run over response and create connections
     for (unsigned int i = 0; i < r->get_mbulk_value()->mbulks_elements.size(); i++) {
-        // create connection
-        mbulk_size_el *shard = r->get_mbulk_value()->mbulks_elements[i]->as_mbulk_size();
+        mbulk_element *shard_el = r->get_mbulk_value()->mbulks_elements[i];
+        if (shard_el == NULL || !shard_el->is_mbulk_size()) {
+            benchmark_error_log("warning: CLUSTER SLOTS: shard %u not an array; skipping\n", i);
+            continue;
+        }
+        mbulk_size_el *shard = shard_el->as_mbulk_size();
+        if (shard->mbulks_elements.size() < 3 || !shard->mbulks_elements[0]->is_bulk() ||
+            !shard->mbulks_elements[1]->is_bulk() || !shard->mbulks_elements[2]->is_mbulk_size()) {
+            benchmark_error_log(
+                "warning: CLUSTER SLOTS: shard %u malformed (need [start, end, [host, port, ...]]); skipping\n", i);
+            continue;
+        }
 
-        int min_slot = strtol(shard->mbulks_elements[0]->as_bulk()->value + 1, NULL, 10);
-        int max_slot = strtol(shard->mbulks_elements[1]->as_bulk()->value + 1, NULL, 10);
+        // Slot bounds: must be parseable, in [0, MAX_CLUSTER_HSLOT], and
+        // min <= max. The old code took the strtol result verbatim and
+        // wrote into m_slot_to_shard[min..max] -- a hostile server could
+        // make us write past the end of the 16384-sized array (OOB write).
+        bulk_el *min_el = shard->mbulks_elements[0]->as_bulk();
+        bulk_el *max_el = shard->mbulks_elements[1]->as_bulk();
+        if (min_el->value_len == 0 || max_el->value_len == 0) {
+            benchmark_error_log("warning: CLUSTER SLOTS: shard %u empty slot bound; skipping\n", i);
+            continue;
+        }
+        errno = 0;
+        long parsed_min = strtol(min_el->value + 1, NULL, 10);
+        long parsed_max = strtol(max_el->value + 1, NULL, 10);
+        if (errno == ERANGE || parsed_min < 0 || parsed_max < 0 || parsed_min > MAX_CLUSTER_HSLOT ||
+            parsed_max > MAX_CLUSTER_HSLOT || parsed_min > parsed_max) {
+            benchmark_error_log("warning: CLUSTER SLOTS: shard %u slot range [%ld, %ld] out of [0, %d]; skipping\n", i,
+                                parsed_min, parsed_max, MAX_CLUSTER_HSLOT);
+            continue;
+        }
+        int min_slot = (int) parsed_min;
+        int max_slot = (int) parsed_max;
 
-        // hostname/ip
-        bulk_el *mbulk_addr_el = shard->mbulks_elements[2]->as_mbulk_size()->mbulks_elements[0]->as_bulk();
+        mbulk_size_el *node = shard->mbulks_elements[2]->as_mbulk_size();
+        if (node->mbulks_elements.size() < 2 || !node->mbulks_elements[0]->is_bulk() ||
+            !node->mbulks_elements[1]->is_bulk()) {
+            benchmark_error_log("warning: CLUSTER SLOTS: shard %u node tuple malformed (need host, port); skipping\n",
+                                i);
+            continue;
+        }
+
+        // hostname/ip + port: reject zero-length bulks (memcpy(..., NULL+1, 0)
+        // is technically UB; embedded NULs would also alias other addrs in
+        // strcmp-based lookup).
+        bulk_el *mbulk_addr_el = node->mbulks_elements[0]->as_bulk();
+        bulk_el *mbulk_port_el = node->mbulks_elements[1]->as_bulk();
+        if (mbulk_addr_el->value_len == 0 || mbulk_port_el->value_len == 0) {
+            benchmark_error_log("warning: CLUSTER SLOTS: shard %u empty host/port; skipping\n", i);
+            continue;
+        }
+        if (memchr(mbulk_addr_el->value, '\0', mbulk_addr_el->value_len) != NULL) {
+            benchmark_error_log("warning: CLUSTER SLOTS: shard %u host contains NUL; skipping\n", i);
+            continue;
+        }
+
         char *addr = (char *) malloc(mbulk_addr_el->value_len + 1);
         memcpy(addr, mbulk_addr_el->value, mbulk_addr_el->value_len);
         addr[mbulk_addr_el->value_len] = '\0';
 
-        // port
-        bulk_el *mbulk_port_el = shard->mbulks_elements[2]->as_mbulk_size()->mbulks_elements[1]->as_bulk();
         char *port = (char *) malloc(mbulk_port_el->value_len + 1);
         memcpy(port, mbulk_port_el->value + 1, mbulk_port_el->value_len);
         port[mbulk_port_el->value_len] = '\0';
@@ -401,8 +475,18 @@ void cluster_client::handle_cluster_slots(protocol_response *r)
             m_slot_to_shard[j] = sc->get_id();
         }
 
+        any_valid_shard = true;
         free(addr);
         free(port);
+    }
+
+    // If every shard in the reply was malformed and skipped, treat the reply
+    // as unusable -- skip the close-stale pass below so we don't disconnect
+    // the bootstrap and any other currently-live connections (cursor bugbot).
+    if (!any_valid_shard) {
+        benchmark_error_log("warning: CLUSTER SLOTS: every shard in the reply was malformed; "
+                            "leaving existing connections in service\n");
+        return;
     }
 
     // check if some connections left with no slots, and need to be closed

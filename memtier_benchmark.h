@@ -21,6 +21,7 @@
 
 #include <atomic>
 #include <vector>
+#include <string>
 #include <sys/time.h>
 #include <pthread.h>
 #include "config_types.h"
@@ -140,6 +141,13 @@ struct benchmark_config
     // logged once and the benchmark continues.
     const char *failed_keys_file;
     unsigned int connection_timeout;
+    // Per-process bound on time spent in the *connection-setup* phase
+    // (AUTH, HELLO, SELECT, CLUSTER SLOTS, initial probe). Once any thread
+    // reaches steady-state (first non-setup response processed), this bound
+    // no longer applies; --test-time takes over. Independent of
+    // --connection-timeout (which is per-connect attempt) and --test-time
+    // (which bounds the steady-state run). Default 30 s; 0 disables.
+    unsigned int connection_stage_timeout;
     unsigned int thread_conn_start_min_jitter_micros;
     unsigned int thread_conn_start_max_jitter_micros;
     int multi_key_get;
@@ -197,6 +205,11 @@ struct benchmark_config
     const char *tls_sni;
     int tls_protocols;
     SSL_CTX *openssl_ctx;
+    // Negotiated TLS protocol/cipher, captured once on the first completed
+    // handshake (static OpenSSL strings; NULL until then). Written under a
+    // call_once on a worker thread, read on the main thread post-join.
+    const char *tls_negotiated_version;
+    const char *tls_negotiated_cipher;
 #endif
 };
 
@@ -204,5 +217,36 @@ struct benchmark_config
 extern void benchmark_log_file_line(int level, const char *filename, unsigned int line, const char *fmt, ...);
 extern void benchmark_log(int level, const char *fmt, ...);
 bool is_redis_protocol(enum PROTOCOL_TYPE type);
+
+// ---------------------------------------------------------------------------
+// Connection-stage supervisor (Phase 1 of #426)
+// ---------------------------------------------------------------------------
+//
+// The worker threads (shard_connection / cluster_client) report two events
+// here:
+//   - report_connection_stage_failure(): a connection-setup step failed
+//     (AUTH / HELLO / SELECT / CLUSTER SLOTS / -ERR / parse error during
+//     initial probe). The first call in a streak stamps the wall-clock
+//     start of the streak; subsequent calls only update the last-error
+//     message.
+//   - report_connection_stage_success(): the worker exited the conn-setup
+//     phase and processed a real response. Clears the streak and arms a
+//     latch (steady_state_reached) so the supervisor stops policing this
+//     run for setup-stalls.
+//
+// The main thread polls connection_stage_should_abort() once per second
+// from run_benchmark(). It returns true when either:
+//   (a) a failure streak has been live for >= --connection-stage-timeout, or
+//   (b) the run has been alive for >= --connection-stage-timeout without
+//       any thread ever reaching steady state (covers the "stuck WAIT" /
+//       "first request never returns" hangs in #426 #17).
+//
+// All state lives behind atomics + a small mutex protecting the
+// last-error string so worker threads can call into it lock-free on the
+// hot success path.
+void connection_stage_supervisor_reset(void);
+void report_connection_stage_failure(const char *err);
+void report_connection_stage_success(void);
+bool connection_stage_should_abort(unsigned int timeout_secs, std::string *out_last_err, unsigned int *out_elapsed);
 
 #endif /* _MEMTIER_BENCHMARK_H */

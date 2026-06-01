@@ -240,6 +240,12 @@ private:
 
     int m_pending_resp;
 
+    // Snapshot of the most recently pushed request's type. Updated on every
+    // push_req() and read by get_last_request_type() from the crash-handler
+    // signal context; volatile + aligned int avoids the racy deref of
+    // m_pipeline->front()->m_type while worker threads mutate the queue.
+    volatile int m_last_pushed_req_type;
+
     enum connection_state m_connection_state;
 
     enum setup_state m_hello;

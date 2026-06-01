@@ -53,6 +53,7 @@
 #include "event2/bufferevent.h"
 
 #ifdef USE_TLS
+#include <mutex>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include "event2/bufferevent_ssl.h"
@@ -210,6 +211,7 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_event_timer(NULL),
         m_request_per_cur_interval(0),
         m_pending_resp(0),
+        m_last_pushed_req_type(-1),
         m_connection_state(conn_disconnected),
         m_hello(setup_done),
         m_authentication(setup_done),
@@ -591,19 +593,12 @@ int shard_connection::get_local_port()
 
 const char *shard_connection::get_last_request_type()
 {
-    if (!m_pipeline || m_pipeline->empty()) {
-        return "none";
-    }
-
-    // Get the last request in the pipeline (the one at the back)
-    // Note: We can't directly access the back of a std::queue, so we need to check the front
-    // which represents the oldest pending request
-    request *req = m_pipeline->front();
-    if (!req) {
-        return "unknown";
-    }
-
-    switch (req->m_type) {
+    // Read the cached most-recently-pushed type set by push_req(). This is
+    // signal-safe diagnostic output: an aligned `volatile int` read can't tear
+    // on the platforms we support, and we never deref the queue's request*
+    // (which a worker thread might be popping/freeing concurrently).
+    int t = m_last_pushed_req_type;
+    switch (t) {
     case rt_set:
         return "SET";
     case rt_get:
@@ -621,7 +616,7 @@ const char *shard_connection::get_last_request_type()
     case rt_hello:
         return "HELLO";
     default:
-        return "unknown";
+        return "none";
     }
 }
 
@@ -640,6 +635,9 @@ void shard_connection::push_req(request *req)
 {
     m_pipeline->push(req);
     m_pending_resp++;
+    // Snapshot the type for the crash handler (which can't safely deref the
+    // queue front without racing with worker-thread pops/destructors).
+    m_last_pushed_req_type = (int) req->m_type;
     if (m_config->request_rate) {
         // Handle race condition during reconnection - don't assert if interval is 0
         if (m_request_per_cur_interval > 0) {
@@ -880,6 +878,15 @@ void shard_connection::process_response(void)
         case rt_auth:
             if (r->is_error()) {
                 benchmark_error_log("error: authentication failed [%s]\n", r->get_status());
+                {
+                    // Forward the server-side status to the connection-stage
+                    // supervisor so --connection-stage-timeout has actionable
+                    // context to surface (e.g. "called without any password
+                    // configured for the default user.").
+                    char buf[256];
+                    snprintf(buf, sizeof(buf), "AUTH failed: %s", r->get_status() ? r->get_status() : "");
+                    report_connection_stage_failure(buf);
+                }
                 error = true;
             } else {
                 m_authentication = setup_done;
@@ -889,6 +896,11 @@ void shard_connection::process_response(void)
         case rt_select_db:
             if (strcmp(r->get_status(), "+OK") != 0) {
                 benchmark_error_log("database selection failed.\n");
+                {
+                    char buf[256];
+                    snprintf(buf, sizeof(buf), "SELECT failed: %s", r->get_status() ? r->get_status() : "");
+                    report_connection_stage_failure(buf);
+                }
                 error = true;
             } else {
                 benchmark_debug_log("database selection successful.\n");
@@ -898,6 +910,8 @@ void shard_connection::process_response(void)
         case rt_cluster_slots:
             if (r->get_mbulk_value() == NULL || r->get_mbulk_value()->mbulks_elements.size() == 0) {
                 benchmark_error_log("cluster slot failed.\n");
+                report_connection_stage_failure("CLUSTER SLOTS failed (server returned empty or non-cluster reply; "
+                                                "is the server actually cluster-enabled?)");
                 error = true;
             } else {
                 // parse response
@@ -911,6 +925,11 @@ void shard_connection::process_response(void)
         case rt_hello:
             if (r->is_error()) {
                 benchmark_error_log("error: HELLO failed [%s]\n", r->get_status());
+                {
+                    char buf[256];
+                    snprintf(buf, sizeof(buf), "HELLO failed: %s", r->get_status() ? r->get_status() : "");
+                    report_connection_stage_failure(buf);
+                }
                 error = true;
             } else {
                 m_hello = setup_done;
@@ -923,6 +942,22 @@ void shard_connection::process_response(void)
 
             m_conns_manager->handle_response(m_id, now, req, r);
             m_conns_manager->inc_reqs_processed();
+            // First *successful* post-setup response observed: tell the
+            // supervisor we reached steady state. Idempotent.
+            //
+            // We deliberately do NOT count error responses as steady state
+            // — a -ERR can fire on the very first request (e.g. the
+            // 'invalid bulk length' loop from #426 #8) and then close the
+            // connection, dropping the worker into an infinite reconnect
+            // loop that the supervisor would otherwise be disarmed against.
+            if (!r->is_error()) {
+                report_connection_stage_success();
+            } else {
+                // Forward the error so a later abort can attribute it.
+                char buf[256];
+                snprintf(buf, sizeof(buf), "server error: %s", r->get_status() ? r->get_status() : "");
+                report_connection_stage_failure(buf);
+            }
             responses_handled = true;
             break;
         }
@@ -938,6 +973,13 @@ void shard_connection::process_response(void)
 
     if (ret == -1) {
         benchmark_error_log("error: response parsing failed.\n");
+        // A parser failure during the initial probe (e.g. talking memcache_text
+        // to a Redis server, or memcache_binary to redis) puts the worker
+        // into an unrecoverable spin: the bytes never align, the response
+        // never completes, and we never call inc_reqs_processed(). Report it
+        // as a connection-stage failure so the supervisor bounds the spin.
+        // Once steady state is reached this is a no-op.
+        report_connection_stage_failure("response parsing failed (protocol mismatch?)");
     }
 
     if (m_config->reconnect_interval > 0 && responses_handled) {
@@ -1033,6 +1075,28 @@ void shard_connection::handle_event(short events)
     if ((get_connection_state() == conn_in_progress) && (events & BEV_EVENT_CONNECTED)) {
         m_connection_state = conn_connected;
         bufferevent_enable(m_bev, EV_READ | EV_WRITE);
+
+#ifdef USE_TLS
+        // Log the negotiated TLS version and cipher exactly once for the whole
+        // run (not per connection/thread/shard) on the first completed handshake.
+        // All connections share one SSL_CTX and hit the same server config, so
+        // one line is representative. std::call_once makes this thread-safe
+        // across the per-thread event loops.
+        if (m_config->openssl_ctx != NULL && m_bev != NULL) {
+            static std::once_flag tls_info_logged;
+            std::call_once(tls_info_logged, [this]() {
+                SSL *ssl = bufferevent_openssl_get_ssl(m_bev);
+                if (ssl != NULL) {
+                    // SSL_get_version/SSL_get_cipher return stable static strings;
+                    // safe to stash on the (shared) config for the JSON output.
+                    m_config->tls_negotiated_version = SSL_get_version(ssl);
+                    m_config->tls_negotiated_cipher = SSL_get_cipher(ssl);
+                    fprintf(stderr, "TLS connection established: protocol %s, cipher %s\n",
+                            m_config->tls_negotiated_version, m_config->tls_negotiated_cipher);
+                }
+            });
+        }
+#endif
 
         // Cancel connection timeout timer on successful connection
         if (m_connection_timeout_timer != NULL) {
