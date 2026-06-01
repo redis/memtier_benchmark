@@ -19,6 +19,9 @@ on:
     types: [labeled, synchronize, reopened]
     branches: [master, main]
 
+permissions:
+  contents: read
+
 jobs:
   build:
     # On pull_request: only fire when the PR carries the `run-soak` label.
