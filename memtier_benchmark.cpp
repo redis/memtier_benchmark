@@ -1162,6 +1162,18 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 fprintf(stderr, "error: data-size-list must be expressed as [size1:weight1],...[sizeN:weightN].\n");
                 return -1;
             }
+            // Reject entries with zero weight: the size sampler would skip them and
+            // (if every entry has weight 0) loop forever picking nothing. Issue #426.
+            for (std::vector<config_weight_list::weight_item>::iterator it = cfg->data_size_list.item_list.begin();
+                 it != cfg->data_size_list.item_list.end(); ++it) {
+                if (it->weight == 0) {
+                    fprintf(stderr,
+                            "error: data-size-list entries must have weight greater than zero "
+                            "(got size=%u weight=0).\n",
+                            it->size);
+                    return -1;
+                }
+            }
             break;
         case o_expiry_range:
             cfg->expiry_range = config_range(optarg);
@@ -1210,8 +1222,10 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         case o_key_stddev:
             endptr = NULL;
             cfg->key_stddev = strtod(optarg, &endptr);
-            if (cfg->key_stddev <= 0 || !endptr || *endptr != '\0') {
-                fprintf(stderr, "error: key-stddev must be greater than zero.\n");
+            // Reject non-finite stddev (NaN, +/-inf): the Gaussian sampler's
+            // rejection loop would never produce an in-range key. Issue #426.
+            if (!endptr || *endptr != '\0' || !std::isfinite(cfg->key_stddev) || cfg->key_stddev <= 0) {
+                fprintf(stderr, "error: key-stddev must be a finite number greater than zero.\n");
                 return -1;
             }
             break;
@@ -3050,6 +3064,20 @@ int main(int argc, char *argv[])
     }
 
     config_init_defaults(&cfg);
+
+    // Reject Gaussian (G) key-pattern over a degenerate 1-key range: the sampler
+    // requires `median > min && median < max`, which is impossible when the range
+    // has fewer than 2 buckets. Without this check, the Gaussian path trips an
+    // assert (SIGABRT). Issue #426.
+    if (cfg.key_pattern && (cfg.key_pattern[key_pattern_set] == 'G' || cfg.key_pattern[key_pattern_get] == 'G')) {
+        if (cfg.key_maximum < cfg.key_minimum || (cfg.key_maximum - cfg.key_minimum) < 2) {
+            fprintf(stderr,
+                    "error: key-pattern=G requires a key range spanning at least 3 keys "
+                    "(key-maximum - key-minimum >= 2); got key-minimum=%llu key-maximum=%llu.\n",
+                    cfg.key_minimum, cfg.key_maximum);
+            exit(2);
+        }
+    }
 
     // Open the failed-keys log if requested. Failure is reported but doesn't
     // abort the benchmark.
