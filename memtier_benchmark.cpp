@@ -1279,7 +1279,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 cfg->requests = -1;
             else {
                 if (optarg_is_negative(optarg)) {
-                    fprintf(stderr, "error: requests must be a positive integer.\n");
+                    fprintf(stderr, "error: requests must be greater than zero.\n");
                     return -1;
                 }
                 errno = 0;
@@ -1297,7 +1297,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         case 'c':
             endptr = NULL;
             if (optarg_is_negative(optarg)) {
-                fprintf(stderr, "error: clients must be a positive integer.\n");
+                fprintf(stderr, "error: clients must be greater than zero.\n");
                 return -1;
             }
             errno = 0;
@@ -1310,7 +1310,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         case 't':
             endptr = NULL;
             if (optarg_is_negative(optarg)) {
-                fprintf(stderr, "error: threads must be a positive integer.\n");
+                fprintf(stderr, "error: threads must be greater than zero.\n");
                 return -1;
             }
             errno = 0;
@@ -1323,7 +1323,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         case o_test_time:
             endptr = NULL;
             if (optarg_is_negative(optarg)) {
-                fprintf(stderr, "error: test time must be a positive integer.\n");
+                fprintf(stderr, "error: test time must be greater than zero.\n");
                 return -1;
             }
             errno = 0;

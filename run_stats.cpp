@@ -1004,13 +1004,14 @@ void run_stats::summarize(totals &result) const
     result.m_wait_cmd.summarize(totals.m_wait_cmd, test_duration_usec);
     result.m_ar_commands.summarize(totals.m_ar_commands, test_duration_usec);
 
+    // Guard against zero-duration runs (sub-microsecond or Ctrl-C at startup) which would produce +Inf/nan in the JSON.
     // hits,misses / sec
     result.m_hits_sec = test_duration_usec > 0 ? (double) totals.m_get_cmd.m_hits / test_duration_usec * 1000000 : 0.0;
     result.m_misses_sec =
         test_duration_usec > 0 ? (double) totals.m_get_cmd.m_misses / test_duration_usec * 1000000 : 0.0;
 
     // total/sec
-    result.m_ops_sec = (double) result.m_ops / test_duration_usec * 1000000;
+    result.m_ops_sec = (test_duration_usec > 0) ? (double) result.m_ops / test_duration_usec * 1000000 : 0.0;
     const unsigned long long int total_latency_sum =
         totals.m_set_cmd.m_total_latency + totals.m_get_cmd.m_total_latency + totals.m_wait_cmd.m_total_latency +
         totals.m_ar_commands.total_latency();
@@ -1021,15 +1022,24 @@ void run_stats::summarize(totals &result) const
         result.m_latency = 0;
     }
 
-    result.m_bytes_sec = ((result.m_bytes_rx + result.m_bytes_tx) / 1024.0) / test_duration_usec * 1000000;
-    result.m_bytes_sec_rx = (result.m_bytes_rx / 1024.0) / test_duration_usec * 1000000;
-    result.m_bytes_sec_tx = (result.m_bytes_tx / 1024.0) / test_duration_usec * 1000000;
-    result.m_moved_sec = (double) (totals.m_set_cmd.m_moved + totals.m_get_cmd.m_moved) / test_duration_usec * 1000000;
-    result.m_ask_sec = (double) (totals.m_set_cmd.m_ask + totals.m_get_cmd.m_ask) / test_duration_usec * 1000000;
+    result.m_bytes_sec = (test_duration_usec > 0)
+                             ? ((result.m_bytes_rx + result.m_bytes_tx) / 1024.0) / test_duration_usec * 1000000
+                             : 0.0;
+    result.m_bytes_sec_rx =
+        (test_duration_usec > 0) ? (result.m_bytes_rx / 1024.0) / test_duration_usec * 1000000 : 0.0;
+    result.m_bytes_sec_tx =
+        (test_duration_usec > 0) ? (result.m_bytes_tx / 1024.0) / test_duration_usec * 1000000 : 0.0;
+    result.m_moved_sec = (test_duration_usec > 0) ? (double) (totals.m_set_cmd.m_moved + totals.m_get_cmd.m_moved) /
+                                                        test_duration_usec * 1000000
+                                                  : 0.0;
+    result.m_ask_sec = (test_duration_usec > 0)
+                           ? (double) (totals.m_set_cmd.m_ask + totals.m_get_cmd.m_ask) / test_duration_usec * 1000000
+                           : 0.0;
 
     // connection errors/sec
     result.m_connection_errors = totals.m_connection_errors;
-    result.m_connection_errors_sec = (double) totals.m_connection_errors / test_duration_usec * 1000000;
+    result.m_connection_errors_sec =
+        (test_duration_usec > 0) ? (double) totals.m_connection_errors / test_duration_usec * 1000000 : 0.0;
 }
 
 void result_print_to_json(json_handler *jsonhandler, const char *type, double ops_sec, double hits, double miss,
