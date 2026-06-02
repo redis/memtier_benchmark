@@ -795,11 +795,13 @@ void client::handle_response(unsigned int conn_id, struct timeval timestamp, req
                 // bulk), *-1 (null array), or anything else (a value).
                 const char *status = response->get_status();
                 // Miss sentinels: $-1 (null bulk), *-1 (null array, RESP2),
-                // and *0 (empty array - returned by SPOP/SRANDMEMBER with a
-                // count argument when the key is absent). Anything else is
-                // a value (or a non-empty container) and counts as a hit.
+                // *0 (empty array - returned by SPOP/SRANDMEMBER with a
+                // count argument when the key is absent), and "_" (RESP3
+                // null, parsed via single_type and stored verbatim as the
+                // status line without the CRLF). Anything else is a value
+                // (or a non-empty container) and counts as a hit.
                 bool is_null = (status != NULL && (strcmp(status, "$-1") == 0 || strcmp(status, "*-1") == 0 ||
-                                                   strcmp(status, "*0") == 0));
+                                                   strcmp(status, "*0") == 0 || strcmp(status, "_") == 0));
                 // Always one bucket for SingleNullBulk: variadic-key blocking
                 // commands like BLPOP carry the winning key in the reply but
                 // we don't parse it, so per-key attribution beyond hit/miss
@@ -853,7 +855,14 @@ void client::handle_response(unsigned int conn_id, struct timeval timestamp, req
                                 // convention; the value-pointer check is the
                                 // semantically correct one and is forward-
                                 // compatible with a parser that distinguishes.
-                                if (bel != NULL && bel->value != NULL) {
+                                //
+                                // RESP3 nil "_\r\n" goes through single_type
+                                // and is stored as a bulk_el with value="_"
+                                // (strdup of the bare line, value_len==1).
+                                // Treat it as a miss, same as $-1 null bulk.
+                                bool resp3_nil =
+                                    (bel != NULL && bel->value_len == 1 && bel->value != NULL && bel->value[0] == '_');
+                                if (bel != NULL && bel->value != NULL && !resp3_nil) {
                                     h = true;
                                 }
                             } else if (el->is_mbulk_size()) {

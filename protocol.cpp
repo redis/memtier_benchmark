@@ -471,7 +471,16 @@ bool redis_protocol::aggregate_type(char c)
 {
     if (c == '*') return true;
 
-    if (m_resp3 && (c == '%' || c == '~' || c == '|')) return true;
+    // RESP3: map (%), set (~), attribute (|), and push (>) are all aggregate
+    // types.  Push frames (">N\r\n" followed by N elements) are structurally
+    // identical to arrays and can be emitted by Redis 7+ at any point on a
+    // RESP3 connection (pubsub, keyspace notifications, client-tracking
+    // invalidation).  We parse them as ordinary aggregates and discard the
+    // content; the alternative -- returning -1 from parse_response -- tears
+    // down the connection unnecessarily.
+    // TODO: route drained push frames to an out-of-band callback so callers
+    // can observe server-initiated events without disrupting the reply stream.
+    if (m_resp3 && (c == '%' || c == '~' || c == '|' || c == '>')) return true;
 
     return false;
 }

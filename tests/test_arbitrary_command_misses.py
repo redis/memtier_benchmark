@@ -376,6 +376,89 @@ def test_arbitrary_xread_keyword_spec_evaluates_correctly(env):
                    message="expected XREAD misses on missing streams")
 
 
+def _server_supports_resp3(env):
+    """Return True if the Redis server accepts HELLO 3 (Redis 6+)."""
+    try:
+        conn = env.getConnection()
+        # HELLO 3 switches the connection to RESP3 and returns a server map.
+        # Older servers return an error.  We reset back to RESP2 afterwards.
+        resp = conn.execute_command("HELLO", "3")
+        conn.execute_command("HELLO", "2")
+        return resp is not None
+    except Exception:
+        return False
+
+
+def test_arbitrary_get_resp3_nil_counted_as_miss(env):
+    """GET under --protocol=resp3 returns '_\\r\\n' (RESP3 null) for missing
+    keys.  Before the fix the SingleNullBulk sentinel did not include '_' so
+    every RESP3 nil was counted as a hit, silently understating the miss rate.
+
+    Gated by capability detection: the test is skipped when the test Redis
+    does not support HELLO 3 (Redis < 6).
+    """
+    env.skipOnCluster()
+    if not _server_supports_resp3(env):
+        env.skip()
+        return
+
+    _preload_strings(env)
+
+    test_dir = tempfile.mkdtemp()
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--command=GET __key__",
+            "--command-key-pattern=R",
+            "--command-stats-breakdown=line",
+            "--command-miss-tracking=auto",
+            "--key-prefix={}".format(_KEY_PREFIX),
+            "--key-minimum=1",
+            "--key-maximum={}".format(_KEY_RANGE_MAX),
+            "--hide-histogram",
+            "--protocol=resp3",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=1, clients=2, requests=_REQUESTS)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    memtier_ok = benchmark.run()
+    debugPrintMemtierOnError(config, env)
+    env.assertTrue(memtier_ok)
+
+    with open("{}/mb.json".format(config.results_dir)) as fh:
+        result = json.load(fh)
+
+    per_key = result["ALL STATS"].get("Per-Key Misses", {})
+    env.assertContains("GET", per_key,
+                       message="Per-Key Misses section missing GET entry under resp3")
+    cmd_stats = per_key["GET"]
+
+    total_ops = cmd_stats["Total Hits"] + cmd_stats["Total Misses"]
+    env.assertEqual(total_ops, _REQUESTS * 2)
+    # Keys 4..10 do not exist.  With ~70% miss rate expected we insist on at
+    # least one miss so that a zero-miss result (as produced by the pre-fix
+    # code that counted RESP3 nil as a hit) is a test failure.
+    env.assertTrue(
+        cmd_stats["Total Misses"] > 0,
+        message=(
+            "GET under resp3: Total Misses=0 (RESP3 nil '_' not recognised "
+            "as miss sentinel — fix regression in SingleNullBulk handler)"
+        ),
+    )
+    # Basic sanity: total hits must also be non-zero (keys 1..3 do exist).
+    env.assertTrue(
+        cmd_stats["Total Hits"] > 0,
+        message="GET under resp3: Total Hits=0 unexpectedly (keys 1..3 were pre-loaded)",
+    )
+
+
 def test_arbitrary_eval_keynum_spec_runs_cleanly(env):
     """EVAL has Keynum begin_search; verify resolve_command_meta doesn't crash.
 
