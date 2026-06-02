@@ -498,15 +498,23 @@ def test_reconnect_backoff_cap_60s(env):
     now clamps the delay to MEMTIER_BACKOFF_CAP_SEC (60 s) after every
     multiplication.
 
-    This test targets a closed port so every connect attempt fails immediately.
-    It runs memtier for ~10 s, interrupts it, and verifies:
-      1. The process exits cleanly (signal-killed is acceptable; SIGABRT is not).
-      2. No logged backoff value in stderr exceeds 60 seconds.
+    This test targets a closed port so every connect attempt fails.  It runs
+    memtier for 20 s (--test-time=20) then lets it exit naturally.
 
-    Note: the cap is enforced by the constant in shard_connection.cpp; this test
-    provides an end-to-end smoke-check via the log output.  If the log format
-    changes and no "attempting reconnection" lines appear the backoff-value check
-    is skipped with a warning rather than a false failure.
+    Behaviour note: memtier uses libevent non-blocking connects, so each
+    call to connect() returns 0 (in-progress) even against a closed port;
+    the ECONNREFUSED arrives later via the error callback which re-starts the
+    backoff sequence from 1.0 s.  Because of this reset the scheduled delay
+    stays at factor*1.0 = 4.0 s per cycle; a single 20 s window cannot drive
+    the delay up to 60 s.  The cap is therefore validated by direct inspection
+    of MEMTIER_BACKOFF_CAP_SEC in shard_connection.cpp rather than by an
+    end-to-end log check.
+
+    What this test CAN verify end-to-end:
+      1. The process exits cleanly (signal-killed is acceptable; SIGABRT is not).
+      2. At least two "attempting reconnection" log lines are present — the test
+         is not vacuous (memtier actually ran and exercised the reconnect path).
+      3. No logged backoff value in stderr exceeds 60 seconds.
     """
     import subprocess
     import re
@@ -529,12 +537,11 @@ def test_reconnect_backoff_cap_60s(env):
         "--protocol=redis",
         "--threads=1",
         "--clients=1",
-        "--requests=forever",
         "--reconnect-on-error",
         "--reconnect-backoff-factor=4.0",
         "--max-reconnect-attempts=0",  # unlimited
         "--connection-timeout=1",
-        "--test-time=10",
+        "--test-time=20",
     ]
 
     stdout_path = "{}/mb.stdout".format(test_dir)
@@ -575,19 +582,26 @@ def test_reconnect_backoff_cap_60s(env):
     delay_pattern = re.compile(r"attempting reconnection\b.+?\bin\s+([\d.]+)\s+seconds")
     delays = [float(m.group(1)) for m in delay_pattern.finditer(stderr_content)]
 
-    if not delays:
-        env.debugPrint(
-            "WARNING: no 'attempting reconnection ... in X seconds' lines found in "
-            "stderr; backoff-cap assertion skipped.  Cap is covered by direct "
-            "inspection of MEMTIER_BACKOFF_CAP_SEC in shard_connection.cpp.",
-            True,
-        )
-    else:
-        env.debugPrint("Observed backoff delays (s): {}".format(delays), True)
-        max_observed = max(delays)
-        env.debugPrint("Max observed backoff: {:.2f}s".format(max_observed), True)
-        env.assertLessEqual(
-            max_observed,
-            60.0,
-            message="Backoff exceeded 60 s cap: {:.2f} s observed".format(max_observed),
-        )
+    env.debugPrint("Observed backoff delays (s): {}".format(delays), True)
+
+    # The test ran for 20 s; with a 4 s reconnect cycle at least 2 reconnect
+    # attempts must have been logged (proves memtier stayed alive and tried).
+    env.assertGreaterEqual(
+        len(delays),
+        2,
+        message=(
+            "Expected at least 2 reconnect delay log lines, got {}. "
+            "memtier may have exited immediately (bad option or crash) rather "
+            "than actually exercising the reconnect path.".format(len(delays))
+        ),
+    )
+
+    max_observed = max(delays)
+    env.debugPrint("Max observed backoff: {:.2f}s".format(max_observed), True)
+
+    # Cap must not be exceeded.
+    env.assertLessEqual(
+        max_observed,
+        60.0,
+        message="Backoff exceeded 60 s cap: {:.2f} s observed".format(max_observed),
+    )
