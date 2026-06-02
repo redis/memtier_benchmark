@@ -236,7 +236,8 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_replay_queue(NULL),
         m_retry_drain_timer(NULL),
         m_current_retry_backoff_ms(0.0),
-        m_deferred_fill_timer(NULL)
+        m_deferred_fill_timer(NULL),
+        m_bev_paused(false)
 {
     m_id = id;
     m_conns_manager = conns_man;
@@ -346,6 +347,10 @@ void shard_connection::setup_event(int sockfd)
     if (m_bev) {
         bufferevent_free(m_bev);
     }
+    // Fresh bufferevent below starts enabled by default (after we call
+    // bufferevent_enable in handle_event on BEV_EVENT_CONNECTED); reset the
+    // pause flag so we don't carry stale state from a prior socket.
+    m_bev_paused = false;
 
 #ifdef USE_TLS
     if (m_config->openssl_ctx) {
@@ -467,6 +472,8 @@ void shard_connection::disconnect()
         bufferevent_free(m_bev);
         m_bev = NULL;
     }
+    // After free, any future bufferevent starts in the default (enabled) state.
+    m_bev_paused = false;
 
     if (m_event_timer != NULL) {
         event_free(m_event_timer);
@@ -1030,8 +1037,13 @@ void shard_connection::fill_pipeline(void)
 
     // Re-enable I/O in case a prior idle period disabled the bufferevent
     // (e.g. a --transaction non-pin connection that was held by hold_pipeline).
-    if (m_bev != NULL && get_connection_state() == conn_connected) {
+    // Gate on m_bev_paused so this lock-taking libevent call only fires when
+    // we actually need to undo a prior pause -- fill_pipeline runs per
+    // response received, so an unconditional enable here showed up as a ~4%
+    // ops/sec regression in the canonical SET/GET micro-bench.
+    if (m_bev != NULL && m_bev_paused && get_connection_state() == conn_connected) {
         bufferevent_enable(m_bev, EV_READ | EV_WRITE);
+        m_bev_paused = false;
     }
 
     while (!m_conns_manager->finished() && m_pipeline->size() < m_config->pipeline) {
@@ -1072,6 +1084,7 @@ void shard_connection::fill_pipeline(void)
                 m_conns_manager->disconnect_all();
             } else if (!m_config->request_rate) {
                 bufferevent_disable(m_bev, EV_WRITE | EV_READ);
+                m_bev_paused = true;
             }
         }
     }
@@ -1086,6 +1099,7 @@ void shard_connection::handle_event(short events)
     if ((get_connection_state() == conn_in_progress) && (events & BEV_EVENT_CONNECTED)) {
         m_connection_state = conn_connected;
         bufferevent_enable(m_bev, EV_READ | EV_WRITE);
+        m_bev_paused = false;
 
 #ifdef USE_TLS
         // Log the negotiated TLS version and cipher exactly once for the whole
@@ -1195,6 +1209,7 @@ void shard_connection::schedule_fill(void)
     // Re-enable I/O in case fill_pipeline silenced this connection while it
     // was blocked by transaction-mode hold_pipeline.
     bufferevent_enable(m_bev, EV_READ | EV_WRITE);
+    m_bev_paused = false;
     if (m_deferred_fill_timer == NULL) {
         m_deferred_fill_timer = event_new(m_event_base, -1, 0, deferred_fill_pipeline_cb, this);
         if (m_deferred_fill_timer == NULL) {
