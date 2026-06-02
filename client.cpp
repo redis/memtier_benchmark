@@ -857,12 +857,13 @@ void client::handle_response(unsigned int conn_id, struct timeval timestamp, req
                                 // compatible with a parser that distinguishes.
                                 //
                                 // RESP3 nil "_\r\n" goes through single_type
-                                // and is stored as a bulk_el with value="_"
-                                // (strdup of the bare line, value_len==1).
-                                // Treat it as a miss, same as $-1 null bulk.
-                                bool resp3_nil =
-                                    (bel != NULL && bel->value_len == 1 && bel->value != NULL && bel->value[0] == '_');
-                                if (bel != NULL && bel->value != NULL && !resp3_nil) {
+                                // and is stored as a bulk_el with is_resp3_null
+                                // set to true. Using the flag (set at parse time)
+                                // avoids false positives from a legitimate bulk
+                                // string whose content happens to be the single
+                                // character '_' (parsed via blob_type, which
+                                // never sets is_resp3_null). Treat it as a miss.
+                                if (bel != NULL && bel->value != NULL && !bel->is_resp3_null) {
                                     h = true;
                                 }
                             } else if (el->is_mbulk_size()) {

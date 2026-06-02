@@ -482,3 +482,97 @@ def test_arbitrary_eval_keynum_spec_runs_cleanly(env):
     eval_entry = all_stats.get("Evals", {})
     env.assertTrue(eval_entry.get("Count", 0) > 0,
                    message="expected EVAL to run (Keynum spec evaluation)")
+
+
+def test_arbitrary_get_resp3_literal_underscore_not_counted_as_miss(env):
+    """GET under --protocol=resp3 must NOT count a literal '_' value as a miss.
+
+    Bugbot LOW on PR #435: the ArrayPerElementNulls walker used a content
+    heuristic (value_len==1 && value[0]=='_') that could not distinguish
+    a RESP3 null (parsed by single_type as strdup("_")) from a legitimate
+    bulk string whose content is the single character '_' (parsed via
+    blob_type from '$1\\r\\n_\\r\\n').  Both produced identical bulk_el
+    value/value_len before the fix.
+
+    The fix adds a bulk_el::is_resp3_null flag set only by single_type when
+    the type byte is '_', so blob_type-constructed elements (real data) are
+    never mistaken for nulls.
+
+    This test pre-populates keys with the literal value '_', then runs GET
+    under resp3 and asserts that Total Misses < total operations (i.e. at
+    least the pre-populated keys are counted as hits, not as nulls).
+    """
+    env.skipOnCluster()
+    if not _server_supports_resp3(env):
+        env.skip()
+        return
+
+    # Populate ALL keys in the range with the literal value "_"
+    # so that every GET in the benchmark hits an existing key.
+    env.flush()
+    conn = env.getConnection()
+    for i in range(1, _KEY_RANGE_MAX + 1):
+        conn.set("{}{}".format(_KEY_PREFIX, i), "_")
+
+    test_dir = tempfile.mkdtemp()
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--command=GET __key__",
+            "--command-key-pattern=R",
+            "--command-stats-breakdown=line",
+            "--command-miss-tracking=auto",
+            "--key-prefix={}".format(_KEY_PREFIX),
+            "--key-minimum=1",
+            "--key-maximum={}".format(_KEY_RANGE_MAX),
+            "--hide-histogram",
+            "--protocol=resp3",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=1, clients=2, requests=_REQUESTS)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    memtier_ok = benchmark.run()
+    debugPrintMemtierOnError(config, env)
+    env.assertTrue(memtier_ok)
+
+    with open("{}/mb.json".format(config.results_dir)) as fh:
+        result = json.load(fh)
+
+    per_key = result["ALL STATS"].get("Per-Key Misses", {})
+    env.assertContains("GET", per_key,
+                       message="Per-Key Misses section missing GET entry under resp3")
+    cmd_stats = per_key["GET"]
+
+    total_ops = cmd_stats["Total Hits"] + cmd_stats["Total Misses"]
+    env.assertEqual(total_ops, _REQUESTS * 2)
+
+    # Every key in [1, KEY_RANGE_MAX] was populated with "_".  With the
+    # content-heuristic bug, all of these would be counted as RESP3 nulls
+    # (misses).  With the is_resp3_null flag fix, the blob_type-constructed
+    # bulk_el carries is_resp3_null=false, so they are correctly counted as
+    # hits.  Assert that Total Misses is strictly less than total_ops
+    # (i.e. at least one hit was observed) and that Total Hits > 0.
+    env.assertTrue(
+        cmd_stats["Total Hits"] > 0,
+        message=(
+            "GET resp3 with literal '_' values: Total Hits=0 — the content "
+            "heuristic is falsely counting real '_' values as RESP3 nulls "
+            "(is_resp3_null flag fix not applied or not working)"
+        ),
+    )
+    env.assertEqual(
+        cmd_stats["Total Misses"],
+        0,
+        message=(
+            "GET resp3 with literal '_' values: Total Misses={} but all keys "
+            "are populated — '_' bulk values are being wrongly counted as "
+            "RESP3 null misses".format(cmd_stats["Total Misses"])
+        ),
+    )

@@ -625,6 +625,11 @@ int redis_protocol::parse_response(void)
                     bulk_el *new_bulk = new bulk_el();
                     new_bulk->value = bulk_value;
                     new_bulk->value_len = strlen(bulk_value);
+                    // Mark RESP3 null elements explicitly so the walker can
+                    // distinguish them from a legitimate bulk string whose
+                    // content happens to be the single character '_' (which
+                    // would arrive via blob_type / rs_read_bulk, not here).
+                    new_bulk->is_resp3_null = (line[0] == '_');
 
                     // insert it to current mbulk
                     m_current_mbulk->add_new_element(new_bulk);
