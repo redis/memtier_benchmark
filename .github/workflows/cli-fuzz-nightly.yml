@@ -1,0 +1,103 @@
+name: CLI Fuzz (Hypothesis)
+
+# Hypothesis-based CLI argument fuzzer for memtier_benchmark.
+# Exercises FLAG_SPECS with weird/degenerate values and asserts that the
+# binary never crashes, hangs, or trips a sanitizer needle -- the parser
+# and connection-stage-timeout supervisor are expected to bound all inputs.
+#
+# Trigger surface:
+#   * nightly cron (always-on regression baseline; large example budget)
+#   * manual workflow_dispatch (honours optional MEMTIER_FUZZ_MAX_EXAMPLES)
+#   * PR with the `run-cli-fuzz` label -- lets an author opt in when the
+#     change plausibly affects CLI parsing, the connection supervisor, or
+#     the key/data-size sampler:
+#         gh pr edit <num> --add-label run-cli-fuzz
+#     Smaller example count (50) so PR feedback is fast (~2-3 min).
+
+on:
+  schedule:
+    - cron: '47 4 * * *'
+  workflow_dispatch:
+    inputs:
+      max_examples:
+        description: 'MEMTIER_FUZZ_MAX_EXAMPLES override (default 500)'
+        required: false
+        default: '500'
+  pull_request:
+    types: [labeled, synchronize, reopened]
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+jobs:
+  cli-fuzz:
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'run-cli-fuzz')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get install -y \
+            build-essential autoconf automake pkg-config \
+            libevent-dev libssl-dev zlib1g-dev
+
+      - name: Build with ASAN+UBSan (catches silent corruptions)
+        run: |
+          autoreconf -ivf
+          ./configure --enable-sanitizers --enable-ubsan
+          make -j
+
+      - name: Smoke-test binary
+        run: ./memtier_benchmark --version
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Python test dependencies
+        run: pip install -r ./tests/test_requirements.txt
+
+      - name: Install Redis
+        run: |
+          curl -fsSL https://packages.redis.io/gpg | \
+            sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] \
+            https://packages.redis.io/deb $(lsb_release -cs) main" | \
+            sudo tee /etc/apt/sources.list.d/redis.list
+          sudo apt-get -qq update
+          sudo apt-get install -y redis
+          sudo service redis-server stop || true
+
+      - name: Start local Redis
+        run: |
+          redis-server --daemonize yes --port 6379 --save "" --logfile /tmp/redis.log
+
+      - name: Run CLI fuzzer
+        env:
+          MEMTIER_FUZZ: "1"
+          MEMTIER_BINARY: ${{ github.workspace }}/memtier_benchmark
+          MEMTIER_FUZZ_HOST: "127.0.0.1"
+          MEMTIER_FUZZ_PORT: "6379"
+          # Smaller budget on PR-label runs; larger on nightly/manual.
+          MEMTIER_FUZZ_MAX_EXAMPLES: >-
+            ${{ github.event_name == 'pull_request' && '50' ||
+                (inputs.max_examples || '500') }}
+          ASAN_OPTIONS: "detect_leaks=1:abort_on_error=1"
+          UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
+        run: |
+          python -m pytest tests/cli_fuzz.py -q --tb=short --hypothesis-seed=0
+
+      - name: Upload hypothesis database on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-fuzz-hypothesis-db
+          path: .hypothesis/
+          retention-days: 14
+          if-no-files-found: ignore

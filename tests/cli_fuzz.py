@@ -89,6 +89,10 @@ weird_int = st.one_of(
             " ",
             "1.5",
             "1,5",
+            # Negative values: #436 parser rejects these before any
+            # allocation or workload loop can run.
+            "-1",
+            "-100",
         ]
     ),
     st.integers(min_value=0, max_value=10000).map(str),
@@ -154,17 +158,16 @@ ratio_like = st.sampled_from(
     ]
 )
 
-# Gaussian (G:G) is intentionally absent here: with the harness default
-# key range (--key-maximum=10000000 implicit) it's fine, but if hypothesis
-# also picks a narrow --key-maximum or an unhealthy --key-stddev value
-# (inf/nan), the Gaussian sampler either aborts or spins forever instead
-# of failing the parser-error path. Filed as a follow-up.
+# G:G (Gaussian) is now included: #430 parser rejects degenerate
+# key-range / key-stddev combinations before the sampler runs, so the
+# previous risk of an infinite spin no longer applies.
 key_pattern_like = st.sampled_from(
     [
         "R:R",
         "S:S",
         "P:P",
         "Z:Z",
+        "G:G",
         "X:X",
         "",
         "RR",
@@ -205,15 +208,11 @@ miss_tracking_like = st.sampled_from(["auto", "off", "", "on", "AUTO"])
 percentiles_like = st.sampled_from(
     ["50,99,99.9", "50.50.50", "50,", ",50", "", "100", "-1", "50,abc"]
 )
-# --data-size-list parser:
-#   * "8:0"  -> hang (entries with zero weight aren't culled, sampling
-#              never picks anything to emit).
-#   * "0:50" -> crash (zero-size SET fires the value_len>0 assert in
-#              protocol.cpp).
-# Both filed as follow-ups; trimmed from the corpus so the fuzzer stays
-# focused on the *parser* shapes (empty, trailing comma, missing colon...).
+# --data-size-list:
+#   * "8:0"  -> now safe: #430 parser rejects zero-weight entries.
+#   * "0:50" -> now safe: #428 parser rejects zero-size entries.
 data_size_list_like = st.sampled_from(
-    ["8:50,16:50", "", "8", "8:50,", ",8:50", "8:50:50"]
+    ["8:50,16:50", "", "8", "8:50,", ",8:50", "8:50:50", "8:0", "0:50"]
 )
 
 # --run-count is multiplied into wall-clock: N iterations of --test-time=1
@@ -275,13 +274,12 @@ command_like = st.sampled_from(
 FLAG_SPECS = [
     # General / connection.
     #
-    # Intentionally excluded from this fuzzer (each one tracked as a
-    # follow-up bug; see PR description):
-    #   * --authenticate: a wrong/empty password keeps memtier retrying past
-    #     --test-time when the server has no auth configured, blowing
-    #     through the 10s timeout.
-    #   * --cluster-mode: against a standalone server it loops in
-    #     "cluster slot failed" indefinitely instead of exiting cleanly.
+    # --authenticate and --cluster-mode are now included: the
+    # --connection-stage-timeout supervisor (#431) terminates the connect-
+    # loop before the 10s subprocess deadline is hit, so both are safe
+    # to fuzz against a standalone server.
+    ("--authenticate", weird_str),
+    ("--cluster-mode", None),
     ("--protocol", protocol_like),
     ("--run-count", run_count_like),
     ("--ipv4", None),
@@ -351,11 +349,12 @@ FLAG_SPECS = [
     ("--key-stddev", weird_float),
     ("--key-median", weird_float),
     ("--key-zipf-exp", weird_float),
-    # WAIT-family flags (--wait-ratio, --num-slaves, --wait-timeout) are
-    # excluded: they require a replication topology and against a standalone
-    # Redis they block on WAIT(n,t) for the full timeout, blowing the
-    # 10s subprocess deadline. Like --cluster-mode and --tls*, fuzzing them
-    # properly needs a dedicated harness; see #410 follow-ups.
+    # WAIT-family flags: --wait-ratio with an unsatisfiable value is now
+    # safe because #431 bounds the connect-loop; the parser rejects or the
+    # supervisor terminates before the 10s subprocess deadline.
+    ("--wait-ratio", ratio_like),
+    ("--num-slaves", weird_int),
+    ("--wait-timeout", weird_int),
 ]
 
 
