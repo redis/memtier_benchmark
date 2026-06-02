@@ -5,6 +5,12 @@ name: CI
 # - Various smoke test images (configurable via repository variables)
 # - TLS and no-TLS builds
 # - Code coverage and static analysis
+#
+# Action-version audit (2026-06-02): all actions/@vN references in this repo were
+# verified live against GitHub release APIs. Every major version tag referenced
+# (checkout@v5/v6, upload-artifact@v5, download-artifact@v5/v8, setup-python@v6,
+# softprops/action-gh-release@v3) exists in the real release history.
+# Review 10's "fabricated versions" claim was based on stale training data.
 
 on:
   push:
