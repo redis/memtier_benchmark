@@ -52,6 +52,16 @@
 #include "retry_policy.h"
 #include "event2/bufferevent.h"
 
+// Maximum backoff delay enforced after every exponential-backoff multiplication.
+// Without a cap, a factor of 2.0 and --max-reconnect-attempts=0 (unlimited)
+// causes the delay to double on every attempt: after ~30 doublings the next
+// scheduled reconnect or retry fires in ~34 years. event_add() silently absorbs
+// that value, making the benchmark go effectively dark instead of surfacing the
+// underlying failure.  60 s is a practical upper bound: tight enough to remain
+// responsive, large enough to avoid thundering-herd reconnect storms.
+static const double MEMTIER_BACKOFF_CAP_SEC = 60.0;
+static const double MEMTIER_BACKOFF_CAP_MS = 60000.0;
+
 #ifdef USE_TLS
 #include <mutex>
 #include <openssl/ssl.h>
@@ -761,6 +771,7 @@ bool shard_connection::enqueue_retry(request *req)
     // Exponential backoff for the *next* retry on this connection.
     if (m_config->retry_backoff_factor > 0.0) {
         m_current_retry_backoff_ms *= m_config->retry_backoff_factor;
+        if (m_current_retry_backoff_ms > MEMTIER_BACKOFF_CAP_MS) m_current_retry_backoff_ms = MEMTIER_BACKOFF_CAP_MS;
     }
 
     return true;
@@ -1211,6 +1222,7 @@ void shard_connection::attempt_reconnect(const char *error_context)
         m_reconnect_attempts++;
         if (m_config->reconnect_backoff_factor > 0.0) {
             m_current_backoff_delay *= m_config->reconnect_backoff_factor;
+            if (m_current_backoff_delay > MEMTIER_BACKOFF_CAP_SEC) m_current_backoff_delay = MEMTIER_BACKOFF_CAP_SEC;
         }
 
         if (m_config->max_reconnect_attempts == 0) {
