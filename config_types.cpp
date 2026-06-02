@@ -299,6 +299,13 @@ static int hex_digit_to_int(char c)
     }
 }
 
+// NOTE: this constructor stores cmd as a C-string (std::string(const char*)),
+// so any embedded NUL bytes from a monitor-input payload are truncated at
+// this layer. load_from_file preserves them in the std::string it builds, but
+// the dispatch path calls this ctor via .c_str() and re-truncates.
+// Tracked as a separate follow-up: change to a (data, len) interface and
+// propagate through split_command_to_args / send so that binary blobs
+// replayed from MONITOR output survive end-to-end.
 arbitrary_command::arbitrary_command(const char *cmd) :
         command(cmd),
         key_pattern('R'),
@@ -539,6 +546,10 @@ bool arbitrary_command::set_ratio(const char *ratio_str)
 
 bool arbitrary_command::split_command_to_args()
 {
+    // command.c_str() yields a NUL-terminated view: any embedded \0 bytes
+    // (e.g. from a binary MONITOR payload preserved by load_from_file) will
+    // terminate the pointer-walk in the loop below. Full binary blob support
+    // requires moving to a (data, len) interface throughout this path.
     const char *p = command.c_str();
     size_t command_len = command.length();
 
@@ -738,7 +749,10 @@ bool monitor_command_list::load_from_file(const char *filename)
             size_t seg_len = seg_end ? (size_t) (seg_end - seg_start) : (size_t) (line + line_len - seg_start);
 
             total_lines++;
-            // Find the first quote - this is where the command starts
+            // Find the first quote - this is where the command starts.
+            // memchr respects the explicit byte count so NUL bytes in the
+            // metadata prefix don't cause early termination (strchr stopped
+            // at \0).
             char *first_quote = (char *) memchr(seg_start, '"', seg_len);
             if (!first_quote) {
                 seg_start = seg_end ? seg_end + 1 : line + line_len;
