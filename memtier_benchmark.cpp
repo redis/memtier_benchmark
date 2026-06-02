@@ -1888,6 +1888,19 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 }
                 tls_token = std::strtok(NULL, tls_delimiter);
             }
+// On OpenSSL 4.0+ the per-version SSL_OP_NO_TLSv1_x disable constants are
+// removed, so the gap-mask blocks in ssl_ctx_init compile to nothing.  A
+// non-contiguous selection (e.g. tlsv1,tlsv1.2) would silently enable the
+// intermediate version inside the envelope range.  Fail fast instead.
+#if OPENSSL_VERSION_NUMBER >= 0x40000000L
+            if (!bitmask_is_contiguous(cfg->tls_protocols)) {
+                fprintf(stderr, "error: --tls-protocols non-contiguous selection is not\n"
+                                "       supported on OpenSSL 4.0+ (per-version disable flags\n"
+                                "       were removed). Either specify a contiguous range or\n"
+                                "       build against OpenSSL <= 3.x.\n");
+                return -1;
+            }
+#endif
             break;
         }
 #endif
@@ -3057,6 +3070,33 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
 }
 
 #ifdef USE_TLS
+
+// On OpenSSL 4.0+ the per-version SSL_OP_NO_TLSv1_x disable constants are
+// removed, so the gap-mask blocks in ssl_ctx_init compile to nothing.  A
+// non-contiguous --tls-protocols selection (e.g. tlsv1,tlsv1.2) would
+// silently enable the intermediate version inside the envelope range.
+// bitmask_is_contiguous() is used by the parser to fail fast in that case.
+#if OPENSSL_VERSION_NUMBER >= 0x40000000L
+// Returns true if the set bits in 'mask' form a contiguous run with no zero
+// gaps between the lowest and highest set bits.  A single set bit, or zero,
+// is trivially contiguous.
+// Examples (4-bit TLS protocol mask):
+//   0x4 (TLSv1.2 only)         -> contiguous
+//   0x6 (TLSv1.1 | TLSv1.2)   -> contiguous
+//   0x5 (TLSv1.0 | TLSv1.2)   -> NOT contiguous (TLSv1.1 gap)
+static bool bitmask_is_contiguous(unsigned int mask)
+{
+    if (mask == 0) return true;
+    // Fill every bit from the lowest set bit up to (and including) the highest
+    // set bit.  If the result equals the original mask the bits are contiguous.
+    unsigned int lowest = mask & (-mask);                    // isolate lowest set bit
+    unsigned int highest = 1u << (31 - __builtin_clz(mask)); // isolate highest
+    // Build fill: highest*2 - 1 clears everything above highest;
+    // subtracting lowest-1 clears everything below lowest.
+    unsigned int fill = (highest * 2 - 1) & ~(lowest - 1);
+    return mask == fill;
+}
+#endif /* OPENSSL_VERSION_NUMBER >= 0x40000000L */
 
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
 // OpenSSL < 1.1.0 requires the application to register its own locking
