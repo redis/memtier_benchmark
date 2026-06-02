@@ -527,6 +527,7 @@ bool redis_protocol::response_ended()
     // and do NOT signal a complete reply for the push.
     if (m_push) {
         m_push = false;
+        m_response_len = 0; // reset: push bytes don't count toward the next reply
         return false;
     }
 
