@@ -241,7 +241,13 @@ bool cluster_client::connect_shard_connection(shard_connection *sc, char *addres
         // Commands in the cleared staged queue were already counted in m_reqs_generated at
         // staging time. Compensate so a --requests run is not left waiting for responses
         // that will never arrive.
-        m_reqs_generated -= empty_staged.size();
+        // Defensive clamp: today entries in empty_staged are popped before m_reqs_generated
+        // is decremented so underflow cannot occur, but guard explicitly so a future
+        // refactor does not silently wrap to 2^64.  Matches the pattern at hold_pipeline.
+        {
+            const size_t n = empty_staged.size();
+            m_reqs_generated -= (m_reqs_generated >= n) ? n : m_reqs_generated;
+        }
     }
 
     // save address and port
@@ -501,7 +507,14 @@ void cluster_client::handle_cluster_slots(protocol_response *r)
             if (!m_staged_monitor_commands[i].empty()) {
                 std::queue<staged_monitor_cmd> empty_staged;
                 std::swap(m_staged_monitor_commands[i], empty_staged);
-                m_reqs_generated -= empty_staged.size();
+                // Defensive clamp: entries in empty_staged are popped before
+                // m_reqs_generated is decremented so underflow cannot occur today,
+                // but guard explicitly so a future refactor does not silently wrap
+                // to 2^64.  Matches the pattern at hold_pipeline.
+                {
+                    const size_t n = empty_staged.size();
+                    m_reqs_generated -= (m_reqs_generated >= n) ? n : m_reqs_generated;
+                }
             }
             if (m_connections[i]->get_connection_state() != conn_disconnected) {
                 m_connections[i]->disconnect();
@@ -1067,7 +1080,14 @@ void cluster_client::handle_moved(unsigned int conn_id, struct timeval timestamp
         std::swap(m_staged_monitor_commands[conn_id], empty_staged);
         // Staged commands were already counted in m_reqs_generated at staging time.
         // Compensate so a --requests run does not hang waiting for phantom responses.
-        m_reqs_generated -= empty_staged.size();
+        // Defensive clamp: entries in empty_staged are popped before m_reqs_generated
+        // is decremented so underflow cannot occur today, but guard explicitly so a
+        // future refactor does not silently wrap to 2^64.  Matches the pattern at
+        // hold_pipeline.
+        {
+            const size_t n = empty_staged.size();
+            m_reqs_generated -= (m_reqs_generated >= n) ? n : m_reqs_generated;
+        }
     }
 
     // set connection to send 'CLUSTER SLOTS' command
