@@ -595,6 +595,11 @@ def test_reconnect_backoff_cap_60s(env):
             "than actually exercising the reconnect path.".format(len(delays))
         ),
     )
+    # RLTest assertions are soft: assertGreaterEqual records a failure but does
+    # not halt execution.  Guard here so that max(delays) is never reached on
+    # an empty list (which would raise ValueError and mask the real failure).
+    if not delays:
+        return
 
     max_observed = max(delays)
     env.debugPrint("Max observed backoff: {:.2f}s".format(max_observed), True)
