@@ -85,8 +85,14 @@ def _wait_for_port(host, port, timeout=5.0):
     return False
 
 
-def _run_fixture(env, fixture_name):
+def _run_fixture(env, fixture_name, cluster_mode=False):
     """Spin up mock_redis_resp_fuzzer + memtier for one fixture.
+
+    When *cluster_mode* is True, memtier is launched with ``--cluster-mode``
+    so that its bootstrap issues ``CLUSTER SLOTS`` and the reply parser branch
+    in ``cluster_client::handle_cluster_slots`` is actually exercised. The
+    mock server is started *without* ``--passthrough-cluster`` in that case so
+    the adversarial fixture bytes are served as the CLUSTER SLOTS reply.
 
     Returns (crashed, needle_hit, hung, exit_code, stderr_text).
     """
@@ -104,17 +110,24 @@ def _run_fixture(env, fixture_name):
     )
     mock_log.close()
 
+    mock_cmd = [
+        sys.executable,
+        MOCK_SERVER,
+        "--port",
+        str(port),
+        "--fixture",
+        fixture_path,
+        "--verbose",
+    ]
+    # When running in cluster_mode the mock must NOT receive
+    # --passthrough-cluster: we want the malformed bytes to be served as the
+    # CLUSTER SLOTS reply so that handle_cluster_slots actually sees
+    # adversarial input. For standalone runs the CLUSTER verb is never sent
+    # by memtier anyway, so no flag is needed.
+
     with open(mock_log.name, "wb") as logf:
         mock_proc = subprocess.Popen(
-            [
-                sys.executable,
-                MOCK_SERVER,
-                "--port",
-                str(port),
-                "--fixture",
-                fixture_path,
-                "--verbose",
-            ],
+            mock_cmd,
             stdout=logf,
             stderr=subprocess.STDOUT,
         )
@@ -152,6 +165,8 @@ def _run_fixture(env, fixture_name):
                 # Suppress the JSON output - we only care about exit/stderr.
                 "--json-out-file=/dev/null",
             ]
+            if cluster_mode:
+                args.append("--cluster-mode")
             with open(stdout_path, "w") as out, open(stderr_path, "w") as err:
                 mem_proc = subprocess.Popen(args, stdout=out, stderr=err)
             try:
@@ -190,10 +205,10 @@ def _run_fixture(env, fixture_name):
     return (crashed, needle_hit, hung, exit_code, stderr_text)
 
 
-def _assert_no_crash(env, fixture_name):
+def _assert_no_crash(env, fixture_name, cluster_mode=False):
     """Run one fixture and assert no crash / no hang / no needle."""
     crashed, needle_hit, hung, exit_code, stderr_text = _run_fixture(
-        env, fixture_name
+        env, fixture_name, cluster_mode=cluster_mode
     )
 
     # _run_fixture returns a "mock server failed to bind" stderr_text when
@@ -330,23 +345,19 @@ def test_unsolicited_reply(env):
 
 def test_cluster_slots_malformed(env):
     """
-    `cluster_slots_malformed.bin` is meaningful only against memtier in
-    --cluster-mode, where the client actually issues `CLUSTER SLOTS`
-    during bootstrap. In standalone mode the parser branch we want to
-    exercise (`cluster_client::handle_cluster_slots`) is never reached,
-    so a standalone run of this fixture is a no-op rather than a real
-    test.
+    Run memtier in --cluster-mode against the `cluster_slots_malformed.bin`
+    fixture so that the bootstrap CLUSTER SLOTS call receives adversarial
+    input and exercises `cluster_client::handle_cluster_slots`.
 
-    The cluster-mode run currently *crashes* memtier with SIGSEGV on
-    master -- see follow-up issue redis/memtier_benchmark#417. Once
-    that crash is fixed, remove this skip and call _assert_no_crash
-    with the cluster-mode flag added in _run_fixture.
+    PR #425 added full shape-validation to handle_cluster_slots (null
+    top-level array, empty topology, per-shard mbulk type checks, slot
+    bound range/order checks, zero-length and NUL-embedded host/port, and
+    every-shard-malformed fallback) so the SIGSEGV from issue #417 no
+    longer occurs.  The skip that was guarded by that TODO is removed here.
     """
     if _skip_if_unsupported(env):
         return
-    # TODO(#417): remove skip once cluster_client::handle_cluster_slots
-    # validates its input array shape.
-    env.skip()
+    _assert_no_crash(env, "cluster_slots_malformed.bin", cluster_mode=True)
 
 
 def test_truncated_frame_dribble(env):
