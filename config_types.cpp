@@ -718,30 +718,56 @@ bool monitor_command_list::load_from_file(const char *filename)
 
     // Use getline() for dynamic allocation - handles arbitrarily long lines
     while ((line_len = getline(&line, &line_capacity, file)) != -1) {
-        total_lines++;
-        // Find the first quote - this is where the command starts
-        char *first_quote = strchr(line, '"');
-        if (!first_quote) {
-            continue; // Skip lines without commands
+        // Normalise CR-only line endings (\r without \n) by replacing every
+        // bare \r with \n so that the segment loop below works uniformly.
+        // getline already consumed the terminating \n (if any), so a trailing
+        // \r here is a CRLF remnant stripped below; internal \r bytes are the
+        // classic-Mac / some-Windows-export case that must be split on.
+        for (ssize_t i = 0; i < line_len - 1; i++) {
+            if (line[i] == '\r' && line[i + 1] != '\n') {
+                line[i] = '\n';
+            }
         }
 
-        // Extract everything from first quote to end of line
-        // We keep the quotes as-is to avoid re-parsing
-        std::string command_str(first_quote);
+        // Process each \n-delimited segment within the (possibly rewritten) buffer.
+        // In the common case there is exactly one segment and no extra allocation occurs.
+        char *seg_start = line;
+        char *seg_end;
+        while (seg_start < line + line_len) {
+            seg_end = (char *) memchr(seg_start, '\n', line + line_len - seg_start);
+            size_t seg_len = seg_end ? (size_t) (seg_end - seg_start) : (size_t) (line + line_len - seg_start);
 
-        // Remove trailing newline if present
-        if (!command_str.empty() && command_str[command_str.length() - 1] == '\n') {
-            command_str.erase(command_str.length() - 1);
+            total_lines++;
+            // Find the first quote - this is where the command starts
+            char *first_quote = (char *) memchr(seg_start, '"', seg_len);
+            if (!first_quote) {
+                seg_start = seg_end ? seg_end + 1 : line + line_len;
+                continue; // Skip segments without commands
+            }
+
+            // Extract everything from first quote to end of segment.
+            // Use the explicit byte-count constructor so that embedded \0
+            // bytes in binary blobs are preserved (the C-string ctor would
+            // silently truncate at the first \0).
+            size_t cmd_len = seg_len - (size_t) (first_quote - seg_start);
+            std::string command_str(first_quote, cmd_len);
+
+            // Remove trailing newline / carriage-return if present
+            if (!command_str.empty() && command_str[command_str.length() - 1] == '\n') {
+                command_str.erase(command_str.length() - 1);
+            }
+            if (!command_str.empty() && command_str[command_str.length() - 1] == '\r') {
+                command_str.erase(command_str.length() - 1);
+            }
+
+            commands.push_back(command_str);
+
+            // Extract and store the command type (e.g., "SET", "GET")
+            std::string cmd_type = extract_command_type(command_str);
+            command_types.push_back(cmd_type);
+
+            seg_start = seg_end ? seg_end + 1 : line + line_len;
         }
-        if (!command_str.empty() && command_str[command_str.length() - 1] == '\r') {
-            command_str.erase(command_str.length() - 1);
-        }
-
-        commands.push_back(command_str);
-
-        // Extract and store the command type (e.g., "SET", "GET")
-        std::string cmd_type = extract_command_type(command_str);
-        command_types.push_back(cmd_type);
     }
 
     free(line);
