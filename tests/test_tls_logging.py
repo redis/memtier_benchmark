@@ -1,5 +1,5 @@
 """
-Tests for the one-shot negotiated-TLS log line.
+Tests for the one-shot negotiated-TLS log line and related JSON output hygiene.
 
 When --tls is enabled, memtier_benchmark logs the agreed TLS protocol version
 and ciphersuite exactly ONCE for the whole run (not per connection / thread /
@@ -11,6 +11,12 @@ These tests run across the full CI matrix:
 - TLS cells (standalone or cluster): assert the line appears EXACTLY once and
   carries a protocol + cipher, even with many connections.
 - Plaintext cells: assert the line does NOT appear.
+
+Path-redaction test (test_tls_paths_redacted_in_json):
+- When --tls is used, the configuration block in mb.json must contain only the
+  basename of cert/key/cacert paths, not the full absolute path.  This prevents
+  directory-layout details (e.g. /etc/ssl/private/client.key) from leaking into
+  benchmark artifacts that operators share.  Pre-existing in 2.3; fixed in 2.4.
 """
 
 import json
@@ -18,6 +24,9 @@ import os
 import tempfile
 
 from include import (
+    TLS_CACERT,
+    TLS_CERT,
+    TLS_KEY,
     add_required_env_arguments,
     addTLSArgs,
     debugPrintMemtierOnError,
@@ -85,6 +94,62 @@ def test_tls_negotiated_logged_once(env):
             env.assertEqual(len(lines), 0,
                             message="TLS line should not appear without --tls: {}".format(lines))
             env.assertNotContains("TLS", js)
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_tls_paths_redacted_in_json(env):
+    """mb.json configuration.cert/key/cacert must be basename-only, not full paths.
+
+    Absolute paths like /etc/ssl/private/client.key leak directory-layout
+    details into every benchmark artifact operators share.  The fix (2.4)
+    strips to basename before emitting JSON.  This test verifies that:
+
+    - In TLS cells: the JSON values equal os.path.basename(TLS_CERT/KEY/CACERT)
+      and contain no directory separator.
+    - In plaintext cells: the configuration block emits empty strings for those
+      fields (no path leakage in either case).
+    """
+    ok, run_config, _stderr, js = _run(env, threads=1, clients=2, requests=20)
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier did not complete")
+        env.assertContains("configuration", js,
+                           message="mb.json must contain a 'configuration' block")
+        cfg = js["configuration"]
+
+        if env.useTLS:
+            # Each emitted value must be a pure basename (no slash of any kind).
+            for field, full_path in (("cert", TLS_CERT),
+                                     ("key", TLS_KEY if TLS_KEY else ""),
+                                     ("cacert", TLS_CACERT)):
+                emitted = cfg.get(field, None)
+                env.assertFalse(emitted is None,
+                                message="configuration.{} missing from mb.json".format(field))
+                # No directory separator must appear in the emitted value.
+                env.assertFalse("/" in emitted,
+                                message="configuration.{} leaks a path separator: {!r}".format(
+                                    field, emitted))
+                env.assertFalse("\\" in emitted,
+                                message="configuration.{} leaks a backslash path separator: {!r}".format(
+                                    field, emitted))
+                # When the full path is known, the basename must match exactly.
+                if full_path:
+                    expected = os.path.basename(full_path)
+                    env.assertEqual(emitted, expected,
+                                    message="configuration.{} is {!r}, expected basename {!r} "
+                                            "(full path was {!r})".format(
+                                                field, emitted, expected, full_path))
+        else:
+            # Without --tls the fields are emitted as empty strings; confirm no
+            # accidental path leaks (e.g. from a misconfigured non-TLS build).
+            for field in ("cert", "key", "cacert"):
+                emitted = cfg.get(field, "")
+                env.assertFalse("/" in emitted,
+                                message="configuration.{} contains a slash in non-TLS run: {!r}".format(
+                                    field, emitted))
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)

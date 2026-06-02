@@ -91,6 +91,16 @@
 
 int log_level = 0;
 
+// Return the basename of a file path (everything after the last '/' or '\').
+// Used to redact directory layout from JSON output (e.g. cert/key paths).
+static std::string basename_only(const char *p)
+{
+    if (!p || !*p) return "";
+    std::string s(p);
+    size_t i = s.find_last_of("/\\");
+    return (i == std::string::npos) ? s : s.substr(i + 1);
+}
+
 // Upper bound for --run-count.  main() allocates several per-run vectors
 // (run_stats, cmd_stats histograms, HDR histograms) that grow linearly with
 // run_count; values in the tens of thousands push tens of MiB of metadata
@@ -611,9 +621,9 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
     jsonhandler->write_obj("out_file", "\"%s\"", cfg->out_file);
 #ifdef USE_TLS
     jsonhandler->write_obj("tls", "\"%s\"", cfg->tls ? "true" : "false");
-    jsonhandler->write_obj("cert", "\"%s\"", cfg->tls_cert);
-    jsonhandler->write_obj("key", "\"%s\"", cfg->tls_key);
-    jsonhandler->write_obj("cacert", "\"%s\"", cfg->tls_cacert);
+    jsonhandler->write_obj("cert", "\"%s\"", basename_only(cfg->tls_cert).c_str());
+    jsonhandler->write_obj("key", "\"%s\"", basename_only(cfg->tls_key).c_str());
+    jsonhandler->write_obj("cacert", "\"%s\"", basename_only(cfg->tls_cacert).c_str());
     jsonhandler->write_obj("tls_skip_verify", "\"%s\"", cfg->tls_skip_verify ? "true" : "false");
     jsonhandler->write_obj("sni", "\"%s\"", cfg->tls_sni);
 #endif
