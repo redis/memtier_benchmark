@@ -279,6 +279,15 @@ private:
     // Cancelable timer for deferred fill_pipeline (replaces event_base_once to
     // avoid UAF when the connection is freed before the callback fires).
     struct event *m_deferred_fill_timer;
+
+    // Tracks whether the bufferevent was paused via bufferevent_disable(EV_READ|
+    // EV_WRITE) by fill_pipeline's idle-disable branch. fill_pipeline used to
+    // call bufferevent_enable() unconditionally on every invocation to recover
+    // from a --transaction hold_pipeline pause; that fired per-response and
+    // took libevent's BEV_LOCK in the hot path. The flag lets the resume be
+    // conditional. Invariant: m_bev_paused == true iff m_bev is currently in
+    // the EV_READ|EV_WRITE-disabled state.
+    bool m_bev_paused;
 };
 
 #endif // MEMTIER_BENCHMARK_SHARD_CONNECTION_H
