@@ -3643,8 +3643,12 @@ int main(int argc, char *argv[])
 #endif
         SSL_CTX_set_options(cfg.openssl_ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
 
-// SSL_OP_NO_TLSv* flags are absent from the OpenSSL 4.0 public API.
-// Use SSL_CTX_set_min/max_proto_version (available since OpenSSL 1.1.0) instead.
+// Set the outer protocol envelope using min/max version (available since OpenSSL 1.1.0).
+// Then re-disable any gap protocols inside [min, max] that the user did not select.
+// The SSL_OP_NO_TLSv* constants are still present in OpenSSL 3.x but were removed in
+// OpenSSL 4.0, so each gap-mask call is wrapped in an #ifdef.  When a symbol is absent
+// the runtime cannot individually disable that version anyway, which aligns with
+// OpenSSL 4.0's intended deprecation policy.
 #if OPENSSL_VERSION_NUMBER >= 0x10100000L
         {
             int min_ver = 0, max_ver = 0;
@@ -3669,6 +3673,23 @@ int main(int argc, char *argv[])
                 max_ver = TLS1_VERSION;
             if (min_ver) SSL_CTX_set_min_proto_version(cfg.openssl_ctx, min_ver);
             if (max_ver) SSL_CTX_set_max_proto_version(cfg.openssl_ctx, max_ver);
+
+                // Gap-mask: explicitly disable any version inside [min,max] that the user
+                // omitted (e.g. --tls-protocols "tlsv1,tlsv1.2" must not allow tlsv1.1).
+                // Each #ifdef guard ensures the build succeeds on OpenSSL 4.0 where these
+                // constants have been removed.
+#ifdef SSL_OP_NO_TLSv1
+            if (!(cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1)) SSL_CTX_set_options(cfg.openssl_ctx, SSL_OP_NO_TLSv1);
+#endif
+#ifdef SSL_OP_NO_TLSv1_1
+            if (!(cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_1)) SSL_CTX_set_options(cfg.openssl_ctx, SSL_OP_NO_TLSv1_1);
+#endif
+#ifdef SSL_OP_NO_TLSv1_2
+            if (!(cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_2)) SSL_CTX_set_options(cfg.openssl_ctx, SSL_OP_NO_TLSv1_2);
+#endif
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L && defined(SSL_OP_NO_TLSv1_3)
+            if (!(cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_3)) SSL_CTX_set_options(cfg.openssl_ctx, SSL_OP_NO_TLSv1_3);
+#endif
         }
 #else
         if (!(cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1)) SSL_CTX_set_options(cfg.openssl_ctx, SSL_OP_NO_TLSv1);
