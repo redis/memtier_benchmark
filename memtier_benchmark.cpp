@@ -1278,8 +1278,13 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             if (strcmp(optarg, "allkeys") == 0)
                 cfg->requests = -1;
             else {
+                if (optarg_is_negative(optarg)) {
+                    fprintf(stderr, "error: requests must be a positive integer.\n");
+                    return -1;
+                }
+                errno = 0;
                 cfg->requests = (unsigned long long) strtoull(optarg, &endptr, 10);
-                if (!cfg->requests || !endptr || *endptr != '\0') {
+                if (errno == ERANGE || !cfg->requests || !endptr || *endptr != '\0') {
                     fprintf(stderr, "error: requests must be greater than zero.\n");
                     return -1;
                 }
@@ -1291,24 +1296,39 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             break;
         case 'c':
             endptr = NULL;
+            if (optarg_is_negative(optarg)) {
+                fprintf(stderr, "error: clients must be a positive integer.\n");
+                return -1;
+            }
+            errno = 0;
             cfg->clients = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!cfg->clients || !endptr || *endptr != '\0') {
+            if (errno == ERANGE || !cfg->clients || !endptr || *endptr != '\0') {
                 fprintf(stderr, "error: clients must be greater than zero.\n");
                 return -1;
             }
             break;
         case 't':
             endptr = NULL;
+            if (optarg_is_negative(optarg)) {
+                fprintf(stderr, "error: threads must be a positive integer.\n");
+                return -1;
+            }
+            errno = 0;
             cfg->threads = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!cfg->threads || !endptr || *endptr != '\0') {
+            if (errno == ERANGE || !cfg->threads || !endptr || *endptr != '\0') {
                 fprintf(stderr, "error: threads must be greater than zero.\n");
                 return -1;
             }
             break;
         case o_test_time:
             endptr = NULL;
+            if (optarg_is_negative(optarg)) {
+                fprintf(stderr, "error: test time must be a positive integer.\n");
+                return -1;
+            }
+            errno = 0;
             cfg->test_time = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!cfg->test_time || !endptr || *endptr != '\0') {
+            if (errno == ERANGE || !cfg->test_time || !endptr || *endptr != '\0') {
                 fprintf(stderr, "error: test time must be greater than zero.\n");
                 return -1;
             }
@@ -3623,12 +3643,37 @@ int main(int argc, char *argv[])
 #endif
         SSL_CTX_set_options(cfg.openssl_ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
 
+// SSL_OP_NO_TLSv* flags are absent from the OpenSSL 4.0 public API.
+// Use SSL_CTX_set_min/max_proto_version (available since OpenSSL 1.1.0) instead.
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+        {
+            int min_ver = 0, max_ver = 0;
+            if (cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1)
+                min_ver = TLS1_VERSION;
+            else if (cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_1)
+                min_ver = TLS1_1_VERSION;
+            else if (cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_2)
+                min_ver = TLS1_2_VERSION;
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+            else if (cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_3)
+                min_ver = TLS1_3_VERSION;
+            if (cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_3)
+                max_ver = TLS1_3_VERSION;
+            else
+#endif
+                if (cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_2)
+                max_ver = TLS1_2_VERSION;
+            else if (cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_1)
+                max_ver = TLS1_1_VERSION;
+            else if (cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1)
+                max_ver = TLS1_VERSION;
+            if (min_ver) SSL_CTX_set_min_proto_version(cfg.openssl_ctx, min_ver);
+            if (max_ver) SSL_CTX_set_max_proto_version(cfg.openssl_ctx, max_ver);
+        }
+#else
         if (!(cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1)) SSL_CTX_set_options(cfg.openssl_ctx, SSL_OP_NO_TLSv1);
         if (!(cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_1)) SSL_CTX_set_options(cfg.openssl_ctx, SSL_OP_NO_TLSv1_1);
         if (!(cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_2)) SSL_CTX_set_options(cfg.openssl_ctx, SSL_OP_NO_TLSv1_2);
-// TLS 1.3 is only available as from version 1.1.1.
-#if OPENSSL_VERSION_NUMBER >= 0x10101000L
-        if (!(cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_3)) SSL_CTX_set_options(cfg.openssl_ctx, SSL_OP_NO_TLSv1_3);
 #endif
 
         if (cfg.tls_cert) {
