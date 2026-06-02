@@ -1005,8 +1005,9 @@ void run_stats::summarize(totals &result) const
     result.m_ar_commands.summarize(totals.m_ar_commands, test_duration_usec);
 
     // hits,misses / sec
-    result.m_hits_sec = (double) totals.m_get_cmd.m_hits / test_duration_usec * 1000000;
-    result.m_misses_sec = (double) totals.m_get_cmd.m_misses / test_duration_usec * 1000000;
+    result.m_hits_sec = test_duration_usec > 0 ? (double) totals.m_get_cmd.m_hits / test_duration_usec * 1000000 : 0.0;
+    result.m_misses_sec =
+        test_duration_usec > 0 ? (double) totals.m_get_cmd.m_misses / test_duration_usec * 1000000 : 0.0;
 
     // total/sec
     result.m_ops_sec = (double) result.m_ops / test_duration_usec * 1000000;

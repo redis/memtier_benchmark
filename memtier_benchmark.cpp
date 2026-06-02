@@ -1278,8 +1278,13 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             if (strcmp(optarg, "allkeys") == 0)
                 cfg->requests = -1;
             else {
+                if (optarg_is_negative(optarg)) {
+                    fprintf(stderr, "error: requests must be a positive integer.\n");
+                    return -1;
+                }
+                errno = 0;
                 cfg->requests = (unsigned long long) strtoull(optarg, &endptr, 10);
-                if (!cfg->requests || !endptr || *endptr != '\0') {
+                if (errno == ERANGE || !cfg->requests || !endptr || *endptr != '\0') {
                     fprintf(stderr, "error: requests must be greater than zero.\n");
                     return -1;
                 }
@@ -1291,24 +1296,39 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             break;
         case 'c':
             endptr = NULL;
+            if (optarg_is_negative(optarg)) {
+                fprintf(stderr, "error: clients must be a positive integer.\n");
+                return -1;
+            }
+            errno = 0;
             cfg->clients = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!cfg->clients || !endptr || *endptr != '\0') {
+            if (errno == ERANGE || !cfg->clients || !endptr || *endptr != '\0') {
                 fprintf(stderr, "error: clients must be greater than zero.\n");
                 return -1;
             }
             break;
         case 't':
             endptr = NULL;
+            if (optarg_is_negative(optarg)) {
+                fprintf(stderr, "error: threads must be a positive integer.\n");
+                return -1;
+            }
+            errno = 0;
             cfg->threads = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!cfg->threads || !endptr || *endptr != '\0') {
+            if (errno == ERANGE || !cfg->threads || !endptr || *endptr != '\0') {
                 fprintf(stderr, "error: threads must be greater than zero.\n");
                 return -1;
             }
             break;
         case o_test_time:
             endptr = NULL;
+            if (optarg_is_negative(optarg)) {
+                fprintf(stderr, "error: test time must be a positive integer.\n");
+                return -1;
+            }
+            errno = 0;
             cfg->test_time = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!cfg->test_time || !endptr || *endptr != '\0') {
+            if (errno == ERANGE || !cfg->test_time || !endptr || *endptr != '\0') {
                 fprintf(stderr, "error: test time must be greater than zero.\n");
                 return -1;
             }
