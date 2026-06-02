@@ -167,6 +167,15 @@ protected:
     mbulk_size_el *m_current_mbulk;
     bool m_resp3;
     bool m_attribute;
+    // Drain mode for RESP3 server-pushed frames ('>'). Pushes are
+    // out-of-band (pubsub, keyspace notifications, client tracking
+    // invalidations) and must not be delivered as a reply to any
+    // in-flight command. While true the parser still walks the frame
+    // to advance the read buffer, but suppresses all writes into
+    // m_last_response (status, mbulk tree, value, hits).
+    // TODO: full out-of-band routing — surface push frames to a
+    // listener instead of silently dropping them.
+    bool m_push;
 
     bool aggregate_type(char c);
     bool blob_type(char c);
@@ -181,7 +190,8 @@ public:
             m_total_bulks_count(0),
             m_current_mbulk(NULL),
             m_resp3(false),
-            m_attribute(false)
+            m_attribute(false),
+            m_push(false)
     {
     }
     virtual redis_protocol *clone(void) { return new redis_protocol(); }
@@ -471,7 +481,16 @@ bool redis_protocol::aggregate_type(char c)
 {
     if (c == '*') return true;
 
-    if (m_resp3 && (c == '%' || c == '~' || c == '|')) return true;
+    // RESP3: map (%), set (~), attribute (|), and push (>) are all aggregate
+    // types.  Push frames (">N\r\n" followed by N elements) are structurally
+    // identical to arrays and can be emitted by Redis 7+ at any point on a
+    // RESP3 connection (pubsub, keyspace notifications, client-tracking
+    // invalidation).  We parse them as ordinary aggregates and discard the
+    // content; the alternative -- returning -1 from parse_response -- tears
+    // down the connection unnecessarily.
+    // TODO: route drained push frames to an out-of-band callback so callers
+    // can observe server-initiated events without disrupting the reply stream.
+    if (m_resp3 && (c == '%' || c == '~' || c == '|' || c == '>')) return true;
 
     return false;
 }
@@ -498,11 +517,22 @@ bool redis_protocol::response_ended()
 {
     if (m_total_bulks_count != 0) return false;
 
-    if (m_attribute) {
-        m_attribute = false;
-        return false;
+    bool was_push = m_push;
+    bool was_attribute = m_attribute;
+
+    if (was_attribute) m_attribute = false;
+    // A RESP3 push frame just finished draining. The actual reply to
+    // the in-flight command (if any) is still pending — keep reading
+    // and do NOT signal a complete reply for the push.
+    // Also handles the case where an attribute (|) is nested inside a
+    // push frame (>) and both complete at the same call: clear BOTH
+    // flags together so m_push does not remain set and eat the next reply.
+    if (was_push) {
+        m_push = false;
+        m_response_len = 0; // reset: push bytes don't count toward the next reply
     }
 
+    if (was_push || was_attribute) return false;
     return true;
 }
 
@@ -519,6 +549,7 @@ int redis_protocol::parse_response(void)
             m_response_len = 0;
             m_total_bulks_count = 0;
             m_attribute = 0;
+            m_push = 0;
             m_response_state = rs_read_line;
 
             break;
@@ -553,12 +584,22 @@ int redis_protocol::parse_response(void)
                     m_attribute = true;
                 }
 
+                if (line[0] == '>') {
+                    // Top-level push frame: enter drain mode. Nested
+                    // pushes (push inside push) are not defined by RESP3
+                    // and not expected; only set the flag once.
+                    m_push = true;
+                }
+
                 // Map or Attribute contain key-value pair
                 if (line[0] == '%' || line[0] == '|') {
                     count *= 2;
                 }
 
-                if (m_keep_value) {
+                // Suppress mbulk allocation while draining a push frame:
+                // the contents are out-of-band and must not be delivered
+                // as the reply to any in-flight command.
+                if (m_keep_value && !m_push) {
                     mbulk_size_el *new_mbulk_size = new mbulk_size_el();
                     new_mbulk_size->bulks_count = count;
                     new_mbulk_size->upper_level = m_current_mbulk;
@@ -574,7 +615,11 @@ int redis_protocol::parse_response(void)
                     m_current_mbulk = new_mbulk_size->get_next_mbulk();
                 }
 
-                m_last_response.set_status(line);
+                if (!m_push) {
+                    m_last_response.set_status(line);
+                } else {
+                    free(line);
+                }
                 m_total_bulks_count += count;
 
                 if (response_ended()) {
@@ -589,9 +634,14 @@ int redis_protocol::parse_response(void)
                 }
 
                 m_bulk_len = strtol(line + 1, NULL, 10);
-                m_last_response.set_status(line);
+                // Suppress reply mutation while draining a push frame.
+                if (!m_push) {
+                    m_last_response.set_status(line);
 
-                if (line[0] == '!') m_last_response.set_error();
+                    if (line[0] == '!') m_last_response.set_error();
+                } else {
+                    free(line);
+                }
 
                 /*
                  * only on negative bulk, the data ends right after the first CRLF ($-1\r\n), so
@@ -609,22 +659,31 @@ int redis_protocol::parse_response(void)
                 }
 
                 // if we are not inside mbulk, the status will be kept in m_status anyway
-                if (m_keep_value && m_current_mbulk) {
+                if (m_keep_value && m_current_mbulk && !m_push) {
                     char *bulk_value = strdup(line);
                     assert(bulk_value != NULL);
 
                     bulk_el *new_bulk = new bulk_el();
                     new_bulk->value = bulk_value;
                     new_bulk->value_len = strlen(bulk_value);
+                    // Mark RESP3 null elements explicitly so the walker can
+                    // distinguish them from a legitimate bulk string whose
+                    // content happens to be the single character '_' (which
+                    // would arrive via blob_type / rs_read_bulk, not here).
+                    new_bulk->is_resp3_null = (line[0] == '_');
 
                     // insert it to current mbulk
                     m_current_mbulk->add_new_element(new_bulk);
                     m_current_mbulk = m_current_mbulk->get_next_mbulk();
                 }
 
-                if (line[0] == '-') m_last_response.set_error();
+                if (!m_push) {
+                    if (line[0] == '-') m_last_response.set_error();
 
-                m_last_response.set_status(line);
+                    m_last_response.set_status(line);
+                } else {
+                    free(line);
+                }
                 m_total_bulks_count--;
 
                 if (response_ended()) {
@@ -650,7 +709,9 @@ int redis_protocol::parse_response(void)
                  * such key as well as non existing key or existing key without data
                  * in the requested range
                  */
-                if (m_bulk_len > 0) {
+                // Suppress hit accounting while draining a push frame; the
+                // bulk belongs to an out-of-band message, not the reply.
+                if (m_bulk_len > 0 && !m_push) {
                     m_last_response.incr_hits();
                 }
 
@@ -660,7 +721,14 @@ int redis_protocol::parse_response(void)
             }
             break;
         case rs_end_bulk:
-            if (m_keep_value) {
+            // Push-frame drain: read+discard the bulk bytes without
+            // touching m_last_response so the reply remains clean.
+            if (m_push) {
+                if (m_bulk_len >= 0) {
+                    int ret = evbuffer_drain(m_read_buf, m_bulk_len + 2);
+                    assert(ret != -1);
+                }
+            } else if (m_keep_value) {
                 /*
                  * keep bulk value - in case we need to save bulk value it depends
                  * if it's inside a mbulk or not.

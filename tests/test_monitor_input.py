@@ -781,6 +781,154 @@ def test_monitor_input_malformed_command_skipped(env):
         )
 
 
+def test_monitor_input_nul_byte_in_prefix_not_truncated(env):
+    """
+    Regression test for NUL-truncation in load_from_file (review finding #30, bug F1).
+
+    Before the fix, load_from_file used strchr(line, '"') to locate the start
+    of the command portion.  strchr stops at the first NUL byte, so a MONITOR
+    capture line whose metadata prefix contains an embedded \\0 (e.g. a binary
+    timestamp field) caused the entire line to be skipped with a "no commands
+    found" warning — even though getline had read the full byte count and the
+    '"CMD"' portion was intact.
+
+    The fix replaces strchr with memchr(seg_start, '"', seg_len), which searches
+    exactly the byte count returned by getline and therefore finds the opening
+    quote regardless of NUL bytes in the prefix.
+
+    This test writes three MONITOR-format lines to a binary file, where the
+    second line has a NUL byte embedded in its metadata prefix (before the
+    first '"').  The benchmark is run with __monitor_line@__ and we assert that
+    all three commands are loaded (i.e. line 2 was NOT silently dropped).
+    """
+    env.skipOnCluster()
+
+    test_dir = tempfile.mkdtemp()
+    monitor_file = os.path.join(test_dir, "monitor_nul.bin")
+
+    # Write the file in binary mode so the NUL byte is preserved verbatim.
+    # Line 2 has '\x00' in the metadata prefix, before the first '"'.
+    line1 = b'1764031576.604009 [0 127.0.0.1:51682] "SET" "nul_key1" "value1"\n'
+    line2 = b'1764031576.605000\x00[0 127.0.0.1:51682] "SET" "nul_key2" "value2"\n'
+    line3 = b'1764031576.606000 [0 127.0.0.1:51682] "SET" "nul_key3" "value3"\n'
+    with open(monitor_file, "wb") as f:
+        f.write(line1 + line2 + line3)
+
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--monitor-input={}".format(monitor_file),
+            "--command=__monitor_line@__",
+            "--hide-histogram",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+
+    config = get_default_memtier_config(threads=1, clients=1, requests=9)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    memtier_ok = benchmark.run()
+
+    debugPrintMemtierOnError(config, env)
+    env.assertTrue(memtier_ok == True,
+                   message="memtier failed while replaying monitor file with NUL byte in prefix")
+
+    # All three commands must have been loaded — if line 2 was dropped due to
+    # NUL truncation the count would be 2, not 3.
+    with open("{0}/mb.stderr".format(config.results_dir)) as stderr:
+        stderr_content = stderr.read()
+        env.assertTrue(
+            "Loaded 3 monitor commands from 3 total lines" in stderr_content,
+            message="Expected 3 loaded commands (NUL-in-prefix line was silently dropped). "
+                    "stderr: {}".format(stderr_content[-800:]),
+        )
+
+
+def test_monitor_input_cr_only_line_endings(env):
+    """
+    Regression test for CR-only line-ending handling in load_from_file
+    (review finding #30, bug F2).
+
+    Before the fix, getline() used '\\n' as the sole delimiter.  A monitor
+    capture file whose lines are separated by bare '\\r' (classic Mac / some
+    Windows exporters) was therefore read as a single giant line; the metadata
+    of every line after the first was appended as extra tokens to the first
+    command, and most commands were dropped or mis-routed silently.
+
+    The fix normalises bare '\\r' bytes to '\\n' before tokenising, so each
+    logical MONITOR line is treated as a separate segment.
+
+    This test writes three MONITOR-format SET commands separated by '\\r' only
+    (no '\\n') and asserts that all three commands are loaded.
+    """
+    env.skipOnCluster()
+
+    test_dir = tempfile.mkdtemp()
+    monitor_file = os.path.join(test_dir, "monitor_cr.bin")
+
+    # Three SET commands, separated by \r only (no \n).
+    line1 = b'1764031576.604009 [0 127.0.0.1:51682] "SET" "cr_key1" "value1"'
+    line2 = b'1764031576.605000 [0 127.0.0.1:51682] "SET" "cr_key2" "value2"'
+    line3 = b'1764031576.606000 [0 127.0.0.1:51682] "SET" "cr_key3" "value3"'
+    with open(monitor_file, "wb") as f:
+        f.write(line1 + b"\r" + line2 + b"\r" + line3 + b"\r")
+
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--monitor-input={}".format(monitor_file),
+            "--command=__monitor_line@__",
+            "--hide-histogram",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+
+    config = get_default_memtier_config(threads=1, clients=1, requests=9)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    memtier_ok = benchmark.run()
+
+    debugPrintMemtierOnError(config, env)
+    env.assertTrue(memtier_ok == True,
+                   message="memtier failed while replaying CR-only monitor file")
+
+    # All three commands must have been loaded.  Pre-fix, the entire file was
+    # read as one line and only one (malformed) command would be found.
+    with open("{0}/mb.stderr".format(config.results_dir)) as stderr:
+        stderr_content = stderr.read()
+        env.assertTrue(
+            "Loaded 3 monitor commands from 3 total lines" in stderr_content,
+            message="Expected 3 loaded commands (CR-only line endings not split correctly). "
+                    "stderr: {}".format(stderr_content[-800:]),
+        )
+
+    # Verify that all three keys were actually set in Redis.
+    master_nodes_connections = env.getOSSMasterNodesConnectionList()
+    keys_found = set()
+    for master_connection in master_nodes_connections:
+        for key in ("cr_key1", "cr_key2", "cr_key3"):
+            try:
+                result = master_connection.execute_command("EXISTS", key)
+                if result:
+                    keys_found.add(key)
+            except Exception:
+                pass
+    env.assertTrue(
+        len(keys_found) == 3,
+        message="Expected all 3 CR-only keys in Redis, found: {}".format(keys_found),
+    )
+
+
 def test_monitor_input_large_line_no_stack_overflow(env):
     """
     Regression test for the VLA stack-overflow in

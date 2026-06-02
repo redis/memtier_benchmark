@@ -116,7 +116,7 @@ public:
 class bulk_el : public mbulk_element
 {
 public:
-    bulk_el() : mbulk_element(mbulk_element_bulk), value(NULL), value_len(0) { ; }
+    bulk_el() : mbulk_element(mbulk_element_bulk), value(NULL), value_len(0), is_resp3_null(false) { ; }
     virtual ~bulk_el()
     {
         free(value);
@@ -129,6 +129,11 @@ public:
 
     char *value;
     unsigned int value_len;
+    // True only when this element was produced by the single_type parser
+    // branch for the RESP3 null type byte '_'. Distinguishes a genuine
+    // RESP3 null from a legitimate bulk string whose content happens to be
+    // the single character '_' (parsed via blob_type / rs_read_bulk).
+    bool is_resp3_null;
 };
 
 struct protocol_response

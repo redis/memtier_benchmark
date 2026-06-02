@@ -1279,7 +1279,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 cfg->requests = -1;
             else {
                 if (optarg_is_negative(optarg)) {
-                    fprintf(stderr, "error: requests must be greater than zero.\n");
+                    fprintf(stderr, "error: requests must be a positive integer.\n");
                     return -1;
                 }
                 errno = 0;
@@ -1297,7 +1297,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         case 'c':
             endptr = NULL;
             if (optarg_is_negative(optarg)) {
-                fprintf(stderr, "error: clients must be greater than zero.\n");
+                fprintf(stderr, "error: clients must be a positive integer.\n");
                 return -1;
             }
             errno = 0;
@@ -1310,7 +1310,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         case 't':
             endptr = NULL;
             if (optarg_is_negative(optarg)) {
-                fprintf(stderr, "error: threads must be greater than zero.\n");
+                fprintf(stderr, "error: threads must be a positive integer.\n");
                 return -1;
             }
             errno = 0;
@@ -1323,7 +1323,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         case o_test_time:
             endptr = NULL;
             if (optarg_is_negative(optarg)) {
-                fprintf(stderr, "error: test time must be greater than zero.\n");
+                fprintf(stderr, "error: test time must be a positive integer.\n");
                 return -1;
             }
             errno = 0;
@@ -3643,12 +3643,58 @@ int main(int argc, char *argv[])
 #endif
         SSL_CTX_set_options(cfg.openssl_ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
 
+// Set the outer protocol envelope using min/max version (available since OpenSSL 1.1.0).
+// Then re-disable any gap protocols inside [min, max] that the user did not select.
+// The SSL_OP_NO_TLSv* constants are still present in OpenSSL 3.x but were removed in
+// OpenSSL 4.0, so each gap-mask call is wrapped in an #ifdef.  When a symbol is absent
+// the runtime cannot individually disable that version anyway, which aligns with
+// OpenSSL 4.0's intended deprecation policy.
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+        {
+            int min_ver = 0, max_ver = 0;
+            if (cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1)
+                min_ver = TLS1_VERSION;
+            else if (cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_1)
+                min_ver = TLS1_1_VERSION;
+            else if (cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_2)
+                min_ver = TLS1_2_VERSION;
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+            else if (cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_3)
+                min_ver = TLS1_3_VERSION;
+            if (cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_3)
+                max_ver = TLS1_3_VERSION;
+            else
+#endif
+                if (cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_2)
+                max_ver = TLS1_2_VERSION;
+            else if (cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_1)
+                max_ver = TLS1_1_VERSION;
+            else if (cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1)
+                max_ver = TLS1_VERSION;
+            if (min_ver) SSL_CTX_set_min_proto_version(cfg.openssl_ctx, min_ver);
+            if (max_ver) SSL_CTX_set_max_proto_version(cfg.openssl_ctx, max_ver);
+
+                // Gap-mask: explicitly disable any version inside [min,max] that the user
+                // omitted (e.g. --tls-protocols "tlsv1,tlsv1.2" must not allow tlsv1.1).
+                // Each #ifdef guard ensures the build succeeds on OpenSSL 4.0 where these
+                // constants have been removed.
+#ifdef SSL_OP_NO_TLSv1
+            if (!(cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1)) SSL_CTX_set_options(cfg.openssl_ctx, SSL_OP_NO_TLSv1);
+#endif
+#ifdef SSL_OP_NO_TLSv1_1
+            if (!(cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_1)) SSL_CTX_set_options(cfg.openssl_ctx, SSL_OP_NO_TLSv1_1);
+#endif
+#ifdef SSL_OP_NO_TLSv1_2
+            if (!(cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_2)) SSL_CTX_set_options(cfg.openssl_ctx, SSL_OP_NO_TLSv1_2);
+#endif
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L && defined(SSL_OP_NO_TLSv1_3)
+            if (!(cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_3)) SSL_CTX_set_options(cfg.openssl_ctx, SSL_OP_NO_TLSv1_3);
+#endif
+        }
+#else
         if (!(cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1)) SSL_CTX_set_options(cfg.openssl_ctx, SSL_OP_NO_TLSv1);
         if (!(cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_1)) SSL_CTX_set_options(cfg.openssl_ctx, SSL_OP_NO_TLSv1_1);
         if (!(cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_2)) SSL_CTX_set_options(cfg.openssl_ctx, SSL_OP_NO_TLSv1_2);
-// TLS 1.3 is only available as from version 1.1.1.
-#if OPENSSL_VERSION_NUMBER >= 0x10101000L
-        if (!(cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_3)) SSL_CTX_set_options(cfg.openssl_ctx, SSL_OP_NO_TLSv1_3);
 #endif
 
         if (cfg.tls_cert) {
