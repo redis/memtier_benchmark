@@ -569,7 +569,10 @@ def test_reconnect_backoff_cap_60s(env):
     # shard_connection.cpp:
     #   "attempting reconnection 5 (unlimited) in 42.00 seconds..."
     #   "attempting reconnection 3/10 in 42.00 seconds..."
-    delay_pattern = re.compile(r"attempting reconnection[^i]+in\s+([\d.]+)\s+seconds")
+    # NOTE: the previous [^i]+ negated class could never match the "(unlimited)"
+    # variant because "unlimited" contains 'i', causing the assertion to run
+    # against an empty list (vacuous pass) under --max-reconnect-attempts=0.
+    delay_pattern = re.compile(r"attempting reconnection\b.+?\bin\s+([\d.]+)\s+seconds")
     delays = [float(m.group(1)) for m in delay_pattern.finditer(stderr_content)]
 
     if not delays:

@@ -1281,6 +1281,8 @@ void shard_connection::handle_reconnect_timer_event()
             m_reconnect_attempts++;
             if (m_config->reconnect_backoff_factor > 0.0) {
                 m_current_backoff_delay *= m_config->reconnect_backoff_factor;
+                if (m_current_backoff_delay > MEMTIER_BACKOFF_CAP_SEC)
+                    m_current_backoff_delay = MEMTIER_BACKOFF_CAP_SEC;
             }
 
             benchmark_error_log("Reconnection attempt %u failed, retrying in %.2f seconds...\n", m_reconnect_attempts,
