@@ -299,13 +299,8 @@ static int hex_digit_to_int(char c)
     }
 }
 
-// NOTE: this constructor stores cmd as a C-string (std::string(const char*)),
-// so any embedded NUL bytes from a monitor-input payload are truncated at
-// this layer. load_from_file preserves them in the std::string it builds, but
-// the dispatch path calls this ctor via .c_str() and re-truncates.
-// Tracked as a separate follow-up: change to a (data, len) interface and
-// propagate through split_command_to_args / send so that binary blobs
-// replayed from MONITOR output survive end-to-end.
+// Stored as a C-string. Embedded NULs from monitor-input get truncated here —
+// full binary blob support requires a (data, len) refactor, tracked as #439.
 arbitrary_command::arbitrary_command(const char *cmd) :
         command(cmd),
         key_pattern('R'),

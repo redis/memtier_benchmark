@@ -170,9 +170,11 @@ OK
 
 You can pipe this output and filter specific patterns with tools such as `grep`, then save it to a file and use it as a `--monitor-input` source. For more details, see the official Redis documentation on [monitoring commands executed in Redis](https://redis.io/docs/latest/develop/tools/cli/#monitor-commands-executed-in-redis).
 
-**Binary payloads** are preserved end-to-end inside `monitor_command_list` (no NUL truncation as of 2.4). The file loader uses an explicit byte-count constructor so that embedded `\0` bytes in command arguments survive the load-from-file path.
-
-**CR-only line endings** (classic Mac `\r`, and some Windows export tools that emit bare `\r` without a following `\n`) parse correctly as of 2.4; previously such files were read as one giant line and no commands were replayed.
+> **What's new in 2.4**
+>
+> **Binary payloads** — the monitor capture loader preserves binary payloads (including embedded NUL bytes) end-to-end into `monitor_command_list`. **However**, dispatch via `arbitrary_command(const char *)` currently re-truncates at the first NUL — full binary blob support through replay is tracked as #439.
+>
+> **CR-only line endings** (classic Mac `\r`, and some Windows export tools that emit bare `\r` without a following `\n`) parse correctly; previously the whole file would be read as one giant line and no commands were replayed.
 
 ### Command statistics breakdown
 
