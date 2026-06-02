@@ -40,15 +40,17 @@ REDIS_PORT = os.environ.get("REDIS_PORT", "6379")
 MEMTIER = Path(os.environ.get("MEMTIER", str(DEFAULT_MEMTIER)))
 FUZZ_TIMEOUT = int(os.environ.get("FUZZ_TIMEOUT", "60"))
 SEED = int(os.environ.get("FUZZ_SEED", str(int.from_bytes(os.urandom(4), "big"))))
-# Max bytes for the `grow` mutator. The issue spec mentioned 8 MiB, but on
-# master (pre-PR #405) lines above ~1 MiB reliably trip a VLA stack overflow in
-# arbitrary_command::split_command_to_args(). Once #405 lands, bump the default
-# (or override with FUZZ_GROW_MAX=8388608 on a master that has the fix).
-GROW_MAX = int(os.environ.get("FUZZ_GROW_MAX", str(256 * 1024)))
+# Max bytes for the `grow` mutator. PR #405 (heap-vector fix for
+# arbitrary_command::split_command_to_args) has landed, so the old 256 KiB cap
+# that guarded against the VLA stack-overflow is no longer needed. The workflow
+# uses -max_len=33554432 (32 MiB); 8 MiB is a sensible default that exercises
+# multi-MB monitor lines without blowing the per-run time budget.
+GROW_MAX = int(os.environ.get("FUZZ_GROW_MAX", str(8 * 1024 * 1024)))
 # Whether to also fuzz the synthetic >16 MiB single-line and 1M-line seeds. These
-# exercise the heap-allocated split-token buffer and loader memory pressure paths
-# but require the PR #405 fix to be present, hence opt-in for now.
-INCLUDE_HUGE_SYNTHETIC = os.environ.get("FUZZ_INCLUDE_HUGE", "0") == "1"
+# exercise the heap-allocated split-token buffer and loader memory pressure paths.
+# PR #405 (the VLA stack-overflow fix) has landed, so these are now enabled by
+# default.
+INCLUDE_HUGE_SYNTHETIC = os.environ.get("FUZZ_INCLUDE_HUGE", "1") == "1"
 
 CRASH_PATTERNS = (
     b"stack smashing detected",
@@ -138,8 +140,9 @@ def mutate(seed_bytes: bytes) -> bytes:
 def generate_synthetic_seeds() -> dict:
     """Build the >16 MiB and million-line seeds that are too big to check in.
 
-    Gated behind FUZZ_INCLUDE_HUGE=1 until PR #405 (the VLA stack-overflow fix
-    for arbitrary_command::split_command_to_args) lands on master.
+    Enabled by default now that PR #405 (the VLA stack-overflow fix for
+    arbitrary_command::split_command_to_args) has landed. Suppress with
+    FUZZ_INCLUDE_HUGE=0 if needed.
     """
     if not INCLUDE_HUGE_SYNTHETIC:
         return {}
