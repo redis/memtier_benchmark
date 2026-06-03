@@ -515,13 +515,92 @@ void cluster_client::handle_cluster_slots(protocol_response *r)
 
         // Start a new shard_group for this primary. id == index in
         // m_shard_groups; consumers (e.g. m_slot_to_shard_group[s]) refer to
-        // the group by this index. Replicas are populated in a follow-up
-        // change; today the vector stays empty so behavior is identical to
-        // the prior primaries-only flat-array form.
+        // the group by this index.
         shard_group group;
         group.id = (unsigned int) m_shard_groups.size();
         group.primary = sc;
         group.replica_rr_cursor = 0;
+
+        // Walk replica node tuples at mbulks_elements[3..N]. Same shape as the
+        // primary node (host, port, node-id, ...). The dedupe-by-(addr,port)
+        // loop below reuses any existing shard_connection so an existing
+        // replica that's still in m_connections is preserved across topology
+        // refreshes (and is not closed by the close_sc[] sweep).
+        for (unsigned int n = 3; n < shard->mbulks_elements.size(); n++) {
+            mbulk_element *replica_el = shard->mbulks_elements[n];
+            if (replica_el == NULL || !replica_el->is_mbulk_size()) {
+                benchmark_error_log("warning: CLUSTER SLOTS: shard %u replica %u not an array; skipping\n", i, n - 3);
+                continue;
+            }
+            mbulk_size_el *replica_node = replica_el->as_mbulk_size();
+            if (replica_node->mbulks_elements.size() < 2 || !replica_node->mbulks_elements[0]->is_bulk() ||
+                !replica_node->mbulks_elements[1]->is_bulk()) {
+                benchmark_error_log(
+                    "warning: CLUSTER SLOTS: shard %u replica %u tuple malformed (need host, port); skipping\n", i,
+                    n - 3);
+                continue;
+            }
+            bulk_el *r_addr_el = replica_node->mbulks_elements[0]->as_bulk();
+            bulk_el *r_port_el = replica_node->mbulks_elements[1]->as_bulk();
+            if (r_addr_el->value_len == 0 || r_port_el->value_len == 0) {
+                benchmark_error_log("warning: CLUSTER SLOTS: shard %u replica %u empty host/port; skipping\n", i,
+                                    n - 3);
+                continue;
+            }
+            if (memchr(r_addr_el->value, '\0', r_addr_el->value_len) != NULL) {
+                benchmark_error_log("warning: CLUSTER SLOTS: shard %u replica %u host contains NUL; skipping\n", i,
+                                    n - 3);
+                continue;
+            }
+
+            char *r_addr = (char *) malloc(r_addr_el->value_len + 1);
+            memcpy(r_addr, r_addr_el->value, r_addr_el->value_len);
+            r_addr[r_addr_el->value_len] = '\0';
+
+            char *r_port = (char *) malloc(r_port_el->value_len + 1);
+            memcpy(r_port, r_port_el->value + 1, r_port_el->value_len);
+            r_port[r_port_el->value_len] = '\0';
+
+            shard_connection *rsc = NULL;
+            for (unsigned int k = 0; k < m_connections.size(); k++) {
+                if (strcmp(r_addr, m_connections[k]->get_address()) == 0 &&
+                    strcmp(r_port, m_connections[k]->get_port()) == 0) {
+                    rsc = m_connections[k];
+
+                    if (k < prev_connections_size) close_sc[k] = false;
+
+                    if (rsc->get_connection_state() == conn_disconnected) {
+                        // Role must be set BEFORE connect() so the READONLY
+                        // ladder is armed during the AUTH/HELLO/READONLY/
+                        // CLUSTER SLOTS sequence. set_role is a no-op for
+                        // already-known replicas (idempotent).
+                        rsc->set_role(role_replica);
+                        connect_shard_connection(rsc, r_addr, r_port);
+                    } else {
+                        // Already connected from a previous refresh. Ensure
+                        // the role label is correct; an existing connection
+                        // discovered for the first time as a replica needs
+                        // its role updated even though we won't re-fire the
+                        // setup ladder until the next reconnect.
+                        rsc->set_role(role_replica);
+                    }
+                    break;
+                }
+            }
+
+            if (rsc == NULL) {
+                rsc = create_shard_connection(MAIN_CONNECTION->get_protocol());
+                // Set the role before connect() so the READONLY ladder is
+                // armed at connect time.
+                rsc->set_role(role_replica);
+                connect_shard_connection(rsc, r_addr, r_port);
+            }
+
+            group.replicas.push_back(rsc);
+
+            free(r_addr);
+            free(r_port);
+        }
 
         // Append the group and remember its index so the slot-range write
         // below points slots at this group rather than at the primary's
