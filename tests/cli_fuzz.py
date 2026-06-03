@@ -390,6 +390,13 @@ def _run_memtier(extra_args):
         "--threads=1",
         "--clients=1",
         "--hide-histogram",
+        # Tighten the connection-stage supervisor (#431) so it fires well
+        # inside the subprocess timeout below; the default (30 s) is too
+        # large for the 10 s hang threshold, letting cases like
+        # `--authenticate ''` against a no-auth server look like hangs to
+        # the fuzzer. `extra_args` is appended after, so a fuzzed
+        # `--connection-stage-timeout=` value still wins (last flag wins).
+        "--connection-stage-timeout=3",
     ] + list(extra_args)
     return subprocess.run(
         cmd,
