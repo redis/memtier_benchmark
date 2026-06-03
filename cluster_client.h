@@ -38,12 +38,37 @@ struct staged_monitor_cmd
 // forward decleration
 class shard_connection;
 
+// Topology grouping: one shard_group per primary, plus the list of replicas
+// (zero-length when the primary has no replicas, or when CLUSTER SLOTS only
+// returned the primary tuple). Per-thread state (replica_rr_cursor) — no
+// atomics because each cluster_client lives on a single thread.
+//
+// id is the group's index in m_shard_groups. m_slot_to_shard_group[slot] points
+// back to that index, so the primary serving slot s is
+// m_shard_groups[m_slot_to_shard_group[s]].primary. Replica selection is
+// owned by a future select_target_conn(); this struct is the data plumbing.
+struct shard_group
+{
+    unsigned int id;
+    shard_connection *primary;
+    std::vector<shard_connection *> replicas;
+    unsigned int replica_rr_cursor; // per-thread, not atomic
+};
+
 class cluster_client : public client
 {
 protected:
     std::vector<key_index_pool *> m_key_index_pools;
     std::vector<std::queue<staged_monitor_cmd> > m_staged_monitor_commands;
-    unsigned int m_slot_to_shard[16384];
+    // Per-slot map to the owning shard group. m_shard_groups[m_slot_to_shard_group[s]].primary
+    // is the connection that owns slot s; replicas are reachable via the same group's
+    // replicas vector. Replaces the old `unsigned int m_slot_to_shard[16384]` (which only
+    // tracked primary conn_id by slot).
+    std::vector<unsigned int> m_slot_to_shard_group;
+    // One entry per primary discovered via CLUSTER SLOTS; index == shard_group::id.
+    // Indices are stable within a topology refresh: handle_cluster_slots() rebuilds the
+    // vector each call so groups stay in step with the rest of the rewritten map.
+    std::vector<shard_group> m_shard_groups;
     // --transaction: shard connection that owns the in-flight rotation of
     // --command entries. -1 = no pin (rotation has not started or just ended).
     // The pin is established when the first command of a fresh rotation is
@@ -71,6 +96,15 @@ protected:
 
     virtual int connect(void);
     virtual void disconnect(void);
+
+    // Primaries-only slot lookup. Resolves a hash slot through the
+    // m_slot_to_shard_group indirection to the conn_id of the owning primary.
+    // Behavior is identical to the prior `m_slot_to_shard[slot]` array — this
+    // is the canonical primary-routing helper while replica selection lives
+    // behind a future select_target_conn() (owned by the integration agent).
+    // Returns UINT_MAX if the slot maps to an unpopulated group (shouldn't
+    // happen post-bootstrap CLUSTER SLOTS, but defensive against torn state).
+    unsigned int slot_primary_conn_id(unsigned int slot) const;
 
     shard_connection *create_shard_connection(abstract_protocol *abs_protocol);
     bool connect_shard_connection(shard_connection *sc, char *address, char *port);

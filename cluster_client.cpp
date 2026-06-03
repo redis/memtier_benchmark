@@ -127,7 +127,11 @@ cluster_client::cluster_client(client_group *group) :
         m_txn_has_staged_key(false),
         m_txn_pin_lost_warned(false)
 {
-    memset(m_slot_to_shard, 0, sizeof(m_slot_to_shard));
+    // Initialize slot map to zero; m_shard_groups starts empty and is populated
+    // by handle_cluster_slots(). Until then, lookups via m_slot_to_shard_group
+    // index 0 are safe because cluster_client::connect() forces the bootstrap
+    // connection to drive CLUSTER SLOTS before any user traffic flows.
+    m_slot_to_shard_group.assign(MAX_CLUSTER_HSLOT + 1, 0);
 }
 
 cluster_client::~cluster_client()
@@ -342,9 +346,26 @@ void cluster_client::build_mget_slot_cache()
 
     for (unsigned int slot = 0; slot <= MAX_CLUSTER_HSLOT; slot++) {
         if (cache->slot_keys[slot].empty()) continue;
-        unsigned int cid = m_slot_to_shard[slot];
+        // Resolve slot -> shard_group -> primary -> conn_id. Behavior identical
+        // to the prior `m_slot_to_shard[slot]` lookup; the indirection through
+        // m_shard_groups is the prep for replica-aware routing.
+        unsigned int gidx = m_slot_to_shard_group[slot];
+        if (gidx >= m_shard_groups.size()) continue;
+        shard_connection *primary = m_shard_groups[gidx].primary;
+        if (primary == NULL) continue;
+        unsigned int cid = primary->get_id();
         if (cid < num_conns) m_mget_conn_slots[cid].push_back(slot);
     }
+}
+
+unsigned int cluster_client::slot_primary_conn_id(unsigned int slot) const
+{
+    if (slot >= m_slot_to_shard_group.size()) return UINT_MAX;
+    unsigned int gidx = m_slot_to_shard_group[slot];
+    if (gidx >= m_shard_groups.size()) return UINT_MAX;
+    shard_connection *primary = m_shard_groups[gidx].primary;
+    if (primary == NULL) return UINT_MAX;
+    return primary->get_id();
 }
 
 void cluster_client::handle_cluster_slots(protocol_response *r)
@@ -382,6 +403,15 @@ void cluster_client::handle_cluster_slots(protocol_response *r)
     // existing connection (including the bootstrap), which contradicts the
     // documented "bootstrap stays in service" invariant. (Cursor bugbot.)
     bool any_valid_shard = false;
+
+    // Reset the per-refresh topology view. Existing primary/replica connection
+    // objects in m_connections are reused via the dedupe-by-(addr,port) loop
+    // below; only the grouping is recomputed. m_slot_to_shard_group keeps its
+    // previous contents and is overwritten range-by-range as each valid shard
+    // entry lands -- ranges that never appear in this reply preserve their
+    // last-known mapping, matching the pre-shard_group behavior of
+    // m_slot_to_shard[].
+    m_shard_groups.clear();
 
     // run over response and create connections
     for (unsigned int i = 0; i < r->get_mbulk_value()->mbulks_elements.size(); i++) {
@@ -476,14 +506,36 @@ void cluster_client::handle_cluster_slots(protocol_response *r)
             connect_shard_connection(sc, addr, port);
         }
 
+        // The primary discovered for this shard owns the slot range; track it
+        // here and reuse the same conn for replicas below to attach to.
+        sc->set_role(role_primary);
+
+        free(addr);
+        free(port);
+
+        // Start a new shard_group for this primary. id == index in
+        // m_shard_groups; consumers (e.g. m_slot_to_shard_group[s]) refer to
+        // the group by this index. Replicas are populated in a follow-up
+        // change; today the vector stays empty so behavior is identical to
+        // the prior primaries-only flat-array form.
+        shard_group group;
+        group.id = (unsigned int) m_shard_groups.size();
+        group.primary = sc;
+        group.replica_rr_cursor = 0;
+
+        // Append the group and remember its index so the slot-range write
+        // below points slots at this group rather than at the primary's
+        // conn_id directly. (Group index, not conn_id; conn_id is recovered
+        // via group.primary->get_id() at lookup time.)
+        unsigned int group_idx = group.id;
+        m_shard_groups.push_back(group);
+
         // update range
         for (int j = min_slot; j <= max_slot; j++) {
-            m_slot_to_shard[j] = sc->get_id();
+            m_slot_to_shard_group[j] = group_idx;
         }
 
         any_valid_shard = true;
-        free(addr);
-        free(port);
     }
 
     // If every shard in the reply was malformed and skipped, treat the reply
@@ -649,15 +701,24 @@ get_key_response cluster_client::get_key_for_conn(unsigned int command_index, un
 
     unsigned int hslot = calc_hslot_crc16_cluster(m_obj_gen->get_key(), m_obj_gen->get_key_len());
 
-    // check if the key match for this connection
-    if (m_slot_to_shard[hslot] == conn_id) {
+    // check if the key match for this connection. slot_primary_conn_id() can
+    // return UINT_MAX before the first CLUSTER SLOTS response populates
+    // m_shard_groups (bootstrap window) -- treat it as "not available" so the
+    // caller retries once the topology settles, matching the prior behavior
+    // where m_slot_to_shard was zero-initialized and the conn-state check
+    // below caught it.
+    unsigned int primary_conn_id = slot_primary_conn_id(hslot);
+    if (primary_conn_id == UINT_MAX) {
+        return not_available;
+    }
+    if (primary_conn_id == conn_id) {
         benchmark_debug_log("%s generated key=[%.*s] for itself\n", m_connections[conn_id]->get_readable_id(),
                             m_obj_gen->get_key_len(), m_obj_gen->get_key());
         return available_for_conn;
     }
 
     // handle key for other connection
-    unsigned int other_conn_id = m_slot_to_shard[hslot];
+    unsigned int other_conn_id = primary_conn_id;
 
     // in case we generated key for connection that is disconnected, 'slot to shard' map may need to be updated
     if (m_connections[other_conn_id]->get_connection_state() == conn_disconnected) {
@@ -784,7 +845,15 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
                 } else {
                     hslot = calc_hslot_crc16_with_hash_tag(gen_key, gen_key_len);
                 }
-                target_conn = (int) m_slot_to_shard[hslot];
+                {
+                    // Resolve slot via the shard_group indirection. If the
+                    // map isn't populated yet (slot_primary_conn_id returns
+                    // UINT_MAX), leave target_conn at -1 so the fallback
+                    // below routes to the current conn_id; matches the prior
+                    // behavior where m_slot_to_shard was zero-initialized.
+                    unsigned int pcid = slot_primary_conn_id(hslot);
+                    target_conn = (pcid == UINT_MAX) ? -1 : (int) pcid;
+                }
                 break;
             }
             /* If we couldn't find a keyed cmd, or the slot mapping isn't
@@ -1000,8 +1069,11 @@ bool cluster_client::create_monitor_request_cluster(unsigned int command_index, 
         const std::string &key = temp_cmd.command_args[1].data;
         if (!key.empty()) {
             uint32_t slot = calc_hslot_crc16_with_hash_tag(key.c_str(), key.size());
-            uint32_t shard = m_slot_to_shard[slot];
-            if (shard < m_connections.size() && m_connections[shard]->get_connection_state() != conn_disconnected &&
+            // Same primaries-only resolution as the prior m_slot_to_shard
+            // read; the shard_group indirection is invisible at this site.
+            unsigned int shard = slot_primary_conn_id(slot);
+            if (shard != UINT_MAX && shard < m_connections.size() &&
+                m_connections[shard]->get_connection_state() != conn_disconnected &&
                 m_connections[shard]->get_cluster_slots_state() == setup_done) {
                 target_conn = shard;
             }
@@ -1130,10 +1202,14 @@ bool cluster_client::retry_after_redirect(unsigned int conn_id, request *req)
         // the correct shard. calc_hslot_crc16_cluster hashes the full string
         // and would map to a different slot, causing an infinite MOVED loop.
         unsigned int hslot = calc_hslot_crc16_with_hash_tag(req->m_key, req->m_key_len);
-        unsigned int mapped = m_slot_to_shard[hslot];
+        // Primary-only routing on retry; UINT_MAX before bootstrap CLUSTER
+        // SLOTS lands -- in that window we fall back to retrying on the same
+        // connection (matches the prior "CLUSTER SLOTS still in flight" path).
+        unsigned int mapped = slot_primary_conn_id(hslot);
         // Only route to a different connection if it's actually ready; otherwise
         // fall back to the same connection (CLUSTER SLOTS may still be in flight).
-        if (mapped < m_connections.size() && m_connections[mapped]->get_connection_state() == conn_connected &&
+        if (mapped != UINT_MAX && mapped < m_connections.size() &&
+            m_connections[mapped]->get_connection_state() == conn_connected &&
             m_connections[mapped]->get_cluster_slots_state() == setup_done) {
             target = mapped;
         }
