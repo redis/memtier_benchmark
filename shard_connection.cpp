@@ -223,6 +223,7 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_pending_resp(0),
         m_last_pushed_req_type(-1),
         m_connection_state(conn_disconnected),
+        m_role(role_primary),
         m_hello(setup_done),
         m_authentication(setup_done),
         m_db_selection(setup_done),

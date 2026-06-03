@@ -50,6 +50,16 @@ enum setup_state
     setup_done
 };
 
+// Topology role of a shard connection. Primary == owns slots and accepts writes.
+// Replica == read-only mirror of a primary; requires READONLY after HELLO before
+// it will serve any user traffic in cluster mode. Cluster mode only; standalone
+// replicas don't get this treatment (see P2 design brief).
+enum shard_role
+{
+    role_primary,
+    role_replica
+};
+
 enum request_type
 {
     rt_unknown,
@@ -167,6 +177,12 @@ public:
 
     enum connection_state get_connection_state() { return m_connection_state; }
 
+    // Topology role accessors. Defaults to role_primary; cluster_client flips
+    // replicas to role_replica after CLUSTER SLOTS reveals them.
+    enum shard_role get_role() const { return m_role; }
+    void set_role(enum shard_role role) { m_role = role; }
+    bool is_replica() const { return m_role == role_replica; }
+
     int get_pending_resp() { return m_pending_resp; }
 
     // Get local port for crash reporting
@@ -247,6 +263,11 @@ private:
     volatile int m_last_pushed_req_type;
 
     enum connection_state m_connection_state;
+    // Topology role; defaults to role_primary. Cluster_client sets it to
+    // role_replica after CLUSTER SLOTS reveals the connection is a replica node.
+    // Connection-scoped (preserved across reconnects so the READONLY ladder
+    // re-fires on every reconnect).
+    enum shard_role m_role;
 
     enum setup_state m_hello;
     enum setup_state m_authentication;
