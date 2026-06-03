@@ -78,6 +78,7 @@ struct CommandSpec
     const char *name;      // Uppercase. Subcommands are space-separated, e.g. "XGROUP CREATE".
     int32_t arity;         // Negative arity == variadic minimum.
     bool movable_keys;     // True if command_flags contains MOVABLEKEYS.
+    bool is_read;          // True if command_flags contains READONLY (safe to route to replicas).
     uint8_t num_key_specs; // Length of key_specs array.
     const KeySpec *key_specs;
     ReplyShape reply_shape;
