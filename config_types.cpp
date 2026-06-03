@@ -308,7 +308,8 @@ arbitrary_command::arbitrary_command(const char *cmd) :
         ratio(1),
         stats_only(false),
         spec(NULL),
-        miss_tracking_enabled(false)
+        miss_tracking_enabled(false),
+        is_read_override(-1)
 {
     // command name is the first word in the command
     size_t pos = command.find(" ");
