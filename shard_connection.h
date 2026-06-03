@@ -70,7 +70,8 @@ enum request_type
     rt_auth,
     rt_select_db,
     rt_cluster_slots,
-    rt_hello
+    rt_hello,
+    rt_readonly
 };
 struct request
 {
@@ -273,6 +274,10 @@ private:
     enum setup_state m_authentication;
     enum setup_state m_db_selection;
     enum setup_state m_cluster_slots;
+    // READONLY ladder stage. Only ever leaves setup_done when m_role ==
+    // role_replica; primaries skip the stage entirely. Re-armed on every
+    // reconnect because READONLY is connection-scoped on the server side.
+    enum setup_state m_readonly_state;
 
     // Reconnection state tracking
     unsigned int m_reconnect_attempts;
