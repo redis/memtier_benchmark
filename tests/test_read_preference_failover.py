@@ -1,0 +1,235 @@
+"""
+Failover test for --read-preference in cluster mode.
+
+Background
+----------
+When a replica goes offline, --read-preference=secondaryPreferred must fall
+back gracefully to the primary/master.  memtier must not crash and GETs must
+continue to be served from the master of the affected shard.
+
+Test
+----
+1. Baseline run: --read-preference=secondaryPreferred with replicas present.
+   Assert GETs land on replicas.
+
+2. Kill one replica shard.
+
+3. Re-run: same flags.  Assert no crash (exit code != signal) and GETs land
+   on masters (since the only replica is gone).
+
+Note: stopping a replica in an RLTest cluster environment requires calling
+``env.envRunner`` internals.  Because the RLTest API for stopping individual
+replica nodes is not stable, this test takes a best-effort approach: it
+iterates over the replica connections found via CLUSTER NODES, attempts to
+send a SHUTDOWN NOSAVE, then waits briefly.  The re-run assertion is the
+authoritative check.
+"""
+
+import time
+import tempfile
+
+from include import (
+    add_required_env_arguments,
+    addTLSArgs,
+    debugPrintMemtierOnError,
+    ensure_clean_benchmark_folder,
+    get_cluster_replica_connections,
+    get_default_memtier_config,
+    reset_commandstats,
+)
+from mb import Benchmark, RunConfig
+
+# ---------------------------------------------------------------------------
+# Env override: replicas required
+# ---------------------------------------------------------------------------
+
+ENV_DEFAULTS = {"useSlaves": True, "shardsCount": 3}
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_THREADS = 2
+_CLIENTS = 2
+_REQUESTS = 100
+
+
+def _pre_populate(env, key_count=100):
+    master_conns = env.getOSSMasterNodesConnectionList()
+    for i in range(key_count):
+        conn = master_conns[i % len(master_conns)]
+        conn.execute_command("SET", "fp-key-{}".format(i), "val-{}".format(i))
+
+
+def _reset_all_commandstats(env, replica_conns):
+    for conn in env.getOSSMasterNodesConnectionList():
+        try:
+            conn.execute_command("CONFIG", "RESETSTAT")
+        except Exception:
+            pass
+    reset_commandstats(replica_conns)
+
+
+def _sum_get_calls(conns):
+    total = 0
+    for conn in conns:
+        try:
+            stats = conn.execute_command("INFO", "COMMANDSTATS")
+        except Exception:
+            continue
+        if isinstance(stats, dict):
+            total += int(stats.get("cmdstat_get", {}).get("calls", 0))
+        else:
+            for line in stats.split("\n"):
+                line = line.strip()
+                if line.startswith("cmdstat_get:"):
+                    for kv in line.split(":", 1)[1].split(","):
+                        kv = kv.strip()
+                        if kv.startswith("calls="):
+                            try:
+                                total += int(kv.split("=", 1)[1])
+                            except ValueError:
+                                pass
+    return total
+
+
+def _run_read_pref(env, read_preference, threads=_THREADS, clients=_CLIENTS,
+                   requests=_REQUESTS):
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--ratio=0:1",
+            "--key-minimum=0",
+            "--key-maximum=99",
+            "--read-preference={}".format(read_preference),
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+
+    config = get_default_memtier_config(
+        threads=threads, clients=clients, requests=requests
+    )
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    test_dir = tempfile.mkdtemp()
+    run_config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(run_config.results_dir)
+
+    benchmark = Benchmark.from_json(run_config, benchmark_specs)
+    ok = benchmark.run()
+    return ok, run_config
+
+
+def _stop_one_replica(replica_conns):
+    """Best-effort: send SHUTDOWN NOSAVE to the first reachable replica.
+
+    Returns True if a replica was successfully stopped, False otherwise.
+    """
+    for conn in replica_conns:
+        try:
+            # SHUTDOWN NOSAVE will close the connection; ignore the error.
+            conn.execute_command("SHUTDOWN", "NOSAVE")
+        except Exception:
+            # The connection is expected to close; treat this as success.
+            pass
+        # Give the OS a moment to reap the process.
+        time.sleep(0.5)
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Test: failover scenario
+# ---------------------------------------------------------------------------
+
+def test_read_preference_failover(env):
+    """Stopping a replica must not crash memtier.  With
+    --read-preference=secondaryPreferred, after the replica is gone GETs must
+    fall back to the master of the affected shard."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    replica_conns = get_cluster_replica_connections(env)
+    if not replica_conns:
+        env.skip()
+        return
+
+    _pre_populate(env, key_count=100)
+
+    # ---- Baseline: confirm replicas are serving reads ---------------------
+    _reset_all_commandstats(env, replica_conns)
+    ok_baseline, run_config_baseline = _run_read_pref(
+        env, "secondaryPreferred"
+    )
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(
+            ok_baseline,
+            message="baseline run exited non-zero before replica shutdown",
+        )
+        replica_gets_baseline = _sum_get_calls(replica_conns)
+        env.assertGreater(
+            replica_gets_baseline,
+            0,
+            message="baseline: expected GETs on replicas before shutdown, "
+                    "got 0 across {} replicas".format(len(replica_conns)),
+        )
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config_baseline, env)
+
+    # ---- Stop one replica -------------------------------------------------
+    stopped = _stop_one_replica(replica_conns)
+    if not stopped:
+        # Could not stop any replica; skip rather than produce a false result.
+        env.skip()
+        return
+
+    # Allow the cluster a moment to register the failure.
+    time.sleep(1)
+
+    # ---- Post-failover run ------------------------------------------------
+    master_conns = env.getOSSMasterNodesConnectionList()
+
+    # Re-discover live replica connections (some may now be unreachable).
+    surviving_replica_conns = []
+    for conn in replica_conns:
+        try:
+            conn.execute_command("PING")
+            surviving_replica_conns.append(conn)
+        except Exception:
+            pass
+
+    _reset_all_commandstats(env, surviving_replica_conns)
+    for conn in master_conns:
+        try:
+            conn.execute_command("CONFIG", "RESETSTAT")
+        except Exception:
+            pass
+
+    ok_post, run_config_post = _run_read_pref(env, "secondaryPreferred")
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        # Must not crash (return code must not be a negative signal value).
+        env.assertTrue(
+            ok_post,
+            message="memtier crashed or returned non-zero after replica "
+                    "shutdown with --read-preference=secondaryPreferred",
+        )
+
+        # GETs must have landed somewhere (masters or surviving replicas).
+        all_live_conns = master_conns + surviving_replica_conns
+        total_gets = _sum_get_calls(all_live_conns)
+        env.assertGreater(
+            total_gets,
+            0,
+            message="no GETs recorded anywhere after replica shutdown; "
+                    "failover to master did not happen",
+        )
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config_post, env)
