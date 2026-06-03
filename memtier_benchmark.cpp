@@ -682,6 +682,42 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
         jsonhandler->write_obj("step_duration", "%u", cfg->step_duration);
     }
 
+    // Read-preference configuration
+    {
+        const char *rp_str = "primary";
+        switch (cfg->read_preference) {
+        case rp_secondary:
+            rp_str = "secondary";
+            break;
+        case rp_secondary_preferred:
+            rp_str = "secondaryPreferred";
+            break;
+        case rp_nearest:
+            rp_str = "nearest";
+            break;
+        default:
+            rp_str = "primary";
+            break;
+        }
+        jsonhandler->write_obj("read_preference", "\"%s\"", rp_str);
+
+        const char *rpf_str = "error";
+        switch (cfg->read_preference_fallback) {
+        case rpf_queue:
+            rpf_str = "queue";
+            break;
+        case rpf_primary:
+            rpf_str = "primary";
+            break;
+        default:
+            rpf_str = "error";
+            break;
+        }
+        jsonhandler->write_obj("read_preference_fallback", "\"%s\"", rpf_str);
+        jsonhandler->write_obj("replica_clients", "%u", cfg->replica_clients);
+        jsonhandler->write_obj("replicas_per_shard", "%u", cfg->replicas_per_shard);
+    }
+
     jsonhandler->close_nesting();
 }
 
@@ -1037,6 +1073,12 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_clients_start,
         o_clients_step,
         o_step_duration,
+        o_read_preference,
+        o_read_server,
+        o_command_is_read,
+        o_replica_clients,
+        o_replicas_per_shard,
+        o_read_preference_fallback,
         o_help
     };
 
@@ -1140,6 +1182,12 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         {"clients-start", 1, 0, o_clients_start},
         {"clients-step", 1, 0, o_clients_step},
         {"step-duration", 1, 0, o_step_duration},
+        {"read-preference", 1, 0, o_read_preference},
+        {"read-server", 1, 0, o_read_server},
+        {"command-is-read", 0, 0, o_command_is_read},
+        {"replica-clients", 1, 0, o_replica_clients},
+        {"replicas-per-shard", 1, 0, o_replicas_per_shard},
+        {"read-preference-fallback", 1, 0, o_read_preference_fallback},
         {NULL, 0, 0, 0}};
 
     int option_index;
@@ -1975,6 +2023,112 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 return -1;
             }
             break;
+        case o_read_preference: {
+            if (!optarg) {
+                fprintf(stderr, "error: --read-preference requires a value.\n");
+                return -1;
+            }
+            if (strcasecmp(optarg, "primary") == 0) {
+                cfg->read_preference = rp_primary;
+            } else if (strcasecmp(optarg, "secondary") == 0) {
+                cfg->read_preference = rp_secondary;
+            } else if (strcasecmp(optarg, "secondaryPreferred") == 0) {
+                cfg->read_preference = rp_secondary_preferred;
+            } else if (strcasecmp(optarg, "nearest") == 0) {
+                cfg->read_preference = rp_nearest;
+            } else {
+                fprintf(stderr,
+                        "error: --read-preference must be one of: primary, secondary, "
+                        "secondaryPreferred, nearest (got '%s').\n",
+                        optarg);
+                return -1;
+            }
+            break;
+        }
+        case o_read_server: {
+            if (!optarg || !*optarg) {
+                fprintf(stderr, "error: --read-server requires a HOST:PORT argument.\n");
+                return -1;
+            }
+            // Parse HOST:PORT.  IPv6 addresses may be bracketed: [::1]:6380.
+            // Find the colon after any closing bracket.
+            const char *rsp = optarg;
+            const char *rscolon = NULL;
+            if (*rsp == '[') {
+                const char *bracket = strchr(rsp, ']');
+                if (!bracket) {
+                    fprintf(stderr, "error: --read-server: unterminated IPv6 bracket in '%s'.\n", optarg);
+                    return -1;
+                }
+                rscolon = strchr(bracket, ':');
+            } else {
+                rscolon = strrchr(rsp, ':');
+            }
+            if (!rscolon || rscolon == rsp || !*(rscolon + 1)) {
+                fprintf(stderr, "error: --read-server: expected HOST:PORT, got '%s'.\n", optarg);
+                return -1;
+            }
+            endptr = NULL;
+            unsigned long rport = strtoul(rscolon + 1, &endptr, 10);
+            if (!endptr || *endptr != '\0' || rport == 0 || rport > 65535) {
+                fprintf(stderr, "error: --read-server: invalid port in '%s'.\n", optarg);
+                return -1;
+            }
+            std::string rhost(rsp, (size_t) (rscolon - rsp));
+            // Strip IPv6 brackets from the stored hostname
+            if (!rhost.empty() && rhost[0] == '[' && rhost[rhost.size() - 1] == ']') {
+                rhost = rhost.substr(1, rhost.size() - 2);
+            }
+            cfg->read_servers.push_back(read_server_spec(rhost, (unsigned short) rport));
+            break;
+        }
+        case o_command_is_read: {
+            if (!cfg->arbitrary_commands || cfg->arbitrary_commands->size() == 0) {
+                fprintf(stderr, "error: --command-is-read must follow a --command.\n");
+                return -1;
+            }
+            arbitrary_command &ircmd = cfg->arbitrary_commands->get_last_command();
+            ircmd.is_read_override = 1;
+            break;
+        }
+        case o_replica_clients: {
+            endptr = NULL;
+            cfg->replica_clients = (unsigned int) strtoul(optarg, &endptr, 10);
+            if (!endptr || *endptr != '\0') {
+                fprintf(stderr, "error: --replica-clients must be a non-negative integer.\n");
+                return -1;
+            }
+            break;
+        }
+        case o_replicas_per_shard: {
+            endptr = NULL;
+            cfg->replicas_per_shard = (unsigned int) strtoul(optarg, &endptr, 10);
+            if (!endptr || *endptr != '\0') {
+                fprintf(stderr, "error: --replicas-per-shard must be a non-negative integer.\n");
+                return -1;
+            }
+            break;
+        }
+        case o_read_preference_fallback: {
+            if (!optarg) {
+                fprintf(stderr, "error: --read-preference-fallback requires a value.\n");
+                return -1;
+            }
+            if (strcasecmp(optarg, "error") == 0) {
+                cfg->read_preference_fallback = rpf_error;
+            } else if (strcasecmp(optarg, "queue") == 0) {
+                cfg->read_preference_fallback = rpf_queue;
+            } else if (strcasecmp(optarg, "primary") == 0) {
+                cfg->read_preference_fallback = rpf_primary;
+            } else {
+                fprintf(stderr,
+                        "error: --read-preference-fallback must be one of: error, queue, primary "
+                        "(got '%s').\n",
+                        optarg);
+                return -1;
+            }
+            break;
+        }
         default:
             return -1;
             break;
@@ -2000,6 +2154,30 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 return -1;
             }
         }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Read-preference post-parse validation
+    // ---------------------------------------------------------------------------
+
+    // --transaction and non-primary read-preference are mutually exclusive:
+    // the transaction pin model assumes all commands in a rotation target
+    // the same (primary) shard connection; routing reads to replicas inside
+    // a MULTI/EXEC block would break the atomicity guarantee.
+    if (cfg->transaction && cfg->read_preference != rp_primary) {
+        fprintf(stderr, "error: --transaction and --read-preference != primary are mutually exclusive. "
+                        "MULTI/EXEC blocks must run on the same primary connection; routing reads "
+                        "to replicas would break the atomicity guarantee.\n");
+        return -1;
+    }
+
+    // Warn when --read-preference is set but has no routing effect:
+    // in standalone mode (no --cluster-mode) the flag only works when at
+    // least one --read-server is given.
+    if (cfg->read_preference != rp_primary && !cfg->cluster_mode && cfg->read_servers.empty()) {
+        fprintf(stderr, "warning: --read-preference has no effect in standalone mode without "
+                        "--read-server. Specify at least one replica endpoint with --read-server "
+                        "HOST:PORT or add --cluster-mode.\n");
     }
 
     // --transaction needs at least one --command to operate on. In
@@ -2212,6 +2390,27 @@ void usage()
         "      --scan-incremental-max-iterations=NUMBER\n"
         "                                 Maximum number of continuation SCANs per iteration cycle\n"
         "                                 (default: 0, follow cursor until it returns 0).\n"
+        "      --command-is-read          Mark the preceding --command as a read operation for\n"
+        "                                 --read-preference routing (per-command override).\n"
+        "\n"
+        "Read Preference Options:\n"
+        "      --read-preference=MODE     Which node class receives read commands (default: primary).\n"
+        "                                 primary           - all reads go to the master/primary node\n"
+        "                                 secondary         - all reads go to replica nodes only\n"
+        "                                 secondaryPreferred - replicas preferred; fall back to primary\n"
+        "                                 nearest           - any node; no strict placement guarantee\n"
+        "      --read-server=HOST:PORT    Replica endpoint for standalone (non-cluster) mode.\n"
+        "                                 Repeatable; each occurrence adds one replica endpoint.\n"
+        "                                 IPv6 addresses may be given as [::1]:6380.\n"
+        "      --replica-clients=N        Connections per replica per client thread (default: 0 = inherit\n"
+        "                                 --clients).\n"
+        "      --replicas-per-shard=K     Cap on replicas used per shard (default: 0 = all).\n"
+        "      --read-preference-fallback=MODE\n"
+        "                                 What to do when the target node class is unavailable\n"
+        "                                 (default: error).\n"
+        "                                 error   - return an error\n"
+        "                                 queue   - queue the request until a suitable node appears\n"
+        "                                 primary - fall back silently to the primary\n"
         "\n"
         "Object Options:\n"
         "  -d  --data-size=SIZE           Object data size in bytes (default: 32)\n"
