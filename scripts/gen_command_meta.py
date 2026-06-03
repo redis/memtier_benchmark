@@ -164,6 +164,7 @@ def main():
         arity = int(doc.get('arity', 0))
         flags = [f.upper() for f in (doc.get('command_flags', []) or [])]
         movable = 'MOVABLEKEYS' in flags
+        is_read = 'READONLY' in flags
         shape = infer_shape(name, doc)
         shape_counts[shape] = shape_counts.get(shape, 0) + 1
 
@@ -185,9 +186,10 @@ def main():
         else:
             specs_ref = 'nullptr'
 
-        cmd_rows.append('    {{ {}, {}, {}, {}, {}, ReplyShape::{} }},'.format(
+        cmd_rows.append('    {{ {}, {}, {}, {}, {}, {}, ReplyShape::{} }},'.format(
             c_str_literal(name), arity,
             'true' if movable else 'false',
+            'true' if is_read else 'false',
             len(key_specs), specs_ref, shape,
         ))
 
