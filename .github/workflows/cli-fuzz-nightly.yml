@@ -88,16 +88,7 @@ jobs:
           MEMTIER_FUZZ_MAX_EXAMPLES: >-
             ${{ github.event_name == 'pull_request' && '50' ||
                 (inputs.max_examples || '500') }}
-          # detect_leaks=0 is deliberate: this harness fuzzes CLI argv shapes
-          # and several supervisor-abort exits (e.g. --authenticate '' against
-          # a no-auth server, combined with --cluster-mode) tear down a
-          # partially-initialised cluster_client that LSAN flags at
-          # __cxa_finalize. That is a documented leak class on the abort
-          # path -- not a leak introduced by any specific CLI input -- and is
-          # tracked separately (#450). Steady-state leak coverage already
-          # comes from asan.yml. abort_on_error=1 remains so any real ASAN
-          # catch (UAF, OOB, double-free) still fails the run loudly.
-          ASAN_OPTIONS: "detect_leaks=0:abort_on_error=1"
+          ASAN_OPTIONS: "detect_leaks=1:abort_on_error=1"
           UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
         run: |
           python -m pytest tests/cli_fuzz.py -q --tb=short --hypothesis-seed=0
