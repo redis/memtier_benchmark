@@ -56,6 +56,37 @@ enum PROTOCOL_TYPE
     PROTOCOL_MEMCACHE_BINARY,
 };
 
+// ---------------------------------------------------------------------------
+// Read-preference enums (storage lives in benchmark_config below)
+// ---------------------------------------------------------------------------
+
+// Which node class should receive read commands.
+enum read_pref_mode
+{
+    rp_primary = 0,         // all reads go to the master/primary (default)
+    rp_secondary,           // reads go to replica nodes only
+    rp_secondary_preferred, // replicas preferred; fall back to primary
+    rp_nearest              // any node; no strict placement guarantee
+};
+
+// What to do when the target node class is unavailable.
+enum read_pref_fallback
+{
+    rpf_error = 0, // return an error to the caller (default)
+    rpf_queue,     // queue the request until a suitable node is available
+    rpf_primary    // fall back silently to the primary
+};
+
+// Lightweight representation of a --read-server HOST:PORT entry.
+// Stored at parse time; routing code converts to server_addr objects later.
+struct read_server_spec
+{
+    std::string host;
+    unsigned short port;
+
+    read_server_spec(const std::string &h, unsigned short p) : host(h), port(p) {}
+};
+
 // Shared MGET slot cache: built once (lazily, on first topology load) and
 // read concurrently by all cluster_client threads.  m_mget_slot_keys is
 // identical for every thread — only the per-slot round-robin cursors differ.
@@ -196,6 +227,21 @@ struct benchmark_config
     bool scan_incremental_iteration;
     unsigned int scan_incremental_max_iterations;
     arbitrary_command *scan_continuation_command;
+    // ---------------------------------------------------------------------------
+    // Read-preference configuration
+    //   read_preference         which node class receives reads (default: primary)
+    //   read_preference_fallback what to do when the target is unavailable
+    //   read_servers            replica endpoints for standalone mode
+    //                           (--read-server HOST:PORT, repeatable)
+    //   replica_clients         connections per replica per client thread;
+    //                           0 = inherit --clients
+    //   replicas_per_shard      cap on replicas used per shard; 0 = all
+    // ---------------------------------------------------------------------------
+    enum read_pref_mode read_preference;
+    enum read_pref_fallback read_preference_fallback;
+    std::vector<read_server_spec> read_servers;
+    unsigned int replica_clients;
+    unsigned int replicas_per_shard;
 #ifdef USE_TLS
     bool tls;
     const char *tls_cert;

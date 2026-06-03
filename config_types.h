@@ -191,6 +191,13 @@ struct arbitrary_command
     // Set by resolve_command_meta() (true iff spec exists and reply_shape is
     // miss-bearing). May be cleared later by the --command-miss-tracking flag.
     bool miss_tracking_enabled;
+
+    // Per-command read classification override set by --command-is-read.
+    // -1 = not set (inherit global read_preference classification),
+    //  0 = force treat as a write,
+    //  1 = force treat as a read.
+    // C++11-compatible replacement for std::optional<bool>.
+    int is_read_override; // -1 / 0 / 1
 };
 
 struct arbitrary_command_list
