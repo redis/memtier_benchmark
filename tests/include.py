@@ -160,7 +160,92 @@ def agg_keyspace_range(master_nodes_connections):
     return overall_keyspace_range
 
 
-def get_column_csv(filename,column_name):
+def get_cluster_replica_connections(env):
+    """Return List[redis.Redis] for every replica advertised by CLUSTER NODES.
+
+    Cluster-mode only.  Requires the env was started with useSlaves=True.
+    Returns an empty list when not in cluster mode or when no replicas are
+    found (so callers can gracefully skip rather than crash).
+    """
+    import redis as _redis
+
+    if not env.isCluster():
+        return []
+    try:
+        any_conn = env.getOSSMasterNodesConnectionList()[0]
+        raw = any_conn.execute_command("CLUSTER", "NODES")
+    except Exception:
+        return []
+
+    # raw may be a bytes string or a plain str depending on the redis-py version
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+
+    conns = []
+    for line in raw.strip().split("\n"):
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        flags = parts[2]
+        if "slave" not in flags and "replica" not in flags:
+            continue
+        host_part, _, _ = parts[1].partition("@")
+        host, _, port_str = host_part.rpartition(":")
+        if not port_str:
+            continue
+        try:
+            port = int(port_str)
+        except ValueError:
+            continue
+        conns.append(
+            _redis.Redis(
+                host=host,
+                port=port,
+                decode_responses=True,
+                socket_connect_timeout=5,
+            )
+        )
+    return conns
+
+
+def reset_commandstats(connections):
+    """CONFIG RESETSTAT on each connection.  Use to baseline before a run."""
+    for c in connections:
+        try:
+            c.execute_command("CONFIG", "RESETSTAT")
+        except Exception:
+            pass
+
+
+def get_get_call_count(conn):
+    """Read 'cmdstat_get' from INFO COMMANDSTATS.  Returns 0 if absent."""
+    try:
+        info = conn.execute_command("INFO", "COMMANDSTATS")
+    except Exception:
+        return 0
+
+    # INFO COMMANDSTATS may be returned as a dict (redis-py >= 4) or a raw str.
+    if isinstance(info, dict):
+        stat = info.get("cmdstat_get", {})
+        return int(stat.get("calls", 0))
+
+    # Raw string fallback (older redis-py or decode_responses=True).
+    for line in info.split("\n"):
+        line = line.strip()
+        if not line.startswith("cmdstat_get:"):
+            continue
+        # format: cmdstat_get:calls=N,usec=M,...
+        for kv in line.split(":", 1)[1].split(","):
+            kv = kv.strip()
+            if kv.startswith("calls="):
+                try:
+                    return int(kv.split("=", 1)[1])
+                except ValueError:
+                    return 0
+    return 0
+
+
+def get_column_csv(filename, column_name):
     found = False
     with open(filename,"r") as fd:
         stop_line = 0
