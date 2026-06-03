@@ -228,6 +228,7 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_authentication(setup_done),
         m_db_selection(setup_done),
         m_cluster_slots(setup_done),
+        m_readonly_state(setup_done),
         m_reconnect_attempts(0),
         m_current_backoff_delay(1.0),
         m_reconnect_timer(NULL),
@@ -428,6 +429,13 @@ int shard_connection::connect(struct connect_info *addr)
     m_authentication = m_config->authenticate ? setup_none : setup_done;
     m_db_selection = m_config->select_db ? setup_none : setup_done;
     m_hello = (m_config->protocol == PROTOCOL_RESP2 || m_config->protocol == PROTOCOL_RESP3) ? setup_none : setup_done;
+    // Replica connections need READONLY before they will serve user reads;
+    // cluster mode only (standalone replicas need a different ladder per P2
+    // design brief). Re-armed on every reconnect because the flag is
+    // connection-scoped on the server.
+    m_readonly_state = (m_role == role_replica && m_config->cluster_mode && is_redis_protocol(m_config->protocol))
+                           ? setup_none
+                           : setup_done;
 
     // setup socket
     int sockfd = setup_socket(addr);
@@ -500,7 +508,7 @@ void shard_connection::disconnect()
             // Only setup commands have no serialized capture (we never attempt
             // capture for those) — drop those.
             if (req->m_type == rt_auth || req->m_type == rt_select_db || req->m_type == rt_cluster_slots ||
-                req->m_type == rt_hello) {
+                req->m_type == rt_hello || req->m_type == rt_readonly) {
                 delete req;
                 continue;
             }
@@ -549,6 +557,7 @@ void shard_connection::disconnect()
     m_db_selection = setup_done;
     m_cluster_slots = setup_done;
     m_hello = setup_done;
+    m_readonly_state = setup_done;
 }
 
 void shard_connection::set_address_port(const char *address, const char *port)
@@ -633,6 +642,8 @@ const char *shard_connection::get_last_request_type()
         return "CLUSTER_SLOTS";
     case rt_hello:
         return "HELLO";
+    case rt_readonly:
+        return "READONLY";
     default:
         return "none";
     }
@@ -843,7 +854,7 @@ void shard_connection::drain_replay_queue_after_reconnect()
 bool shard_connection::is_conn_setup_done()
 {
     return m_authentication == setup_done && m_db_selection == setup_done && m_cluster_slots == setup_done &&
-           m_hello == setup_done;
+           m_hello == setup_done && m_readonly_state == setup_done;
 }
 
 void shard_connection::send_conn_setup_commands(struct timeval timestamp)
@@ -867,6 +878,18 @@ void shard_connection::send_conn_setup_commands(struct timeval timestamp)
         m_protocol->configure_protocol(m_config->protocol);
         push_req(new request(rt_hello, 0, &timestamp, 0));
         m_hello = setup_sent;
+    }
+
+    // READONLY: replica connections only (cluster mode). Sent after AUTH/SELECT/
+    // HELLO so any earlier failure is surfaced first, and before CLUSTER SLOTS
+    // so the slot-discovery command itself is allowed (the server otherwise
+    // rejects user-visible traffic on a replica connection that hasn't opted
+    // into reads).
+    if (m_readonly_state == setup_none) {
+        benchmark_debug_log("sending READONLY command (replica connection).\n");
+        m_protocol->write_command_readonly();
+        push_req(new request(rt_readonly, 0, &timestamp, 0));
+        m_readonly_state = setup_sent;
     }
 
     if (m_cluster_slots == setup_none) {
@@ -953,6 +976,20 @@ void shard_connection::process_response(void)
             } else {
                 m_hello = setup_done;
                 benchmark_debug_log("HELLO successful.\n");
+            }
+            break;
+        case rt_readonly:
+            if (r->is_error()) {
+                benchmark_error_log("error: READONLY failed [%s]\n", r->get_status());
+                {
+                    char buf[256];
+                    snprintf(buf, sizeof(buf), "READONLY failed: %s", r->get_status() ? r->get_status() : "");
+                    report_connection_stage_failure(buf);
+                }
+                error = true;
+            } else {
+                m_readonly_state = setup_done;
+                benchmark_debug_log("READONLY successful.\n");
             }
             break;
         default:
