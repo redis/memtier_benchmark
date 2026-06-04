@@ -564,31 +564,30 @@ void cluster_client::handle_cluster_slots(protocol_response *r)
     // documented "bootstrap stays in service" invariant. (Cursor bugbot.)
     bool any_valid_shard = false;
 
-    // Reset the per-refresh topology view. Existing primary/replica connection
-    // objects in m_connections are reused via the dedupe-by-(addr,port) loop
-    // below; only the grouping is recomputed.
+    // Build the new topology into LOCAL buffers (build-then-swap pattern).
     //
-    // Reset m_slot_to_shard_group to the UINT_MAX sentinel BEFORE clearing
-    // m_shard_groups. The previous behavior left stale group indices in slots
-    // that never reappeared in the new reply, which after the clear() could
-    // alias to a *different* new group (silent mis-routing until MOVED
-    // recovered). Every reader (slot_primary_conn_id, select_target_conn,
-    // get_key_for_conn, retry_after_redirect, create_monitor_request_cluster,
-    // create_mget_request) treats UINT_MAX as "not available" and bails, which
-    // is the correct behavior for a slot that no longer has a known owner.
+    // Round-1 of this fix reset m_slot_to_shard_group and cleared
+    // m_shard_groups *eagerly*, before any shards were parsed (commit 994e9ad).
+    // That left the existing state wiped even when every shard in the reply was
+    // subsequently skipped as malformed -- traffic saw no route until the next
+    // successful refresh (Cursor bugbot HIGH, PR #456).
     //
-    // INVARIANT (cursor bugbot #2 re-verification on f8a25d2): the assign()
-    // call below covers ALL 16384 slots unconditionally and runs BEFORE both
-    // m_shard_groups.clear() and the per-shard loop at line ~578. The
-    // per-shard loop only WRITES m_slot_to_shard_group[s] for slots `s`
-    // explicitly listed in the new reply (range [min_slot, max_slot] of each
-    // valid shard); slots absent from the new reply therefore stay at the
-    // UINT_MAX sentinel set here. Do not move this assign() into the loop
-    // body or guard it on any condition -- doing so reintroduces the stale-
-    // index aliasing bug.
+    // Deferred-commit fix: parse into new_slot_map / new_groups locals.  Only
+    // swap into the member variables if at least one valid shard was produced.
+    // On an all-skipped reply the member state is untouched and a warning is
+    // emitted.  The stale-index aliasing invariant (slots absent from the new
+    // reply must map to UINT_MAX, not to a reused group index) is preserved
+    // because new_slot_map is initialised to UINT_MAX and is only written for
+    // slots explicitly listed in a valid shard range -- identical to the old
+    // unconditional assign(), just deferred until commit time.
+    //
+    // Connections (m_connections) are still created/reused in-place during the
+    // parse loop; in the all-malformed case no new connections are created
+    // (every shard is skipped before reaching create_shard_connection), so
+    // there is nothing to roll back on that side.
     assert(m_slot_to_shard_group.size() == (size_t) MAX_CLUSTER_HSLOT + 1);
-    m_slot_to_shard_group.assign(MAX_CLUSTER_HSLOT + 1, UINT_MAX);
-    m_shard_groups.clear();
+    std::vector<unsigned int> new_slot_map(MAX_CLUSTER_HSLOT + 1, UINT_MAX);
+    std::vector<shard_group> new_groups;
 
     // run over response and create connections
     for (unsigned int i = 0; i < r->get_mbulk_value()->mbulks_elements.size(); i++) {
@@ -691,10 +690,10 @@ void cluster_client::handle_cluster_slots(protocol_response *r)
         free(port);
 
         // Start a new shard_group for this primary. id == index in
-        // m_shard_groups; consumers (e.g. m_slot_to_shard_group[s]) refer to
-        // the group by this index.
+        // new_groups (committed to m_shard_groups on success); consumers
+        // (e.g. m_slot_to_shard_group[s]) refer to the group by this index.
         shard_group group;
-        group.id = (unsigned int) m_shard_groups.size();
+        group.id = (unsigned int) new_groups.size();
         group.primary = sc;
         group.replica_rr_cursor = 0;
 
@@ -787,29 +786,40 @@ void cluster_client::handle_cluster_slots(protocol_response *r)
             free(r_port);
         }
 
-        // Append the group and remember its index so the slot-range write
-        // below points slots at this group rather than at the primary's
-        // conn_id directly. (Group index, not conn_id; conn_id is recovered
-        // via group.primary->get_id() at lookup time.)
+        // Append the group to the local buffer and remember its index so the
+        // slot-range write below points slots at this group rather than at
+        // the primary's conn_id directly. (Group index, not conn_id; conn_id
+        // is recovered via group.primary->get_id() at lookup time.)
         unsigned int group_idx = group.id;
-        m_shard_groups.push_back(group);
+        new_groups.push_back(group);
 
-        // update range
+        // update range in the local slot map
         for (int j = min_slot; j <= max_slot; j++) {
-            m_slot_to_shard_group[j] = group_idx;
+            new_slot_map[j] = group_idx;
         }
 
         any_valid_shard = true;
     }
 
-    // If every shard in the reply was malformed and skipped, treat the reply
-    // as unusable -- skip the close-stale pass below so we don't disconnect
-    // the bootstrap and any other currently-live connections (cursor bugbot).
+    // If every shard in the reply was malformed and skipped, the local buffers
+    // are empty -- leave the existing member state untouched so in-flight
+    // traffic continues to route via the previous topology.  (Build-then-swap
+    // fix for the eager-reset bug: commit 994e9ad wiped m_slot_to_shard_group
+    // and m_shard_groups before parsing, leaving all slots unmapped if parsing
+    // produced no valid shard. Cursor bugbot HIGH, PR #456.)
     if (!any_valid_shard) {
         benchmark_error_log("warning: CLUSTER SLOTS: every shard in the reply was malformed; "
                             "leaving existing connections in service\n");
         return;
     }
+
+    // At least one valid shard was parsed -- commit the new topology.
+    // The stale-index aliasing invariant holds: new_slot_map was initialised
+    // to UINT_MAX and slots absent from the reply were never written, so they
+    // remain at UINT_MAX in the committed map (same guarantee as the old
+    // unconditional assign(), just deferred until here).
+    m_slot_to_shard_group.swap(new_slot_map);
+    m_shard_groups.swap(new_groups);
 
     // check if some connections left with no slots, and need to be closed
     for (unsigned int i = 0; i < prev_connections_size; i++) {
