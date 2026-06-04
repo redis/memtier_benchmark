@@ -1299,6 +1299,24 @@ bool cluster_client::create_mget_request(struct timeval &timestamp, unsigned int
         return false;
     }
 
+    // Cross-connection backpressure: when MGET is routed to a different
+    // connection than the producer (replica / nearest-mode / preferred
+    // fallback), fill_pipeline's `m_pipeline->size() < pipeline` gate caps
+    // only the producer (conn_id). The destination's actual in-flight depth
+    // is invisible at this site, so without this guard the producer keeps
+    // issuing MGETs and the destination's pipeline grows past --pipeline ->
+    // the replica is overloaded and latency tail balloons. Mirror the
+    // monitor-input route-then-stage backpressure pattern (m_reqs_generated
+    // - m_reqs_processed in_flight clamp at hold_pipeline, plus the staged
+    // queue cap at create_monitor_request_cluster:1447) by deferring the
+    // MGET when the destination is at its per-connection pipeline cap.
+    // schedule_fill() wakes the destination so its own fill_pipeline can
+    // drain and re-check; the next outer create_request tick rebalances.
+    if (routed != conn_id && (unsigned int) m_connections[routed]->get_pending_resp() >= m_config->pipeline) {
+        m_connections[routed]->schedule_fill();
+        return false;
+    }
+
     std::vector<unsigned long long> &slot_keys = m_config->mget_cache->slot_keys[target_slot];
     size_t &kc = m_mget_slot_cursor[target_slot];
 
