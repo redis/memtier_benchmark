@@ -601,7 +601,7 @@ void cluster_client::handle_cluster_slots(protocol_response *r)
     // m_shard_groups *eagerly*, before any shards were parsed (commit 994e9ad).
     // That left the existing state wiped even when every shard in the reply was
     // subsequently skipped as malformed -- traffic saw no route until the next
-    // successful refresh (Cursor bugbot HIGH, PR #456).
+    // successful refresh (Cursor bugbot HIGH).
     //
     // Deferred-commit fix: parse into new_slot_map / new_groups locals.  Only
     // swap into the member variables if at least one valid shard was produced.
@@ -837,7 +837,7 @@ void cluster_client::handle_cluster_slots(protocol_response *r)
     // traffic continues to route via the previous topology.  (Build-then-swap
     // fix for the eager-reset bug: commit 994e9ad wiped m_slot_to_shard_group
     // and m_shard_groups before parsing, leaving all slots unmapped if parsing
-    // produced no valid shard. Cursor bugbot HIGH, PR #456.)
+    // produced no valid shard. Cursor bugbot HIGH.)
     if (!any_valid_shard) {
         benchmark_error_log("warning: CLUSTER SLOTS: every shard in the reply was malformed; "
                             "leaving existing connections in service\n");
@@ -1030,10 +1030,13 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
                         rp_str = "primary";
                         break;
                     }
-                    benchmark_error_log(
-                        "warning: all replicas unreachable under read-only workload (--read-preference=%s); "
-                        "benchmark stalled -- check cluster health or set --reconnect-on-error.\n",
-                        rp_str);
+                    // Prefix with the worker's pthread id so log readers can
+                    // dedupe the N copies emitted per 60s under high thread
+                    // counts (one cluster_client per worker thread).
+                    benchmark_error_log("warning: [thread %lu] all replicas unreachable under read-only workload "
+                                        "(--read-preference=%s); benchmark stalled -- check cluster health or set "
+                                        "--reconnect-on-error.\n",
+                                        (unsigned long) pthread_self(), rp_str);
                     m_last_no_replica_warning_ts = now_s;
                 }
             }

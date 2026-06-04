@@ -429,19 +429,17 @@ def test_read_preference_keyless_arbitrary_secondary(env):
         )
 
         # Primary-leak bound: under --read-preference=secondary keyless reads
-        # must NOT spray onto the primary. A small budget is allowed because
-        # the setup ladder may issue a probe per primary connection (AUTH /
-        # HELLO are not DBSIZE, but defensive: 2 conns * up to 2 setup-side
-        # DBSIZE-flavored traffic = 4). If a regression routes keyless reads
-        # to primary, this counter would explode well past the budget.
+        # must NOT spray onto the primary, and no setup-ladder step issues
+        # DBSIZE on the primary (AUTH / HELLO / SELECT only). Any non-zero
+        # count here is a routing leak.
         master_dbsizes = _sum_dbsize_calls(env.getOSSMasterNodesConnectionList())
-        env.assertLessEqual(
+        env.assertEqual(
             master_dbsizes,
-            4,
+            0,
             message="primary observed {} DBSIZE calls under "
-                    "--read-preference=secondary; expected <= 4 (setup-ladder "
-                    "budget). Keyless arbitrary reads may have leaked to "
-                    "primary.".format(master_dbsizes),
+                    "--read-preference=secondary; expected 0 (no legitimate "
+                    "primary DBSIZE source). Keyless arbitrary reads may have "
+                    "leaked to primary.".format(master_dbsizes),
         )
     finally:
         if env.getNumberOfFailedAssertion() > failed:

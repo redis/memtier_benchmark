@@ -1489,6 +1489,7 @@ void shard_connection::handle_reconnect_timer_event()
     if (ret != 0) {
         // Reconnection failed, try again if we haven't exceeded max attempts
         if (m_config->max_reconnect_attempts == 0 || m_reconnect_attempts < m_config->max_reconnect_attempts) {
+            const double prev_backoff_delay = m_current_backoff_delay;
             m_reconnect_attempts++;
             if (m_config->reconnect_backoff_factor > 0.0) {
                 m_current_backoff_delay *= m_config->reconnect_backoff_factor;
@@ -1505,16 +1506,26 @@ void shard_connection::handle_reconnect_timer_event()
             delay.tv_usec = (long) ((m_current_backoff_delay - delay.tv_sec) * 1000000);
 
             m_reconnect_timer = event_new(m_event_base, -1, 0, cluster_client_reconnect_timer_handler, (void *) this);
+            if (m_reconnect_timer == NULL) {
+                benchmark_error_log("error: event_new failed in handle_reconnect_timer_event retry path\n");
+                // Roll back the bookkeeping so the next attempt does not
+                // count an attempt that never armed, and leave m_reconnecting
+                // false so a subsequent error can re-enter this path. Break
+                // out of the event loop -- there is no way to recover this
+                // connection without a working libevent timer.
+                if (m_reconnect_attempts > 0) m_reconnect_attempts--;
+                m_current_backoff_delay = prev_backoff_delay;
+                event_base_loopbreak(m_event_base);
+                return;
+            }
             event_add(m_reconnect_timer, &delay);
             m_reconnecting = true;
         } else {
             benchmark_error_log("Maximum reconnection attempts (%u) exceeded, triggering thread restart.\n",
                                 m_config->max_reconnect_attempts);
-            // Reset for potential future reconnections
-            m_reconnect_attempts = 0;
-            m_current_backoff_delay = 1.0;
-
-            // Break the event loop to trigger thread restart
+            // Break the event loop to trigger thread restart. No state reset
+            // needed here: the thread is torn down and the shard_connection
+            // object destroyed before any field could be read again.
             event_base_loopbreak(m_event_base);
         }
     } else {
