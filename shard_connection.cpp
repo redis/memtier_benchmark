@@ -905,7 +905,18 @@ void shard_connection::send_conn_setup_commands(struct timeval timestamp)
     // into reads).
     if (m_readonly_state == setup_none) {
         benchmark_debug_log("sending READONLY command (replica connection).\n");
-        m_protocol->write_command_readonly();
+        // Use bufferevent_write rather than going through protocol::write_command_readonly
+        // which adds to the bufferevent's output evbuffer directly. For a connection whose
+        // FD was attached to the bufferevent via bufferevent_socket_new + a subsequent
+        // bufferevent_socket_connect (the path A1 uses for replicas discovered through
+        // CLUSTER SLOTS), the evbuffer notify callback does not re-arm EPOLLOUT on the
+        // first user-level send, so the bytes sit in the output buffer forever and the
+        // connect-callback handle_event path has no chance to flush them. bufferevent_write
+        // routes through bufferevent_trigger_nolock_ which forces the EPOLLOUT registration.
+        // Primaries don't hit this because all setup states default to setup_done, so
+        // send_conn_setup_commands is a no-op for them.
+        static const char READONLY_CMD[] = "*1\r\n$8\r\nREADONLY\r\n";
+        bufferevent_write(m_bev, READONLY_CMD, sizeof(READONLY_CMD) - 1);
         push_req(new request(rt_readonly, 0, &timestamp, 0));
         m_readonly_state = setup_sent;
     }
@@ -1008,6 +1019,17 @@ void shard_connection::process_response(void)
             } else {
                 m_readonly_state = setup_done;
                 benchmark_debug_log("READONLY successful.\n");
+                // Wake any peer connection that may have been holding for
+                // a live replica. The bootstrap primary conn will be sitting
+                // in hold_pipeline's "no live replica yet" gate; nudge it.
+                if (m_role == role_replica) {
+                    for (size_t i = 0; i < m_conns_manager->get_connections().size(); i++) {
+                        shard_connection *peer = m_conns_manager->get_connections()[i];
+                        if (peer != this && peer != NULL && peer->get_connection_state() == conn_connected) {
+                            peer->schedule_fill();
+                        }
+                    }
+                }
             }
             break;
         default:

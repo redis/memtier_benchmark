@@ -19,6 +19,10 @@
 #ifndef MEMTIER_BENCHMARK_CLIENT_DATA_MANAGER_H
 #define MEMTIER_BENCHMARK_CLIENT_DATA_MANAGER_H
 
+#include <vector>
+
+class shard_connection;
+
 class connections_manager
 {
 public:
@@ -42,6 +46,12 @@ public:
     virtual int connect(void) = 0;
     virtual void disconnect(void) = 0;
     virtual void disconnect_all(void) = 0;
+
+    // Read-preference helpers: shard_connection's READONLY response handler
+    // needs to wake peers that may be blocked in hold_pipeline waiting for a
+    // live replica. Exposing get_connections via the abstract interface keeps
+    // shard_connection decoupled from client / cluster_client concrete types.
+    virtual std::vector<shard_connection *> &get_connections(void) = 0;
 };
 
 

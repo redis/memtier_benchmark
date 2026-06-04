@@ -891,6 +891,32 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         return true;
     }
 
+    /* Read-preference bootstrap window: if reads need replicas under the
+     * current --read-preference but no replica is live-for-routing yet, we
+     * would otherwise spin in fill_pipeline calling get_key_for_conn ->
+     * select_target_conn -> UINT_MAX -> not_available -> retry forever, with
+     * the event loop never getting a chance to fire BEV_EVENT_CONNECTED for
+     * the in-progress replica connections. Hold here until at least one
+     * replica is live; the bootstrap CLUSTER SLOTS response, plus the next
+     * replica's connect callback, will schedule_fill us out of the hold. */
+    if (m_config->read_preference != rp_primary && m_config->ratio.a == 0) {
+        // Read-only workload that *must* route to replicas. Check if any
+        // shard_group has a live replica. We only need ONE to make progress.
+        bool any_live_replica = false;
+        for (size_t i = 0; i < m_shard_groups.size(); i++) {
+            for (size_t j = 0; j < m_shard_groups[i].replicas.size(); j++) {
+                shard_connection *r = m_shard_groups[i].replicas[j];
+                if (r != NULL && r->get_connection_state() == conn_connected &&
+                    r->get_cluster_slots_state() == setup_done) {
+                    any_live_replica = true;
+                    break;
+                }
+            }
+            if (any_live_replica) break;
+        }
+        if (!any_live_replica) return true;
+    }
+
     /* In transaction mode the pin connection drives the entire rotation.
      * Non-pin connections must not spin in fill_pipeline; they will be
      * rescheduled via schedule_fill() when the pin is cleared. If the pin
