@@ -97,6 +97,15 @@ protected:
     // Set when we emit the "pin connection lost mid-rotation" warning so we
     // don't spam it on every hold_pipeline() call during the outage.
     bool m_txn_pin_lost_warned;
+    // Consecutive read-routing failures under strict rp_secondary with no live
+    // replica. Incremented in get_key_for_conn each time select_target_conn
+    // returns UINT_MAX for a read; reset on any successful routing. When the
+    // counter reaches STRICT_NO_ROUTE_HOLD_THRESHOLD hold_pipeline returns true
+    // (yields the event loop) until a replica connects and schedule_fill wakes
+    // the connection. Prevents busy-spinning fill_pipeline in mixed SET/GET
+    // workloads where writes succeed (primary is live) but every GET routing
+    // attempt fails because no replica is available yet.
+    unsigned int m_strict_no_route_attempts;
     // Per-slot key index cache for cluster MGET. The slot→key table
     // (slot_keys) is shared across threads via m_config->mget_cache and is
     // read-only after the first thread builds it.  Only the per-slot

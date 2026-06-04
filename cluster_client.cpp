@@ -54,6 +54,12 @@
 #define KEY_INDEX_QUEUE_MAX_SIZE 1000000
 #define STAGED_MONITOR_QUEUE_MAX_SIZE 1000000
 
+// After this many consecutive read-routing failures under strict rp_secondary
+// (select_target_conn returning UINT_MAX for reads), hold_pipeline yields the
+// event loop so the reactor can fire BEV_EVENT_CONNECTED for in-progress
+// replica connections instead of busy-spinning through fill_pipeline.
+#define STRICT_NO_ROUTE_HOLD_THRESHOLD 64
+
 #define MOVED_MSG_PREFIX "-MOVED"
 #define MOVED_MSG_PREFIX_LEN 6
 #define ASK_MSG_PREFIX "-ASK"
@@ -126,7 +132,8 @@ cluster_client::cluster_client(client_group *group) :
         m_txn_observed_rotation_seq(0),
         m_txn_staged_key_index(0),
         m_txn_has_staged_key(false),
-        m_txn_pin_lost_warned(false)
+        m_txn_pin_lost_warned(false),
+        m_strict_no_route_attempts(0)
 {
     // Initialize slot map to the UINT_MAX sentinel; m_shard_groups starts empty
     // and is populated by handle_cluster_slots(). Every reader bails on
@@ -947,6 +954,44 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         if (!any_live_replica) return true;
     }
 
+    /* Mixed-workload strict-secondary spin guard.
+     *
+     * The read-only bootstrap window above covers ratio.a == 0 (GET-only).
+     * For mixed workloads (ratio.a > 0 && ratio.b > 0) writes succeed on the
+     * primary, so fill_pipeline's pipeline-depth gate never fires -- but every
+     * GET routing attempt returns UINT_MAX (no live replica), causing
+     * create_request to return without advancing m_get_ratio_count, so the
+     * next fill_pipeline iteration tries the same GET again: a CPU-burning
+     * spin until a replica connects.
+     *
+     * get_key_for_conn bumps m_strict_no_route_attempts on each read routing
+     * failure and resets it on any successful routing. Once the counter
+     * reaches STRICT_NO_ROUTE_HOLD_THRESHOLD we yield here, re-checking
+     * whether a replica has come up in the meantime. If one is live now,
+     * we clear the counter and fall through (the next create_request call
+     * will route successfully and permanently reset it). If still none, we
+     * hold and wait for a schedule_fill wakeup from the replica's connect
+     * callback (shard_connection handles READONLY completion). */
+    if (m_strict_no_route_attempts >= STRICT_NO_ROUTE_HOLD_THRESHOLD && m_config->read_preference == rp_secondary &&
+        m_config->read_preference_fallback != rpf_primary) {
+        bool any_live_replica = false;
+        for (size_t i = 0; i < m_shard_groups.size(); i++) {
+            for (size_t j = 0; j < m_shard_groups[i].replicas.size(); j++) {
+                shard_connection *r = m_shard_groups[i].replicas[j];
+                if (r != NULL && r->get_connection_state() == conn_connected &&
+                    r->get_cluster_slots_state() == setup_done) {
+                    any_live_replica = true;
+                    break;
+                }
+            }
+            if (any_live_replica) break;
+        }
+        if (!any_live_replica) return true;
+        // A replica is now live: clear the back-off counter so we don't
+        // re-enter this gate on the very next fill_pipeline iteration.
+        m_strict_no_route_attempts = 0;
+    }
+
     /* In transaction mode the pin connection drives the entire rotation.
      * Non-pin connections must not spin in fill_pipeline; they will be
      * rescheduled via schedule_fill() when the pin is cleared. If the pin
@@ -1019,8 +1064,23 @@ get_key_response cluster_client::get_key_for_conn(unsigned int command_index, un
         // schedule a CLUSTER SLOTS refresh: rp_secondary failing because every
         // replica is down should not whack the topology -- it's a routing
         // gap, not a topology bug. The next event loop tick will retry.
+        //
+        // For reads, bump the consecutive-failure counter so hold_pipeline can
+        // yield the event loop once the threshold is reached. This prevents a
+        // mixed SET/GET workload from busy-spinning fill_pipeline when writes
+        // succeed (primary is live) but every GET routing returns UINT_MAX
+        // because no replica is available yet. Writes (is_read == false) are
+        // not counted: they return UINT_MAX only during the bootstrap window
+        // where topology is still empty, and that path is already guarded by
+        // the cluster_slots ladder. Saturating at UINT_MAX avoids overflow.
+        if (is_read) {
+            if (m_strict_no_route_attempts < UINT_MAX) m_strict_no_route_attempts++;
+        }
         return not_available;
     }
+    // Routing succeeded: clear the back-off counter so hold_pipeline stops
+    // yielding as soon as the first successful read route is observed.
+    m_strict_no_route_attempts = 0;
     if (target_conn_id == conn_id) {
         benchmark_debug_log("%s generated key=[%.*s] for itself\n", m_connections[conn_id]->get_readable_id(),
                             m_obj_gen->get_key_len(), m_obj_gen->get_key());
