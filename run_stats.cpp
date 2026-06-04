@@ -1851,6 +1851,18 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
     // Emitted only in cluster mode (standalone has a single endpoint by
     // definition and nothing interesting to report).
     if (jsonhandler != NULL && m_config && m_config->cluster_mode && !m_endpoint_snapshots.empty()) {
+        // Sort by (addr, role) for deterministic output. Without this the
+        // emission order tracks the thread-local absorb order, which varies
+        // run-to-run and makes mb.json diffs noisy. stable_sort preserves
+        // the merge order for ties (same addr+role -- shouldn't happen post
+        // coalescing in absorb_endpoint, but make it explicit). addr already
+        // encodes host:port so we don't need a separate port comparator.
+        std::stable_sort(m_endpoint_snapshots.begin(), m_endpoint_snapshots.end(),
+                         [](const endpoint_snapshot &a, const endpoint_snapshot &b) {
+                             if (a.addr != b.addr) return a.addr < b.addr;
+                             return a.role < b.role;
+                         });
+
         jsonhandler->open_nesting("Endpoints");
         for (size_t i = 0; i < m_endpoint_snapshots.size(); ++i) {
             const endpoint_snapshot &e = m_endpoint_snapshots[i];
