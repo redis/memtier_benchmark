@@ -82,6 +82,7 @@
 #include <algorithm>
 
 #include "client.h"
+#include "cluster_client.h"
 #include "JSON_handler.h"
 #include "obj_gen.h"
 #include "memtier_benchmark.h"
@@ -3248,6 +3249,54 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
         (*i)->join();
         (*i)->m_cg->merge_run_stats(&stats);
+    }
+
+    // -----------------------------------------------------------------
+    // Read-preference observability snapshot.
+    //
+    // After threads have joined but before the worker structures are torn
+    // down, walk every client_group -> client -> shard_connection so the
+    // run_stats holds the per-endpoint EWMA + routed_ops + role + the
+    // per-command routing counters (cluster_client only). Once
+    // run_benchmark returns the worker pointers are gone, so this is the
+    // last chance to capture the state.
+    // -----------------------------------------------------------------
+    for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
+        client_group *cg = (*i)->m_cg;
+        std::vector<client *> &clients = cg->get_clients();
+        for (size_t ci = 0; ci < clients.size(); ++ci) {
+            client *c = clients[ci];
+            if (c == NULL) continue;
+            const std::vector<shard_connection *> &conns = c->get_connections();
+            for (size_t k = 0; k < conns.size(); ++k) {
+                shard_connection *sc = conns[k];
+                if (sc == NULL) continue;
+                endpoint_snapshot snap;
+                {
+                    const char *addr = sc->get_address();
+                    const char *port = sc->get_port();
+                    char buf[256];
+                    snprintf(buf, sizeof(buf), "%s:%s", addr ? addr : "?", port ? port : "?");
+                    snap.addr = buf;
+                }
+                snap.role = sc->is_replica() ? "replica" : "primary";
+                snap.shard_id = (int) sc->get_id();
+                snap.routed_ops = sc->get_routed_ops();
+                snap.avg_latency_us = sc->get_latency_ewma_us();
+                snap.latency_samples = sc->get_latency_samples();
+                stats.absorb_endpoint(snap);
+            }
+            // Per-command Read-Routing counters live on cluster_client.
+            cluster_client *cc = dynamic_cast<cluster_client *>(c);
+            if (cc != NULL) {
+                const std::vector<cluster_client::read_routing_counters> &arr = cc->get_arbitrary_routing_counters();
+                for (size_t ai = 0; ai < arr.size(); ++ai) {
+                    stats.absorb_arbitrary_routing(ai, arr[ai].ops_from_primary, arr[ai].ops_from_replica);
+                }
+                const cluster_client::read_routing_counters &g = cc->get_get_routing_counters();
+                stats.absorb_builtin_get_routing(g.ops_from_primary, g.ops_from_replica);
+            }
+        }
     }
 
     // Do we need to produce client stats?

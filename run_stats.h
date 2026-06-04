@@ -104,6 +104,31 @@ public:
     void print(FILE *out, const char *header);
 };
 
+// Per-endpoint snapshot (one entry per shard_connection at run end). Built
+// in main thread after threads.join() but before the thread / client groups
+// are destroyed, then merged into run_stats so it survives to JSON time.
+struct endpoint_snapshot
+{
+    std::string addr;                    // host:port
+    std::string role;                    // "primary" | "replica" | ""
+    int shard_id;                        // index in the owning cluster_client (or -1)
+    unsigned long long routed_ops;       // user-level requests sent on this conn
+    double avg_latency_us;               // EWMA in microseconds (0.0 when no samples)
+    unsigned int latency_samples;        // 0 when never warm
+    unsigned long int connection_errors; // currently not tracked per-conn; left 0
+    endpoint_snapshot() : shard_id(-1), routed_ops(0), avg_latency_us(0.0), latency_samples(0), connection_errors(0) {}
+};
+
+// Aggregated --read-preference routing counters (Ops from Primary / Ops from
+// Replica). One entry per arbitrary-command index, plus a built-in GET slot.
+// Merged across clients in main thread.
+struct read_routing_summary
+{
+    unsigned long long ops_from_primary;
+    unsigned long long ops_from_replica;
+    read_routing_summary() : ops_from_primary(0), ops_from_replica(0) {}
+};
+
 // Structure to hold aggregated stats by command type
 struct aggregated_command_type_stats
 {
@@ -231,6 +256,25 @@ public:
     // when shape doesn't carry per-position info.
     void update_arbitrary_op_misses(size_t arbitrary_index, unsigned int hits, unsigned int misses,
                                     const std::vector<bool> &per_key_hit);
+
+    // ---------------------------------------------------------------------
+    // Read-preference observability (Step 2f).
+    // Snapshot the per-endpoint state at run end so the JSON dump can reflect
+    // it after the worker threads are gone. Both fields are populated by
+    // run_benchmark() right after the join loop; print_json() consumes them.
+    // ---------------------------------------------------------------------
+    std::vector<endpoint_snapshot> m_endpoint_snapshots;
+    std::vector<read_routing_summary> m_arbitrary_read_routing; // per arbitrary-cmd index
+    read_routing_summary m_get_read_routing;                    // built-in GET aggregate
+
+    // Aggregator: fold the per-endpoint snapshot from one client's
+    // shard_connections into m_endpoint_snapshots. Entries are coalesced by
+    // (addr, role) so the JSON is at most O(distinct endpoints) regardless
+    // of thread count. Latency is op-weighted average across threads.
+    void absorb_endpoint(const endpoint_snapshot &snap);
+    // Aggregator for read-routing counters.
+    void absorb_arbitrary_routing(size_t arbitrary_index, unsigned long long primary, unsigned long long replica);
+    void absorb_builtin_get_routing(unsigned long long primary, unsigned long long replica);
 
     void aggregate_average(const std::vector<run_stats> &all_stats);
     void summarize(totals &result) const;
