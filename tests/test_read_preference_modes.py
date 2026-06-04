@@ -49,9 +49,8 @@ from mb import Benchmark, RunConfig
 # Env override: every test in this module needs replicas
 # ---------------------------------------------------------------------------
 
-# RLTest reads a module-level ``ENV_DEFAULTS`` (or ``ENV`` on older versions)
-# dict to set per-module environment overrides.
-ENV_DEFAULTS = {"useSlaves": True, "shardsCount": 3}
+# Replica/shard topology is driven by --use-slaves and --shards-count, which
+# tests/run_tests.sh passes to RLTest when OSS_CLUSTER_REPLICAS=1.
 
 
 # ---------------------------------------------------------------------------

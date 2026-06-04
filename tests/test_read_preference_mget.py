@@ -36,7 +36,8 @@ from mb import Benchmark, RunConfig
 # Env override: replicas required
 # ---------------------------------------------------------------------------
 
-ENV_DEFAULTS = {"useSlaves": True, "shardsCount": 3}
+# Replica/shard topology is driven by --use-slaves and --shards-count, which
+# tests/run_tests.sh passes to RLTest when OSS_CLUSTER_REPLICAS=1.
 
 # ---------------------------------------------------------------------------
 # Helpers

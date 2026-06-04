@@ -99,7 +99,14 @@ REDIS_SERVER=${REDIS_SERVER:-redis-server}
 MEMTIER_BINARY=$ROOT/memtier_benchmark
 
 RLTEST_ARGS=" --cluster-start-timeout 180 --oss-redis-path $REDIS_SERVER --enable-debug-command --cluster_node_timeout 15000"
-[[ "$TEST" != "" ]] && RLTEST_ARGS+=" --test $TEST"
+# RLTest's --test uses action='append' with no nargs, so a space-separated
+# TEST="f1 f2 f3" must be emitted as multiple --test flags. Splitting on $TEST
+# unquoted lets the shell word-split into individual tokens.
+if [[ "$TEST" != "" ]]; then
+	for t in $TEST; do
+		RLTEST_ARGS+=" --test $t"
+	done
+fi
 [[ -n "$PARALLELISM" ]] && RLTEST_ARGS+=" --parallelism $PARALLELISM"
 [[ $VERBOSE == 1 ]] && RLTEST_ARGS+=" -v"
 [[ $TLS == 1 ]] && RLTEST_ARGS+=" --tls-cert-file $TLS_CERT --tls-key-file $TLS_KEY --tls-ca-cert-file $TLS_CACERT --tls"
