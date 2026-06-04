@@ -571,6 +571,17 @@ void cluster_client::handle_cluster_slots(protocol_response *r)
     // get_key_for_conn, retry_after_redirect, create_monitor_request_cluster,
     // create_mget_request) treats UINT_MAX as "not available" and bails, which
     // is the correct behavior for a slot that no longer has a known owner.
+    //
+    // INVARIANT (cursor bugbot #2 re-verification on f8a25d2): the assign()
+    // call below covers ALL 16384 slots unconditionally and runs BEFORE both
+    // m_shard_groups.clear() and the per-shard loop at line ~578. The
+    // per-shard loop only WRITES m_slot_to_shard_group[s] for slots `s`
+    // explicitly listed in the new reply (range [min_slot, max_slot] of each
+    // valid shard); slots absent from the new reply therefore stay at the
+    // UINT_MAX sentinel set here. Do not move this assign() into the loop
+    // body or guard it on any condition -- doing so reintroduces the stale-
+    // index aliasing bug.
+    assert(m_slot_to_shard_group.size() == (size_t) MAX_CLUSTER_HSLOT + 1);
     m_slot_to_shard_group.assign(MAX_CLUSTER_HSLOT + 1, UINT_MAX);
     m_shard_groups.clear();
 
