@@ -717,6 +717,20 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
         jsonhandler->write_obj("read_preference_fallback", "\"%s\"", rpf_str);
         jsonhandler->write_obj("replica_clients", "%u", cfg->replica_clients);
         jsonhandler->write_obj("replicas_per_shard", "%u", cfg->replicas_per_shard);
+
+        // --read-server entries as a comma-separated "host:port,host:port,..."
+        // string. Matches the surrounding key=value style used for
+        // data_size_list / wait-ratio / etc. Empty when no replica endpoints
+        // were given.
+        std::string read_servers_str;
+        for (size_t i = 0; i < cfg->read_servers.size(); i++) {
+            if (i > 0) read_servers_str += ",";
+            char endpoint[256];
+            snprintf(endpoint, sizeof(endpoint), "%s:%u", cfg->read_servers[i].host.c_str(),
+                     (unsigned int) cfg->read_servers[i].port);
+            read_servers_str += endpoint;
+        }
+        jsonhandler->write_obj("read_servers", "\"%s\"", read_servers_str.c_str());
     }
 
     jsonhandler->close_nesting();
@@ -2179,6 +2193,16 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         fprintf(stderr, "warning: --read-preference has no effect in standalone mode without "
                         "--read-server. Specify at least one replica endpoint with --read-server "
                         "HOST:PORT or add --cluster-mode.\n");
+    }
+
+    // Warn when --replica-clients is set but the read-preference does not
+    // direct any traffic to replicas. With --read-preference=primary every
+    // read still goes to the primary regardless of how many replica clients
+    // are provisioned, so the extra connections sit idle and consume
+    // resources. Mirrors the no-routing-effect warning above.
+    if (cfg->replica_clients > 0 && cfg->read_preference == rp_primary) {
+        fprintf(stderr, "warning: --replica-clients has no effect when --read-preference=primary. "
+                        "Reads only flow to replicas under secondary, secondaryPreferred, or nearest.\n");
     }
 
     // --transaction needs at least one --command to operate on. In
