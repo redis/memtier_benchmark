@@ -754,12 +754,20 @@ void cluster_client::handle_cluster_slots(protocol_response *r)
                         rsc->set_role(role_replica);
                         connect_shard_connection(rsc, r_addr, r_port);
                     } else {
-                        // Already connected from a previous refresh. Ensure
-                        // the role label is correct; an existing connection
-                        // discovered for the first time as a replica needs
-                        // its role updated even though we won't re-fire the
-                        // setup ladder until the next reconnect.
+                        // Already connected from a previous refresh. Update
+                        // the role label; if this connection was previously
+                        // treated as a primary (m_readonly_state == setup_done
+                        // with role_primary) and is now listed as a replica,
+                        // the READONLY ladder was never run. rearm_readonly()
+                        // re-arms the ladder and sends READONLY immediately so
+                        // the server stops rejecting reads with -READONLY. For
+                        // already-known replicas set_role is idempotent and
+                        // rearm_readonly() is a no-op (m_readonly_state !=
+                        // setup_done when the replica is mid-handshake, or the
+                        // early-exit guard fires when setup_done is the correct
+                        // post-role-flip state).
                         rsc->set_role(role_replica);
+                        rsc->rearm_readonly();
                     }
                     break;
                 }

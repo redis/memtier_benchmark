@@ -191,6 +191,14 @@ public:
     // setup_done) so this always returns setup_done for them.
     enum setup_state get_readonly_state() const { return m_readonly_state; }
 
+    // Re-arm and immediately send READONLY on an already-connected replica
+    // connection whose role was just flipped from primary → replica by a live
+    // CLUSTER SLOTS refresh. Re-sets m_readonly_state to setup_none (so
+    // is_conn_setup_done() returns false) and fires the READONLY wire bytes
+    // immediately. If the connection is not yet in conn_connected state the
+    // call is a no-op: connect() will arm the ladder normally.
+    void rearm_readonly();
+
     // True iff this connection is ready to serve user-level reads:
     // TCP connected, cluster-slots ladder done, and (for replicas) the
     // READONLY ladder also done. Primaries satisfy the last condition

@@ -932,6 +932,38 @@ void shard_connection::send_conn_setup_commands(struct timeval timestamp)
     }
 }
 
+// Called by cluster_client::handle_cluster_slots when a live CLUSTER SLOTS
+// refresh promotes an already-connected primary to a replica (role flip).
+// Re-arms the READONLY ladder and sends the wire command immediately so the
+// connection becomes eligible for reads without a full reconnect.
+void shard_connection::rearm_readonly()
+{
+    // Only cluster-mode Redis replica connections need READONLY.
+    if (m_role != role_replica || !m_config->cluster_mode || !is_redis_protocol(m_config->protocol)) return;
+    // Skip if the connection is not yet fully up; connect() will arm the
+    // ladder through the normal path.
+    if (m_connection_state != conn_connected) return;
+    // Skip if READONLY was already sent or acknowledged (e.g. a second refresh
+    // that sees the same replica twice).
+    if (m_readonly_state != setup_done) return;
+
+    benchmark_debug_log("rearm_readonly: re-sending READONLY on live role-flip connection.\n");
+
+    // Re-arm the ladder so is_conn_setup_done() returns false and
+    // fill_pipeline holds new user traffic until the ACK arrives.
+    m_readonly_state = setup_none;
+
+    struct timeval now;
+    gettimeofday(&now, NULL);
+
+    // Send the READONLY bytes via bufferevent_write (same path as the normal
+    // ladder in send_conn_setup_commands) to force EPOLLOUT registration.
+    static const char READONLY_CMD[] = "*1\r\n$8\r\nREADONLY\r\n";
+    bufferevent_write(m_bev, READONLY_CMD, sizeof(READONLY_CMD) - 1);
+    push_req(new request(rt_readonly, 0, &now, 0));
+    m_readonly_state = setup_sent;
+}
+
 void shard_connection::process_response(void)
 {
     int ret;
