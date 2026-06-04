@@ -94,7 +94,7 @@ def _sum_mget_calls(conns):
     return total
 
 
-def _run_mget_workload(env, extra_args, threads=2, clients=4, requests=100):
+def _run_mget_workload(env, extra_args, threads=2, clients=4, requests=100, timeout=60):
     benchmark_specs = {
         "name": env.testName,
         "args": list(extra_args),
@@ -112,7 +112,7 @@ def _run_mget_workload(env, extra_args, threads=2, clients=4, requests=100):
     ensure_clean_benchmark_folder(run_config.results_dir)
 
     benchmark = Benchmark.from_json(run_config, benchmark_specs)
-    ok = benchmark.run()
+    ok = benchmark.run(timeout=timeout)
     return ok, run_config
 
 
@@ -214,7 +214,7 @@ def test_read_preference_mget_strict_secondary_spin_guard(env):
         "--read-preference=secondary",
     ]
     ok, run_config = _run_mget_workload(
-        env, extra_args, threads=1, clients=2, requests=200
+        env, extra_args, threads=1, clients=2, requests=200, timeout=20
     )
 
     failed = env.getNumberOfFailedAssertion()
@@ -274,7 +274,7 @@ def test_read_preference_mget_pure_pipeline_cap_spin_guard(env):
     # pass requests=None to suppress the auto-injected --requests and rely on
     # --test-time=5 above as the sole bound.
     ok, run_config = _run_mget_workload(
-        env, extra_args, threads=1, clients=2, requests=None
+        env, extra_args, threads=1, clients=2, requests=None, timeout=20
     )
 
     failed = env.getNumberOfFailedAssertion()
