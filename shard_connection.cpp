@@ -1502,9 +1502,11 @@ void shard_connection::handle_reconnect_timer_event()
         }
     } else {
         benchmark_error_log("Reconnection successful after %u attempts.\n", m_reconnect_attempts);
-        // Reset reconnection state
-        m_reconnect_attempts = 0;
-        m_current_backoff_delay = 1.0;
+        // State reset (m_reconnect_attempts, m_current_backoff_delay) is now
+        // done by report_connection_stage_success() once the full setup ladder
+        // completes and the first user-level response arrives. Resetting here
+        // would mask --max-reconnect-attempts under a READONLY-error storm
+        // where TCP-connect succeeds but READONLY repeatedly fails.
     }
 }
 
