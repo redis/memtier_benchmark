@@ -1047,24 +1047,36 @@ void shard_connection::process_response(void)
                     snprintf(buf, sizeof(buf), "READONLY failed: %s", r->get_status() ? r->get_status() : "");
                     report_connection_stage_failure(buf);
                 }
-                // Schedule a backoff-armed reconnect so the setup state
-                // machine re-arms from scratch. attempt_reconnect() itself
-                // calls disconnect() to tear down the bufferevent + state and
-                // then schedules connect() on the standard
-                // --reconnect-on-error / --max-reconnect-attempts /
-                // MEMTIER_BACKOFF_CAP_SEC ladder. A bare disconnect() (as
-                // used previously) only updates supervisor counters: the
-                // connection stays pinned in conn_disconnected with no timer
-                // armed, m_readonly_state remains setup_sent forever,
-                // is_ready_for_reads() never returns true, and the bootstrap
-                // hold gate in cluster_client::hold_pipeline never releases
-                // until some unrelated MOVED triggers a CLUSTER SLOTS
-                // refresh. Under -NOREPLICATION-style errors the replica
-                // would effectively stay offline for the rest of the run.
-                attempt_reconnect("READONLY error");
+                // READONLY recovery policy:
+                //
+                // * --reconnect-on-error ON: schedule a backoff-armed
+                //   reconnect so the setup state machine re-arms from
+                //   scratch. attempt_reconnect() tears down the
+                //   bufferevent + state and reschedules connect() on the
+                //   standard --max-reconnect-attempts / backoff ladder.
+                //
+                // * --reconnect-on-error OFF (default): the round-3 fix
+                //   unconditionally called attempt_reconnect(), which then
+                //   fell through to the supervisor-trip arm and called
+                //   event_base_loopbreak() — a single transient
+                //   -NOREPLICATION killed the entire worker thread.
+                //   Restore the round-2 behavior: bare disconnect() (idle
+                //   the replica connection) and rely on the next
+                //   CLUSTER SLOTS refresh (driven by any peer) to revive
+                //   it. The peer-wake loop below covers both branches so
+                //   the bootstrap "no live replica yet" gate releases.
+                if (m_config->reconnect_on_error) {
+                    attempt_reconnect("READONLY error");
+                } else {
+                    disconnect();
+                }
                 // Wake peer connections (the primary may be parked in the
                 // "no live replica yet" gate); mirror the success arm so a
-                // stalled READONLY does not deadlock the bootstrap.
+                // stalled READONLY does not deadlock the bootstrap. In the
+                // disconnect-only path this is the only mechanism by which
+                // the failed replica gets re-evaluated — a peer's next
+                // CLUSTER SLOTS refresh will rebuild topology and may
+                // re-bring this replica online.
                 if (m_role == role_replica) {
                     for (size_t i = 0; i < m_conns_manager->get_connections().size(); i++) {
                         shard_connection *peer = m_conns_manager->get_connections()[i];
@@ -1106,6 +1118,19 @@ void shard_connection::process_response(void)
             // loop that the supervisor would otherwise be disarmed against.
             if (!r->is_error()) {
                 report_connection_stage_success();
+                // Steady state reached: reset the per-connection reconnect
+                // attempts counter now (not at BEV_EVENT_CONNECTED). The
+                // READONLY-error reconnect storm completes TCP before the
+                // -NOREPLICATION lands, so resetting on connect would
+                // defeat --max-reconnect-attempts; resetting here ties the
+                // counter to setup-ladder lifetime instead. Idempotent —
+                // subsequent successful responses just re-assign 0.
+                if (m_reconnect_attempts > 0) {
+                    benchmark_debug_log(
+                        "Setup ladder + first response succeeded after %u reconnection attempts; resetting counter.\n",
+                        m_reconnect_attempts);
+                }
+                m_reconnect_attempts = 0;
             } else {
                 // Forward the error so a later abort can attribute it.
                 char buf[256];
@@ -1265,12 +1290,19 @@ void shard_connection::handle_event(short events)
             m_connection_timeout_timer = NULL;
         }
 
-        // Reset reconnection state on successful connection
+        // Log progress on successful TCP connect, but do NOT reset the
+        // attempts counter here. The READONLY-error reconnect storm always
+        // completes TCP before -NOREPLICATION arrives — resetting on every
+        // BEV_EVENT_CONNECTED defeated --max-reconnect-attempts and produced
+        // an unbounded spin loop. The counter is now reset only when the
+        // setup ladder reaches steady state (see the rt_get/rt_arbitrary
+        // success branch in handle_response). Clear m_reconnecting and the
+        // backoff delay here so the next backoff schedule starts fresh if
+        // the setup ladder fails again before steady state.
         if (m_reconnect_attempts > 0) {
-            benchmark_debug_log("Connection established successfully after %u reconnection attempts.\n",
+            benchmark_debug_log("TCP connection established (attempt %u); awaiting setup-ladder success.\n",
                                 m_reconnect_attempts);
         }
-        m_reconnect_attempts = 0;
         m_current_backoff_delay = 1.0;
         m_reconnecting = false;
 
@@ -1390,6 +1422,17 @@ void shard_connection::attempt_reconnect(const char *error_context)
         delay.tv_usec = (long) ((m_current_backoff_delay - delay.tv_sec) * 1000000);
 
         m_reconnect_timer = event_new(m_event_base, -1, 0, cluster_client_reconnect_timer_handler, (void *) this);
+        if (m_reconnect_timer == NULL) {
+            benchmark_error_log("error: event_new failed in attempt_reconnect\n");
+            // Roll back the bookkeeping so the next attempt does not
+            // count an attempt that never armed, and leave m_reconnecting
+            // false so a subsequent error can re-enter this path. Break
+            // out of the event loop — there is no way to recover this
+            // connection without a working libevent timer.
+            if (m_reconnect_attempts > 0) m_reconnect_attempts--;
+            event_base_loopbreak(m_event_base);
+            return;
+        }
         event_add(m_reconnect_timer, &delay);
         m_reconnecting = true;
     } else if (m_config->reconnect_on_error && m_reconnecting) {
