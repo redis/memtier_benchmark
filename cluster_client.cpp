@@ -1361,6 +1361,10 @@ bool cluster_client::create_get_request(struct timeval &timestamp, unsigned int 
 
 bool cluster_client::create_mget_request(struct timeval &timestamp, unsigned int conn_id)
 {
+    // Reset the defer flag at entry so stale true from a prior defer call is
+    // never mistaken for a defer when we actually hit an exhausted path below.
+    m_mget_defer = false;
+
     // Only reached when --multi-key-get is set.
     // Use the pre-built slot cache so all N keys in this MGET share one hash
     // slot — Redis requires exact same-slot (not just same-node) for MGET in
@@ -1387,8 +1391,12 @@ bool cluster_client::create_mget_request(struct timeval &timestamp, unsigned int
     // a tiny per-conn outbound queue (see m_pending_mget_send below).
     const unsigned int routed = select_target_conn(target_slot, true /* MGET is always a read */);
     if (routed == UINT_MAX) {
-        // Strict-secondary with no live replica and rpf_error/queue. Treat
-        // as not_available so the rate limiter retries on the next tick.
+        // Strict-secondary with no live replica and rpf_error/queue. The
+        // routing policy has no eligible replica right now, but may have one
+        // on the next topology refresh or fill_pipeline tick. Signal defer so
+        // the caller does NOT advance m_get_ratio_count; the batch will be
+        // retried rather than silently abandoned.
+        m_mget_defer = true;
         return false;
     }
 
@@ -1407,6 +1415,7 @@ bool cluster_client::create_mget_request(struct timeval &timestamp, unsigned int
     // drain and re-check; the next outer create_request tick rebalances.
     if (routed != conn_id && (unsigned int) m_connections[routed]->get_pending_resp() >= m_config->pipeline) {
         m_connections[routed]->schedule_fill();
+        m_mget_defer = true;
         return false;
     }
 

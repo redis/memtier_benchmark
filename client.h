@@ -95,6 +95,14 @@ protected:
 
     keylist *m_keylist; // used to construct multi commands
 
+    // Set by create_mget_request() overrides to signal WHY false was returned:
+    // true  = backpressure / no-route — caller must NOT advance m_get_ratio_count
+    //         (the batch should be retried on the next fill_pipeline tick).
+    // false = exhausted / no slots for this connection — caller SHOULD advance the
+    //         counter past the threshold to skip the rest of the batch.
+    // Only meaningful when create_mget_request() returns false; undefined otherwise.
+    bool m_mget_defer;
+
 public:
     client(client_group *group);
     client(struct event_base *event_base, benchmark_config *config, abstract_protocol *protocol,

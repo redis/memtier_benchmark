@@ -148,7 +148,8 @@ client::client(client_group *group) :
         m_tot_set_ops(0),
         m_tot_wait_ops(0),
         m_scan_cursor("0"),
-        m_scan_iteration_count(0)
+        m_scan_iteration_count(0),
+        m_mget_defer(false)
 {
     m_event_base = group->get_event_base();
 
@@ -179,7 +180,8 @@ client::client(struct event_base *event_base, benchmark_config *config, abstract
         m_tot_wait_ops(0),
         m_scan_cursor("0"),
         m_scan_iteration_count(0),
-        m_keylist(NULL)
+        m_keylist(NULL),
+        m_mget_defer(false)
 {
     m_event_base = event_base;
 
@@ -657,11 +659,18 @@ void client::create_request(struct timeval timestamp, unsigned int conn_id)
 
         // MGET command
         if (!create_mget_request(timestamp, conn_id)) {
-            // No MGET could be sent (e.g. this cluster connection owns no
-            // slots that map to the configured key range). Force the ratio
-            // counter past the threshold so the next create_request() call
-            // resets both counters instead of busy-spinning here forever.
-            m_get_ratio_count = m_config->ratio.b;
+            // Two distinct reasons for false:
+            //   defer  (m_mget_defer==true):  backpressure or no-route — the
+            //     destination connection is at pipeline capacity or the routing
+            //     policy found no eligible replica right now. Do NOT advance the
+            //     ratio counter; the next fill_pipeline tick will retry.
+            //   exhausted (m_mget_defer==false): this connection owns no slots
+            //     in the configured key range. Force the counter past the
+            //     threshold so create_request() resets both counters on the next
+            //     call instead of busy-spinning here forever.
+            if (!m_mget_defer) {
+                m_get_ratio_count = m_config->ratio.b;
+            }
             return;
         }
 
