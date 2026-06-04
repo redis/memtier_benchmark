@@ -228,3 +228,64 @@ def test_read_preference_mget_strict_secondary_spin_guard(env):
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)
+
+
+# ---------------------------------------------------------------------------
+# Pure-MGET pipeline-cap spin-guard reproducer (round-6 hold_pipeline yield).
+#
+# Round-5 commit bffeb91 added a strict-no-route counter bump on
+# create_mget_request's pipeline-cap defer; round-6 hardens hold_pipeline to
+# yield unconditionally once the counter trips, even when `any_route=true`
+# (the destination is saturated-but-live). Pure MGET (ratio=0:1) with a small
+# --pipeline cap stresses that path: the producer's own pipeline never grows,
+# so the only way to release the event loop is the hold_pipeline yield.
+#
+# NOTE: smoke-only. Engineering a deterministic "slow replica" in a unit-test
+# Docker/RLTest environment is fragile, so we just assert the benchmark exits
+# within --test-time=5s. A timeout (hang or uncapped spin) means the spin
+# guard regressed. TODO(round-7): add a CPU-time sample if/when RLTest gains
+# a portable resource-usage hook.
+# ---------------------------------------------------------------------------
+
+def test_read_preference_mget_pure_pipeline_cap_spin_guard(env):
+    """Pure-MGET workload (ratio=0:1) with --pipeline=4 and
+    --read-preference=secondary must complete within --test-time=5s. A
+    hang means the round-6 hold_pipeline yield-on-saturation regressed."""
+    if not env.isCluster():
+        env.skip()
+        return
+    replica_conns = get_cluster_replica_connections(env)
+    if not replica_conns:
+        env.skip()
+        return
+
+    _pre_populate(env)
+
+    extra_args = [
+        "--ratio=0:1",
+        "--multi-key-get={}".format(_MGET_BATCH),
+        "--pipeline=4",
+        "--key-minimum={}".format(_KEY_MIN),
+        "--key-maximum={}".format(_KEY_MAX),
+        "--read-preference=secondary",
+        "--test-time=5",
+    ]
+    # _run_mget_workload supplies --requests; --test-time overrides it inside
+    # memtier so the time bound applies. Pass requests=0 by using the standard
+    # helper; the --test-time arg above is the actual bound.
+    ok, run_config = _run_mget_workload(
+        env, extra_args, threads=1, clients=2, requests=200
+    )
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(
+            ok,
+            message="memtier did not exit cleanly within --test-time=5 for "
+                    "pure-MGET --pipeline=4 --read-preference=secondary; "
+                    "possible spin or hang in the pipeline-cap defer path "
+                    "(hold_pipeline yield-on-saturation regressed)",
+        )
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
