@@ -19,6 +19,7 @@
 #ifndef MEMTIER_BENCHMARK_SHARD_CONNECTION_H
 #define MEMTIER_BENCHMARK_SHARD_CONNECTION_H
 
+#include <climits>
 #include <queue>
 #include <string>
 #include <netdb.h>
@@ -184,6 +185,46 @@ public:
     void set_role(enum shard_role role) { m_role = role; }
     bool is_replica() const { return m_role == role_replica; }
 
+    // ----------------------------------------------------------------------
+    // Read-preference observability hooks
+    // ----------------------------------------------------------------------
+    //
+    // Per-endpoint EWMA latency in microseconds. Updated on every successful
+    // response via `update_latency_ewma`. Until `m_latency_samples` reaches
+    // `LATENCY_EWMA_MIN_SAMPLES` the EWMA is treated as +inf by
+    // `nearest`-mode selection, so cold or unproven endpoints never win the
+    // lowest-latency tiebreak.
+    //
+    // Per-role op counters track how many user-level requests were routed
+    // to this endpoint. They feed the "Endpoints" array in mb.json and the
+    // "Ops from Primary"/"Ops from Replica" counts in the per-command "Read
+    // Routing" sub-object. The counters live on the connection (not on
+    // run_stats) because routing is per-conn, and the connection's role can
+    // be flipped at topology refresh time.
+    // C++11 forbids in-class initializers for static constexpr doubles
+    // (technically allowed but odr-use would require an out-of-class
+    // definition, which is brittle); wrap the constants in static inline
+    // accessors instead.
+    static double latency_ewma_alpha() { return 0.1; }
+    static unsigned int latency_ewma_min_samples() { return 10; }
+
+    double get_latency_ewma_us() const { return m_latency_ewma_us; }
+    unsigned int get_latency_samples() const { return m_latency_samples; }
+    bool latency_ewma_warm() const { return m_latency_samples >= latency_ewma_min_samples(); }
+    void update_latency_ewma(double sample_us)
+    {
+        if (m_latency_samples == 0)
+            m_latency_ewma_us = sample_us;
+        else {
+            const double a = latency_ewma_alpha();
+            m_latency_ewma_us = a * sample_us + (1.0 - a) * m_latency_ewma_us;
+        }
+        if (m_latency_samples < UINT_MAX) m_latency_samples++;
+    }
+
+    void inc_routed_ops() { m_routed_ops++; }
+    unsigned long long get_routed_ops() const { return m_routed_ops; }
+
     int get_pending_resp() { return m_pending_resp; }
 
     // Get local port for crash reporting
@@ -314,6 +355,22 @@ private:
     // conditional. Invariant: m_bev_paused == true iff m_bev is currently in
     // the EV_READ|EV_WRITE-disabled state.
     bool m_bev_paused;
+
+    // EWMA of per-response latency in microseconds; see public accessors above
+    // (LATENCY_EWMA_ALPHA / LATENCY_EWMA_MIN_SAMPLES). Driven by
+    // update_latency_ewma() from the response handler. Read by the
+    // `nearest` selector in cluster_client. Per-conn, single-threaded: no
+    // synchronization needed.
+    double m_latency_ewma_us = 0.0;
+    unsigned int m_latency_samples = 0;
+
+    // Number of user-facing requests this endpoint has handled (after the
+    // routing decision lands at send-time). Distinct from m_pending_resp,
+    // which is in-flight depth, and from run_stats counters, which aggregate
+    // across endpoints and don't know about role. Bumped at send-time, not
+    // at response time, so per-endpoint Ops reflects what we routed there
+    // even when a request later fails.
+    unsigned long long m_routed_ops = 0;
 };
 
 #endif // MEMTIER_BENCHMARK_SHARD_CONNECTION_H

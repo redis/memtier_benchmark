@@ -667,6 +667,24 @@ void shard_connection::push_req(request *req)
     // Snapshot the type for the crash handler (which can't safely deref the
     // queue front without racing with worker-thread pops/destructors).
     m_last_pushed_req_type = (int) req->m_type;
+    // Per-endpoint routed_ops: count anything that's not a connection-setup
+    // request. This is the canonical "how many user-level requests did we
+    // route here" tally used by the "Endpoints" array in mb.json.
+    switch (req->m_type) {
+    case rt_get:
+    case rt_set:
+    case rt_wait:
+    case rt_arbitrary:
+        m_routed_ops++;
+        break;
+    case rt_unknown:
+    case rt_auth:
+    case rt_select_db:
+    case rt_cluster_slots:
+    case rt_hello:
+    case rt_readonly:
+        break;
+    }
     if (m_config->request_rate) {
         // Handle race condition during reconnection - don't assert if interval is 0
         if (m_request_per_cur_interval > 0) {

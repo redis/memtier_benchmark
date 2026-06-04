@@ -45,6 +45,7 @@
 #endif
 
 #include "cluster_client.h"
+#include "command_meta.h"
 #include "memtier_benchmark.h"
 #include "obj_gen.h"
 #include "retry_policy.h"
@@ -366,6 +367,156 @@ unsigned int cluster_client::slot_primary_conn_id(unsigned int slot) const
     shard_connection *primary = m_shard_groups[gidx].primary;
     if (primary == NULL) return UINT_MAX;
     return primary->get_id();
+}
+
+// True if `sc` is in a usable steady state for sending a fresh user-level
+// request: TCP connected, conn-setup ladder finished. The READONLY ladder is
+// part of m_cluster_slots == setup_done for replicas (cluster_client only
+// flips state to setup_done after the entire pre-flight finishes).
+static inline bool conn_is_live_for_routing(shard_connection *sc)
+{
+    if (sc == NULL) return false;
+    if (sc->get_connection_state() != conn_connected) return false;
+    if (sc->get_cluster_slots_state() != setup_done) return false;
+    return true;
+}
+
+unsigned int cluster_client::select_target_conn(unsigned int slot, bool is_read)
+{
+    if (slot >= m_slot_to_shard_group.size()) return UINT_MAX;
+    unsigned int gidx = m_slot_to_shard_group[slot];
+    if (gidx >= m_shard_groups.size()) return UINT_MAX;
+    shard_group &group = m_shard_groups[gidx];
+    if (group.primary == NULL) return UINT_MAX;
+
+    // Writes always go to the primary. This is the only sane choice; replicas
+    // either reject (-READONLY) or accept and immediately diverge from the
+    // authoritative primary.
+    if (!is_read) {
+        return conn_is_live_for_routing(group.primary) ? group.primary->get_id() : UINT_MAX;
+    }
+
+    const enum read_pref_mode mode = m_config->read_preference;
+
+    // rp_primary: legacy behavior (read from primary). Falling all the way
+    // through to the slot's primary owner gives parity with the
+    // pre-read-preference world.
+    if (mode == rp_primary) {
+        return conn_is_live_for_routing(group.primary) ? group.primary->get_id() : UINT_MAX;
+    }
+
+    // rp_nearest: scan (primary + warm replicas) and pick the lowest EWMA.
+    // Cold (samples < threshold) entries are treated as +inf so the tiebreak
+    // is among warm endpoints. If nothing is warm yet, fall back to the
+    // primary so reads still flow during the warm-up window.
+    if (mode == rp_nearest) {
+        shard_connection *best = NULL;
+        double best_ewma = 0.0;
+        // Consider primary first
+        if (conn_is_live_for_routing(group.primary) && group.primary->latency_ewma_warm()) {
+            best = group.primary;
+            best_ewma = group.primary->get_latency_ewma_us();
+        }
+        for (size_t i = 0; i < group.replicas.size(); i++) {
+            shard_connection *r = group.replicas[i];
+            if (!conn_is_live_for_routing(r)) continue;
+            if (!r->latency_ewma_warm()) continue;
+            const double e = r->get_latency_ewma_us();
+            if (best == NULL || e < best_ewma) {
+                best = r;
+                best_ewma = e;
+            }
+        }
+        if (best != NULL) return best->get_id();
+        // No warm endpoint yet — keep traffic on the primary to seed samples
+        // on the most important node first.
+        return conn_is_live_for_routing(group.primary) ? group.primary->get_id() : UINT_MAX;
+    }
+
+    // rp_secondary / rp_secondary_preferred: round-robin over live replicas.
+    // The cursor lives on the per-thread shard_group and wraps; we walk up
+    // to N entries so a single dead replica doesn't push us back to primary.
+    const size_t nreplicas = group.replicas.size();
+    if (nreplicas > 0) {
+        for (size_t step = 0; step < nreplicas; step++) {
+            unsigned int idx = (group.replica_rr_cursor + step) % nreplicas;
+            shard_connection *r = group.replicas[idx];
+            if (conn_is_live_for_routing(r)) {
+                group.replica_rr_cursor = (idx + 1) % nreplicas;
+                return r->get_id();
+            }
+        }
+    }
+
+    // No live replica. rp_secondary_preferred falls back to the primary;
+    // rp_secondary returns UINT_MAX and lets the caller apply
+    // --read-preference-fallback (rpf_error / rpf_queue / rpf_primary).
+    if (mode == rp_secondary_preferred) {
+        return conn_is_live_for_routing(group.primary) ? group.primary->get_id() : UINT_MAX;
+    }
+    // Strict rp_secondary: honor --read-preference-fallback at the routing
+    // site. rpf_primary silently degrades to the primary; rpf_error and
+    // rpf_queue both return UINT_MAX (caller treats as not_available).
+    if (m_config->read_preference_fallback == rpf_primary) {
+        return conn_is_live_for_routing(group.primary) ? group.primary->get_id() : UINT_MAX;
+    }
+    return UINT_MAX;
+}
+
+bool cluster_client::classify_read(const request *req) const
+{
+    if (req == NULL) return false;
+    switch (req->m_type) {
+    case rt_get:
+        return true;
+    case rt_set:
+    case rt_wait: // WAIT must run on the primary; classify as write
+    case rt_auth:
+    case rt_select_db:
+    case rt_cluster_slots:
+    case rt_hello:
+    case rt_readonly:
+        return false;
+    case rt_arbitrary: {
+        const arbitrary_request *ar = static_cast<const arbitrary_request *>(req);
+        if (ar->m_cmd_meta == NULL) return false;
+        // Per-command override takes precedence over the command-meta lookup.
+        if (ar->m_cmd_meta->is_read_override == 1) return true;
+        if (ar->m_cmd_meta->is_read_override == 0) return false;
+        // Spec-resolved is_read flag (READONLY in Redis command-flags).
+        if (ar->m_cmd_meta->spec != NULL) return ar->m_cmd_meta->spec->is_read;
+        return false;
+    }
+    case rt_unknown:
+    default:
+        return false;
+    }
+}
+
+void cluster_client::record_read_routing(size_t arbitrary_index, bool from_replica)
+{
+    if (m_arbitrary_routing_counters.empty()) {
+        // Lazily size to match the configured --command count. handle_response
+        // can land here before run_stats finishes its own per-command setup,
+        // so size on first use.
+        if (m_config && m_config->arbitrary_commands) {
+            m_arbitrary_routing_counters.assign(m_config->arbitrary_commands->size(), read_routing_counters());
+        }
+    }
+    if (arbitrary_index >= m_arbitrary_routing_counters.size()) return;
+    if (from_replica)
+        m_arbitrary_routing_counters[arbitrary_index].ops_from_replica++;
+    else
+        m_arbitrary_routing_counters[arbitrary_index].ops_from_primary++;
+}
+
+void cluster_client::record_builtin_read_routing(request_type rt, bool from_replica)
+{
+    if (rt != rt_get) return;
+    if (from_replica)
+        m_get_routing_counters.ops_from_replica++;
+    else
+        m_get_routing_counters.ops_from_primary++;
 }
 
 void cluster_client::handle_cluster_slots(protocol_response *r)
@@ -763,6 +914,24 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
     return false;
 }
 
+// Classify a (command_index, kind-of-flow) pair as read vs write for routing.
+// The interpretation of command_index differs between the built-in SET/GET
+// path and the arbitrary-command path; resolve here so callers don't have to.
+bool cluster_client::is_read_command_index(unsigned int command_index) const
+{
+    if (m_config->arbitrary_commands && m_config->arbitrary_commands->is_defined()) {
+        // command_index addresses arbitrary_commands[].
+        if (command_index >= m_config->arbitrary_commands->size()) return false;
+        const arbitrary_command &cmd = m_config->arbitrary_commands->at(command_index);
+        if (cmd.is_read_override == 1) return true;
+        if (cmd.is_read_override == 0) return false;
+        if (cmd.spec != NULL) return cmd.spec->is_read;
+        return false; // unknown command -> safe default: write
+    }
+    // Built-in path: only SET_CMD_IDX (write) and GET_CMD_IDX (read) are used.
+    return command_index == GET_CMD_IDX;
+}
+
 get_key_response cluster_client::get_key_for_conn(unsigned int command_index, unsigned int conn_id,
                                                   unsigned long long *key_index)
 {
@@ -780,27 +949,39 @@ get_key_response cluster_client::get_key_for_conn(unsigned int command_index, un
 
     unsigned int hslot = calc_hslot_crc16_cluster(m_obj_gen->get_key(), m_obj_gen->get_key_len());
 
-    // check if the key match for this connection. slot_primary_conn_id() can
-    // return UINT_MAX before the first CLUSTER SLOTS response populates
-    // m_shard_groups (bootstrap window) -- treat it as "not available" so the
-    // caller retries once the topology settles, matching the prior behavior
-    // where m_slot_to_shard was zero-initialized and the conn-state check
-    // below caught it.
-    unsigned int primary_conn_id = slot_primary_conn_id(hslot);
-    if (primary_conn_id == UINT_MAX) {
+    // Read-preference-aware target selection. For writes this collapses to
+    // the slot's primary owner (identical to the pre-read-pref world). For
+    // reads it follows --read-preference. Returns UINT_MAX before bootstrap
+    // (no shard_group populated) or under strict rp_secondary when no replica
+    // is live -- both cases fall through to "not_available" so the next tick
+    // retries or the caller applies a fallback.
+    const bool is_read = is_read_command_index(command_index);
+    unsigned int target_conn_id = select_target_conn(hslot, is_read);
+
+    if (target_conn_id == UINT_MAX) {
+        // Bootstrap / strict-secondary-no-replica path. We do NOT pre-emptively
+        // schedule a CLUSTER SLOTS refresh: rp_secondary failing because every
+        // replica is down should not whack the topology -- it's a routing
+        // gap, not a topology bug. The next event loop tick will retry.
         return not_available;
     }
-    if (primary_conn_id == conn_id) {
+    if (target_conn_id == conn_id) {
         benchmark_debug_log("%s generated key=[%.*s] for itself\n", m_connections[conn_id]->get_readable_id(),
                             m_obj_gen->get_key_len(), m_obj_gen->get_key());
         return available_for_conn;
     }
 
     // handle key for other connection
-    unsigned int other_conn_id = primary_conn_id;
+    unsigned int other_conn_id = target_conn_id;
 
-    // in case we generated key for connection that is disconnected, 'slot to shard' map may need to be updated
+    // in case we generated key for connection that is disconnected, 'slot to shard' map may need to be updated.
+    // The disconnect check here only fires for the PRIMARY slot owner: select_target_conn already filtered
+    // dead replicas. Trigger a CLUSTER SLOTS refresh only when the primary is down, to match the prior
+    // behaviour of this guard.
     if (m_connections[other_conn_id]->get_connection_state() == conn_disconnected) {
+        // The select_target_conn rebuild above means we only get here if the primary itself is dead
+        // (target chosen for a write or rp_primary). Triggering a CLUSTER SLOTS refresh is the right
+        // recovery -- a replica going down doesn't normally need one.
         m_connections[conn_id]->set_cluster_slots();
         return not_available;
     }
@@ -1011,7 +1192,33 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
     m_key_index_pools[conn_id]->push(key_index);
     client::create_arbitrary_request(command_index, timestamp, conn_id);
 
+    // Read-routing observability: when routing chose conn_id (available_for_conn),
+    // the send just happened on this connection. Bump the per-command counter
+    // so it matches the conn's role.
+    if (is_read_command_index(command_index)) {
+        record_read_routing(command_index, m_connections[conn_id]->is_replica());
+    }
+
     return true;
+}
+
+bool cluster_client::create_get_request(struct timeval &timestamp, unsigned int conn_id)
+{
+    // Snapshot the connection's pending-resp counter; push_req() on the
+    // shard_connection bumps it for every user-level request we send. If
+    // the base implementation sent a GET on THIS connection, pending_resp
+    // increments by 1; if it routed the work to another connection's pool
+    // (or returned not_available) pending_resp stays put. That distinction
+    // is what we need to attribute the read to the correct (primary vs
+    // replica) endpoint here, without re-implementing the routing logic.
+    const int before = m_connections[conn_id]->get_pending_resp();
+    bool ok = client::create_get_request(timestamp, conn_id);
+    if (!ok) return false;
+    const int after = m_connections[conn_id]->get_pending_resp();
+    if (after > before) {
+        record_builtin_read_routing(rt_get, m_connections[conn_id]->is_replica());
+    }
+    return ok;
 }
 
 bool cluster_client::create_mget_request(struct timeval &timestamp, unsigned int conn_id)
@@ -1035,6 +1242,18 @@ bool cluster_client::create_mget_request(struct timeval &timestamp, unsigned int
     unsigned int target_slot = m_mget_conn_slots[conn_id][sc % m_mget_conn_slots[conn_id].size()];
     sc++;
 
+    // Read-preference routing for MGET. The slot cache is built off the
+    // primary's conn_id, so by default conn_id IS the slot's primary. When
+    // --read-preference != primary we redirect this MGET to the configured
+    // node class. If routing returns a different conn, hand it the work via
+    // a tiny per-conn outbound queue (see m_pending_mget_send below).
+    const unsigned int routed = select_target_conn(target_slot, true /* MGET is always a read */);
+    if (routed == UINT_MAX) {
+        // Strict-secondary with no live replica and rpf_error/queue. Treat
+        // as not_available so the rate limiter retries on the next tick.
+        return false;
+    }
+
     std::vector<unsigned long long> &slot_keys = m_config->mget_cache->slot_keys[target_slot];
     size_t &kc = m_mget_slot_cursor[target_slot];
 
@@ -1046,7 +1265,11 @@ bool cluster_client::create_mget_request(struct timeval &timestamp, unsigned int
         m_keylist->add_key(m_obj_gen->get_key(), m_obj_gen->get_key_len());
     }
 
-    m_connections[conn_id]->send_mget_command(&timestamp, m_keylist);
+    m_connections[routed]->send_mget_command(&timestamp, m_keylist);
+    // routed_ops is bumped by shard_connection::push_req. Record the
+    // read-routing decision (Ops from Primary / Ops from Replica) here
+    // because the send-side has no other context about the routing class.
+    record_builtin_read_routing(rt_get, m_connections[routed]->is_replica());
     return true;
 }
 
@@ -1068,14 +1291,25 @@ void cluster_client::create_request(struct timeval timestamp, unsigned int conn_
     unsigned int command_index = m_key_index_pools[conn_id]->front();
     m_key_index_pools[conn_id]->pop();
 
-    if (m_config->arbitrary_commands->is_defined())
+    if (m_config->arbitrary_commands->is_defined()) {
+        const int pre_pending = m_connections[conn_id]->get_pending_resp();
         client::create_arbitrary_request(command_index, timestamp, conn_id);
-    else if (command_index == SET_CMD_IDX)
+        // Per-arbitrary-command read-routing counters. We only bump when the
+        // send actually landed on conn_id (pending-resp grew). If routing
+        // dispatched the key to another conn's pool, the bump fires when
+        // that conn drains the pool through this same path.
+        if (is_read_command_index(command_index) && m_connections[conn_id]->get_pending_resp() > pre_pending) {
+            record_read_routing(command_index, m_connections[conn_id]->is_replica());
+        }
+    } else if (command_index == SET_CMD_IDX) {
         create_set_request(timestamp, conn_id);
-    else if (command_index == GET_CMD_IDX)
+    } else if (command_index == GET_CMD_IDX) {
+        // create_get_request is virtual; the cluster override records the
+        // built-in read-routing counter so we don't bump it twice here.
         create_get_request(timestamp, conn_id);
-    else
+    } else {
         assert("Unexpected command index");
+    }
 
     /* Make sure we used pair of command and key index */
     assert(m_key_index_pools[conn_id]->size() == pool_size - 2);
@@ -1269,6 +1503,14 @@ void cluster_client::handle_ask(unsigned int conn_id, struct timeval timestamp, 
 // Falls back to retrying on the same connection if the key is not captured
 // (e.g. arbitrary command without --retry-on-error key plumbing). Returns true
 // if ownership of `req` was transferred to a retry queue.
+//
+// Read-preference-aware: for read-class requests, select_target_conn honors
+// --read-preference on retry, so a read that hit MOVED on a replica that no
+// longer owns the slot can be re-routed to a *different* replica (or the
+// primary, depending on mode). Write-class retries always go to the primary.
+// The exception is `-READONLY` (handled by caller above): we force routing
+// to the primary regardless of read_preference, because the server has
+// explicitly told us the replica won't accept this command class.
 bool cluster_client::retry_after_redirect(unsigned int conn_id, request *req)
 {
     if (!m_config->retry_on_error) return false;
@@ -1281,10 +1523,12 @@ bool cluster_client::retry_after_redirect(unsigned int conn_id, request *req)
         // the correct shard. calc_hslot_crc16_cluster hashes the full string
         // and would map to a different slot, causing an infinite MOVED loop.
         unsigned int hslot = calc_hslot_crc16_with_hash_tag(req->m_key, req->m_key_len);
-        // Primary-only routing on retry; UINT_MAX before bootstrap CLUSTER
-        // SLOTS lands -- in that window we fall back to retrying on the same
-        // connection (matches the prior "CLUSTER SLOTS still in flight" path).
-        unsigned int mapped = slot_primary_conn_id(hslot);
+        const bool is_read = classify_read(req);
+        unsigned int mapped = select_target_conn(hslot, is_read);
+        // Defensive: if select_target_conn returned UINT_MAX (strict secondary
+        // with no live replica), fall back to the slot primary so the retry
+        // doesn't get stuck.
+        if (mapped == UINT_MAX) mapped = slot_primary_conn_id(hslot);
         // Only route to a different connection if it's actually ready; otherwise
         // fall back to the same connection (CLUSTER SLOTS may still be in flight).
         if (mapped != UINT_MAX && mapped < m_connections.size() &&
@@ -1331,9 +1575,67 @@ void cluster_client::finalize_dropped_redirect(struct timeval timestamp, request
 void cluster_client::handle_response(unsigned int conn_id, struct timeval timestamp, request *request,
                                      protocol_response *response)
 {
+    // EWMA latency update for `--read-preference=nearest`. Computed from the
+    // request's most-recent send time (m_sent_time), not its first attempt;
+    // retries should be reflected in the latency observed by selection.
+    // Skip error responses so a flaky replica isn't punished twice (once by
+    // unavailability, once by inflated EWMA).
+    if (!response->is_error() && request != NULL) {
+        const long long diff_us = ts_diff(request->m_sent_time, timestamp);
+        if (diff_us > 0) m_connections[conn_id]->update_latency_ewma((double) diff_us);
+    }
+
     if (response->is_error()) {
         benchmark_debug_log("server %s handle response: %s\n", m_connections[conn_id]->get_readable_id(),
                             response->get_status());
+        // handle "-READONLY"
+        // Server signals "you sent a write to a replica". We misclassified
+        // this request as a read (or the topology changed mid-flight, e.g.
+        // a failover demoted the primary to a replica). Re-route to the
+        // current slot primary and retry once. We do NOT trigger a CLUSTER
+        // SLOTS refresh here -- READONLY is a per-request signal, not a
+        // topology event, and the cost of bouncing the entire cluster's
+        // topology view per misclassification is way too high.
+        static const char READONLY_MSG_PREFIX[] = "-READONLY";
+        static const size_t READONLY_MSG_PREFIX_LEN = sizeof(READONLY_MSG_PREFIX) - 1;
+        if (strncmp(response->get_status(), READONLY_MSG_PREFIX, READONLY_MSG_PREFIX_LEN) == 0) {
+            benchmark_debug_log("server %s: READONLY (misclassified read); rerouting to primary\n",
+                                m_connections[conn_id]->get_readable_id());
+            // Override classify_read by stamping request as write before the
+            // retry path: -READONLY means the server thinks this is a write,
+            // and the next attempt MUST go to a primary regardless of the
+            // global --read-preference setting. We do this by force-setting
+            // the request type. For arbitrary requests, set is_read_override
+            // on the per-request meta via a local flag instead of mutating
+            // the shared command_meta (which would affect future calls).
+            // Simpler implementation: temporarily set request->m_type to
+            // rt_set so classify_read returns false. Restore on exit.
+            //
+            // Even simpler: just slot-route to the primary directly here,
+            // bypassing select_target_conn entirely on the READONLY path.
+            unsigned int primary_target = conn_id;
+            if (request && request->m_key && request->m_key_len > 0) {
+                unsigned int hslot = calc_hslot_crc16_with_hash_tag(request->m_key, request->m_key_len);
+                unsigned int p = slot_primary_conn_id(hslot);
+                if (p != UINT_MAX && p < m_connections.size() &&
+                    m_connections[p]->get_connection_state() == conn_connected &&
+                    m_connections[p]->get_cluster_slots_state() == setup_done) {
+                    primary_target = p;
+                }
+            }
+            if (m_config->retry_on_error && request && request->m_serialized && request->m_serialized_len > 0 &&
+                m_connections[primary_target]->enqueue_retry(request)) {
+                m_stats.inc_retry_attempt();
+                if (request->m_retries == 0) m_stats.inc_retried_op();
+                return;
+            }
+            // Either retry_on_error is off or no captured bytes. Fall
+            // through and finalize as a terminal error to keep accounting
+            // honest (the original send did happen on the wire and the
+            // server explicitly rejected it).
+            finalize_dropped_redirect(timestamp, request, response);
+            return;
+        }
         // handle "-MOVED"
         if (strncmp(response->get_status(), MOVED_MSG_PREFIX, MOVED_MSG_PREFIX_LEN) == 0) {
             handle_moved(conn_id, timestamp, request, response);

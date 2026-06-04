@@ -57,6 +57,19 @@ struct shard_group
 
 class cluster_client : public client
 {
+public:
+    // Per-conn observability: dispatch dispatches Ops-from-Primary /
+    // Ops-from-Replica counts per arbitrary command type. Implemented as a
+    // small fixed-size table indexed by (arbitrary_command_index, role).
+    // Used by run_stats::print_json via accessor below to populate the
+    // per-command "Read Routing" object.
+    struct read_routing_counters
+    {
+        unsigned long long ops_from_primary;
+        unsigned long long ops_from_replica;
+        read_routing_counters() : ops_from_primary(0), ops_from_replica(0) {}
+    };
+
 protected:
     std::vector<key_index_pool *> m_key_index_pools;
     std::vector<std::queue<staged_monitor_cmd> > m_staged_monitor_commands;
@@ -94,6 +107,13 @@ protected:
     std::vector<size_t> m_mget_conn_slot_cursor;               // [conn] → slot round-robin cursor
     void build_mget_slot_cache();
 
+    // Per-arbitrary-command-index routing counters (sized to the number of
+    // entries in --command at startup; entries beyond that are silently
+    // dropped). The built-in counters split out GET (the only built-in read
+    // class) and report under "Gets" in the JSON.
+    std::vector<read_routing_counters> m_arbitrary_routing_counters;
+    read_routing_counters m_get_routing_counters;
+
     virtual int connect(void);
     virtual void disconnect(void);
 
@@ -105,6 +125,45 @@ protected:
     // Returns UINT_MAX if the slot maps to an unpopulated group (shouldn't
     // happen post-bootstrap CLUSTER SLOTS, but defensive against torn state).
     unsigned int slot_primary_conn_id(unsigned int slot) const;
+
+    // Read-routing dispatch. Resolves a hash slot to the conn_id of the
+    // shard_connection that should serve a request under the configured
+    // --read-preference. Writes (is_read == false) always go to the
+    // primary. Reads route per mode:
+    //
+    //   rp_primary             -> primary
+    //   rp_secondary           -> next live replica (RR); UINT_MAX if no live
+    //                             replica (caller applies fallback policy)
+    //   rp_secondary_preferred -> next live replica, else primary
+    //   rp_nearest             -> lowest EWMA-latency among warm replicas+primary
+    //
+    // "Live" means connection_state==conn_connected AND cluster_slots_state==
+    // setup_done (the READONLY ladder having lit setup_done is implicit in
+    // setup_done for replicas because the readonly ladder is checked alongside).
+    //
+    // Returns UINT_MAX when the slot is unmapped (bootstrap window) or when
+    // strict `rp_secondary` has no live replicas. Callers must handle the
+    // UINT_MAX case explicitly (typically by treating as not_available and
+    // letting the next tick retry, or applying --read-preference-fallback for
+    // the strict-secondary case).
+    unsigned int select_target_conn(unsigned int slot, bool is_read);
+
+    // True if the request should be classified as a read for routing
+    // purposes (see select_target_conn). Inspects request type plus
+    // arbitrary_command::is_read_override and CommandSpec::is_read. Returns
+    // false for WAIT, MULTI/EXEC, EVAL/EVALSHA (write-classified by default),
+    // and any unknown command (safe default).
+    bool classify_read(const request *req) const;
+
+    // command_index -> is_read variant of classify_read, for the synchronous
+    // routing path inside get_key_for_conn (where there is no request*
+    // available yet). When arbitrary_commands is defined, command_index
+    // addresses arbitrary_commands[]; otherwise it's SET_CMD_IDX / GET_CMD_IDX.
+    bool is_read_command_index(unsigned int command_index) const;
+
+    // Bump the per-command Ops-from-Primary / Ops-from-Replica counter.
+    void record_read_routing(size_t arbitrary_index, bool from_replica);
+    void record_builtin_read_routing(request_type rt, bool from_replica);
 
     shard_connection *create_shard_connection(abstract_protocol *abs_protocol);
     bool connect_shard_connection(shard_connection *sc, char *address, char *port);
@@ -134,6 +193,20 @@ public:
                                               unsigned long long *key_index);
     virtual bool create_arbitrary_request(unsigned int command_index, struct timeval &timestamp, unsigned int conn_id);
     virtual bool create_mget_request(struct timeval &timestamp, unsigned int conn_id);
+    // Overriden so we can bump the per-command read-routing counter after
+    // the base class actually sends. The base implementation handles all
+    // the heavy lifting (key generation, routing-target sharding via
+    // get_key_for_conn); we only annotate the routing outcome.
+    virtual bool create_get_request(struct timeval &timestamp, unsigned int conn_id);
+
+    // Snapshot accessors for the per-command read-routing counters. Read-only
+    // and intended for the merge thread (post-join). See JSON_handler /
+    // run_stats::print_json for the consumer.
+    const std::vector<read_routing_counters> &get_arbitrary_routing_counters() const
+    {
+        return m_arbitrary_routing_counters;
+    }
+    const read_routing_counters &get_get_routing_counters() const { return m_get_routing_counters; }
 
     // client manager api's
     virtual void handle_cluster_slots(protocol_response *r);
