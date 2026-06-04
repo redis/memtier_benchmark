@@ -1068,7 +1068,7 @@ void shard_connection::process_response(void)
                 if (m_role == role_replica) {
                     for (size_t i = 0; i < m_conns_manager->get_connections().size(); i++) {
                         shard_connection *peer = m_conns_manager->get_connections()[i];
-                        if (peer != this && peer != NULL && peer->get_connection_state() == conn_connected) {
+                        if (peer != this && peer->get_connection_state() == conn_connected) {
                             peer->schedule_fill();
                         }
                     }
@@ -1083,7 +1083,7 @@ void shard_connection::process_response(void)
                 if (m_role == role_replica) {
                     for (size_t i = 0; i < m_conns_manager->get_connections().size(); i++) {
                         shard_connection *peer = m_conns_manager->get_connections()[i];
-                        if (peer != this && peer != NULL && peer->get_connection_state() == conn_connected) {
+                        if (peer != this && peer->get_connection_state() == conn_connected) {
                             peer->schedule_fill();
                         }
                     }

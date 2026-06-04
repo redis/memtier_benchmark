@@ -406,6 +406,10 @@ unsigned int cluster_client::select_target_conn(unsigned int slot, bool is_read)
     }
 
     const enum read_pref_mode mode = m_config->read_preference;
+    // Used by both rp_nearest (cold-seed RR) and rp_secondary/_preferred (live
+    // replica RR). Hoisted above the mode switch so the two branches share one
+    // declaration instead of shadowing each other.
+    const size_t nreplicas = group.replicas.size();
 
     // rp_primary: legacy behavior (read from primary). Falling all the way
     // through to the slot's primary owner gives parity with the
@@ -414,24 +418,27 @@ unsigned int cluster_client::select_target_conn(unsigned int slot, bool is_read)
         return conn_is_live_for_routing(group.primary) ? group.primary->get_id() : UINT_MAX;
     }
 
-    // rp_nearest: scan (primary + warm replicas) and pick the lowest EWMA.
-    // Cold (samples < threshold) entries are treated as +inf so the tiebreak
-    // is among warm endpoints. While any live replica is still cold, route to
-    // it round-robin so every replica accumulates its first
-    // LATENCY_EWMA_MIN_SAMPLES; once all live replicas are warm, the EWMA
-    // pick below takes over. (Previously we fell back to the primary in the
-    // cold window — the primary warmed first and replicas never received a
-    // sample, so `nearest` was permanently equivalent to `primary`.)
+    // rp_nearest: scan warm replicas (and the primary if it has already
+    // accumulated samples) and pick the lowest EWMA. Cold (samples <
+    // threshold) entries are treated as +inf so the tiebreak is among warm
+    // endpoints. While any live replica is still cold, route to it round-
+    // robin so every replica accumulates its first LATENCY_EWMA_MIN_SAMPLES;
+    // once all live replicas are warm, the EWMA pick below takes over.
+    // (In steady-state operation the primary never warms because
+    // update_latency_ewma only fires on rt_get/rt_arbitrary responses and
+    // those are routed to replicas; the primary appears in the warm pool
+    // only after the no-live-replica fallback below has actually run.)
     if (mode == rp_nearest) {
         shard_connection *best = NULL;
         double best_ewma = 0.0;
-        // Consider primary first
+        // Consider primary first (only contends if it has already accumulated
+        // samples; see comment above on why that is normally false).
         if (conn_is_live_for_routing(group.primary) && group.primary->latency_ewma_warm()) {
             best = group.primary;
             best_ewma = group.primary->get_latency_ewma_us();
         }
         bool any_cold_live_replica = false;
-        for (size_t i = 0; i < group.replicas.size(); i++) {
+        for (size_t i = 0; i < nreplicas; i++) {
             shard_connection *r = group.replicas[i];
             if (!conn_is_live_for_routing(r)) continue;
             if (!r->latency_ewma_warm()) {
@@ -448,7 +455,6 @@ unsigned int cluster_client::select_target_conn(unsigned int slot, bool is_read)
         // looking for any live-but-not-yet-warm replica. Once everyone is
         // warm, this loop finds nothing and we fall through to either the
         // warm pick (`best`) or the primary fallback.
-        const size_t nreplicas = group.replicas.size();
         if (any_cold_live_replica && nreplicas > 0) {
             for (size_t step = 0; step < nreplicas; step++) {
                 unsigned int idx = (group.replica_rr_cursor + step) % nreplicas;
@@ -468,7 +474,6 @@ unsigned int cluster_client::select_target_conn(unsigned int slot, bool is_read)
     // rp_secondary / rp_secondary_preferred: round-robin over live replicas.
     // The cursor lives on the per-thread shard_group and wraps; we walk up
     // to N entries so a single dead replica doesn't push us back to primary.
-    const size_t nreplicas = group.replicas.size();
     if (nreplicas > 0) {
         for (size_t step = 0; step < nreplicas; step++) {
             unsigned int idx = (group.replica_rr_cursor + step) % nreplicas;
