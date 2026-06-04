@@ -1810,15 +1810,15 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
     // Read-preference observability (Step 2f).
     //
     // "Read Routing" sub-object: emitted whenever a non-default read
-    // preference is in effect OR the standalone --read-server path has
-    // routed reads to a configured non-primary endpoint. Reports
-    // ops-from-primary / ops-from-replica per command class. Emitted in the
-    // built-in "Gets" path; arbitrary commands embed their own per-command
-    // totals.
+    // preference is in effect. m_get_read_routing is only fed by
+    // cluster_client::record_builtin_read_routing — the standalone
+    // --read-server dispatch path does not yet record read-routing
+    // attribution, so gating on (!cluster_mode && !read_servers.empty())
+    // would open an empty JSON block. Restrict the gate to non-primary
+    // read_preference (cluster-only) and revisit when standalone read
+    // attribution is implemented.
     // -----------------------------------------------------------------
-    const bool emit_read_routing =
-        jsonhandler != NULL && m_config &&
-        (m_config->read_preference != rp_primary || (!m_config->cluster_mode && !m_config->read_servers.empty()));
+    const bool emit_read_routing = jsonhandler != NULL && m_config && m_config->read_preference != rp_primary;
     if (emit_read_routing) {
         const bool any = (m_get_read_routing.ops_from_primary + m_get_read_routing.ops_from_replica) > 0;
         if (any) {

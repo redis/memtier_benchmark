@@ -424,15 +424,17 @@ unsigned int cluster_client::select_target_conn(unsigned int slot, bool is_read)
     // endpoints. While any live replica is still cold, route to it round-
     // robin so every replica accumulates its first LATENCY_EWMA_MIN_SAMPLES;
     // once all live replicas are warm, the EWMA pick below takes over.
-    // (In steady-state operation the primary never warms because
-    // update_latency_ewma only fires on rt_get/rt_arbitrary responses and
-    // those are routed to replicas; the primary appears in the warm pool
-    // only after the no-live-replica fallback below has actually run.)
+    // (Consider primary first - under built-in GET/MGET workloads it never
+    // warms because no rt_get response reaches it, but under arbitrary
+    // mixed workloads rt_arbitrary writes update its EWMA, so it can
+    // participate in selection. The no-live-replica fallback below also
+    // routes traffic to primary, which independently warms it.)
     if (mode == rp_nearest) {
         shard_connection *best = NULL;
         double best_ewma = 0.0;
-        // Consider primary first (only contends if it has already accumulated
-        // samples; see comment above on why that is normally false).
+        // Consider primary first (contends only if it has accumulated
+        // samples via rt_arbitrary writes or the no-live-replica fallback;
+        // see comment above).
         if (conn_is_live_for_routing(group.primary) && group.primary->latency_ewma_warm()) {
             best = group.primary;
             best_ewma = group.primary->get_latency_ewma_us();
