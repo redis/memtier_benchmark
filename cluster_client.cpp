@@ -128,11 +128,15 @@ cluster_client::cluster_client(client_group *group) :
         m_txn_has_staged_key(false),
         m_txn_pin_lost_warned(false)
 {
-    // Initialize slot map to zero; m_shard_groups starts empty and is populated
-    // by handle_cluster_slots(). Until then, lookups via m_slot_to_shard_group
-    // index 0 are safe because cluster_client::connect() forces the bootstrap
-    // connection to drive CLUSTER SLOTS before any user traffic flows.
-    m_slot_to_shard_group.assign(MAX_CLUSTER_HSLOT + 1, 0);
+    // Initialize slot map to the UINT_MAX sentinel; m_shard_groups starts empty
+    // and is populated by handle_cluster_slots(). Every reader bails on
+    // UINT_MAX (slot_primary_conn_id, select_target_conn, get_key_for_conn,
+    // retry_after_redirect, create_monitor_request_cluster, create_mget_request),
+    // so the pre-bootstrap window cannot silently route to a stale group index.
+    // cluster_client::connect() still forces the bootstrap CLUSTER SLOTS before
+    // user traffic flows; the sentinel is belt-and-braces against a topology
+    // refresh leaving stale entries for slots absent from the new reply.
+    m_slot_to_shard_group.assign(MAX_CLUSTER_HSLOT + 1, UINT_MAX);
 }
 
 cluster_client::~cluster_client()
@@ -557,11 +561,17 @@ void cluster_client::handle_cluster_slots(protocol_response *r)
 
     // Reset the per-refresh topology view. Existing primary/replica connection
     // objects in m_connections are reused via the dedupe-by-(addr,port) loop
-    // below; only the grouping is recomputed. m_slot_to_shard_group keeps its
-    // previous contents and is overwritten range-by-range as each valid shard
-    // entry lands -- ranges that never appear in this reply preserve their
-    // last-known mapping, matching the pre-shard_group behavior of
-    // m_slot_to_shard[].
+    // below; only the grouping is recomputed.
+    //
+    // Reset m_slot_to_shard_group to the UINT_MAX sentinel BEFORE clearing
+    // m_shard_groups. The previous behavior left stale group indices in slots
+    // that never reappeared in the new reply, which after the clear() could
+    // alias to a *different* new group (silent mis-routing until MOVED
+    // recovered). Every reader (slot_primary_conn_id, select_target_conn,
+    // get_key_for_conn, retry_after_redirect, create_monitor_request_cluster,
+    // create_mget_request) treats UINT_MAX as "not available" and bails, which
+    // is the correct behavior for a slot that no longer has a known owner.
+    m_slot_to_shard_group.assign(MAX_CLUSTER_HSLOT + 1, UINT_MAX);
     m_shard_groups.clear();
 
     // run over response and create connections
@@ -891,15 +901,24 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         return true;
     }
 
-    /* Read-preference bootstrap window: if reads need replicas under the
-     * current --read-preference but no replica is live-for-routing yet, we
-     * would otherwise spin in fill_pipeline calling get_key_for_conn ->
-     * select_target_conn -> UINT_MAX -> not_available -> retry forever, with
-     * the event loop never getting a chance to fire BEV_EVENT_CONNECTED for
-     * the in-progress replica connections. Hold here until at least one
+    /* Read-preference bootstrap window: if reads STRICTLY require replicas
+     * under the current --read-preference but no replica is live-for-routing
+     * yet, we would otherwise spin in fill_pipeline calling get_key_for_conn
+     * -> select_target_conn -> UINT_MAX -> not_available -> retry forever,
+     * with the event loop never getting a chance to fire BEV_EVENT_CONNECTED
+     * for the in-progress replica connections. Hold here until at least one
      * replica is live; the bootstrap CLUSTER SLOTS response, plus the next
-     * replica's connect callback, will schedule_fill us out of the hold. */
-    if (m_config->read_preference != rp_primary && m_config->ratio.a == 0) {
+     * replica's connect callback, will schedule_fill us out of the hold.
+     *
+     * Only the strict mode (rp_secondary with fallback != rpf_primary)
+     * actually needs the hold -- the non-strict modes
+     * (rp_secondary_preferred, rp_nearest, and rp_secondary + rpf_primary)
+     * are explicitly defined to fall back to the primary when no replica is
+     * available, and select_target_conn already returns the primary's
+     * conn_id in those cases. Holding here for non-strict modes would stall
+     * reads that should drain to the primary. */
+    if (m_config->ratio.a == 0 && m_config->read_preference == rp_secondary &&
+        m_config->read_preference_fallback != rpf_primary) {
         // Read-only workload that *must* route to replicas. Check if any
         // shard_group has a live replica. We only need ONE to make progress.
         bool any_live_replica = false;
@@ -1639,7 +1658,17 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
             //
             // Even simpler: just slot-route to the primary directly here,
             // bypassing select_target_conn entirely on the READONLY path.
-            unsigned int primary_target = conn_id;
+            //
+            // If we cannot identify a *live* primary for this slot (no key /
+            // unmapped slot / primary not setup_done), we must NOT fall back
+            // to `conn_id` (the rejecting replica) -- doing so re-queues the
+            // request onto the same connection that just returned -READONLY,
+            // guaranteeing another rejection until --retry-max-attempts is
+            // hit. Instead, schedule a topology refresh on this connection
+            // (the next CLUSTER SLOTS reply re-binds slot -> primary) and
+            // finalize the in-flight request as a terminal error -- the next
+            // pipeline tick reroutes future traffic correctly.
+            unsigned int primary_target = UINT_MAX;
             if (request && request->m_key && request->m_key_len > 0) {
                 unsigned int hslot = calc_hslot_crc16_with_hash_tag(request->m_key, request->m_key_len);
                 unsigned int p = slot_primary_conn_id(hslot);
@@ -1648,6 +1677,14 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
                     m_connections[p]->get_cluster_slots_state() == setup_done) {
                     primary_target = p;
                 }
+            }
+            if (primary_target == UINT_MAX) {
+                // No live primary known for this slot. Trigger a topology
+                // refresh on the rejecting connection and drop the request
+                // instead of looping it back onto the same replica.
+                m_connections[conn_id]->set_cluster_slots();
+                finalize_dropped_redirect(timestamp, request, response);
+                return;
             }
             if (m_config->retry_on_error && request && request->m_serialized && request->m_serialized_len > 0 &&
                 m_connections[primary_target]->enqueue_retry(request)) {
