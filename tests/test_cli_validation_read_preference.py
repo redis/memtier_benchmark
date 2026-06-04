@@ -74,10 +74,14 @@ def test_read_preference_all_valid_modes_parse(env):
         # but we want exit != 2 (usage error).  The parse path exits with 2 on
         # bad options.  We just check that the binary does NOT print the
         # mode-list rejection message.
+        # --max-reconnect-attempts=1 + --connection-stage-timeout=2 bound the
+        # connect/setup loops so a dead port exits in well under the 15s
+        # timeout (otherwise the post-test cleanup phase runs full duration).
         result = _run(
             ["-s", "127.0.0.1", "-p", "1", "--test-time=1",
+             "--max-reconnect-attempts=1", "--connection-stage-timeout=2",
              "--read-preference={}".format(mode)],
-            timeout=5,
+            timeout=15,
         )
         env.assertFalse(
             "--read-preference must be one of" in result.stderr,
@@ -95,8 +99,9 @@ def test_read_preference_no_cluster_no_server_warns(env):
     --read-server) must emit a warning but not a hard error."""
     result = _run(
         ["-s", "127.0.0.1", "-p", "1", "--test-time=1",
+         "--max-reconnect-attempts=1", "--connection-stage-timeout=2",
          "--read-preference=secondary"],
-        timeout=5,
+        timeout=15,
     )
     env.assertTrue(
         "--read-preference has no effect" in result.stderr,
@@ -158,9 +163,10 @@ def test_read_server_valid_format_accepted(env):
     """--read-server=127.0.0.1:6380 must not trigger a parse-time error."""
     result = _run(
         ["-s", "127.0.0.1", "-p", "1", "--test-time=1",
+         "--max-reconnect-attempts=1", "--connection-stage-timeout=2",
          "--read-preference=secondary",
          "--read-server=127.0.0.1:6380"],
-        timeout=5,
+        timeout=15,
     )
     # Parse error exits with code 2 or prints usage; a connection error
     # does not.  We just verify there is no parse rejection message.
@@ -199,8 +205,9 @@ def test_read_preference_fallback_valid_values_accepted(env):
     for val in ("error", "queue", "primary"):
         result = _run(
             ["-s", "127.0.0.1", "-p", "1", "--test-time=1",
+             "--max-reconnect-attempts=1", "--connection-stage-timeout=2",
              "--read-preference-fallback={}".format(val)],
-            timeout=5,
+            timeout=15,
         )
         env.assertFalse(
             "--read-preference-fallback must be one of" in result.stderr,
