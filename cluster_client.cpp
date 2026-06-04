@@ -1018,38 +1018,20 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
      *
      * get_key_for_conn bumps m_strict_no_route_attempts on each read routing
      * failure and resets it on a successful read. Once the counter reaches
-     * STRICT_NO_ROUTE_HOLD_THRESHOLD we yield here, re-checking whether a
-     * routable target has come up in the meantime. If yes, clear the counter
-     * and fall through (the next create_request call will route
-     * successfully and permanently reset it). If still none, we hold and
-     * wait for a schedule_fill wakeup from a connect callback. The gate
-     * triggers for any non-primary read preference: rp_secondary +
-     * non-rpf_primary fallback (replica-only), rp_secondary_preferred and
-     * rp_nearest (a UINT_MAX result implies even the primary is offline). */
+     * STRICT_NO_ROUTE_HOLD_THRESHOLD we yield here unconditionally -- even
+     * if `any_route` is true. The destination may be saturated but live; we
+     * still need to release the event loop so the queued schedule_fill can
+     * fire and the destination can drain. Under pure-MGET + saturated-replica
+     * the producer's own pipeline never grows (no SETs), so fill_pipeline
+     * would otherwise keep spinning here without ever returning control to
+     * libevent. The counter is reset by successful read routes (see
+     * get_key_for_conn's reset at line 1148 and create_mget_request's mirror)
+     * when traffic resumes. The gate triggers for any non-primary read
+     * preference: rp_secondary + non-rpf_primary fallback (replica-only),
+     * rp_secondary_preferred and rp_nearest (a UINT_MAX result implies even
+     * the primary is offline). */
     if (m_strict_no_route_attempts >= STRICT_NO_ROUTE_HOLD_THRESHOLD && m_config->read_preference != rp_primary) {
-        const bool strict_secondary =
-            m_config->read_preference == rp_secondary && m_config->read_preference_fallback != rpf_primary;
-        bool any_route = false;
-        for (size_t i = 0; i < m_shard_groups.size() && !any_route; i++) {
-            if (!strict_secondary) {
-                shard_connection *p = m_shard_groups[i].primary;
-                if (p != NULL && p->is_ready_for_reads()) {
-                    any_route = true;
-                    break;
-                }
-            }
-            for (size_t j = 0; j < m_shard_groups[i].replicas.size(); j++) {
-                shard_connection *r = m_shard_groups[i].replicas[j];
-                if (r != NULL && r->is_ready_for_reads()) {
-                    any_route = true;
-                    break;
-                }
-            }
-        }
-        if (!any_route) return true;
-        // A routing target is now live: clear the back-off counter so we
-        // don't re-enter this gate on the very next fill_pipeline iteration.
-        m_strict_no_route_attempts = 0;
+        return true;
     }
 
     /* In transaction mode the pin connection drives the entire rotation.
