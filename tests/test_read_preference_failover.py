@@ -188,8 +188,22 @@ def test_read_preference_failover(env):
         env.skip()
         return
 
-    # Allow the cluster a moment to register the failure.
-    time.sleep(1)
+    # Allow the cluster a moment to register the failure. Poll until at least
+    # one of the original replicas stops responding to PING (i.e. the SHUTDOWN
+    # actually took effect), then break. Caps at 5s so a flaky-but-alive
+    # replica doesn't hang the test indefinitely.
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        any_down = False
+        for conn in replica_conns:
+            try:
+                conn.execute_command("PING")
+            except Exception:
+                any_down = True
+                break
+        if any_down:
+            break
+        time.sleep(0.1)
 
     # ---- Post-failover run ------------------------------------------------
     master_conns = env.getOSSMasterNodesConnectionList()

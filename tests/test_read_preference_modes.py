@@ -276,6 +276,17 @@ def test_read_preference_secondary_preferred(env):
                     "--read-preference=secondaryPreferred, got 0 across "
                     "{} replicas".format(len(replica_conns)),
         )
+
+        # secondaryPreferred should route to replicas whenever they are live;
+        # masters must not receive GET traffic in the steady state. Mirrors
+        # the assertion in test_read_preference_secondary above.
+        master_gets = _sum_get_calls(env.getOSSMasterNodesConnectionList())
+        env.assertEqual(
+            master_gets,
+            0,
+            message="secondaryPreferred should not hit masters when replicas "
+                    "are live; got {} master GET(s)".format(master_gets),
+        )
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)
