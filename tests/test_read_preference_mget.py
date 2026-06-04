@@ -221,7 +221,7 @@ def test_read_preference_mget_strict_secondary_spin_guard(env):
     try:
         env.assertTrue(
             ok,
-            message="memtier did not exit cleanly within --test-time=5 for "
+            message="memtier did not exit cleanly within requests=200 budget for "
                     "mixed SET+MGET --read-preference=secondary; possible "
                     "spin or hang in the MGET defer path",
         )

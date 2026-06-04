@@ -1852,10 +1852,11 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
     }
 
     // "Endpoints" array: one entry per distinct shard_connection address+role.
-    // Gated on the same predicate as "Read Routing" above (non-primary read
-    // preference, or standalone --read-server use) so both blocks share a
-    // schema gate and we don't emit per-endpoint stats for a primary-only
-    // cluster workload where the data is uninteresting.
+    // Emitted only when cluster_mode is on AND read_preference != rp_primary
+    // (the standalone --read-server clause was reverted), so both this block
+    // and "Read Routing" above share a single schema gate and we don't emit
+    // per-endpoint stats for a primary-only cluster workload where the data
+    // is uninteresting.
     if (emit_read_routing && m_config->cluster_mode && !m_endpoint_snapshots.empty()) {
         // Sort by (addr, role) for deterministic output. Without this the
         // emission order tracks the thread-local absorb order, which varies

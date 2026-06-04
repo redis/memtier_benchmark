@@ -259,7 +259,8 @@ wired into the connection topology in this release; see the open
 limitations in the PR.
 
 Read-preference also extends the JSON output (`--json-out-file`) with two
-new top-level blocks (emitted only when `--read-preference != primary`):
+new top-level blocks (emitted only when `--cluster-mode` is on AND
+`--read-preference != primary`):
 
 * `Read Routing` - `Ops from Primary`, `Ops from Replica`, and
   `Primary Fraction` for the built-in GET/MGET classes. Arbitrary

@@ -1902,11 +1902,13 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
     // request's most-recent send time (m_sent_time), not its first attempt;
     // retries should be reflected in the latency observed by selection.
     // Skip error responses so a flaky replica isn't punished twice (once by
-    // unavailability, once by inflated EWMA). Restrict to actual user-level
-    // reads (rt_get for the built-in path, rt_arbitrary for the arbitrary
-    // path): mixing setup-ladder responses (AUTH, HELLO, CLUSTER SLOTS,
-    // READONLY) and writes (rt_set) into the EWMA would skew the first
-    // LATENCY_EWMA_MIN_SAMPLES samples on a freshly-warmed replica.
+    // unavailability, once by inflated EWMA). rt_get and rt_arbitrary are
+    // the eligible request types -- excluding setup-ladder responses (AUTH,
+    // HELLO, CLUSTER SLOTS, READONLY) and built-in writes (rt_set). Note
+    // rt_arbitrary covers both reads AND writes from the --command path; we
+    // accept the slight EWMA contamination from arbitrary writes because the
+    // arbitrary path has no per-request read/write classification at this
+    // layer and writes there still land on the routed endpoint.
     if (!response->is_error() && request != NULL && (request->m_type == rt_get || request->m_type == rt_arbitrary)) {
         const long long diff_us = ts_diff(request->m_sent_time, timestamp);
         if (diff_us > 0) m_connections[conn_id]->update_latency_ewma((double) diff_us);
