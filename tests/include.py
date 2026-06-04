@@ -119,6 +119,13 @@ def addTLSArgs(benchmark_specs, env):
 
 
 def get_default_memtier_config(threads=10, clients=5, requests=1000, test_time=None):
+    """Build a default memtier_benchmark config dict.
+
+    Pass requests=None to omit --requests entirely; this is required when the
+    caller wants to bound the run by --test-time only (memtier rejects
+    --requests and --test-time as mutually exclusive). mb.py skips the
+    --requests emission when this value is None.
+    """
     config = {
         "memtier_benchmark": {
             "binary": MEMTIER_BINARY,

@@ -270,11 +270,11 @@ def test_read_preference_mget_pure_pipeline_cap_spin_guard(env):
         "--read-preference=secondary",
         "--test-time=5",
     ]
-    # _run_mget_workload supplies --requests; --test-time overrides it inside
-    # memtier so the time bound applies. Pass requests=0 by using the standard
-    # helper; the --test-time arg above is the actual bound.
+    # memtier rejects --requests + --test-time as mutually exclusive, so we
+    # pass requests=None to suppress the auto-injected --requests and rely on
+    # --test-time=5 above as the sole bound.
     ok, run_config = _run_mget_workload(
-        env, extra_args, threads=1, clients=2, requests=200
+        env, extra_args, threads=1, clients=2, requests=None
     )
 
     failed = env.getNumberOfFailedAssertion()
