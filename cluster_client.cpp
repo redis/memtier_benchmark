@@ -1473,10 +1473,14 @@ bool cluster_client::create_mget_request(struct timeval &timestamp, unsigned int
         return false;
     }
 
-    // Round-robin over the slots owned by this connection.
+    // Round-robin over the slots owned by this connection. Compute the
+    // target slot via the cursor BUT do not advance the cursor yet. Both
+    // defer paths below (no-route, pipeline-cap) must leave the cursor
+    // untouched so the deferred slot gets retried on the next tick — a
+    // pre-bumped cursor silently dropped deferred slots on the floor (the
+    // cursor advanced at the tick rate, not the send rate).
     size_t &sc = m_mget_conn_slot_cursor[conn_id];
     unsigned int target_slot = m_mget_conn_slots[conn_id][sc % m_mget_conn_slots[conn_id].size()];
-    sc++;
 
     // Read-preference routing for MGET. The slot cache is built off the
     // primary's conn_id, so by default conn_id IS the slot's primary. When
@@ -1518,9 +1522,24 @@ bool cluster_client::create_mget_request(struct timeval &timestamp, unsigned int
     // drain and re-check; the next outer create_request tick rebalances.
     if (routed != conn_id && (unsigned int) m_connections[routed]->get_pending_resp() >= m_config->pipeline) {
         m_connections[routed]->schedule_fill();
+        // Bump the strict-no-route counter on pipeline-cap defer too. In
+        // pure-MGET workloads (--ratio 0:N --multi-key-get) with a
+        // saturated destination replica the producer's pipeline never
+        // grows (no writes land here), so fill_pipeline's pipeline-depth
+        // gate never fires and the while-condition stays true. Without
+        // bumping the counter here, hold_pipeline cannot trip the
+        // STRICT_NO_ROUTE_HOLD_THRESHOLD yield gate, and schedule_fill on
+        // the destination is a zero-timer that requires libevent control
+        // — control the tight in-call spin would never yield to. Bumping
+        // the counter mirrors the no-route arm above.
+        if (m_strict_no_route_attempts < UINT_MAX) m_strict_no_route_attempts++;
         m_mget_defer = true;
         return false;
     }
+
+    // Both defer guards passed: commit the cursor advance so the next
+    // fill_pipeline tick picks the next slot in round-robin.
+    sc++;
 
     std::vector<unsigned long long> &slot_keys = m_config->mget_cache->slot_keys[target_slot];
     size_t &kc = m_mget_slot_cursor[target_slot];
