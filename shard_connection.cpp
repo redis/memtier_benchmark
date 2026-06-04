@@ -552,6 +552,11 @@ void shard_connection::disconnect()
     // Reset rate limiting state during disconnection
     m_request_per_cur_interval = 0;
 
+    // Clear the reconnect-in-progress flag. If a teardown races a pending
+    // reconnect timer (the timer was freed above), leaving m_reconnecting
+    // true would make every future attempt_reconnect call no-op silently.
+    m_reconnecting = false;
+
     // by default no need to send any setup request
     m_authentication = setup_done;
     m_db_selection = setup_done;
@@ -1068,6 +1073,14 @@ void shard_connection::process_response(void)
                 if (m_config->reconnect_on_error) {
                     attempt_reconnect("READONLY error");
                 } else {
+                    // Mirror attempt_reconnect's stat bump so the OFF path
+                    // is observable: without this, --reconnect-on-error=off
+                    // READONLY errors would silently idle the replica with
+                    // no signal in the connection-error counter.
+                    struct timeval err_now;
+                    gettimeofday(&err_now, NULL);
+                    client *c = static_cast<client *>(m_conns_manager);
+                    c->get_stats()->update_connection_error(&err_now);
                     disconnect();
                 }
                 // Wake peer connections (the primary may be parked in the
@@ -1402,6 +1415,9 @@ void shard_connection::attempt_reconnect(const char *error_context)
     if (m_config->reconnect_on_error && !m_reconnecting &&
         (m_config->max_reconnect_attempts == 0 || m_reconnect_attempts < m_config->max_reconnect_attempts)) {
         disconnect();
+        // Snapshot the backoff delay before the multiplication so we can
+        // restore it cleanly if event_new fails below.
+        const double prev_backoff_delay = m_current_backoff_delay;
         m_reconnect_attempts++;
         if (m_config->reconnect_backoff_factor > 0.0) {
             m_current_backoff_delay *= m_config->reconnect_backoff_factor;
@@ -1430,6 +1446,7 @@ void shard_connection::attempt_reconnect(const char *error_context)
             // out of the event loop — there is no way to recover this
             // connection without a working libevent timer.
             if (m_reconnect_attempts > 0) m_reconnect_attempts--;
+            m_current_backoff_delay = prev_backoff_delay;
             event_base_loopbreak(m_event_base);
             return;
         }
