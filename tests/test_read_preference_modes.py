@@ -35,7 +35,6 @@ Test matrix
 import tempfile
 
 from include import (
-    MEMTIER_BINARY,
     add_required_env_arguments,
     addTLSArgs,
     debugPrintMemtierOnError,
@@ -138,14 +137,6 @@ def _run_read_pref(env, read_preference, threads=_THREADS, clients=_CLIENTS,
     return ok, run_config
 
 
-def _skip_if_no_replicas(env, replica_conns):
-    """Skip the calling test when no replicas are available."""
-    if not replica_conns:
-        env.skip()
-        return True
-    return False
-
-
 # ---------------------------------------------------------------------------
 # Test 1 – primary: reads land only on masters
 # ---------------------------------------------------------------------------
@@ -156,8 +147,11 @@ def test_read_preference_primary(env):
     if not env.isCluster():
         env.skip()
         return
-
     replica_conns = get_cluster_replica_connections(env)
+    if not replica_conns:
+        env.skip()
+        return
+
     _pre_populate(env, key_count=100)
     _reset_all_commandstats(env, replica_conns)
 
@@ -178,16 +172,15 @@ def test_read_preference_primary(env):
                     "got 0",
         )
 
-        if replica_conns:
-            replica_gets = _sum_get_calls(replica_conns)
-            env.assertEqual(
-                replica_gets,
-                0,
-                message="expected 0 GETs on replicas with --read-preference=primary, "
-                        "got {} across {} replicas".format(
-                            replica_gets, len(replica_conns)
-                        ),
-            )
+        replica_gets = _sum_get_calls(replica_conns)
+        env.assertEqual(
+            replica_gets,
+            0,
+            message="expected 0 GETs on replicas with --read-preference=primary, "
+                    "got {} across {} replicas".format(
+                        replica_gets, len(replica_conns)
+                    ),
+        )
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)
@@ -203,9 +196,9 @@ def test_read_preference_secondary(env):
     if not env.isCluster():
         env.skip()
         return
-
     replica_conns = get_cluster_replica_connections(env)
-    if _skip_if_no_replicas(env, replica_conns):
+    if not replica_conns:
+        env.skip()
         return
 
     _pre_populate(env, key_count=100)
@@ -250,9 +243,9 @@ def test_read_preference_secondary_preferred(env):
     if not env.isCluster():
         env.skip()
         return
-
     replica_conns = get_cluster_replica_connections(env)
-    if _skip_if_no_replicas(env, replica_conns):
+    if not replica_conns:
+        env.skip()
         return
 
     _pre_populate(env, key_count=100)
@@ -303,8 +296,11 @@ def test_read_preference_nearest(env):
     if not env.isCluster():
         env.skip()
         return
-
     replica_conns = get_cluster_replica_connections(env)
+    if not replica_conns:
+        env.skip()
+        return
+
     all_conns = list(env.getOSSMasterNodesConnectionList()) + replica_conns
 
     _pre_populate(env, key_count=100)
