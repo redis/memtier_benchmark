@@ -1041,7 +1041,7 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         }
     }
 
-    /* Mixed-workload no-route spin guard.
+    /* Mixed-workload no-route spin guard (self-clearing yield).
      *
      * The read-only bootstrap window above covers ratio.a == 0 (GET-only).
      * For mixed workloads (ratio.a > 0 && ratio.b > 0) writes succeed on the
@@ -1053,19 +1053,39 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
      *
      * get_key_for_conn bumps m_strict_no_route_attempts on each read routing
      * failure and resets it on a successful read. Once the counter reaches
-     * STRICT_NO_ROUTE_HOLD_THRESHOLD we yield here unconditionally -- even
-     * if `any_route` is true. The destination may be saturated but live; we
-     * still need to release the event loop so the queued schedule_fill can
-     * fire and the destination can drain. Under pure-MGET + saturated-replica
-     * the producer's own pipeline never grows (no SETs), so fill_pipeline
-     * would otherwise keep spinning here without ever returning control to
-     * libevent. The counter is reset by successful read routes (see
-     * get_key_for_conn's reset at line 1148 and create_mget_request's mirror)
-     * when traffic resumes. The gate triggers for any non-primary read
-     * preference: rp_secondary + non-rpf_primary fallback (replica-only),
-     * rp_secondary_preferred and rp_nearest (a UINT_MAX result implies even
-     * the primary is offline). */
+     * STRICT_NO_ROUTE_HOLD_THRESHOLD we yield here -- even if `any_route` is
+     * true. The destination may be saturated but live; we still need to
+     * release the event loop so the queued schedule_fill can fire and the
+     * destination can drain. Under pure-MGET + saturated-replica the
+     * producer's own pipeline never grows (no SETs), so fill_pipeline would
+     * otherwise keep spinning here without ever returning control to
+     * libevent.
+     *
+     * SELF-CLEARING YIELD: the counter is shared per-cluster_client (i.e.,
+     * across producer and destination connections within the same worker
+     * thread). An unconditional yield would deadlock: the producer trips the
+     * threshold and parks (its fill_pipeline breaks, bufferevent_disable),
+     * then the destination's queued schedule_fill fires, the destination's
+     * fill_pipeline runs, finds counter still >= threshold, yields too, and
+     * parks. The counter could then only reset via a successful MGET send
+     * (see create_mget_request's reset around line 1582), but reaching that
+     * path requires bypassing hold_pipeline -- chicken and egg.
+     *
+     * Resetting the counter to zero *at the moment we yield* converts the
+     * deadlock back to a bounded spin: the next fill_pipeline call sees
+     * counter == 0, falls through to create_mget_request, and either sends
+     * successfully (counter stays 0) or re-defers (counter slowly rebuilds
+     * to STRICT_NO_ROUTE_HOLD_THRESHOLD before the next yield). The worst
+     * case is STRICT_NO_ROUTE_HOLD_THRESHOLD defers per yielded iteration --
+     * acceptable, and identical to round-5 behaviour. A "zero-spin" fix
+     * would need producer-side wait-on-destination tracking, which is too
+     * invasive for this round.
+     *
+     * The gate triggers for any non-primary read preference: rp_secondary +
+     * non-rpf_primary fallback (replica-only), rp_secondary_preferred and
+     * rp_nearest (a UINT_MAX result implies even the primary is offline). */
     if (m_strict_no_route_attempts >= STRICT_NO_ROUTE_HOLD_THRESHOLD && m_config->read_preference != rp_primary) {
+        m_strict_no_route_attempts = 0;
         return true;
     }
 
