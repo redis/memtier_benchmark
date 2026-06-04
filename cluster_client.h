@@ -106,6 +106,12 @@ protected:
     // workloads where writes succeed (primary is live) but every GET routing
     // attempt fails because no replica is available yet.
     unsigned int m_strict_no_route_attempts;
+    // Monotonic timestamp (CLOCK_MONOTONIC seconds) of the last "all replicas
+    // unreachable under read-only workload" warning emitted from
+    // hold_pipeline. Rate-limited to once per 60s so a stalled benchmark
+    // produces an operator-visible signal without log spam. 0 means never
+    // emitted.
+    long long m_last_no_replica_warning_ts;
     // Per-slot key index cache for cluster MGET. The slot→key table
     // (slot_keys) is shared across threads via m_config->mget_cache and is
     // read-only after the first thread builds it.  Only the per-slot

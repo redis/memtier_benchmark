@@ -133,7 +133,8 @@ cluster_client::cluster_client(client_group *group) :
         m_txn_staged_key_index(0),
         m_txn_has_staged_key(false),
         m_txn_pin_lost_warned(false),
-        m_strict_no_route_attempts(0)
+        m_strict_no_route_attempts(0),
+        m_last_no_replica_warning_ts(0)
 {
     // Initialize slot map to the UINT_MAX sentinel; m_shard_groups starts empty
     // and is populated by handle_cluster_slots(). Every reader bails on
@@ -1003,7 +1004,41 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
                 }
             }
         }
-        if (!any_route) return true;
+        if (!any_route) {
+            // Coarse rate-limited operator signal: when ratio.a==0 + no live
+            // routing target + non-rp_primary, the benchmark stalls
+            // indefinitely (--reconnect-on-error=off can't revive the lost
+            // replicas). Emit a single warning at most every 60s so the
+            // stall is visible without log spam. Use CLOCK_MONOTONIC so the
+            // window is immune to wall-clock jumps.
+            struct timespec mono;
+            if (clock_gettime(CLOCK_MONOTONIC, &mono) == 0) {
+                const long long now_s = (long long) mono.tv_sec;
+                if (m_last_no_replica_warning_ts == 0 || now_s - m_last_no_replica_warning_ts >= 60) {
+                    const char *rp_str = "primary";
+                    switch (m_config->read_preference) {
+                    case rp_secondary:
+                        rp_str = "secondary";
+                        break;
+                    case rp_secondary_preferred:
+                        rp_str = "secondary-preferred";
+                        break;
+                    case rp_nearest:
+                        rp_str = "nearest";
+                        break;
+                    default:
+                        rp_str = "primary";
+                        break;
+                    }
+                    benchmark_error_log(
+                        "warning: all replicas unreachable under read-only workload (--read-preference=%s); "
+                        "benchmark stalled -- check cluster health or set --reconnect-on-error.\n",
+                        rp_str);
+                    m_last_no_replica_warning_ts = now_s;
+                }
+            }
+            return true;
+        }
     }
 
     /* Mixed-workload no-route spin guard.
