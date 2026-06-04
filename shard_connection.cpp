@@ -1047,13 +1047,21 @@ void shard_connection::process_response(void)
                     snprintf(buf, sizeof(buf), "READONLY failed: %s", r->get_status() ? r->get_status() : "");
                     report_connection_stage_failure(buf);
                 }
-                // Drop the connection so the reconnect ladder re-arms the
-                // setup state machine from scratch. report_connection_stage_*
-                // only updates supervisor counters; without disconnect()
-                // m_readonly_state stays pinned at setup_sent forever, so
-                // is_ready_for_reads() never returns true and the bootstrap
-                // hold gate in cluster_client::hold_pipeline never releases.
-                disconnect();
+                // Schedule a backoff-armed reconnect so the setup state
+                // machine re-arms from scratch. attempt_reconnect() itself
+                // calls disconnect() to tear down the bufferevent + state and
+                // then schedules connect() on the standard
+                // --reconnect-on-error / --max-reconnect-attempts /
+                // MEMTIER_BACKOFF_CAP_SEC ladder. A bare disconnect() (as
+                // used previously) only updates supervisor counters: the
+                // connection stays pinned in conn_disconnected with no timer
+                // armed, m_readonly_state remains setup_sent forever,
+                // is_ready_for_reads() never returns true, and the bootstrap
+                // hold gate in cluster_client::hold_pipeline never releases
+                // until some unrelated MOVED triggers a CLUSTER SLOTS
+                // refresh. Under -NOREPLICATION-style errors the replica
+                // would effectively stay offline for the rest of the run.
+                attempt_reconnect("READONLY error");
                 // Wake peer connections (the primary may be parked in the
                 // "no live replica yet" gate); mirror the success arm so a
                 // stalled READONLY does not deadlock the bootstrap.
