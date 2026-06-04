@@ -1328,9 +1328,25 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
         return true;
     }
 
-    /* keyless command can be used by any connection */
+    /* keyless command: no slot to hash, but if the command is classified as a
+     * read and read_preference != primary, steer it toward a replica so that
+     * e.g. "DBSIZE --command-is-read" or "PING --command-is-read" honours the
+     * same preference as keyed reads.  We use slot 0 as an arbitrary anchor —
+     * the slot itself is irrelevant for a keyless command; we only need it to
+     * resolve a shard_group and let select_target_conn apply the policy.
+     * If the topology is not ready yet (UINT_MAX) fall back to conn_id. */
     if (cmd.keys_count == 0) {
-        client::create_arbitrary_request(command_index, timestamp, conn_id);
+        unsigned int send_conn_id = conn_id;
+        if (is_read_command_index(command_index) && m_config->read_preference != rp_primary) {
+            unsigned int routed = select_target_conn(0 /* any slot */, true);
+            if (routed != UINT_MAX && routed < m_connections.size()) {
+                send_conn_id = routed;
+            }
+        }
+        client::create_arbitrary_request(command_index, timestamp, send_conn_id);
+        if (is_read_command_index(command_index)) {
+            record_read_routing(command_index, m_connections[send_conn_id]->is_replica());
+        }
         return true;
     }
 
