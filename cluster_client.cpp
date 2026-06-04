@@ -381,15 +381,13 @@ unsigned int cluster_client::slot_primary_conn_id(unsigned int slot) const
 }
 
 // True if `sc` is in a usable steady state for sending a fresh user-level
-// request: TCP connected, conn-setup ladder finished. The READONLY ladder is
-// part of m_cluster_slots == setup_done for replicas (cluster_client only
-// flips state to setup_done after the entire pre-flight finishes).
+// request: TCP connected, cluster-slots ladder finished, and (for replicas)
+// the READONLY ladder also finished. Delegates to shard_connection::
+// is_ready_for_reads() which encodes the full per-role readiness predicate.
 static inline bool conn_is_live_for_routing(shard_connection *sc)
 {
     if (sc == NULL) return false;
-    if (sc->get_connection_state() != conn_connected) return false;
-    if (sc->get_cluster_slots_state() != setup_done) return false;
-    return true;
+    return sc->is_ready_for_reads();
 }
 
 unsigned int cluster_client::select_target_conn(unsigned int slot, bool is_read)
@@ -938,13 +936,15 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
     if (m_config->ratio.a == 0 && m_config->read_preference == rp_secondary &&
         m_config->read_preference_fallback != rpf_primary) {
         // Read-only workload that *must* route to replicas. Check if any
-        // shard_group has a live replica. We only need ONE to make progress.
+        // shard_group has a live, READONLY-ready replica. We only need ONE to
+        // make progress. Use is_ready_for_reads() so a replica that has
+        // connected but not yet received its READONLY ack is not counted as
+        // routable (routing there returns -READONLY from the server).
         bool any_live_replica = false;
         for (size_t i = 0; i < m_shard_groups.size(); i++) {
             for (size_t j = 0; j < m_shard_groups[i].replicas.size(); j++) {
                 shard_connection *r = m_shard_groups[i].replicas[j];
-                if (r != NULL && r->get_connection_state() == conn_connected &&
-                    r->get_cluster_slots_state() == setup_done) {
+                if (r != NULL && r->is_ready_for_reads()) {
                     any_live_replica = true;
                     break;
                 }
@@ -978,8 +978,7 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         for (size_t i = 0; i < m_shard_groups.size(); i++) {
             for (size_t j = 0; j < m_shard_groups[i].replicas.size(); j++) {
                 shard_connection *r = m_shard_groups[i].replicas[j];
-                if (r != NULL && r->get_connection_state() == conn_connected &&
-                    r->get_cluster_slots_state() == setup_done) {
+                if (r != NULL && r->is_ready_for_reads()) {
                     any_live_replica = true;
                     break;
                 }

@@ -185,6 +185,27 @@ public:
     void set_role(enum shard_role role) { m_role = role; }
     bool is_replica() const { return m_role == role_replica; }
 
+    // READONLY ladder state accessor. setup_done means the server has
+    // acknowledged the READONLY command for this connection. Primary
+    // connections skip the ladder (m_readonly_state starts and stays
+    // setup_done) so this always returns setup_done for them.
+    enum setup_state get_readonly_state() const { return m_readonly_state; }
+
+    // True iff this connection is ready to serve user-level reads:
+    // TCP connected, cluster-slots ladder done, and (for replicas) the
+    // READONLY ladder also done. Primaries satisfy the last condition
+    // trivially because m_readonly_state is initialised to setup_done.
+    bool is_ready_for_reads() const
+    {
+        if (m_connection_state != conn_connected) return false;
+        if (m_cluster_slots != setup_done) return false;
+        // Replicas must have completed the READONLY handshake before the
+        // server will serve reads; sending a read before READONLY gets
+        // a -READONLY error from the server.
+        if (m_role == role_replica && m_readonly_state != setup_done) return false;
+        return true;
+    }
+
     // ----------------------------------------------------------------------
     // Read-preference observability hooks
     // ----------------------------------------------------------------------
