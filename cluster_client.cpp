@@ -416,8 +416,12 @@ unsigned int cluster_client::select_target_conn(unsigned int slot, bool is_read)
 
     // rp_nearest: scan (primary + warm replicas) and pick the lowest EWMA.
     // Cold (samples < threshold) entries are treated as +inf so the tiebreak
-    // is among warm endpoints. If nothing is warm yet, fall back to the
-    // primary so reads still flow during the warm-up window.
+    // is among warm endpoints. While any live replica is still cold, route to
+    // it round-robin so every replica accumulates its first
+    // LATENCY_EWMA_MIN_SAMPLES; once all live replicas are warm, the EWMA
+    // pick below takes over. (Previously we fell back to the primary in the
+    // cold window — the primary warmed first and replicas never received a
+    // sample, so `nearest` was permanently equivalent to `primary`.)
     if (mode == rp_nearest) {
         shard_connection *best = NULL;
         double best_ewma = 0.0;
@@ -426,19 +430,38 @@ unsigned int cluster_client::select_target_conn(unsigned int slot, bool is_read)
             best = group.primary;
             best_ewma = group.primary->get_latency_ewma_us();
         }
+        bool any_cold_live_replica = false;
         for (size_t i = 0; i < group.replicas.size(); i++) {
             shard_connection *r = group.replicas[i];
             if (!conn_is_live_for_routing(r)) continue;
-            if (!r->latency_ewma_warm()) continue;
+            if (!r->latency_ewma_warm()) {
+                any_cold_live_replica = true;
+                continue;
+            }
             const double e = r->get_latency_ewma_us();
             if (best == NULL || e < best_ewma) {
                 best = r;
                 best_ewma = e;
             }
         }
+        // Seed cold live replicas first: round-robin over the replica list
+        // looking for any live-but-not-yet-warm replica. Once everyone is
+        // warm, this loop finds nothing and we fall through to either the
+        // warm pick (`best`) or the primary fallback.
+        const size_t nreplicas = group.replicas.size();
+        if (any_cold_live_replica && nreplicas > 0) {
+            for (size_t step = 0; step < nreplicas; step++) {
+                unsigned int idx = (group.replica_rr_cursor + step) % nreplicas;
+                shard_connection *r = group.replicas[idx];
+                if (conn_is_live_for_routing(r) && !r->latency_ewma_warm()) {
+                    group.replica_rr_cursor = (idx + 1) % nreplicas;
+                    return r->get_id();
+                }
+            }
+        }
         if (best != NULL) return best->get_id();
-        // No warm endpoint yet — keep traffic on the primary to seed samples
-        // on the most important node first.
+        // No warm endpoint and no cold live replica — keep traffic on the
+        // primary so reads still flow during the warm-up window.
         return conn_is_live_for_routing(group.primary) ? group.primary->get_id() : UINT_MAX;
     }
 
@@ -935,77 +958,90 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         return true;
     }
 
-    /* Read-preference bootstrap window: if reads STRICTLY require replicas
-     * under the current --read-preference but no replica is live-for-routing
-     * yet, we would otherwise spin in fill_pipeline calling get_key_for_conn
-     * -> select_target_conn -> UINT_MAX -> not_available -> retry forever,
-     * with the event loop never getting a chance to fire BEV_EVENT_CONNECTED
-     * for the in-progress replica connections. Hold here until at least one
-     * replica is live; the bootstrap CLUSTER SLOTS response, plus the next
-     * replica's connect callback, will schedule_fill us out of the hold.
+    /* Read-preference bootstrap window: if reads under the current
+     * --read-preference would otherwise have NO routable target, we would
+     * spin in fill_pipeline calling get_key_for_conn -> select_target_conn
+     * -> UINT_MAX -> not_available -> retry forever, with the event loop
+     * never getting a chance to fire BEV_EVENT_CONNECTED for the in-progress
+     * connections. Hold here until at least one read target is live; the
+     * bootstrap CLUSTER SLOTS response, plus the next connect callback,
+     * will schedule_fill us out of the hold.
      *
-     * Only the strict mode (rp_secondary with fallback != rpf_primary)
-     * actually needs the hold -- the non-strict modes
-     * (rp_secondary_preferred, rp_nearest, and rp_secondary + rpf_primary)
-     * are explicitly defined to fall back to the primary when no replica is
-     * available, and select_target_conn already returns the primary's
-     * conn_id in those cases. Holding here for non-strict modes would stall
-     * reads that should drain to the primary. */
-    if (m_config->ratio.a == 0 && m_config->read_preference == rp_secondary &&
-        m_config->read_preference_fallback != rpf_primary) {
-        // Read-only workload that *must* route to replicas. Check if any
-        // shard_group has a live, READONLY-ready replica. We only need ONE to
-        // make progress. Use is_ready_for_reads() so a replica that has
-        // connected but not yet received its READONLY ack is not counted as
-        // routable (routing there returns -READONLY from the server).
-        bool any_live_replica = false;
-        for (size_t i = 0; i < m_shard_groups.size(); i++) {
-            for (size_t j = 0; j < m_shard_groups[i].replicas.size(); j++) {
-                shard_connection *r = m_shard_groups[i].replicas[j];
-                if (r != NULL && r->is_ready_for_reads()) {
-                    any_live_replica = true;
+     * Strict rp_secondary (with fallback != rpf_primary) only routes to
+     * replicas, so the gate triggers as soon as no replica is live. For
+     * rp_secondary_preferred and rp_nearest, select_target_conn falls back
+     * to the primary, so a no-route situation only arises when *every*
+     * connection (primary + replicas) is offline -- a transient state we
+     * still want to yield on rather than burn CPU. */
+    if (m_config->ratio.a == 0 && m_config->read_preference != rp_primary) {
+        const bool strict_secondary =
+            m_config->read_preference == rp_secondary && m_config->read_preference_fallback != rpf_primary;
+        // For strict-secondary we need a live REPLICA; for the non-strict
+        // modes (which can fall back to the primary) we need *any* live
+        // routing target.
+        bool any_route = false;
+        for (size_t i = 0; i < m_shard_groups.size() && !any_route; i++) {
+            if (!strict_secondary) {
+                shard_connection *p = m_shard_groups[i].primary;
+                if (p != NULL && p->is_ready_for_reads()) {
+                    any_route = true;
                     break;
                 }
             }
-            if (any_live_replica) break;
+            for (size_t j = 0; j < m_shard_groups[i].replicas.size(); j++) {
+                shard_connection *r = m_shard_groups[i].replicas[j];
+                if (r != NULL && r->is_ready_for_reads()) {
+                    any_route = true;
+                    break;
+                }
+            }
         }
-        if (!any_live_replica) return true;
+        if (!any_route) return true;
     }
 
-    /* Mixed-workload strict-secondary spin guard.
+    /* Mixed-workload no-route spin guard.
      *
      * The read-only bootstrap window above covers ratio.a == 0 (GET-only).
      * For mixed workloads (ratio.a > 0 && ratio.b > 0) writes succeed on the
      * primary, so fill_pipeline's pipeline-depth gate never fires -- but every
-     * GET routing attempt returns UINT_MAX (no live replica), causing
+     * GET routing attempt returns UINT_MAX (no routable target), causing
      * create_request to return without advancing m_get_ratio_count, so the
      * next fill_pipeline iteration tries the same GET again: a CPU-burning
-     * spin until a replica connects.
+     * spin until a routing target connects.
      *
      * get_key_for_conn bumps m_strict_no_route_attempts on each read routing
-     * failure and resets it on any successful routing. Once the counter
-     * reaches STRICT_NO_ROUTE_HOLD_THRESHOLD we yield here, re-checking
-     * whether a replica has come up in the meantime. If one is live now,
-     * we clear the counter and fall through (the next create_request call
-     * will route successfully and permanently reset it). If still none, we
-     * hold and wait for a schedule_fill wakeup from the replica's connect
-     * callback (shard_connection handles READONLY completion). */
-    if (m_strict_no_route_attempts >= STRICT_NO_ROUTE_HOLD_THRESHOLD && m_config->read_preference == rp_secondary &&
-        m_config->read_preference_fallback != rpf_primary) {
-        bool any_live_replica = false;
-        for (size_t i = 0; i < m_shard_groups.size(); i++) {
-            for (size_t j = 0; j < m_shard_groups[i].replicas.size(); j++) {
-                shard_connection *r = m_shard_groups[i].replicas[j];
-                if (r != NULL && r->is_ready_for_reads()) {
-                    any_live_replica = true;
+     * failure and resets it on a successful read. Once the counter reaches
+     * STRICT_NO_ROUTE_HOLD_THRESHOLD we yield here, re-checking whether a
+     * routable target has come up in the meantime. If yes, clear the counter
+     * and fall through (the next create_request call will route
+     * successfully and permanently reset it). If still none, we hold and
+     * wait for a schedule_fill wakeup from a connect callback. The gate
+     * triggers for any non-primary read preference: rp_secondary +
+     * non-rpf_primary fallback (replica-only), rp_secondary_preferred and
+     * rp_nearest (a UINT_MAX result implies even the primary is offline). */
+    if (m_strict_no_route_attempts >= STRICT_NO_ROUTE_HOLD_THRESHOLD && m_config->read_preference != rp_primary) {
+        const bool strict_secondary =
+            m_config->read_preference == rp_secondary && m_config->read_preference_fallback != rpf_primary;
+        bool any_route = false;
+        for (size_t i = 0; i < m_shard_groups.size() && !any_route; i++) {
+            if (!strict_secondary) {
+                shard_connection *p = m_shard_groups[i].primary;
+                if (p != NULL && p->is_ready_for_reads()) {
+                    any_route = true;
                     break;
                 }
             }
-            if (any_live_replica) break;
+            for (size_t j = 0; j < m_shard_groups[i].replicas.size(); j++) {
+                shard_connection *r = m_shard_groups[i].replicas[j];
+                if (r != NULL && r->is_ready_for_reads()) {
+                    any_route = true;
+                    break;
+                }
+            }
         }
-        if (!any_live_replica) return true;
-        // A replica is now live: clear the back-off counter so we don't
-        // re-enter this gate on the very next fill_pipeline iteration.
+        if (!any_route) return true;
+        // A routing target is now live: clear the back-off counter so we
+        // don't re-enter this gate on the very next fill_pipeline iteration.
         m_strict_no_route_attempts = 0;
     }
 

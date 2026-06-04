@@ -1047,6 +1047,24 @@ void shard_connection::process_response(void)
                     snprintf(buf, sizeof(buf), "READONLY failed: %s", r->get_status() ? r->get_status() : "");
                     report_connection_stage_failure(buf);
                 }
+                // Drop the connection so the reconnect ladder re-arms the
+                // setup state machine from scratch. report_connection_stage_*
+                // only updates supervisor counters; without disconnect()
+                // m_readonly_state stays pinned at setup_sent forever, so
+                // is_ready_for_reads() never returns true and the bootstrap
+                // hold gate in cluster_client::hold_pipeline never releases.
+                disconnect();
+                // Wake peer connections (the primary may be parked in the
+                // "no live replica yet" gate); mirror the success arm so a
+                // stalled READONLY does not deadlock the bootstrap.
+                if (m_role == role_replica) {
+                    for (size_t i = 0; i < m_conns_manager->get_connections().size(); i++) {
+                        shard_connection *peer = m_conns_manager->get_connections()[i];
+                        if (peer != this && peer != NULL && peer->get_connection_state() == conn_connected) {
+                            peer->schedule_fill();
+                        }
+                    }
+                }
                 error = true;
             } else {
                 m_readonly_state = setup_done;
