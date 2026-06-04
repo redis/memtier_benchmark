@@ -321,6 +321,112 @@ def test_read_preference_nearest(env):
             message="expected at least one GET to land somewhere in the cluster "
                     "with --read-preference=nearest, got 0",
         )
+
+        # Distribution sanity: nearest must cold-seed replicas round-robin
+        # until each accumulates LATENCY_EWMA_MIN_SAMPLES. If the cold-seed
+        # path regressed (and selection fell back to primary-only routing)
+        # the test would silently pass with total_gets > 0 but 0 on
+        # replicas. Require at least one GET on a replica.
+        replica_gets = _sum_get_calls(replica_conns)
+        env.assertGreater(
+            replica_gets,
+            0,
+            message="expected at least one GET on a replica with "
+                    "--read-preference=nearest (cold-seed round-robin); got 0 "
+                    "across {} replicas. nearest may have regressed back to "
+                    "primary-pinned selection.".format(len(replica_conns)),
+        )
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+# ---------------------------------------------------------------------------
+# Test 5 - keyless arbitrary read (--command + --command-is-read) under
+# rp_secondary must land on a replica. Smoke-level: prove the keyless
+# arbitrary code path is wired through read-preference at all.
+# ---------------------------------------------------------------------------
+
+def _sum_dbsize_calls(conns):
+    """Sum cmdstat_dbsize.calls across a list of Redis connections."""
+    total = 0
+    for conn in conns:
+        try:
+            stats = conn.execute_command("INFO", "COMMANDSTATS")
+        except Exception:
+            continue
+        if isinstance(stats, dict):
+            total += int(stats.get("cmdstat_dbsize", {}).get("calls", 0))
+        else:
+            for line in stats.split("\n"):
+                line = line.strip()
+                if line.startswith("cmdstat_dbsize:"):
+                    for kv in line.split(":", 1)[1].split(","):
+                        kv = kv.strip()
+                        if kv.startswith("calls="):
+                            try:
+                                total += int(kv.split("=", 1)[1])
+                            except ValueError:
+                                pass
+    return total
+
+
+def test_read_preference_keyless_arbitrary_secondary(env):
+    """A keyless arbitrary read (DBSIZE flagged with --command-is-read)
+    under --read-preference=secondary must land on a replica. Asserts
+    DBSIZE counter > 0 on replicas; primary may also see DBSIZE traffic
+    from the connection-setup ladder, so the primary-zero check is not
+    made here."""
+    if not env.isCluster():
+        env.skip()
+        return
+    replica_conns = get_cluster_replica_connections(env)
+    if not replica_conns:
+        env.skip()
+        return
+
+    _reset_all_commandstats(env, replica_conns)
+
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--command=DBSIZE",
+            "--command-is-read",
+            "--command-ratio=1",
+            "--read-preference=secondary",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+
+    config = get_default_memtier_config(threads=1, clients=2, requests=20)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    test_dir = tempfile.mkdtemp()
+    run_config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(run_config.results_dir)
+
+    benchmark = Benchmark.from_json(run_config, benchmark_specs)
+    ok = benchmark.run()
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(
+            ok,
+            message="memtier exited non-zero for DBSIZE --command-is-read "
+                    "--read-preference=secondary",
+        )
+
+        replica_dbsizes = _sum_dbsize_calls(replica_conns)
+        env.assertGreater(
+            replica_dbsizes,
+            0,
+            message="expected DBSIZE calls on replicas under "
+                    "--read-preference=secondary; got 0 across {} replicas. "
+                    "Keyless arbitrary read routing may have regressed.".format(
+                        len(replica_conns)
+                    ),
+        )
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)

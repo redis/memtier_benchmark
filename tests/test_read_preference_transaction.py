@@ -102,7 +102,20 @@ def _run_transaction_workload(env, extra_command_args, threads=1, clients=1,
 
 def _assert_transaction_read_pref_rejected(env, read_preference):
     """Shared helper: assert that --transaction + --read-preference=<mode>
-    exits non-zero and mentions both flags in stderr."""
+    exits non-zero and mentions both flags in stderr.
+
+    Although this is a parse-time check (memtier should reject before
+    talking to a server), the helper spawns a real subprocess against the
+    configured port. When the cell is standalone the binary may try to
+    connect during arg validation in some build modes; skip cleanly in
+    that case to avoid bleeding subprocess noise into the standalone CI
+    cell. The cluster-mode rejection path is what we actually care
+    about — parse-time only assertions belong in
+    test_cli_validation_read_preference.py.
+    """
+    if not env.isCluster():
+        env.skip()
+        return
     rc, stderr = _run_subprocess(
         env,
         [

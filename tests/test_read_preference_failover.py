@@ -245,6 +245,21 @@ def test_read_preference_failover(env):
             message="no GETs recorded anywhere after replica shutdown; "
                     "failover to master did not happen",
         )
+
+        # Fallback-to-primary specifically: with --read-preference=
+        # secondaryPreferred, the failed shard must redirect its reads to
+        # the master. Aggregating across all live conns hides the case
+        # where surviving replicas absorb all traffic (different shards)
+        # and the stopped shard's master gets none. Require master_gets
+        # > 0 to prove the fallback actually fired.
+        master_gets = _sum_get_calls(master_conns)
+        env.assertGreater(
+            master_gets,
+            0,
+            message="no GETs recorded on masters after replica shutdown "
+                    "with --read-preference=secondaryPreferred; expected "
+                    "the affected shard to fall back to its master, got 0",
+        )
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config_post, env)

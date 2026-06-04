@@ -173,3 +173,58 @@ def test_read_preference_mget(env):
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)
+
+
+# ---------------------------------------------------------------------------
+# Spin-guard smoke: mixed SET+MGET with strict-secondary must not peg CPU.
+#
+# Round-5 bug: pipeline-cap defer in create_mget_request set m_mget_defer
+# but did not bump m_strict_no_route_attempts. For workloads where the
+# producer's pipeline never grew (pure-MGET) the loop became tight; for
+# mixed SET+MGET the writes saturated the primary fast enough that the
+# replica's --pipeline cap could still trip the defer repeatedly. We test
+# the milder mixed case here: under --ratio=1:1 --multi-key-get=10
+# --read-preference=secondary, memtier should produce a reasonable Ops/sec
+# and exit 0, not hang or spin uncapped.
+# ---------------------------------------------------------------------------
+
+def test_read_preference_mget_strict_secondary_spin_guard(env):
+    """Mixed SET+MGET workload under --read-preference=secondary must
+    complete cleanly within a short test-time. If the defer counter is
+    not bumped on pipeline-cap defer, hold_pipeline cannot trip the
+    yield gate and the run either hangs or pegs CPU."""
+    if not env.isCluster():
+        env.skip()
+        return
+    replica_conns = get_cluster_replica_connections(env)
+    if not replica_conns:
+        env.skip()
+        return
+
+    _pre_populate(env)
+
+    # Use a bounded --requests budget rather than --test-time so a hang
+    # would manifest as the harness timeout; the requests count is small
+    # enough that a healthy run completes in well under a second.
+    extra_args = [
+        "--ratio=1:1",
+        "--multi-key-get={}".format(_MGET_BATCH),
+        "--key-minimum={}".format(_KEY_MIN),
+        "--key-maximum={}".format(_KEY_MAX),
+        "--read-preference=secondary",
+    ]
+    ok, run_config = _run_mget_workload(
+        env, extra_args, threads=1, clients=2, requests=200
+    )
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(
+            ok,
+            message="memtier did not exit cleanly within --test-time=5 for "
+                    "mixed SET+MGET --read-preference=secondary; possible "
+                    "spin or hang in the MGET defer path",
+        )
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
