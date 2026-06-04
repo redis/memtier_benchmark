@@ -221,7 +221,53 @@ Also, the ratio and the key generator is per client (and not connection).
 In this case, setting the ratio to 1:1 does not guarantee 100% hits because
 the keys spread to different connections/nodes.
 
+### Read Preference (cluster mode)
 
+`--read-preference` selects which class of node receives read commands when
+running against a Redis Cluster with replicas.  Four modes are available:
+
+* `primary` (default) - reads land on the slot owner (primary). Legacy
+  behaviour.
+* `secondary` - all reads go to a replica; if no live replica owns the
+  slot the `--read-preference-fallback` policy decides what happens.
+* `secondaryPreferred` - prefer a replica; on absence of a live replica
+  fall back silently to the primary.
+* `nearest` - EWMA-based selection. Cold replicas are seeded round-robin
+  until warm, then reads are routed to the lowest-EWMA endpoint among
+  warm replicas (primary may participate once it has accumulated samples).
+
+When the target node class is unavailable, the fallback is controlled by
+`--read-preference-fallback`:
+
+* `error` (default) - return an error.
+* `primary` - fall back silently to the primary.
+* `queue` - reserved; currently treated as `error`. Request queuing is
+  not yet implemented.
+
+Built-in read commands (GET, MGET) and arbitrary commands marked with
+`--command-is-read` participate in read-preference routing.  Reads on
+arbitrary keyless commands (e.g. `DBSIZE`, `CLUSTER NODES`) are routed
+to the same node class.
+
+`--read-server=HOST:PORT` lets you declare additional replica endpoints
+for standalone (non-cluster) runs. The flag is parsed in all modes, but
+read dispatch via the `--read-preference` policy currently fires only in
+cluster mode.
+
+`--replica-clients=N` and `--replicas-per-shard=K` are parsed but not yet
+wired into the connection topology in this release; see the open
+limitations in the PR.
+
+Read-preference also extends the JSON output (`--json-out-file`) with two
+new top-level blocks (emitted only when `--read-preference != primary`):
+
+* `Read Routing` - `Ops from Primary`, `Ops from Replica`, and
+  `Primary Fraction` for the built-in GET/MGET classes. Arbitrary
+  per-command totals appear under `Arbitrary Read Routing`.
+* `Endpoints` - one entry per distinct shard connection (address + role)
+  with `conn_id`, `role`, `Ops`, `Avg Latency (us)`, and
+  `Latency Samples`. `conn_id` is the shard_connection vector index
+  (NOT a stable cluster shard identity).
 
 ### Using rate-limiting for informed benchmarking
 
