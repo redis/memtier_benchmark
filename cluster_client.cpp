@@ -1681,15 +1681,28 @@ bool cluster_client::retry_after_redirect(unsigned int conn_id, request *req)
         unsigned int hslot = calc_hslot_crc16_with_hash_tag(req->m_key, req->m_key_len);
         const bool is_read = classify_read(req);
         unsigned int mapped = select_target_conn(hslot, is_read);
-        // Defensive: if select_target_conn returned UINT_MAX (strict secondary
-        // with no live replica), fall back to the slot primary so the retry
-        // doesn't get stuck.
+        // select_target_conn returns UINT_MAX when strict rp_secondary finds no
+        // live replica AND fallback != rpf_primary. In that case we must NOT
+        // silently fall back to the primary — that would violate the "replicas
+        // only" contract. Return false so the caller calls
+        // finalize_dropped_redirect, consistent with the original create path
+        // returning not_available and --read-preference-fallback=error/queue
+        // semantics.
+        // Non-strict modes (rp_secondary_preferred, rp_nearest, rp_primary, and
+        // rp_secondary+rpf_primary) already fold the primary into the returned
+        // conn_id inside select_target_conn, so UINT_MAX here can only mean
+        // "all nodes are offline" — the fall-through to slot_primary_conn_id
+        // below is the right recovery for that transient topology gap.
+        if (mapped == UINT_MAX && is_read && m_config->read_preference == rp_secondary &&
+            m_config->read_preference_fallback != rpf_primary) {
+            return false;
+        }
+        // For any other UINT_MAX (offline topology / non-strict mode), try the
+        // slot primary as a best-effort recovery so the retry doesn't get stuck.
         if (mapped == UINT_MAX) mapped = slot_primary_conn_id(hslot);
         // Only route to a different connection if it's actually ready; otherwise
         // fall back to the same connection (CLUSTER SLOTS may still be in flight).
-        if (mapped != UINT_MAX && mapped < m_connections.size() &&
-            m_connections[mapped]->get_connection_state() == conn_connected &&
-            m_connections[mapped]->get_cluster_slots_state() == setup_done) {
+        if (mapped != UINT_MAX && mapped < m_connections.size() && m_connections[mapped]->is_ready_for_reads()) {
             target = mapped;
         }
     }
