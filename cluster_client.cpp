@@ -1541,6 +1541,10 @@ bool cluster_client::create_mget_request(struct timeval &timestamp, unsigned int
     // read-routing decision (Ops from Primary / Ops from Replica) here
     // because the send-side has no other context about the routing class.
     record_builtin_read_routing(rt_get, m_connections[routed]->is_replica());
+    // Successful read route: reset strict-no-route counter so the spin
+    // guard doesn't trip on healthy pure-MGET workloads with intermittent
+    // defers. Mirrors get_key_for_conn's reset at line 1148.
+    m_strict_no_route_attempts = 0;
     return true;
 }
 
