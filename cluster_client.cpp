@@ -1030,15 +1030,38 @@ get_key_response cluster_client::get_key_for_conn(unsigned int command_index, un
     // handle key for other connection
     unsigned int other_conn_id = target_conn_id;
 
-    // in case we generated key for connection that is disconnected, 'slot to shard' map may need to be updated.
-    // The disconnect check here only fires for the PRIMARY slot owner: select_target_conn already filtered
-    // dead replicas. Trigger a CLUSTER SLOTS refresh only when the primary is down, to match the prior
-    // behaviour of this guard.
+    // The target connection picked by select_target_conn was live at selection
+    // time (conn_is_live_for_routing already filters disconnected nodes), but a
+    // TOCTOU window exists between that check and the dispatch here -- the
+    // bufferevent can fire BEV_EVENT_EOF in between. If the target is no longer
+    // connected at dispatch time, route the recovery based on its role:
+    //
+    //   PRIMARY disconnect  ->  topology gap. The slot's authoritative owner
+    //                           is gone; we cannot route writes (or rp_primary
+    //                           reads) anywhere else without a fresh CLUSTER
+    //                           SLOTS reply. Schedule a topology refresh on
+    //                           the producer connection (this conn_id), which
+    //                           was the historical behavior of this guard.
+    //
+    //   REPLICA disconnect  ->  local routing gap, not a topology change. A
+    //                           dead replica must not whack the whole
+    //                           cluster's topology view: under skewed
+    //                           workloads a single transiently-flapping
+    //                           replica would otherwise churn CLUSTER SLOTS
+    //                           on every produce tick. Simply defer; on the
+    //                           next routing attempt select_target_conn's
+    //                           round-robin / nearest / preferred path will
+    //                           skip the dead replica and pick a live one
+    //                           (or fall back to the primary per
+    //                           --read-preference-fallback). The next regular
+    //                           topology poll heals naturally.
+    //
+    // Bugbot finding (cluster_client.cpp:1029): apply the role split so a
+    // replica outage doesn't trigger a cluster-wide topology refresh.
     if (m_connections[other_conn_id]->get_connection_state() == conn_disconnected) {
-        // The select_target_conn rebuild above means we only get here if the primary itself is dead
-        // (target chosen for a write or rp_primary). Triggering a CLUSTER SLOTS refresh is the right
-        // recovery -- a replica going down doesn't normally need one.
-        m_connections[conn_id]->set_cluster_slots();
+        if (!m_connections[other_conn_id]->is_replica()) {
+            m_connections[conn_id]->set_cluster_slots();
+        }
         return not_available;
     }
 
