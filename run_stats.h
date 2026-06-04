@@ -109,14 +109,16 @@ public:
 // are destroyed, then merged into run_stats so it survives to JSON time.
 struct endpoint_snapshot
 {
-    std::string addr;                    // host:port
-    std::string role;                    // "primary" | "replica" | ""
-    int shard_id;                        // index in the owning cluster_client (or -1)
-    unsigned long long routed_ops;       // user-level requests sent on this conn
-    double avg_latency_us;               // EWMA in microseconds (0.0 when no samples)
-    unsigned int latency_samples;        // 0 when never warm
-    unsigned long int connection_errors; // currently not tracked per-conn; left 0
-    endpoint_snapshot() : shard_id(-1), routed_ops(0), avg_latency_us(0.0), latency_samples(0), connection_errors(0) {}
+    std::string addr;              // host:port
+    std::string role;              // "primary" | "replica" | ""
+    int conn_id;                   // shard_connection's vector index (NOT a stable
+                                   // cluster shard identity); -1 when unknown
+    unsigned long long routed_ops; // user-level requests sent on this conn
+    double avg_latency_us;         // EWMA in microseconds (0.0 when no samples)
+    unsigned int latency_samples;  // 0 when never warm
+    // Per-endpoint MOVED/ASK and connection-error counters are NOT emitted
+    // here; they live in the top-level cluster_summary aggregate.
+    endpoint_snapshot() : conn_id(-1), routed_ops(0), avg_latency_us(0.0), latency_samples(0) {}
 };
 
 // Aggregated --read-preference routing counters (Ops from Primary / Ops from

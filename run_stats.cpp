@@ -996,8 +996,7 @@ void run_stats::absorb_endpoint(const endpoint_snapshot &snap)
             // Conservative: keep the max sample count across threads to
             // reflect "warmest" view of the endpoint.
             if (snap.latency_samples > e.latency_samples) e.latency_samples = snap.latency_samples;
-            e.connection_errors += snap.connection_errors;
-            if (e.shard_id < 0 && snap.shard_id >= 0) e.shard_id = snap.shard_id;
+            if (e.conn_id < 0 && snap.conn_id >= 0) e.conn_id = snap.conn_id;
             return;
         }
     }
@@ -1810,12 +1809,17 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
     // -----------------------------------------------------------------
     // Read-preference observability (Step 2f).
     //
-    // "Read Routing" sub-object: only emitted when --read-preference != primary
-    // (the default). Reports ops-from-primary / ops-from-replica per command
-    // class. Emitted in the built-in "Gets" path; arbitrary commands embed
-    // their own per-command totals.
+    // "Read Routing" sub-object: emitted whenever a non-default read
+    // preference is in effect OR the standalone --read-server path has
+    // routed reads to a configured non-primary endpoint. Reports
+    // ops-from-primary / ops-from-replica per command class. Emitted in the
+    // built-in "Gets" path; arbitrary commands embed their own per-command
+    // totals.
     // -----------------------------------------------------------------
-    if (jsonhandler != NULL && m_config && m_config->cluster_mode && m_config->read_preference != rp_primary) {
+    const bool emit_read_routing =
+        jsonhandler != NULL && m_config &&
+        (m_config->read_preference != rp_primary || (!m_config->cluster_mode && !m_config->read_servers.empty()));
+    if (emit_read_routing) {
         const bool any = (m_get_read_routing.ops_from_primary + m_get_read_routing.ops_from_replica) > 0;
         if (any) {
             jsonhandler->open_nesting("Read Routing");
@@ -1848,9 +1852,11 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
     }
 
     // "Endpoints" array: one entry per distinct shard_connection address+role.
-    // Emitted only in cluster mode (standalone has a single endpoint by
-    // definition and nothing interesting to report).
-    if (jsonhandler != NULL && m_config && m_config->cluster_mode && !m_endpoint_snapshots.empty()) {
+    // Gated on the same predicate as "Read Routing" above (non-primary read
+    // preference, or standalone --read-server use) so both blocks share a
+    // schema gate and we don't emit per-endpoint stats for a primary-only
+    // cluster workload where the data is uninteresting.
+    if (emit_read_routing && m_config->cluster_mode && !m_endpoint_snapshots.empty()) {
         // Sort by (addr, role) for deterministic output. Without this the
         // emission order tracks the thread-local absorb order, which varies
         // run-to-run and makes mb.json diffs noisy. stable_sort preserves
@@ -1868,11 +1874,15 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
             const endpoint_snapshot &e = m_endpoint_snapshots[i];
             jsonhandler->open_nesting(e.addr.c_str());
             jsonhandler->write_obj("role", "\"%s\"", e.role.c_str());
-            jsonhandler->write_obj("shard_id", "%d", e.shard_id);
+            // conn_id is the shard_connection's vector index (NOT a stable
+            // cluster shard identity). Renamed from "shard_id" to avoid that
+            // misinterpretation. MOVED/ASK and connection-error counters are
+            // intentionally omitted here; they live in the top-level
+            // cluster_summary aggregate.
+            jsonhandler->write_obj("conn_id", "%d", e.conn_id);
             jsonhandler->write_obj("Ops", "%llu", e.routed_ops);
             jsonhandler->write_obj("Avg Latency (us)", "%.3f", e.avg_latency_us);
             jsonhandler->write_obj("Latency Samples", "%u", e.latency_samples);
-            jsonhandler->write_obj("Connection Errors", "%lu", e.connection_errors);
             jsonhandler->close_nesting();
         }
         jsonhandler->close_nesting();

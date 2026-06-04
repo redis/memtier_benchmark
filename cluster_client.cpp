@@ -1131,9 +1131,15 @@ get_key_response cluster_client::get_key_for_conn(unsigned int command_index, un
         }
         return not_available;
     }
-    // Routing succeeded: clear the back-off counter so hold_pipeline stops
-    // yielding as soon as the first successful read route is observed.
-    m_strict_no_route_attempts = 0;
+    // Routing succeeded. Clear the back-off counter only for reads: under a
+    // mixed SET/GET workload the counter is a "consecutive read no-route"
+    // gauge, and resetting it on a successful write would mask a permanent
+    // GET-routing failure (every SET would reset the 64-attempt yield
+    // before hold_pipeline could ever trip). Writes always route to the
+    // primary and never enter the no-route path themselves.
+    if (is_read) {
+        m_strict_no_route_attempts = 0;
+    }
     if (target_conn_id == conn_id) {
         benchmark_debug_log("%s generated key=[%.*s] for itself\n", m_connections[conn_id]->get_readable_id(),
                             m_obj_gen->get_key_len(), m_obj_gen->get_key());
@@ -1373,14 +1379,27 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
      * If the topology is not ready yet (UINT_MAX) fall back to conn_id. */
     if (cmd.keys_count == 0) {
         unsigned int send_conn_id = conn_id;
-        if (is_read_command_index(command_index) && m_config->read_preference != rp_primary) {
+        const bool is_read = is_read_command_index(command_index);
+        if (is_read && m_config->read_preference != rp_primary) {
             unsigned int routed = select_target_conn(0 /* any slot */, true);
-            if (routed != UINT_MAX && routed < m_connections.size()) {
+            if (routed == UINT_MAX) {
+                /* No eligible target right now (e.g. strict rp_secondary with
+                 * rpf_error/queue and every replica offline). Signal defer to
+                 * the caller -- returning false here keeps create_request
+                 * from advancing m_executed_command_index, so the batch is
+                 * retried on the next fill_pipeline tick rather than silently
+                 * routed to the primary and the read-preference contract
+                 * violated. Mirrors the built-in MGET m_mget_defer path. */
+                if (m_strict_no_route_attempts < UINT_MAX) m_strict_no_route_attempts++;
+                return false;
+            }
+            if (routed < m_connections.size()) {
                 send_conn_id = routed;
             }
         }
         client::create_arbitrary_request(command_index, timestamp, send_conn_id);
-        if (is_read_command_index(command_index)) {
+        if (is_read) {
+            m_strict_no_route_attempts = 0;
             record_read_routing(command_index, m_connections[send_conn_id]->is_replica());
         }
         return true;
@@ -1827,8 +1846,12 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
     // request's most-recent send time (m_sent_time), not its first attempt;
     // retries should be reflected in the latency observed by selection.
     // Skip error responses so a flaky replica isn't punished twice (once by
-    // unavailability, once by inflated EWMA).
-    if (!response->is_error() && request != NULL) {
+    // unavailability, once by inflated EWMA). Restrict to actual user-level
+    // reads (rt_get for the built-in path, rt_arbitrary for the arbitrary
+    // path): mixing setup-ladder responses (AUTH, HELLO, CLUSTER SLOTS,
+    // READONLY) and writes (rt_set) into the EWMA would skew the first
+    // LATENCY_EWMA_MIN_SAMPLES samples on a freshly-warmed replica.
+    if (!response->is_error() && request != NULL && (request->m_type == rt_get || request->m_type == rt_arbitrary)) {
         const long long diff_us = ts_diff(request->m_sent_time, timestamp);
         if (diff_us > 0) m_connections[conn_id]->update_latency_ewma((double) diff_us);
     }

@@ -3304,7 +3304,7 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
                     snap.addr = buf;
                 }
                 snap.role = sc->is_replica() ? "replica" : "primary";
-                snap.shard_id = (int) sc->get_id();
+                snap.conn_id = (int) sc->get_id();
                 snap.routed_ops = sc->get_routed_ops();
                 snap.avg_latency_us = sc->get_latency_ewma_us();
                 snap.latency_samples = sc->get_latency_samples();
