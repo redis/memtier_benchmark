@@ -1485,6 +1485,15 @@ bool cluster_client::create_mget_request(struct timeval &timestamp, unsigned int
         // on the next topology refresh or fill_pipeline tick. Signal defer so
         // the caller does NOT advance m_get_ratio_count; the batch will be
         // retried rather than silently abandoned.
+        //
+        // Bump the strict-no-route counter so hold_pipeline's second gate
+        // (STRICT_NO_ROUTE_HOLD_THRESHOLD) trips and parks the producer
+        // instead of busy-spinning in mixed SET+MGET workloads (where the
+        // writes keep landing on the primary, fill_pipeline's pipeline-depth
+        // gate never fires, and no other read-failure site increments this
+        // counter). Mirrors the keyless-arbitrary defer path at
+        // cluster_client.cpp:1393.
+        if (m_strict_no_route_attempts < UINT_MAX) m_strict_no_route_attempts++;
         m_mget_defer = true;
         return false;
     }
