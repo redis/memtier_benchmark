@@ -402,8 +402,29 @@ unsigned int cluster_client::select_target_conn(unsigned int slot, bool is_read)
     // Writes always go to the primary. This is the only sane choice; replicas
     // either reject (-READONLY) or accept and immediately diverge from the
     // authoritative primary.
+    //
+    // Writes only require the primary's TCP socket to be connected; the full
+    // is_ready_for_reads() predicate (which also requires
+    // m_cluster_slots == setup_done) is unnecessarily strict here. Several
+    // code paths transiently flip the primary's m_cluster_slots back to
+    // setup_none (role-aware disconnect, MOVED redirect, READONLY-no-loop
+    // guard, the build-then-swap window of a CLUSTER SLOTS refresh). During
+    // those windows is_ready_for_reads() returns false even though the slot
+    // map is still valid and dispatching a SET on the producer's own slot
+    // will not loop. Because client::get_key_for_conn has already advanced
+    // m_obj_gen->m_next_key by the time we get here, returning UINT_MAX
+    // *consumes* the key index without issuing the SET -- and when the
+    // iterator wraps at m_key_max the client re-writes already-touched
+    // keys, manifesting as a deterministic per-run key shortfall (round-8:
+    // ~9 skips x 20 clients = ~176 keys; 500000 == 499824).
+    //
+    // The cluster_slots gate is meaningful only for reads, which need a
+    // valid slot map to ROUTE; writes to the producer's primary do not
+    // re-look-up routing. Reads continue to use the full
+    // conn_is_live_for_routing() / is_ready_for_reads() predicate below.
     if (!is_read) {
-        return conn_is_live_for_routing(group.primary) ? group.primary->get_id() : UINT_MAX;
+        if (group.primary->get_connection_state() != conn_connected) return UINT_MAX;
+        return group.primary->get_id();
     }
 
     const enum read_pref_mode mode = m_config->read_preference;
