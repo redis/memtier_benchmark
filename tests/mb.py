@@ -75,7 +75,7 @@ class Benchmark(object):
         with open(os.path.join(self.config.results_dir, name), 'wb') as outfile:
             outfile.write(data)
 
-    def run(self, timeout=60):
+    def run(self, timeout=240):
         """Run memtier_benchmark to completion.
 
         timeout: hard upper bound (seconds) on the child process. A real
@@ -84,6 +84,14 @@ class Benchmark(object):
         timeout fires we kill the child, drain its pipes, write a
         truncated mb.stderr, and return False so the calling test fails
         fast rather than hanging.
+
+        The default of 240s covers ASAN+TLS+reconnect-heavy workloads with
+        margin. Round-7's 60s default killed test_short_reconnect_interval
+        (50,000 ops at --reconnect-interval=1 with full TLS handshake per
+        op; ~380-450 ops/sec under ASAN+TLS -> 110-130s wall time) on three
+        CI cells. Spin-guard tests that need a tight bound to fail fast
+        on a real hang still override with a small explicit timeout (e.g.
+        timeout=20 in test_read_preference_mget).
         """
         logging.debug('  Command: %s', ' '.join(self.args))
         process = subprocess.Popen(
