@@ -1524,7 +1524,16 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
      * same preference as keyed reads.  We use slot 0 as an arbitrary anchor —
      * the slot itself is irrelevant for a keyless command; we only need it to
      * resolve a shard_group and let select_target_conn apply the policy.
-     * If the topology is not ready yet (UINT_MAX) fall back to conn_id. */
+     * If the topology is not ready yet (UINT_MAX) fall back to conn_id.
+     *
+     * Cursor bugbot MED (deferred): the slot-0 anchor pins keyless arbitrary
+     * reads to shard_group[0]'s replicas under rp_secondary, so other shards'
+     * live replicas are ignored. The right fix is to round-robin a synthetic
+     * slot across populated shard groups (or to add a select_replica_for_any_shard
+     * helper that returns the next live replica regardless of slot), but that
+     * touches the shared rp_secondary / rp_nearest / rp_secondary_preferred
+     * fallback ladder and is out of scope for the read-preference rollout.
+     * Tracked in #457. */
     if (cmd.keys_count == 0) {
         unsigned int send_conn_id = conn_id;
         const bool is_read = is_read_command_index(command_index);
@@ -1811,6 +1820,14 @@ bool cluster_client::create_monitor_request_cluster(unsigned int command_index, 
 
     // Determine target shard from the first key argument (index 1 = first arg after command name).
     // Fall back to the current connection if topology isn't ready yet or there is no key.
+    //
+    // Cursor bugbot MED (deferred): --monitor-input cluster replay always
+    // targets slot-primary owners, ignoring --read-preference. MONITOR is
+    // intrinsically per-shard streaming and doesn't map cleanly to
+    // MongoDB-style read preferences (a "secondary" preference on a stream
+    // workload changes the captured traffic class, not just where reads land).
+    // Reworking this requires per-stream replica selection and replica-side
+    // ordering guarantees we don't have today. Tracked in #457.
     unsigned int target_conn = conn_id;
     if (temp_cmd.command_args.size() >= 2) {
         const std::string &key = temp_cmd.command_args[1].data;
