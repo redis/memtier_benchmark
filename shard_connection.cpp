@@ -1028,7 +1028,7 @@ void shard_connection::process_response(void)
                 // false and the prior topology (empty on bootstrap) is left
                 // in place.
                 //
-                // Round-9 (R6): when the build is rejected we MUST NOT advance
+                // When the build is rejected we MUST NOT advance
                 // m_cluster_slots to setup_done. Doing so would let the worker
                 // enter steady-state routing with an empty topology
                 // (m_shard_groups empty on bootstrap), and every slot lookup

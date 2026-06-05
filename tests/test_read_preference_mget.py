@@ -178,14 +178,14 @@ def test_read_preference_mget(env):
 # ---------------------------------------------------------------------------
 # Spin-guard smoke: mixed SET+MGET with strict-secondary must not peg CPU.
 #
-# Round-5 bug: pipeline-cap defer in create_mget_request set m_mget_defer
-# but did not bump m_strict_no_route_attempts. For workloads where the
-# producer's pipeline never grew (pure-MGET) the loop became tight; for
-# mixed SET+MGET the writes saturated the primary fast enough that the
-# replica's --pipeline cap could still trip the defer repeatedly. We test
-# the milder mixed case here: under --ratio=1:1 --multi-key-get=10
-# --read-preference=secondary, memtier should produce a reasonable Ops/sec
-# and exit 0, not hang or spin uncapped.
+# Verifies the pipeline-cap defer in create_mget_request bumps
+# m_strict_no_route_attempts so the spin guard can trip and cap CPU.
+# When the producer's pipeline never grows (pure-MGET) the defer loop
+# becomes tight; for mixed SET+MGET the writes saturate the primary fast
+# enough that the replica's --pipeline cap can still trip the defer
+# repeatedly. We test the milder mixed case here: under --ratio=1:1
+# --multi-key-get=10 --read-preference=secondary, memtier should produce
+# a reasonable Ops/sec and exit 0, not hang or spin uncapped.
 # ---------------------------------------------------------------------------
 
 def test_read_preference_mget_strict_secondary_spin_guard(env):

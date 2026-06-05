@@ -618,19 +618,15 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
 
     // Build the new topology into LOCAL buffers (build-then-swap pattern).
     //
-    // Round-1 of this fix reset m_slot_to_shard_group and cleared
-    // m_shard_groups *eagerly*, before any shards were parsed (commit 994e9ad).
-    // That left the existing state wiped even when every shard in the reply was
-    // subsequently skipped as malformed -- traffic saw no route until the next
-    // successful refresh (Cursor bugbot HIGH).
-    //
-    // Deferred-commit fix: parse into new_slot_map / new_groups locals.  Only
-    // swap into the member variables if at least one valid shard was produced.
-    // On an all-skipped reply the member state is untouched and a warning is
-    // emitted.  The stale-index aliasing invariant (slots absent from the new
-    // reply must map to UINT_MAX, not to a reused group index) is preserved
-    // because new_slot_map is initialised to UINT_MAX and is only written for
-    // slots explicitly listed in a valid shard range -- identical to the old
+    // Parse into new_slot_map / new_groups locals.  Only swap into the member
+    // variables if at least one valid shard was produced.  On an all-skipped
+    // reply the member state is untouched and a warning is emitted, so traffic
+    // continues to route against the prior topology rather than seeing an
+    // empty slot map until the next successful refresh.  The stale-index
+    // aliasing invariant (slots absent from the new reply must map to
+    // UINT_MAX, not to a reused group index) is preserved because
+    // new_slot_map is initialised to UINT_MAX and is only written for slots
+    // explicitly listed in a valid shard range -- identical to an
     // unconditional assign(), just deferred until commit time.
     //
     // Connections (m_connections) are still created/reused in-place during the

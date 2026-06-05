@@ -85,13 +85,14 @@ class Benchmark(object):
         truncated mb.stderr, and return False so the calling test fails
         fast rather than hanging.
 
-        The default of 240s covers ASAN+TLS+reconnect-heavy workloads with
-        margin. Round-7's 60s default killed test_short_reconnect_interval
-        (50,000 ops at --reconnect-interval=1 with full TLS handshake per
-        op; ~380-450 ops/sec under ASAN+TLS -> 110-130s wall time) on three
-        CI cells. Spin-guard tests that need a tight bound to fail fast
-        on a real hang still override with a small explicit timeout (e.g.
-        timeout=20 in test_read_preference_mget).
+        The default of 240s accommodates ASAN+TLS+reconnect-heavy workloads
+        with margin. test_short_reconnect_interval, for example, runs 50,000
+        ops at --reconnect-interval=1 with a full TLS handshake per op and
+        sustains only ~380-450 ops/sec under ASAN+TLS (110-130s wall time),
+        so a tighter default would flake on slow CI cells. Spin-guard tests
+        that need a tight bound to fail fast on a real hang still override
+        with a small explicit timeout (e.g. timeout=20 in
+        test_read_preference_mget).
         """
         logging.debug('  Command: %s', ' '.join(self.args))
         process = subprocess.Popen(
