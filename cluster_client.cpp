@@ -2045,16 +2045,29 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
     // request's most-recent send time (m_sent_time), not its first attempt;
     // retries should be reflected in the latency observed by selection.
     // Skip error responses so a flaky replica isn't punished twice (once by
-    // unavailability, once by inflated EWMA). rt_get and rt_arbitrary are
-    // the eligible request types -- excluding setup-ladder responses (AUTH,
-    // HELLO, CLUSTER SLOTS, READONLY) and built-in writes (rt_set). Note
-    // rt_arbitrary covers both reads AND writes from the --command path; we
-    // accept the slight EWMA contamination from arbitrary writes because the
-    // arbitrary path has no per-request read/write classification at this
-    // layer and writes there still land on the routed endpoint.
-    if (!response->is_error() && request != NULL && (request->m_type == rt_get || request->m_type == rt_arbitrary)) {
-        const long long diff_us = ts_diff(request->m_sent_time, timestamp);
-        if (diff_us > 0) m_connections[conn_id]->update_latency_ewma((double) diff_us);
+    // unavailability, once by inflated EWMA).
+    //
+    // Cursor bugbot MED (cluster_client.cpp:2011): rt_arbitrary covers both
+    // reads AND writes from the --command path (request type is stamped at
+    // creation, before read/write classification). Updating the per-endpoint
+    // EWMA on arbitrary writes biased rp_nearest selection toward endpoints
+    // that handled writes (always the primary), defeating the
+    // nearest-replica intent in mixed arbitrary workloads. Funnel arbitrary
+    // requests through classify_read() so only actual reads seed the EWMA;
+    // rt_get is always a read by definition. Setup-ladder responses (AUTH,
+    // HELLO, CLUSTER SLOTS, READONLY) and built-in writes (rt_set, rt_wait)
+    // are still excluded by the outer m_type gate.
+    if (!response->is_error() && request != NULL) {
+        bool ewma_eligible = false;
+        if (request->m_type == rt_get) {
+            ewma_eligible = true;
+        } else if (request->m_type == rt_arbitrary) {
+            ewma_eligible = classify_read(request);
+        }
+        if (ewma_eligible) {
+            const long long diff_us = ts_diff(request->m_sent_time, timestamp);
+            if (diff_us > 0) m_connections[conn_id]->update_latency_ewma((double) diff_us);
+        }
     }
 
     if (response->is_error()) {
