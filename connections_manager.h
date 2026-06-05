@@ -36,7 +36,16 @@ public:
     virtual void set_start_time(void) = 0;
     virtual void set_end_time(void) = 0;
 
-    virtual void handle_cluster_slots(protocol_response *r) = 0;
+    // Returns true if the reply produced a usable topology that was committed
+    // to the manager's internal slot map; false if the reply was rejected
+    // (malformed, empty, or every shard was skipped during parsing). The
+    // caller -- shard_connection's CLUSTER SLOTS response handler -- uses
+    // the return value to decide whether to transition m_cluster_slots to
+    // setup_done. A rejected reply must NOT advance setup_done, otherwise the
+    // worker enters steady-state routing with an empty topology and every
+    // slot lookup returns UINT_MAX. Non-cluster clients (no override) return
+    // false because they never produce a topology.
+    virtual bool handle_cluster_slots(protocol_response *r) = 0;
     virtual void handle_response(unsigned int conn_id, struct timeval timestamp, request *request,
                                  protocol_response *response) = 0;
 

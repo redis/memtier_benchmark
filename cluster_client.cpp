@@ -580,7 +580,7 @@ void cluster_client::record_builtin_read_routing(request_type rt, bool from_repl
         m_get_routing_counters.ops_from_primary++;
 }
 
-void cluster_client::handle_cluster_slots(protocol_response *r)
+bool cluster_client::handle_cluster_slots(protocol_response *r)
 {
     /*
      * temporary array to test if some of the connections are left with no
@@ -598,7 +598,7 @@ void cluster_client::handle_cluster_slots(protocol_response *r)
     // existing bootstrap connection stays in service.
     if (r->get_mbulk_value() == NULL) {
         benchmark_error_log("warning: CLUSTER SLOTS: server returned non-array; ignoring reply\n");
-        return;
+        return false;
     }
 
     // A *valid* zero-shard reply would silently retire every existing
@@ -606,7 +606,7 @@ void cluster_client::handle_cluster_slots(protocol_response *r)
     // crashing -- the benchmark continues with no shards. Reject it.
     if (r->get_mbulk_value()->mbulks_elements.size() == 0) {
         benchmark_error_log("warning: CLUSTER SLOTS: server returned empty topology; ignoring reply\n");
-        return;
+        return false;
     }
 
     // Track whether any shard in the reply passed validation. If every shard
@@ -862,7 +862,7 @@ void cluster_client::handle_cluster_slots(protocol_response *r)
     if (!any_valid_shard) {
         benchmark_error_log("warning: CLUSTER SLOTS: every shard in the reply was malformed; "
                             "leaving existing connections in service\n");
-        return;
+        return false;
     }
 
     // At least one valid shard was parsed -- commit the new topology.
@@ -912,6 +912,10 @@ void cluster_client::handle_cluster_slots(protocol_response *r)
             if (m_connections[i]->get_connection_state() != conn_disconnected) m_connections[i]->schedule_fill();
         }
     }
+
+    // Topology committed. Tell the caller (shard_connection's CLUSTER SLOTS
+    // response handler) it's safe to advance m_cluster_slots to setup_done.
+    return true;
 }
 
 bool cluster_client::hold_pipeline(unsigned int conn_id)

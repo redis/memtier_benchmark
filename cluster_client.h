@@ -224,7 +224,7 @@ public:
     const read_routing_counters &get_get_routing_counters() const { return m_get_routing_counters; }
 
     // client manager api's
-    virtual void handle_cluster_slots(protocol_response *r);
+    virtual bool handle_cluster_slots(protocol_response *r);
     virtual void create_request(struct timeval timestamp, unsigned int conn_id);
     virtual bool hold_pipeline(unsigned int conn_id);
     virtual void handle_response(unsigned int conn_id, struct timeval timestamp, request *request,

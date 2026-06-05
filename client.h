@@ -132,7 +132,11 @@ public:
 
     void inc_reqs_generated() { m_reqs_generated++; }
 
-    virtual void handle_cluster_slots(protocol_response *r) { assert(false && "handle_cluster_slots not supported"); }
+    virtual bool handle_cluster_slots(protocol_response *r)
+    {
+        assert(false && "handle_cluster_slots not supported");
+        return false;
+    }
 
     virtual void handle_response(unsigned int conn_id, struct timeval timestamp, request *request,
                                  protocol_response *response);

@@ -1022,12 +1022,32 @@ void shard_connection::process_response(void)
                                                 "is the server actually cluster-enabled?)");
                 error = true;
             } else {
-                // parse response
-                m_conns_manager->handle_cluster_slots(r);
+                // Parse the reply. handle_cluster_slots returns true only when
+                // at least one valid shard parsed and the new topology was
+                // committed; on a malformed / all-skipped reply it returns
+                // false and the prior topology (empty on bootstrap) is left
+                // in place.
+                //
+                // Round-9 (R6): when the build is rejected we MUST NOT advance
+                // m_cluster_slots to setup_done. Doing so would let the worker
+                // enter steady-state routing with an empty topology
+                // (m_shard_groups empty on bootstrap), and every slot lookup
+                // would return UINT_MAX. Leave m_cluster_slots at its prior
+                // value (setup_sent during the bootstrap ladder) so subsequent
+                // protocol-error / reconnect / retry paths can re-arm. The
+                // write-side hold_pipeline spin guard added in the previous
+                // commit still prevents fill_pipeline from busy-spinning if
+                // the worker somehow reaches steady-state with an empty
+                // topology via a different code path.
+                bool committed = m_conns_manager->handle_cluster_slots(r);
                 m_protocol->set_keep_value(false);
 
-                m_cluster_slots = setup_done;
-                benchmark_debug_log("cluster slot command successful\n");
+                if (committed) {
+                    m_cluster_slots = setup_done;
+                    benchmark_debug_log("cluster slot command successful\n");
+                } else {
+                    benchmark_debug_log("cluster slot reply rejected; leaving m_cluster_slots unchanged\n");
+                }
             }
             break;
         case rt_hello:
