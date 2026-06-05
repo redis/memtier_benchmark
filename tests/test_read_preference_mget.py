@@ -231,26 +231,26 @@ def test_read_preference_mget_strict_secondary_spin_guard(env):
 
 
 # ---------------------------------------------------------------------------
-# Pure-MGET pipeline-cap spin-guard reproducer (round-6 hold_pipeline yield).
+# Pure-MGET pipeline-cap spin-guard reproducer.
 #
-# Round-5 commit bffeb91 added a strict-no-route counter bump on
-# create_mget_request's pipeline-cap defer; round-6 hardens hold_pipeline to
-# yield unconditionally once the counter trips, even when `any_route=true`
-# (the destination is saturated-but-live). Pure MGET (ratio=0:1) with a small
-# --pipeline cap stresses that path: the producer's own pipeline never grows,
-# so the only way to release the event loop is the hold_pipeline yield.
+# create_mget_request bumps the strict-no-route counter on a pipeline-cap
+# defer; hold_pipeline yields unconditionally once the counter trips, even
+# when `any_route=true` (the destination is saturated-but-live). Pure MGET
+# (ratio=0:1) with a small --pipeline cap stresses that path: the producer's
+# own pipeline never grows, so the only way to release the event loop is the
+# hold_pipeline yield.
 #
 # NOTE: smoke-only. Engineering a deterministic "slow replica" in a unit-test
 # Docker/RLTest environment is fragile, so we just assert the benchmark exits
 # within --test-time=5s. A timeout (hang or uncapped spin) means the spin
-# guard regressed. TODO(round-7): add a CPU-time sample if/when RLTest gains
-# a portable resource-usage hook.
+# guard regressed. TODO: add a CPU-time sample if/when RLTest gains a portable
+# resource-usage hook.
 # ---------------------------------------------------------------------------
 
 def test_read_preference_mget_pure_pipeline_cap_spin_guard(env):
     """Pure-MGET workload (ratio=0:1) with --pipeline=4 and
     --read-preference=secondary must complete within --test-time=5s. A
-    hang means the round-6 hold_pipeline yield-on-saturation regressed."""
+    hang means the hold_pipeline yield-on-saturation regressed."""
     if not env.isCluster():
         env.skip()
         return

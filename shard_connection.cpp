@@ -1092,16 +1092,15 @@ void shard_connection::process_response(void)
                 //   bufferevent + state and reschedules connect() on the
                 //   standard --max-reconnect-attempts / backoff ladder.
                 //
-                // * --reconnect-on-error OFF (default): the round-3 fix
-                //   unconditionally called attempt_reconnect(), which then
-                //   fell through to the supervisor-trip arm and called
-                //   event_base_loopbreak() — a single transient
-                //   -NOREPLICATION killed the entire worker thread.
-                //   Restore the round-2 behavior: bare disconnect() (idle
-                //   the replica connection) and rely on the next
-                //   CLUSTER SLOTS refresh (driven by any peer) to revive
-                //   it. The peer-wake loop below covers both branches so
-                //   the bootstrap "no live replica yet" gate releases.
+                // * --reconnect-on-error OFF (default): bare disconnect()
+                //   (idle the replica connection) and rely on the next
+                //   CLUSTER SLOTS refresh (driven by any peer) to revive it.
+                //   Unconditionally calling attempt_reconnect() here would
+                //   fall through to the supervisor-trip arm and call
+                //   event_base_loopbreak(), so a single transient
+                //   -NOREPLICATION would kill the entire worker thread. The
+                //   peer-wake loop below covers both branches so the
+                //   bootstrap "no live replica yet" gate releases.
                 if (m_config->reconnect_on_error) {
                     attempt_reconnect("READONLY error");
                 } else {

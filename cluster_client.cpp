@@ -415,8 +415,8 @@ unsigned int cluster_client::select_target_conn(unsigned int slot, bool is_read)
     // m_obj_gen->m_next_key by the time we get here, returning UINT_MAX
     // *consumes* the key index without issuing the SET -- and when the
     // iterator wraps at m_key_max the client re-writes already-touched
-    // keys, manifesting as a deterministic per-run key shortfall (round-8:
-    // ~9 skips x 20 clients = ~176 keys; 500000 == 499824).
+    // keys, manifesting as a deterministic per-run key shortfall
+    // (observed pattern: ~9 skips x 20 clients = ~176 keys; 500000 == 499824).
     //
     // The cluster_slots gate is meaningful only for reads, which need a
     // valid slot map to ROUTE; writes to the producer's primary do not
@@ -1105,9 +1105,9 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
      * successfully (counter stays 0) or re-defers (counter slowly rebuilds
      * to STRICT_NO_ROUTE_HOLD_THRESHOLD before the next yield). The worst
      * case is STRICT_NO_ROUTE_HOLD_THRESHOLD defers per yielded iteration --
-     * acceptable, and identical to round-5 behaviour. A "zero-spin" fix
-     * would need producer-side wait-on-destination tracking, which is too
-     * invasive for this round.
+     * acceptable, and matches the pre-yield bounded-spin behaviour. A
+     * "zero-spin" fix would need producer-side wait-on-destination tracking,
+     * which is out of scope here.
      *
      * The gate triggers for any non-primary read preference: rp_secondary +
      * non-rpf_primary fallback (replica-only), rp_secondary_preferred and
@@ -1117,7 +1117,7 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         return true;
     }
 
-    /* Write-side / empty-topology spin guard (round-9: R6 + R7).
+    /* Write-side / empty-topology spin guard.
      *
      * The gate above only triggers when --read-preference != rp_primary, which
      * leaves the all-malformed CLUSTER SLOTS case (cluster_slots_malformed.bin
@@ -1127,15 +1127,15 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
      * pipeline never grows because no write is ever issued). The --test-time
      * timer never fires.
      *
-     * With the round-9 get_key_for_conn change above, the counter is bumped on
-     * every no-route (reads AND writes), so by the time it crosses
-     * STRICT_NO_ROUTE_HOLD_THRESHOLD here we know routing has been wedged for
-     * at least that many attempts. If the topology is empty OR every shard
-     * group's primary is unroutable, yield to the event loop so the timer can
-     * fire and so any in-progress CLUSTER SLOTS refresh can land. Reset the
-     * counter on yield to preserve the self-clearing semantics of the gate
-     * above (bounded spin instead of deadlock; see the long comment block on
-     * the previous gate for the rationale). */
+     * get_key_for_conn bumps the counter on every no-route (reads AND writes),
+     * so by the time it crosses STRICT_NO_ROUTE_HOLD_THRESHOLD here we know
+     * routing has been wedged for at least that many attempts. If the topology
+     * is empty OR every shard group's primary is unroutable, yield to the
+     * event loop so the timer can fire and so any in-progress CLUSTER SLOTS
+     * refresh can land. Reset the counter on yield to preserve the
+     * self-clearing semantics of the gate above (bounded spin instead of
+     * deadlock; see the long comment block on the previous gate for the
+     * rationale). */
     if (m_strict_no_route_attempts >= STRICT_NO_ROUTE_HOLD_THRESHOLD) {
         bool any_live_primary = false;
         for (size_t i = 0; i < m_shard_groups.size() && !any_live_primary; i++) {
@@ -1229,15 +1229,15 @@ get_key_response cluster_client::get_key_for_conn(unsigned int command_index, un
         // succeed (primary is live) but every GET routing returns UINT_MAX
         // because no replica is available yet.
         //
-        // For writes, this is the round-9 spin-guard fix (R6 + R7): on an
-        // all-malformed CLUSTER SLOTS reply, the build-then-swap protection
-        // leaves m_shard_groups empty. Every SET then routes through
-        // select_target_conn -> UINT_MAX -> not_available, and without a
-        // write-side bump fill_pipeline busy-loops on
-        // m_pipeline->size() < pipeline forever (the producer's pipeline never
-        // grows, so the pipeline-depth gate never fires). hold_pipeline's
-        // empty-topology gate (added in this commit) trips on this bump and
-        // yields. Saturating at UINT_MAX avoids overflow.
+        // For writes, this counter feeds hold_pipeline's empty-topology spin
+        // guard: on an all-malformed CLUSTER SLOTS reply, the build-then-swap
+        // protection leaves m_shard_groups empty. Every SET then routes
+        // through select_target_conn -> UINT_MAX -> not_available, and
+        // without a write-side bump fill_pipeline busy-loops on
+        // m_pipeline->size() < pipeline forever (the producer's pipeline
+        // never grows, so the pipeline-depth gate never fires).
+        // hold_pipeline's empty-topology gate trips on this bump and yields.
+        // Saturating at UINT_MAX avoids overflow.
         if (m_strict_no_route_attempts < UINT_MAX) m_strict_no_route_attempts++;
         return not_available;
     }
@@ -1247,12 +1247,12 @@ get_key_response cluster_client::get_key_for_conn(unsigned int command_index, un
     // (the read-only one). Resetting it on a successful write would mask a
     // permanent GET-routing failure (every SET would reset the
     // STRICT_NO_ROUTE_HOLD_THRESHOLD-attempt yield before hold_pipeline could
-    // ever trip the read-only gate). The round-9 write-side gate in
-    // hold_pipeline is keyed on `m_shard_groups.empty() || no live primary`,
-    // a state that cannot coexist with a successful write -- so the counter
-    // staying high across a successful write does not delay the write-side
-    // gate from firing during the all-malformed CLUSTER SLOTS case (the
-    // counter will be reset by the gate's own yield path).
+    // ever trip the read-only gate). The write-side gate in hold_pipeline is
+    // keyed on `m_shard_groups.empty() || no live primary`, a state that
+    // cannot coexist with a successful write -- so the counter staying high
+    // across a successful write does not delay the write-side gate from
+    // firing during the all-malformed CLUSTER SLOTS case (the counter will be
+    // reset by the gate's own yield path).
     if (is_read) {
         m_strict_no_route_attempts = 0;
     }
