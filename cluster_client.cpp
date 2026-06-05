@@ -716,9 +716,16 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
         memcpy(addr, mbulk_addr_el->value, mbulk_addr_el->value_len);
         addr[mbulk_addr_el->value_len] = '\0';
 
-        char *port = (char *) malloc(mbulk_port_el->value_len + 1);
-        memcpy(port, mbulk_port_el->value + 1, mbulk_port_el->value_len);
-        port[mbulk_port_el->value_len] = '\0';
+        // value points at the bulk header byte (':' for integer reply) and
+        // value_len is the strdup'd length INCLUDING that prefix. value+1
+        // skips the prefix; the digits themselves are value_len-1 bytes.
+        // The old form copied value_len bytes and worked only because the
+        // strdup() trailing NUL backed up the +1 overrun. Match the source
+        // length to the intent so static analyzers stop flagging this.
+        const unsigned int port_digits_len = mbulk_port_el->value_len - 1;
+        char *port = (char *) malloc(port_digits_len + 1);
+        memcpy(port, mbulk_port_el->value + 1, port_digits_len);
+        port[port_digits_len] = '\0';
 
         // check if connection already exist
         shard_connection *sc = NULL;
@@ -797,9 +804,13 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
             memcpy(r_addr, r_addr_el->value, r_addr_el->value_len);
             r_addr[r_addr_el->value_len] = '\0';
 
-            char *r_port = (char *) malloc(r_port_el->value_len + 1);
-            memcpy(r_port, r_port_el->value + 1, r_port_el->value_len);
-            r_port[r_port_el->value_len] = '\0';
+            // Same +1 prefix accounting as the primary port copy above:
+            // value_len includes the ':' bulk header, so the digit run is
+            // value_len-1 bytes.
+            const unsigned int r_port_digits_len = r_port_el->value_len - 1;
+            char *r_port = (char *) malloc(r_port_digits_len + 1);
+            memcpy(r_port, r_port_el->value + 1, r_port_digits_len);
+            r_port[r_port_digits_len] = '\0';
 
             shard_connection *rsc = NULL;
             for (unsigned int k = 0; k < m_connections.size(); k++) {
