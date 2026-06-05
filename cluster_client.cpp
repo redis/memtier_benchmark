@@ -1969,7 +1969,26 @@ bool cluster_client::retry_after_redirect(unsigned int conn_id, request *req)
         if (mapped == UINT_MAX) mapped = slot_primary_conn_id(hslot);
         // Only route to a different connection if it's actually ready; otherwise
         // fall back to the same connection (CLUSTER SLOTS may still be in flight).
-        if (mapped != UINT_MAX && mapped < m_connections.size() && m_connections[mapped]->is_ready_for_reads()) {
+        //
+        // The readiness predicate splits by request class to mirror
+        // select_target_conn's write-path tolerance (round-9 744339c) and the
+        // cross-shard write retry path (round-10 a257fc2): writes only need
+        // the target's TCP socket connected because the primary owns the
+        // slot regardless of the cluster_slots ladder state; reads still need
+        // the full is_ready_for_reads() ladder because the slot map must be
+        // valid to honor --read-preference. Without this split, a primary
+        // mid-CLUSTER-SLOTS-refresh (m_cluster_slots transiently != setup_done)
+        // would reject a write-retry and the retry would dribble into the
+        // source connection, defeating MOVED's purpose.
+        bool target_ready = false;
+        if (mapped != UINT_MAX && mapped < m_connections.size()) {
+            if (is_read) {
+                target_ready = m_connections[mapped]->is_ready_for_reads();
+            } else {
+                target_ready = m_connections[mapped]->get_connection_state() == conn_connected;
+            }
+        }
+        if (target_ready) {
             target = mapped;
         }
     }
