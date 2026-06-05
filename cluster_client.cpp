@@ -438,8 +438,19 @@ unsigned int cluster_client::select_target_conn(unsigned int slot, bool is_read)
     // valid slot map to ROUTE; writes to the producer's primary do not
     // re-look-up routing. Reads continue to use the full
     // conn_is_live_for_routing() / is_ready_for_reads() predicate below.
+    //
+    // Round-13: even the conn_connected gate has been removed for writes.
+    // The producer's own slot is conn_connected by definition (fill_pipeline
+    // runs only on connected conns). For cross-shard writes, the target's
+    // own fill_pipeline waits for setup_done before draining its pool, so
+    // queueing here is safe regardless of target TCP state. The pre-PR
+    // master path returned available_for_conn unconditionally for
+    // producer==primary; this restores that invariant for both
+    // producer-owned and cross-shard writes. Gating on transient
+    // conn_in_progress/conn_disconnected (bootstrap or post-reconnect)
+    // silently consumed the key index advanced by client::get_key_for_conn
+    // and was the root cause of the 500000 == 499824 keyspace loss.
     if (!is_read) {
-        if (group.primary->get_connection_state() != conn_connected) return UINT_MAX;
         return group.primary->get_id();
     }
 
@@ -1332,11 +1343,21 @@ get_key_response cluster_client::get_key_for_conn(unsigned int command_index, un
     //
     // Bugbot finding (cluster_client.cpp:1029): apply the role split so a
     // replica outage doesn't trigger a cluster-wide topology refresh.
-    if (m_connections[other_conn_id]->get_connection_state() == conn_disconnected) {
-        if (!m_connections[other_conn_id]->is_replica()) {
-            m_connections[conn_id]->set_cluster_slots();
-        }
-        return not_available;
+    //
+    // Round-13: do NOT return not_available here. m_obj_gen->m_next_key
+    // has already advanced via client::get_key_for_conn above, so an
+    // early return silently drops the key index and the iterator wraps
+    // re-writing already-touched keys (the 500000 == 499824 keyspace
+    // loss observed in CI). Trigger the topology refresh (primary
+    // disconnect only) but fall through to the cross-shard queue push
+    // below. Queueing onto the target's pool is safe: the target's
+    // fill_pipeline waits for setup_done before draining, and on
+    // reconnect the pool drains normally. The read-side setup_done
+    // gate at line ~1352 still protects reads that need a populated
+    // slot map to route.
+    if (m_connections[other_conn_id]->get_connection_state() == conn_disconnected &&
+        !m_connections[other_conn_id]->is_replica()) {
+        m_connections[conn_id]->set_cluster_slots();
     }
 
     // Cross-shard write/read: target_conn_id != producer's conn_id (key hashes
