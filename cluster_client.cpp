@@ -368,6 +368,22 @@ void cluster_client::build_mget_slot_cache()
         if (primary == NULL) continue;
         unsigned int cid = primary->get_id();
         if (cid < num_conns) m_mget_conn_slots[cid].push_back(slot);
+
+        // Replica producers also need a populated slot list so they can produce
+        // MGETs in mixed --ratio + --multi-key-get workloads. Without this,
+        // create_mget_request returns false with m_mget_defer=false on a replica
+        // producer; the caller in client::create_request then forces
+        // m_get_ratio_count to the GET cap and silently skips the MGET batch.
+        // Each replica gets the same slot set as its primary; create_mget_request
+        // calls select_target_conn(target_slot, true) which honors --read-preference
+        // and naturally dispatches to whichever replica (or back to the primary
+        // for rp_primary) the routing policy elects.
+        const shard_group &g = m_shard_groups[gidx];
+        for (size_t r = 0; r < g.replicas.size(); r++) {
+            if (g.replicas[r] == NULL) continue;
+            unsigned int rcid = g.replicas[r]->get_id();
+            if (rcid < num_conns) m_mget_conn_slots[rcid].push_back(slot);
+        }
     }
 }
 
