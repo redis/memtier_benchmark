@@ -1047,6 +1047,18 @@ void shard_connection::process_response(void)
                     benchmark_debug_log("cluster slot command successful\n");
                 } else {
                     benchmark_debug_log("cluster slot reply rejected; leaving m_cluster_slots unchanged\n");
+                    // Surface the rejection to the connection-stage supervisor
+                    // so the failure-streak detector arms regardless of whether
+                    // the peer half-closes after the malformed reply. The fuzz
+                    // fixture relied on BEV_EVENT_EOF to trigger reconnect, but
+                    // a real server that keeps the socket open after every
+                    // shard's mbulk fails validation would otherwise stall the
+                    // worker in fill_pipeline's setup branch until
+                    // --connection-stage-timeout fired via run-elapsed (default
+                    // 30s), or hang indefinitely with
+                    // --connection-stage-timeout=0. Mirrors how AUTH / SELECT /
+                    // HELLO / READONLY rejections are already surfaced above.
+                    report_connection_stage_failure("CLUSTER SLOTS reply rejected (every shard malformed)");
                 }
             }
             break;
