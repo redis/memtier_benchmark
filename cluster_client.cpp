@@ -1300,8 +1300,17 @@ get_key_response cluster_client::get_key_for_conn(unsigned int command_index, un
         return not_available;
     }
 
-    // in case connection is during cluster slots command, his slots mapping not relevant
-    if (m_connections[other_conn_id]->get_cluster_slots_state() != setup_done) return not_available;
+    // Cross-shard write/read: target_conn_id != producer's conn_id (key hashes
+    // to a different shard's primary or to a replica). For reads we still need
+    // the full readiness check because we may dispatch on a replica that needs
+    // READONLY acked before it will serve traffic, and we need a valid slot
+    // map to route. For writes, the target's TCP socket being connected is
+    // sufficient -- writes to a connected primary always succeed, and gating
+    // on transient cluster_slots_state (MOVED redirect, role flip, periodic
+    // refresh) after client::get_key_for_conn has already advanced
+    // m_obj_gen->m_next_key would consume a key index without sending, the
+    // same silent key shortfall pattern as the producer==primary path above.
+    if (is_read && m_connections[other_conn_id]->get_cluster_slots_state() != setup_done) return not_available;
 
     key_index_pool *key_idx_pool = m_key_index_pools[other_conn_id];
     if (key_idx_pool->size() >= KEY_INDEX_QUEUE_MAX_SIZE) return not_available;
