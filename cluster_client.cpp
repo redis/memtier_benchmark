@@ -740,6 +740,16 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
 
                 // if connection disconnected, try to reconnect
                 if (sc->get_connection_state() == conn_disconnected) {
+                    // Role must be set BEFORE connect() so the setup ladder is
+                    // armed against the *new* role (primary). A reused endpoint
+                    // that was previously labeled role_replica would otherwise
+                    // re-arm the READONLY ladder against the now-primary node,
+                    // causing the handshake to send READONLY to a primary and
+                    // leaving the connection in a state where writes route to
+                    // it as group.primary while it still presents replica-side
+                    // setup state. Mirrors the set_role-before-connect order
+                    // used for replicas below.
+                    sc->set_role(role_primary);
                     connect_shard_connection(sc, addr, port);
                 }
 
@@ -750,11 +760,17 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
         // if connection doesn't exist, add it
         if (sc == NULL) {
             sc = create_shard_connection(MAIN_CONNECTION->get_protocol());
+            // Set the role before connect() so the setup ladder is armed at
+            // connect time (primary path: no READONLY ladder).
+            sc->set_role(role_primary);
             connect_shard_connection(sc, addr, port);
         }
 
         // The primary discovered for this shard owns the slot range; track it
         // here and reuse the same conn for replicas below to attach to.
+        // set_role is idempotent; already-correct for newly-created and
+        // reconnected primaries; covers the already-connected role-flip case
+        // where the previous label was role_replica.
         sc->set_role(role_primary);
 
         free(addr);
