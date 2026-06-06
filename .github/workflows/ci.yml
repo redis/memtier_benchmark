@@ -201,6 +201,11 @@ jobs:
                    OSS_CLUSTER_REPLICAS: "1", TLS: "0", VERBOSE: "1", SHARDS: "3", PARALLELISM: "2",
                    TEST: "test_read_preference_modes.py test_read_preference_failover.py test_read_preference_mget.py test_read_preference_transaction.py" }
             tls: false
+          - name: "OSS-CLUSTER + replicas: read-preference RESP3"
+            env: { LOG_LEVEL: "notice", OSS_STANDALONE: "0", OSS_CLUSTER: "0",
+                   OSS_CLUSTER_REPLICAS: "1", TLS: "0", VERBOSE: "1", SHARDS: "3", PARALLELISM: "2",
+                   TEST: "test_read_preference_resp3.py" }
+            tls: false
     runs-on: ${{ matrix.platform }}
     name: Test ${{ matrix.test-config.name }}
     steps:
