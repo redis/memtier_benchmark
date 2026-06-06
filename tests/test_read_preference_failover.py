@@ -263,3 +263,43 @@ def test_read_preference_failover(env):
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config_post, env)
+
+
+# ---------------------------------------------------------------------------
+# -READONLY retry path coverage placeholder
+#
+# Round-14 reviewers (R4+R6 #100) asked for an explicit test of the
+# -READONLY retry path in cluster_client.cpp:2138 (handle "-READONLY"). The
+# scenario is:
+#   1. memtier has an in-flight GET queued on connection C (a replica).
+#   2. CLUSTER FAILOVER promotes the replica to primary (or the topology
+#      otherwise demotes the original primary; either way C is now a primary).
+#   3. memtier's pre-failover producer sends GET on C. Depending on the
+#      flow (sticky producer connection, queued before the role flip), the
+#      "would-be-read" can be perceived by C as a write and rejected with
+#      -READONLY. The retry path in handle_response must reroute to the
+#      current slot primary (could be the same node post-failover) and
+#      complete without hanging.
+#
+# Forcing -READONLY deterministically requires precisely orchestrated
+# CLUSTER FAILOVER timing against an in-flight pipeline, which the RLTest
+# harness does not expose: there is no stable hook to interleave a FAILOVER
+# command with the memtier producer's pipeline tick.
+#
+# Skipping with a TODO is preferable to writing a probabilistic test that
+# either flakes (if FAILOVER lands between the producer's keypress) or
+# silently passes when no -READONLY is ever produced (FAILOVER happens
+# before the producer connects).
+# ---------------------------------------------------------------------------
+
+def test_readonly_retry_resp2_resp3(env):
+    """Coverage placeholder for the -READONLY retry path
+    (cluster_client.cpp handle_response, "-READONLY" prefix branch).
+
+    TODO(#100): deterministic -READONLY orchestration requires precise
+    CLUSTER FAILOVER timing against an in-flight memtier pipeline, which
+    the RLTest harness does not expose. Re-enable when a stable hook for
+    interleaving FAILOVER between producer pipeline ticks is available.
+    """
+    env.skip()
+    return

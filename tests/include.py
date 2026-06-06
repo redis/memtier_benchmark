@@ -224,6 +224,27 @@ def reset_commandstats(connections):
             pass
 
 
+def server_supports_resp3(env):
+    """Return True if the Redis server accepts HELLO 3 (Redis 6+).
+
+    Capability probe used by tests that pass --protocol=resp3.  Older servers
+    (Redis < 6) reject HELLO 3 with an error, in which case the caller should
+    env.skip().  The probe connection is reset back to RESP2 after the probe
+    so subsequent CLI commands issued via the same connection are not
+    accidentally left in RESP3 mode.
+    """
+    try:
+        conn = env.getConnection()
+        resp = conn.execute_command("HELLO", "3")
+        try:
+            conn.execute_command("HELLO", "2")
+        except Exception:
+            pass
+        return resp is not None
+    except Exception:
+        return False
+
+
 def get_get_call_count(conn):
     """Read 'cmdstat_get' from INFO COMMANDSTATS.  Returns 0 if absent."""
     try:
