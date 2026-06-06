@@ -1637,6 +1637,17 @@ bool cluster_client::create_get_request(struct timeval &timestamp, unsigned int 
     if (!ok) return false;
     const int after = m_connections[conn_id]->get_pending_resp();
     if (after > before) {
+        // Deferred follow-up (#101): this counter records the attempted-routing
+        // decision at send time. A subsequent -READONLY rejection (handled in
+        // handle_response around line ~2140) triggers a retry onto the
+        // primary, but the retry does NOT re-bump the counter. The result is
+        // that Ops from Replica is mildly overstated and Ops from Primary
+        // mildly understated in the presence of -READONLY retries. The skew
+        // is bounded by the -READONLY rate, which is normally zero (only fires
+        // on misclassification or topology drift). A clean fix would
+        // decrement-on-retry here and re-record at successful retry-send time;
+        // not done yet because the simpler attempted-routing semantics are
+        // adequate for the typical zero-READONLY workload.
         record_builtin_read_routing(rt_get, m_connections[conn_id]->is_replica());
     }
     return ok;
@@ -2135,6 +2146,14 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
         // SLOTS refresh here -- READONLY is a per-request signal, not a
         // topology event, and the cost of bouncing the entire cluster's
         // topology view per misclassification is way too high.
+        //
+        // Deferred follow-up (#99): the prefix check matches the simple-error
+        // form "-READONLY ...". Redis currently emits simple errors for
+        // READONLY, but the RESP3 blob-error type "!<len>\r\n-READONLY ..."
+        // would not match this byte-prefix and would fall through to the
+        // generic error-handling path below (terminal error, no retry). This
+        // is acceptable today because Redis OSS does not produce blob errors
+        // for READONLY, but revisit if the upstream behavior changes.
         static const char READONLY_MSG_PREFIX[] = "-READONLY";
         static const size_t READONLY_MSG_PREFIX_LEN = sizeof(READONLY_MSG_PREFIX) - 1;
         if (strncmp(response->get_status(), READONLY_MSG_PREFIX, READONLY_MSG_PREFIX_LEN) == 0) {
