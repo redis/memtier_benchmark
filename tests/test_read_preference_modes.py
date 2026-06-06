@@ -1,6 +1,14 @@
 """
 Tests for --read-preference routing modes in cluster mode.
 
+JSON schema validation
+----------------------
+test_endpoints_json_emitted exercises the mb.json schema for the Endpoints
+and Read Routing blocks introduced for --read-preference observability.
+It runs a secondary-mode workload and asserts that both blocks are present
+and well-formed, then runs a primary-mode workload and asserts both are
+absent (per the emit_read_routing gate in run_stats.cpp:1821).
+
 Background
 ----------
 The --read-preference flag controls which cluster nodes receive GET traffic:
@@ -32,6 +40,8 @@ Test matrix
    no distribution assertion is made (nearest is inherently racy).
 """
 
+import json
+import os
 import tempfile
 
 from include import (
@@ -444,3 +454,191 @@ def test_read_preference_keyless_arbitrary_secondary(env):
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)
+
+
+# ---------------------------------------------------------------------------
+# Test 6 - Endpoints / Read Routing JSON schema validation
+#
+# Verifies that the read-preference observability JSON blocks are emitted with
+# the expected schema and that they are correctly suppressed for primary mode
+# (per the emit_read_routing gate in run_stats.cpp:1821).
+# ---------------------------------------------------------------------------
+
+# Bump the workload size so each active endpoint accumulates at least
+# LATENCY_EWMA_MIN_SAMPLES (defined as 10 in cluster_client.cpp / shard_connection.cpp).
+# Lower values would race the warm threshold and make the "Latency Samples >= 10"
+# assertion flaky.
+_ENDPOINTS_REQUESTS = 200
+_ENDPOINTS_CLIENTS = 4
+_ENDPOINTS_THREADS = 2
+_LATENCY_SAMPLES_WARM_THRESHOLD = 10
+
+
+def _load_mb_json(run_config):
+    json_path = os.path.join(run_config.results_dir, "mb.json")
+    with open(json_path) as fh:
+        return json.load(fh)
+
+
+def test_endpoints_json_emitted(env):
+    """When --read-preference != primary in cluster mode, mb.json must emit
+    a "Read Routing" sub-object and an "Endpoints" sub-object under
+    "ALL STATS".  The Read Routing block must include Ops from Primary,
+    Ops from Replica, and Primary Fraction.  Each endpoint must include
+    role, conn_id, Ops, Avg Latency (us), and Latency Samples.  At least
+    one active endpoint must show Latency Samples >= the warm threshold
+    (10 = LATENCY_EWMA_MIN_SAMPLES).
+
+    The same workload run with --read-preference=primary must NOT emit
+    either block (run_stats.cpp emit_read_routing gate)."""
+    if not env.isCluster():
+        env.skip()
+        return
+    replica_conns = get_cluster_replica_connections(env)
+    if not replica_conns:
+        env.skip()
+        return
+
+    _pre_populate(env, key_count=100)
+    _reset_all_commandstats(env, replica_conns)
+
+    # ---- Phase A: read_preference=secondary -> blocks present ----------
+    ok_sec, run_config_sec = _run_read_pref(
+        env,
+        "secondary",
+        threads=_ENDPOINTS_THREADS,
+        clients=_ENDPOINTS_CLIENTS,
+        requests=_ENDPOINTS_REQUESTS,
+    )
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(
+            ok_sec,
+            message="memtier exited non-zero under "
+                    "--read-preference=secondary",
+        )
+
+        result_sec = _load_mb_json(run_config_sec)
+        env.assertContains("ALL STATS", result_sec)
+        all_stats_sec = result_sec["ALL STATS"]
+
+        # ---- Read Routing schema ----------------------------------------
+        env.assertContains(
+            "Read Routing",
+            all_stats_sec,
+            message="Read Routing block missing from ALL STATS under "
+                    "--read-preference=secondary",
+        )
+        rr = all_stats_sec["Read Routing"]
+        for key in ("Ops from Primary", "Ops from Replica", "Primary Fraction"):
+            env.assertContains(
+                key,
+                rr,
+                message="Read Routing missing required key '{}'".format(key),
+            )
+
+        # Secondary mode: ALL ops must come from replicas; Primary Fraction
+        # must be 0.0.  The aggregate counter validates the schema AND the
+        # routing-attribution code path at once.
+        env.assertGreater(
+            int(rr["Ops from Replica"]),
+            0,
+            message="Read Routing.Ops from Replica == 0 under secondary "
+                    "(routing attribution counter not incrementing)",
+        )
+        env.assertEqual(
+            int(rr["Ops from Primary"]),
+            0,
+            message="Read Routing.Ops from Primary > 0 under secondary "
+                    "(read leaked to primary in attribution counter; "
+                    "got {})".format(rr["Ops from Primary"]),
+        )
+
+        # ---- Endpoints schema -------------------------------------------
+        env.assertContains(
+            "Endpoints",
+            all_stats_sec,
+            message="Endpoints block missing from ALL STATS under "
+                    "--read-preference=secondary",
+        )
+        endpoints = all_stats_sec["Endpoints"]
+        env.assertTrue(
+            len(endpoints) > 0,
+            message="Endpoints block is empty under secondary; expected at "
+                    "least one entry",
+        )
+
+        warm_endpoints = 0
+        for addr, ep in endpoints.items():
+            for key in ("role", "conn_id", "Ops", "Avg Latency (us)", "Latency Samples"):
+                env.assertContains(
+                    key,
+                    ep,
+                    message="Endpoints[{}] missing required key '{}'".format(
+                        addr, key
+                    ),
+                )
+            # role must be either "primary" or "replica" (string-typed)
+            role_val = ep["role"]
+            env.assertTrue(
+                role_val in ("primary", "replica"),
+                message="Endpoints[{}].role unexpected value '{}'; "
+                        "expected 'primary' or 'replica'".format(addr, role_val),
+            )
+            samples = int(ep["Latency Samples"])
+            if samples >= _LATENCY_SAMPLES_WARM_THRESHOLD:
+                warm_endpoints += 1
+
+        env.assertGreater(
+            warm_endpoints,
+            0,
+            message="no Endpoints block entry reached Latency Samples >= {} "
+                    "(LATENCY_EWMA_MIN_SAMPLES); EWMA seeding may have "
+                    "regressed or the workload was too small".format(
+                        _LATENCY_SAMPLES_WARM_THRESHOLD
+                    ),
+        )
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config_sec, env)
+
+    # ---- Phase B: read_preference=primary -> blocks absent -------------
+    _reset_all_commandstats(env, replica_conns)
+
+    ok_pri, run_config_pri = _run_read_pref(
+        env,
+        "primary",
+        threads=_ENDPOINTS_THREADS,
+        clients=_ENDPOINTS_CLIENTS,
+        requests=_ENDPOINTS_REQUESTS,
+    )
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(
+            ok_pri,
+            message="memtier exited non-zero under --read-preference=primary",
+        )
+
+        result_pri = _load_mb_json(run_config_pri)
+        all_stats_pri = result_pri["ALL STATS"]
+        # Both blocks must be absent for primary mode -- the emit_read_routing
+        # gate in run_stats.cpp is `read_preference != rp_primary`.
+        env.assertNotContains(
+            "Read Routing",
+            all_stats_pri,
+            message="Read Routing block present under primary; the "
+                    "emit_read_routing gate (read_preference != rp_primary) "
+                    "regressed",
+        )
+        env.assertNotContains(
+            "Endpoints",
+            all_stats_pri,
+            message="Endpoints block present under primary; the "
+                    "emit_read_routing gate (read_preference != rp_primary) "
+                    "regressed",
+        )
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config_pri, env)
