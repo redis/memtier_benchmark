@@ -60,6 +60,11 @@ from mb import Benchmark, RunConfig
 _HASH_TAG = "rpresp3"
 _KEY_MIN = 1
 _KEY_MAX = 200
+# Only pre-populate the lower half of the key range so that memtier queries
+# (_KEY_MIN.._KEY_MAX) include keys that were never SET.  Each MGET batch
+# therefore contains a mix of existing values and nils, exercising the RESP3
+# nil (_\r\n) parsing branch that the test claims to validate.
+_MGET_KEY_POPULATED_MAX = 100
 _MGET_BATCH = 10
 
 
@@ -229,7 +234,11 @@ def test_resp3_read_preference_mget_secondary(env):
     if not ok:
         return
 
-    _pre_populate_same_slot(env)
+    # Populate only keys _KEY_MIN.._MGET_KEY_POPULATED_MAX (1..100); memtier
+    # will query _KEY_MIN.._KEY_MAX (1..200), so roughly half the keys in every
+    # MGET batch are absent and Redis returns nil (_\r\n in RESP3), forcing
+    # the nil-parsing branch to be exercised.
+    _pre_populate_same_slot(env, key_max=_MGET_KEY_POPULATED_MAX)
     _reset_all_commandstats(env, replica_conns)
 
     extra_args = [
