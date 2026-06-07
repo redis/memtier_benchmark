@@ -884,19 +884,22 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
                         // already-known replicas (idempotent).
                         rsc->set_role(role_replica);
                         connect_shard_connection(rsc, r_addr, r_port);
-                    } else {
-                        // Already connected from a previous refresh. Update
-                        // the role label; if this connection was previously
-                        // treated as a primary (m_readonly_state == setup_done
-                        // with role_primary) and is now listed as a replica,
-                        // the READONLY ladder was never run. rearm_readonly()
+                    } else if (rsc->get_role() != role_replica) {
+                        // Live role flip: this conn was previously treated as
+                        // a primary (m_readonly_state == setup_done with
+                        // role_primary) and is now listed as a replica. The
+                        // READONLY ladder was never run; rearm_readonly()
                         // re-arms the ladder and sends READONLY immediately so
-                        // the server stops rejecting reads with -READONLY. For
-                        // already-known replicas set_role is idempotent and
-                        // rearm_readonly() is a no-op (m_readonly_state !=
-                        // setup_done when the replica is mid-handshake, or the
-                        // early-exit guard fires when setup_done is the correct
-                        // post-role-flip state).
+                        // the server stops rejecting reads with -READONLY.
+                        //
+                        // Gate this on actual role change: a steady-state
+                        // CLUSTER SLOTS refresh of an already-known replica
+                        // (rsc->get_role() == role_replica) must NOT re-fire
+                        // rearm_readonly. Re-arming flips m_readonly_state
+                        // back to setup_none/setup_sent, which gates
+                        // is_ready_for_reads() until the next ack, briefly
+                        // dropping a stable replica out of read routing on
+                        // every periodic topology refresh.
                         rsc->set_role(role_replica);
                         rsc->rearm_readonly();
                     }
