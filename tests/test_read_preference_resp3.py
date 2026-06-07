@@ -77,10 +77,20 @@ def _pre_populate_keys(env, key_min=0, key_max=99, prefix="rp3-key-"):
 
 
 def _pre_populate_same_slot(env, hash_tag=_HASH_TAG, key_min=_KEY_MIN, key_max=_KEY_MAX):
-    """Write same-slot keys via the {tag} hash-tag pattern.  Used by MGET."""
-    master_conns = env.getOSSMasterNodesConnectionList()
+    """Write same-slot keys via the {tag} hash-tag pattern.  Used by MGET.
+
+    Earlier revisions iterated keys round-robin over
+    getOSSMasterNodesConnectionList() with plain StrictRedis connections.
+    When the cluster's CLUSTER SLOTS view has not fully converged across
+    all masters at test setup, SETs hit MOVED redirects that the non-
+    cluster-aware client cannot follow, failing the entire RESP3 cell.
+    Mirror the round-19 a663c31 fix in test_read_preference_modes.py:
+    switch to env.getClusterConnectionIfNeeded() which returns a cluster-
+    aware client that auto-follows MOVED in cluster mode (and a plain
+    connection in non-cluster envs).
+    """
+    conn = env.getClusterConnectionIfNeeded()
     for i in range(key_min, key_max + 1):
-        conn = master_conns[i % len(master_conns)]
         conn.execute_command(
             "SET",
             "{{{}}}-key-{}".format(hash_tag, i),
