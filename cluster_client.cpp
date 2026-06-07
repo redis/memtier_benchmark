@@ -2192,8 +2192,22 @@ void cluster_client::handle_moved(unsigned int conn_id, struct timeval timestamp
     if (m_connections[conn_id]->get_cluster_slots_state() != setup_done) return;
 
     // flush stale routing entries for this connection's old slot ownership
+    // Cross-shard reads that were routed to this connection (via
+    // create_request_for_other) push a (command_index, key_index) pair into
+    // m_key_index_pools[conn_id] AFTER client::create_request has already
+    // incremented m_reqs_generated (client.cpp:656 for GET, the arbitrary
+    // path at create_request_for_other for --command). Clearing the pool here
+    // without compensating leaves m_reqs_processed < m_reqs_generated
+    // permanently, so a --requests run hangs and a --test-time run
+    // mis-accounts pending in-flight. Compensate by n/2 (pairs). Defensive
+    // clamp guards against underflow.  Matches the pattern at
+    // connect_shard_connection.
     key_index_pool empty_queue;
     std::swap(*m_key_index_pools[conn_id], empty_queue);
+    {
+        const size_t n = empty_queue.size() / 2;
+        m_reqs_generated -= (m_reqs_generated >= n) ? n : m_reqs_generated;
+    }
     {
         std::queue<staged_monitor_cmd> empty_staged;
         std::swap(m_staged_monitor_commands[conn_id], empty_staged);
