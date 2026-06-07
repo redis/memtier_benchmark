@@ -249,8 +249,26 @@ bool cluster_client::connect_shard_connection(shard_connection *sc, char *addres
 {
     // empty key index queue and staged monitor commands
     if (m_key_index_pools[sc->get_id()]->size()) {
+        // Cross-shard reads that were routed to this connection (via
+        // create_request_for_other) push a (command_index, key_index) pair into
+        // m_key_index_pools[sc->get_id()] AFTER client::create_request has
+        // already incremented m_reqs_generated (client.cpp:656 for GET, the
+        // arbitrary path at create_request_for_other for --command). Clearing
+        // the pool here without compensating leaves m_reqs_processed < m_reqs_generated
+        // permanently, so a --requests run hangs and a --test-time run
+        // mis-accounts pending in-flight. Compensate by n/2 (pairs).
+        // Defensive clamp guards against underflow from any future single-entry
+        // push pattern (txn_release_pin pushes a lone key, but the pin path
+        // does not increment m_reqs_generated for that staged key -- it is
+        // consumed by the next rotation -- so n/2 is the right accounting
+        // for cross-shard residue and a no-op for the txn-staged singleton
+        // beyond the clamp.) Matches the pattern at hold_pipeline.
         key_index_pool empty_queue;
         std::swap(*m_key_index_pools[sc->get_id()], empty_queue);
+        {
+            const size_t n = empty_queue.size() / 2;
+            m_reqs_generated -= (m_reqs_generated >= n) ? n : m_reqs_generated;
+        }
     }
     {
         std::queue<staged_monitor_cmd> empty_staged;
@@ -1018,6 +1036,20 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
                 // to 2^64.  Matches the pattern at hold_pipeline.
                 {
                     const size_t n = empty_staged.size();
+                    m_reqs_generated -= (m_reqs_generated >= n) ? n : m_reqs_generated;
+                }
+            }
+            // Same hang for the cross-shard read queue: get_key_for_conn ->
+            // create_request_for_other pushes (cmd_idx, key_idx) pairs onto
+            // m_key_index_pools[i] AFTER m_reqs_generated was incremented
+            // (client.cpp:656). A retired shard's pool would otherwise be
+            // discarded by the connection's destructor without compensating
+            // the counter, stranding the run. Pair semantics -> divide by 2.
+            if (!m_key_index_pools[i]->empty()) {
+                key_index_pool empty_queue;
+                std::swap(*m_key_index_pools[i], empty_queue);
+                {
+                    const size_t n = empty_queue.size() / 2;
                     m_reqs_generated -= (m_reqs_generated >= n) ? n : m_reqs_generated;
                 }
             }
