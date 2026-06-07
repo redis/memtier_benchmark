@@ -270,6 +270,25 @@ new top-level blocks (emitted only when `--cluster-mode` is on AND
   `Latency Samples`. `conn_id` is the shard_connection vector index
   (NOT a stable cluster shard identity).
 
+### Testing limitations
+
+The `OSS-CLUSTER + replicas: read-preference` CI matrix cell exercises the
+RLTest harness with `--use-slaves`, which starts replicas using `--slaveof`
+without `--cluster-enabled yes`. The resulting slave nodes are not part of
+cluster gossip - `CLUSTER SLOTS` returns empty replica arrays from each
+master, so memtier_benchmark cannot discover them. The test helper's
+`get_cluster_replica_connections()` gate detects this and skips the tests
+with a stderr warning.
+
+The production read-routing code was verified empirically against real
+`redis-cli --cluster create` clusters with cluster-aware replicas under
+both RESP2 and RESP3. See PR #456 round-18 reviewer reports for the
+measurements: all four modes (primary, secondary, secondaryPreferred,
+nearest) route reads correctly to replicas, with zero leakage to primaries.
+
+A follow-up fixture that bootstraps a real `redis-cli --cluster create`
+cluster within the test harness is tracked in issue #XXX (filed by this PR).
+
 ### Using rate-limiting for informed benchmarking
 
 When you impose a rate limit on your benchmark tests, you're essentially mimicking a controlled production environment. This setup is crucial for understanding how latency behaves under certain throughput constraints. Here's why benchmarking latency in a rate-limited scenario is important:
