@@ -1358,11 +1358,15 @@ get_key_response cluster_client::get_key_for_conn(unsigned int command_index, un
         if (m_strict_no_route_attempts < UINT_MAX) m_strict_no_route_attempts++;
         return not_available;
     }
-    // Routing succeeded. Clear the back-off counter only for reads: under a
-    // mixed SET/GET workload with --read-preference != rp_primary, the counter
-    // is a "consecutive read no-route" gauge for the first hold_pipeline gate
-    // (the read-only one). Resetting it on a successful write would mask a
-    // permanent GET-routing failure (every SET would reset the
+    // Routing succeeded. Clear the back-off counter only for reads (and only
+    // for the producer==target fast path here; the cross-shard branch below
+    // defers the reset until after its own not_available gates so a perpetual
+    // "routed-but-not-dispatched" loop still trips hold_pipeline's yield).
+    //
+    // Mixed SET/GET workload rationale: under --read-preference != rp_primary,
+    // the counter is a "consecutive read no-route" gauge for hold_pipeline's
+    // first gate (the read-only one). Resetting it on a successful write would
+    // mask a permanent GET-routing failure (every SET would reset the
     // STRICT_NO_ROUTE_HOLD_THRESHOLD-attempt yield before hold_pipeline could
     // ever trip the read-only gate). The write-side gate in hold_pipeline is
     // keyed on `m_shard_groups.empty() || no live primary`, a state that
@@ -1370,10 +1374,19 @@ get_key_response cluster_client::get_key_for_conn(unsigned int command_index, un
     // across a successful write does not delay the write-side gate from
     // firing during the all-malformed CLUSTER SLOTS case (the counter will be
     // reset by the gate's own yield path).
-    if (is_read) {
-        m_strict_no_route_attempts = 0;
-    }
+    //
+    // Cursor bugbot MED (cluster_client.cpp:1083 round-25): the reset used to
+    // fire here unconditionally for is_read, BEFORE the cross-shard
+    // not_available gates below (setup_done / KEY_INDEX_QUEUE_MAX_SIZE). When
+    // a cross-shard read repeatedly hit one of those gates the key index was
+    // consumed but no GET was issued AND the counter was reset on each
+    // attempt -- hold_pipeline never yielded, fill_pipeline spun. Defer the
+    // reset to after the gates so the counter accumulates and the yield
+    // gate trips.
     if (target_conn_id == conn_id) {
+        if (is_read) {
+            m_strict_no_route_attempts = 0;
+        }
         benchmark_debug_log("%s generated key=[%.*s] for itself\n", m_connections[conn_id]->get_readable_id(),
                             m_obj_gen->get_key_len(), m_obj_gen->get_key());
         return available_for_conn;
@@ -1428,19 +1441,49 @@ get_key_response cluster_client::get_key_for_conn(unsigned int command_index, un
     }
 
     // Cross-shard write/read: target_conn_id != producer's conn_id (key hashes
-    // to a different shard's primary or to a replica). For reads we still need
-    // the full readiness check because we may dispatch on a replica that needs
-    // READONLY acked before it will serve traffic, and we need a valid slot
-    // map to route. For writes, the target's TCP socket being connected is
-    // sufficient -- writes to a connected primary always succeed, and gating
-    // on transient cluster_slots_state (MOVED redirect, role flip, periodic
-    // refresh) after client::get_key_for_conn has already advanced
-    // m_obj_gen->m_next_key would consume a key index without sending, the
-    // same silent key shortfall pattern as the producer==primary path above.
-    if (is_read && m_connections[other_conn_id]->get_cluster_slots_state() != setup_done) return not_available;
+    // to a different shard's primary or to a replica). The pre-round-25
+    // version gated reads here on the target's cluster_slots_state ==
+    // setup_done, mirroring "the slot map must be valid to route." That
+    // turned out to share the same key-loss footgun as the writes guard
+    // fixed in round-9 (a257fc2): client::get_key_for_conn has already
+    // advanced m_obj_gen->m_next_key by the time we reach this gate, so a
+    // not_available return silently consumed the key index. The iterator
+    // then wrapped at m_key_max and re-wrote already-touched keys -- the
+    // same keyspace shortfall round-9 fixed for writes.
+    //
+    // Cursor bugbot MED (cluster_client.cpp:1129 round-25): drop the
+    // setup_done check for reads too. Queueing onto the target's pool is
+    // safe regardless of m_cluster_slots: the target's own fill_pipeline
+    // calls is_conn_setup_done() (m_authentication && m_db_selection &&
+    // m_cluster_slots && m_hello && m_readonly_state all == setup_done)
+    // BEFORE draining the pool, so the queued read is held until the
+    // ladder completes and the slot map is valid. This mirrors the
+    // cross-shard write fix (a257fc2): producer side does not duplicate
+    // the readiness check that the drain side already enforces.
+    //
+    // The READONLY ack concern is already handled by is_conn_setup_done()'s
+    // m_readonly_state predicate -- not by m_cluster_slots, which is what
+    // this gate was checking.
+    //
+    // The b73b2a9 cross-shard route-then-stage in-flight backpressure gate
+    // in hold_pipeline now bounds the producer side, so we cannot unbounded-
+    // push into a stalled target's pool: once in_flight reaches the budget
+    // the producer yields and the queued reads drain when the target
+    // completes its setup ladder.
 
     key_index_pool *key_idx_pool = m_key_index_pools[other_conn_id];
     if (key_idx_pool->size() >= KEY_INDEX_QUEUE_MAX_SIZE) return not_available;
+
+    // Cross-shard routing actually committed: reset the back-off counter
+    // now (deferred from the producer==target reset above). Cursor bugbot
+    // MED round-25: the prior placement reset BEFORE the gates above, so
+    // a perpetual not_available from the setup_done or queue-cap gate
+    // stayed invisible to hold_pipeline's yield. Resetting here means the
+    // counter only clears on an actually-queued read, mirroring the
+    // semantics of the producer==target reset.
+    if (is_read) {
+        m_strict_no_route_attempts = 0;
+    }
 
     // store command and key for the other connection
     benchmark_debug_log("%s generated key=[%.*s] for %s\n", m_connections[conn_id]->get_readable_id(),
