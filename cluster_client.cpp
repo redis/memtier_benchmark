@@ -860,7 +860,20 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
                     // Cursor Bugbot HIGH thread.
                     bool already_primary = false;
                     unsigned int primary_group_id = 0;
-                    for (size_t gi = 0; gi < new_groups.size(); gi++) {
+                    // Cover the current shard's primary too: `sc` was set
+                    // ~80 lines above as group.primary for THIS shard but
+                    // `group` has not yet been pushed into new_groups (that
+                    // happens at the bottom of the outer loop). Without
+                    // this check, a replica tuple that reuses the (addr,
+                    // port) of its own shard's primary would slip past the
+                    // new_groups scan and silently flip the primary's role
+                    // to role_replica + rearm READONLY, breaking writes on
+                    // that shard. Bugbot HIGH round-26.
+                    if (rsc == sc) {
+                        already_primary = true;
+                        primary_group_id = group.id;
+                    }
+                    for (size_t gi = 0; !already_primary && gi < new_groups.size(); gi++) {
                         if (new_groups[gi].primary == rsc) {
                             already_primary = true;
                             primary_group_id = new_groups[gi].id;
@@ -918,6 +931,13 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
                 for (unsigned int k = 0; k < m_connections.size(); k++) {
                     if (strcmp(r_addr, m_connections[k]->get_address()) == 0 &&
                         strcmp(r_port, m_connections[k]->get_port()) == 0) {
+                        // Match against the current shard's primary (`sc`)
+                        // too, since `group` is not yet in new_groups (see
+                        // first-pass guard above). Bugbot HIGH round-26.
+                        if (m_connections[k] == sc) {
+                            shared_endpoint_skip = true;
+                            break;
+                        }
                         for (size_t gi = 0; gi < new_groups.size(); gi++) {
                             if (new_groups[gi].primary == m_connections[k]) {
                                 shared_endpoint_skip = true;
