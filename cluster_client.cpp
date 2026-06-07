@@ -847,6 +847,36 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
 
                     if (k < prev_connections_size) close_sc[k] = false;
 
+                    // Defensive guard for shared endpoints: if this same conn
+                    // was already claimed as a primary by an earlier shard in
+                    // this CLUSTER SLOTS reply, do NOT overwrite the role to
+                    // role_replica or rearm READONLY. Standard Redis OSS
+                    // topologies don't produce a node that serves as primary
+                    // for one shard and replica for another, but exotic /
+                    // migrating layouts can. Without this guard the replica-
+                    // loop's set_role(role_replica) silently undoes the
+                    // primary role established ~80 lines earlier, breaking
+                    // routing on the primary shard. Closes the unresolved
+                    // Cursor Bugbot HIGH thread.
+                    bool already_primary = false;
+                    unsigned int primary_group_id = 0;
+                    for (size_t gi = 0; gi < new_groups.size(); gi++) {
+                        if (new_groups[gi].primary == rsc) {
+                            already_primary = true;
+                            primary_group_id = new_groups[gi].id;
+                            break;
+                        }
+                    }
+                    if (already_primary) {
+                        benchmark_error_log("warning: CLUSTER SLOTS: node %s:%s is both primary (shard %u) and replica "
+                                            "(shard %u); preserving primary role and skipping replica registration\n",
+                                            r_addr, r_port, primary_group_id, group.id);
+                        // Skip pushing rsc as a replica for this shard. The
+                        // node continues to serve its primary shard correctly.
+                        rsc = NULL;
+                        break;
+                    }
+
                     if (rsc->get_connection_state() == conn_disconnected) {
                         // Role must be set BEFORE connect() so the READONLY
                         // ladder is armed during the AUTH/HELLO/READONLY/
@@ -875,6 +905,30 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
             }
 
             if (rsc == NULL) {
+                // Either no matching conn was found (new endpoint) or the
+                // shared-endpoint guard above forcibly cleared rsc to skip
+                // the role overwrite. Distinguish via a re-scan: if a conn
+                // with this (addr, port) exists and is already a primary in
+                // new_groups, skip creating a new one and skip pushing as a
+                // replica.
+                bool shared_endpoint_skip = false;
+                for (unsigned int k = 0; k < m_connections.size(); k++) {
+                    if (strcmp(r_addr, m_connections[k]->get_address()) == 0 &&
+                        strcmp(r_port, m_connections[k]->get_port()) == 0) {
+                        for (size_t gi = 0; gi < new_groups.size(); gi++) {
+                            if (new_groups[gi].primary == m_connections[k]) {
+                                shared_endpoint_skip = true;
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                }
+                if (shared_endpoint_skip) {
+                    free(r_addr);
+                    free(r_port);
+                    continue;
+                }
                 rsc = create_shard_connection(MAIN_CONNECTION->get_protocol());
                 // Set the role before connect() so the READONLY ladder is
                 // armed at connect time.
