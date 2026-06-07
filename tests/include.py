@@ -173,7 +173,17 @@ def get_cluster_replica_connections(env):
     Cluster-mode only.  Requires the env was started with useSlaves=True.
     Returns an empty list when not in cluster mode or when no replicas are
     found (so callers can gracefully skip rather than crash).
+
+    When the env was started with ``--use-slaves`` (RLTest's useSlaves=True)
+    but CLUSTER NODES advertises no replicas, this helper emits a loud
+    stderr warning before returning an empty list.  This is the known
+    RLTest harness gap: ``--use-slaves`` starts replicas via ``--slaveof``
+    *without* ``--cluster-enabled yes``, so the slave processes are
+    standalone and never join cluster gossip.  See the
+    ``Read Preference -> Testing limitations`` section in README.md for
+    the full background.
     """
+    import sys
     import redis as _redis
 
     if not env.isCluster():
@@ -212,6 +222,30 @@ def get_cluster_replica_connections(env):
                 socket_connect_timeout=5,
             )
         )
+
+    # If RLTest was launched with useSlaves=True but CLUSTER NODES
+    # advertises zero replicas, emit a loud warning so the silent skip
+    # is at least visible in test output.  Use getattr() chains because
+    # RLTest's env.envRunner shape varies across versions.
+    if not conns:
+        use_slaves = False
+        runner = getattr(env, "envRunner", None)
+        if runner is not None:
+            use_slaves = bool(
+                getattr(runner, "useSlaves", False)
+                or getattr(runner, "use_slaves", False)
+            )
+        if use_slaves:
+            sys.stderr.write(
+                "warning: OSS_CLUSTER_REPLICAS=1 is set and RLTest started "
+                "slave nodes,\nbut CLUSTER NODES shows zero replicas "
+                "(slaves were started with --slaveof\nand not "
+                "--cluster-enabled yes, so they are not in cluster "
+                "gossip).\nThe read-preference tests will skip. See README "
+                "\"Read Preference -\ntesting limitations\" for the known "
+                "harness gap.\n"
+            )
+            sys.stderr.flush()
     return conns
 
 
