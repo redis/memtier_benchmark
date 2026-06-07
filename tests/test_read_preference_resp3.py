@@ -244,6 +244,12 @@ def test_resp3_read_preference_mget_secondary(env):
     extra_args = [
         "--ratio=0:{}".format(_MGET_BATCH),
         "--multi-key-get={}".format(_MGET_BATCH),
+        # Match the prefix used by _pre_populate_same_slot ({rpresp3}-key-).
+        # Without this, memtier queries with the default `memtier-` prefix
+        # against keys that were SET as `{rpresp3}-key-N`, producing 100%
+        # miss instead of the intended ~50% hit rate that exercises the
+        # RESP3 nil parsing branch.
+        "--key-prefix={{{}}}-key-".format(_HASH_TAG),
         "--key-minimum={}".format(_KEY_MIN),
         "--key-maximum={}".format(_KEY_MAX),
         "--read-preference=secondary",
