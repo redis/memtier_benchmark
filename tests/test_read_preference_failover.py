@@ -100,7 +100,7 @@ def _run_read_pref(env, read_preference, threads=_THREADS, clients=_CLIENTS,
         "name": env.testName,
         "args": [
             "--ratio=0:1",
-            "--key-minimum=0",
+            "--key-minimum=1",
             "--key-maximum=99",
             "--read-preference={}".format(read_preference),
         ],
