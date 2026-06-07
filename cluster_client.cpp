@@ -1382,6 +1382,13 @@ get_key_response cluster_client::get_key_for_conn(unsigned int command_index, un
 
     key_idx_pool->push(command_index);
     key_idx_pool->push(*key_index);
+    // Wake the target's bufferevent so its own fill_pipeline drains the pool.
+    // Without this, cross-shard reads/writes accumulate in the target's
+    // key_index_pool but the target stays idle (its bufferevent has no
+    // pending I/O). Under --test-time mode client::finished() advances only
+    // on completed ops, so the benchmark livelocks. Mirrors the wake-up in
+    // create_monitor_request_cluster's staged-command path.
+    m_connections[other_conn_id]->schedule_fill();
     return available_for_other_conn;
 }
 
