@@ -182,7 +182,7 @@ def test_resp3_read_preference_secondary(env):
     extra_args = [
         "--ratio=0:1",
         "--key-prefix=rp3-key-",
-        "--key-minimum=0",
+        "--key-minimum=1",
         "--key-maximum=99",
         "--read-preference=secondary",
         "--protocol=resp3",
@@ -356,7 +356,7 @@ def test_resp3_read_preference_secondaryPreferred_fallback(env):
     extra_args = [
         "--ratio=0:1",
         "--key-prefix=rp3fb-key-",
-        "--key-minimum=0",
+        "--key-minimum=1",
         "--key-maximum=99",
         "--read-preference=secondaryPreferred",
         "--protocol=resp3",
