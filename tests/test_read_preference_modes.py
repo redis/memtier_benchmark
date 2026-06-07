@@ -73,13 +73,18 @@ _REQUESTS = 200
 
 
 def _pre_populate(env, key_count=100):
-    """Write key_count keys directly to the cluster masters via SET."""
-    master_conns = env.getOSSMasterNodesConnectionList()
-    # Use a pipeline per master to fan out keys quickly.
-    # We use a hash-tag so that the writes are distributed across all shards.
+    """Write key_count keys to the cluster using a cluster-aware client.
+
+    Earlier revisions iterated rp-key-N round-robin over
+    getOSSMasterNodesConnectionList() with plain StrictRedis connections.
+    Because each connection talks to a single shard and does not follow
+    MOVED redirects, every key that did not hash to its assigned master
+    surfaced as a MOVED 101 error (R5 round-18). Switch to a cluster-aware
+    connection that routes each SET to the slot's owner automatically and
+    falls back to a regular connection in non-cluster envs.
+    """
+    conn = env.getClusterConnectionIfNeeded()
     for i in range(key_count):
-        # pick a master in round-robin
-        conn = master_conns[i % len(master_conns)]
         conn.execute_command("SET", "rp-key-{}".format(i), "val-{}".format(i))
 
 
