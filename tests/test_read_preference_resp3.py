@@ -69,10 +69,14 @@ _MGET_BATCH = 10
 
 
 def _pre_populate_keys(env, key_min=0, key_max=99, prefix="rp3-key-"):
-    """Write plain keys spread across masters.  Used by GET test."""
-    master_conns = env.getOSSMasterNodesConnectionList()
+    """Write plain keys via a cluster-aware connection (auto-follows MOVED).
+
+    Round-robin over getOSSMasterNodesConnectionList() crashes with
+    MovedError when a key hashes to a different shard than the connection
+    picked by the modulus.
+    """
+    conn = env.getClusterConnectionIfNeeded()
     for i in range(key_min, key_max + 1):
-        conn = master_conns[i % len(master_conns)]
         conn.execute_command("SET", "{}{}".format(prefix, i), "val-{}".format(i))
 
 
