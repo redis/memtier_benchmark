@@ -425,6 +425,14 @@ int shard_connection::setup_socket(struct connect_info *addr)
 
 int shard_connection::connect(struct connect_info *addr)
 {
+    // Belt-and-suspenders: disconnect() already calls reset_state(), but if
+    // this object was constructed and never went through a disconnect (very
+    // first connect on a fresh shard_connection) we still want a clean
+    // parser cursor. Cheap and idempotent.
+    if (m_protocol != NULL) {
+        m_protocol->reset_state();
+    }
+
     // set required setup commands
     m_authentication = m_config->authenticate ? setup_none : setup_done;
     m_db_selection = m_config->select_db ? setup_none : setup_done;
@@ -563,6 +571,16 @@ void shard_connection::disconnect()
     m_cluster_slots = setup_done;
     m_hello = setup_done;
     m_readonly_state = setup_done;
+
+    // Drop any partial RESP parser state. A TCP RST received mid-bulk
+    // (especially while draining a RESP3 push frame) would otherwise leave
+    // m_response_state / m_total_bulks_count / m_push / m_attribute /
+    // m_bulk_len at intermediate values, and the next reconnect's first
+    // bytes would parse under stale cursor state. The setup ladder above
+    // is already reset; this finishes the job for the protocol layer.
+    if (m_protocol != NULL) {
+        m_protocol->reset_state();
+    }
 }
 
 void shard_connection::set_address_port(const char *address, const char *port)
