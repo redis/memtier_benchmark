@@ -1050,26 +1050,36 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         }
     }
 
-    /* Backpressure for --monitor-input cluster replay.
+    /* Cross-shard route-then-stage in-flight backpressure.
      *
-     * The route-then-stage design lets a routing connection fan commands out
-     * into *other* shards' staged queues (m_staged_monitor_commands) without
-     * growing its own m_pipeline. fill_pipeline's `m_pipeline->size() < pipeline`
+     * Several cluster_client routing paths fan work out into *other* shards'
+     * queues (m_key_index_pools for built-in SET/GET routing under
+     * --read-preference, m_staged_monitor_commands for --monitor-input, the
+     * key_index_pool again for cross-shard MGET) without growing the
+     * producer's own m_pipeline. fill_pipeline's `m_pipeline->size() < pipeline`
      * gate therefore never throttles the producer: the routing side keeps
-     * selecting and staging, bounded only by the rate limiter, while each target
-     * drains at most ~pipeline-per-RTT. The staged queues grow without bound, so
-     * reported latency (measured from selection) climbs monotonically as queue
-     * residence dominates the tail, and throughput overshoots the rate target.
+     * selecting and pushing while each target drains at most ~pipeline-per-RTT.
+     * The target pools grow without bound, the event loop never yields, and
+     * `client::finished()` (whose duration counter advances only via
+     * response-driven roll_cur_stats() calls) cannot observe --test-time
+     * expiry. The benchmark livelocks. R5 round-19's 6479c3b added
+     * schedule_fill on the target after each push, but that timer only fires
+     * once the producer actually returns to libevent — which it never does
+     * while this gate is missing.
      *
      * Couple production to drain by capping the global end-to-end in-flight
-     * count — staged + sent-awaiting-response, which equals
-     * (m_reqs_generated - m_reqs_processed) — at pipeline * connection_count, the
-     * same total depth a non-staged run would sustain. A connection that still
-     * has its own staged (or pooled) commands to drain is never held here, so
-     * draining and therefore forward progress is never blocked; only pure
-     * producers pause until responses bring the backlog back under budget. */
-    if (m_config->monitor_input != NULL && m_staged_monitor_commands[conn_id].empty() &&
-        m_key_index_pools[conn_id]->empty()) {
+     * count — pooled/staged + sent-awaiting-response, which equals
+     * (m_reqs_generated - m_reqs_processed) — at pipeline * connection_count,
+     * the same total depth a non-staged run would sustain. A connection that
+     * still has its own pooled or staged commands to drain is never held
+     * here, so draining and therefore forward progress is never blocked;
+     * only pure producers pause until responses bring the backlog back under
+     * budget. Once a target's response handler bumps m_reqs_processed below
+     * the budget, the next fill_pipeline tick on the producer (driven by the
+     * target's own schedule_fill chain after responses, or by any other
+     * conn's bufferevent callback in the same event loop) sees in_flight <
+     * budget and resumes producing. */
+    if (m_staged_monitor_commands[conn_id].empty() && m_key_index_pools[conn_id]->empty()) {
         // Clamp the subtraction: m_reqs_generated is normally >= m_reqs_processed,
         // but with --retry-on-error a redirected/replayed request can be processed
         // more than once without a matching generated bump. An unsigned underflow
