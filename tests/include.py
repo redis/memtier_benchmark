@@ -259,22 +259,39 @@ def reset_commandstats(connections):
 
 
 def server_supports_resp3(env):
-    """Return True if the Redis server accepts HELLO 3 (Redis 6+).
+    """Detect whether the test cluster's Redis version supports RESP3.
 
-    Capability probe used by tests that pass --protocol=resp3.  Older servers
-    (Redis < 6) reject HELLO 3 with an error, in which case the caller should
-    env.skip().  The probe connection is reset back to RESP2 after the probe
-    so subsequent CLI commands issued via the same connection are not
-    accidentally left in RESP3 mode.
+    Capability probe used by tests that pass --protocol=resp3. RESP3 was
+    introduced in Redis 6.0, so checking the server's major version is
+    sufficient.
+
+    HELLO 3 cannot be used as a probe over a RESP2 connection: the server
+    switches wire format to RESP3 mid-reply (the response is a %7\\r\\n map),
+    redis-py's RESP2 parser fails with a protocol error, and the broad
+    ``except`` would silently classify a fully RESP3-capable Redis 6+ server
+    as "not supported" (R5 round-18 caused 3 RESP3 read-preference tests to
+    silent-skip on Redis 6+). Parse ``redis_version`` from ``INFO server``
+    instead — that reply stays RESP2 and tells us exactly what we need.
     """
     try:
         conn = env.getConnection()
-        resp = conn.execute_command("HELLO", "3")
-        try:
-            conn.execute_command("HELLO", "2")
-        except Exception:
-            pass
-        return resp is not None
+        info = conn.execute_command("INFO", "server")
+        version = None
+        if isinstance(info, dict):
+            version = info.get("redis_version")
+        else:
+            # Raw bulk string fallback (older redis-py / decode_responses=True).
+            if isinstance(info, bytes):
+                info = info.decode("utf-8", errors="replace")
+            for line in info.splitlines():
+                line = line.strip()
+                if line.startswith("redis_version:"):
+                    version = line.split(":", 1)[1].strip()
+                    break
+        if not version:
+            return False
+        major = int(version.split(".")[0])
+        return major >= 6
     except Exception:
         return False
 
