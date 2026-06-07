@@ -287,7 +287,7 @@ measurements: all four modes (primary, secondary, secondaryPreferred,
 nearest) route reads correctly to replicas, with zero leakage to primaries.
 
 A follow-up fixture that bootstraps a real `redis-cli --cluster create`
-cluster within the test harness is tracked in issue #XXX (filed by this PR).
+cluster within the test harness is tracked in issue #462 (filed by this PR).
 
 ### Using rate-limiting for informed benchmarking
 
