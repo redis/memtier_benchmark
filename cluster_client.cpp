@@ -908,6 +908,29 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
                         break;
                     }
 
+                    // Defensive invariant: by this point the guard at lines
+                    // 879-909 must have filtered any rsc that is already a
+                    // primary of an earlier shard in this reply (including
+                    // the current shard's `sc`). If it didn't, we are about
+                    // to silently flip a node from role_primary to
+                    // role_replica and rearm READONLY, which is the exact
+                    // failure mode the guard exists to prevent. Bugbot HIGH
+                    // round-27: assert the contract holds so a future
+                    // refactor can't quietly break it.
+                    //
+                    // Known gap (out of scope here): a LATER shard in the
+                    // same reply that claims rsc as ITS primary would be
+                    // processed after this replica registration and would
+                    // still overwrite the role at line 803. OSS Redis emits
+                    // each shard tuple with primary at index [2] before its
+                    // replicas, but the reply's outer iteration order
+                    // across shards is not guaranteed by the protocol. The
+                    // correct fix is a two-pass scan (collect all primaries
+                    // first, then walk replicas); tracked as a follow-up.
+                    assert(rsc != sc);
+                    for (size_t gi = 0; gi < new_groups.size(); gi++) {
+                        assert(new_groups[gi].primary != rsc);
+                    }
                     if (rsc->get_connection_state() == conn_disconnected) {
                         // Role must be set BEFORE connect() so the READONLY
                         // ladder is armed during the AUTH/HELLO/READONLY/
@@ -975,6 +998,14 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
                 // armed at connect time.
                 rsc->set_role(role_replica);
                 connect_shard_connection(rsc, r_addr, r_port);
+                // Defensive invariant: a freshly created rsc cannot already
+                // be a primary in this reply (it was just allocated).
+                // Same iteration-order caveat as the existing-conn path
+                // above. Bugbot HIGH round-27.
+                assert(rsc != sc);
+                for (size_t gi = 0; gi < new_groups.size(); gi++) {
+                    assert(new_groups[gi].primary != rsc);
+                }
             }
 
             group.replicas.push_back(rsc);
