@@ -1130,21 +1130,56 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         // modes (which can fall back to the primary) we need *any* live
         // routing target.
         bool any_route = false;
-        for (size_t i = 0; i < m_shard_groups.size() && !any_route; i++) {
+        bool any_replica_warming = false;
+        // Walk every shard group so any_replica_warming reflects the whole
+        // topology -- the early-exit on `!any_route` from the previous
+        // implementation could miss a warming replica when the primary went
+        // live first, and that's exactly the bootstrap window we now need to
+        // detect for rp_secondary_preferred.
+        for (size_t i = 0; i < m_shard_groups.size(); i++) {
             if (!strict_secondary) {
                 shard_connection *p = m_shard_groups[i].primary;
                 if (p != NULL && p->is_ready_for_reads()) {
                     any_route = true;
-                    break;
                 }
             }
             for (size_t j = 0; j < m_shard_groups[i].replicas.size(); j++) {
                 shard_connection *r = m_shard_groups[i].replicas[j];
-                if (r != NULL && r->is_ready_for_reads()) {
+                if (r == NULL) continue;
+                if (r->is_ready_for_reads()) {
                     any_route = true;
-                    break;
+                } else if (r->get_connection_state() != conn_disconnected) {
+                    // Replica TCP is up (conn_in_progress or conn_connected) but
+                    // its setup ladder (AUTH/HELLO/READONLY/CLUSTER SLOTS) has not
+                    // completed yet. Treat as "warming"; the next event-loop tick
+                    // will progress it to is_ready_for_reads().
+                    any_replica_warming = true;
                 }
             }
+        }
+        // Bootstrap window for rp_secondary_preferred / rp_nearest: when a
+        // replica is still warming (TCP connected but the setup ladder
+        // AUTH/HELLO/READONLY/CLUSTER SLOTS hasn't completed) but the primary
+        // for that shard is already live, the permissive fallback would
+        // silently steer every GET on that shard's slots to the primary until
+        // the replica finishes its ladder.
+        // tests/test_read_preference_modes.py (test #3 secondary_preferred) and
+        // R5 round-25 CI both observed ~50-63 master GETs leak out of 1600
+        // total. Hold the producer while ANY configured replica is still
+        // warming -- the leak is per-shard and depends on which replicas
+        // happen to finish their ladder first, so checking a single
+        // "any_live_replica" flag is insufficient (a shard whose replica
+        // landed second still leaks GETs to its primary). Once every replica
+        // has either completed setup or permanently failed, exit the
+        // bootstrap window. The primary-fallback semantics of
+        // select_target_conn still apply once we leave this window, so a
+        // cluster that genuinely has no replicas is unaffected. The warning
+        // ladder below remains the safety net when the bootstrap stretches
+        // past 60s.
+        //
+        if (any_replica_warming &&
+            (m_config->read_preference == rp_secondary_preferred || m_config->read_preference == rp_nearest)) {
+            return true;
         }
         if (!any_route) {
             // Coarse rate-limited operator signal: when ratio.a==0 + no live
