@@ -961,6 +961,20 @@ void shard_connection::rearm_readonly()
     struct timeval now;
     gettimeofday(&now, NULL);
 
+    // Under --read-preference=secondary, primary connections get paused via
+    // bufferevent_disable(EV_READ | EV_WRITE) by fill_pipeline once they have
+    // no work. On a role flip primary->replica, bufferevent_write below would
+    // force EPOLLOUT but EV_READ would stay disabled; the +OK reply would
+    // land in the kernel buffer with no readcb to consume it, m_readonly_state
+    // would stay at setup_sent, is_conn_setup_done() would never return true,
+    // and the connection would deadlock for reads. Re-enable I/O and clear
+    // the paused flag, matching the BEV_EVENT_CONNECTED handler and
+    // schedule_fill paths.
+    if (m_bev_paused) {
+        bufferevent_enable(m_bev, EV_READ | EV_WRITE);
+        m_bev_paused = false;
+    }
+
     // Send the READONLY bytes via bufferevent_write (same path as the normal
     // ladder in send_conn_setup_commands) to force EPOLLOUT registration.
     static const char READONLY_CMD[] = "*1\r\n$8\r\nREADONLY\r\n";
