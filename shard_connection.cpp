@@ -906,6 +906,36 @@ bool shard_connection::is_conn_setup_done()
            m_hello == setup_done && m_readonly_state == setup_done;
 }
 
+bool shard_connection::peer_client_has_any_setup_in_progress() const
+{
+    // Walk every shard_connection on the same client. A peer "is mid-setup"
+    // if it is either climbing the setup ladder (conn_in_progress) OR
+    // already TCP-connected but not yet ready for reads (HELLO/CLUSTER
+    // SLOTS/READONLY pending). Dead/disconnected peers don't count — they
+    // either gave up too, or they're racing us toward their own terminal
+    // exit. Reconnect-pending peers (conn_disconnected but with
+    // m_reconnect_attempts > 0 and m_reconnecting true) also count because
+    // their timer is armed and they may yet rejoin the setup ladder.
+    if (m_conns_manager == NULL) return false;
+    const std::vector<shard_connection *> &peers = m_conns_manager->get_connections();
+    for (size_t i = 0; i < peers.size(); i++) {
+        const shard_connection *peer = peers[i];
+        if (peer == NULL || peer == this) continue;
+        const enum connection_state st = peer->m_connection_state;
+        if (st == conn_in_progress) {
+            return true;
+        }
+        if (st == conn_connected && !peer->is_ready_for_reads()) {
+            return true;
+        }
+        if (st == conn_disconnected && peer->m_reconnecting) {
+            // Peer has a reconnect timer armed; treat as in-flight.
+            return true;
+        }
+    }
+    return false;
+}
+
 void shard_connection::send_conn_setup_commands(struct timeval timestamp)
 {
     if (m_authentication == setup_none) {
@@ -1537,6 +1567,22 @@ void shard_connection::attempt_reconnect(const char *error_context)
         // --max-reconnect-attempts is set.
         return;
     } else {
+        // Under --read-preference != primary, ONE dead replica should not
+        // tear down the whole worker thread while sibling connections are
+        // still mid-setup-ladder on the surviving primary/replicas. The
+        // RESP3 setup ladder (HELLO 3 ack + READONLY ack) is heavy enough
+        // that a Connection-refused storm from the shut-down replica races
+        // ahead of those acks; if we loopbreak here, the peers never finish
+        // setup and zero GETs ever fly. Fall back to the cluster_client
+        // routing path which already gates on is_ready_for_reads() and
+        // handles dead-conn cases via the bootstrap-warming hold.
+        if (m_config->read_preference != rp_primary && peer_client_has_any_setup_in_progress()) {
+            benchmark_error_log("Maximum reconnection attempts (%u) exceeded for %s on conn %u; peers still mid-setup, "
+                                "leaving connection dead and continuing.\n",
+                                m_config->max_reconnect_attempts, error_context, m_id);
+            disconnect();
+            return;
+        }
         benchmark_error_log("Maximum reconnection attempts (%u) exceeded for %s, triggering thread restart.\n",
                             m_config->max_reconnect_attempts, error_context);
         disconnect();
@@ -1592,6 +1638,20 @@ void shard_connection::handle_reconnect_timer_event()
             event_add(m_reconnect_timer, &delay);
             m_reconnecting = true;
         } else {
+            // Mirror attempt_reconnect's terminal-else policy: under
+            // --read-preference != primary, do not tear down the worker
+            // thread if any sibling connection is still climbing its setup
+            // ladder. The cluster_client routing path will skip this dead
+            // connection via is_ready_for_reads() and route around it.
+            if (m_config->read_preference != rp_primary && peer_client_has_any_setup_in_progress()) {
+                benchmark_error_log("Maximum reconnection attempts (%u) exceeded on conn %u; peers still mid-setup, "
+                                    "leaving connection dead and continuing.\n",
+                                    m_config->max_reconnect_attempts, m_id);
+                // disconnect() already ran when the prior attempt failed;
+                // m_connection_state is conn_disconnected and routing will
+                // skip it. Just return — no loopbreak, no further retries.
+                return;
+            }
             benchmark_error_log("Maximum reconnection attempts (%u) exceeded, triggering thread restart.\n",
                                 m_config->max_reconnect_attempts);
             // Break the event loop to trigger thread restart. No state reset

@@ -301,6 +301,15 @@ private:
     bool is_conn_setup_done();
     void send_conn_setup_commands(struct timeval timestamp);
 
+    // True iff any peer connection on this client is still climbing the
+    // setup ladder (TCP-up or in-progress, but not yet ready for reads).
+    // Used by attempt_reconnect's terminal-else to avoid tearing down the
+    // whole worker thread when ONE connection has exhausted its reconnect
+    // budget but its sibling connections are still mid-HELLO/READONLY on
+    // surviving nodes — cluster_client's routing path can fall back to
+    // those peers via the existing is_ready_for_reads() gate.
+    bool peer_client_has_any_setup_in_progress() const;
+
     request *pop_req();
     void push_req(request *req);
 
