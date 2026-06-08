@@ -56,9 +56,18 @@ _REQUESTS = 100
 
 
 def _pre_populate(env, key_count=100):
-    master_conns = env.getOSSMasterNodesConnectionList()
+    """Write key_count keys to the cluster using a cluster-aware client.
+
+    Earlier revisions iterated fp-key-N round-robin over
+    getOSSMasterNodesConnectionList() with plain StrictRedis connections.
+    Because each connection talks to a single shard and does not follow
+    MOVED redirects, every key that did not hash to its assigned master
+    surfaced as a MOVED error. Switch to a cluster-aware connection that
+    routes each SET to the slot's owner automatically and falls back to a
+    regular connection in non-cluster envs.
+    """
+    conn = env.getClusterConnectionIfNeeded()
     for i in range(key_count):
-        conn = master_conns[i % len(master_conns)]
         conn.execute_command("SET", "fp-key-{}".format(i), "val-{}".format(i))
 
 

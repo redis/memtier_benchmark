@@ -50,10 +50,18 @@ _MGET_BATCH = 10
 
 
 def _pre_populate(env, hash_tag=_HASH_TAG, key_min=_KEY_MIN, key_max=_KEY_MAX):
-    """Write same-slot keys via SET on the masters."""
-    master_conns = env.getOSSMasterNodesConnectionList()
+    """Write same-slot keys to the cluster using a cluster-aware client.
+
+    Earlier revisions iterated round-robin over
+    getOSSMasterNodesConnectionList() with plain StrictRedis connections,
+    which do not follow MOVED redirects. Every key that did not hash to
+    its assigned master surfaced as a MOVED error. Switch to a
+    cluster-aware connection that routes each SET to the slot's owner
+    automatically and falls back to a regular connection in non-cluster
+    envs.
+    """
+    conn = env.getClusterConnectionIfNeeded()
     for i in range(key_min, key_max + 1):
-        conn = master_conns[i % len(master_conns)]
         conn.execute_command(
             "SET",
             "{{{}}}-key-{}".format(hash_tag, i),
