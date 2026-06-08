@@ -1957,6 +1957,24 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
                 send_conn_id = routed;
             }
         }
+        /* Cross-connection backpressure: when the keyless arbitrary read is
+         * routed to a different connection than the producer (replica under
+         * non-primary read_preference), fill_pipeline's
+         * `m_pipeline->size() < pipeline` gate caps only the producer
+         * (conn_id). The destination's actual in-flight depth is invisible
+         * here, so without this guard the producer keeps issuing reads and
+         * the destination's pipeline grows past --pipeline. Mirror the
+         * create_mget_request cross-shard cap at line ~2089: defer when the
+         * destination is at its per-connection pipeline cap, bump the
+         * strict-no-route counter (saturating) so hold_pipeline can trip
+         * the yield gate, and wake the destination so its fill_pipeline can
+         * drain. */
+        if (send_conn_id != conn_id &&
+            (unsigned int) m_connections[send_conn_id]->get_pending_resp() >= m_config->pipeline) {
+            m_connections[send_conn_id]->schedule_fill();
+            if (m_strict_no_route_attempts < UINT_MAX) m_strict_no_route_attempts++;
+            return false;
+        }
         client::create_arbitrary_request(command_index, timestamp, send_conn_id);
         if (is_read) {
             m_strict_no_route_attempts = 0;
