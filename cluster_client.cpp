@@ -682,6 +682,43 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
     std::vector<unsigned int> new_slot_map(MAX_CLUSTER_HSLOT + 1, UINT_MAX);
     std::vector<shard_group> new_groups;
 
+    // Pre-scan all shard tuples to collect the set of (addr, port) endpoints
+    // advertised as a PRIMARY anywhere in this reply. The replica-registration
+    // loop below already guards against flipping a node that's a primary in
+    // an EARLIER or the CURRENT shard (via new_groups + `sc`), but it cannot
+    // see LATER shards that haven't been parsed yet. Without this pre-scan a
+    // node that serves as replica in shard N and primary in shard M > N would
+    // still get role_replica + rearm_readonly() applied at the replica loop,
+    // and the role flip would silently win until shard M is processed (which
+    // re-sets role_primary at line 803 but does NOT undo rearm_readonly).
+    // The known-gap comment at lines 921-929 documented exactly this.
+    // Bugbot HIGH iter6-R3 / round-29 cursor[bot] thread.
+    //
+    // Shape this as a vector<pair<string,string>> rather than a set so a
+    // malformed shard tuple (caught by the validation below) can still
+    // contribute defensively; we only consult contains(), and false negatives
+    // are harmless because the existing guards still cover earlier shards.
+    std::vector<std::pair<std::string, std::string> > advertised_primary_endpoints;
+    for (unsigned int pi = 0; pi < r->get_mbulk_value()->mbulks_elements.size(); pi++) {
+        mbulk_element *ps_el = r->get_mbulk_value()->mbulks_elements[pi];
+        if (ps_el == NULL || !ps_el->is_mbulk_size()) continue;
+        mbulk_size_el *ps = ps_el->as_mbulk_size();
+        if (ps->mbulks_elements.size() < 3 || !ps->mbulks_elements[2]->is_mbulk_size()) continue;
+        mbulk_size_el *pn = ps->mbulks_elements[2]->as_mbulk_size();
+        if (pn->mbulks_elements.size() < 2 || !pn->mbulks_elements[0]->is_bulk() || !pn->mbulks_elements[1]->is_bulk())
+            continue;
+        bulk_el *pa = pn->mbulks_elements[0]->as_bulk();
+        bulk_el *pp = pn->mbulks_elements[1]->as_bulk();
+        if (pa->value_len == 0 || pp->value_len == 0) continue;
+        if (memchr(pa->value, '\0', pa->value_len) != NULL) continue;
+        // pp->value points at the bulk header (':' integer-reply prefix);
+        // value+1 / value_len-1 strips it, matching the primary-port copy
+        // at lines 754-757.
+        std::string p_addr((const char *) pa->value, pa->value_len);
+        std::string p_port((const char *) pp->value + 1, pp->value_len - 1);
+        advertised_primary_endpoints.push_back(std::make_pair(p_addr, p_port));
+    }
+
     // run over response and create connections
     for (unsigned int i = 0; i < r->get_mbulk_value()->mbulks_elements.size(); i++) {
         mbulk_element *shard_el = r->get_mbulk_value()->mbulks_elements[i];
@@ -898,6 +935,29 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
                             break;
                         }
                     }
+                    // Cover LATER shards whose primary tuple hasn't been
+                    // parsed yet: consult the pre-scan of advertised primary
+                    // endpoints. Without this, a node that's a replica in
+                    // shard N and primary in shard M > N would briefly be
+                    // role_replica + rearm_readonly() until shard M's tuple
+                    // restores role_primary -- but rearm_readonly() flips the
+                    // READONLY ladder back to setup_none, so the next read
+                    // pass on the now-primary would gate is_ready_for_reads()
+                    // and send READONLY to a primary on the next handshake.
+                    // Bugbot HIGH iter6-R3 / round-29.
+                    if (!already_primary) {
+                        for (size_t pi = 0; pi < advertised_primary_endpoints.size(); pi++) {
+                            if (advertised_primary_endpoints[pi].first == r_addr &&
+                                advertised_primary_endpoints[pi].second == r_port) {
+                                already_primary = true;
+                                // primary_group_id stays 0 sentinel; the log
+                                // line below names addr:port so the operator
+                                // can identify the node even without a group
+                                // id at this point.
+                                break;
+                            }
+                        }
+                    }
                     if (already_primary) {
                         benchmark_error_log("warning: CLUSTER SLOTS: node %s:%s is both primary (shard %u) and replica "
                                             "(shard %u); preserving primary role and skipping replica registration\n",
@@ -986,6 +1046,20 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
                             }
                         }
                         break;
+                    }
+                }
+                // Cover LATER shards (same iteration-order gap as the
+                // existing-conn path above): if any shard in this reply
+                // advertises (r_addr, r_port) as primary, do not create a
+                // role_replica conn that the later-shard pass will silently
+                // role-flip without undoing READONLY. Bugbot HIGH round-29.
+                if (!shared_endpoint_skip) {
+                    for (size_t pi = 0; pi < advertised_primary_endpoints.size(); pi++) {
+                        if (advertised_primary_endpoints[pi].first == r_addr &&
+                            advertised_primary_endpoints[pi].second == r_port) {
+                            shared_endpoint_skip = true;
+                            break;
+                        }
                     }
                 }
                 if (shared_endpoint_skip) {
