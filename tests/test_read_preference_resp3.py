@@ -310,16 +310,63 @@ def test_resp3_read_preference_mget_secondary(env):
 # Test 3: RESP3 + secondaryPreferred fallback after replica shutdown
 # ---------------------------------------------------------------------------
 
-def _stop_one_replica(replica_conns):
+def _conn_port(conn):
+    """Return the TCP port a redis.Redis connection is bound to, or None."""
+    try:
+        return int(conn.connection_pool.connection_kwargs.get("port"))
+    except Exception:
+        return None
+
+
+def _mark_dead_in_rltest(env, killed_ports):
+    """Tell RLTest that the slave(s) listening on ``killed_ports`` were
+    intentionally shut down by the test, so teardown does not flag the
+    missing process as a crash.
+
+    Requires the RLTest fork carrying StandardEnv.markSlaveDeadByTest
+    (fix/cluster-aware-replicas branch). Silently no-ops on older RLTest
+    builds so the test stays runnable against upstream.
+    """
+    if not killed_ports:
+        return
+    runner = getattr(env, "envRunner", None)
+    shards = getattr(runner, "shards", None) if runner is not None else None
+    if not shards:
+        return
+    for shard in shards:
+        slave_ports = getattr(shard, "slavePorts", None) or []
+        mark = getattr(shard, "markSlaveDeadByTest", None)
+        if not callable(mark):
+            continue
+        for idx, port in enumerate(slave_ports):
+            try:
+                port_int = int(port)
+            except (TypeError, ValueError):
+                continue
+            if port_int in killed_ports:
+                try:
+                    mark(idx)
+                except Exception:
+                    pass
+
+
+def _stop_one_replica(env, replica_conns):
     """Best-effort: SHUTDOWN NOSAVE the first reachable replica.  Returns
-    True if at least one replica was sent the shutdown."""
+    True if at least one replica was sent the shutdown.
+
+    Also notifies RLTest that the killed replica was an expected death so
+    teardown does not flag it as a crash in checkExitCode.
+    """
     for conn in replica_conns:
+        killed_port = _conn_port(conn)
         try:
             conn.execute_command("SHUTDOWN", "NOSAVE")
         except Exception:
             # SHUTDOWN closes the connection; expected.
             pass
         time.sleep(0.5)
+        if killed_port is not None:
+            _mark_dead_in_rltest(env, {killed_port})
         return True
     return False
 
@@ -340,7 +387,7 @@ def test_resp3_read_preference_secondaryPreferred_fallback(env):
     _pre_populate_keys(env, key_min=0, key_max=99, prefix="rp3fb-key-")
 
     # ---- Stop one replica ------------------------------------------------
-    stopped = _stop_one_replica(replica_conns)
+    stopped = _stop_one_replica(env, replica_conns)
     if not stopped:
         env.skip()
         return
