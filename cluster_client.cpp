@@ -1709,7 +1709,18 @@ get_key_response cluster_client::get_key_for_conn(unsigned int command_index, un
     // completes its setup ladder.
 
     key_index_pool *key_idx_pool = m_key_index_pools[other_conn_id];
-    if (key_idx_pool->size() >= KEY_INDEX_QUEUE_MAX_SIZE) return not_available;
+    if (key_idx_pool->size() >= KEY_INDEX_QUEUE_MAX_SIZE) {
+        // Cursor bugbot MED round-33: queue-cap deferral must bump the
+        // strict-no-route counter so hold_pipeline's spin guard
+        // (STRICT_NO_ROUTE_HOLD_THRESHOLD) sees it. Without this bump a
+        // perpetually-full target pool returns not_available silently and
+        // fill_pipeline busy-loops since the pipeline-depth gate never
+        // fires (producer's own pipeline does not grow). Mirrors the
+        // empty-topology bump at line 1595. Saturating at UINT_MAX avoids
+        // overflow.
+        if (m_strict_no_route_attempts < UINT_MAX) m_strict_no_route_attempts++;
+        return not_available;
+    }
 
     // Cross-shard routing actually committed: reset the back-off counter
     // now (deferred from the producer==target reset above). Cursor bugbot
@@ -1717,7 +1728,8 @@ get_key_response cluster_client::get_key_for_conn(unsigned int command_index, un
     // a perpetual not_available from the setup_done or queue-cap gate
     // stayed invisible to hold_pipeline's yield. Resetting here means the
     // counter only clears on an actually-queued read, mirroring the
-    // semantics of the producer==target reset.
+    // semantics of the producer==target reset. Round-33: queue-cap path
+    // now also bumps the counter above, so hold_pipeline yields.
     if (is_read) {
         m_strict_no_route_attempts = 0;
     }
