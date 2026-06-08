@@ -11,8 +11,26 @@ name: TSAN (ThreadSanitizer)
 on:
   push:
     branches: [master, main]
+    paths-ignore:
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/code-style.yml'
+      - '.github/workflows/release.yml'
+      - '.github/workflows/release-rpm.yml'
+      - '.github/workflows/dockers.yml'
+      - 'README.md'
+      - 'docs/**'
+      - '**.md'
   pull_request:
     branches: [master, main]
+    paths-ignore:
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/code-style.yml'
+      - '.github/workflows/release.yml'
+      - '.github/workflows/release-rpm.yml'
+      - '.github/workflows/dockers.yml'
+      - 'README.md'
+      - 'docs/**'
+      - '**.md'
 
 permissions:
   contents: read
