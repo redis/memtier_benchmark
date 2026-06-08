@@ -79,18 +79,70 @@ jobs:
           - name: "Single Endpoint: TCP Plaintext"
             env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "0", VERBOSE: "1", ASAN_OPTIONS: "detect_leaks=1" }
             tls: false
-          - name: "Single Endpoint: TCP TLS"
-            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", VERBOSE: "1", ASAN_OPTIONS: "detect_leaks=1" }
+          # "Single Endpoint: TCP TLS" was split into per-test-file cells
+          # (round-37) to reduce wallclock on the longest sanitizer cells. Each
+          # split honors the TEST env var consumed by tests/run_tests.sh.
+          - name: "Single Endpoint: TCP TLS (monitor)"
+            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", VERBOSE: "1", ASAN_OPTIONS: "detect_leaks=1",
+                   TEST: "test_monitor_input.py" }
+            tls: true
+          - name: "Single Endpoint: TCP TLS (scan-staircase)"
+            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", VERBOSE: "1", ASAN_OPTIONS: "detect_leaks=1",
+                   TEST: "test_scan.py test_client_staircase.py" }
+            tls: true
+          - name: "Single Endpoint: TCP TLS (mget)"
+            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", VERBOSE: "1", ASAN_OPTIONS: "detect_leaks=1",
+                   TEST: "test_mget_protocol.py test_mget_standalone.py test_mget_validation.py" }
+            tls: true
+          - name: "Single Endpoint: TCP TLS (cli)"
+            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", VERBOSE: "1", ASAN_OPTIONS: "detect_leaks=1",
+                   TEST: "test_cli_validation_command.py test_cli_validation_count_flags.py test_cli_validation_read_preference.py test_cli_validation_run_count.py test_cli_validation_sampler.py test_cli_validation_size.py test_cli_fuzz_phase1.py" }
+            tls: true
+          - name: "Single Endpoint: TCP TLS (misc)"
+            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", VERBOSE: "1", ASAN_OPTIONS: "detect_leaks=1",
+                   TEST: "test_arbitrary_command_misses.py test_crash_handler_integration.py test_json_output_integrity.py test_large_key_prefix.py test_miss_rate_tracking.py test_realtime_latencies.py test_resp_response_fuzzer.py test_retry_on_error.py test_sigpipe_immunity.py test_sigpipe_tls_rst.py test_statsd.py test_tls_logging.py" }
             tls: true
           # TODO: v1.2 coverage deferred to nightly when schedule added
-          - name: "OSS TCP TLS v1.3"
-            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", TLS_PROTOCOLS: "TLSv1.3", VERBOSE: "1", ASAN_OPTIONS: "detect_leaks=1" }
+          # "OSS TCP TLS v1.3" was split into per-test-file cells (round-37).
+          - name: "OSS TCP TLS v1.3 (monitor)"
+            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", TLS_PROTOCOLS: "TLSv1.3", VERBOSE: "1", ASAN_OPTIONS: "detect_leaks=1",
+                   TEST: "test_monitor_input.py" }
+            tls: true
+          - name: "OSS TCP TLS v1.3 (scan-staircase)"
+            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", TLS_PROTOCOLS: "TLSv1.3", VERBOSE: "1", ASAN_OPTIONS: "detect_leaks=1",
+                   TEST: "test_scan.py test_client_staircase.py" }
+            tls: true
+          - name: "OSS TCP TLS v1.3 (mget)"
+            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", TLS_PROTOCOLS: "TLSv1.3", VERBOSE: "1", ASAN_OPTIONS: "detect_leaks=1",
+                   TEST: "test_mget_protocol.py test_mget_standalone.py test_mget_validation.py" }
+            tls: true
+          - name: "OSS TCP TLS v1.3 (cli)"
+            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", TLS_PROTOCOLS: "TLSv1.3", VERBOSE: "1", ASAN_OPTIONS: "detect_leaks=1",
+                   TEST: "test_cli_validation_command.py test_cli_validation_count_flags.py test_cli_validation_read_preference.py test_cli_validation_run_count.py test_cli_validation_sampler.py test_cli_validation_size.py test_cli_fuzz_phase1.py" }
+            tls: true
+          - name: "OSS TCP TLS v1.3 (misc)"
+            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", TLS_PROTOCOLS: "TLSv1.3", VERBOSE: "1", ASAN_OPTIONS: "detect_leaks=1",
+                   TEST: "test_arbitrary_command_misses.py test_crash_handler_integration.py test_json_output_integrity.py test_large_key_prefix.py test_miss_rate_tracking.py test_realtime_latencies.py test_resp_response_fuzzer.py test_retry_on_error.py test_sigpipe_immunity.py test_sigpipe_tls_rst.py test_statsd.py test_tls_logging.py" }
             tls: true
           - name: "OSS-CLUSTER API: TCP Plaintext"
             env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", VERBOSE: "1", ASAN_OPTIONS: "detect_leaks=1", PARALLELISM: "2" }
             tls: false
-          - name: "OSS-CLUSTER API: TCP TLS"
-            env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", TLS: "1", VERBOSE: "1", ASAN_OPTIONS: "detect_leaks=1", PARALLELISM: "2" }
+          # "OSS-CLUSTER API: TCP TLS" was split into per-test-file cells (round-37).
+          - name: "OSS-CLUSTER API: TCP TLS (mget)"
+            env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", TLS: "1", VERBOSE: "1", ASAN_OPTIONS: "detect_leaks=1", PARALLELISM: "2",
+                   TEST: "test_mget_cluster.py" }
+            tls: true
+          - name: "OSS-CLUSTER API: TCP TLS (reconnections)"
+            env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", TLS: "1", VERBOSE: "1", ASAN_OPTIONS: "detect_leaks=1", PARALLELISM: "2",
+                   TEST: "test_reconnections.py" }
+            tls: true
+          - name: "OSS-CLUSTER API: TCP TLS (transaction)"
+            env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", TLS: "1", VERBOSE: "1", ASAN_OPTIONS: "detect_leaks=1", PARALLELISM: "2",
+                   TEST: "test_cluster_transaction.py test_transaction_pipeline.py" }
+            tls: true
+          - name: "OSS-CLUSTER API: TCP TLS (misc)"
+            env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", TLS: "1", VERBOSE: "1", ASAN_OPTIONS: "detect_leaks=1", PARALLELISM: "2",
+                   TEST: "test_monitor_cluster.py test_monitor_cluster_backpressure.py test_cli_fuzz_phase1.py test_cli_validation_command.py test_cli_validation_count_flags.py test_cli_validation_read_preference.py test_cli_validation_size.py test_crash_handler_integration.py test_json_output_integrity.py test_realtime_latencies.py test_resp_response_fuzzer.py test_retry_on_error.py test_sigpipe_immunity.py test_sigpipe_tls_rst.py test_statsd.py test_tls_logging.py" }
             tls: true
           - name: "STRESS: Standalone TCP Plaintext"
             env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "0", VERBOSE: "1", ASAN_OPTIONS: "detect_leaks=1", STRESS: "1" }
