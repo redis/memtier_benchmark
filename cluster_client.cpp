@@ -387,21 +387,19 @@ void cluster_client::build_mget_slot_cache()
         unsigned int cid = primary->get_id();
         if (cid < num_conns) m_mget_conn_slots[cid].push_back(slot);
 
-        // Replica producers also need a populated slot list so they can produce
-        // MGETs in mixed --ratio + --multi-key-get workloads. Without this,
-        // create_mget_request returns false with m_mget_defer=false on a replica
-        // producer; the caller in client::create_request then forces
-        // m_get_ratio_count to the GET cap and silently skips the MGET batch.
-        // Each replica gets the same slot set as its primary; create_mget_request
-        // calls select_target_conn(target_slot, true) which honors --read-preference
-        // and naturally dispatches to whichever replica (or back to the primary
-        // for rp_primary) the routing policy elects.
-        const shard_group &g = m_shard_groups[gidx];
-        for (size_t r = 0; r < g.replicas.size(); r++) {
-            if (g.replicas[r] == NULL) continue;
-            unsigned int rcid = g.replicas[r]->get_id();
-            if (rcid < num_conns) m_mget_conn_slots[rcid].push_back(slot);
-        }
+        // Slot ownership is intentionally primary-only: exactly one producer
+        // per shard. The primary's fill_pipeline ticks drive create_mget_request,
+        // which then calls select_target_conn(slot, true) to honor
+        // --read-preference and dispatch the MGET to the chosen primary or
+        // replica connection. Attaching the same slot list to replica conns as
+        // well caused duplicate MGET issuance (the replica's own fill_pipeline
+        // would also produce an MGET for "its" slot, and m_get_ratio_count —
+        // shared at the client level — would advance twice per cycle, so the
+        // configured --ratio no longer matched on-the-wire request counts).
+        // Replica conns with an empty slot list take the "exhausted" branch
+        // in create_mget_request, which resets the SET/GET cycle so mixed
+        // --ratio workloads keep producing SETs (routed to the primary) from
+        // every connection.
     }
 }
 
@@ -2053,7 +2051,17 @@ bool cluster_client::create_mget_request(struct timeval &timestamp, unsigned int
     if (keys_count == 0) return false;
 
     if (conn_id >= m_mget_conn_slots.size() || m_mget_conn_slots[conn_id].empty()) {
-        // Cache not ready or no key in the configured range maps to this shard.
+        // Cache not ready, no key in the configured range maps to this shard,
+        // or this connection is a replica (slot ownership is primary-only;
+        // see build_mget_slot_cache). The "exhausted" semantics here — m_mget_defer
+        // stays false so the caller force-bumps m_get_ratio_count to the GET cap
+        // and resets the SET/GET cycle on the next tick — are exactly what keeps
+        // mixed --ratio + --multi-key-get workloads progressing on replica
+        // fill_pipeline ticks: the replica's SET phase still produces routed SETs
+        // (which select_target_conn dispatches to the primary), and the would-be
+        // replica MGET is correctly elided because the primary's own
+        // fill_pipeline is the sole producer (select_target_conn there honors
+        // --read-preference and may dispatch the actual MGET back to a replica).
         return false;
     }
 
