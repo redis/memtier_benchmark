@@ -1353,8 +1353,27 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         // window under mixed traffic too; SETs are deferred along with
         // GETs, which is acceptable cost for the few hundred ms it takes
         // the replicas' ladders to land.
+        //
+        // Strict-secondary mixed-workload coverage (Cursor[bot] round-32):
+        // under --read-preference=secondary the strict_secondary branch
+        // above only fires when there is NO route at all (!any_route). In a
+        // mixed workload (ratio.b > 0 with ratio.a > 0) the SET path has a
+        // route via the primary, so any_route is true and the !any_route
+        // gate never trips. GETs then race through get_key_for_conn, which
+        // calls client::get_key_for_conn FIRST (advancing the key cursor)
+        // and only THEN consults select_target_conn -- which returns
+        // UINT_MAX while replicas are still warming. The result is silent
+        // key-index loss: every deferred GET burns one key slot before
+        // not_available is returned. Extend the warming-gate condition to
+        // strict rp_secondary whenever there is any read component, so the
+        // producer pauses until at least one replica has finished its
+        // setup ladder. Pure-read strict secondary (ratio.b > 0 &&
+        // ratio.a == 0) is also covered here, which is strictly more
+        // protective than the !any_route gate alone (no behavioural
+        // regression -- the producer just yields a few ticks earlier).
         if (any_replica_warming &&
-            (m_config->read_preference == rp_secondary_preferred || m_config->read_preference == rp_nearest)) {
+            (m_config->read_preference == rp_secondary_preferred || m_config->read_preference == rp_nearest ||
+             (m_config->read_preference == rp_secondary && m_config->ratio.b > 0))) {
             return true;
         }
         // The all-replicas-unreachable warning + stall hold below is
