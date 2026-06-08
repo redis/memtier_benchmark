@@ -1285,12 +1285,36 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         // modes (which can fall back to the primary) we need *any* live
         // routing target.
         bool any_route = false;
-        bool any_replica_warming = false;
-        // Walk every shard group so any_replica_warming reflects the whole
-        // topology -- the early-exit on `!any_route` from the previous
-        // implementation could miss a warming replica when the primary went
-        // live first, and that's exactly the bootstrap window we now need to
-        // detect for rp_secondary_preferred.
+        bool this_shard_replica_warming = false;
+        // Locate the shard group owning conn_id so the warming gate can be
+        // scoped to *this* shard's replicas. The original implementation
+        // walked every shard's replicas and tripped the gate if ANY replica
+        // anywhere was still warming -- a shard whose own replicas were
+        // already ready (or which had no replicas at all) would still be
+        // held back while UNRELATED shards' replicas finished their setup
+        // ladder. Per-shard scoping fixes the per-shard leak (the original
+        // bug round-25 / round-32 were chasing) without over-blocking
+        // primary-fallback producers under rp_secondary_preferred /
+        // rp_nearest. (Bugbot round-41.)
+        size_t conn_shard_idx = m_shard_groups.size(); // sentinel == "not found"
+        for (size_t i = 0; i < m_shard_groups.size(); i++) {
+            shard_connection *p = m_shard_groups[i].primary;
+            if (p != NULL && p->get_id() == conn_id) {
+                conn_shard_idx = i;
+                break;
+            }
+            for (size_t j = 0; j < m_shard_groups[i].replicas.size(); j++) {
+                shard_connection *r = m_shard_groups[i].replicas[j];
+                if (r != NULL && r->get_id() == conn_id) {
+                    conn_shard_idx = i;
+                    break;
+                }
+            }
+            if (conn_shard_idx != m_shard_groups.size()) break;
+        }
+        // Walk every shard for the cluster-wide any_route signal (used by
+        // the all-replicas-unreachable warning below), but only consult the
+        // current shard's replicas for the per-shard warming flag.
         for (size_t i = 0; i < m_shard_groups.size(); i++) {
             if (!strict_secondary) {
                 shard_connection *p = m_shard_groups[i].primary;
@@ -1303,24 +1327,34 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
                 if (r == NULL) continue;
                 if (r->is_ready_for_reads()) {
                     any_route = true;
-                } else if (r->get_connection_state() != conn_disconnected) {
+                } else if (r->get_connection_state() != conn_disconnected && i == conn_shard_idx) {
                     // Replica TCP is up (conn_in_progress or conn_connected) but
                     // its setup ladder (AUTH/HELLO/READONLY/CLUSTER SLOTS) has not
                     // completed yet. Treat as "warming"; the next event-loop tick
                     // will progress it to is_ready_for_reads().
+                    //
+                    // Only count warming for replicas that belong to the
+                    // current producer's shard -- otherwise an UNRELATED
+                    // shard's still-warming replica would block this shard
+                    // even though this shard's own routing is already
+                    // resolvable. If conn_id could not be located in any
+                    // shard group (transient mid-topology-refresh window),
+                    // conn_shard_idx == m_shard_groups.size() and no shard
+                    // can ever match -- which is the correct fail-open: do
+                    // not hold on stale topology.
                     //
                     // Bounded-wait safety net: this branch only fires while a
                     // replica is in a non-terminal state. If DNS is broken or
                     // every replica is dead, attempt_reconnect() eventually
                     // transitions the conn through disconnect() -> backoff ->
                     // connect() -> ..., and during the backoff window the
-                    // state is conn_disconnected, so any_replica_warming flips
-                    // false and the gate releases below (primary fallback
+                    // state is conn_disconnected, so this_shard_replica_warming
+                    // flips false and the gate releases below (primary fallback
                     // works for rp_secondary_preferred / rp_nearest). After
                     // --max-reconnect-attempts the thread is torn down by
                     // event_base_loopbreak. So the hold is never permanent
                     // even with all replicas down. Bugbot round-29 B2.
-                    any_replica_warming = true;
+                    this_shard_replica_warming = true;
                 }
             }
         }
@@ -1369,7 +1403,7 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         // ratio.a == 0) is also covered here, which is strictly more
         // protective than the !any_route gate alone (no behavioural
         // regression -- the producer just yields a few ticks earlier).
-        if (any_replica_warming &&
+        if (this_shard_replica_warming &&
             (m_config->read_preference == rp_secondary_preferred || m_config->read_preference == rp_nearest ||
              (m_config->read_preference == rp_secondary && m_config->ratio.b > 0))) {
             return true;
