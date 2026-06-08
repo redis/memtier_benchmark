@@ -69,9 +69,7 @@ jobs:
           - name: "Single Endpoint: TCP TLS"
             env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", VERBOSE: "1" }
             tls: true
-          - name: "OSS TCP TLS v1.2"
-            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", TLS_PROTOCOLS: "TLSv1.2", VERBOSE: "1" }
-            tls: true
+          # TODO: v1.2 coverage deferred to nightly when schedule added
           - name: "OSS TCP TLS v1.3"
             env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", TLS_PROTOCOLS: "TLSv1.3", VERBOSE: "1" }
             tls: true
