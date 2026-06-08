@@ -151,8 +151,11 @@ def test_monitor_cluster_completes_and_routes(env):
     test_dir = tempfile.mkdtemp()
     monitor_file = _make_monitor_file(test_dir)
 
-    # Smaller, quick run.
-    ok, js, _run_config = _run_monitor_cluster(env, monitor_file, requests=1000)
+    # Smaller, quick run. requests=4000 keeps the smoke check fast while pushing
+    # the aggregate duration above ~1ms so run_stats::timeval_factorial_average
+    # (run_stats.cpp:116-123) does not truncate the diff to 0 us and report
+    # Ops/sec = 0 under sanitizer/UBSan slowdown.
+    ok, js, _run_config = _run_monitor_cluster(env, monitor_file, requests=4000)
     env.assertTrue(ok, message="memtier did not complete the monitor-cluster run")
 
     totals = js.get("ALL STATS", {}).get("Totals", {})
