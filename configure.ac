@@ -85,7 +85,7 @@ AC_ARG_ENABLE([sanitizers],
                   [Enable AddressSanitizer and LeakSanitizer for memory error detection])])
 AS_IF([test "x$enable_sanitizers" = "xyes"], [
        AC_MSG_NOTICE([Enabling AddressSanitizer and LeakSanitizer])
-       CXXFLAGS="$CXXFLAGS -fsanitize=address -fsanitize=leak -fno-omit-frame-pointer -O1"
+       CXXFLAGS="$CXXFLAGS -fsanitize=address -fsanitize=leak -fno-omit-frame-pointer -O1 -g"
        LDFLAGS="$LDFLAGS -fsanitize=address -fsanitize=leak"
        ], [])
 
@@ -95,7 +95,7 @@ AC_ARG_ENABLE([ubsan],
                   [Enable UndefinedBehaviorSanitizer for undefined behavior detection])])
 AS_IF([test "x$enable_ubsan" = "xyes"], [
        AC_MSG_NOTICE([Enabling UndefinedBehaviorSanitizer])
-       CXXFLAGS="$CXXFLAGS -fsanitize=undefined -fno-omit-frame-pointer"
+       CXXFLAGS="$CXXFLAGS -fsanitize=undefined -fno-omit-frame-pointer -O1 -g"
        LDFLAGS="$LDFLAGS -fsanitize=undefined"
        ], [])
 
@@ -108,7 +108,7 @@ AS_IF([test "x$enable_thread_sanitizer" = "xyes"], [
               AC_MSG_ERROR([--enable-thread-sanitizer and --enable-sanitizers are mutually exclusive])
        ])
        AC_MSG_NOTICE([Enabling ThreadSanitizer])
-       CXXFLAGS="$CXXFLAGS -fsanitize=thread -fno-omit-frame-pointer -O1"
+       CXXFLAGS="$CXXFLAGS -fsanitize=thread -fno-omit-frame-pointer -O1 -g"
        LDFLAGS="$LDFLAGS -fsanitize=thread"
        ], [])
 
