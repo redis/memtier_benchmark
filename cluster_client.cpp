@@ -1280,7 +1280,7 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
      * to the primary, so a no-route situation only arises when *every*
      * connection (primary + replicas) is offline -- a transient state we
      * still want to yield on rather than burn CPU. */
-    if (m_config->ratio.a == 0 && m_config->read_preference != rp_primary) {
+    if (m_config->read_preference != rp_primary) {
         const bool strict_secondary =
             m_config->read_preference == rp_secondary && m_config->read_preference_fallback != rpf_primary;
         // For strict-secondary we need a live REPLICA; for the non-strict
@@ -1310,6 +1310,18 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
                     // its setup ladder (AUTH/HELLO/READONLY/CLUSTER SLOTS) has not
                     // completed yet. Treat as "warming"; the next event-loop tick
                     // will progress it to is_ready_for_reads().
+                    //
+                    // Bounded-wait safety net: this branch only fires while a
+                    // replica is in a non-terminal state. If DNS is broken or
+                    // every replica is dead, attempt_reconnect() eventually
+                    // transitions the conn through disconnect() -> backoff ->
+                    // connect() -> ..., and during the backoff window the
+                    // state is conn_disconnected, so any_replica_warming flips
+                    // false and the gate releases below (primary fallback
+                    // works for rp_secondary_preferred / rp_nearest). After
+                    // --max-reconnect-attempts the thread is torn down by
+                    // event_base_loopbreak. So the hold is never permanent
+                    // even with all replicas down. Bugbot round-29 B2.
                     any_replica_warming = true;
                 }
             }
@@ -1334,11 +1346,25 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         // ladder below remains the safety net when the bootstrap stretches
         // past 60s.
         //
+        // Mixed-workload coverage (Bugbot round-29 B3): the original gate was
+        // scoped to ratio.a == 0 (pure GETs), so under --ratio=1:1 GETs
+        // could still leak to the primary during warmup. Removing the
+        // ratio.a precondition holds the producer for the (short) bootstrap
+        // window under mixed traffic too; SETs are deferred along with
+        // GETs, which is acceptable cost for the few hundred ms it takes
+        // the replicas' ladders to land.
         if (any_replica_warming &&
             (m_config->read_preference == rp_secondary_preferred || m_config->read_preference == rp_nearest)) {
             return true;
         }
-        if (!any_route) {
+        // The all-replicas-unreachable warning + stall hold below is
+        // specifically about the read-only spin-loop pathology
+        // (fill_pipeline calling select_target_conn -> UINT_MAX ->
+        // not_available -> retry forever, with no SETs to keep the
+        // pipeline-depth gate happy). Keep the ratio.a==0 precondition for
+        // this branch only; mixed workloads have SETs to consume budget so
+        // they cannot spin here.
+        if (m_config->ratio.a == 0 && !any_route) {
             // Coarse rate-limited operator signal: when ratio.a==0 + no live
             // routing target + non-rp_primary, the benchmark stalls
             // indefinitely (--reconnect-on-error=off can't revive the lost
