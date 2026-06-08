@@ -643,11 +643,14 @@ int shard_connection::get_local_port()
 
 const char *shard_connection::get_last_request_type()
 {
-    // Read the cached most-recently-pushed type set by push_req(). This is
-    // signal-safe diagnostic output: an aligned `volatile int` read can't tear
-    // on the platforms we support, and we never deref the queue's request*
-    // (which a worker thread might be popping/freeing concurrently).
-    int t = m_last_pushed_req_type;
+    // Read the cached most-recently-pushed type set by push_req(). Called from
+    // the crash-handler signal context on a foreign (main) thread, racing with
+    // the connection's worker thread; std::atomic<int> with relaxed ordering
+    // gives TSAN a clean happens-before edge and is signal-safe because the
+    // load is lock-free on every supported platform. We never deref the
+    // queue's request* (which a worker thread might be popping/freeing
+    // concurrently).
+    int t = m_last_pushed_req_type.load(std::memory_order_relaxed);
     switch (t) {
     case rt_set:
         return "SET";
@@ -677,8 +680,12 @@ request *shard_connection::pop_req()
     request *req = m_pipeline->front();
     m_pipeline->pop();
 
-    m_pending_resp--;
-    assert(m_pending_resp >= 0);
+    // Worker-thread mutation; relaxed is sufficient because all mutations
+    // happen on the connection's owning event-loop thread. The signal-handler
+    // reader uses an atomic load purely to establish a TSAN happens-before
+    // edge for the foreign-thread read.
+    m_pending_resp.fetch_sub(1, std::memory_order_relaxed);
+    assert(m_pending_resp.load(std::memory_order_relaxed) >= 0);
 
     return req;
 }
@@ -686,10 +693,11 @@ request *shard_connection::pop_req()
 void shard_connection::push_req(request *req)
 {
     m_pipeline->push(req);
-    m_pending_resp++;
+    // Worker-thread mutation (see pop_req comment).
+    m_pending_resp.fetch_add(1, std::memory_order_relaxed);
     // Snapshot the type for the crash handler (which can't safely deref the
     // queue front without racing with worker-thread pops/destructors).
-    m_last_pushed_req_type = (int) req->m_type;
+    m_last_pushed_req_type.store((int) req->m_type, std::memory_order_relaxed);
     // Per-endpoint routed_ops: count anything that's not a connection-setup
     // request. This is the canonical "how many user-level requests did we
     // route here" tally used by the "Endpoints" array in mb.json.

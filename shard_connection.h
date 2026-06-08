@@ -19,6 +19,7 @@
 #ifndef MEMTIER_BENCHMARK_SHARD_CONNECTION_H
 #define MEMTIER_BENCHMARK_SHARD_CONNECTION_H
 
+#include <atomic>
 #include <climits>
 #include <queue>
 #include <string>
@@ -254,7 +255,11 @@ public:
     void inc_routed_ops() { m_routed_ops++; }
     unsigned long long get_routed_ops() const { return m_routed_ops; }
 
-    int get_pending_resp() { return m_pending_resp; }
+    // Snapshot the pending-response counter. Read by the crash-handler signal
+    // path (print_client_list) which races with worker-thread push_req/pop_req
+    // mutations; std::atomic with relaxed ordering gives TSAN a clean
+    // happens-before edge and is signal-safe for lock-free integer atomics.
+    int get_pending_resp() { return m_pending_resp.load(std::memory_order_relaxed); }
 
     // Get local port for crash reporting
     int get_local_port();
@@ -325,13 +330,20 @@ private:
     std::queue<request *> *m_pipeline;
     unsigned int m_request_per_cur_interval; // number requests to send during the current interval
 
-    int m_pending_resp;
+    // Pending-response counter. Mutated only by the connection's owning worker
+    // thread (push_req/pop_req on the libevent callback) but read from the
+    // crash-handler signal context on a foreign thread. std::atomic<int>
+    // serializes those accesses cleanly under TSAN; on every supported
+    // platform std::atomic<int> is lock-free and the loads/stores are
+    // async-signal-safe.
+    std::atomic<int> m_pending_resp;
 
     // Snapshot of the most recently pushed request's type. Updated on every
     // push_req() and read by get_last_request_type() from the crash-handler
-    // signal context; volatile + aligned int avoids the racy deref of
-    // m_pipeline->front()->m_type while worker threads mutate the queue.
-    volatile int m_last_pushed_req_type;
+    // signal context. std::atomic<int> (lock-free, signal-safe) replaces the
+    // earlier `volatile int` which was not sufficient to silence TSAN's
+    // foreign-thread read race report.
+    std::atomic<int> m_last_pushed_req_type;
 
     enum connection_state m_connection_state;
     // Topology role; defaults to role_primary. Cluster_client sets it to
