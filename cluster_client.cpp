@@ -1327,7 +1327,8 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
                 if (r == NULL) continue;
                 if (r->is_ready_for_reads()) {
                     any_route = true;
-                } else if (r->get_connection_state() != conn_disconnected && i == conn_shard_idx) {
+                } else if (r->get_connection_state() != conn_disconnected &&
+                           (conn_shard_idx == m_shard_groups.size() || i == conn_shard_idx)) {
                     // Replica TCP is up (conn_in_progress or conn_connected) but
                     // its setup ladder (AUTH/HELLO/READONLY/CLUSTER SLOTS) has not
                     // completed yet. Treat as "warming"; the next event-loop tick
@@ -1339,9 +1340,14 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
                     // even though this shard's own routing is already
                     // resolvable. If conn_id could not be located in any
                     // shard group (transient mid-topology-refresh window),
-                    // conn_shard_idx == m_shard_groups.size() and no shard
-                    // can ever match -- which is the correct fail-open: do
-                    // not hold on stale topology.
+                    // conn_shard_idx == m_shard_groups.size(); in that case
+                    // we fail CLOSED -- fall back to the pre-round-41 global
+                    // walk so a warming replica anywhere still trips the
+                    // gate. Failing OPEN would leak reads to masters under
+                    // rp_secondary_preferred (round-42 regression: ~3%
+                    // master leaks observed during topology-refresh
+                    // windows because the producer's conn_id couldn't be
+                    // resolved and the gate was silently skipped).
                     //
                     // Bounded-wait safety net: this branch only fires while a
                     // replica is in a non-terminal state. If DNS is broken or
