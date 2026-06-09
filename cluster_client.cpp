@@ -1409,7 +1409,19 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         // ratio.a == 0) is also covered here, which is strictly more
         // protective than the !any_route gate alone (no behavioural
         // regression -- the producer just yields a few ticks earlier).
-        if (this_shard_replica_warming &&
+        // Primary-fallback exemption (Cursor[bot] round-43): when
+        // --read-preference-fallback=primary is set, select_target_conn
+        // will gracefully degrade reads to the live primary while replicas
+        // are still warming. Blocking the producer here is pure cost --
+        // the routing layer already has a valid target, but traffic never
+        // reaches it because the gate above pauses every producer until
+        // every replica completes its setup ladder. For workloads with
+        // long replica warmup (TLS handshakes, large ACLs, slow CLUSTER
+        // SLOTS) this caused the benchmark to stall instead of honoring
+        // the explicit primary-fallback contract. Skip the gate when
+        // fallback=primary; the warning ladder below still trips if EVERY
+        // route (primary included) is down.
+        if (this_shard_replica_warming && m_config->read_preference_fallback != rpf_primary &&
             (m_config->read_preference == rp_secondary_preferred || m_config->read_preference == rp_nearest ||
              (m_config->read_preference == rp_secondary && m_config->ratio.b > 0))) {
             return true;
