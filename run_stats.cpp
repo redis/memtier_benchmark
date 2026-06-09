@@ -115,10 +115,15 @@ inline unsigned long int ts_diff_now(struct timeval a)
 
 inline timeval timeval_factorial_average(timeval a, timeval b, unsigned int weight)
 {
+    // Convert both to total microseconds, average via integer math, split back.
+    // Averaging tv_sec/tv_usec independently truncates each -> loses precision
+    // when aggregate spans < 1ms. See issue #463.
+    int64_t a_usec = (int64_t) a.tv_sec * 1000000 + a.tv_usec;
+    int64_t b_usec = (int64_t) b.tv_sec * 1000000 + b.tv_usec;
+    int64_t avg_usec = (a_usec * (weight - 1) + b_usec) / weight;
     timeval tv;
-    double factor = ((double) weight - 1) / weight;
-    tv.tv_sec = factor * a.tv_sec + (double) b.tv_sec / weight;
-    tv.tv_usec = factor * a.tv_usec + (double) b.tv_usec / weight;
+    tv.tv_sec = (time_t) (avg_usec / 1000000);
+    tv.tv_usec = (suseconds_t) (avg_usec % 1000000);
     return (tv);
 }
 
