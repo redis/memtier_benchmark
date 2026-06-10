@@ -32,7 +32,12 @@ jobs:
     if: >-
       github.event_name != 'pull_request' ||
       contains(github.event.pull_request.labels.*.name, 'run-differential')
-    runs-on: ubuntu-22.04
+    # ubuntu-22.04 ships redis-tools 6.0.16, whose `redis-benchmark --csv`
+    # output does not yet expose the `p99_latency_ms` column that the
+    # differential parser depends on (tests/differential_redis_benchmark.py
+    # raises IndexError when that column is missing). ubuntu-24.04 ships
+    # redis-tools 7.x with the new CSV schema.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
