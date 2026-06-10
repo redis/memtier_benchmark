@@ -115,7 +115,11 @@ def test_slow_network_smooth(env):
         ensure_clean_benchmark_folder(config.results_dir)
 
         benchmark = Benchmark.from_json(config, benchmark_specs)
-        memtier_ok = benchmark.run()
+        # Benchmark.run() defaults to timeout=240s. Soak runs with
+        # test_time>=300s would be killed before they could write a
+        # summary, so we pass an explicit upper bound that leaves
+        # ~90s of slack for graceful shutdown.
+        memtier_ok = benchmark.run(timeout=test_time + 90)
 
         if not memtier_ok:
             debugPrintMemtierOnError(config, env)
