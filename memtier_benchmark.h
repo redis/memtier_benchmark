@@ -32,6 +32,7 @@
 
 // Forward declaration
 class statsd_client;
+class prometheus_exporter;
 
 #define LOGLEVEL_ERROR 0
 #define LOGLEVEL_DEBUG 1

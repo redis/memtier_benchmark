@@ -58,6 +58,7 @@ memtier_benchmark_SOURCES = \
 	command_meta.cpp command_meta.h command_meta_data.h \
 	statsd.cpp statsd.h \
 	prometheus_metrics.cpp prometheus_metrics.h \
+	prometheus_exporter.cpp prometheus_exporter.h \
 	retry_policy.cpp retry_policy.h \
 	deps/hdr_histogram/hdr_histogram_log.c deps/hdr_histogram/hdr_histogram_log.h deps/hdr_histogram/byteorder.h \
 	deps/hdr_histogram/hdr_histogram.c deps/hdr_histogram/hdr_histogram.h \
