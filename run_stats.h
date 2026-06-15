@@ -195,6 +195,11 @@ protected:
     // this mutex serializes hdr_reset and hdr_add from the main thread.
     reinit_mutex_t m_inst_histogram_mutex;
 
+    // Last inst-totals histogram total_count copied by the Prometheus gated
+    // aggregation (copy_inst_histogram_if_changed). Main-thread-only; plain
+    // int64_t so run_stats stays copyable when collected into vectors post-join.
+    int64_t m_prom_last_copied_total;
+
     // Cumulative hits/misses bookkeeping for arbitrary commands. Indexed by
     // arbitrary command index. Per-key vectors are sized to the spec-resolved
     // key count for that command (or 1 when the command has no spec key
@@ -294,6 +299,13 @@ public:
     // Safely copy instantaneous total latency histogram into target under mutex.
     // Use this instead of a raw pointer getter to avoid data races with worker threads.
     void copy_inst_histogram(hdr_histogram *target) const;
+
+    // Like copy_inst_histogram, but only adds (and returns true) when the
+    // inst-totals histogram's total_count changed since the previous gated
+    // copy. Skips frozen histograms (clients that stopped completing ops) so a
+    // dead connection's last partial second is not re-added on every 1 Hz tick.
+    // Main-thread-only; reads total_count under m_inst_histogram_mutex.
+    bool copy_inst_histogram_if_changed(hdr_histogram *target);
     void save_csv_one_sec_cluster(FILE *f);
     void save_csv_set_get_commands(FILE *f, bool cluster_mode);
     void save_csv_arbitrary_commands_one_sec(FILE *f, arbitrary_command_list &command_list,
@@ -342,6 +354,11 @@ public:
     unsigned int get_duration(void);
     unsigned long int get_duration_usec(void);
     unsigned long int get_total_bytes(void);
+    // rx/tx split of get_total_bytes(); same benign-race pattern. The Prometheus
+    // exporter needs the split (memtier_received_bytes_total /
+    // memtier_sent_bytes_total); never source bytes from summarize().
+    unsigned long int get_total_bytes_rx(void);
+    unsigned long int get_total_bytes_tx(void);
     unsigned long int get_total_ops(void);
     double get_total_latency(void);
     unsigned long int get_total_connection_errors(void);

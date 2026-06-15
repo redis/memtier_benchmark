@@ -279,6 +279,8 @@ public:
     std::vector<client *> &get_clients(void) { return m_clients; }
 
     unsigned long int get_total_bytes(void);
+    unsigned long int get_total_bytes_rx(void);
+    unsigned long int get_total_bytes_tx(void);
     unsigned long int get_total_ops(void);
     double get_total_latency(void);
     unsigned long int get_duration_usec(void);
@@ -291,6 +293,7 @@ public:
 
     void merge_run_stats(run_stats *target);
     void aggregate_inst_histogram(hdr_histogram *target);
+    void aggregate_inst_histogram_if_changed(hdr_histogram *target);
 };
 
 

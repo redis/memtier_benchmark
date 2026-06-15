@@ -37,6 +37,7 @@ completions_DATA=bash-completion/memtier_benchmark
 memtier_benchmark_CPPFLAGS = \
 	$(CODE_COVERAGE_CFLAGS) \
 	$(LIBEVENT_CFLAGS) \
+	$(LIBEVENT_EXTRA_CFLAGS) \
 	$(LIBEVENT_PTHREADS_CFLAGS) \
 	$(LIBEVENT_OPENSSL_CFLAGS) \
 	$(LIBCRYPTO_CFLAGS) \
@@ -64,6 +65,7 @@ memtier_benchmark_SOURCES = \
 
 memtier_benchmark_LDADD = \
 	$(CODE_COVERAGE_LIBS) \
+	$(LIBEVENT_EXTRA_LIBS) \
 	$(LIBEVENT_LIBS) \
 	$(LIBEVENT_PTHREADS_LIBS) \
 	$(LIBEVENT_OPENSSL_LIBS) \

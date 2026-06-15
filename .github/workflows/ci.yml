@@ -114,13 +114,28 @@ jobs:
         sudo apt-get -qq update
         sudo apt-get install lcov autoconf automake pkg-config libevent-dev
 
-    - name: Build without TLS
+    - name: Build without TLS (prometheus default-on)
       run: autoreconf -ivf && ./configure --disable-tls && make -j
 
-    - name: Verify version, libevent
+    - name: Verify version, libevent, prometheus enabled
       run: |
         ./memtier_benchmark --version
         ldd ./memtier_benchmark | grep libevent
+        grep -q '#define HAVE_EVHTTP 1' config.h
+
+    - name: Unit tests (prometheus enabled)
+      run: make check
+
+    - name: Build without TLS and without Prometheus
+      run: make distclean && ./configure --disable-tls --disable-prometheus && make -j
+
+    - name: Verify prometheus compiled out
+      run: |
+        ./memtier_benchmark --version
+        grep -q '/\* #undef HAVE_EVHTTP \*/' config.h
+
+    - name: Unit tests (prometheus disabled)
+      run: make check
 
   build-ubuntu-latest:
     runs-on: ubuntu-latest

@@ -28,6 +28,8 @@ help() {
 		                         Used by the sanitizer workflows' STRESS matrix axis (issue #411).
 
 		REDIS_SERVER=path   Location of redis-server
+		MEMTIER_BINARY=path Location of the memtier_benchmark binary to test
+		                    (default: the in-tree build at the repo root)
 		VERBOSE=1           Print commands
 		LOG_LEVEL=level     RLTest log level (default: debug)
 		TEST_TIMEOUT=n      Test timeout in seconds (default: 300)
@@ -96,7 +98,7 @@ TLS_KEY=$ROOT/tests/tls/redis.key
 TLS_CERT=$ROOT/tests/tls/redis.crt
 TLS_CACERT=$ROOT/tests/tls/ca.crt
 REDIS_SERVER=${REDIS_SERVER:-redis-server}
-MEMTIER_BINARY=$ROOT/memtier_benchmark
+MEMTIER_BINARY=${MEMTIER_BINARY:-$ROOT/memtier_benchmark}
 
 RLTEST_ARGS=" --cluster-start-timeout 180 --oss-redis-path $REDIS_SERVER --enable-debug-command --cluster_node_timeout 15000"
 # RLTest's --test uses action='append' with no nargs, so a space-separated

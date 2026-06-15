@@ -10,6 +10,7 @@ configure~
 compile
 depcomp
 install-sh
+test-driver
 ltmain.sh
 m4
 Makefile.in
@@ -26,6 +27,13 @@ version.h
 *.DS_Store
 .vscode/*
 .idea/*
+
+# Sibling VPATH build dirs used by the local build/test gate (§7.7)
+/build-prom/
+/build-noprom/
+/build-asan/
+/build-tsan/
+/.venv/
 
 # tls helper related files
 tests/tls/*
