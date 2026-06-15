@@ -56,6 +56,7 @@ memtier_benchmark_SOURCES = \
 	config_types.cpp config_types.h \
 	command_meta.cpp command_meta.h command_meta_data.h \
 	statsd.cpp statsd.h \
+	prometheus_metrics.cpp prometheus_metrics.h \
 	retry_policy.cpp retry_policy.h \
 	deps/hdr_histogram/hdr_histogram_log.c deps/hdr_histogram/hdr_histogram_log.h deps/hdr_histogram/byteorder.h \
 	deps/hdr_histogram/hdr_histogram.c deps/hdr_histogram/hdr_histogram.h \
@@ -70,6 +71,20 @@ memtier_benchmark_LDADD = \
 	$(LIBSSL_LIBS)
 
 
+# Unit-test harness for the pure metrics layer (prometheus_metrics.{h,cpp}).
+# First `make check` program in the repo. The metrics layer is config-free and
+# libevent-free (Decisions #52 purity contract), so this links only the metrics
+# layer + hdr_histogram (a leaf dep). No $(LIBEVENT_CFLAGS) by design (hygiene
+# only; purity is enforced by the S10 grep audit). -I$(srcdir) is required for
+# VPATH builds.
+check_PROGRAMS = prometheus_metrics_test
+prometheus_metrics_test_SOURCES = tests/unit/prometheus_metrics_test.cpp \
+    prometheus_metrics.cpp prometheus_metrics.h \
+    deps/hdr_histogram/hdr_histogram.c deps/hdr_histogram/hdr_histogram.h
+prometheus_metrics_test_CPPFLAGS = -I$(srcdir)
+prometheus_metrics_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+TESTS = $(check_PROGRAMS)
+
 @CODE_COVERAGE_RULES@
 memtier_benchmark_LDFLAGS = $(CODE_COVERAGE_LDFLAGS)
 
@@ -83,13 +98,13 @@ rebuild-man:
 .PHONY: format format-check
 format:
 	@echo "Formatting C++ source files..."
-	@find $(srcdir) -name "*.cpp" -o -name "*.h" | grep -v deps/ | grep -v autom4te.cache/ | xargs clang-format -i
+	@find $(srcdir) -name "*.cpp" -o -name "*.h" | grep -v deps/ | grep -v autom4te.cache/ | grep -v -E '(^|/)build-[^/]*/' | grep -v -E '(^|/)(config|version)\.h$$' | xargs clang-format -i
 	@echo "Done."
 
 format-check:
 	@echo "Checking C++ source file formatting..."
 	@FAILED=0; \
-	for file in $$(find $(srcdir) -name "*.cpp" -o -name "*.h" | grep -v deps/ | grep -v autom4te.cache/); do \
+	for file in $$(find $(srcdir) -name "*.cpp" -o -name "*.h" | grep -v deps/ | grep -v autom4te.cache/ | grep -v -E '(^|/)build-[^/]*/' | grep -v -E '(^|/)(config|version)\.h$$'); do \
 		if ! clang-format --dry-run --Werror "$$file" 2>/dev/null; then \
 			echo "Needs formatting: $$file"; \
 			FAILED=1; \
