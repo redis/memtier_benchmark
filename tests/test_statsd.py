@@ -18,6 +18,7 @@ import tempfile
 import shutil
 import time
 import os
+import re
 import logging
 
 from include import (
@@ -28,6 +29,50 @@ from include import (
     MEMTIER_BINARY,
 )
 from mb import Benchmark, RunConfig
+
+
+# ---------------------------------------------------------------------------
+# StatsD wire pins (PLAN §10 "StatsD wire pins", Decisions #46)
+#
+# Per-metric value-format regexes that pin the exact printf shape of every
+# StatsD payload, so a wire regression (a dropped (long) cast, a
+# gauge(double)->gauge(long) overload swap, a renamed/new metric) turns the
+# test RED instead of passing silently.
+#
+# Exact printf shapes: line = "<prefix><name>:<value>|<type>" (statsd.cpp:141);
+#   gauge(long)   "%ld"   |g   (statsd.cpp:156-160)  -> integer, no decimal
+#   gauge(double) "%.6f"  |g   (statsd.cpp:149-153)  -> exactly 6 decimals
+#   timing(double)"%.3f"  |ms  (statsd.cpp:163-167)  -> exactly 3 decimals
+#
+# Two distinct emit sites carry these gauges (memtier_benchmark.cpp):
+#   - the 1 Hz tick (:3221-3253): ops_sec/bytes_sec/connections via gauge(long)
+#     "%ld"; progress_pct via gauge(double) "%.6f"; latency_p* via gauge(double).
+#   - the run-end zeroing block (:3270-3274): ops_sec, ops_sec_avg, bytes_sec,
+#     bytes_sec_avg AND progress_pct are all forced to gauge((long) 0) -> "0|g".
+# So progress_pct legitimately appears in BOTH the "%.6f" tick form and the
+# integer "0|g" run-end form; its pin must accept both (this is today's wire).
+# ---------------------------------------------------------------------------
+
+INT_G = re.compile(r":-?\d+\|g$")          # integer gauge: no decimal point, ever
+F6_G = re.compile(r":\d+\.\d{6}\|g$")      # double gauge: exactly 6 decimals
+F3_MS = re.compile(r":\d+\.\d{3}\|ms$")    # timing: exactly 3 decimals
+# progress_pct: "%.6f" gauge at tick time, but the run-end block zeroes it via
+# gauge((long) 0) -> exactly ":0|g". Anything else (e.g. a non-zero integer, or
+# "0.000000" from a dropped overload) is a regression.
+F6_G_OR_ZERO = re.compile(r":(?:\d+\.\d{6}|0)\|g$")
+
+VALUE_FORMAT_RES = {
+    "ops_sec": INT_G,
+    "ops_sec_avg": INT_G,
+    "bytes_sec": INT_G,
+    "bytes_sec_avg": INT_G,
+    "connections": INT_G,
+    "connection_errors": INT_G,
+    "progress_pct": F6_G_OR_ZERO,
+    "latency_ms": F3_MS,
+    "latency_avg_ms": F3_MS,
+}
+LATENCY_PCT_NAME = re.compile(r"^latency_p[0-9_]+$")   # value class F6_G
 
 
 # ---------------------------------------------------------------------------
@@ -182,13 +227,23 @@ def test_statsd_metrics_emitted(env):
         time.sleep(0.3)
         server.stop()
 
+        # This test supplies --statsd-host over loopback UDP with --test-time=3
+        # (>=2 ticks of the 1 Hz loop), so silence here IS the wire regression:
+        # hard-fail instead of skip-pass (PLAN §10 pin 2, Decisions #46).
         if not ok:
-            _skip(env, "memtier_benchmark exited with non-zero status")
+            env.assertTrue(
+                False,
+                message="statsd hard-fail: memtier_benchmark exited with non-zero status",
+            )
             return
 
         received = server.get_metrics()
         if not received:
-            _skip(env, "no StatsD datagrams received (benchmark may have finished too quickly)")
+            env.assertTrue(
+                False,
+                message="statsd hard-fail: no StatsD datagrams received "
+                "(benchmark may have finished too quickly)",
+            )
             return
 
         print(f"Received {len(received)} StatsD metric lines")
@@ -231,6 +286,33 @@ def test_statsd_metrics_emitted(env):
             message=f"Malformed metric lines (missing ':' or '|'): {malformed[:5]}"
         )
 
+        # Per-metric value-format pins (PLAN §10 pin 1, Decisions #46): strip the
+        # prefix to recover each metric name, then assert its payload matches the
+        # pinned printf shape. An unknown metric name is a wire change and FAILS
+        # (it must update these pins); a value-format mismatch (e.g. progress_pct
+        # routed through gauge(long), or a dropped (long) cast) also FAILS.
+        bad_fmt = []
+        unknown = []
+        for line in received:
+            if not line.startswith(expected_prefix):
+                continue  # prefix violations already asserted above
+            name = line[len(expected_prefix):].split(":", 1)[0]
+            if name in VALUE_FORMAT_RES:
+                regex = VALUE_FORMAT_RES[name]
+            elif LATENCY_PCT_NAME.match(name):
+                regex = F6_G
+            else:
+                unknown.append(line)
+                continue
+            if not regex.search(line):
+                bad_fmt.append(line)
+        env.assertEqual(
+            len(bad_fmt) + len(unknown), 0,
+            message=f"StatsD wire value-format regressions — "
+            f"unknown metric names {unknown[:5]}; "
+            f"bad value formats {bad_fmt[:5]}"
+        )
+
     finally:
         server.stop()
         shutil.rmtree(test_dir, ignore_errors=True)
@@ -268,13 +350,21 @@ def test_statsd_prefix_and_label(env):
         time.sleep(0.3)
         server.stop()
 
+        # This test supplies --statsd-host over loopback UDP; silence IS the
+        # regression -> hard-fail, not skip-pass (PLAN §10 pin 2, Decisions #46).
         if not ok:
-            _skip(env, "memtier_benchmark exited with non-zero status")
+            env.assertTrue(
+                False,
+                message="statsd hard-fail: memtier_benchmark exited with non-zero status",
+            )
             return
 
         received = server.get_metrics()
         if not received:
-            _skip(env, "no StatsD datagrams received")
+            env.assertTrue(
+                False,
+                message="statsd hard-fail: no StatsD datagrams received",
+            )
             return
 
         expected_prefix = f"{custom_prefix}.{custom_label}."
