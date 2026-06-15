@@ -88,6 +88,7 @@
 #include "memtier_benchmark.h"
 #include "retry_policy.h"
 #include "statsd.h"
+#include "prometheus_metrics.h"
 
 
 int log_level = 0;
@@ -2819,6 +2820,55 @@ static void print_staircase_pattern(int run_id, benchmark_config *cfg)
     fprintf(stderr, "\n");
 }
 
+// One-producer-two-transports refactor (PLAN section 3.6c, Decisions #37):
+// the 1 Hz StatsD emit block, relocated verbatim out of run_benchmark()'s
+// progress loop into this file-static producer. It consumes a metrics_snapshot
+// (the one-producer POD from prometheus_metrics.h) so the Prometheus transport
+// can later share the exact same source. This is statsd-ONLY and lives OUTSIDE
+// any HAVE_EVHTTP guard. The byte-identical UDP wire is preserved: the snapshot
+// carries cur/avg_ops_sec et al. as `long` (cast at the fill site), so they
+// route through gauge(long) ("%ld"|g) exactly as before, while progress_pct is
+// `double` (gauge(double), "%.6f"|g) and the latencies go through timing(double)
+// ("%.3f"|ms). The >0 send condition for connection_errors is unchanged.
+static void statsd_publish_tick(statsd_client *statsd, const metrics_snapshot &snap, hdr_histogram *inst_hist_agg,
+                                const std::vector<double> &quantiles)
+{
+    statsd->gauge("ops_sec", snap.cur_ops_sec);
+    statsd->gauge("ops_sec_avg", snap.avg_ops_sec);
+    statsd->gauge("bytes_sec", snap.cur_bytes_sec);
+    statsd->gauge("bytes_sec_avg", snap.avg_bytes_sec);
+    statsd->timing("latency_ms", snap.cur_latency_ms);
+    statsd->timing("latency_avg_ms", snap.avg_latency_ms);
+    statsd->gauge("connections", (long) snap.connections);
+    statsd->gauge("progress_pct", snap.progress_pct);
+    if (snap.run_connection_errors > 0) {
+        statsd->gauge("connection_errors", (long) snap.run_connection_errors);
+    }
+
+    // Send percentile metrics derived from the aggregated instantaneous
+    // histogram (allocated by the caller; shared with the TUI renderer when enabled).
+    if (inst_hist_agg != NULL && hdr_total_count(inst_hist_agg) > 0) {
+        for (std::size_t i = 0; i < quantiles.size(); i++) {
+            double percentile = quantiles[i];
+            int64_t value = hdr_value_at_percentile(inst_hist_agg, percentile);
+            double value_ms = value / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
+
+            // Format the metric name (e.g., "latency_p50", "latency_p99", "latency_p99_9",
+            // "latency_p99_99"). %.10g preserves up to 10 significant digits so deep-tail
+            // percentiles (99.99999, 99.999999) don't round to 100 and collide.
+            char metric_name[40];
+            char pct_str[24];
+            snprintf(pct_str, sizeof(pct_str), "%.10g", percentile);
+            for (char *p = pct_str; *p; p++) {
+                if (*p == '.') *p = '_';
+            }
+            snprintf(metric_name, sizeof(metric_name), "latency_p%s", pct_str);
+
+            statsd->gauge(metric_name, value_ms);
+        }
+    }
+}
+
 run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj_gen)
 {
     fprintf(stderr, "[RUN #%u] Preparing benchmark client...\n", run_id);
@@ -3216,43 +3266,24 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         prev_errors = total_errors;
         prev_retry_attempts = total_retry_attempts;
 
-        // Send metrics to StatsD if configured
+        // One-producer-two-transports (PLAN section 3.6c, Decisions #37): build the
+        // metrics_snapshot from the same loop locals the inline StatsD block read,
+        // then hand it to the file-static producer statsd_publish_tick(). The read
+        // sites and benign-race discipline are identical; only the StatsD-relevant
+        // fields are populated (the rest are zeroed) — this is a statsd-only refactor.
         if (cfg->statsd != NULL && cfg->statsd->is_enabled()) {
-            cfg->statsd->gauge("ops_sec", (long) cur_ops_sec);
-            cfg->statsd->gauge("ops_sec_avg", (long) ops_sec);
-            cfg->statsd->gauge("bytes_sec", (long) cur_bytes_sec);
-            cfg->statsd->gauge("bytes_sec_avg", (long) bytes_sec);
-            cfg->statsd->timing("latency_ms", cur_latency);
-            cfg->statsd->timing("latency_avg_ms", avg_latency);
-            cfg->statsd->gauge("connections", (long) (display_clients * active_threads));
-            cfg->statsd->gauge("progress_pct", progress);
-            if (total_connection_errors > 0) {
-                cfg->statsd->gauge("connection_errors", (long) total_connection_errors);
-            }
-
-            // Send percentile metrics derived from the aggregated instantaneous
-            // histogram (allocated above; shared with the TUI renderer when enabled).
-            if (inst_hist_agg != NULL && hdr_total_count(inst_hist_agg) > 0) {
-                const std::vector<double> &quantiles = cfg->print_percentiles.quantile_list;
-                for (std::size_t i = 0; i < quantiles.size(); i++) {
-                    double percentile = quantiles[i];
-                    int64_t value = hdr_value_at_percentile(inst_hist_agg, percentile);
-                    double value_ms = value / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
-
-                    // Format the metric name (e.g., "latency_p50", "latency_p99", "latency_p99_9",
-                    // "latency_p99_99"). %.10g preserves up to 10 significant digits so deep-tail
-                    // percentiles (99.99999, 99.999999) don't round to 100 and collide.
-                    char metric_name[40];
-                    char pct_str[24];
-                    snprintf(pct_str, sizeof(pct_str), "%.10g", percentile);
-                    for (char *p = pct_str; *p; p++) {
-                        if (*p == '.') *p = '_';
-                    }
-                    snprintf(metric_name, sizeof(metric_name), "latency_p%s", pct_str);
-
-                    cfg->statsd->gauge(metric_name, value_ms);
-                }
-            }
+            metrics_snapshot snap;
+            memset(&snap, 0, sizeof(snap));
+            snap.connections = display_clients * active_threads; // :3227 parity, uint32 product
+            snap.progress_pct = progress;
+            snap.cur_ops_sec = (long) cur_ops_sec;
+            snap.avg_ops_sec = (long) ops_sec;
+            snap.cur_bytes_sec = (long) cur_bytes_sec;
+            snap.avg_bytes_sec = (long) bytes_sec;
+            snap.cur_latency_ms = cur_latency;
+            snap.avg_latency_ms = avg_latency;
+            snap.run_connection_errors = total_connection_errors; // RAW per-run (Decisions #11)
+            statsd_publish_tick(cfg->statsd, snap, inst_hist_agg, cfg->print_percentiles.quantile_list);
         }
 
         if (inst_hist_agg != NULL) hdr_close(inst_hist_agg);
