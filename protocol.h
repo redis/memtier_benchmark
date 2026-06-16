@@ -21,6 +21,7 @@
 
 #include <event2/buffer.h>
 #include <vector>
+#include <cstdint>
 #include "memtier_benchmark.h"
 
 enum mbulk_element_type
@@ -153,6 +154,15 @@ protected:
     // without materializing element values via set_keep_value(). A null array
     // ($-1/*-1) and an empty array (*0) both record 0.
     int m_top_array_len;
+    // Per-element hit/miss flags for the reply's top-level array, recorded at
+    // parse time when miss tracking is enabled (set_track_elem_misses). 1=hit
+    // (non-null element), 0=miss (null bulk, RESP3 null, or empty sub-array).
+    // This is the alloc-free alternative to materializing the reply tree via
+    // set_keep_value() purely to attribute per-position misses for the
+    // ArrayPerElementNulls shape (HMGET/MGET/ZMSCORE/GEOPOS/...). Only top-level
+    // elements are recorded; children of nested sub-arrays are skipped (a
+    // nested element is a hit iff its sub-array is non-empty).
+    std::vector<uint8_t> m_elem_hits;
 
 public:
     protocol_response();
@@ -175,6 +185,10 @@ public:
 
     void set_top_array_len(int len);
     int get_top_array_len(void);
+
+    void elem_hits_reserve(size_t n);
+    void elem_hit_push(bool hit);
+    const std::vector<uint8_t> &get_elem_hits(void);
 
     void clear();
 
@@ -217,6 +231,12 @@ protected:
     struct evbuffer *m_write_buf;
 
     bool m_keep_value;
+    // When set, the parser records per-top-level-element hit/miss flags into
+    // m_last_response.m_elem_hits without materializing the reply tree. Used by
+    // the ArrayPerElementNulls miss-tracking path as an alloc-free replacement
+    // for set_keep_value(). Independent of m_keep_value (both may be on if a
+    // SCAN-style command shares the connection).
+    bool m_track_elem_misses;
     struct protocol_response m_last_response;
 
 public:
@@ -225,6 +245,7 @@ public:
     virtual abstract_protocol *clone(void) = 0;
     void set_buffers(struct evbuffer *read_buf, struct evbuffer *write_buf);
     void set_keep_value(bool flag);
+    void set_track_elem_misses(bool flag);
 
     virtual int select_db(int db) = 0;
     virtual int authenticate(const char *credentials) = 0;
