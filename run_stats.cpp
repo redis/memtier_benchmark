@@ -937,8 +937,9 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
         // avg_utilization_pct uses WORKER-only CPU (main excluded), matching the
         // single-run semantics so it cannot exceed 100% from main-thread overhead.
         agg_cpu.avg_utilization_pct =
-            max_threads_counted > 0 ? 100.0 * (agg_cpu.worker_total_seconds / agg_cpu.wall_seconds) / max_threads_counted
-                                    : 0.0;
+            max_threads_counted > 0
+                ? 100.0 * (agg_cpu.worker_total_seconds / agg_cpu.wall_seconds) / max_threads_counted
+                : 0.0;
         agg_cpu.valid = true;
         m_cpu_summary = agg_cpu;
     }

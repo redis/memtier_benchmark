@@ -152,7 +152,8 @@ public:
 // and each m_thread_cpu_pct entry are "% of a single core" for that 1s window
 // (so a fully-busy worker reads ~100.0). Used for the per-second JSON detail
 // and the live one-shot high-CPU warning. Trivially copyable.
-struct per_second_cpu_stats {
+struct per_second_cpu_stats
+{
     unsigned int m_second;
     double m_main_thread_cpu_pct;
     std::vector<double> m_thread_cpu_pct;
@@ -163,7 +164,8 @@ struct per_second_cpu_stats {
 // getrusage(RUSAGE_THREAD) deltas captured inside the worker (accumulated
 // across restarts). Seconds are wall-independent CPU time; cores_used is
 // total_seconds / wall_seconds (i.e. average busy cores for this thread).
-struct per_thread_cpu_total {
+struct per_thread_cpu_total
+{
     unsigned int thread_id;
     double user_seconds;
     double sys_seconds;
@@ -171,9 +173,16 @@ struct per_thread_cpu_total {
     double wall_seconds;
     double cores_used;
     bool valid; // false => getrusage unavailable/failed; excluded from sums
-    per_thread_cpu_total()
-        : thread_id(0), user_seconds(0.0), sys_seconds(0.0), total_seconds(0.0), wall_seconds(0.0), cores_used(0.0),
-          valid(false) {}
+    per_thread_cpu_total() :
+            thread_id(0),
+            user_seconds(0.0),
+            sys_seconds(0.0),
+            total_seconds(0.0),
+            wall_seconds(0.0),
+            cores_used(0.0),
+            valid(false)
+    {
+    }
 };
 
 // Whole-process CPU aggregate for the run: sum of every worker (plus the main
@@ -181,20 +190,31 @@ struct per_thread_cpu_total {
 // is normalized to the worker-thread count, so 100% means "all worker threads
 // were saturated". peak_utilization_pct is the highest single-second whole-process
 // utilization observed by the live sampler.
-struct cpu_summary {
+struct cpu_summary
+{
     double user_seconds;
     double sys_seconds;
-    double total_seconds;          // whole process: workers + main thread
-    double worker_total_seconds;   // workers only; basis for avg_utilization_pct
+    double total_seconds;        // whole process: workers + main thread
+    double worker_total_seconds; // workers only; basis for avg_utilization_pct
     double wall_seconds;
     double cores_used;
     double avg_utilization_pct;
     double peak_utilization_pct;
     unsigned int threads_counted; // number of valid worker threads in the sums
     bool valid;
-    cpu_summary()
-        : user_seconds(0.0), sys_seconds(0.0), total_seconds(0.0), worker_total_seconds(0.0), wall_seconds(0.0),
-          cores_used(0.0), avg_utilization_pct(0.0), peak_utilization_pct(0.0), threads_counted(0), valid(false) {}
+    cpu_summary() :
+            user_seconds(0.0),
+            sys_seconds(0.0),
+            total_seconds(0.0),
+            worker_total_seconds(0.0),
+            wall_seconds(0.0),
+            cores_used(0.0),
+            avg_utilization_pct(0.0),
+            peak_utilization_pct(0.0),
+            threads_counted(0),
+            valid(false)
+    {
+    }
 };
 
 class totals_cmd

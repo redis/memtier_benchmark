@@ -2543,7 +2543,7 @@ struct cg_thread
     // of those same segments, captured at the exact same points as the CPU
     // snapshots, so cores_used = cpu/wall divides two values over the identical
     // interval (no setup-vs-serving skew). Only read post-join (race-free).
-    struct rusage m_cpu_start_ru;  // CPU snapshot at the current segment's start
+    struct rusage m_cpu_start_ru;   // CPU snapshot at the current segment's start
     struct timeval m_wall_start_tv; // wall snapshot at the same point
     unsigned long long m_cpu_user_usec_acc;
     unsigned long long m_cpu_sys_usec_acc;
@@ -2680,10 +2680,8 @@ static void cg_thread_capture_cpu_end(cg_thread *thread)
     if (rc == 0) {
         // ts_diff(a, b) returns b - a in microseconds; rusage CPU time is
         // monotonic per native thread, so each delta is >= 0.
-        thread->m_cpu_user_usec_acc +=
-            (unsigned long long) ts_diff(thread->m_cpu_start_ru.ru_utime, end_ru.ru_utime);
-        thread->m_cpu_sys_usec_acc +=
-            (unsigned long long) ts_diff(thread->m_cpu_start_ru.ru_stime, end_ru.ru_stime);
+        thread->m_cpu_user_usec_acc += (unsigned long long) ts_diff(thread->m_cpu_start_ru.ru_utime, end_ru.ru_utime);
+        thread->m_cpu_sys_usec_acc += (unsigned long long) ts_diff(thread->m_cpu_start_ru.ru_stime, end_ru.ru_stime);
     }
     thread->m_wall_usec_acc += (unsigned long long) ts_diff(thread->m_wall_start_tv, end_tv);
     thread->m_cpu_started = false;
