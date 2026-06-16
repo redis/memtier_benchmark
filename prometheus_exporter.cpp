@@ -454,7 +454,10 @@ void prometheus_exporter::publish_run_end(uint32_t run_id, uint32_t run_count)
     memset(&s, 0, sizeof(s));
     s.run_id = run_id;
     s.run_count = run_count;
-    s.active_threads = m_opts.n_threads;
+    // Worker threads have joined by run-end; report 0 active threads (and thus
+    // 0 connections, already memset) so a scrape between runs doesn't claim the
+    // configured thread count is still live (Bugbot review, PR #468).
+    s.active_threads = 0;
     s.progress_pct = 100.0;
     m_accum.fill(s.counters);
     publish(s, NULL);
