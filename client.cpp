@@ -85,30 +85,29 @@ bool client::setup_client(benchmark_config *config, abstract_protocol *protocol,
         MAIN_CONNECTION->get_protocol()->set_keep_value(true);
     }
 
-    // Enable value keeping for arbitrary-command miss tracking only when a
-    // configured command needs per-element reply inspection. Only
-    // ArrayPerElementNulls (HMGET/MGET/ZMSCORE/GEOPOS/...) requires walking the
-    // materialized reply array to attribute hits/misses per position.
-    // EmptyCollection (HGETALL/SMEMBERS/LRANGE) only needs to know whether the
-    // top-level array is empty, which it reads from the parser's running hit
-    // counter (response->get_hits()) with zero materialization -- keeping
-    // values there would malloc+memcpy every element of every reply on the hot
-    // path for no benefit. SingleNullBulk and IntegerMembership use the
-    // parser's scalar counters / status line, so no materialization either.
+    // Enable per-element miss tracking only when a configured command needs
+    // per-position reply inspection. Only ArrayPerElementNulls
+    // (HMGET/MGET/ZMSCORE/GEOPOS/...) attributes hits/misses per position; the
+    // parser records a per-top-level-element hit bitmap directly
+    // (set_track_elem_misses), with zero reply materialization -- no malloc /
+    // memcpy of element values, no mbulk tree. EmptyCollection
+    // (HGETALL/SMEMBERS/LRANGE) only needs the top-level array length
+    // (response->get_top_array_len()); SingleNullBulk and IntegerMembership use
+    // the parser's scalar counters / status line. None of them keep values.
     if (config->arbitrary_commands->is_defined()) {
-        bool needs_array_walk = false;
+        bool needs_elem_tracking = false;
         for (size_t i = 0; i < config->arbitrary_commands->size(); ++i) {
             const arbitrary_command &cmd = config->arbitrary_commands->at(i);
             if (!cmd.miss_tracking_enabled || cmd.spec == NULL) continue;
             using memtier::command_meta::ReplyShape;
             if (cmd.spec->reply_shape == ReplyShape::ArrayPerElementNulls) {
-                needs_array_walk = true;
+                needs_elem_tracking = true;
                 break;
             }
         }
-        if (needs_array_walk) {
+        if (needs_elem_tracking) {
             for (size_t i = 0; i < m_connections.size(); ++i) {
-                m_connections[i]->get_protocol()->set_keep_value(true);
+                m_connections[i]->get_protocol()->set_track_elem_misses(true);
             }
         }
     }
@@ -828,77 +827,38 @@ void client::handle_response(unsigned int conn_id, struct timeval timestamp, req
                 break;
             }
             case ReplyShape::ArrayPerElementNulls: {
-                // Walk the top-level mbulk array. Bucket count is the reply
-                // element count, not the spec key count: HMGET / ZMSCORE
+                // The parser recorded a per-top-level-element hit/miss bitmap at
+                // parse time (set_track_elem_misses) with no materialization --
+                // no value malloc/memcpy, no mbulk tree. Bucket count is the
+                // reply element count, not the spec key count: HMGET / ZMSCORE
                 // have 1 Redis key but produce one reply element per
-                // field/member, so capping to num_keys (==1) would lose all
-                // but the first position. MGET (multi-key spec) naturally
-                // matches reply size 1:1.
-                mbulk_size_el *top = response->get_mbulk_value();
-                if (top != NULL) {
-                    size_t n = top->mbulks_elements.size();
-                    per_key_hit.assign(n, false);
-                    num_keys = (unsigned int) n;
-                    for (size_t i = 0; i < n; ++i) {
-                        mbulk_element *el = top->mbulks_elements[i];
-                        bool h = false;
-                        if (el != NULL) {
-                            // ArrayPerElementNulls covers two reply shapes:
-                            //   - array of (bulk | null bulk): MGET, HMGET,
-                            //     ZMSCORE. Null bulk ($-1) materializes as a
-                            //     bulk_el with value==NULL/value_len==0.
-                            //   - array of (nested-array | null array):
-                            //     GEOPOS, COMMAND INFO, SORT_RO. Null array
-                            //     (*-1) materializes as an mbulk_size_el with
-                            //     no children (indistinguishable from *0,
-                            //     which is also "no value here" in practice).
-                            // is_bulk()/is_mbulk_size() avoid the assert that
-                            // as_bulk()/as_mbulk_size() raise on the wrong
-                            // kind.
-                            if (el->is_bulk()) {
-                                bulk_el *bel = el->as_bulk();
-                                // Hit = the bulk slot carries a value. Use
-                                // value!=NULL (the parser zero-allocates the
-                                // pointer only for $-1 null bulks) so that
-                                // empty-string values ($0\r\n\r\n) count as
-                                // hits when the parser is later extended to
-                                // preserve them. Today the redis_protocol
-                                // parser collapses $0 and $-1 into the same
-                                // representation (value=NULL, value_len=0),
-                                // matching the existing GET path's m_hits
-                                // convention; the value-pointer check is the
-                                // semantically correct one and is forward-
-                                // compatible with a parser that distinguishes.
-                                //
-                                // RESP3 nil "_\r\n" goes through single_type
-                                // and is stored as a bulk_el with is_resp3_null
-                                // set to true. Using the flag (set at parse time)
-                                // avoids false positives from a legitimate bulk
-                                // string whose content happens to be the single
-                                // character '_' (parsed via blob_type, which
-                                // never sets is_resp3_null). Treat it as a miss.
-                                if (bel != NULL && bel->value != NULL && !bel->is_resp3_null) {
-                                    h = true;
-                                }
-                            } else if (el->is_mbulk_size()) {
-                                mbulk_size_el *sub = el->as_mbulk_size();
-                                if (sub != NULL && !sub->mbulks_elements.empty()) {
-                                    h = true;
-                                }
-                            }
-                        }
-                        per_key_hit[i] = h;
-                        if (h) hits++;
-                    }
-                    misses = (num_keys > hits) ? (num_keys - hits) : 0;
-                } else {
-                    // Top-level reply isn't an mbulk (could be +OK, -ERR, a
-                    // single bulk for a misshape, or any non-array reply).
-                    // Account uniformly: a single miss bucket so per-key and
-                    // aggregate counters stay in sync.
+                // field/member; MGET (multi-key spec) matches reply size 1:1.
+                //
+                // The bitmap reproduces the old materialized walk's semantics:
+                //   - bulk leaf: hit iff $N with N>0 (null $-1 and empty $0 are
+                //     misses); RESP3 null '_' is a miss; other single types are
+                //     hits (see track_leaf in protocol.cpp).
+                //   - nested sub-array element (GEOPOS/SORT_RO/...): hit iff the
+                //     sub-array is non-empty (*0 / *-1 are misses).
+                if (response->get_top_array_len() < 0) {
+                    // Top-level reply isn't an array (+OK, -ERR, a single bulk,
+                    // or any non-array misshape). One miss bucket, matching the
+                    // previous get_mbulk_value()==NULL guard.
                     per_key_hit.assign(1, false);
                     num_keys = 1;
                     misses = 1;
+                } else {
+                    const std::vector<uint8_t> &eh = response->get_elem_hits();
+                    size_t n = eh.size();
+                    per_key_hit.assign(n, false);
+                    num_keys = (unsigned int) n;
+                    for (size_t i = 0; i < n; ++i) {
+                        if (eh[i]) {
+                            per_key_hit[i] = true;
+                            hits++;
+                        }
+                    }
+                    misses = (num_keys > hits) ? (num_keys - hits) : 0;
                 }
                 break;
             }
