@@ -429,6 +429,9 @@ void prometheus_exporter::publish(const metrics_snapshot &snap, const struct hdr
     pthread_mutex_lock(&m_snap_mutex);
     m_snap = snap;
     m_snap.seq = ++m_publish_seq;
+    // test_time is process-immutable config; stamp it here so every snapshot
+    // (tick, run-start/_end, ctor zero) carries it without touching fill sites.
+    m_snap.test_time = m_opts.test_time;
     clock_gettime(CLOCK_MONOTONIC, &m_snap.published_at);
     if (inst != NULL && m_lifetime_hist != NULL && hdr_total_count(inst) > 0) hdr_add(m_lifetime_hist, inst);
     pthread_mutex_unlock(&m_snap_mutex);

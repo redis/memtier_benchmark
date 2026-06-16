@@ -484,12 +484,11 @@ void text_renderer::render(std::string &out, const metrics_snapshot &snap, const
     emit_help_type(out, defs[di++]);
     append_fmt(out, "memtier_configured_runs%s %.6g\n", m_label_block.c_str(), (double) snap.run_count);
 
-    // 16. memtier_config_test_time_seconds (gauge) — sourced via run_count? No:
-    // the configured --test-time is not in the snapshot v1 (rendered by exporter
-    // from options). Until A1.2 wires options, render 0 here; the value is added
-    // by the exporter layer in a later stage. For now emit 0 to keep the family.
+    // 16. memtier_config_test_time_seconds (gauge): the configured --test-time,
+    // carried on the snapshot (stamped by the exporter's publish() from
+    // options.test_time). 0 when running by --requests.
     emit_help_type(out, defs[di++]);
-    append_fmt(out, "memtier_config_test_time_seconds%s %.6g\n", m_label_block.c_str(), 0.0);
+    append_fmt(out, "memtier_config_test_time_seconds%s %.6g\n", m_label_block.c_str(), (double) snap.test_time);
 
     // 17. memtier_latency_seconds (histogram): cumulative bucket walk.
     emit_help_type(out, defs[di++]);

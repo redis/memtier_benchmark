@@ -81,6 +81,7 @@ struct metrics_snapshot
     uint32_t run_id, run_count;         // memtier_run / memtier_configured_runs (0 = ctor snap)
     uint32_t active_threads;            // memtier_threads
     uint32_t connections;               // display_clients * active_threads
+    int32_t test_time;                  // memtier_config_test_time_seconds; stamped by publish() from options
     uint64_t seq;                       // stamped by publish(); staleness assert only, never rendered
     struct timespec published_at;       // CLOCK_MONOTONIC, stamped by publish() -> snapshot_age
     // statsd-only (one producer, two transports; NOT rendered in v1):

@@ -131,6 +131,14 @@ static void print_all_threads_stack_trace(FILE *fp, int pid, const char *timestr
 // Global pointer to threads for crash handler access
 static std::vector<cg_thread *> *g_threads = NULL;
 
+#ifdef HAVE_EVHTTP
+// Ownership handle for the Prometheus exporter (PLAN.md section 3.1, Decisions
+// #2). Lives next to g_threads; cfg.prometheus aliases it. Keeping the global
+// reachable means an exporter deliberately leaked on an exit(1) path stays
+// LSan-reachable (no suppressions). NULL when the exporter is disabled.
+static prometheus_exporter *g_prom_exporter = NULL;
+#endif
+
 // ---------------------------------------------------------------------------
 // Connection-stage supervisor state (declarations in memtier_benchmark.h)
 // ---------------------------------------------------------------------------
@@ -3162,6 +3170,99 @@ static void statsd_publish_tick(statsd_client *statsd, const metrics_snapshot &s
     }
 }
 
+// ---------------------------------------------------------------------------
+// Prometheus producer helper island (PLAN.md section 3.4 / 3.6 / 3.7).
+//
+// All cfg->prometheus access is funnelled through these file-static helpers so
+// the run loop stays ifdef-free: with HAVE_EVHTTP off the #else branch defines
+// empty inline stubs (unnamed params, -Wall-silent) and the producer wiring
+// folds to nothing. All helpers run on the MAIN thread only.
+// ---------------------------------------------------------------------------
+#ifdef HAVE_EVHTTP
+
+// True when the exporter is active.
+static inline bool prom_enabled(benchmark_config *cfg)
+{
+    return cfg->prometheus != NULL;
+}
+
+// Read one client_group's live cumulative counters into a counter_set. These
+// are the TSan-documented benign-race scalar getters (client.h:282-292); safe
+// to sample at 1 Hz from the main thread. Bytes are the split rx/tx getters
+// (never summarize() — it double-counts arbitrary-command bytes).
+static counter_set prom_read_cg_counters(client_group *cg)
+{
+    counter_set cs;
+    cs.v[MT_OPS] = cg->get_total_ops();
+    cs.v[MT_BYTES_TX] = cg->get_total_bytes_tx();
+    cs.v[MT_BYTES_RX] = cg->get_total_bytes_rx();
+    cs.v[MT_HITS] = cg->get_total_hits();
+    cs.v[MT_MISSES] = cg->get_total_misses();
+    cs.v[MT_ERRORS] = cg->get_total_errors();
+    cs.v[MT_CONN_ERRORS] = cg->get_total_connection_errors();
+    cs.v[MT_RETRY_ATTEMPTS] = cg->get_total_retry_attempts();
+    cs.v[MT_RETRIED_OPS] = cg->get_total_retried_ops();
+    return cs;
+}
+
+// 1 Hz observe: feed every thread's live counters to the monotonic accumulator,
+// then fill the snapshot's cumulative counters from it (non-decreasing totals).
+static void prom_observe_and_fill(benchmark_config *cfg, std::vector<cg_thread *> &threads, metrics_snapshot &snap)
+{
+    monotonic_accumulator &accum = cfg->prometheus->accumulator();
+    for (size_t t = 0; t < threads.size(); t++) {
+        accum.observe_live(t, prom_read_cg_counters(threads[t]->m_cg));
+    }
+    accum.fill(snap.counters);
+}
+
+// Exact post-join fold of one thread's final totals into the accumulator basis,
+// BEFORE its client_group is destroyed (restart or run end). Race-free.
+static void prom_fold_thread(benchmark_config *cfg, size_t t, client_group *cg)
+{
+    cfg->prometheus->accumulator().fold_final(t, prom_read_cg_counters(cg));
+}
+
+// 1 Hz publish: reset the exporter's scratch tick histogram, run the gated
+// per-client aggregation walk over non-finished threads (mirrors the statsd
+// !m_finished gate), then publish the fully-filled snapshot + the tick
+// histogram. PLAN.md section 3.7.
+static void prom_publish_tick(benchmark_config *cfg, const metrics_snapshot &snap, std::vector<cg_thread *> &threads)
+{
+    hdr_histogram *tick = cfg->prometheus->tick_histogram();
+    hdr_reset(tick);
+    for (size_t t = 0; t < threads.size(); t++) {
+        if (!threads[t]->m_finished) {
+            threads[t]->m_cg->aggregate_inst_histogram_if_changed(tick);
+        }
+    }
+    cfg->prometheus->publish(snap, tick);
+}
+
+static void prom_publish_run_start(benchmark_config *cfg, uint32_t run_id)
+{
+    cfg->prometheus->publish_run_start(run_id, cfg->run_count);
+}
+
+static void prom_publish_run_end(benchmark_config *cfg, uint32_t run_id)
+{
+    cfg->prometheus->publish_run_end(run_id, cfg->run_count);
+}
+
+#else // !HAVE_EVHTTP — empty stubs keep the run loop ifdef-free.
+
+static inline bool prom_enabled(benchmark_config *)
+{
+    return false;
+}
+static inline void prom_observe_and_fill(benchmark_config *, std::vector<cg_thread *> &, metrics_snapshot &) {}
+static inline void prom_fold_thread(benchmark_config *, size_t, client_group *) {}
+static inline void prom_publish_tick(benchmark_config *, const metrics_snapshot &, std::vector<cg_thread *> &) {}
+static inline void prom_publish_run_start(benchmark_config *, uint32_t) {}
+static inline void prom_publish_run_end(benchmark_config *, uint32_t) {}
+
+#endif // HAVE_EVHTTP
+
 run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj_gen)
 {
     fprintf(stderr, "[RUN #%u] Preparing benchmark client...\n", run_id);
@@ -3216,6 +3317,11 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
                  run_id);
         cfg->statsd->event("Benchmark Started", event_data, "memtier,start");
     }
+
+    // Prometheus run-start publish (PLAN section 3.6d): counters = carried
+    // accumulator totals, run_id/run_count set, all gauges/rates zero (live at
+    // the first 1 Hz tick). Mirrors statsd's zeroing convention.
+    if (prom_enabled(cfg)) prom_publish_run_start(cfg, run_id);
 
     unsigned long int prev_ops = 0;
     unsigned long int prev_bytes = 0;
@@ -3313,6 +3419,12 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
 
                 // Join the failed thread first
                 (*i)->join();
+
+                // Prometheus restart fold (PLAN section 3.6b): fold this
+                // thread's exact post-join totals into the accumulator basis
+                // BEFORE restart() deletes m_cg, so the monotonic counters
+                // survive the client_group replacement.
+                if (prom_enabled(cfg)) prom_fold_thread(cfg, (size_t) (i - threads.begin()), (*i)->m_cg);
 
                 // Attempt to restart
                 if ((*i)->restart() == 0) {
@@ -3559,14 +3671,19 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         prev_errors = total_errors;
         prev_retry_attempts = total_retry_attempts;
 
-        // One-producer-two-transports (PLAN section 3.6c, Decisions #37): build the
-        // metrics_snapshot from the same loop locals the inline StatsD block read,
-        // then hand it to the file-static producer statsd_publish_tick(). The read
-        // sites and benign-race discipline are identical; only the StatsD-relevant
-        // fields are populated (the rest are zeroed) — this is a statsd-only refactor.
-        if (cfg->statsd != NULL && cfg->statsd->is_enabled()) {
+        // One-producer-two-transports (PLAN section 3.6c, Decisions #37): build
+        // the metrics_snapshot once from the same loop locals both transports
+        // read, then hand it to each enabled transport. The StatsD path reads
+        // only `connections` + the statsd-only fields and stays byte-identical;
+        // the Prometheus path fills the cumulative counters via the monotonic
+        // accumulator and publishes its own gated tick histogram.
+        bool statsd_on = (cfg->statsd != NULL && cfg->statsd->is_enabled());
+        if (statsd_on || prom_enabled(cfg)) {
             metrics_snapshot snap;
             memset(&snap, 0, sizeof(snap));
+            snap.run_id = run_id;
+            snap.run_count = cfg->run_count;
+            snap.active_threads = active_threads;
             snap.connections = display_clients * active_threads; // :3227 parity, uint32 product
             snap.progress_pct = progress;
             snap.cur_ops_sec = (long) cur_ops_sec;
@@ -3576,7 +3693,9 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             snap.cur_latency_ms = cur_latency;
             snap.avg_latency_ms = avg_latency;
             snap.run_connection_errors = total_connection_errors; // RAW per-run (Decisions #11)
-            statsd_publish_tick(cfg->statsd, snap, inst_hist_agg, cfg->print_percentiles.quantile_list);
+            if (prom_enabled(cfg)) prom_observe_and_fill(cfg, threads, snap);
+            if (statsd_on) statsd_publish_tick(cfg->statsd, snap, inst_hist_agg, cfg->print_percentiles.quantile_list);
+            if (prom_enabled(cfg)) prom_publish_tick(cfg, snap, threads); // gated walk + publish (PLAN 3.7)
         }
 
         if (inst_hist_agg != NULL) hdr_close(inst_hist_agg);
@@ -3654,6 +3773,19 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
                 stats.absorb_builtin_get_routing(g.ops_from_primary, g.ops_from_replica);
             }
         }
+    }
+
+    // Prometheus post-join reconcile + run-end publish (PLAN section 3.6e):
+    // fold every thread's exact post-join totals into the accumulator basis
+    // (race-free; m_cg is still alive here, before the deletion loop below),
+    // then publish the run-end snapshot. This guarantees the run-end publish
+    // happens before teardown and the cumulative counters reflect the final,
+    // exact per-thread totals (never summarize() — rx/tx double-count trap).
+    if (prom_enabled(cfg)) {
+        for (size_t t = 0; t < threads.size(); t++) {
+            prom_fold_thread(cfg, t, threads[t]->m_cg);
+        }
+        prom_publish_run_end(cfg, run_id);
     }
 
     // Do we need to produce client stats?
@@ -4233,6 +4365,32 @@ int main(int argc, char *argv[])
         }
     }
 
+#ifdef HAVE_EVHTTP
+    // Initialize the Prometheus exporter if configured (PLAN.md section 3.2).
+    // This is AFTER the statsd init block, after evthread_use_pthreads() and
+    // config_init_defaults(). Only when --prometheus-port was given (>= 0; the
+    // sentinel -1 means the flag was absent and the feature stays off). On
+    // start() failure the exporter is deliberately leaked (reachable via
+    // g_prom_exporter for LSan) and the process exits 1 with one stderr line.
+    if (cfg.prometheus_port >= 0) {
+        prometheus_exporter::options popts;
+        popts.bind_addr = cfg.prometheus_bind_addr ? cfg.prometheus_bind_addr : "127.0.0.1";
+        popts.port = cfg.prometheus_port;
+        popts.run_labels = cfg.prometheus_run_labels;
+        popts.latency_buckets = cfg.prometheus_latency_buckets;
+        popts.run_count = cfg.run_count;
+        popts.test_time = (int) cfg.test_time;
+        popts.n_threads = cfg.threads;
+        g_prom_exporter = new prometheus_exporter(popts);
+        if (!g_prom_exporter->start()) {
+            delete g_prom_exporter;
+            g_prom_exporter = NULL;
+            exit(1);
+        }
+        cfg.prometheus = g_prom_exporter;
+    }
+#endif
+
     if (cfg.show_config) {
         fprintf(stderr, "============== Configuration values: ==============\n");
         config_print(stderr, &cfg);
@@ -4764,6 +4922,19 @@ int main(int argc, char *argv[])
         delete cfg.statsd;
         cfg.statsd = NULL;
     }
+
+#ifdef HAVE_EVHTTP
+    // Clean up the Prometheus exporter (PLAN.md section 3.2 join point). This is
+    // the first runtime exercise of the stop-event teardown protocol: wake the
+    // listener via the stop-event, join it, free libevent state. It must not
+    // hang. Done before the TLS cleanup, on every normal-exit path.
+    if (g_prom_exporter != NULL) {
+        g_prom_exporter->stop_and_join();
+        delete g_prom_exporter;
+        g_prom_exporter = NULL;
+        cfg.prometheus = NULL;
+    }
+#endif
 
 #ifdef USE_TLS
     if (cfg.tls) {
