@@ -209,6 +209,7 @@ struct benchmark_config
     bool command_stats_by_type; // true = aggregate by command type (default), false = per command line
     bool command_miss_tracking; // true = auto (track misses for known shapes), false = off
     double miss_rate_threshold; // warn when miss rate exceeds this fraction (default 0.01 = 1%)
+    double cpu_warn_threshold;  // warn when a memtier thread's CPU exceeds this fraction of a core (default 0.95)
     const char *hdr_prefix;
     unsigned int request_rate;
     unsigned int request_per_interval;

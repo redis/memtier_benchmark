@@ -17,3 +17,7 @@ hypothesis>=6.0
 # tests/test_prometheus_redaction.py, via include.py's prom_parse /
 # prom_sample_value) to validate /metrics scrapes the way Prometheus itself would.
 prometheus_client>=0.20
+# psutil powers the external CPU cross-validation in tests/test_cpu_stats.py
+# (independent oracle for memtier's self-reported per-thread CPU). Skips
+# gracefully if unavailable.
+psutil>=5.9.0

@@ -33,7 +33,10 @@
 
 /////////////////////////////////////////////////////////////////////////
 
-abstract_protocol::abstract_protocol() : m_read_buf(NULL), m_write_buf(NULL), m_keep_value(false) {}
+abstract_protocol::abstract_protocol() :
+        m_read_buf(NULL), m_write_buf(NULL), m_keep_value(false), m_track_elem_misses(false)
+{
+}
 
 abstract_protocol::~abstract_protocol() {}
 
@@ -48,6 +51,11 @@ void abstract_protocol::set_keep_value(bool flag)
     m_keep_value = flag;
 }
 
+void abstract_protocol::set_track_elem_misses(bool flag)
+{
+    m_track_elem_misses = flag;
+}
+
 void abstract_protocol::reset_state()
 {
     // Default: just clear m_last_response so any allocated mbulk tree /
@@ -60,7 +68,13 @@ void abstract_protocol::reset_state()
 /////////////////////////////////////////////////////////////////////////
 
 protocol_response::protocol_response() :
-        m_status(NULL), m_mbulk_value(NULL), m_value(NULL), m_value_len(0), m_hits(0), m_error(false)
+        m_status(NULL),
+        m_mbulk_value(NULL),
+        m_value(NULL),
+        m_value_len(0),
+        m_hits(0),
+        m_error(false),
+        m_top_array_len(-1)
 {
 }
 
@@ -125,6 +139,31 @@ unsigned int protocol_response::get_hits(void)
     return m_hits;
 }
 
+void protocol_response::set_top_array_len(int len)
+{
+    m_top_array_len = len;
+}
+
+int protocol_response::get_top_array_len(void)
+{
+    return m_top_array_len;
+}
+
+void protocol_response::elem_hits_reserve(size_t n)
+{
+    m_elem_hits.reserve(n);
+}
+
+void protocol_response::elem_hit_push(bool hit)
+{
+    m_elem_hits.push_back(hit ? 1 : 0);
+}
+
+const std::vector<uint8_t> &protocol_response::get_elem_hits(void)
+{
+    return m_elem_hits;
+}
+
 void protocol_response::clear(void)
 {
     if (m_status != NULL) {
@@ -144,6 +183,8 @@ void protocol_response::clear(void)
     m_total_len = 0;
     m_hits = 0;
     m_error = 0;
+    m_top_array_len = -1;
+    m_elem_hits.clear();
 }
 
 void protocol_response::set_mbulk_value(mbulk_size_el *element)
@@ -185,11 +226,32 @@ protected:
     // TODO: full out-of-band routing — surface push frames to a
     // listener instead of silently dropping them.
     bool m_push;
+    // Per-response state for alloc-free ArrayPerElementNulls miss tracking
+    // (m_track_elem_misses). m_tracking turns true once the reply's top-level
+    // array header is seen. m_nested_remaining counts leaf/element slots still
+    // to consume inside the current top-level element's subtree: while >0 we
+    // are below the top level and skip recording; when it returns to 0 the next
+    // element is again a direct child of the top array. This handles arbitrary
+    // nesting depth without a frame stack.
+    bool m_tracking;
+    int m_nested_remaining;
 
     bool aggregate_type(char c);
     bool blob_type(char c);
     bool single_type(char c);
     bool response_ended();
+    // Record one leaf element (bulk / single type) for alloc-free miss
+    // tracking: pushes a hit/miss flag when the leaf is a direct child of the
+    // top-level array, otherwise just consumes a slot of the current nested
+    // subtree. No-op unless tracking is active for this reply.
+    inline void track_leaf(bool hit)
+    {
+        if (!m_track_elem_misses || m_push || !m_tracking) return;
+        if (m_nested_remaining == 0)
+            m_last_response.elem_hit_push(hit);
+        else
+            m_nested_remaining--;
+    }
 
 public:
     redis_protocol() :
@@ -200,7 +262,9 @@ public:
             m_current_mbulk(NULL),
             m_resp3(false),
             m_attribute(false),
-            m_push(false)
+            m_push(false),
+            m_tracking(false),
+            m_nested_remaining(0)
     {
     }
     virtual redis_protocol *clone(void) { return new redis_protocol(); }
@@ -249,6 +313,8 @@ void redis_protocol::reset_state()
     m_bulk_len = 0;
     m_response_len = 0;
     m_current_mbulk = NULL;
+    m_tracking = false;
+    m_nested_remaining = 0;
 }
 
 int redis_protocol::select_db(int db)
@@ -602,6 +668,8 @@ int redis_protocol::parse_response(void)
             m_total_bulks_count = 0;
             m_attribute = 0;
             m_push = 0;
+            m_tracking = false;
+            m_nested_remaining = 0;
             m_response_state = rs_read_line;
 
             break;
@@ -618,6 +686,15 @@ int redis_protocol::parse_response(void)
 
             if (aggregate_type(line[0])) {
                 int count = strtol(line + 1, NULL, 10);
+
+                // The reply's top-level aggregate is the one parsed while no
+                // bulks are still outstanding. Capture its declared length so
+                // miss-tracking can tell an empty collection from a populated
+                // one without materializing values (see EmptyCollection in
+                // client::handle_response). Out-of-band frames are excluded:
+                // attribute (|) is a prefix to the real reply, push (>) is not
+                // a reply at all.
+                bool top_level_aggregate = (m_total_bulks_count == 0);
 
                 // in case of nested mbulk, the mbulk is one of the total bulks
                 if (m_total_bulks_count > 0) {
@@ -646,6 +723,32 @@ int redis_protocol::parse_response(void)
                 // Map or Attribute contain key-value pair
                 if (line[0] == '%' || line[0] == '|') {
                     count *= 2;
+                }
+
+                // Record the reply body's declared element count (count is now
+                // null-clamped to >=0 and map-doubled). '|' is the attribute
+                // prefix, not the reply body; '>' (m_push) is out-of-band.
+                if (top_level_aggregate && !m_push && line[0] != '|') {
+                    m_last_response.set_top_array_len(count);
+                }
+
+                // Alloc-free per-element miss tracking (m_track_elem_misses).
+                // The top-level array container starts tracking; a nested
+                // aggregate is itself an element -- a hit iff it is non-empty
+                // (count>0). See the m_tracking/m_nested_remaining contract.
+                if (m_track_elem_misses && !m_push && line[0] != '|') {
+                    if (top_level_aggregate) {
+                        m_tracking = true;
+                        m_nested_remaining = 0;
+                        m_last_response.elem_hits_reserve(count);
+                    } else if (m_tracking) {
+                        if (m_nested_remaining == 0) {
+                            m_last_response.elem_hit_push(count > 0);
+                            m_nested_remaining = count; // descend into this element's subtree
+                        } else {
+                            m_nested_remaining += count - 1; // consume this slot, add its children
+                        }
+                    }
                 }
 
                 // Suppress mbulk allocation while draining a push frame:
@@ -686,6 +789,10 @@ int redis_protocol::parse_response(void)
                 }
 
                 m_bulk_len = strtol(line + 1, NULL, 10);
+                // A bulk leaf is a hit iff it carries a value ($N, N>0). A null
+                // bulk ($-1) and an empty bulk ($0) are misses -- matching the
+                // pre-existing value!=NULL convention of the materialized walk.
+                track_leaf(m_bulk_len > 0);
                 // Suppress reply mutation while draining a push frame.
                 if (!m_push) {
                     m_last_response.set_status(line);
@@ -709,6 +816,12 @@ int redis_protocol::parse_response(void)
                 if (m_total_bulks_count == 0) {
                     m_total_bulks_count++;
                 }
+
+                // A single-type leaf carries a value (+status, :int, ,double,
+                // #bool, (bignum, -error) and counts as a hit; only the RESP3
+                // null '_' is a miss. Mirrors the materialized walk, which kept
+                // a value for every single type except '_' (is_resp3_null).
+                track_leaf(line[0] != '_');
 
                 // if we are not inside mbulk, the status will be kept in m_status anyway
                 if (m_keep_value && m_current_mbulk && !m_push) {
