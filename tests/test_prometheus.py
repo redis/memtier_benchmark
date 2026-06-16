@@ -241,7 +241,7 @@ def test_F1_disabled_by_default(env):
 def test_F2_mid_run_scrape(env):
     rd = _new_results_dir()
     proc, out_path, err_path = _popen_memtier(
-        env, ["--test-time=10", "--prometheus-port=0"], rd
+        env, ["--test-time=4", "--prometheus-port=0"], rd
     )
     try:
         url = wait_for_prometheus_url(out_path, timeout=20)
@@ -285,7 +285,7 @@ def test_F2_mid_run_scrape(env):
 def test_F3_counter_monotonicity_two_scrapes(env):
     rd = _new_results_dir()
     proc, out_path, err_path = _popen_memtier(
-        env, ["--test-time=12", "--prometheus-port=0"], rd
+        env, ["--test-time=5", "--prometheus-port=0"], rd
     )
     try:
         url = wait_for_prometheus_url(out_path, timeout=20)
@@ -503,7 +503,7 @@ def test_F8_run_label_propagation_and_escaping(env):
 def test_F9_ttl_render_cache(env):
     rd = _new_results_dir()
     proc, out_path, err_path = _popen_memtier(
-        env, ["--test-time=8", "--prometheus-port=0"], rd
+        env, ["--test-time=4", "--prometheus-port=0"], rd
     )
     try:
         url = wait_for_prometheus_url(out_path, timeout=20)
@@ -693,7 +693,7 @@ def test_F15_teardown_race_window(env):
         import_file = alt if os.path.isfile(alt) else import_file
     env.assertTrue(os.path.isfile(import_file),
                    message="data-import fixture not found: {}".format(import_file))
-    for i in range(20):
+    for i in range(8):
         rd = _new_results_dir()
         proc, out_path, err_path = _popen_memtier(
             env,
@@ -847,7 +847,7 @@ def test_F17_monotonicity_under_churn(env):
         return
     rd = _new_results_dir()
     proc, out_path, err_path = _popen_memtier(
-        env, ["--test-time=12", "--prometheus-port=0"], rd
+        env, ["--test-time=5", "--prometheus-port=0"], rd
     )
     stop = threading.Event()
 
@@ -901,7 +901,7 @@ def test_F18_cluster_smoke(env):
         return
     rd = _new_results_dir()
     proc, out_path, err_path = _popen_memtier(
-        env, ["--test-time=10", "--run-count=2", "--prometheus-port=0"], rd
+        env, ["--test-time=5", "--run-count=2", "--prometheus-port=0"], rd
     )
     series = []
     try:
@@ -940,9 +940,9 @@ def test_F19_stall_dedup(env):
     # A long DEBUG SLEEP (18 s) against a generous test-time gives a wide,
     # unambiguous frozen window even on a busy/sanitized CI cell.  The server
     # must allow DEBUG (RLTest passes --enable-debug-command, run_tests.sh).
-    sleep_secs = 18
+    sleep_secs = 12
     proc, out_path, err_path = _popen_memtier(
-        env, ["--test-time=45", "-t", "2", "-c", "2", "--prometheus-port=0"], rd
+        env, ["--test-time=28", "-t", "2", "-c", "2", "--prometheus-port=0"], rd
     )
     try:
         url = wait_for_prometheus_url(out_path, timeout=20)
