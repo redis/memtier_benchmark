@@ -64,6 +64,13 @@ appendonlydir/
 
 tests/.env/
 
+# Unit-test harness (tests/unit/) build + automake check-driver artifacts
+/prometheus_metrics_test
+tests/unit/prometheus_metrics_test
+*.log
+*.trs
+tests/unit/.dirstamp
+
 # libFuzzer fuzz harness build artifacts and crash dumps
 /split_command_to_args_fuzz
 /monitor_input_fuzz
