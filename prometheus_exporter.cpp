@@ -213,15 +213,9 @@ bool prometheus_exporter::start()
             m_bound_port = (int) ntohs(((struct sockaddr_in6 *) &ss)->sin6_port);
         else
             m_bound_port = (int) ntohs(((struct sockaddr_in *) &ss)->sin_port);
-
-        // Bracket IPv6 literals in the announce URL (RFC 3986). Exactly one
-        // flushed stdout line — the RLTest discovery contract (Decisions #9).
-        const bool is_v6 = (m_opts.bind_addr.find(':') != std::string::npos);
-        if (is_v6)
-            printf("Prometheus exporter listening on http://[%s]:%d/metrics\n", m_opts.bind_addr.c_str(), m_bound_port);
-        else
-            printf("Prometheus exporter listening on http://%s:%d/metrics\n", m_opts.bind_addr.c_str(), m_bound_port);
-        fflush(stdout);
+        // NB: the listen-URL announce is deferred to the end of start() (after
+        // pthread_create succeeds) so a failure in a later step never leaves
+        // stdout advertising a /metrics URL that was never brought up (Bugbot).
     }
 
     // 6. HDR allocation — :3058 triplet verbatim (Decisions #22). The
@@ -262,6 +256,15 @@ bool prometheus_exporter::start()
         return false;
     }
     m_thread_started = true;
+
+    // Announce only now that the listener is fully up (bind + HDR + stop event +
+    // thread all succeeded). Bracket IPv6 literals (RFC 3986). Exactly one
+    // flushed stdout line — the RLTest discovery contract (Decisions #9).
+    if (m_opts.bind_addr.find(':') != std::string::npos)
+        printf("Prometheus exporter listening on http://[%s]:%d/metrics\n", m_opts.bind_addr.c_str(), m_bound_port);
+    else
+        printf("Prometheus exporter listening on http://%s:%d/metrics\n", m_opts.bind_addr.c_str(), m_bound_port);
+    fflush(stdout);
     return true;
 }
 
