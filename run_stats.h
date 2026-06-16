@@ -200,6 +200,13 @@ protected:
     // int64_t so run_stats stays copyable when collected into vectors post-join.
     int64_t m_prom_last_copied_total;
 
+    // Per-bucket snapshot of inst_m_totals_latency_histogram as of the previous
+    // gated copy, so copy_inst_histogram_if_changed adds only the positive
+    // per-bucket delta (each latency sample folded at most once) instead of the
+    // whole histogram. safe_hdr_histogram is deep-copyable, so run_stats stays
+    // copyable when collected into vectors post-join. Main-thread-only.
+    safe_hdr_histogram m_prom_last_inst;
+
     // Cumulative hits/misses bookkeeping for arbitrary commands. Indexed by
     // arbitrary command index. Per-key vectors are sized to the spec-resolved
     // key count for that command (or 1 when the command has no spec key
