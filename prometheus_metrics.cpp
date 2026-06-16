@@ -66,9 +66,11 @@ static const metric_def kMetricDefs[] = {
     {"memtier_sent_bytes_total", MT_TYPE_COUNTER, "Total bytes written to the server since process start."},
     {"memtier_received_bytes_total", MT_TYPE_COUNTER, "Total bytes read from the server since process start."},
     {"memtier_hits_total", MT_TYPE_COUNTER,
-     "Total read operations that found the key; tracked for GET and miss-tracked arbitrary commands only."},
+     "Total GET operations that found the key. Counts GET-command hits only; hits on arbitrary "
+     "(--command) miss-trackable commands are not included in this total."},
     {"memtier_misses_total", MT_TYPE_COUNTER,
-     "Total read operations that did not find the key; tracked for GET and miss-tracked arbitrary commands only."},
+     "Total GET operations that did not find the key. Counts GET-command misses only; misses on arbitrary "
+     "(--command) miss-trackable commands are not included in this total."},
     {"memtier_errors_total", MT_TYPE_COUNTER,
      "Total commands that received an error reply after retries were exhausted; connection errors are counted "
      "separately."},

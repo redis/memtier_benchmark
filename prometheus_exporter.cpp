@@ -416,7 +416,11 @@ const std::string &prometheus_exporter::render_body(const struct timespec &now)
     pthread_mutex_unlock(&m_snap_mutex);
 
     double age = ts_delta_sec(snap.published_at, now); // computed at render time (F10)
-    ++m_renders;                                       // HTTP-thread-local -> renders_total
+    if (age < 0.0)
+        age = 0.0; // 'now' is sampled before the snapshot mutex; a publish()
+                   // in that sub-ms window can make published_at > now. Clamp
+                   // so the gauge is never transiently negative.
+    ++m_renders;   // HTTP-thread-local -> renders_total
     m_renderer.render(m_cached_body, snap, m_render_hist, m_start_time_seconds, age, m_renders);
     m_last_render = now;
     m_have_cached = true;

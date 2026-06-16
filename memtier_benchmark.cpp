@@ -4649,8 +4649,9 @@ int main(int argc, char *argv[])
     // This is AFTER the statsd init block, after evthread_use_pthreads() and
     // config_init_defaults(). Only when --prometheus-port was given (>= 0; the
     // sentinel -1 means the flag was absent and the feature stays off). On
-    // start() failure the exporter is deliberately leaked (reachable via
-    // g_prom_exporter for LSan) and the process exits 1 with one stderr line.
+    // start() failure the exporter is freed (delete + NULL) and the process
+    // exits 1 with one stderr line; start() already released any partial
+    // libevent state via free_libevent_state() before returning false.
     if (cfg.prometheus_port >= 0) {
         prometheus_exporter::options popts;
         popts.bind_addr = cfg.prometheus_bind_addr ? cfg.prometheus_bind_addr : "127.0.0.1";
