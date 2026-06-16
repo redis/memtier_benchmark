@@ -146,6 +146,13 @@ protected:
     unsigned int m_total_len;
     unsigned int m_hits;
     bool m_error;
+    // Declared element count of the reply's top-level aggregate (* array, %
+    // map, ~ set), captured once per response from the header line. -1 means
+    // the top-level reply was not such an aggregate (a scalar, bulk, error, or
+    // unparsed). Lets miss-tracking classify empty vs non-empty collections
+    // without materializing element values via set_keep_value(). A null array
+    // ($-1/*-1) and an empty array (*0) both record 0.
+    int m_top_array_len;
 
 public:
     protocol_response();
@@ -165,6 +172,9 @@ public:
 
     void incr_hits(void);
     unsigned int get_hits(void);
+
+    void set_top_array_len(int len);
+    int get_top_array_len(void);
 
     void clear();
 
