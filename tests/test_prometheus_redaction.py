@@ -99,30 +99,59 @@ def _tls_args(env):
     return args, [p for p in paths if p]
 
 
-def _set_password(env, password):
-    """requirepass the target so the run must authenticate.
+def _master_conns(env, password=None):
+    """A fresh redis-py connection to EVERY master node, TLS-aware.
 
-    Returns the prior value so it can be restored, or None if it could not be
-    set (the assertions that need it self-skip).
+    Cluster envs have one master per shard; requirepass must be set/cleared on
+    all of them or memtier (which authenticates to every shard) restart-loops
+    against the shards that still reject AUTH.  When clearing, pass the canary
+    as ``password`` so the client AUTHs before issuing CONFIG SET.
+    """
+    import redis as _redis
+
+    tls_kwargs = {}
+    if getattr(env, "useTLS", False):
+        tls_kwargs = dict(
+            ssl=True,
+            ssl_certfile=TLS_CERT or None,
+            ssl_keyfile=TLS_KEY or None,
+            ssl_ca_certs=TLS_CACERT or None,
+            ssl_cert_reqs="none",
+        )
+    conns = []
+    for node in env.getMasterNodesList():
+        conns.append(
+            _redis.Redis(
+                host=node.get("host") or "127.0.0.1",
+                port=node["port"],
+                password=password if password is not None else node.get("password"),
+                socket_connect_timeout=5,
+                **tls_kwargs
+            )
+        )
+    return conns
+
+
+def _set_password(env, password):
+    """requirepass every master so the run must authenticate.
+
+    Returns True only if it was set on all masters (the assertions that need it
+    self-skip otherwise).
     """
     try:
-        conn = env.getConnection()
-        conn.execute_command("CONFIG", "SET", "requirepass", password)
+        for conn in _master_conns(env):
+            conn.execute_command("CONFIG", "SET", "requirepass", password)
         return True
     except Exception:
+        # Best-effort rollback so a partial set does not wedge the env.
+        _clear_password(env, password)
         return False
 
 
 def _clear_password(env, password):
     try:
-        conn = env.getConnection()
-        # We are now authenticated implicitly only if RLTest's pool reconnects;
-        # send AUTH first to be safe, then clear.
-        try:
-            conn.execute_command("AUTH", password)
-        except Exception:
-            pass
-        conn.execute_command("CONFIG", "SET", "requirepass", "")
+        for conn in _master_conns(env, password=password):
+            conn.execute_command("CONFIG", "SET", "requirepass", "")
     except Exception:
         pass
 
@@ -230,8 +259,11 @@ def test_R1_no_secret_in_metrics_body(env):
         with open(os.path.join(rd, "prom_scrape.txt"), "w") as fh:
             fh.write(body)
         _assert_redacted(env, body, host, port, paths, password=password)
-        rc = proc.wait(timeout=20)
-        env.assertEqual(rc, 0, message="memtier exit {}".format(rc))
+        try:
+            rc = proc.wait(timeout=20)
+            env.assertEqual(rc, 0, message="memtier exit {}".format(rc))
+        except subprocess.TimeoutExpired:
+            env.assertTrue(False, message="memtier did not exit within 20s")
     finally:
         _kill(proc)
         if have_pw:

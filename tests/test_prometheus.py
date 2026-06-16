@@ -35,6 +35,10 @@ from include import (
     MEMTIER_BINARY,
     PROM_CONTENT_TYPE,
     PROM_LISTEN_RE,
+    TLS_CACERT,
+    TLS_CERT,
+    TLS_KEY,
+    TLS_PROTOCOLS,
     prom_parse,
     prom_sample_value,
     prom_scrape,
@@ -76,6 +80,9 @@ def _server_args(env):
     Standalone: --server/--port of the master shard.
     Cluster:    --server/--port of one shard plus --cluster-mode (memtier
                 discovers the rest via CLUSTER SLOTS).
+    TLS:        when the env runs TLS, redis accepts only TLS connections, so
+                add --tls and the cert material (mirrors include.addTLSArgs).
+                The exporter listener stays plain HTTP regardless.
     """
     master_nodes_list = env.getMasterNodesList()
     node = master_nodes_list[0]
@@ -85,6 +92,16 @@ def _server_args(env):
     args = ["--server", str(host), "--port", str(port)]
     if _is_cluster(env):
         args.append("--cluster-mode")
+    if getattr(env, "useTLS", False):
+        args.append("--tls")
+        args.append("--cert={}".format(TLS_CERT))
+        args.append("--cacert={}".format(TLS_CACERT))
+        if TLS_KEY != "":
+            args.append("--key={}".format(TLS_KEY))
+        else:
+            args.append("--tls-skip-verify")
+        if TLS_PROTOCOLS != "":
+            args.append("--tls-protocols={}".format(TLS_PROTOCOLS))
     return args
 
 
@@ -931,6 +948,19 @@ def test_F19_stall_dedup(env):
         node = env.getMasterNodesList()[0]
         sleeper_err = []
 
+        # Under TLS the server accepts only TLS connections, so the dedicated
+        # DEBUG SLEEP client must speak TLS too (the test CA is self-signed; the
+        # client cert/key authenticate, ca_certs verifies the server).
+        tls_kwargs = {}
+        if getattr(env, "useTLS", False):
+            tls_kwargs = dict(
+                ssl=True,
+                ssl_certfile=TLS_CERT or None,
+                ssl_keyfile=TLS_KEY or None,
+                ssl_ca_certs=TLS_CACERT or None,
+                ssl_cert_reqs="none",
+            )
+
         def sleeper():
             try:
                 conn = _redis.Redis(
@@ -939,6 +969,7 @@ def test_F19_stall_dedup(env):
                     password=node.get("password"),
                     socket_timeout=None,
                     socket_connect_timeout=5,
+                    **tls_kwargs
                 )
                 conn.execute_command("DEBUG", "SLEEP", str(sleep_secs))
             except Exception as e:  # noqa: BLE001
