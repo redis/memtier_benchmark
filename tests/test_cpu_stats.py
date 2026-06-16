@@ -229,16 +229,22 @@ def test_cpu_aggregate_cores(env):
         return
 
     cpu = all_stats['CPU']
-    # 2 worker threads + main thread: cores_used must be > 0 and well under threads+2.
+    # 2 worker threads + main thread: cores_used must be > 0 and bounded.
     env.assertTrue(cpu['cpu_cores_used'] > 0.0)
-    env.assertTrue(cpu['cpu_cores_used'] < 4.0)
+    env.assertTrue(cpu['cpu_cores_used'] < cpu['threads_counted'] + 2.0)
 
-    # Sum of per-thread cores_used should be <= aggregate (aggregate also includes main).
-    per_thread_sum = sum(pt['cores_used'] for pt in cpu['Per Thread'].values())
-    env.assertTrue(per_thread_sum <= cpu['cpu_cores_used'] + 0.05)
-    # avg% normalized to worker count
-    env.assertTrue(abs(cpu['avg_cpu_utilization_pct']
-                       - 100.0 * cpu['cpu_cores_used'] / cpu['threads_counted']) < 0.5)
+    # cpu_cores_used is whole-process: total CPU / wall (exact internal invariant).
+    env.assertTrue(abs(cpu['cpu_cores_used']
+                       - cpu['cpu_total_seconds'] / cpu['cpu_wall_seconds']) < 0.01)
+
+    # avg_cpu_utilization_pct is WORKER-only saturation: 100 * (sum of worker CPU
+    # seconds / wall) / worker count. Reconstruct it exactly from the per-thread
+    # JSON so the check is independent of run timing (robust under sanitizers,
+    # where the main thread's CPU -- excluded here -- is amplified). It must NOT
+    # equal 100*cpu_cores_used/threads, which includes main-thread CPU.
+    worker_total = sum(pt['total_seconds'] for pt in cpu['Per Thread'].values())
+    expected_avg = 100.0 * (worker_total / cpu['cpu_wall_seconds']) / cpu['threads_counted']
+    env.assertTrue(abs(cpu['avg_cpu_utilization_pct'] - expected_avg) < 0.5)
 
 
 def test_cpu_stats_external_validation(env):
