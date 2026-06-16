@@ -909,6 +909,35 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
         m_end_time.tv_sec = (time_t) (total_duration_usec / 1000000);
         m_end_time.tv_usec = (suseconds_t) (total_duration_usec % 1000000);
     }
+
+    // Combine the whole-process CPU aggregate across runs: sum CPU-seconds and
+    // wall-seconds (so cores_used is the time-weighted average), take the max
+    // peak, and recompute the derived fields. Per-second / per-thread CPU detail
+    // is intentionally left empty for the AVERAGE report (it belongs to a single
+    // run; BEST/WORST keep their own).
+    cpu_summary agg_cpu;
+    unsigned int cpu_runs = 0;
+    unsigned int max_threads_counted = 0;
+    for (std::vector<run_stats>::const_iterator i = all_stats.begin(); i != all_stats.end(); i++) {
+        const cpu_summary &cs = i->m_cpu_summary;
+        if (!cs.valid) continue;
+        cpu_runs++;
+        agg_cpu.user_seconds += cs.user_seconds;
+        agg_cpu.sys_seconds += cs.sys_seconds;
+        agg_cpu.total_seconds += cs.total_seconds;
+        agg_cpu.wall_seconds += cs.wall_seconds;
+        if (cs.peak_utilization_pct > agg_cpu.peak_utilization_pct)
+            agg_cpu.peak_utilization_pct = cs.peak_utilization_pct;
+        if (cs.threads_counted > max_threads_counted) max_threads_counted = cs.threads_counted;
+    }
+    if (cpu_runs > 0 && agg_cpu.wall_seconds > 0.0) {
+        agg_cpu.threads_counted = max_threads_counted;
+        agg_cpu.cores_used = agg_cpu.total_seconds / agg_cpu.wall_seconds;
+        agg_cpu.avg_utilization_pct =
+            max_threads_counted > 0 ? 100.0 * agg_cpu.cores_used / max_threads_counted : 0.0;
+        agg_cpu.valid = true;
+        m_cpu_summary = agg_cpu;
+    }
 }
 
 void run_stats::merge(const run_stats &other, int iteration)
@@ -1656,6 +1685,40 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
         jsonhandler->write_obj("Interrupted", "\"%s\"", m_interrupted ? "true" : "false");
         jsonhandler->close_nesting();
     }
+
+    // Whole-process CPU aggregate (memtier's own utilization). Emitted as a
+    // sibling of "Runtime" so the existing Runtime schema is untouched. Only
+    // present when per-thread CPU accounting succeeded (Linux RUSAGE_THREAD).
+    if (jsonhandler != NULL && m_cpu_summary.valid) {
+        jsonhandler->open_nesting("CPU");
+        jsonhandler->write_obj("cpu_user_seconds", "%.3f", m_cpu_summary.user_seconds);
+        jsonhandler->write_obj("cpu_sys_seconds", "%.3f", m_cpu_summary.sys_seconds);
+        jsonhandler->write_obj("cpu_total_seconds", "%.3f", m_cpu_summary.total_seconds);
+        jsonhandler->write_obj("cpu_wall_seconds", "%.3f", m_cpu_summary.wall_seconds);
+        jsonhandler->write_obj("cpu_cores_used", "%.3f", m_cpu_summary.cores_used);
+        jsonhandler->write_obj("avg_cpu_utilization_pct", "%.3f", m_cpu_summary.avg_utilization_pct);
+        jsonhandler->write_obj("peak_cpu_utilization_pct", "%.3f", m_cpu_summary.peak_utilization_pct);
+        jsonhandler->write_obj("threads_counted", "%u", m_cpu_summary.threads_counted);
+        if (!m_cpu_threads.empty()) {
+            jsonhandler->open_nesting("Per Thread");
+            for (size_t i = 0; i < m_cpu_threads.size(); i++) {
+                const per_thread_cpu_total &pt = m_cpu_threads[i];
+                if (!pt.valid) continue;
+                char thread_name[32];
+                snprintf(thread_name, sizeof(thread_name), "Thread %u", pt.thread_id);
+                jsonhandler->open_nesting(thread_name);
+                jsonhandler->write_obj("user_seconds", "%.3f", pt.user_seconds);
+                jsonhandler->write_obj("sys_seconds", "%.3f", pt.sys_seconds);
+                jsonhandler->write_obj("total_seconds", "%.3f", pt.total_seconds);
+                jsonhandler->write_obj("wall_seconds", "%.3f", pt.wall_seconds);
+                jsonhandler->write_obj("cores_used", "%.3f", pt.cores_used);
+                jsonhandler->close_nesting();
+            }
+            jsonhandler->close_nesting();
+        }
+        jsonhandler->close_nesting();
+    }
+
     std::vector<unsigned int> timestamps = get_one_sec_cmd_stats_timestamp();
 
     if (print_arbitrary_commands_results()) {
@@ -1912,6 +1975,28 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
         }
         jsonhandler->close_nesting();
     }
+
+    // Per-second, per-thread CPU detail from the live sampler. Advisory: these
+    // are 1s-window "% of a core" samples, distinct from the authoritative "CPU"
+    // aggregate above. Each second carries the main thread plus one "Thread N"
+    // entry per worker.
+    if (jsonhandler != NULL && !m_cpu_stats.empty()) {
+        jsonhandler->open_nesting("CPU Stats");
+        for (size_t i = 0; i < m_cpu_stats.size(); i++) {
+            const per_second_cpu_stats &cs = m_cpu_stats[i];
+            char sec_str[16];
+            snprintf(sec_str, sizeof(sec_str), "%u", cs.m_second);
+            jsonhandler->open_nesting(sec_str);
+            jsonhandler->write_obj("Main Thread", "%.2f", cs.m_main_thread_cpu_pct);
+            for (size_t t = 0; t < cs.m_thread_cpu_pct.size(); t++) {
+                char thread_name[32];
+                snprintf(thread_name, sizeof(thread_name), "Thread %zu", t);
+                jsonhandler->write_obj(thread_name, "%.2f", cs.m_thread_cpu_pct[t]);
+            }
+            jsonhandler->close_nesting();
+        }
+        jsonhandler->close_nesting();
+    }
 }
 
 void run_stats::print_histogram(FILE *out, json_handler *jsonhandler, arbitrary_command_list &command_list,
@@ -2115,6 +2200,37 @@ void run_stats::print(FILE *out, benchmark_config *config, const char *header /*
             if (miss_rate > miss_threshold) {
                 fprintf(stderr, "warning: GET miss rate %.2f%% above target %.2f%% (%lu misses / %llu ops)\n",
                         miss_rate * 100.0, miss_threshold * 100.0, m_totals.m_misses, total);
+            }
+        }
+    }
+
+    // CPU utilization summary for memtier itself. Goes to stderr (like the
+    // miss-rate warning above) so it never corrupts piped / redirected table
+    // output. Only the authoritative getrusage-based aggregate is shown here.
+    if (m_cpu_summary.valid) {
+        fprintf(stderr,
+                "\n"
+                "CPU Utilization Summary\n"
+                "  Total CPU time:   %.3fs  (user %.3fs, sys %.3fs)\n"
+                "  Wall time:        %.3fs\n"
+                "  Cores used:       %.3f   (avg %.1f%% across %u worker threads)\n"
+                "  Peak utilization: %.1f%%\n",
+                m_cpu_summary.total_seconds, m_cpu_summary.user_seconds, m_cpu_summary.sys_seconds,
+                m_cpu_summary.wall_seconds, m_cpu_summary.cores_used, m_cpu_summary.avg_utilization_pct,
+                m_cpu_summary.threads_counted, m_cpu_summary.peak_utilization_pct);
+
+        // End-of-run high-CPU warning (one line per offending thread), computed
+        // from the authoritative per-thread totals. config->cpu_warn_threshold
+        // is a fraction of a single core (default 0.95).
+        const double cpu_threshold = config->cpu_warn_threshold;
+        for (size_t i = 0; i < m_cpu_threads.size(); i++) {
+            const per_thread_cpu_total &pt = m_cpu_threads[i];
+            if (!pt.valid) continue;
+            if (pt.cores_used > cpu_threshold) {
+                fprintf(stderr,
+                        "warning: thread %u averaged %.1f%% of a core over the run (threshold %.1f%%) - "
+                        "memtier may be the bottleneck; results may be unreliable\n",
+                        pt.thread_id, pt.cores_used * 100.0, cpu_threshold * 100.0);
             }
         }
     }
