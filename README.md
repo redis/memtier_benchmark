@@ -371,3 +371,38 @@ docker-compose -f docker-compose.statsd.yml up -d
 | `--statsd-run-label=LABEL` | `default` | Label to identify/compare benchmark runs. |
 
 For detailed setup instructions, dashboard usage, and troubleshooting, see [Real-Time Metrics Guide](docs/REALTIME_METRICS.md).
+
+#### Prometheus /metrics exporter
+
+memtier_benchmark can also expose live metrics as a Prometheus `/metrics`
+endpoint, scrapable by Prometheus or any OpenMetrics-compatible collector. The
+exporter is built in by default (it requires libevent 2.1.1 or newer; see
+[DEVELOPMENT.md](DEVELOPMENT.md) for the `--disable-prometheus` build flavor).
+It is **off at runtime** until you pass `--prometheus-port`:
+
+```bash
+# Bind the exporter on a fixed port (loopback by default)
+./memtier_benchmark -s <redis-host> --test-time=60 --prometheus-port=8080
+# Scrape it:
+curl http://127.0.0.1:8080/metrics
+
+# Or let the OS pick an ephemeral port; the bound URL is announced on stdout:
+./memtier_benchmark -s <redis-host> --test-time=60 --prometheus-port=0
+# -> "Prometheus exporter listening on http://127.0.0.1:43217/metrics"
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--prometheus-port=PORT` | *(disabled)* | TCP port for the `/metrics` HTTP endpoint. `0` selects an ephemeral port (announced on stdout). Enables the exporter when set. |
+| `--prometheus-bind-addr=ADDR` | `127.0.0.1` | Address to bind the exporter to. Loopback by default; a non-loopback address prints a one-shot warning. |
+| `--prometheus-run-label=K=V` | *(none)* | Repeatable label applied to every exported sample, e.g. to compare runs. |
+| `--prometheus-latency-buckets=L` | *(26 defaults)* | Comma-separated histogram bucket upper bounds in seconds. |
+
+The exporter exposes cumulative counters (ops, bytes, hits/misses, errors,
+connection errors, retries), gauges (connections, threads, current/configured
+run), and a latency histogram (`memtier_latency_seconds`), plus build info. By
+design it echoes **no** connection identity (no server address, password, URI,
+or filesystem path) into the scrape body. The end-of-run output remains the
+authoritative latency source; the histogram samples a phase-dependent fraction
+of operations. See the [Real-Time Metrics Guide](docs/REALTIME_METRICS.md) for
+the full metric mapping, threat model, and operational notes.

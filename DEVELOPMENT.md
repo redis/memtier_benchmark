@@ -8,8 +8,9 @@ This document provides information for developers working on memtier_benchmark.
 
 The following libraries are required for building:
 
-* libevent 2.0.10 or newer.
+* libevent 2.1.1 or newer (the default-on Prometheus exporter requires evhttp >= 2.1.1; libevent 2.0.10 suffices with ./configure --disable-prometheus).
 * OpenSSL (unless TLS support is disabled by `./configure --disable-tls`).
+* Prometheus /metrics exporter support can be disabled by ./configure --disable-prometheus.
 
 The following tools are required:
 * autoconf
@@ -190,6 +191,36 @@ To verify TSAN is enabled:
     $ ldd ./memtier_benchmark | grep tsan
 
 **Note:** TSAN and ASAN are mutually exclusive and cannot be used together. A suppression file (`tsan_suppressions.txt`) is provided to ignore known benign data races that do not affect correctness.
+
+### Prometheus exporter build flavor
+
+memtier_benchmark ships a built-in Prometheus `/metrics` exporter (a second
+real-time transport alongside StatsD; see
+[Real-Time Metrics Visualization](docs/REALTIME_METRICS.md)). It is **enabled by
+default** — no extra configure flag is needed:
+
+    $ ./configure && make
+
+The exporter is built on libevent's `evhttp`, which requires **libevent 2.1.1 or
+newer**. `configure` performs an explicit **LINK test** for `evhttp_new` (not just
+a header check); if your libevent is too old, the build fails loudly at configure
+time with a message pointing at `--disable-prometheus`. To build without the
+exporter (e.g. on a host pinned to libevent 2.0.x):
+
+    $ ./configure --disable-prometheus && make
+
+Verify which flavor you built using the `--version` token:
+
+    $ ./memtier_benchmark --version
+    memtier_benchmark ... prometheus=yes      # default-on build
+    $ ./memtier_benchmark --version            # after --disable-prometheus
+    memtier_benchmark ... prometheus=no
+
+In a `prometheus=no` build the `--prometheus-*` flags are rejected with
+`unrecognized option` (exit code 2). The `make check` unit harness
+(`tests/unit/prometheus_metrics_test.cpp`) runs under **both** flavors — the
+metrics-layer unit tests are independent of libevent and validate the histogram
+math, exposition rendering, and bucket parsing in either build.
 
 ### On-demand fuzzers and extra suites (PR labels)
 
