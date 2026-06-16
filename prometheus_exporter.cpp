@@ -132,11 +132,14 @@ prometheus_exporter::prometheus_exporter(const options &opts) :
 
     m_accum.init(opts.n_threads);
 
-    // Publish the zero snapshot (run_id = 0, run_count set). counters all zero.
+    // Publish the idle zero snapshot: run_id 0, counters 0, and 0 active threads
+    // — no worker threads exist until the first run's publish_run_start(), so the
+    // gauge must read 0 here (matches run-end behavior; avoids advertising live
+    // threads during --verify-only or pre-run startup). run_count is config.
     metrics_snapshot s;
     memset(&s, 0, sizeof(s));
     s.run_count = opts.run_count;
-    s.active_threads = opts.n_threads;
+    s.active_threads = 0;
     publish(s, NULL);
 }
 
