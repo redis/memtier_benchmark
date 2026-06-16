@@ -470,25 +470,27 @@ void text_renderer::render(std::string &out, const metrics_snapshot &snap, const
 
     // 12. memtier_connections (gauge)
     emit_help_type(out, defs[di++]);
-    append_fmt(out, "memtier_connections%s %.6g\n", m_label_block.c_str(), (double) snap.connections);
+    // integer count, rendered exactly (%.6g switches to scientific notation
+    // past 6 significant digits, losing fidelity for large client x thread).
+    append_fmt(out, "memtier_connections%s %u\n", m_label_block.c_str(), (unsigned) snap.connections);
 
     // 13. memtier_threads (gauge)
     emit_help_type(out, defs[di++]);
-    append_fmt(out, "memtier_threads%s %.6g\n", m_label_block.c_str(), (double) snap.active_threads);
+    append_fmt(out, "memtier_threads%s %u\n", m_label_block.c_str(), (unsigned) snap.active_threads);
 
     // 14. memtier_run (gauge)
     emit_help_type(out, defs[di++]);
-    append_fmt(out, "memtier_run%s %.6g\n", m_label_block.c_str(), (double) snap.run_id);
+    append_fmt(out, "memtier_run%s %u\n", m_label_block.c_str(), (unsigned) snap.run_id);
 
     // 15. memtier_configured_runs (gauge)
     emit_help_type(out, defs[di++]);
-    append_fmt(out, "memtier_configured_runs%s %.6g\n", m_label_block.c_str(), (double) snap.run_count);
+    append_fmt(out, "memtier_configured_runs%s %u\n", m_label_block.c_str(), (unsigned) snap.run_count);
 
     // 16. memtier_config_test_time_seconds (gauge): the configured --test-time,
     // carried on the snapshot (stamped by the exporter's publish() from
     // options.test_time). 0 when running by --requests.
     emit_help_type(out, defs[di++]);
-    append_fmt(out, "memtier_config_test_time_seconds%s %.6g\n", m_label_block.c_str(), (double) snap.test_time);
+    append_fmt(out, "memtier_config_test_time_seconds%s %d\n", m_label_block.c_str(), (int) snap.test_time);
 
     // 17. memtier_latency_seconds (histogram): cumulative bucket walk.
     emit_help_type(out, defs[di++]);
