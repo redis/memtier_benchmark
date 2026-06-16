@@ -222,6 +222,20 @@ In a `prometheus=no` build the `--prometheus-*` flags are rejected with
 metrics-layer unit tests are independent of libevent and validate the histogram
 math, exposition rendering, and bucket parsing in either build.
 
+Before pushing changes that touch the exporter, run the one-command local gate
+(`tests/run_local_gate.sh`):
+
+    $ make gate
+
+It builds both flavors in sibling VPATH directories, runs the unit harness under
+each, the RLTest CLI/functional/redaction/statsd suites, a live HTTP smoke
+(hardening, render-cache TTL, run-boundary monotonicity, teardown race window),
+the error-path/IPv6/in-flight-cap checks, the ASan and TSan cells, and the
+docs/completion/purity grep audits — printing `GATE PASS` on success. Set
+`GATE_FAST=1 make gate` to skip the (slower) sanitizer stage. The gate validates
+`/metrics` with `promtool` when it is on `PATH`, otherwise via a pinned
+`prom/prometheus` Docker image (warn+skip if that image is unavailable offline).
+
 ### On-demand fuzzers and extra suites (PR labels)
 
 A few longer-running test suites do not run on every PR by default — their wall-clock cost outweighs the per-PR signal — but you can opt a PR into running them by attaching a label:

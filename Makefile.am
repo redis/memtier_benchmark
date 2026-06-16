@@ -97,6 +97,13 @@ dist_man1_MANS = memtier_benchmark.1
 rebuild-man:
 	help2man --name="NoSQL benchmark tool" --no-info --no-discard-stderr --output=memtier_benchmark.1 $(builddir)/memtier_benchmark
 
+# One-command local gate (PLAN.md §11): both-flavor VPATH builds, unit + CLI +
+# functional + redaction + statsd suites, HTTP smoke, sanitizers, and the
+# docs/completion/purity grep audits. GATE_FAST=1 skips the sanitizer stage.
+.PHONY: gate
+gate:
+	$(srcdir)/tests/run_local_gate.sh
+
 # Code formatting
 .PHONY: format format-check
 format:
