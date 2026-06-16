@@ -47,3 +47,13 @@ race:run_stats::copy_inst_histogram_if_changed
 # These are known benign races within OpenSSL library itself
 race:libcrypto.so*
 
+# Prometheus exporter event loop: the exporter runs its own libevent event_base
+# (epoll) on a dedicated thread, concurrently with the main thread creating
+# benchmark sockets (shard_connection::setup_socket -> socket()). TSan reports a
+# "data race" on a file-descriptor *number* (e.g. epoll_ctl in the exporter
+# thread vs socket() in main) because fd numbers are reused across threads — a
+# known TSan fd-shadow limitation, not a real race: the exporter's event_base and
+# the benchmark sockets are independent kernel objects, and epoll_ctl/socket are
+# kernel-thread-safe. The exporter never touches benchmark connection fds.
+race:prometheus_exporter::thread_entry
+
