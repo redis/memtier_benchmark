@@ -50,6 +50,8 @@
 #include <ctype.h>
 #include <sys/utsname.h>
 #include <dirent.h>
+#include <arpa/inet.h>  // inet_pton, ntohl/ntohs for prometheus-bind-addr parsing
+#include <netinet/in.h> // struct in_addr / in6_addr / IN6_IS_ADDR_LOOPBACK
 #include <event2/event.h>
 #include <event2/thread.h>
 
@@ -89,6 +91,7 @@
 #include "retry_policy.h"
 #include "statsd.h"
 #include "prometheus_metrics.h"
+#include "prometheus_exporter.h"
 
 
 int log_level = 0;
@@ -511,6 +514,56 @@ static const char *get_protocol_name(enum PROTOCOL_TYPE type)
         return "none";
 }
 
+#ifdef HAVE_EVHTTP
+// Comma-joined "key=value" run labels in insertion order (PLAN.md section 5).
+// With json_escape, applies JSON string escaping (\, ", and control chars as
+// \u00XX) because json_handler::write_obj is a raw vfprintf passthrough.
+static std::string prometheus_run_labels_str(struct benchmark_config *cfg, bool json_escape)
+{
+    std::string s;
+    for (size_t i = 0; i < cfg->prometheus_run_labels.size(); i++) {
+        if (i > 0) s += ",";
+        const std::string &k = cfg->prometheus_run_labels[i].first;
+        const std::string &v = cfg->prometheus_run_labels[i].second;
+        std::string kv = k + "=" + v;
+        if (json_escape) {
+            for (size_t j = 0; j < kv.size(); j++) {
+                unsigned char c = (unsigned char) kv[j];
+                if (c == '\\') {
+                    s += "\\\\";
+                } else if (c == '"') {
+                    s += "\\\"";
+                } else if (c < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", (unsigned int) c);
+                    s += buf;
+                } else {
+                    s += (char) c;
+                }
+            }
+        } else {
+            s += kv;
+        }
+    }
+    return s;
+}
+
+// "default" when no custom buckets were given, else %.12g comma-joined seconds
+// (same precision as format_le so parsed-float round-trips). PLAN.md section 5.
+static std::string prometheus_buckets_str(struct benchmark_config *cfg)
+{
+    if (cfg->prometheus_latency_buckets.empty()) return "default";
+    std::string s;
+    char buf[64];
+    for (size_t i = 0; i < cfg->prometheus_latency_buckets.size(); i++) {
+        if (i > 0) s += ",";
+        snprintf(buf, sizeof(buf), "%.12g", cfg->prometheus_latency_buckets[i]);
+        s += buf;
+    }
+    return s;
+}
+#endif // HAVE_EVHTTP
+
 static void config_print(FILE *file, struct benchmark_config *cfg)
 {
     char tmpbuf[512];
@@ -579,7 +632,14 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             "num-slaves = %u-%u\n"
             "wait-timeout = %u-%u\n"
             "json-out-file = %s\n"
-            "print-all-runs = %s\n",
+            "print-all-runs = %s\n"
+#ifdef HAVE_EVHTTP
+            "prometheus-port = %d\n"
+            "prometheus-bind-addr = %s\n"
+            "prometheus-run-labels = %s\n"
+            "prometheus-latency-buckets = %s\n"
+#endif
+            ,
             cfg->server, cfg->port, cfg->uri ? cfg->uri : "", cfg->unix_socket,
             cfg->resolution == AF_UNSPEC ? "Unspecified"
             : cfg->resolution == AF_INET ? "AF_INET"
@@ -602,7 +662,13 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             cfg->thread_conn_start_min_jitter_micros, cfg->thread_conn_start_max_jitter_micros, cfg->multi_key_get,
             cfg->authenticate ? cfg->authenticate : "", cfg->select_db, cfg->no_expiry ? "yes" : "no",
             cfg->wait_ratio.a, cfg->wait_ratio.b, cfg->num_slaves.min, cfg->num_slaves.max, cfg->wait_timeout.min,
-            cfg->wait_timeout.max, cfg->json_out_file, cfg->print_all_runs ? "yes" : "no");
+            cfg->wait_timeout.max, cfg->json_out_file, cfg->print_all_runs ? "yes" : "no"
+#ifdef HAVE_EVHTTP
+            ,
+            cfg->prometheus_port, cfg->prometheus_bind_addr ? cfg->prometheus_bind_addr : "127.0.0.1",
+            prometheus_run_labels_str(cfg, false).c_str(), prometheus_buckets_str(cfg).c_str()
+#endif
+    );
 }
 
 static void config_print_to_json(json_handler *jsonhandler, struct benchmark_config *cfg)
@@ -733,6 +799,16 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
         }
         jsonhandler->write_obj("read_servers", "\"%s\"", read_servers_str.c_str());
     }
+
+#ifdef HAVE_EVHTTP
+    // Prometheus configuration (PLAN.md section 5). None of these are secrets.
+    // Run labels are JSON-escaped because write_obj is a raw vfprintf passthrough.
+    jsonhandler->write_obj("prometheus-port", "%d", cfg->prometheus_port);
+    jsonhandler->write_obj("prometheus-bind-addr", "\"%s\"",
+                           cfg->prometheus_bind_addr ? cfg->prometheus_bind_addr : "127.0.0.1");
+    jsonhandler->write_obj("prometheus-run-labels", "\"%s\"", prometheus_run_labels_str(cfg, true).c_str());
+    jsonhandler->write_obj("prometheus-latency-buckets", "\"%s\"", prometheus_buckets_str(cfg).c_str());
+#endif
 
     jsonhandler->close_nesting();
 }
@@ -892,6 +968,14 @@ static void config_init_defaults(struct benchmark_config *cfg)
     if (!cfg->statsd_run_label) cfg->statsd_run_label = "default";
     if (!cfg->graphite_port) cfg->graphite_port = 8080;
 
+        // Prometheus defaults - bind-addr only matters if --prometheus-port is set.
+        // NULL at parse time means "user didn't pass it" (so the W1 non-loopback
+        // warning never fires on the default); the loopback default is applied here,
+        // after parsing. PLAN.md section 5.
+#ifdef HAVE_EVHTTP
+    if (!cfg->prometheus_bind_addr) cfg->prometheus_bind_addr = "127.0.0.1";
+#endif
+
 #ifdef USE_TLS
     if (!cfg->tls_protocols) cfg->tls_protocols = REDIS_TLS_PROTO_DEFAULT;
 #endif
@@ -1006,6 +1090,31 @@ static bool optarg_is_negative(const char *s)
     return *s == '-';
 }
 
+#ifdef HAVE_EVHTTP
+// True if a bracket-free numeric IPv4/IPv6 literal is a loopback address
+// (PLAN.md section 5, W1). IPv4 loopback = 127.0.0.0/8; IPv6 loopback = ::1.
+// 0.0.0.0 and :: are NOT loopback (they are wildcard binds). IPv4-mapped
+// ::ffff:127.0.0.1 is treated as loopback (accepted conservatism). The
+// fallback is false (fail-safe = warn) when the literal does not parse as
+// either family.
+static bool addr_is_loopback(const char *addr)
+{
+    if (addr == NULL) return false;
+    struct in_addr a4;
+    if (inet_pton(AF_INET, addr, &a4) == 1) {
+        return (ntohl(a4.s_addr) >> 24) == 127;
+    }
+    struct in6_addr a6;
+    if (inet_pton(AF_INET6, addr, &a6) == 1) {
+        if (IN6_IS_ADDR_LOOPBACK(&a6)) return true;
+        // IPv4-mapped ::ffff:127.x.x.x -> inspect the embedded v4 octet.
+        if (IN6_IS_ADDR_V4MAPPED(&a6)) return a6.s6_addr[12] == 127;
+        return false;
+    }
+    return false;
+}
+#endif
+
 static int config_parse_args(int argc, char *argv[], struct benchmark_config *cfg)
 {
     enum extended_options
@@ -1084,6 +1193,10 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_statsd_prefix,
         o_statsd_run_label,
         o_graphite_port,
+        o_prometheus_port,
+        o_prometheus_bind_addr,
+        o_prometheus_run_label,
+        o_prometheus_latency_buckets,
         o_scan_incremental_iteration,
         o_scan_incremental_max_iterations,
         o_clients_start,
@@ -1193,6 +1306,12 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         {"statsd-prefix", 1, 0, o_statsd_prefix},
         {"statsd-run-label", 1, 0, o_statsd_run_label},
         {"graphite-port", 1, 0, o_graphite_port},
+#ifdef HAVE_EVHTTP
+        {"prometheus-port", 1, 0, o_prometheus_port},
+        {"prometheus-bind-addr", 1, 0, o_prometheus_bind_addr},
+        {"prometheus-run-label", 1, 0, o_prometheus_run_label},
+        {"prometheus-latency-buckets", 1, 0, o_prometheus_latency_buckets},
+#endif
         {"scan-incremental-iteration", 0, 0, o_scan_incremental_iteration},
         {"scan-incremental-max-iterations", 1, 0, o_scan_incremental_max_iterations},
         {"clients-start", 1, 0, o_clients_start},
@@ -1234,6 +1353,13 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             // Print OpenSSL version if TLS is enabled
 #ifdef USE_TLS
             printf(" openssl=%s", OPENSSL_VERSION_TEXT);
+#endif
+
+            // Print Prometheus exporter availability (compiled in iff HAVE_EVHTTP)
+#ifdef HAVE_EVHTTP
+            printf(" prometheus=yes");
+#else
+            printf(" prometheus=no");
 #endif
 
             printf("\n");
@@ -2003,6 +2129,127 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 return -1;
             }
             break;
+#ifdef HAVE_EVHTTP
+        case o_prometheus_port: {
+            // strtoul pattern (statsd-port) with three deltas: accept 0,
+            // reject a leading '-' before strtoul wraps it, and bound the
+            // value to [0,65535] BEFORE any narrowing cast (a cast would
+            // silently wrap 70000 -> 4464). PLAN.md section 5 / E1.
+            static const char *E1 = "error: prometheus-port must be a number in the range [0-65535] (0 = ephemeral).\n";
+            if (!optarg || !*optarg || optarg_is_negative(optarg)) {
+                fprintf(stderr, "%s", E1);
+                return -1;
+            }
+            endptr = NULL;
+            unsigned long pport = strtoul(optarg, &endptr, 10);
+            if (!endptr || *endptr != '\0' || pport > 65535) {
+                fprintf(stderr, "%s", E1);
+                return -1;
+            }
+            cfg->prometheus_port = (int) pport;
+            break;
+        }
+        case o_prometheus_bind_addr: {
+            // Numeric IPv4/IPv6 literals only; hostnames (incl. localhost)
+            // rejected (no DNS at startup). Bracketed IPv6 [::1] is accepted
+            // and stripped in place; brackets imply IPv6 ([1.2.3.4] rejected).
+            // PLAN.md section 5 / E2.
+            static const char *E2 = "error: prometheus-bind-addr must be a numeric IPv4 or IPv6 address "
+                                    "(e.g. 127.0.0.1, 0.0.0.0, ::1, ::); hostnames are not supported "
+                                    "(for localhost use 127.0.0.1 or ::1).\n";
+            if (!optarg || !*optarg) {
+                fprintf(stderr, "%s", E2);
+                return -1;
+            }
+            bool bracketed = (optarg[0] == '[');
+            // argv is modifiable (C11 5.1.2.2.1p2; --read-server precedent).
+            char *addr = optarg;
+            if (bracketed) {
+                char *close = strchr(addr, ']');
+                if (!close || *(close + 1) != '\0') { // require "[...]" with nothing after
+                    fprintf(stderr, "%s", E2);
+                    return -1;
+                }
+                *close = '\0';
+                addr = addr + 1; // strip leading '['
+            }
+            struct in_addr a4;
+            struct in6_addr a6;
+            bool ok = false;
+            if (!bracketed && inet_pton(AF_INET, addr, &a4) == 1) ok = true; // v4 only if unbracketed
+            if (!ok && inet_pton(AF_INET6, addr, &a6) == 1) ok = true;       // v6 always tried
+            if (!ok) {
+                fprintf(stderr, "%s", E2);
+                return -1;
+            }
+            cfg->prometheus_bind_addr = addr; // bracket-free literal, points into argv
+            break;
+        }
+        case o_prometheus_run_label: {
+            if (!optarg) {
+                fprintf(stderr, "error: --prometheus-run-label expects KEY=VALUE.\n");
+                return -1;
+            }
+            const char *eq = strchr(optarg, '=');
+            if (eq == NULL) {
+                fprintf(stderr, "error: --prometheus-run-label expects KEY=VALUE.\n");
+                return -1;
+            }
+            std::string key(optarg, (size_t) (eq - optarg));
+            std::string value(eq + 1);
+            switch (prom::validate_prom_label_name(key)) {
+            case prom::LABEL_NAME_OK:
+                break;
+            case prom::LABEL_NAME_TOO_LONG:
+                fprintf(stderr, "error: --prometheus-run-label: label name exceeds 128 bytes.\n");
+                return -1;
+            case prom::LABEL_NAME_INVALID:
+                fprintf(stderr,
+                        "error: --prometheus-run-label: invalid label name '%s' "
+                        "(must match [a-zA-Z_][a-zA-Z0-9_]*).\n",
+                        key.c_str());
+                return -1;
+            case prom::LABEL_NAME_RESERVED_PREFIX:
+                fprintf(stderr,
+                        "error: --prometheus-run-label: label name '%s' is reserved "
+                        "(names beginning with __ are reserved for Prometheus internal use).\n",
+                        key.c_str());
+                return -1;
+            case prom::LABEL_NAME_RESERVED:
+                fprintf(stderr, "error: --prometheus-run-label: label name '%s' is reserved.\n", key.c_str());
+                return -1;
+            }
+            if (value.size() > 256) {
+                fprintf(stderr, "error: --prometheus-run-label: value for '%s' exceeds 256 bytes.\n", key.c_str());
+                return -1;
+            }
+            for (size_t i = 0; i < cfg->prometheus_run_labels.size(); i++) {
+                if (cfg->prometheus_run_labels[i].first == key) {
+                    fprintf(stderr, "error: --prometheus-run-label: duplicate label name '%s'.\n", key.c_str());
+                    return -1;
+                }
+            }
+            if (cfg->prometheus_run_labels.size() >= 16) {
+                fprintf(stderr, "error: --prometheus-run-label: too many labels (max 16).\n");
+                return -1;
+            }
+            cfg->prometheus_run_labels.push_back(std::make_pair(key, value));
+            break;
+        }
+        case o_prometheus_latency_buckets: {
+            std::vector<double> parsed;
+            std::string err, warn;
+            if (!prom::parse_latency_buckets(optarg, parsed, err, warn)) {
+                fprintf(stderr, "%s\n", err.c_str());
+                return -1;
+            }
+            if (!warn.empty()) {
+                fprintf(stderr, "%s\n", warn.c_str());
+            }
+            cfg->prometheus_latency_buckets.swap(parsed); // last wins (cleared + refilled)
+            break;
+        }
+#endif // HAVE_EVHTTP
         case o_scan_incremental_iteration:
             cfg->scan_incremental_iteration = true;
             break;
@@ -2227,6 +2474,42 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         return -1;
     }
 
+#ifdef HAVE_EVHTTP
+    // Prometheus post-parse tail (PLAN.md section 5). Runs once, before
+    // config_init_defaults, so a NULL bind-addr still means "unset" and the
+    // default 127.0.0.1 can never trip the W1 warning.
+    {
+        // (1) Dependency check (E12): any non-port prometheus flag requires
+        //     --prometheus-port. prometheus_port < 0 = flag absent.
+        if (cfg->prometheus_port < 0) {
+            const char *dep = NULL;
+            if (cfg->prometheus_bind_addr != NULL)
+                dep = "--prometheus-bind-addr";
+            else if (!cfg->prometheus_run_labels.empty())
+                dep = "--prometheus-run-label";
+            else if (!cfg->prometheus_latency_buckets.empty())
+                dep = "--prometheus-latency-buckets";
+            if (dep != NULL) {
+                fprintf(stderr, "error: %s requires --prometheus-port.\n", dep);
+                return -1;
+            }
+        }
+
+        // (2) One-shot non-loopback warning (W1) when an explicit bind-addr is
+        //     not a loopback address. The default is applied later, so only a
+        //     user-supplied bind-addr is checked here.
+        if (cfg->prometheus_port >= 0 && cfg->prometheus_bind_addr != NULL &&
+            !addr_is_loopback(cfg->prometheus_bind_addr)) {
+            fprintf(stderr,
+                    "warning: --prometheus-bind-addr=%s is not a loopback address; /metrics will be "
+                    "served as unauthenticated plaintext HTTP reachable from other hosts, and anyone "
+                    "who can connect can read benchmark metrics. Restrict access with a firewall or "
+                    "security group, or keep the default 127.0.0.1.\n",
+                    cfg->prometheus_bind_addr);
+        }
+    }
+#endif // HAVE_EVHTTP
+
     return 0;
 }
 
@@ -2324,6 +2607,16 @@ void usage()
         "(default: default)\n"
         "      --graphite-port=PORT       Graphite HTTP port for event annotations (default: 8080 for host access; "
         "use 80 when running inside the Docker network)\n"
+#ifdef HAVE_EVHTTP
+        "      --prometheus-port=PORT     Serve Prometheus metrics on this port at /metrics (default: disabled; "
+        "0 = ephemeral port)\n"
+        "      --prometheus-bind-addr=ADDR  Numeric IPv4/IPv6 address to bind the Prometheus exporter to "
+        "(default: 127.0.0.1; hostnames not supported)\n"
+        "      --prometheus-run-label=KEY=VALUE  Add a constant label to every Prometheus metric (repeatable; max 16)\n"
+        "      --prometheus-latency-buckets=LIST  Comma-separated, strictly ascending latency histogram bounds in "
+        "seconds (default: built-in 26-bound list). Bounds closer than 1%% of their value collapse to the same "
+        "histogram slot and are rejected\n"
+#endif
         "\n"
         "Test Options:\n"
         "  -n, --requests=NUMBER          Number of total requests per client (default: 10000)\n"
@@ -3553,6 +3846,12 @@ int main(int argc, char *argv[])
     // as the unset marker because 0 is a valid user-specified "disable the
     // supervisor entirely" value.
     cfg.connection_stage_timeout = UINT_MAX;
+#ifdef HAVE_EVHTTP
+    // Prometheus port sentinel: -1 = flag absent (exporter disabled). 0 is a
+    // valid user value (ephemeral port), so it cannot be the unset marker.
+    cfg.prometheus_port = -1;
+#endif
+    cfg.prometheus = NULL;
 
     if (config_parse_args(argc, argv, &cfg) < 0) {
         usage();

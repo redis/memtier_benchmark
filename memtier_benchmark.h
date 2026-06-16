@@ -22,6 +22,7 @@
 #include <atomic>
 #include <vector>
 #include <string>
+#include <utility>
 #include <sys/time.h>
 #include <pthread.h>
 #include "config_types.h"
@@ -224,6 +225,16 @@ struct benchmark_config
     const char *statsd_run_label;
     unsigned short graphite_port;
     statsd_client *statsd;
+    // Prometheus metrics export (PLAN.md v5 sections 3.1, 5). The four flag
+    // members are guarded; the exporter pointer is unguarded (statsd idiom,
+    // Decisions #25): NULL when disabled or compiled out.
+#ifdef HAVE_EVHTTP
+    int prometheus_port;              // sentinel -1 = unset; 0 = ephemeral; else fixed port
+    const char *prometheus_bind_addr; // NULL until config_init_defaults applies 127.0.0.1
+    std::vector<std::pair<std::string, std::string> > prometheus_run_labels; // raw; renderer escapes
+    std::vector<double> prometheus_latency_buckets;                          // seconds; empty = default
+#endif
+    prometheus_exporter *prometheus; // unguarded ownership alias of g_prom_exporter
     // SCAN incremental cursor iteration
     bool scan_incremental_iteration;
     unsigned int scan_incremental_max_iterations;
