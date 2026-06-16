@@ -151,6 +151,39 @@ def test_arbitrary_smembers_empty_collection(env):
                    message="expected SMEMBERS misses on missing keys")
 
 
+def test_arbitrary_smembers_zero_length_member_is_hit(env):
+    """Regression: a set whose only member is the empty string returns a
+    non-empty array (*1 $0) and must count as a HIT, not a miss.
+
+    EmptyCollection miss-tracking classifies emptiness from the reply's
+    declared top-level array length (get_top_array_len()), not from a per-value
+    hit walk. An earlier approach keyed on the parser's non-null-bulk hit
+    counter, which skips zero-length bulks and so misreported this populated
+    set as empty/missing. This test pins the declared-length behaviour."""
+    env.skipOnCluster()
+    set_prefix = "memtier-emptyset-"
+    env.flush()
+    conn = env.getConnection()
+    # Keys 1..3 each hold a single zero-length member; 4..10 stay missing.
+    for i in range(1, _PRELOADED_KEYS + 1):
+        conn.sadd("{}{}".format(set_prefix, i), "")
+
+    result = _run_benchmark(env, "SMEMBERS __key__", key_prefix=set_prefix)
+    per_key = result["ALL STATS"].get("Per-Key Misses", {})
+    env.assertContains("SMEMBERS", per_key)
+    cmd_stats = per_key["SMEMBERS"]
+
+    total_ops = cmd_stats["Total Hits"] + cmd_stats["Total Misses"]
+    env.assertEqual(total_ops, _REQUESTS * 2)
+    # The populated (zero-length-member) sets must register as hits.
+    env.assertTrue(cmd_stats["Total Hits"] > 0,
+                   message="zero-length set member must count as a hit, got "
+                           "{} hits".format(cmd_stats["Total Hits"]))
+    # And the missing keys 4..10 must still register as misses.
+    env.assertTrue(cmd_stats["Total Misses"] > 0,
+                   message="expected misses on missing keys")
+
+
 def test_arbitrary_exists_integer_membership(env):
     """EXISTS — IntegerMembership; integer reply N == hit count."""
     env.skipOnCluster()

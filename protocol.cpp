@@ -51,7 +51,13 @@ void abstract_protocol::set_keep_value(bool flag)
 /////////////////////////////////////////////////////////////////////////
 
 protocol_response::protocol_response() :
-        m_status(NULL), m_mbulk_value(NULL), m_value(NULL), m_value_len(0), m_hits(0), m_error(false)
+        m_status(NULL),
+        m_mbulk_value(NULL),
+        m_value(NULL),
+        m_value_len(0),
+        m_hits(0),
+        m_error(false),
+        m_top_array_len(-1)
 {
 }
 
@@ -116,6 +122,16 @@ unsigned int protocol_response::get_hits(void)
     return m_hits;
 }
 
+void protocol_response::set_top_array_len(int len)
+{
+    m_top_array_len = len;
+}
+
+int protocol_response::get_top_array_len(void)
+{
+    return m_top_array_len;
+}
+
 void protocol_response::clear(void)
 {
     if (m_status != NULL) {
@@ -135,6 +151,7 @@ void protocol_response::clear(void)
     m_total_len = 0;
     m_hits = 0;
     m_error = 0;
+    m_top_array_len = -1;
 }
 
 void protocol_response::set_mbulk_value(mbulk_size_el *element)
@@ -567,6 +584,15 @@ int redis_protocol::parse_response(void)
             if (aggregate_type(line[0])) {
                 int count = strtol(line + 1, NULL, 10);
 
+                // The reply's top-level aggregate is the one parsed while no
+                // bulks are still outstanding. Capture its declared length so
+                // miss-tracking can tell an empty collection from a populated
+                // one without materializing values (see EmptyCollection in
+                // client::handle_response). Out-of-band frames are excluded:
+                // attribute (|) is a prefix to the real reply, push (>) is not
+                // a reply at all.
+                bool top_level_aggregate = (m_total_bulks_count == 0);
+
                 // in case of nested mbulk, the mbulk is one of the total bulks
                 if (m_total_bulks_count > 0) {
                     m_total_bulks_count--;
@@ -594,6 +620,13 @@ int redis_protocol::parse_response(void)
                 // Map or Attribute contain key-value pair
                 if (line[0] == '%' || line[0] == '|') {
                     count *= 2;
+                }
+
+                // Record the reply body's declared element count (count is now
+                // null-clamped to >=0 and map-doubled). '|' is the attribute
+                // prefix, not the reply body; '>' (m_push) is out-of-band.
+                if (top_level_aggregate && !m_push && line[0] != '|') {
+                    m_last_response.set_top_array_len(count);
                 }
 
                 // Suppress mbulk allocation while draining a push frame:
