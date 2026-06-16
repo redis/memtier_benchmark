@@ -55,6 +55,23 @@
 #include "retry_policy.h"
 
 
+void client::apply_arbitrary_tracking_flags(abstract_protocol *protocol)
+{
+    // Mirror the per-element miss-tracking decision made in setup_client onto a
+    // single protocol. In cluster mode shard connections are *re-created* (not
+    // reconnected in place) on topology reset -- cluster_client::disconnect()
+    // deletes the non-main connections and the next cluster-slots discovery
+    // rebuilds them via create_shard_connection(). Each rebuild clone()s a fresh
+    // protocol with runtime flags reset to defaults, so the flag must be
+    // re-applied here or miss tracking silently never engages for them. (An
+    // in-place reconnect keeps the same protocol object; reset_state() preserves
+    // the flag, so that path needs nothing.) See issue #476.
+    if (protocol == NULL) return;
+    if (m_arbitrary_needs_elem_tracking) {
+        protocol->set_track_elem_misses(true);
+    }
+}
+
 bool client::setup_client(benchmark_config *config, abstract_protocol *protocol, object_generator *objgen)
 {
     m_config = config;
@@ -95,20 +112,21 @@ bool client::setup_client(benchmark_config *config, abstract_protocol *protocol,
     // (response->get_top_array_len()); SingleNullBulk and IntegerMembership use
     // the parser's scalar counters / status line. None of them keep values.
     if (config->arbitrary_commands->is_defined()) {
-        bool needs_elem_tracking = false;
         for (size_t i = 0; i < config->arbitrary_commands->size(); ++i) {
             const arbitrary_command &cmd = config->arbitrary_commands->at(i);
             if (!cmd.miss_tracking_enabled || cmd.spec == NULL) continue;
             using memtier::command_meta::ReplyShape;
             if (cmd.spec->reply_shape == ReplyShape::ArrayPerElementNulls) {
-                needs_elem_tracking = true;
+                m_arbitrary_needs_elem_tracking = true;
                 break;
             }
         }
-        if (needs_elem_tracking) {
-            for (size_t i = 0; i < m_connections.size(); ++i) {
-                m_connections[i]->get_protocol()->set_track_elem_misses(true);
-            }
+        // Apply to the connections that exist now. Connections created later --
+        // notably the per-shard connections that cluster_client builds during
+        // cluster-slots discovery -- pick the flag up via
+        // apply_arbitrary_tracking_flags() at creation time (see issue #476).
+        for (size_t i = 0; i < m_connections.size(); ++i) {
+            apply_arbitrary_tracking_flags(m_connections[i]->get_protocol());
         }
     }
 
@@ -153,7 +171,8 @@ client::client(client_group *group) :
         m_tot_wait_ops(0),
         m_scan_cursor("0"),
         m_scan_iteration_count(0),
-        m_mget_defer(false)
+        m_mget_defer(false),
+        m_arbitrary_needs_elem_tracking(false)
 {
     m_event_base = group->get_event_base();
 
@@ -185,7 +204,8 @@ client::client(struct event_base *event_base, benchmark_config *config, abstract
         m_scan_cursor("0"),
         m_scan_iteration_count(0),
         m_keylist(NULL),
-        m_mget_defer(false)
+        m_mget_defer(false),
+        m_arbitrary_needs_elem_tracking(false)
 {
     m_event_base = event_base;
 
