@@ -269,6 +269,26 @@ public:
     std::vector<read_routing_summary> m_arbitrary_read_routing; // per arbitrary-cmd index
     read_routing_summary m_get_read_routing;                    // built-in GET aggregate
 
+    // ---------------------------------------------------------------------
+    // CPU utilization of memtier itself (the load generator).
+    //   m_cpu_summary  - authoritative whole-run aggregate (getrusage-based)
+    //   m_cpu_threads  - authoritative per-worker totals (getrusage-based)
+    //   m_cpu_stats    - advisory per-second per-thread sampler detail
+    // All three are populated by run_benchmark() after the join loop and
+    // consumed by print()/print_json(). They survive the copyable run_stats
+    // (POD doubles + vectors) and are intentionally NOT routed through the
+    // per-client merge()/totals path: per-thread CPU is folded exactly once
+    // from cg_thread, not summed across the N per-client run_stats.
+    // ---------------------------------------------------------------------
+    cpu_summary m_cpu_summary;
+    std::vector<per_thread_cpu_total> m_cpu_threads;
+    std::vector<per_second_cpu_stats> m_cpu_stats;
+
+    void set_cpu_summary(const cpu_summary &s) { m_cpu_summary = s; }
+    void add_cpu_thread(const per_thread_cpu_total &t) { m_cpu_threads.push_back(t); }
+    void set_cpu_stats(std::vector<per_second_cpu_stats> s) { m_cpu_stats = std::move(s); }
+    const cpu_summary &get_cpu_summary() const { return m_cpu_summary; }
+
     // Aggregator: fold the per-endpoint snapshot from one client's
     // shard_connections into m_endpoint_snapshots. Entries are coalesced by
     // (addr, role) so the JSON is at most O(distinct endpoints) regardless

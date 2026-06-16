@@ -12,3 +12,7 @@ git+https://github.com/fcostaoliveira/RLTest.git@fix/cluster-aware-replicas
 # on demand; pinning them here keeps the bootstrap reproducible.
 pytest>=7.0
 hypothesis>=6.0
+# psutil powers the external CPU cross-validation in tests/test_cpu_stats.py
+# (independent oracle for memtier's self-reported per-thread CPU). Skips
+# gracefully if unavailable.
+psutil>=5.9.0

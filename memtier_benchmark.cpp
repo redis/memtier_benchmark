@@ -21,6 +21,12 @@
 #define _XOPEN_SOURCE 600
 #endif
 
+// _GNU_SOURCE exposes getrusage(RUSAGE_THREAD) on glibc (per-thread CPU
+// accounting). Harmless on musl/Alpine, where RUSAGE_THREAD is unconditional.
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
@@ -81,11 +87,16 @@
 #include <atomic>
 #include <algorithm>
 
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
+
 #include "client.h"
 #include "cluster_client.h"
 #include "JSON_handler.h"
 #include "obj_gen.h"
 #include "memtier_benchmark.h"
+#include "run_stats_types.h"
 #include "retry_policy.h"
 #include "statsd.h"
 
@@ -882,6 +893,7 @@ static void config_init_defaults(struct benchmark_config *cfg)
     if (!cfg->print_percentiles.is_defined()) cfg->print_percentiles = config_quantiles("50,99,99.9");
     if (!cfg->monitor_pattern) cfg->monitor_pattern = 'S';
     if (cfg->miss_rate_threshold < 0.0) cfg->miss_rate_threshold = 0.01; // Default: warn above 1%
+    if (cfg->cpu_warn_threshold < 0.0) cfg->cpu_warn_threshold = 0.95;   // Default: warn above 95% of a core
     // Default --connection-stage-timeout to 30 s; 0 means "operator disabled".
     if (cfg->connection_stage_timeout == UINT_MAX) cfg->connection_stage_timeout = 30;
 
@@ -1068,6 +1080,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_command_stats_breakdown,
         o_command_miss_tracking,
         o_miss_rate_threshold,
+        o_cpu_warn_threshold,
         o_tls,
         o_tls_cert,
         o_tls_key,
@@ -1185,6 +1198,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         {"command-stats-breakdown", 1, 0, o_command_stats_breakdown},
         {"command-miss-tracking", 1, 0, o_command_miss_tracking},
         {"miss-rate-threshold", 1, 0, o_miss_rate_threshold},
+        {"cpu-warn-threshold", 1, 0, o_cpu_warn_threshold},
         {"rate-limiting", 1, 0, o_rate_limiting},
         {"uri", 1, 0, o_uri},
         {"statsd-host", 1, 0, o_statsd_host},
@@ -1906,6 +1920,16 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             cfg->miss_rate_threshold = pct / 100.0;
             break;
         }
+        case o_cpu_warn_threshold: {
+            endptr = NULL;
+            double pct = strtod(optarg, &endptr);
+            if (endptr == optarg || !endptr || *endptr != '\0' || !std::isfinite(pct) || pct < 0.0 || pct > 100.0) {
+                fprintf(stderr, "error: --cpu-warn-threshold must be a percentage between 0 and 100.\n");
+                return -1;
+            }
+            cfg->cpu_warn_threshold = pct / 100.0;
+            break;
+        }
         case o_rate_limiting: {
             endptr = NULL;
             cfg->request_rate = (unsigned int) strtoul(optarg, &endptr, 10);
@@ -2316,6 +2340,10 @@ void usage()
         "                                 Warn when miss rate exceeds this percentage (default: 1.0).\n"
         "                                 Accepts fractional values, e.g. 0.5 for half a percent.\n"
         "                                 0 warns on any miss.\n"
+        "      --cpu-warn-threshold=PERCENTAGE\n"
+        "                                 Warn when a memtier worker thread's CPU exceeds this percentage of a\n"
+        "                                 core (default: 95.0), indicating memtier itself may be the bottleneck\n"
+        "                                 and results may be unreliable. 0 warns on any CPU usage.\n"
         "      --statsd-host=HOST         StatsD server hostname to send real-time metrics (default: none, disabled)\n"
         "      --statsd-port=PORT         StatsD server UDP port (default: 8125)\n"
         "      --statsd-prefix=PREFIX     Prefix for StatsD metric names (default: memtier)\n"
@@ -2508,6 +2536,21 @@ struct cg_thread
     bool m_restart_requested;
     unsigned int m_restart_count;
 
+    // Per-thread CPU accounting via getrusage(RUSAGE_THREAD), captured inside
+    // the worker. A restart() spawns a NEW native thread, so RUSAGE_THREAD
+    // resets to 0 each segment; m_cpu_*_usec_acc accumulate completed segments
+    // so the reported total spans all restarts. m_wall_usec_acc is the WALL time
+    // of those same segments, captured at the exact same points as the CPU
+    // snapshots, so cores_used = cpu/wall divides two values over the identical
+    // interval (no setup-vs-serving skew). Only read post-join (race-free).
+    struct rusage m_cpu_start_ru;   // CPU snapshot at the current segment's start
+    struct timeval m_wall_start_tv; // wall snapshot at the same point
+    unsigned long long m_cpu_user_usec_acc;
+    unsigned long long m_cpu_sys_usec_acc;
+    unsigned long long m_wall_usec_acc;
+    bool m_cpu_started; // m_cpu_start_ru/m_wall_start_tv valid for this segment
+    bool m_cpu_valid;   // getrusage(RUSAGE_THREAD) succeeded at least once
+
     cg_thread(unsigned int id, benchmark_config *config, object_generator *obj_gen) :
             m_thread_id(id),
             m_config(config),
@@ -2516,7 +2559,12 @@ struct cg_thread
             m_protocol(NULL),
             m_finished(false),
             m_restart_requested(false),
-            m_restart_count(0)
+            m_restart_count(0),
+            m_cpu_user_usec_acc(0),
+            m_cpu_sys_usec_acc(0),
+            m_wall_usec_acc(0),
+            m_cpu_started(false),
+            m_cpu_valid(false)
     {
         m_protocol = protocol_factory(m_config->protocol);
         assert(m_protocol != NULL);
@@ -2580,8 +2628,139 @@ struct cg_thread
         m_restart_requested = false;
         m_restart_count++;
 
+        // CPU accumulators (m_cpu_*_usec_acc) intentionally persist across
+        // restarts. The new native thread re-snapshots m_cpu_start_ru on entry,
+        // so clear only the per-segment "started" flag.
+        m_cpu_started = false;
+
         // Start new thread
         return pthread_create(&m_thread, NULL, cg_thread_start, (void *) this);
+    }
+};
+
+// Cumulative CPU time (user+system, microseconds) consumed by an arbitrary
+// thread, read WITHOUT perturbing that thread. Used by the live per-second
+// sampler in the monitor loop. On Linux this is pthread_getcpuclockid +
+// clock_gettime (a per-thread CPU clock); on macOS it is Mach thread_info.
+// Returns 0 if the thread's CPU clock cannot be read (treated as no delta).
+static unsigned long long get_thread_cpu_usec(pthread_t thread)
+{
+#ifdef __APPLE__
+    mach_port_t mt = pthread_mach_thread_np(thread);
+    thread_basic_info_data_t info;
+    mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+    if (thread_info(mt, THREAD_BASIC_INFO, (thread_info_t) &info, &count) != KERN_SUCCESS) return 0;
+    return (unsigned long long) info.user_time.seconds * 1000000ULL + info.user_time.microseconds +
+           (unsigned long long) info.system_time.seconds * 1000000ULL + info.system_time.microseconds;
+#else
+    clockid_t cid;
+    if (pthread_getcpuclockid(thread, &cid) != 0) return 0;
+    struct timespec ts;
+    if (clock_gettime(cid, &ts) != 0) return 0;
+    return (unsigned long long) ts.tv_sec * 1000000ULL + (unsigned long long) ts.tv_nsec / 1000ULL;
+#endif
+}
+
+// Fold this worker's current-segment CPU usage (getrusage delta) AND the wall
+// time of the same segment into its across-restart accumulators. Called from
+// inside the worker on every exit path, BEFORE m_finished is set, so the
+// segment is accounted before the monitor loop can observe completion and
+// trigger a restart. The wall bracket is captured at the same two points as the
+// CPU bracket so cores_used = cpu/wall covers one identical interval.
+static void cg_thread_capture_cpu_end(cg_thread *thread)
+{
+#if defined(RUSAGE_THREAD)
+    if (!thread->m_cpu_started) return;
+    struct rusage end_ru;
+    struct timeval end_tv;
+    // Capture in the same order as the start snapshot (CPU then wall) so the
+    // wall window encloses the CPU window symmetrically.
+    int rc = getrusage(RUSAGE_THREAD, &end_ru);
+    gettimeofday(&end_tv, NULL);
+    if (rc == 0) {
+        // ts_diff(a, b) returns b - a in microseconds; rusage CPU time is
+        // monotonic per native thread, so each delta is >= 0.
+        thread->m_cpu_user_usec_acc += (unsigned long long) ts_diff(thread->m_cpu_start_ru.ru_utime, end_ru.ru_utime);
+        thread->m_cpu_sys_usec_acc += (unsigned long long) ts_diff(thread->m_cpu_start_ru.ru_stime, end_ru.ru_stime);
+    }
+    thread->m_wall_usec_acc += (unsigned long long) ts_diff(thread->m_wall_start_tv, end_tv);
+    thread->m_cpu_started = false;
+#else
+    (void) thread;
+#endif
+}
+
+// Advisory per-second CPU sampler driven from the monitor loop. Reads each
+// worker's CPU clock from the MAIN thread (no worker perturbation), converts the
+// delta to "% of a core" over the real wall window, emits a de-duped live
+// high-CPU warning (once per thread, on first crossing), tracks the peak
+// whole-process utilization, and appends a per-second snapshot to a history
+// vector. Finished/restarting workers are skipped so their pthread_t is never
+// read while joined or mid-restart.
+struct cpu_live_sampler
+{
+    std::vector<unsigned long long> thread_prev;
+    std::vector<bool> warned;
+    unsigned long long main_prev;
+    unsigned int second;
+    double peak_pct;
+    double warn_pct;
+    struct timeval prev_tv;
+
+    void init(const std::vector<cg_thread *> &threads, double warn_threshold_fraction)
+    {
+        thread_prev.assign(threads.size(), 0);
+        warned.assign(threads.size(), false);
+        for (size_t t = 0; t < threads.size(); t++)
+            thread_prev[t] = get_thread_cpu_usec(threads[t]->m_thread);
+        main_prev = get_thread_cpu_usec(pthread_self());
+        second = 0;
+        peak_pct = 0.0;
+        warn_pct = warn_threshold_fraction * 100.0;
+        gettimeofday(&prev_tv, NULL);
+    }
+
+    void tick(const std::vector<cg_thread *> &threads, std::vector<per_second_cpu_stats> &history)
+    {
+        second++;
+        struct timeval cur_tv;
+        gettimeofday(&cur_tv, NULL);
+        double wall_usec = (double) ts_diff(prev_tv, cur_tv);
+        if (wall_usec < 1.0) wall_usec = 1.0; // guard against division by zero
+
+        per_second_cpu_stats snap;
+        snap.m_second = second;
+
+        unsigned long long main_cur = get_thread_cpu_usec(pthread_self());
+        unsigned long long main_delta = (main_cur > main_prev) ? main_cur - main_prev : 0;
+        snap.m_main_thread_cpu_pct = (double) main_delta / wall_usec * 100.0;
+        main_prev = main_cur;
+
+        double whole_pct = snap.m_main_thread_cpu_pct;
+        for (size_t t = 0; t < threads.size(); t++) {
+            double pct = 0.0;
+            // Skip finished/restarting workers: a reset clock on a new pthread_t
+            // would yield a bogus delta, and a joined handle is unsafe to read.
+            if (!threads[t]->m_finished) {
+                unsigned long long cur = get_thread_cpu_usec(threads[t]->m_thread);
+                unsigned long long delta = (cur > thread_prev[t]) ? cur - thread_prev[t] : 0;
+                pct = (double) delta / wall_usec * 100.0;
+                thread_prev[t] = cur;
+            }
+            snap.m_thread_cpu_pct.push_back(pct);
+            whole_pct += pct;
+
+            if (pct > warn_pct && !warned[t]) {
+                fprintf(stderr,
+                        "\nwarning: high CPU on thread %u: %.1f%% of a core (threshold %.1f%%) - "
+                        "results may be unreliable\n",
+                        threads[t]->m_thread_id, pct, warn_pct);
+                warned[t] = true;
+            }
+        }
+        if (whole_pct > peak_pct) peak_pct = whole_pct;
+        prev_tv = cur_tv;
+        history.push_back(std::move(snap));
     }
 };
 
@@ -2593,6 +2772,17 @@ static void *cg_thread_start(void *t)
     // overflow on this thread (or any other handler entry) runs on a fresh
     // stack rather than re-faulting on the exhausted one.
     install_alt_signal_stack();
+
+    // Snapshot this segment's starting CPU time and wall time (per-thread) at
+    // the same instant. Accumulators on cg_thread carry prior segments forward
+    // across restarts.
+#if defined(RUSAGE_THREAD)
+    if (getrusage(RUSAGE_THREAD, &thread->m_cpu_start_ru) == 0) {
+        gettimeofday(&thread->m_wall_start_tv, NULL);
+        thread->m_cpu_started = true;
+        thread->m_cpu_valid = true;
+    }
+#endif
 
     try {
         thread->m_cg->run();
@@ -2612,15 +2802,18 @@ static void *cg_thread_start(void *t)
             thread->m_restart_requested = true;
         }
 
+        cg_thread_capture_cpu_end(thread);
         thread->m_finished = true;
     } catch (const std::exception &e) {
         benchmark_error_log("Thread %u caught exception: %s\n", thread->m_thread_id, e.what());
+        cg_thread_capture_cpu_end(thread);
         thread->m_finished = true;
         if (!g_connection_stage_aborted.load(std::memory_order_acquire)) {
             thread->m_restart_requested = true;
         }
     } catch (...) {
         benchmark_error_log("Thread %u caught unknown exception\n", thread->m_thread_id);
+        cg_thread_capture_cpu_end(thread);
         thread->m_finished = true;
         if (!g_connection_stage_aborted.load(std::memory_order_acquire)) {
             thread->m_restart_requested = true;
@@ -2860,6 +3053,13 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     // reply to AUTH on the same TCP RTT as the connect).
     connection_stage_supervisor_reset();
 
+    // Snapshot the main thread's CPU time just before launching workers, so the
+    // whole-process CPU aggregate includes the orchestrator/sampler overhead.
+#if defined(RUSAGE_THREAD)
+    struct rusage main_cpu_start_ru;
+    bool main_cpu_valid = (getrusage(RUSAGE_THREAD, &main_cpu_start_ru) == 0);
+#endif
+
     // launch threads
     fprintf(stderr, "[RUN #%u] Launching threads now...\n", run_id);
     for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
@@ -2897,6 +3097,14 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     if (cfg->realtime_latencies) {
         hdr_init(LATENCY_HDR_MIN_VALUE, LATENCY_HDR_SEC_MAX_VALUE, LATENCY_HDR_SEC_SIGDIGTS, &rtl_totals_hist);
     }
+
+    // Live (advisory) per-second CPU sampler. The main thread reads each worker's
+    // CPU clock without perturbing it, so this adds no overhead to the workers.
+    // Feeds the per-second JSON detail, the de-duped live high-CPU warning, and
+    // the peak-utilization figure.
+    std::vector<per_second_cpu_stats> cpu_history;
+    cpu_live_sampler cpu_sampler;
+    cpu_sampler.init(threads, cfg->cpu_warn_threshold);
 
     // provide some feedback...
     // NOTE: Reading stats from worker threads without synchronization is a benign race.
@@ -3255,6 +3463,9 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             }
         }
 
+        // Per-second CPU sampling (advisory).
+        cpu_sampler.tick(threads, cpu_history);
+
         if (inst_hist_agg != NULL) hdr_close(inst_hist_agg);
     } while (active_threads > 0);
 
@@ -3282,6 +3493,73 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
         (*i)->join();
         (*i)->m_cg->merge_run_stats(&stats);
+    }
+
+    // -----------------------------------------------------------------
+    // CPU utilization aggregate (memtier's own usage).
+    //
+    // Fold each worker's authoritative getrusage(RUSAGE_THREAD) totals (already
+    // accumulated across restarts inside the worker) into the run_stats. Each
+    // worker's cores_used divides its CPU by ITS OWN wall bracket (captured at
+    // the same points as the CPU snapshots), so there is no setup-vs-serving or
+    // across-restart skew. The whole-process aggregate divides total CPU (all
+    // workers + the main thread) by the longest summed active-serving wall time
+    // across workers, so the aggregate and per-thread figures stay consistent:
+    // the denominator is the window during which work actually happened, not the
+    // main thread's launch->join span which also covers idle teardown. Done
+    // here, post-join, so reads are race-free.
+    // -----------------------------------------------------------------
+    {
+        cpu_summary csum;
+        double worker_total_seconds = 0.0; // workers only, for the saturation %
+        double max_worker_wall = 0.0;
+        for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
+            cg_thread *t = *i;
+            per_thread_cpu_total pt;
+            pt.thread_id = t->m_thread_id;
+            pt.valid = t->m_cpu_valid;
+            pt.user_seconds = (double) t->m_cpu_user_usec_acc / 1e6;
+            pt.sys_seconds = (double) t->m_cpu_sys_usec_acc / 1e6;
+            pt.total_seconds = pt.user_seconds + pt.sys_seconds;
+            pt.wall_seconds = (double) t->m_wall_usec_acc / 1e6;
+            pt.cores_used = (pt.wall_seconds > 0.0) ? pt.total_seconds / pt.wall_seconds : 0.0;
+            stats.add_cpu_thread(pt);
+
+            if (pt.valid && pt.wall_seconds > 0.0) {
+                csum.user_seconds += pt.user_seconds;
+                csum.sys_seconds += pt.sys_seconds;
+                worker_total_seconds += pt.total_seconds;
+                csum.threads_counted++;
+                if (pt.wall_seconds > max_worker_wall) max_worker_wall = pt.wall_seconds;
+            }
+        }
+
+        // Add the main thread's own CPU (orchestrator/sampler overhead) to the
+        // whole-process totals, measured over the matching launch->here interval.
+#if defined(RUSAGE_THREAD)
+        if (main_cpu_valid) {
+            struct rusage main_end_ru;
+            if (getrusage(RUSAGE_THREAD, &main_end_ru) == 0) {
+                csum.user_seconds += (double) ts_diff(main_cpu_start_ru.ru_utime, main_end_ru.ru_utime) / 1e6;
+                csum.sys_seconds += (double) ts_diff(main_cpu_start_ru.ru_stime, main_end_ru.ru_stime) / 1e6;
+            }
+        }
+#endif
+
+        csum.total_seconds = csum.user_seconds + csum.sys_seconds;
+        csum.worker_total_seconds = worker_total_seconds;
+        csum.wall_seconds = max_worker_wall;
+        csum.peak_utilization_pct = cpu_sampler.peak_pct;
+        if (csum.threads_counted > 0 && csum.wall_seconds > 0.0) {
+            csum.cores_used = csum.total_seconds / csum.wall_seconds;
+            // Saturation % is based on WORKER cores only (main thread excluded),
+            // so a value near 100% means the worker threads are saturated and
+            // cannot exceed 100% from main-thread overhead alone.
+            csum.avg_utilization_pct = 100.0 * (worker_total_seconds / csum.wall_seconds) / csum.threads_counted;
+            csum.valid = true;
+        }
+        stats.set_cpu_summary(csum);
+        stats.set_cpu_stats(std::move(cpu_history));
     }
 
     // -----------------------------------------------------------------
@@ -3516,6 +3794,7 @@ int main(int argc, char *argv[])
     // sentinel before parsing args.
     cfg.max_retries = -1;
     cfg.miss_rate_threshold = -1.0;   // sentinel; config_init_defaults replaces with 0.01
+    cfg.cpu_warn_threshold = -1.0;    // sentinel; config_init_defaults replaces with 0.95
     cfg.command_miss_tracking = true; // Default: auto-track misses for known shapes
     // Sentinel for --connection-stage-timeout: UINT_MAX means "operator did
     // not specify"; config_init_defaults replaces with 30 s. We can't reuse 0
