@@ -85,18 +85,23 @@ bool client::setup_client(benchmark_config *config, abstract_protocol *protocol,
         MAIN_CONNECTION->get_protocol()->set_keep_value(true);
     }
 
-    // Enable value keeping for arbitrary-command miss tracking when any
-    // configured command needs reply-array inspection (ArrayPerElementNulls or
-    // EmptyCollection). SingleNullBulk and IntegerMembership use the parser's
-    // existing scalar counters so no materialization is required for them.
+    // Enable value keeping for arbitrary-command miss tracking only when a
+    // configured command needs per-element reply inspection. Only
+    // ArrayPerElementNulls (HMGET/MGET/ZMSCORE/GEOPOS/...) requires walking the
+    // materialized reply array to attribute hits/misses per position.
+    // EmptyCollection (HGETALL/SMEMBERS/LRANGE) only needs to know whether the
+    // top-level array is empty, which it reads from the parser's running hit
+    // counter (response->get_hits()) with zero materialization -- keeping
+    // values there would malloc+memcpy every element of every reply on the hot
+    // path for no benefit. SingleNullBulk and IntegerMembership use the
+    // parser's scalar counters / status line, so no materialization either.
     if (config->arbitrary_commands->is_defined()) {
         bool needs_array_walk = false;
         for (size_t i = 0; i < config->arbitrary_commands->size(); ++i) {
             const arbitrary_command &cmd = config->arbitrary_commands->at(i);
             if (!cmd.miss_tracking_enabled || cmd.spec == NULL) continue;
             using memtier::command_meta::ReplyShape;
-            if (cmd.spec->reply_shape == ReplyShape::ArrayPerElementNulls ||
-                cmd.spec->reply_shape == ReplyShape::EmptyCollection) {
+            if (cmd.spec->reply_shape == ReplyShape::ArrayPerElementNulls) {
                 needs_array_walk = true;
                 break;
             }
@@ -901,8 +906,24 @@ void client::handle_response(unsigned int conn_id, struct timeval timestamp, req
                 // Heuristic: empty array == missing key. EmptyCollection
                 // commands (SMEMBERS, LRANGE, HGETALL, ...) virtually always
                 // carry exactly 1 key.
-                mbulk_size_el *top = response->get_mbulk_value();
-                bool empty = (top == NULL || top->mbulks_elements.empty());
+                //
+                // We only need the top-level element count, not the element
+                // values, so we avoid set_keep_value() materialization (see the
+                // keep_value gate in setup_client) and read the declared
+                // aggregate length the parser captured from the reply header.
+                // get_top_array_len() is:
+                //   >0  for a populated array/map/set  -> hit (regardless of
+                //       whether the elements are zero-length: the count comes
+                //       from the *N/%N/~N header, not a per-value walk),
+                //    0  for an empty (*0) or null (*-1) collection -> miss,
+                //   -1  when the reply was not a top-level aggregate at all
+                //       (a scalar/bulk misshape) -> miss, matching the previous
+                //       get_mbulk_value()==NULL guard.
+                // This reproduces the old structural check exactly while
+                // staying alloc-free, and is independent of keep_value (it is
+                // captured whether or not an ArrayPerElementNulls command on
+                // the same connection forced materialization on).
+                bool empty = (response->get_top_array_len() <= 0);
                 per_key_hit.assign(num_keys, !empty);
                 hits = empty ? 0 : num_keys;
                 misses = empty ? num_keys : 0;
