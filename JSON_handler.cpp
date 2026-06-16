@@ -95,7 +95,9 @@ void json_handler::write_obj(const char *objectname, const char *format, ...)
         double value = va_arg(tmp_argptr, double);
         va_end(tmp_argptr);
 
-        if (std::isnan(value)) {
+        // Emit JSON null for any non-finite value (NaN and +/-Inf). Bare
+        // 'nan'/'inf' tokens from vfprintf would otherwise produce invalid JSON.
+        if (!std::isfinite(value)) {
             fprintf(m_json_file, "null");
         } else {
             vfprintf(m_json_file, format, argptr);

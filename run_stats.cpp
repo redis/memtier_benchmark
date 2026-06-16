@@ -1988,6 +1988,9 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
             snprintf(sec_str, sizeof(sec_str), "%u", cs.m_second);
             jsonhandler->open_nesting(sec_str);
             jsonhandler->write_obj("Main Thread", "%.2f", cs.m_main_thread_cpu_pct);
+            // "Thread N" here is the worker's positional index, which equals its
+            // m_thread_id (assigned as the construction index), so these labels
+            // line up 1:1 with the authoritative "CPU" -> "Per Thread" block.
             for (size_t t = 0; t < cs.m_thread_cpu_pct.size(); t++) {
                 char thread_name[32];
                 snprintf(thread_name, sizeof(thread_name), "Thread %zu", t);

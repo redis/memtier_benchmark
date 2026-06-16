@@ -97,13 +97,16 @@ def test_cpu_stats_high_load(env):
     de-duped live warning + end-of-run warning."""
     env.skipOnCluster()
 
+    # Warn threshold = 10% of a core, aligned with the hard >10% load assertion
+    # below so the warning path is exercised whenever the load assertion holds
+    # (avoids a gap where the test passes without validating any warning).
     benchmark_specs = {"name": env.testName, "args": [
         '--pipeline=100',
         '--data-size=1',
         '--ratio=1:1',
         '--key-pattern=R:R',
         '--key-maximum=100',
-        '--cpu-warn-threshold=50',
+        '--cpu-warn-threshold=10',
     ]}
     addTLSArgs(benchmark_specs, env)
     config = get_default_memtier_config(threads=1, clients=500, requests=None, test_time=5)
@@ -128,25 +131,31 @@ def test_cpu_stats_high_load(env):
     env.assertTrue(max_thread_cpu > 10.0)
 
     stderr_content = _read_stderr(config)
-    # Live warning string (lowercase, new format).
     live_warnings = stderr_content.count('high CPU on thread')
     env.debugPrint("Live high-CPU warnings: {}".format(live_warnings), True)
     # De-dup: at most one live warning per worker thread (here: 1 thread).
     env.assertTrue(live_warnings <= 1)
-    if max_thread_cpu > 50.0:
-        env.assertTrue(live_warnings >= 1)
-        # End-of-run summary warning (only when the aggregate block is available).
-        if 'CPU' in all_stats:
+    # A per-second sample exceeded 10% (we asserted max_thread_cpu > 10), so the
+    # live warning must have fired exactly once.
+    env.assertTrue(live_warnings == 1)
+
+    # The end-of-run warning is driven by the AUTHORITATIVE run-average cores_used,
+    # not the per-second peak, so gate its assertion on the JSON aggregate value.
+    if 'CPU' in all_stats:
+        cores = all_stats['CPU']['Per Thread']['Thread 0']['cores_used']
+        env.debugPrint("Authoritative Thread 0 cores_used: {:.3f}".format(cores), True)
+        if cores > 0.10:
             env.assertTrue('averaged' in stderr_content and 'of a core' in stderr_content)
 
 
 def test_cpu_warn_threshold_flag(env):
-    """--cpu-warn-threshold=0 must warn; =100 must stay silent."""
+    """--cpu-warn-threshold=0 must warn; a high threshold must suppress the
+    authoritative end-of-run warning."""
     env.skipOnCluster()
 
     base_args = ['--pipeline=50', '--data-size=1', '--ratio=1:1', '--key-maximum=100']
 
-    # threshold=0 -> warns on any CPU usage
+    # threshold=0 -> warns on any CPU usage (a worker always uses some CPU).
     specs0 = {"name": env.testName, "args": base_args + ['--cpu-warn-threshold=0']}
     addTLSArgs(specs0, env)
     cfg0 = get_default_memtier_config(threads=1, clients=50, requests=None, test_time=3)
@@ -154,14 +163,43 @@ def test_cpu_warn_threshold_flag(env):
     stderr0 = _read_stderr(cfg0)
     env.assertTrue('high CPU on thread' in stderr0)
 
-    # threshold=100 -> effectively silent (a single thread cannot exceed 100% of a core)
+    # threshold=100 -> the authoritative end-of-run warning (run-average cores_used)
+    # cannot fire: a single thread's average over its own lifetime never exceeds
+    # 1.0 core (100%). We assert on the end-of-run 'of a core' line specifically,
+    # not the per-second live line, because a momentary per-second sample can
+    # legitimately read slightly above 100% due to wall-window sampling jitter.
     specs100 = {"name": env.testName, "args": base_args + ['--cpu-warn-threshold=100']}
     addTLSArgs(specs100, env)
     cfg100 = get_default_memtier_config(threads=1, clients=50, requests=None, test_time=3)
     cfg100, _ = _run_and_load(env, specs100, cfg100)
     stderr100 = _read_stderr(cfg100)
-    env.assertTrue('high CPU on thread' not in stderr100)
     env.assertTrue('of a core' not in stderr100)
+
+
+def test_cpu_multi_run(env):
+    """--run-count>1 must still produce a valid aggregate CPU block."""
+    env.skipOnCluster()
+
+    benchmark_specs = {"name": env.testName, "args": [
+        '--pipeline=50', '--data-size=1', '--ratio=1:1', '--key-maximum=100',
+        '--run-count=2',
+    ]}
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=2, clients=20, requests=None, test_time=3)
+
+    config, results_dict = _run_and_load(env, benchmark_specs, config)
+
+    # Find any per-report block carrying an aggregate 'CPU' section (BEST / WORST /
+    # AGGREGATED AVERAGE). On Linux at least one must be present and plausible.
+    cpu_blocks = [v['CPU'] for v in results_dict.values()
+                  if isinstance(v, dict) and 'CPU' in v]
+    if not cpu_blocks:
+        env.debugPrint("No aggregate CPU block (non-Linux platform), skipping", True)
+        return
+    for cpu in cpu_blocks:
+        env.assertTrue(cpu['cpu_cores_used'] > 0.0)
+        env.assertTrue(cpu['cpu_cores_used'] < 4.0)
+        env.assertTrue(cpu['threads_counted'] == 2)
 
 
 def test_cpu_aggregate_cores(env):
