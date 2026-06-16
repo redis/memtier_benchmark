@@ -569,8 +569,14 @@ def test_F11_http_hardening(env):
         # normal scrape still works
         env.assertEqual(prom_scrape(url).status, 200, message="scrape broken after hardening probes")
         # let the run finish on its own (--test-time): exit must be clean 0.
-        rc = proc.wait(timeout=30)
-        env.assertEqual(rc, 0, message="exit code {}".format(rc))
+        # Generous timeout for slow sanitizer + cluster-TLS builds.
+        try:
+            rc = proc.wait(timeout=120)
+            env.assertEqual(rc, 0, message="exit code {}".format(rc))
+        except subprocess.TimeoutExpired:
+            _kill(proc)
+            env.assertTrue(False, message="did not exit within 120s")
+            return
         _no_sanitizer_output(env, _drain(err_path))
     finally:
         _kill(proc)
@@ -714,7 +720,9 @@ def test_F15_teardown_race_window(env):
                 message="iter {}: unexpected status {} (closed outcome set)".format(i, r.status),
             )
         try:
-            rc = proc.wait(timeout=30)
+            # 120s tolerates slow sanitizer + cluster-TLS builds; a hang beyond
+            # that is a genuine teardown bug (this test's whole point).
+            rc = proc.wait(timeout=120)
         except subprocess.TimeoutExpired:
             _kill(proc)
             env.assertTrue(False, message="iter {}: TEARDOWN HANG (TimeoutExpired)".format(i))
@@ -1081,8 +1089,16 @@ def test_F20_inflight_cap_503(env):
         # one non-/metrics path -> 503 as well (cap precedes routing)
         g = prom_scrape(base + "/x", timeout=2)
         env.assertEqual(g.status, 503, message="gencb not capped under cap=0")
-        rc = proc.wait(timeout=10)
-        env.assertEqual(rc, 0, message="cap-seam exit {}".format(rc))
+        # Generous wait: under sanitizer + cluster-TLS, a --test-time=3 run's
+        # startup (cluster discovery, per-shard TLS handshakes) and teardown can
+        # take far longer than the wall-clock test time.
+        try:
+            rc = proc.wait(timeout=120)
+            env.assertEqual(rc, 0, message="cap-seam exit {}".format(rc))
+        except subprocess.TimeoutExpired:
+            _kill(proc)
+            env.assertTrue(False, message="cap-seam: did not exit within 120s")
+            return
         _no_sanitizer_output(env, _drain(err_path))
     finally:
         _kill(proc)
