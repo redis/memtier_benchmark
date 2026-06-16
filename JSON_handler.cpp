@@ -22,7 +22,7 @@
 
 #include <stdlib.h>
 #include <string.h>
-#include <cmath> // For std::isnan
+#include <cmath> // For std::isfinite
 #include "JSON_handler.h"
 
 

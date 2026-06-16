@@ -184,7 +184,8 @@ struct per_thread_cpu_total {
 struct cpu_summary {
     double user_seconds;
     double sys_seconds;
-    double total_seconds;
+    double total_seconds;          // whole process: workers + main thread
+    double worker_total_seconds;   // workers only; basis for avg_utilization_pct
     double wall_seconds;
     double cores_used;
     double avg_utilization_pct;
@@ -192,8 +193,8 @@ struct cpu_summary {
     unsigned int threads_counted; // number of valid worker threads in the sums
     bool valid;
     cpu_summary()
-        : user_seconds(0.0), sys_seconds(0.0), total_seconds(0.0), wall_seconds(0.0), cores_used(0.0),
-          avg_utilization_pct(0.0), peak_utilization_pct(0.0), threads_counted(0), valid(false) {}
+        : user_seconds(0.0), sys_seconds(0.0), total_seconds(0.0), worker_total_seconds(0.0), wall_seconds(0.0),
+          cores_used(0.0), avg_utilization_pct(0.0), peak_utilization_pct(0.0), threads_counted(0), valid(false) {}
 };
 
 class totals_cmd

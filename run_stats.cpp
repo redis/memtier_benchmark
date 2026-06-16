@@ -925,6 +925,7 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
         agg_cpu.user_seconds += cs.user_seconds;
         agg_cpu.sys_seconds += cs.sys_seconds;
         agg_cpu.total_seconds += cs.total_seconds;
+        agg_cpu.worker_total_seconds += cs.worker_total_seconds;
         agg_cpu.wall_seconds += cs.wall_seconds;
         if (cs.peak_utilization_pct > agg_cpu.peak_utilization_pct)
             agg_cpu.peak_utilization_pct = cs.peak_utilization_pct;
@@ -933,8 +934,11 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
     if (cpu_runs > 0 && agg_cpu.wall_seconds > 0.0) {
         agg_cpu.threads_counted = max_threads_counted;
         agg_cpu.cores_used = agg_cpu.total_seconds / agg_cpu.wall_seconds;
+        // avg_utilization_pct uses WORKER-only CPU (main excluded), matching the
+        // single-run semantics so it cannot exceed 100% from main-thread overhead.
         agg_cpu.avg_utilization_pct =
-            max_threads_counted > 0 ? 100.0 * agg_cpu.cores_used / max_threads_counted : 0.0;
+            max_threads_counted > 0 ? 100.0 * (agg_cpu.worker_total_seconds / agg_cpu.wall_seconds) / max_threads_counted
+                                    : 0.0;
         agg_cpu.valid = true;
         m_cpu_summary = agg_cpu;
     }

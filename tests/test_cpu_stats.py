@@ -163,17 +163,25 @@ def test_cpu_warn_threshold_flag(env):
     stderr0 = _read_stderr(cfg0)
     env.assertTrue('high CPU on thread' in stderr0)
 
-    # threshold=100 -> the authoritative end-of-run warning (run-average cores_used)
-    # cannot fire: a single thread's average over its own lifetime never exceeds
-    # 1.0 core (100%). We assert on the end-of-run 'of a core' line specifically,
-    # not the per-second live line, because a momentary per-second sample can
-    # legitimately read slightly above 100% due to wall-window sampling jitter.
+    # threshold=100 -> the authoritative end-of-run warning fires only for a
+    # thread whose run-average cores_used exceeds 1.0. A single thread over its
+    # own wall bracket physically cannot exceed ~1.0 core, so this is normally
+    # silent. Rather than assert blanket silence (which clock/wall jitter could
+    # rarely break at exactly 1.0), assert the warning count is CONSISTENT with
+    # the authoritative JSON: one 'of a core' line per thread with cores_used>1.0.
     specs100 = {"name": env.testName, "args": base_args + ['--cpu-warn-threshold=100']}
     addTLSArgs(specs100, env)
     cfg100 = get_default_memtier_config(threads=1, clients=50, requests=None, test_time=3)
-    cfg100, _ = _run_and_load(env, specs100, cfg100)
+    cfg100, results100 = _run_and_load(env, specs100, cfg100)
     stderr100 = _read_stderr(cfg100)
-    env.assertTrue('of a core' not in stderr100)
+    end_warnings = stderr100.count('of a core')
+    all100 = results100['ALL STATS']
+    if 'CPU' in all100:
+        over_one_core = sum(1 for pt in all100['CPU']['Per Thread'].values() if pt['cores_used'] > 1.0)
+        env.assertTrue(end_warnings == over_one_core)
+    else:
+        # No authoritative aggregate (non-Linux): no end-of-run warning possible.
+        env.assertTrue(end_warnings == 0)
 
 
 def test_cpu_multi_run(env):

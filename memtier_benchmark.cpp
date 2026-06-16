@@ -2673,8 +2673,11 @@ static void cg_thread_capture_cpu_end(cg_thread *thread)
     if (!thread->m_cpu_started) return;
     struct rusage end_ru;
     struct timeval end_tv;
+    // Capture in the same order as the start snapshot (CPU then wall) so the
+    // wall window encloses the CPU window symmetrically.
+    int rc = getrusage(RUSAGE_THREAD, &end_ru);
     gettimeofday(&end_tv, NULL);
-    if (getrusage(RUSAGE_THREAD, &end_ru) == 0) {
+    if (rc == 0) {
         // ts_diff(a, b) returns b - a in microseconds; rusage CPU time is
         // monotonic per native thread, so each delta is >= 0.
         thread->m_cpu_user_usec_acc +=
@@ -3502,11 +3505,11 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     // worker's cores_used divides its CPU by ITS OWN wall bracket (captured at
     // the same points as the CPU snapshots), so there is no setup-vs-serving or
     // across-restart skew. The whole-process aggregate divides total CPU (all
-    // workers + the main thread) by the longest worker lifetime, so the
-    // aggregate and per-thread figures stay consistent: the denominator is the
-    // window during which work actually happened, not the main thread's
-    // launch->join span which also covers idle teardown. Done here, post-join,
-    // so reads are race-free.
+    // workers + the main thread) by the longest summed active-serving wall time
+    // across workers, so the aggregate and per-thread figures stay consistent:
+    // the denominator is the window during which work actually happened, not the
+    // main thread's launch->join span which also covers idle teardown. Done
+    // here, post-join, so reads are race-free.
     // -----------------------------------------------------------------
     {
         cpu_summary csum;
@@ -3546,6 +3549,7 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
 #endif
 
         csum.total_seconds = csum.user_seconds + csum.sys_seconds;
+        csum.worker_total_seconds = worker_total_seconds;
         csum.wall_seconds = max_worker_wall;
         csum.peak_utilization_pct = cpu_sampler.peak_pct;
         if (csum.threads_counted > 0 && csum.wall_seconds > 0.0) {
