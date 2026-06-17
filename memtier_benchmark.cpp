@@ -3382,7 +3382,12 @@ static inline bool prom_enabled(benchmark_config *cfg)
 // Read one client_group's live cumulative counters into a counter_set. These
 // are the TSan-documented benign-race scalar getters (client.h:282-292); safe
 // to sample at 1 Hz from the main thread. Bytes are the split rx/tx getters
-// (never summarize() — it double-counts arbitrary-command bytes).
+// (never summarize() — it double-counts arbitrary-command bytes). The arbitrary
+// hits/misses sum only the per-command scalar totals in run_stats
+// m_arbitrary_misses[] (never the per-key vectors the worker grow-resizes), so
+// they read race-free at the same off-worker point as the GET hits/misses; the
+// accessors live on client_group/run_stats rather than the client.h:282-292
+// flat-scalar block because the source lives in per-command run_stats state.
 static counter_set prom_read_cg_counters(client_group *cg)
 {
     counter_set cs;
@@ -3395,6 +3400,8 @@ static counter_set prom_read_cg_counters(client_group *cg)
     cs.v[MT_CONN_ERRORS] = cg->get_total_connection_errors();
     cs.v[MT_RETRY_ATTEMPTS] = cg->get_total_retry_attempts();
     cs.v[MT_RETRIED_OPS] = cg->get_total_retried_ops();
+    cs.v[MT_ARBITRARY_HITS] = cg->get_total_arbitrary_hits();
+    cs.v[MT_ARBITRARY_MISSES] = cg->get_total_arbitrary_misses();
     return cs;
 }
 

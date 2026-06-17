@@ -28,6 +28,16 @@ race:run_stats::get_total_errors
 race:run_stats::get_total_retry_attempts
 race:run_stats::get_total_retried_ops
 
+# Arbitrary-command hits/misses (#483): the producer tick sums the per-command
+# scalar totals in m_arbitrary_misses[] (run_stats::get_total_arbitrary_hits/
+# misses) while workers bump them in run_stats::update_arbitrary_op_misses. Same
+# benign class as the display getters: the read touches only the monotonic
+# total_hits/total_misses scalars (never the grow-resized per_key_* vectors),
+# live data is approximate, and authoritative totals merge race-free post-join.
+race:run_stats::get_total_arbitrary_hits
+race:run_stats::get_total_arbitrary_misses
+race:run_stats::update_arbitrary_op_misses
+
 # Write-side inline counter bumps read by those getters.
 race:run_stats::inc_error
 race:run_stats::inc_retry_attempt

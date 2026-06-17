@@ -399,6 +399,15 @@ public:
     unsigned long int get_total_hits(void);
     unsigned long int get_total_misses(void);
 
+    // Aggregate hits/misses across arbitrary (--command) miss-trackable commands.
+    // Sums only the per-command scalar totals in m_arbitrary_misses[] (assigned
+    // once in setup_arbitrary_commands), never the per-key vectors which the
+    // worker grow-resizes; safe to sample off-worker at 1 Hz like get_total_hits.
+    // unsigned long long because the source fields are 64-bit (run_stats.h
+    // arbitrary_misses_total) and can exceed 32 bits on long runs.
+    unsigned long long get_total_arbitrary_hits(void);
+    unsigned long long get_total_arbitrary_misses(void);
+
     // Returns true if set_start_time() was called, indicating the client
     // produced (or was ready to produce) meaningful stats data.
     bool has_started(void) const { return m_started.flag.load(std::memory_order_acquire); }

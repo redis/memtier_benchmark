@@ -53,7 +53,8 @@ DEFAULT_LE_STRINGS = [
     "0.05", "0.075", "0.1", "0.25", "0.5", "1", "2.5", "5", "10", "30", "60",
 ]
 
-# The nine cumulative counter families the exporter exports (PLAN.md §3.4 / §4).
+# The cumulative counter families the exporter exports (PLAN.md §3.4 / §4;
+# arbitrary hits/misses added for #483).
 COUNTER_NAMES = [
     "memtier_ops_total",
     "memtier_sent_bytes_total",
@@ -64,7 +65,31 @@ COUNTER_NAMES = [
     "memtier_connection_errors_total",
     "memtier_retry_attempts_total",
     "memtier_retried_ops_total",
+    "memtier_arbitrary_hits_total",
+    "memtier_arbitrary_misses_total",
 ]
+
+# --command arguments that make memtier issue a single miss-trackable GET per op
+# (random key over a sparse range -> mostly misses), used by the #483 tests.
+_ARBITRARY_MISS_ARGS = [
+    "--command=GET __key__",
+    "--command-key-pattern=R",
+    "--command-stats-breakdown=line",
+    "--command-miss-tracking=auto",
+    "--key-prefix=prom_arb:",
+    "--key-minimum=1",
+    "--key-maximum=100000",
+]
+
+
+def _json_arbitrary_totals(json_path):
+    """Sum Total Hits / Total Misses across every arbitrary command in mb.json."""
+    with open(json_path) as fh:
+        js = json.load(fh)
+    per_key = js.get("ALL STATS", {}).get("Per-Key Misses", {})
+    hits = sum(v.get("Total Hits", 0) for v in per_key.values())
+    misses = sum(v.get("Total Misses", 0) for v in per_key.values())
+    return hits, misses
 
 
 # ---------------------------------------------------------------------------
@@ -1100,5 +1125,176 @@ def test_F20_inflight_cap_503(env):
             env.assertTrue(False, message="cap-seam: did not exit within 120s")
             return
         _no_sanitizer_output(env, _drain(err_path))
+    finally:
+        _kill(proc)
+
+
+# ---------------------------------------------------------------------------
+# F21-F24 -- arbitrary-command hits/misses series (#483).
+# memtier_arbitrary_hits_total / memtier_arbitrary_misses_total surface the
+# per-command miss tracking that the GET-only memtier_hits_total/misses_total
+# deliberately exclude. Sourced race-free at the same 1 Hz producer point.
+# ---------------------------------------------------------------------------
+def _scrape_last(proc, url, names, deadline_s=90):
+    """Poll /metrics @0.25 s until the process exits; return {name: last_value}
+    from the last successful scrape for each requested name, plus the last run."""
+    last = {n: None for n in names}
+    last["memtier_run"] = None
+    deadline = time.time() + deadline_s
+    while proc.poll() is None and time.time() < deadline:
+        r = prom_scrape(url, timeout=2)
+        if r.status == 200:
+            p = prom_parse(r.body)
+            for n in last:
+                v = prom_sample_value(p, n)
+                if v is not None:
+                    last[n] = v
+        time.sleep(0.25)
+    return last
+
+
+def test_F21_arbitrary_misses_surfaced(env):
+    """A --command miss workload populates the arbitrary series, and must NOT
+    leak into the GET-only memtier_hits_total/misses_total (Option B contract)."""
+    if _is_cluster(env):
+        env.skip()  # cluster covered by F23
+        return
+    rd = _new_results_dir()
+    json_path = os.path.join(rd, "mb.json")
+    proc, out_path, err_path = _popen_memtier(
+        env,
+        ["--test-time=6", "--prometheus-port=0", "--json-out-file", json_path] + _ARBITRARY_MISS_ARGS,
+        rd,
+    )
+    try:
+        url = wait_for_prometheus_url(out_path, timeout=20)
+        env.assertFalse(url is None, message="no announce line")
+        last = _scrape_last(proc, url,
+                            ["memtier_arbitrary_hits_total", "memtier_arbitrary_misses_total",
+                             "memtier_hits_total", "memtier_misses_total"])
+        rc = proc.wait()
+        env.assertEqual(rc, 0, message="memtier exit {}: {}".format(rc, _drain(err_path)))
+        am = last["memtier_arbitrary_misses_total"]
+        env.assertFalse(am is None, message="arbitrary_misses never scraped")
+        env.assertTrue(am > 0, message="arbitrary_misses stayed 0 under a miss workload")
+        # Option-B leak guard (exact): an arbitrary-only workload must leave the
+        # GET-path series at zero.
+        env.assertEqual(last["memtier_hits_total"], 0,
+                        message="GET hits_total inflated by arbitrary workload: {}".format(last["memtier_hits_total"]))
+        env.assertEqual(last["memtier_misses_total"], 0,
+                        message="GET misses_total inflated by arbitrary workload: {}".format(last["memtier_misses_total"]))
+        # Cross-check vs final JSON. Band (mirrors F5): the exporter dies with the
+        # process and the last pre-exit scrape lags the final JSON by the in-flight
+        # second, so an exact equality would flake; the band catches a gross
+        # under-count and any double-count (scrape must never exceed JSON).
+        _jh, jm = _json_arbitrary_totals(json_path)
+        env.assertTrue(jm > 0, message="JSON reported no arbitrary misses")
+        env.assertTrue(0.5 * jm <= am <= jm,
+                       message="arbitrary_misses {} not within [0.5*{}, {}]".format(am, jm, jm))
+    finally:
+        _kill(proc)
+
+
+def test_F22_arbitrary_series_zero_without_command(env):
+    """Without --command the arbitrary series are present and read exactly 0
+    while the benchmark is doing work (reverse leak guard)."""
+    if _is_cluster(env):
+        env.skip()
+        return
+    rd = _new_results_dir()
+    proc, out_path, err_path = _popen_memtier(
+        env, ["--test-time=4", "--ratio=1:1", "--prometheus-port=0"], rd
+    )
+    try:
+        url = wait_for_prometheus_url(out_path, timeout=20)
+        env.assertFalse(url is None, message="no announce line")
+        last = _scrape_last(proc, url,
+                            ["memtier_arbitrary_hits_total", "memtier_arbitrary_misses_total", "memtier_ops_total"])
+        rc = proc.wait()
+        env.assertEqual(rc, 0, message="memtier exit {}: {}".format(rc, _drain(err_path)))
+        env.assertTrue(last["memtier_ops_total"] and last["memtier_ops_total"] > 0,
+                       message="no ops observed")
+        env.assertEqual(last["memtier_arbitrary_hits_total"], 0,
+                        message="arbitrary_hits nonzero without --command")
+        env.assertEqual(last["memtier_arbitrary_misses_total"], 0,
+                        message="arbitrary_misses nonzero without --command")
+    finally:
+        _kill(proc)
+
+
+def test_F23_arbitrary_misses_cluster(env):
+    """Cluster mode: the per-shard arbitrary miss counts aggregate into the two
+    series the same race-free way (proves no partial-shard loss / no double count)."""
+    if not _is_cluster(env):
+        env.skip()
+        return
+    rd = _new_results_dir()
+    json_path = os.path.join(rd, "mb.json")
+    proc, out_path, err_path = _popen_memtier(
+        env,
+        ["--test-time=6", "--prometheus-port=0", "--json-out-file", json_path] + _ARBITRARY_MISS_ARGS,
+        rd,
+    )
+    try:
+        url = wait_for_prometheus_url(out_path, timeout=30)
+        env.assertFalse(url is None, message="no announce line")
+        last = _scrape_last(proc, url, ["memtier_arbitrary_misses_total"], deadline_s=120)
+        rc = proc.wait()
+        env.assertEqual(rc, 0, message="memtier exit {}: {}".format(rc, _drain(err_path)))
+        am = last["memtier_arbitrary_misses_total"]
+        env.assertFalse(am is None, message="arbitrary_misses never scraped")
+        env.assertTrue(am > 0, message="cluster arbitrary_misses stayed 0")
+        _jh, jm = _json_arbitrary_totals(json_path)
+        env.assertTrue(jm > 0, message="JSON reported no arbitrary misses")
+        env.assertTrue(0.5 * jm <= am <= jm,
+                       message="cluster arbitrary_misses {} not within [0.5*{}, {}]".format(am, jm, jm))
+    finally:
+        _kill(proc)
+
+
+def test_F24_arbitrary_misses_accumulate_across_runs(env):
+    """--run-count=2: the arbitrary counters accumulate across the run boundary
+    (monotonic, never reset) -- the value seen in run 2 strictly exceeds the
+    last value seen in run 1."""
+    if _is_cluster(env):
+        env.skip()  # cluster run boundaries covered by F18/F23
+        return
+    rd = _new_results_dir()
+    proc, out_path, err_path = _popen_memtier(
+        env,
+        ["--test-time=4", "--run-count=2", "--prometheus-port=0"] + _ARBITRARY_MISS_ARGS,
+        rd,
+    )
+    samples = []  # (arbitrary_misses, run)
+    try:
+        url = wait_for_prometheus_url(out_path, timeout=20)
+        env.assertFalse(url is None, message="no announce line")
+        deadline = time.time() + 90
+        while proc.poll() is None and time.time() < deadline:
+            r = prom_scrape(url, timeout=2)
+            if r.status == 200:
+                p = prom_parse(r.body)
+                am = prom_sample_value(p, "memtier_arbitrary_misses_total")
+                run = prom_sample_value(p, "memtier_run")
+                if am is not None and run is not None:
+                    samples.append((am, int(run)))
+            time.sleep(0.25)
+        rc = proc.wait()
+        env.assertEqual(rc, 0, message="memtier exit {}: {}".format(rc, _drain(err_path)))
+        env.assertTrue(len(samples) >= 3, message="too few samples: {}".format(samples))
+        # never decreases (monotonic accumulator, same path as memtier_ops_total)
+        prev = -1.0
+        for am, _run in samples:
+            env.assertTrue(am >= prev, message="arbitrary_misses went backwards: {}".format(samples))
+            prev = am
+        run1 = [am for am, run in samples if run == 1]
+        run2 = [am for am, run in samples if run == 2]
+        env.assertTrue(len(run1) > 0 and len(run2) > 0,
+                       message="did not observe both runs: {}".format(samples))
+        env.assertTrue(run1[-1] > 0, message="run 1 produced no arbitrary misses")
+        # run 2 continues accumulating from run 1's total, not from zero.
+        env.assertTrue(run2[-1] > run1[-1],
+                       message="arbitrary_misses did not accumulate across runs: run1={} run2={}".format(
+                           run1[-1], run2[-1]))
     finally:
         _kill(proc)
