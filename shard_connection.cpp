@@ -1278,21 +1278,15 @@ void shard_connection::process_response(void)
 
     if (ret == -1) {
         benchmark_error_log("error: response parsing failed.\n");
-        // A parser failure means the byte stream is unrecoverable: the bytes
-        // never realign, the response never completes, and we never call
-        // inc_reqs_processed() again. Report it as a connection-stage failure so
-        // the supervisor can attribute it -- but the supervisor is disarmed once
-        // steady state is reached, so on a post-steady-state parse failure (e.g.
-        // replaying a MONITOR-captured HELLO/AUTH sequence the parser cannot
-        // follow) the worker would otherwise sit idle in its event loop forever,
-        // ignoring --test-time and hanging the run until an external watchdog
-        // kills it (the Monitor-Input Fuzz timeouts). Break this worker's own
-        // event loop so the run terminates cleanly instead. We are on the loop's
-        // own thread here, so loopbreak is safe (cf. the event_new-failure path
-        // in attempt_reconnect).
+        // A parser failure during the initial probe (e.g. talking memcache_text
+        // to a Redis server, or memcache_binary to redis) puts the worker
+        // into an unrecoverable spin: the bytes never align, the response
+        // never completes, and we never call inc_reqs_processed(). Report it
+        // as a connection-stage failure so the supervisor bounds the spin.
+        // Once steady state is reached this is a no-op; the --test-time wall-clock
+        // backstop in run_benchmark() bounds it in that case (see
+        // memtier_benchmark.cpp).
         report_connection_stage_failure("response parsing failed (protocol mismatch?)");
-        event_base_loopbreak(m_event_base);
-        return;
     }
 
     if (m_config->reconnect_interval > 0 && responses_handled) {

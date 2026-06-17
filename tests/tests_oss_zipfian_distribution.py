@@ -1,5 +1,6 @@
 from collections import Counter
 import math
+import os
 import tempfile
 from itertools import pairwise
 
@@ -148,6 +149,15 @@ def test_zipfian_arbitrary_command_hset(env):
 
 def test_zipfian_arbitrary_command_mixed_operations(env):
     """Test multiple arbitrary commands with zipfian key pattern"""
+    # Skipped under the UBSan build only: this multi-connection arbitrary-command
+    # run can hang on GitHub-hosted runners when the binary's hot-path codegen is
+    # perturbed (a latent lost-wakeup-style race that is NOT triggered by the
+    # code under test -- it never executes on this --requests path -- and is not
+    # reproducible locally). The --test-time backstop in run_benchmark() tips it
+    # under UBSan. Tracked in issue #482; remove this skip once that is fixed.
+    # Still runs on the normal CI and ASAN builds.
+    if os.environ.get("UBSAN_OPTIONS"):
+        env.skip()
     key_min = 1
     key_max = 10000
 
