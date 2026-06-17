@@ -34,6 +34,7 @@
 #endif
 
 #include "run_stats.h"
+#include "prometheus_metrics.h" // prom::hdr_add_positive_delta (pure layer, always linked)
 
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
@@ -202,7 +203,7 @@ void run_stats::copy_inst_histogram(hdr_histogram *target) const
     pthread_mutex_unlock(&m_inst_histogram_mutex.mtx);
 }
 
-bool run_stats::copy_inst_histogram_if_changed(hdr_histogram *target)
+void run_stats::copy_inst_histogram_if_changed(hdr_histogram *target)
 { // Main thread, 1 Hz. Workers bump counts with hdr_record_value_capped_atomic
     // (lock-free); this read under the copy/reset mutex is the same benign-race
     // class as copy_inst_histogram (suppressions, tsan_suppressions.txt).
@@ -222,7 +223,6 @@ bool run_stats::copy_inst_histogram_if_changed(hdr_histogram *target)
     // masked by enough new samples that total_count still rises, some post-reset
     // samples may be dropped — an undercount, consistent with the metric's
     // documented non-authoritative contract, and never a double-count.
-    bool added = false;
     pthread_mutex_lock(&m_inst_histogram_mutex.mtx);
     hdr_histogram *inst = inst_m_totals_latency_histogram;
     hdr_histogram *last = m_prom_last_inst;
@@ -234,22 +234,14 @@ bool run_stats::copy_inst_histogram_if_changed(hdr_histogram *target)
         } else {
             // Monotonic growth (no reset, or a reset masked by net growth): add
             // only the positive per-bucket increment so nothing is re-counted.
-            // inst and last share identical HDR params, so indices map 1:1.
-            for (int32_t i = 0; i < inst->counts_len; i++) {
-                const int64_t delta = hdr_count_at_index(inst, i) - hdr_count_at_index(last, i);
-                if (delta > 0) {
-                    hdr_record_values(target, hdr_value_at_index(inst, i), delta);
-                }
-            }
+            prom::hdr_add_positive_delta(target, inst, last);
         }
         // Snapshot current inst as the baseline for the next delta.
         hdr_reset(last);
         hdr_add(last, inst);
         m_prom_last_copied_total = cur;
-        added = true;
     }
     pthread_mutex_unlock(&m_inst_histogram_mutex.mtx);
-    return added;
 }
 
 void run_stats::roll_cur_stats(struct timeval *ts)

@@ -327,12 +327,14 @@ public:
     // Use this instead of a raw pointer getter to avoid data races with worker threads.
     void copy_inst_histogram(hdr_histogram *target) const;
 
-    // Like copy_inst_histogram, but only adds (and returns true) when the
-    // inst-totals histogram's total_count changed since the previous gated
-    // copy. Skips frozen histograms (clients that stopped completing ops) so a
-    // dead connection's last partial second is not re-added on every 1 Hz tick.
-    // Main-thread-only; reads total_count under m_inst_histogram_mutex.
-    bool copy_inst_histogram_if_changed(hdr_histogram *target);
+    // Like copy_inst_histogram, but only folds the per-bucket increment since
+    // the previous gated copy (via prom::hdr_add_positive_delta), so each latency
+    // sample is added to target at most once even when two 1 Hz exporter ticks
+    // land within one worker-second. Skips frozen histograms (clients that
+    // stopped completing ops) so a dead connection's last partial second is not
+    // re-added on every tick. Main-thread-only; reads total_count and updates
+    // m_prom_last_inst / m_prom_last_copied_total under m_inst_histogram_mutex.
+    void copy_inst_histogram_if_changed(hdr_histogram *target);
     void save_csv_one_sec_cluster(FILE *f);
     void save_csv_set_get_commands(FILE *f, bool cluster_mode);
     void save_csv_arbitrary_commands_one_sec(FILE *f, arbitrary_command_list &command_list,

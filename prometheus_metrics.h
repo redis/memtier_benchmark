@@ -186,6 +186,25 @@ label_name_result validate_prom_label_name(const std::string &name);
 bool parse_latency_buckets(const char *s, std::vector<double> &out, std::string &err, std::string &warn);
 
 /*
+ * hdr_add_positive_delta: fold the positive per-bucket increment of `cur` over
+ * `prev` into `target` — i.e. target += max(0, count_i(cur) - count_i(prev)) at
+ * each bucket's representative value. `cur` and `prev` MUST share identical HDR
+ * params so their bucket indices map 1:1 (the caller guarantees this).
+ *
+ * This is the pure core of run_stats::copy_inst_histogram_if_changed's growing
+ * branch: between two 1 Hz exporter ticks the per-second inst histogram may have
+ * gained samples, and folding the whole histogram again (as the original code
+ * did) re-counted samples already folded on the previous tick. Adding only the
+ * positive delta versus the previous snapshot folds every latency sample into
+ * the lifetime histogram at most once. Buckets where cur < prev (a reset folded
+ * into the same window) contribute nothing here; the caller handles a detected
+ * reset separately by adding the whole current histogram. Extracted as a free
+ * function so it can be unit-tested in isolation (see tests/unit).
+ */
+void hdr_add_positive_delta(struct hdr_histogram *target, const struct hdr_histogram *cur,
+                            const struct hdr_histogram *prev);
+
+/*
  * text_renderer: the classic-text exposition renderer (PLAN.md sections 3.3,
  * 4). Construction is the ONLY place this layer opens an hdr_histogram (one
  * throwaway, for slot-edge quantization of the bucket bounds). render()

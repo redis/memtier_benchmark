@@ -17,7 +17,7 @@
  */
 
 /*
- * Unit tests U1-U8 for the pure metrics layer (PLAN.md section 10).
+ * Unit tests U1-U9 for the pure metrics layer (PLAN.md section 10).
  * Assert-style main, no gtest. PURITY: no config.h / version.h / libevent.
  * Links prometheus_metrics.cpp + hdr_histogram (a leaf dep). U2 ships a clamp
  * replica pinned to run_stats.cpp:46-47 instead of linking run_stats.cpp.
@@ -619,6 +619,77 @@ static void U8()
     CHECK(memcmp(&a, &b, sizeof(a)) == 0, "U8: metrics_snapshot trivial copy memcmp-equal");
 }
 
+// U9 — prom::hdr_add_positive_delta folds each sample at most once.
+// Regression guard for the gated-copy double-count fix (run_stats.cpp
+// copy_inst_histogram_if_changed). Before that fix the growing branch did
+// hdr_add(target, inst), re-counting samples already folded on the previous
+// 1 Hz tick when two ticks landed within one worker-second. Reverting to the
+// always-add behaviour makes U9b fail (target total would be 6, not 4).
+static void U9()
+{
+    // (a) basic: only positive per-bucket deltas are folded; buckets where cur
+    // shrank versus prev contribute nothing.
+    {
+        struct hdr_histogram *prev = new_hist();
+        struct hdr_histogram *cur = new_hist();
+        struct hdr_histogram *target = new_hist();
+        hdr_record_value(prev, 100);
+        hdr_record_values(prev, 200, 2);
+        hdr_record_value(prev, 300);    // cur will have fewer here
+        hdr_record_values(cur, 100, 2); // +1 over prev
+        hdr_record_values(cur, 200, 3); // +1 over prev
+        // value 300 absent in cur -> delta -1, must be ignored
+        hdr_record_value(cur, 500); // +1 (new bucket)
+        prom::hdr_add_positive_delta(target, cur, prev);
+        CHECK(hdr_total_count(target) == 3, "U9a: only positive per-bucket deltas folded (+1+1+1)");
+        CHECK(hdr_count_at_value(target, 100) == 1, "U9a: bucket 100 delta == 1");
+        CHECK(hdr_count_at_value(target, 200) == 1, "U9a: bucket 200 delta == 1");
+        CHECK(hdr_count_at_value(target, 300) == 0, "U9a: shrinking bucket 300 contributes 0");
+        CHECK(hdr_count_at_value(target, 500) == 1, "U9a: new bucket 500 delta == 1");
+        hdr_close(prev);
+        hdr_close(cur);
+        hdr_close(target);
+    }
+
+    // (b) two ticks within one worker-second with a growing (never-reset) inst
+    // histogram, mirroring copy_inst_histogram_if_changed's growing branch (add
+    // positive delta, then snapshot inst into last). The lifetime target must
+    // equal the true sample count, not double it.
+    {
+        struct hdr_histogram *inst = new_hist();   // per-second inst histogram
+        struct hdr_histogram *last = new_hist();   // m_prom_last_inst snapshot
+        struct hdr_histogram *target = new_hist(); // lifetime histogram
+        int64_t last_total = 0;
+
+        // tick 1: 2 samples this second
+        hdr_record_value(inst, 100);
+        hdr_record_value(inst, 200);
+        int64_t cur = hdr_total_count(inst);
+        if (cur != last_total) { // growing (cur > last_total)
+            prom::hdr_add_positive_delta(target, inst, last);
+            hdr_reset(last);
+            hdr_add(last, inst);
+            last_total = cur;
+        }
+        // tick 2: SAME worker-second, inst grew by 2 more (no reset)
+        hdr_record_values(inst, 300, 2);
+        cur = hdr_total_count(inst);
+        if (cur != last_total) {
+            prom::hdr_add_positive_delta(target, inst, last);
+            hdr_reset(last);
+            hdr_add(last, inst);
+            last_total = cur;
+        }
+        CHECK(hdr_total_count(target) == 4, "U9b: two same-second ticks fold 4 samples once (not 6)");
+        CHECK(hdr_count_at_value(target, 100) == 1, "U9b: value 100 folded once");
+        CHECK(hdr_count_at_value(target, 200) == 1, "U9b: value 200 folded once");
+        CHECK(hdr_count_at_value(target, 300) == 2, "U9b: value 300 folded twice (2 samples)");
+        hdr_close(inst);
+        hdr_close(last);
+        hdr_close(target);
+    }
+}
+
 int main()
 {
     U1();
@@ -630,9 +701,10 @@ int main()
     U6();
     U7();
     U8();
+    U9();
 
     if (g_failures == 0) {
-        printf("PASS: all %d checks passed (U1-U8)\n", g_checks);
+        printf("PASS: all %d checks passed (U1-U9)\n", g_checks);
         return 0;
     }
     fprintf(stderr, "FAILED: %d of %d checks failed\n", g_failures, g_checks);
