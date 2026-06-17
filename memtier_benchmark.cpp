@@ -3085,16 +3085,6 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     unsigned long int prev_errors = 0;
     unsigned long int prev_retry_attempts = 0;
 
-    // Wall-clock backstop for --test-time. A worker normally terminates itself
-    // once finished() reaches test_time, but that check is driven by
-    // op-completion stats (run_stats::get_duration), which freeze when no op
-    // ever completes -- e.g. a monitor-replay HELLO/AUTH sequence that desyncs
-    // the parser (ret == -1) after steady state, leaving the connection idle in
-    // its event loop forever and ignoring --test-time. Counts consecutive 1s
-    // ticks elapsed past the deadline with zero completed operations; see the
-    // backstop in the loop below.
-    unsigned int testtime_stall_secs = 0;
-
     // Detect once whether stderr is a real terminal. --realtime-latencies uses
     // this to choose between in-place cursor-up redraw and plain-append output.
     bool stderr_is_tty = isatty(fileno(stderr)) != 0;
@@ -3225,38 +3215,6 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         prev_bytes = total_bytes;
         prev_latency = total_latency;
         prev_duration = duration;
-
-        // Wall-clock --test-time backstop (see testtime_stall_secs above).
-        // `duration` is the average per-thread wall-clock elapsed
-        // (get_duration_usec), so it advances even when no op completes. Once we
-        // are past the deadline AND no operation has completed for a grace
-        // window, the workers are wedged (not merely draining): interrupt them.
-        // interrupt() wakes a worker blocked in epoll via loopexit (see
-        // client_group::interrupt). We require a run of zero-op ticks rather
-        // than firing the instant we cross the deadline so a healthy run
-        // flushing its last in-flight responses -- or a deliberately sparse
-        // --request-rate run -- is never cut short; request_rate runs can
-        // legitimately idle between ticks, so the grace is widened there.
-        if (cfg->test_time > 0 && active_threads > 0 && (duration / 1000000) >= (unsigned long) cfg->test_time) {
-            const unsigned int grace = cfg->request_rate ? 30 : 5;
-            if (cur_ops == 0) {
-                testtime_stall_secs++;
-            } else {
-                testtime_stall_secs = 0;
-            }
-            if (testtime_stall_secs >= grace) {
-                fprintf(stderr,
-                        "\n[RUN #%u] --test-time deadline exceeded: %lus elapsed (limit %us) with no completed "
-                        "operations for %us; stopping stalled threads...\n",
-                        run_id, duration / 1000000, cfg->test_time, testtime_stall_secs);
-                for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
-                    (*i)->m_cg->interrupt();
-                }
-                break;
-            }
-        } else {
-            testtime_stall_secs = 0;
-        }
 
         unsigned long int ops_sec = 0;
         unsigned long int bytes_sec = 0;
