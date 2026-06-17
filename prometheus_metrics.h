@@ -61,6 +61,8 @@ enum mt_counter
     MT_CONN_ERRORS,
     MT_RETRY_ATTEMPTS,
     MT_RETRIED_OPS,
+    MT_ARBITRARY_HITS,   // hits on arbitrary (--command) miss-trackable commands
+    MT_ARBITRARY_MISSES, // misses on arbitrary (--command) miss-trackable commands
     MT_NUM_COUNTERS
 };
 

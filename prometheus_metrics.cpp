@@ -67,10 +67,10 @@ static const metric_def kMetricDefs[] = {
     {"memtier_received_bytes_total", MT_TYPE_COUNTER, "Total bytes read from the server since process start."},
     {"memtier_hits_total", MT_TYPE_COUNTER,
      "Total GET operations that found the key. Counts GET-command hits only; hits on arbitrary "
-     "(--command) miss-trackable commands are not included in this total."},
+     "(--command) miss-trackable commands are reported separately by memtier_arbitrary_hits_total."},
     {"memtier_misses_total", MT_TYPE_COUNTER,
      "Total GET operations that did not find the key. Counts GET-command misses only; misses on arbitrary "
-     "(--command) miss-trackable commands are not included in this total."},
+     "(--command) miss-trackable commands are reported separately by memtier_arbitrary_misses_total."},
     {"memtier_errors_total", MT_TYPE_COUNTER,
      "Total commands that received an error reply after retries were exhausted; connection errors are counted "
      "separately."},
@@ -81,6 +81,14 @@ static const metric_def kMetricDefs[] = {
      "Total command resend attempts; nonzero only with --retry-on-error."},
     {"memtier_retried_ops_total", MT_TYPE_COUNTER,
      "Total operations that eventually succeeded after at least one retry; nonzero only with --retry-on-error."},
+    {"memtier_arbitrary_hits_total", MT_TYPE_COUNTER,
+     "Total key lookups on arbitrary (--command) miss-trackable commands that found the key (a multi-key command "
+     "such as HMGET contributes one increment per element), aggregated across all configured arbitrary commands. "
+     "GET-command hits are reported separately by memtier_hits_total."},
+    {"memtier_arbitrary_misses_total", MT_TYPE_COUNTER,
+     "Total key lookups on arbitrary (--command) miss-trackable commands that did not find the key (a multi-key "
+     "command such as HMGET contributes one increment per element), aggregated across all configured arbitrary "
+     "commands. GET-command misses are reported separately by memtier_misses_total."},
     {"memtier_connections", MT_TYPE_GAUGE, "Client connections currently open."},
     {"memtier_threads", MT_TYPE_GAUGE, "Worker threads currently active."},
     {"memtier_run", MT_TYPE_GAUGE, "Current run number, 1-based; 0 before the first run starts."},
@@ -130,6 +138,10 @@ static const char *counter_metric_name(int m)
         return "memtier_retry_attempts_total";
     case MT_RETRIED_OPS:
         return "memtier_retried_ops_total";
+    case MT_ARBITRARY_HITS:
+        return "memtier_arbitrary_hits_total";
+    case MT_ARBITRARY_MISSES:
+        return "memtier_arbitrary_misses_total";
     default:
         return "";
     }
@@ -476,38 +488,39 @@ void text_renderer::render(std::string &out, const metrics_snapshot &snap, const
     emit_help_type(out, defs[di++]);
     append_fmt(out, "memtier_start_time_seconds%s %.3f\n", m_label_block.c_str(), start_time_seconds);
 
-    // 3-11. counters, in mt_counter order.
+    // All counters, in mt_counter order (defs[di] advances in lockstep, so the
+    // kMetricDefs counter rows must stay contiguous and in the same order).
     for (int m = 0; m < MT_NUM_COUNTERS; m++) {
         emit_help_type(out, defs[di++]);
         append_fmt(out, "%s%s %llu\n", counter_metric_name(m), m_label_block.c_str(),
                    (unsigned long long) snap.counters[m]);
     }
 
-    // 12. memtier_connections (gauge)
+    // memtier_connections (gauge)
     emit_help_type(out, defs[di++]);
     // integer count, rendered exactly (%.6g switches to scientific notation
     // past 6 significant digits, losing fidelity for large client x thread).
     append_fmt(out, "memtier_connections%s %u\n", m_label_block.c_str(), (unsigned) snap.connections);
 
-    // 13. memtier_threads (gauge)
+    // memtier_threads (gauge)
     emit_help_type(out, defs[di++]);
     append_fmt(out, "memtier_threads%s %u\n", m_label_block.c_str(), (unsigned) snap.active_threads);
 
-    // 14. memtier_run (gauge)
+    // memtier_run (gauge)
     emit_help_type(out, defs[di++]);
     append_fmt(out, "memtier_run%s %u\n", m_label_block.c_str(), (unsigned) snap.run_id);
 
-    // 15. memtier_configured_runs (gauge)
+    // memtier_configured_runs (gauge)
     emit_help_type(out, defs[di++]);
     append_fmt(out, "memtier_configured_runs%s %u\n", m_label_block.c_str(), (unsigned) snap.run_count);
 
-    // 16. memtier_config_test_time_seconds (gauge): the configured --test-time,
+    // memtier_config_test_time_seconds (gauge): the configured --test-time,
     // carried on the snapshot (stamped by the exporter's publish() from
     // options.test_time). 0 when running by --requests.
     emit_help_type(out, defs[di++]);
     append_fmt(out, "memtier_config_test_time_seconds%s %d\n", m_label_block.c_str(), (int) snap.test_time);
 
-    // 17. memtier_latency_seconds (histogram): cumulative bucket walk.
+    // memtier_latency_seconds (histogram): cumulative bucket walk.
     emit_help_type(out, defs[di++]);
     {
         size_t n = m_edge_us.size();
@@ -543,12 +556,12 @@ void text_renderer::render(std::string &out, const metrics_snapshot &snap, const
         append_fmt(out, "memtier_latency_seconds_sum%s %.9g\n", m_label_block.c_str(), sum_us / USECS_PER_SEC);
     }
 
-    // 18. memtier_exporter_renders_total (counter)
+    // memtier_exporter_renders_total (counter)
     emit_help_type(out, defs[di++]);
     append_fmt(out, "memtier_exporter_renders_total%s %llu\n", m_label_block.c_str(),
                (unsigned long long) renders_total);
 
-    // 19. memtier_exporter_snapshot_age_seconds (gauge)
+    // memtier_exporter_snapshot_age_seconds (gauge)
     emit_help_type(out, defs[di++]);
     append_fmt(out, "memtier_exporter_snapshot_age_seconds%s %.3f\n", m_label_block.c_str(), snapshot_age_seconds);
 

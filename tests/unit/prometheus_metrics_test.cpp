@@ -17,7 +17,7 @@
  */
 
 /*
- * Unit tests U1-U9 for the pure metrics layer (PLAN.md section 10).
+ * Unit tests U1-U10 for the pure metrics layer (PLAN.md section 10).
  * Assert-style main, no gtest. PURITY: no config.h / version.h / libevent.
  * Links prometheus_metrics.cpp + hdr_histogram (a leaf dep). U2 ships a clamp
  * replica pinned to run_stats.cpp:46-47 instead of linking run_stats.cpp.
@@ -690,6 +690,77 @@ static void U9()
     }
 }
 
+// U10 — arbitrary-command hits/misses series (#483): structural counter/def
+// alignment, positional placement of the two new counter rows, and a sentinel
+// render proving the GET series are NOT folded and the new series render at
+// their own enum index (the kMetricDefs order vs counter_metric_name hazard).
+static void U10()
+{
+    const prom::metric_def *defs = prom::metric_defs();
+    const size_t n = prom::metric_defs_count();
+
+    // (b) positional: the two new rows sit immediately after memtier_retried_ops_total
+    // and before memtier_connections, both typed counter.
+    size_t k = n;
+    for (size_t i = 0; i < n; i++)
+        if (strcmp(defs[i].name, "memtier_retried_ops_total") == 0) {
+            k = i;
+            break;
+        }
+    CHECK(k != n, "U10: memtier_retried_ops_total present");
+    if (k + 3 < n) {
+        CHECK(strcmp(defs[k + 1].name, "memtier_arbitrary_hits_total") == 0,
+              "U10: arbitrary_hits_total follows retried_ops_total");
+        CHECK(defs[k + 1].type == prom::MT_TYPE_COUNTER, "U10: arbitrary_hits_total is a counter");
+        CHECK(strcmp(defs[k + 2].name, "memtier_arbitrary_misses_total") == 0,
+              "U10: arbitrary_misses_total follows arbitrary_hits_total");
+        CHECK(defs[k + 2].type == prom::MT_TYPE_COUNTER, "U10: arbitrary_misses_total is a counter");
+        CHECK(strcmp(defs[k + 3].name, "memtier_connections") == 0,
+              "U10: memtier_connections follows the two new counter rows");
+    }
+
+    // (c) sentinel render: distinct value per counter index. The render loop
+    // walks the contiguous counter-def block in mt_counter order, so for every
+    // enum index m the def at (ops_offset + m) must render value 1000+m. This
+    // proves kMetricDefs order aligns with counter_metric_name across the WHOLE
+    // block — and, for the GET series specifically, that arbitrary is NOT folded
+    // into them (each renders its own sentinel, not a sum).
+    prom::text_renderer r = make_default_renderer();
+    struct hdr_histogram *h = new_hist();
+    metrics_snapshot s;
+    zero_snapshot(s);
+    for (int m = 0; m < MT_NUM_COUNTERS; m++)
+        s.counters[m] = (uint64_t) (1000 + m);
+    std::string body;
+    r.render(body, s, h, 0.0, 0.0, 0);
+    std::string v;
+    size_t ops_off = n;
+    for (size_t i = 0; i < n; i++)
+        if (strcmp(defs[i].name, "memtier_ops_total") == 0) {
+            ops_off = i;
+            break;
+        }
+    CHECK(ops_off != n, "U10: memtier_ops_total present (counter block start)");
+    if (ops_off + (size_t) MT_NUM_COUNTERS <= n) {
+        for (int m = 0; m < MT_NUM_COUNTERS; m++) {
+            const prom::metric_def &d = defs[ops_off + m];
+            char msg[160];
+            snprintf(msg, sizeof(msg), "U10: counter[%d] %s renders sentinel 1000+%d", m, d.name, m);
+            CHECK(d.type == prom::MT_TYPE_COUNTER && find_line_value(body, d.name, v) && atoi(v.c_str()) == 1000 + m,
+                  msg);
+        }
+    }
+
+    // (d) HELP honesty: GET series forward-reference the new series and no longer
+    // claim arbitrary is "not included"; new series name "arbitrary" + "per element".
+    CHECK(body.find("Counts GET-command hits only") != std::string::npos, "U10: GET hits HELP scope retained");
+    CHECK(body.find("memtier_arbitrary_hits_total") != std::string::npos,
+          "U10: GET hits HELP forward-references new series");
+    CHECK(body.find("not included in this total") == std::string::npos, "U10: stale 'not included' HELP removed");
+    CHECK(body.find("per element") != std::string::npos, "U10: new HELP states per-element (key-lookup) granularity");
+    hdr_close(h);
+}
+
 int main()
 {
     U1();
@@ -702,9 +773,10 @@ int main()
     U7();
     U8();
     U9();
+    U10();
 
     if (g_failures == 0) {
-        printf("PASS: all %d checks passed (U1-U9)\n", g_checks);
+        printf("PASS: all %d checks passed (U1-U10)\n", g_checks);
         return 0;
     }
     fprintf(stderr, "FAILED: %d of %d checks failed\n", g_failures, g_checks);

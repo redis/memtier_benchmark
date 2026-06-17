@@ -494,6 +494,22 @@ unsigned long int run_stats::get_total_misses(void)
     return m_totals.m_misses;
 }
 
+unsigned long long run_stats::get_total_arbitrary_hits(void)
+{
+    unsigned long long t = 0;
+    for (size_t i = 0; i < m_arbitrary_misses.size(); ++i)
+        t += m_arbitrary_misses[i].total_hits;
+    return t;
+}
+
+unsigned long long run_stats::get_total_arbitrary_misses(void)
+{
+    unsigned long long t = 0;
+    for (size_t i = 0; i < m_arbitrary_misses.size(); ++i)
+        t += m_arbitrary_misses[i].total_misses;
+    return t;
+}
+
 #define AVERAGE(total, count) ((unsigned int) ((count) > 0 ? (total) / (count) : 0))
 #define USEC_FORMAT(value) (value) / 1000000, (value) % 1000000
 

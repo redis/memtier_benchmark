@@ -1427,6 +1427,26 @@ unsigned long int client_group::get_total_misses(void)
     return total;
 }
 
+unsigned long long client_group::get_total_arbitrary_hits(void)
+{
+    unsigned long long total = 0;
+    unsigned int count = active_client_count();
+    for (unsigned int i = 0; i < count; i++) {
+        total += m_clients[i]->get_stats()->get_total_arbitrary_hits();
+    }
+    return total;
+}
+
+unsigned long long client_group::get_total_arbitrary_misses(void)
+{
+    unsigned long long total = 0;
+    unsigned int count = active_client_count();
+    for (unsigned int i = 0; i < count; i++) {
+        total += m_clients[i]->get_stats()->get_total_arbitrary_misses();
+    }
+    return total;
+}
+
 unsigned long int client_group::get_total_retry_attempts(void)
 {
     unsigned long int total = 0;
