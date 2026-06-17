@@ -722,6 +722,7 @@ bool monitor_command_list::load_from_file(const char *filename)
     size_t line_capacity = 0;
     ssize_t line_len;
     size_t total_lines = 0;
+    size_t skipped_malformed = 0;
 
     // Use getline() for dynamic allocation - handles arbitrarily long lines
     while ((line_len = getline(&line, &line_capacity, file)) != -1) {
@@ -770,6 +771,28 @@ bool monitor_command_list::load_from_file(const char *filename)
                 command_str.erase(command_str.length() - 1);
             }
 
+            // Validate that the command actually parses with the exact tokenizer
+            // used at request time (arbitrary_command::split_command_to_args).
+            // Previously any segment containing a quote was accepted and the only
+            // sanity check was that a command *type* (first quoted word) could be
+            // extracted -- so a line like  "SET" "key" "unterminated  has a valid
+            // type ("SET") yet fails to split at request time. When every loaded
+            // command is malformed, create_arbitrary_request() skips each one and
+            // never enqueues a request, leaving fill_pipeline() to busy-spin
+            // forever: the --test-time deadline is only re-evaluated once an op
+            // completes, and no op ever completes. That hung the run until the CI
+            // watchdog killed it (the Monitor-Input Fuzz 90s timeout). Reject
+            // unparseable commands here so the loader fails fast on garbage and a
+            // partially-malformed file still runs its valid commands. The probe
+            // uses command_str.c_str() exactly as the request path does, so any
+            // command accepted here is guaranteed to split at request time too.
+            arbitrary_command probe(command_str.c_str());
+            if (!probe.split_command_to_args()) {
+                skipped_malformed++;
+                seg_start = seg_end ? seg_end + 1 : line + line_len;
+                continue;
+            }
+
             commands.push_back(command_str);
 
             // Extract and store the command type (e.g., "SET", "GET")
@@ -784,11 +807,22 @@ bool monitor_command_list::load_from_file(const char *filename)
     fclose(file);
 
     if (commands.empty()) {
-        fprintf(stderr, "error: no commands found in monitor input file: %s\n", filename);
+        if (skipped_malformed > 0) {
+            fprintf(stderr,
+                    "error: no valid commands found in monitor input file: %s (%zu malformed line(s) skipped)\n",
+                    filename, skipped_malformed);
+        } else {
+            fprintf(stderr, "error: no commands found in monitor input file: %s\n", filename);
+        }
         return false;
     }
 
-    fprintf(stderr, "Loaded %zu monitor commands from %zu total lines\n", commands.size(), total_lines);
+    if (skipped_malformed > 0) {
+        fprintf(stderr, "Loaded %zu monitor commands from %zu total lines (%zu malformed line(s) skipped)\n",
+                commands.size(), total_lines, skipped_malformed);
+    } else {
+        fprintf(stderr, "Loaded %zu monitor commands from %zu total lines\n", commands.size(), total_lines);
+    }
     return true;
 }
 

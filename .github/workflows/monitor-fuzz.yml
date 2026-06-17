@@ -71,7 +71,17 @@ jobs:
           REDIS_HOST: 127.0.0.1
           REDIS_PORT: "6379"
           # Smaller corpus pass on PR-label runs; larger on nightly/manual.
+          # FUZZ_ITER is an upper bound on per-seed iterations; the run is
+          # actually bounded by FUZZ_MAX_SECONDS below (a mutation that starts a
+          # benchmark runs for --test-time seconds, so the full FUZZ_ITER sweep
+          # would take hours and the job was always cancelled at its 35-minute
+          # cap -- it never completed once before this budget was added).
           FUZZ_ITER: ${{ github.event_name == 'pull_request' && '300' || (inputs.iterations || '2000') }}
+          # Wall-clock budget for the whole sweep, sized to finish inside the
+          # job's timeout-minutes with margin for the build/setup steps. The
+          # driver iterates seeds round-robin, so a budget-bounded run still
+          # covers every seed. ~3 min for PR-label feedback, ~25 min nightly.
+          FUZZ_MAX_SECONDS: ${{ github.event_name == 'pull_request' && '180' || '1500' }}
           # 90s accommodates ASAN+UBSan overhead × 8 MiB payloads (#443)
           FUZZ_TIMEOUT: "90"
         run: python3 tests/fuzz/fuzz_monitor_input.py

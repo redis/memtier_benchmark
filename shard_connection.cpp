@@ -311,6 +311,18 @@ shard_connection::~shard_connection()
     }
 
     if (m_pipeline != NULL) {
+        // Free any requests still in flight. A normally-completed run drains the
+        // pipeline before teardown, but an early teardown (Ctrl+C,
+        // --connection-stage-timeout abort, or the --test-time backstop tearing
+        // down a wedged connection -- e.g. replaying a monitor command that
+        // never gets a reply) leaves queued request objects behind. Deleting the
+        // queue without draining it leaks them; LeakSanitizer flags it (the
+        // Monitor-Input Fuzz exit=42 reports). Mirrors the retry/replay queues
+        // below.
+        while (!m_pipeline->empty()) {
+            delete m_pipeline->front();
+            m_pipeline->pop();
+        }
         delete m_pipeline;
         m_pipeline = NULL;
     }
@@ -1271,7 +1283,9 @@ void shard_connection::process_response(void)
         // into an unrecoverable spin: the bytes never align, the response
         // never completes, and we never call inc_reqs_processed(). Report it
         // as a connection-stage failure so the supervisor bounds the spin.
-        // Once steady state is reached this is a no-op.
+        // Once steady state is reached this is a no-op; the --test-time wall-clock
+        // backstop in run_benchmark() bounds it in that case (see
+        // memtier_benchmark.cpp).
         report_connection_stage_failure("response parsing failed (protocol mismatch?)");
     }
 

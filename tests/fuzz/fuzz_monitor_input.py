@@ -22,6 +22,11 @@ Environment:
   MEMTIER       path to memtier_benchmark binary (default: ../../memtier_benchmark)
   FUZZ_SEED     PRNG seed for reproducible runs (default: os.urandom-derived)
   FUZZ_TIMEOUT  per-run timeout in seconds (default 30)
+  FUZZ_MAX_SECONDS  wall-clock cap for the whole sweep (default 0 = no cap).
+                When set, the driver stops launching new iterations once this
+                many seconds have elapsed, so the run fits inside the CI job
+                timeout regardless of FUZZ_ITER. Seeds run round-robin so the
+                budget is spread evenly across them.
 """
 import os
 import random
@@ -262,8 +267,31 @@ def main() -> int:
     # the driver only prints the startup banner and final summary, leaving
     # an opaque gap whenever the runner is yanked mid-run.
     progress_every = int(os.environ.get("FUZZ_PROGRESS_EVERY", "50"))
-    for name, payload in seeds.items():
-        for i in range(FUZZ_ITER):
+    # Wall-clock budget for the whole sweep. FUZZ_ITER alone wildly overshoots
+    # the CI job timeout: every mutation that starts a benchmark runs for
+    # --test-time seconds (2s here), and a mutation that wedges a connection
+    # runs until the --test-time backstop (a few more seconds), so
+    # FUZZ_ITER * seeds easily implies hours of work. Before this cap the job
+    # was always cancelled at its 35-minute limit (it never completed once).
+    # FUZZ_MAX_SECONDS bounds the run so it always finishes and reports the
+    # failures found within the budget; 0 disables it. Seeds are iterated
+    # round-robin (iteration-major) so a time-bounded run spreads coverage
+    # across every seed instead of spending the whole budget on the first few.
+    max_seconds = int(os.environ.get("FUZZ_MAX_SECONDS", "0"))
+    seed_items = list(seeds.items())
+    budget_hit = False
+    for _ in range(FUZZ_ITER):
+        if budget_hit:
+            break
+        for name, payload in seed_items:
+            if max_seconds > 0 and (time.time() - t0) >= max_seconds:
+                sys.stderr.write(
+                    "fuzz_monitor_input: hit FUZZ_MAX_SECONDS={}s budget after {} iterations; stopping\n".format(
+                        max_seconds, total
+                    )
+                )
+                budget_hit = True
+                break
             if progress_every > 0 and total % progress_every == 0:
                 sys.stderr.write(
                     "fuzz_monitor_input: iter {}/{} elapsed={}s seed={}\n".format(

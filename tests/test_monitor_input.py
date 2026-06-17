@@ -781,6 +781,76 @@ def test_monitor_input_malformed_command_skipped(env):
         )
 
 
+def test_monitor_input_all_unparseable_fails_fast(env):
+    """
+    Regression test for the Monitor-Input Fuzz nightly timeout.
+
+    The loader's only validity check used to be that a command *type* (the first
+    quoted word) could be extracted. A line like
+
+        "SET" "key" "unterminated
+
+    has a valid type ("SET") but an unterminated final quote, so it passes that
+    check yet fails arbitrary_command::split_command_to_args() at request time.
+    When *every* loaded command is like that, create_arbitrary_request() skips
+    each one without enqueuing a request, and shard_connection::fill_pipeline()
+    busy-spins forever -- the --test-time deadline is only re-evaluated when an
+    operation completes, and none ever does. The run hung until CI killed it
+    (90s) while flooding stderr with "skipping malformed monitor command".
+
+    The fix validates every command with split_command_to_args() at load time,
+    so a file with no parseable command fails fast (clean non-zero exit) instead
+    of hanging. This test feeds such a file and asserts memtier exits cleanly and
+    reports the error rather than timing out.
+    """
+    env.skipOnCluster()
+    test_dir = tempfile.mkdtemp()
+    monitor_file = os.path.join(test_dir, "monitor.txt")
+    with open(monitor_file, "w") as f:
+        # Every line: valid type ("SET"/"GET"), unparseable body (open quote).
+        f.write('1764031576.604009 [0 127.0.0.1:51682] "SET" "key1" "unterminated\n')
+        f.write('1764031576.605000 [0 127.0.0.1:51682] "GET" "k\n')
+        f.write('1764031576.606000 [0 127.0.0.1:51682] "HSET" "h" "f" "v\n')
+
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--monitor-input={}".format(monitor_file),
+            "--command=__monitor_line@__",
+            "--hide-histogram",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+
+    # test-time bounds the run; pre-fix this hung well past it (the busy-spin
+    # never re-checked the deadline), so a hang shows up as an RLTest timeout.
+    config = get_default_memtier_config(threads=1, clients=1, requests=None, test_time=2)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    memtier_ok = benchmark.run()
+
+    # Loader rejects the file -> memtier exits non-zero before the run starts.
+    debugPrintMemtierOnError(config, env)
+    env.assertTrue(memtier_ok == False,
+                   message="memtier should fail fast on an all-unparseable "
+                           "monitor file, not hang in fill_pipeline")
+
+    with open("{0}/mb.stderr".format(config.results_dir)) as stderr:
+        stderr_content = stderr.read()
+        env.assertTrue(
+            "no valid commands found" in stderr_content,
+            message="expected a clean 'no valid commands found' error; got: {}".format(
+                stderr_content[-500:]))
+        # The hang signature was millions of these lines; the loader must no
+        # longer defer the failure to the per-request path.
+        env.assertFalse("skipping malformed monitor command" in stderr_content)
+
+
 def test_monitor_input_nul_byte_in_prefix_not_truncated(env):
     """
     Regression test for NUL-truncation in load_from_file (review finding #30, bug F1).
