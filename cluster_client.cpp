@@ -231,6 +231,13 @@ shard_connection *cluster_client::create_shard_connection(abstract_protocol *abs
     shard_connection *sc = new shard_connection(m_connections.size(), this, m_config, m_event_base, abs_protocol);
     assert(sc != NULL);
 
+    // The shard_connection ctor clones abs_protocol, and clone() resets runtime
+    // flags to defaults, so re-apply the arbitrary-command miss-tracking flag
+    // here. Without this, per-shard connections discovered after setup_client()
+    // never track misses and cluster-mode miss accounting is silently a no-op
+    // (issue #476).
+    apply_arbitrary_tracking_flags(sc->get_protocol());
+
     m_connections.push_back(sc);
 
     // create key index pool

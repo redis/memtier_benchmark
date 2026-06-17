@@ -103,6 +103,22 @@ protected:
     // Only meaningful when create_mget_request() returns false; undefined otherwise.
     bool m_mget_defer;
 
+    // True when at least one configured arbitrary command needs per-element
+    // miss tracking (ArrayPerElementNulls reply shape). Computed once in
+    // setup_client and applied to every shard connection's protocol via
+    // apply_arbitrary_tracking_flags() -- including connections created
+    // dynamically after setup (cluster-slots discovery / reconnect), whose
+    // freshly cloned protocols would otherwise start with the flag cleared.
+    bool m_arbitrary_needs_elem_tracking;
+
+    // Apply the resolved arbitrary-command tracking flags to a single protocol.
+    // Currently a single flag (set_track_elem_misses); plural name is
+    // deliberate so additional per-protocol arbitrary-command setup can be
+    // folded in here without touching the call sites. Idempotent and safe to
+    // call on any connection's protocol at or after setup_client(); a no-op
+    // until setup_client() has computed the flag.
+    void apply_arbitrary_tracking_flags(abstract_protocol *protocol);
+
 public:
     client(client_group *group);
     client(struct event_base *event_base, benchmark_config *config, abstract_protocol *protocol,
