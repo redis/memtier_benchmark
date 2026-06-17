@@ -34,6 +34,7 @@
 #endif
 
 #include "run_stats.h"
+#include "prometheus_metrics.h" // prom::hdr_add_positive_delta (pure layer, always linked)
 
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
@@ -127,7 +128,8 @@ inline timeval timeval_factorial_average(timeval a, timeval b, unsigned int weig
     return (tv);
 }
 
-run_stats::run_stats(benchmark_config *config) : m_config(config), m_interrupted(false), m_totals(), m_cur_stats(0)
+run_stats::run_stats(benchmark_config *config) :
+        m_config(config), m_interrupted(false), m_totals(), m_cur_stats(0), m_prom_last_copied_total(0)
 {
     memset(&m_start_time, 0, sizeof(m_start_time));
     memset(&m_end_time, 0, sizeof(m_end_time));
@@ -198,6 +200,47 @@ void run_stats::copy_inst_histogram(hdr_histogram *target) const
 {
     pthread_mutex_lock(&m_inst_histogram_mutex.mtx);
     hdr_add(target, inst_m_totals_latency_histogram);
+    pthread_mutex_unlock(&m_inst_histogram_mutex.mtx);
+}
+
+void run_stats::copy_inst_histogram_if_changed(hdr_histogram *target)
+{ // Main thread, 1 Hz. Workers bump counts with hdr_record_value_capped_atomic
+    // (lock-free); this read under the copy/reset mutex is the same benign-race
+    // class as copy_inst_histogram (suppressions, tsan_suppressions.txt).
+    //
+    // The inst-totals histogram is reset once per worker-second in
+    // summarize_current_second(). When an exporter tick and that reset drift so
+    // two ticks land within one worker-second, adding the whole histogram on each
+    // tick (the previous behaviour) re-counted samples already folded on the
+    // earlier tick, inflating memtier_latency_seconds buckets and _count. We
+    // instead add only the positive per-bucket delta versus m_prom_last_inst (the
+    // snapshot from the previous gated copy), so every sample is folded at most
+    // once.
+    //
+    // A histogram frozen since the previous gated copy (client stopped completing
+    // ops: cur == last total) is skipped so a dead connection's last partial
+    // second is not re-added each tick. In the rare window where a reset is
+    // masked by enough new samples that total_count still rises, some post-reset
+    // samples may be dropped — an undercount, consistent with the metric's
+    // documented non-authoritative contract, and never a double-count.
+    pthread_mutex_lock(&m_inst_histogram_mutex.mtx);
+    hdr_histogram *inst = inst_m_totals_latency_histogram;
+    hdr_histogram *last = m_prom_last_inst;
+    const int64_t cur = hdr_total_count(inst);
+    if (cur != m_prom_last_copied_total) {
+        if (cur < m_prom_last_copied_total) {
+            // inst was reset since the last copy: all current samples are new.
+            hdr_add(target, inst);
+        } else {
+            // Monotonic growth (no reset, or a reset masked by net growth): add
+            // only the positive per-bucket increment so nothing is re-counted.
+            prom::hdr_add_positive_delta(target, inst, last);
+        }
+        // Snapshot current inst as the baseline for the next delta.
+        hdr_reset(last);
+        hdr_add(last, inst);
+        m_prom_last_copied_total = cur;
+    }
     pthread_mutex_unlock(&m_inst_histogram_mutex.mtx);
 }
 
@@ -414,6 +457,16 @@ unsigned long int run_stats::get_duration_usec(void)
 unsigned long int run_stats::get_total_bytes(void)
 {
     return m_totals.m_bytes_rx + m_totals.m_bytes_tx;
+}
+
+unsigned long int run_stats::get_total_bytes_rx(void)
+{
+    return m_totals.m_bytes_rx;
+}
+
+unsigned long int run_stats::get_total_bytes_tx(void)
+{
+    return m_totals.m_bytes_tx;
 }
 
 unsigned long int run_stats::get_total_ops(void)

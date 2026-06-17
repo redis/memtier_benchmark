@@ -195,6 +195,18 @@ protected:
     // this mutex serializes hdr_reset and hdr_add from the main thread.
     reinit_mutex_t m_inst_histogram_mutex;
 
+    // Last inst-totals histogram total_count copied by the Prometheus gated
+    // aggregation (copy_inst_histogram_if_changed). Main-thread-only; plain
+    // int64_t so run_stats stays copyable when collected into vectors post-join.
+    int64_t m_prom_last_copied_total;
+
+    // Per-bucket snapshot of inst_m_totals_latency_histogram as of the previous
+    // gated copy, so copy_inst_histogram_if_changed adds only the positive
+    // per-bucket delta (each latency sample folded at most once) instead of the
+    // whole histogram. safe_hdr_histogram is deep-copyable, so run_stats stays
+    // copyable when collected into vectors post-join. Main-thread-only.
+    safe_hdr_histogram m_prom_last_inst;
+
     // Cumulative hits/misses bookkeeping for arbitrary commands. Indexed by
     // arbitrary command index. Per-key vectors are sized to the spec-resolved
     // key count for that command (or 1 when the command has no spec key
@@ -314,6 +326,15 @@ public:
     // Safely copy instantaneous total latency histogram into target under mutex.
     // Use this instead of a raw pointer getter to avoid data races with worker threads.
     void copy_inst_histogram(hdr_histogram *target) const;
+
+    // Like copy_inst_histogram, but only folds the per-bucket increment since
+    // the previous gated copy (via prom::hdr_add_positive_delta), so each latency
+    // sample is added to target at most once even when two 1 Hz exporter ticks
+    // land within one worker-second. Skips frozen histograms (clients that
+    // stopped completing ops) so a dead connection's last partial second is not
+    // re-added on every tick. Main-thread-only; reads total_count and updates
+    // m_prom_last_inst / m_prom_last_copied_total under m_inst_histogram_mutex.
+    void copy_inst_histogram_if_changed(hdr_histogram *target);
     void save_csv_one_sec_cluster(FILE *f);
     void save_csv_set_get_commands(FILE *f, bool cluster_mode);
     void save_csv_arbitrary_commands_one_sec(FILE *f, arbitrary_command_list &command_list,
@@ -362,6 +383,11 @@ public:
     unsigned int get_duration(void);
     unsigned long int get_duration_usec(void);
     unsigned long int get_total_bytes(void);
+    // rx/tx split of get_total_bytes(); same benign-race pattern. The Prometheus
+    // exporter needs the split (memtier_received_bytes_total /
+    // memtier_sent_bytes_total); never source bytes from summarize().
+    unsigned long int get_total_bytes_rx(void);
+    unsigned long int get_total_bytes_tx(void);
     unsigned long int get_total_ops(void);
     double get_total_latency(void);
     unsigned long int get_total_connection_errors(void);

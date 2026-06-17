@@ -232,6 +232,124 @@ docker-compose -f docker-compose.statsd.yml up -d
                                           └─────────────────────┘
 ```
 
+## Prometheus /metrics Exporter
+
+In addition to the StatsD/Graphite push transport above, memtier_benchmark can
+expose the same live metrics over a Prometheus `/metrics` HTTP endpoint (pull
+model). The exporter is compiled in by default and enabled at runtime by
+`--prometheus-port`.
+
+```bash
+# Fixed port (loopback by default):
+./memtier_benchmark -s redis-server --test-time=60 --prometheus-port=8080
+curl http://127.0.0.1:8080/metrics
+
+# Ephemeral port — the bound URL is announced on stdout as a single line:
+./memtier_benchmark -s redis-server --test-time=60 --prometheus-port=0
+# Prometheus exporter listening on http://127.0.0.1:43217/metrics
+```
+
+### Command-Line Options (Prometheus)
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--prometheus-port=PORT` | *(disabled)* | TCP port for `/metrics`. `0` selects an ephemeral port. Setting it enables the exporter. |
+| `--prometheus-bind-addr=ADDR` | `127.0.0.1` | Numeric IPv4/IPv6 address to bind to. Hostnames are not supported. A non-loopback address prints a one-shot warning. |
+| `--prometheus-run-label=KEY=VALUE` | *(none)* | Constant label applied to every sample; repeatable, max 16. |
+| `--prometheus-latency-buckets=LIST` | *(26 built-in)* | Comma-separated, strictly ascending latency bucket bounds in seconds. Bounds within ~1% of each other collapse to one HDR slot and are rejected. |
+
+### Ephemeral-port contract
+
+With `--prometheus-port=0` the kernel assigns a free port; memtier prints the
+fully-resolved URL exactly once on **stdout**:
+
+```
+Prometheus exporter listening on http://127.0.0.1:43217/metrics
+```
+
+IPv6 binds are bracketed (`http://[::1]:43217/metrics`). Automation should parse
+this line rather than guess a port. The endpoint serves `GET /metrics` only;
+other methods return `501`, unknown paths return a fixed `404` body, and the
+response carries `Content-Type: text/plain; version=0.0.4; charset=utf-8`.
+
+### Metric Reference and StatsD Mapping
+
+The exporter publishes the **same one-producer snapshot** as StatsD, reshaped to
+Prometheus conventions (cumulative counters, native histogram). Notable
+differences from the StatsD names above:
+
+| Prometheus | Type | StatsD equivalent | Notes |
+|---|---|---|---|
+| `memtier_ops_total` | counter | `ops_sec` (rate) | Prometheus exports the cumulative total; rate is derived at query time. |
+| `memtier_sent_bytes_total` / `memtier_received_bytes_total` | counter | `bytes_sec` | Cumulative bytes since process start. |
+| `memtier_hits_total` / `memtier_misses_total` | counter | hits/misses | |
+| `memtier_errors_total` | counter | — | Errors after retries are exhausted. |
+| `memtier_connection_errors_total` | counter | `connection_errors` | Accumulated across runs (StatsD reports the raw per-run value). |
+| `memtier_retry_attempts_total` / `memtier_retried_ops_total` | counter | — | Nonzero only with `--retry-on-error`. |
+| `memtier_connections` / `memtier_threads` | gauge | `connections` | |
+| `memtier_run` / `memtier_configured_runs` | gauge | — | Current run (1-based; 0 before the first run) and `--run-count`. |
+| `memtier_config_test_time_seconds` | gauge | — | Configured `--test-time` (0 when bounded by `--requests`). |
+| `memtier_latency_seconds` | histogram | `latency_ms` family | Seconds, not milliseconds; see the accuracy notes below. |
+| `memtier_build_info{version,git_sha}` | gauge=1 | — | Build identity only — no config labels. |
+| `memtier_start_time_seconds` | gauge | — | Process start, Unix seconds. |
+| `memtier_exporter_renders_total` | counter | — | Number of times the body was rendered (scrapes that missed the 1 s render cache). |
+| `memtier_exporter_snapshot_age_seconds` | gauge | — | Seconds since the benchmark loop last published a snapshot. |
+
+Counters accumulate across runs and connection restarts, so a multi-run session
+(`--run-count > 1`) produces monotonically non-decreasing series instead of the
+per-run reset that a naive exporter would emit.
+
+### Latency accuracy (error model)
+
+`memtier_latency_seconds` is built from **1 Hz snapshots** of each connection's
+in-progress second of HDR-recorded latencies. Treat it as an operational signal,
+not the authoritative result:
+
+- **Phase-dependent capture (~50% in steady state).** Only the portion of each
+  connection's per-second histogram that is complete at snapshot time is folded
+  in, so in steady state roughly half of all operations are represented.
+  `memtier_latency_seconds_count` is therefore **not** comparable to
+  `memtier_ops_total` and must not be used to compute a hit fraction.
+- **Stall dedup + residuals.** A snapshot whose source histogram has not changed
+  since the previous tick is skipped, so a stalled server (every in-flight op
+  frozen) does **not** keep inflating `_count`; once traffic resumes the series
+  grows again. A small residual at the tail of a run can be lost this way.
+- **Run-tail loss.** The final fraction of a second at run end may not be
+  captured by the last tick.
+- **HDR quantization (≤1%).** Bucket placement carries up to 1% HDR
+  quantization; the `le` bound rendered is the user-supplied (µs-quantized)
+  bound, not the internal slot edge.
+
+For exact percentiles and totals, use the **end-of-run output** (or the full
+latency spectrum, see the README). The exporter is for live observation.
+
+### Security / threat model
+
+The `/metrics` body is designed to leak **zero** connection or configuration
+identity. It contains no server address or port, no password or
+`--authenticate` credentials, no request URI, and no filesystem paths (including
+TLS cert/key/CA paths). Prometheus's own `instance` label covers target
+identity, so the exporter deliberately omits any `server`/`host`/`target` label.
+Error responses (`404`/`503`) are fixed strings that echo nothing from the
+request. The exporter binds **loopback by default**; binding a non-loopback
+address is allowed but warned, and exposing `/metrics` beyond a trusted network
+is the operator's responsibility (there is no authentication on the endpoint).
+HTTP hardening rejects non-GET methods, oversized headers, and unknown paths.
+
+### Mode interactions
+
+- **`--cluster-mode`** is supported. Counters are cluster-wide totals summed
+  across all shard connections; the exporter binds its own TCP socket
+  independently of the benchmark transport. (MOVED/ASK redirection counters are
+  not yet exported.)
+- **`--verify-only`** performs no benchmark run, so the exporter serves only the
+  constructor's zero snapshot (`memtier_run 0`, all counters 0, with
+  `memtier_exporter_snapshot_age_seconds` growing) for the whole verification
+  window. `--verify-only` requires `--data-import` (it implies `--data-verify`).
+- **`--unix-socket`** does not interact with the exporter: the benchmark talks to
+  the target over the Unix socket while the exporter still binds its own TCP
+  port.
+
 ## Using with External StatsD/Graphite
 
 If you have an existing StatsD-compatible metrics infrastructure:

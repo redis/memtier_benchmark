@@ -153,6 +153,44 @@ PKG_CHECK_MODULES(LIBEVENT_PTHREADS,
     AC_SUBST(LIBEVENT_PTHREADS_CFLAGS) AC_SUBST(LIBEVENT_PTHREADS_LIBS)
 )
 
+# Prometheus exporter (evhttp) is optional, default ON. PKG check = non-fatal hygiene;
+# the LINK test is the real gate (bare AC_CHECK_HEADERS mis-detects on keg-only Homebrew
+# arm64). Link test deliberately uses the NEWEST evhttp symbol the exporter calls
+# (>= 2.1.1) so old libevent fails here, loudly.
+AC_ARG_ENABLE([prometheus],
+  [AS_HELP_STRING([--disable-prometheus],
+                  [Disable the Prometheus /metrics HTTP exporter])])
+AS_IF([test "x$enable_prometheus" != "xno"], [
+       PKG_CHECK_MODULES([LIBEVENT_EXTRA], [libevent_extra >= 2.1.1],
+                         [AC_SUBST(LIBEVENT_EXTRA_CFLAGS) AC_SUBST(LIBEVENT_EXTRA_LIBS)],
+                         [LIBEVENT_EXTRA_CFLAGS="" LIBEVENT_EXTRA_LIBS=""])
+       memtier_saved_CFLAGS="$CFLAGS"; memtier_saved_LIBS="$LIBS"
+       CFLAGS="$CFLAGS $LIBEVENT_CFLAGS $LIBEVENT_EXTRA_CFLAGS"
+       LIBS="$LIBEVENT_EXTRA_LIBS $LIBEVENT_LIBS $LIBS"
+       AC_MSG_CHECKING([whether libevent evhttp is usable (evhttp_request_set_on_complete_cb)])
+       AC_LINK_IFELSE(
+         [AC_LANG_PROGRAM([[#include <event2/event.h>
+#include <event2/http.h>
+static void mt_done_cb(struct evhttp_request *r, void *a) { (void)r; (void)a; }]],
+                          [[struct event_base *b = event_base_new();
+                            struct evhttp *h = evhttp_new(b);
+                            evhttp_request_set_on_complete_cb((struct evhttp_request *)0,
+                                                              mt_done_cb, (void *)0);
+                            evhttp_free(h); event_base_free(b);]])],
+         [AC_MSG_RESULT([yes])
+          AC_DEFINE([HAVE_EVHTTP], [1], [define to enable the Prometheus /metrics exporter])],
+         [AC_MSG_RESULT([no])
+          AC_MSG_ERROR([libevent evhttp >= 2.1.1 is required for the Prometheus exporter.
+Install libevent development packages (libevent-dev / libevent-devel),
+or configure with --disable-prometheus.])])
+       CFLAGS="$memtier_saved_CFLAGS"; LIBS="$memtier_saved_LIBS"
+       ], [
+       LIBEVENT_EXTRA_CFLAGS=""
+       LIBEVENT_EXTRA_LIBS=""
+       AC_SUBST(LIBEVENT_EXTRA_CFLAGS)
+       AC_SUBST(LIBEVENT_EXTRA_LIBS)
+       ])
+
 # bash completion
 PKG_CHECK_MODULES([BASH_COMPLETION], [bash-completion >= 2.0],
     [BASH_COMPLETION_DIR="`pkg-config --variable=completionsdir bash-completion`"],

@@ -1317,6 +1317,28 @@ unsigned long int client_group::get_total_bytes(void)
     return total_bytes;
 }
 
+unsigned long int client_group::get_total_bytes_rx(void)
+{
+    unsigned long int total_bytes_rx = 0;
+    unsigned int count = active_client_count();
+    for (unsigned int i = 0; i < count; i++) {
+        total_bytes_rx += m_clients[i]->get_stats()->get_total_bytes_rx();
+    }
+
+    return total_bytes_rx;
+}
+
+unsigned long int client_group::get_total_bytes_tx(void)
+{
+    unsigned long int total_bytes_tx = 0;
+    unsigned int count = active_client_count();
+    for (unsigned int i = 0; i < count; i++) {
+        total_bytes_tx += m_clients[i]->get_stats()->get_total_bytes_tx();
+    }
+
+    return total_bytes_tx;
+}
+
 unsigned long int client_group::get_total_ops(void)
 {
     unsigned long int total_ops = 0;
@@ -1435,6 +1457,14 @@ void client_group::aggregate_inst_histogram(hdr_histogram *target)
     for (unsigned int i = 0; i < m_clients.size(); i++) {
         if (!m_clients[i]->get_stats()->has_started()) continue;
         m_clients[i]->get_stats()->copy_inst_histogram(target);
+    }
+}
+
+void client_group::aggregate_inst_histogram_if_changed(hdr_histogram *target)
+{
+    for (unsigned int i = 0; i < m_clients.size(); i++) {
+        if (!m_clients[i]->get_stats()->has_started()) continue;
+        m_clients[i]->get_stats()->copy_inst_histogram_if_changed(target);
     }
 }
 

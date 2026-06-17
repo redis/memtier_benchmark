@@ -10,6 +10,7 @@ configure~
 compile
 depcomp
 install-sh
+test-driver
 ltmain.sh
 m4
 Makefile.in
@@ -26,6 +27,13 @@ version.h
 *.DS_Store
 .vscode/*
 .idea/*
+
+# Sibling VPATH build dirs used by the local build/test gate (§7.7)
+/build-prom/
+/build-noprom/
+/build-asan/
+/build-tsan/
+/.venv/
 
 # tls helper related files
 tests/tls/*
@@ -55,6 +63,13 @@ appendonlydir/
 *.conf
 
 tests/.env/
+
+# Unit-test harness (tests/unit/) build + automake check-driver artifacts
+/prometheus_metrics_test
+tests/unit/prometheus_metrics_test
+*.log
+*.trs
+tests/unit/.dirstamp
 
 # libFuzzer fuzz harness build artifacts and crash dumps
 /split_command_to_args_fuzz
