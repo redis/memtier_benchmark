@@ -2348,7 +2348,9 @@ void run_stats::print(FILE *out, benchmark_config *config, const char *header /*
                 double miss_rate = (double) agg.total_misses / (double) total;
                 if (miss_rate > miss_threshold) {
                     // EXEC nulls are optimistic-lock aborts, not cache misses.
-                    const bool abort = is_abort_command_type(agg.command_type);
+                    // Gated on --transaction to match the Aborts column / JSON /
+                    // live tail: without the flag, output keeps "miss" wording.
+                    const bool abort = config->transaction && is_abort_command_type(agg.command_type);
                     fprintf(stderr, "warning: %s %s rate %.2f%% above target %.2f%% (%llu %s / %llu ops)\n",
                             agg.command_type.c_str(), abort ? "abort" : "miss", miss_rate * 100.0,
                             miss_threshold * 100.0, agg.total_misses, abort ? "aborts" : "misses", total);
@@ -2365,7 +2367,9 @@ void run_stats::print(FILE *out, benchmark_config *config, const char *header /*
                                                       ? config->arbitrary_commands->at(i).command_type
                                                       : std::string("unknown");
                     // EXEC nulls are optimistic-lock aborts, not cache misses.
-                    const bool abort = is_abort_command_type(cmd_type);
+                    // Gated on --transaction to match the Aborts column / JSON /
+                    // live tail: without the flag, output keeps "miss" wording.
+                    const bool abort = config->transaction && is_abort_command_type(cmd_type);
                     fprintf(stderr, "warning: %s %s rate %.2f%% above target %.2f%% (%llu %s / %llu ops)\n",
                             cmd_type.c_str(), abort ? "abort" : "miss", miss_rate * 100.0, miss_threshold * 100.0,
                             am.total_misses, abort ? "aborts" : "misses", total);
