@@ -277,6 +277,10 @@ public:
                                const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
     void print_missess_sec_column(output_table &table,
                                   const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
+    // Aborts/sec column, shown only under --transaction. Reports the EXEC
+    // optimistic-lock abort rate (the abort-semantics subset of misses).
+    void print_aborts_sec_column(output_table &table,
+                                 const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
     void print_moved_sec_column(output_table &table,
                                 const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
     void print_ask_sec_column(output_table &table,
@@ -306,6 +310,19 @@ public:
     // for live progress display.
     unsigned long int get_total_hits(void);
     unsigned long int get_total_misses(void);
+
+    // Aggregate hits/misses across arbitrary (--command) miss-trackable commands.
+    // Sums only the per-command scalar totals in m_arbitrary_misses[] (assigned
+    // once in setup_arbitrary_commands), never the per-key vectors which the
+    // worker grow-resizes; safe to sample off-worker at 1 Hz like get_total_hits.
+    // unsigned long long because the source fields are 64-bit (run_stats.h
+    // arbitrary_misses_total) and can exceed 32 bits on long runs.
+    unsigned long long get_total_arbitrary_hits(void);
+    unsigned long long get_total_arbitrary_misses(void);
+    // Subset of arbitrary misses that are transaction aborts (EXEC null reply).
+    // Display-only reinterpretation of the miss counter; see is_abort_command_type.
+    unsigned long long get_total_arbitrary_aborts(void);
+    static bool is_abort_command_type(const std::string &command_type);
 
     // Returns true if set_start_time() was called, indicating the client
     // produced (or was ready to produce) meaningful stats data.
