@@ -473,10 +473,13 @@ bool client::create_arbitrary_request(unsigned int command_index, struct timeval
         } else if (arg->type == key_type) {
             // --transaction: reuse one key for every __key__ in the rotation so
             // the whole WATCH/MULTI/EXEC unit resolves to a single key/slot.
-            // Only when keys are generated (not on the data-import path, which
-            // streams a distinct key per command). cluster_client overrides this
-            // method, so this branch only runs for the non-cluster path.
-            const bool txn_reuse = m_config->transaction && (!m_config->data_import || m_config->generate_keys);
+            // Non-cluster path only: in --cluster-mode, cluster_client drives the
+            // reuse by pushing the rotation key onto m_key_index_pools and relies
+            // on this method draining it via get_key_for_conn, so the fast path
+            // here would leave the pool un-drained. Also skip the data-import
+            // path, which streams a distinct key per command.
+            const bool txn_reuse =
+                m_config->transaction && !m_config->cluster_mode && (!m_config->data_import || m_config->generate_keys);
             if (txn_reuse && m_txn_rotation_key_valid && m_txn_rotation_key_seq == m_arbitrary_command_rotation_seq) {
                 // Same rotation as the cached key: regenerate the identical key
                 // string without advancing the per-iter key cursor.
