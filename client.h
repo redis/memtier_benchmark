@@ -305,6 +305,7 @@ public:
     unsigned long int get_total_misses(void);
     unsigned long long get_total_arbitrary_hits(void);
     unsigned long long get_total_arbitrary_misses(void);
+    unsigned long long get_total_arbitrary_aborts(void);
     unsigned long int get_total_retry_attempts(void);
     unsigned long int get_total_retried_ops(void);
     unsigned long int get_total_errors(void);

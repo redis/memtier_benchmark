@@ -510,6 +510,32 @@ unsigned long long run_stats::get_total_arbitrary_misses(void)
     return t;
 }
 
+// A command whose null/aborted reply should be reported as a transaction
+// "abort" rather than a cache "miss". Today that is EXEC: in a WATCH/MULTI/EXEC
+// unit, EXEC returns a null array iff the optimistic lock failed (a watched key
+// changed), which is an abort, not a missing key. This is a display-only
+// reinterpretation: the count still lives in the per-command miss counter
+// (m_arbitrary_misses[i].total_misses), so global miss totals are unchanged.
+bool run_stats::is_abort_command_type(const std::string &command_type)
+{
+    return command_type == "EXEC";
+}
+
+// Sum of misses attributed to abort-semantics commands (EXEC). Reuses the miss
+// counter; selection is by command_type so no separate tracking is needed.
+unsigned long long run_stats::get_total_arbitrary_aborts(void)
+{
+    unsigned long long t = 0;
+    if (m_config == NULL || !m_config->arbitrary_commands->is_defined()) return 0;
+    for (size_t i = 0; i < m_arbitrary_misses.size(); ++i) {
+        if (i < m_config->arbitrary_commands->size() &&
+            is_abort_command_type(m_config->arbitrary_commands->at(i).command_type)) {
+            t += m_arbitrary_misses[i].total_misses;
+        }
+    }
+    return t;
+}
+
 #define AVERAGE(total, count) ((unsigned int) ((count) > 0 ? (total) / (count) : 0))
 #define USEC_FORMAT(value) (value) / 1000000, (value) % 1000000
 
@@ -1195,7 +1221,8 @@ void result_print_to_json(json_handler *jsonhandler, const char *type, double op
                           double moved, double ask, double kbs, double kbs_rx, double kbs_tx, double latency,
                           long m_total_latency, long ops, double connection_errors_sec, long connection_errors,
                           std::vector<double> quantile_list, struct hdr_histogram *latency_histogram,
-                          std::vector<unsigned int> timestamps, std::vector<one_sec_cmd_stats> timeserie_stats)
+                          std::vector<unsigned int> timestamps, std::vector<one_sec_cmd_stats> timeserie_stats,
+                          double aborts = -1.0)
 {
     if (jsonhandler != NULL) { // Added for double verification in case someone accidently send NULL.
         jsonhandler->open_nesting(type);
@@ -1203,6 +1230,10 @@ void result_print_to_json(json_handler *jsonhandler, const char *type, double op
         jsonhandler->write_obj("Ops/sec", "%.2f", ops_sec);
         jsonhandler->write_obj("Hits/sec", "%.2f", hits);
         jsonhandler->write_obj("Misses/sec", "%.2f", miss);
+
+        // Only emitted under --transaction (callers pass aborts >= 0). Aborts are
+        // the EXEC optimistic-lock subset already included in Misses/sec.
+        if (aborts >= 0) jsonhandler->write_obj("Aborts/sec", "%.2f", aborts);
 
         if (moved >= 0) jsonhandler->write_obj("MOVED/sec", "%.2f", moved);
 
@@ -1540,6 +1571,47 @@ void run_stats::print_missess_sec_column(output_table &table,
     table.add_column(column);
 }
 
+void run_stats::print_aborts_sec_column(output_table &table,
+                                        const std::vector<aggregated_command_type_stats> *aggregated)
+{
+    table_el el;
+    table_column column(12);
+
+    column.elements.push_back(*el.init_str("%12s ", "Aborts/sec"));
+    column.elements.push_back(*el.init_str("%s", "-------------"));
+
+    // Only abort-semantics commands (EXEC) contribute; every other row shows
+    // 0.00. The count is the same value carried in that command's Misses/sec
+    // (display-only reinterpretation), so Aborts is a labeled subset of Misses.
+    unsigned long int test_duration_usec = ts_diff(m_start_time, m_end_time);
+    unsigned long long total_aborts = 0;
+    if (aggregated != nullptr) {
+        for (const auto &agg : *aggregated) {
+            unsigned long long aborts = is_abort_command_type(agg.command_type) ? agg.total_misses : 0;
+            double aborts_sec =
+                test_duration_usec > 0 ? (double) aborts / (double) test_duration_usec * 1000000.0 : 0.0;
+            column.elements.push_back(*el.init_double("%12.2f ", aborts_sec));
+            total_aborts += aborts;
+        }
+    } else {
+        for (size_t i = 0; i < m_totals.m_ar_commands.size(); i++) {
+            bool is_abort = m_config != NULL && i < m_config->arbitrary_commands->size() &&
+                            is_abort_command_type(m_config->arbitrary_commands->at(i).command_type);
+            unsigned long long aborts =
+                (is_abort && i < m_arbitrary_misses.size()) ? m_arbitrary_misses[i].total_misses : 0;
+            double aborts_sec =
+                test_duration_usec > 0 ? (double) aborts / (double) test_duration_usec * 1000000.0 : 0.0;
+            column.elements.push_back(*el.init_double("%12.2f ", aborts_sec));
+            total_aborts += aborts;
+        }
+    }
+    double total_aborts_sec =
+        test_duration_usec > 0 ? (double) total_aborts / (double) test_duration_usec * 1000000.0 : 0.0;
+    column.elements.push_back(*el.init_double("%12.2f ", total_aborts_sec));
+
+    table.add_column(column);
+}
+
 void run_stats::print_moved_sec_column(output_table &table,
                                        const std::vector<aggregated_command_type_stats> *aggregated)
 {
@@ -1839,7 +1911,9 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
                                      avg_latency, agg.stats.m_total_latency, agg.stats.m_ops,
                                      0.0, // connection_errors_sec (not tracked per command)
                                      0,   // connection_errors (not tracked per command)
-                                     quantiles_list, agg.latency_hist, timestamps, agg.per_second_stats);
+                                     quantiles_list, agg.latency_hist, timestamps, agg.per_second_stats,
+                                     (m_config->transaction && is_abort_command_type(agg.command_type)) ? misses_sec
+                                                                                                        : -1.0);
             }
         } else {
             // Original per-command behavior
@@ -1858,16 +1932,17 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
                     misses_sec = (double) m_arbitrary_misses[i].total_misses / (double) test_duration_usec * 1000000.0;
                 }
 
-                result_print_to_json(jsonhandler, command_name.c_str(), m_totals.m_ar_commands[i].m_ops_sec, hits_sec,
-                                     misses_sec, cluster_mode ? m_totals.m_ar_commands[i].m_moved_sec : -1,
-                                     cluster_mode ? m_totals.m_ar_commands[i].m_ask_sec : -1,
-                                     m_totals.m_ar_commands[i].m_bytes_sec, m_totals.m_ar_commands[i].m_bytes_sec_rx,
-                                     m_totals.m_ar_commands[i].m_bytes_sec_tx, m_totals.m_ar_commands[i].m_latency,
-                                     m_totals.m_ar_commands[i].m_total_latency, m_totals.m_ar_commands[i].m_ops,
-                                     0.0, // connection_errors_sec (not tracked per command)
-                                     0,   // connection_errors (not tracked per command)
-                                     quantiles_list, arbitrary_command_latency_histogram, timestamps,
-                                     arbitrary_command_stats);
+                result_print_to_json(
+                    jsonhandler, command_name.c_str(), m_totals.m_ar_commands[i].m_ops_sec, hits_sec, misses_sec,
+                    cluster_mode ? m_totals.m_ar_commands[i].m_moved_sec : -1,
+                    cluster_mode ? m_totals.m_ar_commands[i].m_ask_sec : -1, m_totals.m_ar_commands[i].m_bytes_sec,
+                    m_totals.m_ar_commands[i].m_bytes_sec_rx, m_totals.m_ar_commands[i].m_bytes_sec_tx,
+                    m_totals.m_ar_commands[i].m_latency, m_totals.m_ar_commands[i].m_total_latency,
+                    m_totals.m_ar_commands[i].m_ops,
+                    0.0, // connection_errors_sec (not tracked per command)
+                    0,   // connection_errors (not tracked per command)
+                    quantiles_list, arbitrary_command_latency_histogram, timestamps, arbitrary_command_stats,
+                    (m_config->transaction && is_abort_command_type(command_list[i].command_type)) ? misses_sec : -1.0);
             }
         }
 
@@ -1952,12 +2027,17 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
             totals_misses_sec = (double) all_misses / (double) dur_usec * 1000000.0;
         }
     }
+    double totals_aborts_sec = -1.0;
+    if (m_config->transaction && print_arbitrary_commands_results()) {
+        unsigned long int dur_usec = ts_diff(m_start_time, m_end_time);
+        totals_aborts_sec = dur_usec > 0 ? (double) get_total_arbitrary_aborts() / (double) dur_usec * 1000000.0 : 0.0;
+    }
     result_print_to_json(jsonhandler, "Totals", m_totals.m_ops_sec, totals_hits_sec, totals_misses_sec,
                          cluster_mode ? m_totals.m_moved_sec : -1, cluster_mode ? m_totals.m_ask_sec : -1,
                          m_totals.m_bytes_sec, m_totals.m_bytes_sec_rx, m_totals.m_bytes_sec_tx, m_totals.m_latency,
                          m_totals.m_total_latency, m_totals.m_ops, m_totals.m_connection_errors_sec,
                          m_totals.m_connection_errors, quantiles_list, m_totals.latency_histogram, timestamps,
-                         total_stats);
+                         total_stats, totals_aborts_sec);
 
     // -----------------------------------------------------------------
     // Read-preference observability (Step 2f).
@@ -2225,6 +2305,12 @@ void run_stats::print(FILE *out, benchmark_config *config, const char *header /*
     // Misses/sec column
     print_missess_sec_column(table, aggregated_ptr);
 
+    // Aborts/sec column (transaction mode only): EXEC optimistic-lock aborts,
+    // broken out from the generic Misses column.
+    if (config->transaction) {
+        print_aborts_sec_column(table, aggregated_ptr);
+    }
+
     // Moved & ASK column (relevant only for cluster mode)
     if (config->cluster_mode) {
         print_moved_sec_column(table, aggregated_ptr);
@@ -2261,9 +2347,11 @@ void run_stats::print(FILE *out, benchmark_config *config, const char *header /*
                 if (total == 0) continue;
                 double miss_rate = (double) agg.total_misses / (double) total;
                 if (miss_rate > miss_threshold) {
-                    fprintf(stderr, "warning: %s miss rate %.2f%% above target %.2f%% (%llu misses / %llu ops)\n",
-                            agg.command_type.c_str(), miss_rate * 100.0, miss_threshold * 100.0, agg.total_misses,
-                            total);
+                    // EXEC nulls are optimistic-lock aborts, not cache misses.
+                    const bool abort = is_abort_command_type(agg.command_type);
+                    fprintf(stderr, "warning: %s %s rate %.2f%% above target %.2f%% (%llu %s / %llu ops)\n",
+                            agg.command_type.c_str(), abort ? "abort" : "miss", miss_rate * 100.0,
+                            miss_threshold * 100.0, agg.total_misses, abort ? "aborts" : "misses", total);
                 }
             }
         } else {
@@ -2273,11 +2361,14 @@ void run_stats::print(FILE *out, benchmark_config *config, const char *header /*
                 if (total == 0) continue;
                 double miss_rate = (double) am.total_misses / (double) total;
                 if (miss_rate > miss_threshold) {
-                    const char *cmd_name = i < config->arbitrary_commands->size()
-                                               ? config->arbitrary_commands->at(i).command_type.c_str()
-                                               : "unknown";
-                    fprintf(stderr, "warning: %s miss rate %.2f%% above target %.2f%% (%llu misses / %llu ops)\n",
-                            cmd_name, miss_rate * 100.0, miss_threshold * 100.0, am.total_misses, total);
+                    const std::string &cmd_type = i < config->arbitrary_commands->size()
+                                                      ? config->arbitrary_commands->at(i).command_type
+                                                      : std::string("unknown");
+                    // EXEC nulls are optimistic-lock aborts, not cache misses.
+                    const bool abort = is_abort_command_type(cmd_type);
+                    fprintf(stderr, "warning: %s %s rate %.2f%% above target %.2f%% (%llu %s / %llu ops)\n",
+                            cmd_type.c_str(), abort ? "abort" : "miss", miss_rate * 100.0, miss_threshold * 100.0,
+                            am.total_misses, abort ? "aborts" : "misses", total);
                 }
             }
         }

@@ -54,6 +54,14 @@ def _read_stderr(run_config):
         return f.read()
 
 
+def _read_stdout(run_config):
+    path = "{0}/mb.stdout".format(run_config.results_dir)
+    if not os.path.isfile(path):
+        return ""
+    with open(path) as f:
+        return f.read()
+
+
 def _assert_no_transaction_breakage(env, stderr_text):
     for needle in TRANSACTION_BREAKAGE_PATTERNS:
         env.assertTrue(
@@ -654,6 +662,90 @@ def test_transaction_same_key_reused_within_rotation(env):
             total_keys, 0,
             message="no rk-* keys were written; the transaction produced no "
                     "side effects")
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_abort_column_and_warning(env):
+    """Under --transaction the stats output must break EXEC optimistic-lock
+    aborts out into their own 'Aborts/sec' column (table + JSON), and the
+    miss-rate warning for EXEC must say 'abort rate', never 'miss rate'.
+
+    A narrow key range with several contending clients makes concurrent
+    rotations watch+write the same key, so some EXECs abort and the abort
+    columns/warning are exercised with non-zero values."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    test_dir = tempfile.mkdtemp()
+    benchmark_specs = {"name": env.testName, "args": ["--transaction"]}
+    addTLSArgs(benchmark_specs, env)
+    benchmark_specs["args"].extend([
+        # Hash-tag prefix keeps every key in one slot (no cross-slot pin churn),
+        # and a narrow key range makes concurrent rotations watch+write the same
+        # key -> EXEC optimistic-lock aborts.
+        '--command=WATCH __key__',
+        '--command=GET   __key__',
+        '--command=MULTI',
+        '--command=SETEX __key__ 600 __data__',
+        '--command=EXEC',
+        '--command=UNWATCH',
+        '--command-key-pattern=R',
+        '--key-prefix={abrt}-',
+        '--key-minimum=1',
+        '--key-maximum=5',
+    ])
+
+    config = get_default_memtier_config(threads=4, clients=4, requests=500)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    run_config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(run_config.results_dir)
+    benchmark = Benchmark.from_json(run_config, benchmark_specs)
+    ok = benchmark.run()
+
+    stdout = _read_stdout(run_config)
+    stderr = _read_stderr(run_config)
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier_benchmark exited non-zero")
+        _assert_no_transaction_breakage(env, stderr)
+
+        # Table must carry the Aborts/sec column under --transaction.
+        env.assertTrue(
+            "Aborts/sec" in stdout,
+            message="'Aborts/sec' column missing from --transaction output")
+
+        # EXEC's miss-rate warning, if any, must be phrased as an abort.
+        env.assertTrue(
+            "EXEC miss rate" not in stderr,
+            message="EXEC reported as 'miss rate'; should be 'abort rate'")
+
+        # JSON: the Execs command block and Totals must expose Aborts/sec.
+        json_path = os.path.join(run_config.results_dir, "mb.json")
+        with open(json_path) as f:
+            doc = json.load(f)
+
+        def _find(node, key):
+            if isinstance(node, dict):
+                if key in node:
+                    return node[key]
+                for v in node.values():
+                    r = _find(v, key)
+                    if r is not None:
+                        return r
+            return None
+
+        execs = _find(doc, "Execs")
+        env.assertTrue(execs is not None, message="no Execs block in JSON")
+        env.assertTrue(
+            "Aborts/sec" in execs,
+            message="Execs JSON block missing 'Aborts/sec': {}".format(
+                list(execs.keys())))
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)

@@ -3547,6 +3547,7 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     unsigned long int cur_bytes_sec = 0;
     unsigned long int prev_hits = 0;
     unsigned long int prev_misses = 0;
+    unsigned long int prev_aborts = 0;
     unsigned long int prev_errors = 0;
     unsigned long int prev_retry_attempts = 0;
 
@@ -3631,6 +3632,7 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         unsigned long int total_connection_errors = 0;
         unsigned long int total_hits = 0;
         unsigned long int total_misses = 0;
+        unsigned long int total_aborts = 0;
         unsigned long int total_errors = 0;
         unsigned long int total_retry_attempts = 0;
         unsigned long int total_retried_ops = 0;
@@ -3670,8 +3672,18 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
                 total_retried_ops += (*i)->m_cg->get_total_retried_ops();
             }
             if (cfg->realtime_latencies) {
-                total_hits += (*i)->m_cg->get_total_hits();
-                total_misses += (*i)->m_cg->get_total_misses();
+                // In --command (arbitrary) mode the SET/GET hit/miss counters
+                // stay zero, so pull the live miss/abort figures from the
+                // arbitrary-command counters instead. Aborts are the EXEC
+                // optimistic-lock subset of misses (see run_stats).
+                if (cfg->arbitrary_commands->is_defined()) {
+                    total_hits += (*i)->m_cg->get_total_arbitrary_hits();
+                    total_misses += (*i)->m_cg->get_total_arbitrary_misses();
+                    total_aborts += (*i)->m_cg->get_total_arbitrary_aborts();
+                } else {
+                    total_hits += (*i)->m_cg->get_total_hits();
+                    total_misses += (*i)->m_cg->get_total_misses();
+                }
             }
             thread_counter++;
             float factor = ((float) (thread_counter - 1) / thread_counter);
@@ -3772,6 +3784,23 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             else
                 snprintf(avg_miss_str, sizeof(avg_miss_str), "  -  ");
 
+            // Abort ratio (--transaction only): EXEC optimistic-lock aborts as a
+            // share of the same lookup denominator. Aborts are a subset of misses,
+            // so abort% <= miss%. It's a blended live indicator across all
+            // arbitrary commands; the authoritative per-command abort rate is in
+            // the final table / "abort rate" warning.
+            char cur_abort_str[16], avg_abort_str[16];
+            if (cur_lookups > 0)
+                snprintf(cur_abort_str, sizeof(cur_abort_str), "%5.2f%%",
+                         100.0 * (double) (total_aborts - prev_aborts) / (double) cur_lookups);
+            else
+                snprintf(cur_abort_str, sizeof(cur_abort_str), "  -  ");
+            if (tot_lookups > 0)
+                snprintf(avg_abort_str, sizeof(avg_abort_str), "%5.2f%%",
+                         100.0 * (double) total_aborts / (double) tot_lookups);
+            else
+                snprintf(avg_abort_str, sizeof(avg_abort_str), "  -  ");
+
             char line1[640];
             int line1_used = 0;
             if (total_connection_errors > 0) {
@@ -3785,6 +3814,13 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
                     snprintf(line1, sizeof(line1),
                              "%s throughput %s (avg: %s) ops/sec   %s/sec (avg: %s/sec)   miss %s (avg: %s)", tag,
                              cur_ops_str, avg_ops_str, cur_bytes_str, bytes_str, cur_miss_str, avg_miss_str);
+            }
+            // Abort tail: only under --transaction so default arbitrary-command
+            // output is unchanged for existing log-scraping.
+            if (cfg->transaction && line1_used > 0 && (size_t) line1_used < sizeof(line1)) {
+                int n = snprintf(line1 + line1_used, sizeof(line1) - line1_used, "   abort %s (avg: %s)", cur_abort_str,
+                                 avg_abort_str);
+                if (n > 0) line1_used += n;
             }
             // Retry/error tail: only printed when --retry-on-error is enabled
             // so existing CI / log-scraping is unaffected by default.
@@ -3892,6 +3928,7 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
 
         prev_hits = total_hits;
         prev_misses = total_misses;
+        prev_aborts = total_aborts;
         prev_errors = total_errors;
         prev_retry_attempts = total_retry_attempts;
 
