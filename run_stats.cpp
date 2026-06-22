@@ -1580,34 +1580,49 @@ void run_stats::print_aborts_sec_column(output_table &table,
     column.elements.push_back(*el.init_str("%12s ", "Aborts/sec"));
     column.elements.push_back(*el.init_str("%s", "-------------"));
 
-    // Only abort-semantics commands (EXEC) contribute; every other row shows
-    // 0.00. The count is the same value carried in that command's Misses/sec
-    // (display-only reinterpretation), so Aborts is a labeled subset of Misses.
-    unsigned long int test_duration_usec = ts_diff(m_start_time, m_end_time);
-    unsigned long long total_aborts = 0;
-    if (aggregated != nullptr) {
-        for (const auto &agg : *aggregated) {
-            unsigned long long aborts = is_abort_command_type(agg.command_type) ? agg.total_misses : 0;
-            double aborts_sec =
-                test_duration_usec > 0 ? (double) aborts / (double) test_duration_usec * 1000000.0 : 0.0;
-            column.elements.push_back(*el.init_double("%12.2f ", aborts_sec));
-            total_aborts += aborts;
+    // Aborts only exist for arbitrary (--command) workloads. This column is
+    // only added under --transaction, which requires --command, so the
+    // arbitrary branch is what actually runs; the SET/GET/Wait branch mirrors
+    // print_missess_sec_column's row layout so the column never misaligns if
+    // the gating ever changes.
+    if (print_arbitrary_commands_results()) {
+        // Only abort-semantics commands (EXEC) contribute; every other row
+        // shows 0.00. The count is the same value carried in that command's
+        // Misses/sec (display-only reinterpretation), so Aborts is a labeled
+        // subset of Misses.
+        unsigned long int test_duration_usec = ts_diff(m_start_time, m_end_time);
+        unsigned long long total_aborts = 0;
+        if (aggregated != nullptr) {
+            for (const auto &agg : *aggregated) {
+                unsigned long long aborts = is_abort_command_type(agg.command_type) ? agg.total_misses : 0;
+                double aborts_sec =
+                    test_duration_usec > 0 ? (double) aborts / (double) test_duration_usec * 1000000.0 : 0.0;
+                column.elements.push_back(*el.init_double("%12.2f ", aborts_sec));
+                total_aborts += aborts;
+            }
+        } else {
+            for (size_t i = 0; i < m_totals.m_ar_commands.size(); i++) {
+                bool is_abort = m_config != NULL && i < m_config->arbitrary_commands->size() &&
+                                is_abort_command_type(m_config->arbitrary_commands->at(i).command_type);
+                unsigned long long aborts =
+                    (is_abort && i < m_arbitrary_misses.size()) ? m_arbitrary_misses[i].total_misses : 0;
+                double aborts_sec =
+                    test_duration_usec > 0 ? (double) aborts / (double) test_duration_usec * 1000000.0 : 0.0;
+                column.elements.push_back(*el.init_double("%12.2f ", aborts_sec));
+                total_aborts += aborts;
+            }
         }
+        double total_aborts_sec =
+            test_duration_usec > 0 ? (double) total_aborts / (double) test_duration_usec * 1000000.0 : 0.0;
+        column.elements.push_back(*el.init_double("%12.2f ", total_aborts_sec));
     } else {
-        for (size_t i = 0; i < m_totals.m_ar_commands.size(); i++) {
-            bool is_abort = m_config != NULL && i < m_config->arbitrary_commands->size() &&
-                            is_abort_command_type(m_config->arbitrary_commands->at(i).command_type);
-            unsigned long long aborts =
-                (is_abort && i < m_arbitrary_misses.size()) ? m_arbitrary_misses[i].total_misses : 0;
-            double aborts_sec =
-                test_duration_usec > 0 ? (double) aborts / (double) test_duration_usec * 1000000.0 : 0.0;
-            column.elements.push_back(*el.init_double("%12.2f ", aborts_sec));
-            total_aborts += aborts;
-        }
+        // SET/GET/Wait layout (no aborts possible): one cell per Type row plus
+        // the Totals cell, matching the other columns' row count.
+        column.elements.push_back(*el.init_str("%12s ", "---"));
+        column.elements.push_back(*el.init_double("%12.2f ", 0.0));
+        column.elements.push_back(*el.init_str("%12s ", "---"));
+        column.elements.push_back(*el.init_double("%12.2f ", 0.0));
     }
-    double total_aborts_sec =
-        test_duration_usec > 0 ? (double) total_aborts / (double) test_duration_usec * 1000000.0 : 0.0;
-    column.elements.push_back(*el.init_double("%12.2f ", total_aborts_sec));
 
     table.add_column(column);
 }
