@@ -2495,14 +2495,6 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         return -1;
     }
 
-    if (cfg->transaction && !cfg->cluster_mode) {
-        fprintf(stderr, "warning: --transaction has no effect without --cluster-mode. "
-                        "In standalone mode every client uses a single connection so commands "
-                        "are already serialized in order. Note the cluster-mode behavior of "
-                        "collapsing every __key__ in a rotation to a single key does NOT apply "
-                        "here: each keyed --command keeps its own key.\n");
-    }
-
     if ((cfg->cluster_mode && !verify_cluster_option(cfg)) ||
         (cfg->arbitrary_commands->is_defined() && !verify_arbitrary_command_option(cfg))) {
         return -1;
@@ -2588,23 +2580,24 @@ void usage()
         "  -x, --run-count=NUMBER         Number of full-test iterations to perform\n"
         "  -D, --debug                    Print debug output\n"
         "      --cluster-mode             Run client in cluster mode\n"
-        "      --transaction              In --cluster-mode, pin one full rotation of --command entries to\n"
-        "                                 a single shard connection so that keyless commands (MULTI/EXEC/\n"
-        "                                 UNWATCH) stay on the same connection as the keyed ones. Every\n"
-        "                                 __key__ in a rotation resolves to the same key (taken from the\n"
-        "                                 first keyed command's --command-key-pattern), so keyed commands\n"
-        "                                 (e.g. WATCH/GET/SETEX) all hit one slot and one key: the WATCH\n"
-        "                                 guards the key the SETEX writes and the WATCH/MULTI/EXEC unit\n"
-        "                                 runs without CROSSSLOT errors -- no hash-tag needed. Caveat: keep\n"
-        "                                 the literal text around __key__ (including any {tag}) identical\n"
-        "                                 across keyed commands; differing affixes still hash to different\n"
-        "                                 slots and get MOVED. This same-key collapse happens only in\n"
-        "                                 --cluster-mode; in standalone this flag is a no-op (each client\n"
-        "                                 already runs through a single connection and keys are NOT\n"
-        "                                 collapsed). Requires at least one --command.\n"
-        "                                 --pipeline > 1 is supported: each rotation is sent contiguously\n"
-        "                                 on its pinned connection, so multiple whole transactions can be\n"
-        "                                 in flight without interleaving MULTI/EXEC blocks.\n"
+        "      --transaction              Treat one full rotation of --command entries as a transactional\n"
+        "                                 unit (e.g. WATCH/GET/MULTI/SETEX/EXEC/UNWATCH). Every __key__ in\n"
+        "                                 a rotation resolves to the same key (taken from the first keyed\n"
+        "                                 command's --command-key-pattern), so all keyed commands hit one\n"
+        "                                 key and one slot: the WATCH guards the key the SETEX writes and\n"
+        "                                 the unit runs without CROSSSLOT errors -- no hash-tag needed.\n"
+        "                                 This same-key behavior applies in every mode, so it also works\n"
+        "                                 against a single endpoint fronting a sharded backend (e.g. a\n"
+        "                                 Redis Enterprise proxy) where keyed commands must share a slot.\n"
+        "                                 In --cluster-mode it additionally pins the whole rotation to the\n"
+        "                                 owning shard connection so the keyless commands (MULTI/EXEC/\n"
+        "                                 UNWATCH) stay with the keyed ones. Caveat: keep the literal text\n"
+        "                                 around __key__ (including any {tag}) identical across keyed\n"
+        "                                 commands; differing affixes still hash to different slots.\n"
+        "                                 Requires at least one --command.\n"
+        "                                 --pipeline > 1 is supported: in --cluster-mode each rotation is\n"
+        "                                 sent contiguously on its pinned connection, so multiple whole\n"
+        "                                 transactions can be in flight without interleaving MULTI/EXEC.\n"
         "                                 Note: if --reconnect-on-error triggers mid-rotation, the\n"
         "                                 interrupted rotation's stats will be inaccurate (server-side\n"
         "                                 WATCH/MULTI state is lost on reconnect).\n"

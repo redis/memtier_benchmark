@@ -170,10 +170,9 @@ def test_transaction_with_discard(env):
             debugPrintMemtierOnError(run_config, env)
 
 
-def test_transaction_in_standalone_is_noop(env):
-    """In standalone, --transaction is accepted but does nothing: each client
-    already runs on a single connection, so the rotation order is naturally
-    preserved. The benchmark must complete cleanly with no server-side
+def test_transaction_in_standalone_runs_clean(env):
+    """In standalone, --transaction does not pin (there is only one
+    connection), but it must still run cleanly with no server-side
     transaction breakage."""
     if env.isCluster():
         env.skip()
@@ -192,6 +191,57 @@ def test_transaction_in_standalone_is_noop(env):
     try:
         env.assertTrue(ok, message="memtier_benchmark exited non-zero")
         _assert_no_transaction_breakage(env, stderr)
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_standalone_same_key_per_rotation(env):
+    """--transaction must collapse every __key__ in a rotation to one key even
+    WITHOUT --cluster-mode, so a single endpoint fronting a sharded backend
+    (e.g. a Redis Enterprise proxy) never sees a cross-slot WATCH/MULTI/EXEC.
+
+    Verified the slot-independent way: SET 'aa' then APPEND 'bb' on a bare
+    __key__ in one MULTI/EXEC. If both commands share the rotation's key every
+    populated key holds 'aabb'; if they drew independent keys (the pre-change
+    standalone behavior) we'd see stray 'aa' / 'bb' values."""
+    if env.isCluster():
+        env.skip()
+        return
+
+    conn = env.getConnection()
+    conn.flushall()
+
+    cmds = [
+        '--command=MULTI',
+        '--command=SET    __key__ aa',
+        '--command=APPEND __key__ bb',
+        '--command=EXEC',
+        '--command-key-pattern=R',
+        '--key-prefix=sk-',
+        '--key-minimum=1',
+        '--key-maximum=30',
+    ]
+    ok, run_config, stderr = _run_transaction_workload(
+        env, cmds, threads=2, clients=2, requests=400)
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier_benchmark exited non-zero")
+        _assert_no_transaction_breakage(env, stderr)
+
+        total_keys = 0
+        for key in conn.scan_iter(match="sk-*"):
+            total_keys += 1
+            value = conn.execute_command("GET", key)
+            env.assertEqual(
+                value, b"aabb",
+                message="key {!r} holds {!r}, expected 'aabb' — standalone "
+                        "--transaction did not reuse one key per "
+                        "rotation".format(key, value))
+        env.assertGreater(
+            total_keys, 0,
+            message="no sk-* keys written; transaction produced no side effects")
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)

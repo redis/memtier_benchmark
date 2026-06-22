@@ -167,6 +167,9 @@ client::client(client_group *group) :
         m_arbitrary_command_ratio_count(0),
         m_executed_command_index(0),
         m_arbitrary_command_rotation_seq(0),
+        m_txn_rotation_key_index(0),
+        m_txn_rotation_key_valid(false),
+        m_txn_rotation_key_seq(0),
         m_tot_set_ops(0),
         m_tot_wait_ops(0),
         m_scan_cursor("0"),
@@ -199,6 +202,9 @@ client::client(struct event_base *event_base, benchmark_config *config, abstract
         m_arbitrary_command_ratio_count(0),
         m_executed_command_index(0),
         m_arbitrary_command_rotation_seq(0),
+        m_txn_rotation_key_index(0),
+        m_txn_rotation_key_valid(false),
+        m_txn_rotation_key_seq(0),
         m_tot_set_ops(0),
         m_tot_wait_ops(0),
         m_scan_cursor("0"),
@@ -465,10 +471,29 @@ bool client::create_arbitrary_request(unsigned int command_index, struct timeval
         if (arg->type == const_type) {
             cmd_size += m_connections[conn_id]->send_arbitrary_command(arg);
         } else if (arg->type == key_type) {
-            unsigned long long key_index;
-            get_key_response res = get_key_for_conn(command_index, conn_id, &key_index);
-            /* If key not available for this connection, we have a bug of sending partial request */
-            assert(res == available_for_conn);
+            // --transaction: reuse one key for every __key__ in the rotation so
+            // the whole WATCH/MULTI/EXEC unit resolves to a single key/slot.
+            // Only when keys are generated (not on the data-import path, which
+            // streams a distinct key per command). cluster_client overrides this
+            // method, so this branch only runs for the non-cluster path.
+            const bool txn_reuse = m_config->transaction && (!m_config->data_import || m_config->generate_keys);
+            if (txn_reuse && m_txn_rotation_key_valid && m_txn_rotation_key_seq == m_arbitrary_command_rotation_seq) {
+                // Same rotation as the cached key: regenerate the identical key
+                // string without advancing the per-iter key cursor.
+                m_obj_gen->generate_key(m_txn_rotation_key_index);
+            } else {
+                unsigned long long key_index;
+                get_key_response res = get_key_for_conn(command_index, conn_id, &key_index);
+                /* If key not available for this connection, we have a bug of sending partial request */
+                assert(res == available_for_conn);
+                if (txn_reuse) {
+                    // First keyed command of the rotation: adopt this key for
+                    // the rest of the rotation.
+                    m_txn_rotation_key_index = key_index;
+                    m_txn_rotation_key_valid = true;
+                    m_txn_rotation_key_seq = m_arbitrary_command_rotation_seq;
+                }
+            }
 
             // when we have static data mixed with the key placeholder
             if (arg->has_key_affixes) {
