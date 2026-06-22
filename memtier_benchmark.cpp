@@ -2012,12 +2012,6 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         return -1;
     }
 
-    if (cfg->transaction && !cfg->cluster_mode) {
-        fprintf(stderr, "warning: --transaction has no effect without --cluster-mode. "
-                        "In standalone mode every client uses a single connection so commands "
-                        "are already serialized in order.\n");
-    }
-
     if ((cfg->cluster_mode && !verify_cluster_option(cfg)) ||
         (cfg->arbitrary_commands->is_defined() && !verify_arbitrary_command_option(cfg))) {
         return -1;
@@ -2067,16 +2061,24 @@ void usage()
         "  -x, --run-count=NUMBER         Number of full-test iterations to perform\n"
         "  -D, --debug                    Print debug output\n"
         "      --cluster-mode             Run client in cluster mode\n"
-        "      --transaction              In --cluster-mode, pin one full rotation of --command entries to\n"
-        "                                 a single shard connection so that keyless commands (MULTI/EXEC/\n"
-        "                                 UNWATCH) stay on the same connection as the keyed ones. Hash-tag\n"
-        "                                 your keys so they map to the same slot, otherwise the cross-slot\n"
-        "                                 keyed commands of the same rotation will get MOVED back. In\n"
-        "                                 standalone mode this flag is a no-op (each client already runs\n"
-        "                                 through a single connection). Requires at least one --command.\n"
-        "                                 --pipeline > 1 is supported: each rotation is sent contiguously\n"
-        "                                 on its pinned connection, so multiple whole transactions can be\n"
-        "                                 in flight without interleaving MULTI/EXEC blocks.\n"
+        "      --transaction              Treat one full rotation of --command entries as a transactional\n"
+        "                                 unit (e.g. WATCH/GET/MULTI/SETEX/EXEC/UNWATCH). Every __key__ in\n"
+        "                                 a rotation resolves to the same key (taken from the first keyed\n"
+        "                                 command's --command-key-pattern), so all keyed commands hit one\n"
+        "                                 key and one slot: the WATCH guards the key the SETEX writes and\n"
+        "                                 the unit runs without CROSSSLOT errors -- no hash-tag needed.\n"
+        "                                 This same-key behavior applies in every mode, so it also works\n"
+        "                                 against a single endpoint fronting a sharded backend (e.g. a\n"
+        "                                 Redis Enterprise proxy) where keyed commands must share a slot.\n"
+        "                                 In --cluster-mode it additionally pins the whole rotation to the\n"
+        "                                 owning shard connection so the keyless commands (MULTI/EXEC/\n"
+        "                                 UNWATCH) stay with the keyed ones. Caveat: keep the literal text\n"
+        "                                 around __key__ (including any {tag}) identical across keyed\n"
+        "                                 commands; differing affixes still hash to different slots.\n"
+        "                                 Requires at least one --command.\n"
+        "                                 --pipeline > 1 is supported: in --cluster-mode each rotation is\n"
+        "                                 sent contiguously on its pinned connection, so multiple whole\n"
+        "                                 transactions can be in flight without interleaving MULTI/EXEC.\n"
         "                                 Note: if --reconnect-on-error triggers mid-rotation, the\n"
         "                                 interrupted rotation's stats will be inaccurate (server-side\n"
         "                                 WATCH/MULTI state is lost on reconnect).\n"
@@ -2649,6 +2651,7 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     unsigned long int cur_bytes_sec = 0;
     unsigned long int prev_hits = 0;
     unsigned long int prev_misses = 0;
+    unsigned long int prev_aborts = 0;
     unsigned long int prev_errors = 0;
     unsigned long int prev_retry_attempts = 0;
 
@@ -2725,6 +2728,7 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         unsigned long int total_connection_errors = 0;
         unsigned long int total_hits = 0;
         unsigned long int total_misses = 0;
+        unsigned long int total_aborts = 0;
         unsigned long int total_errors = 0;
         unsigned long int total_retry_attempts = 0;
         unsigned long int total_retried_ops = 0;
@@ -2758,8 +2762,18 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
                 total_retried_ops += (*i)->m_cg->get_total_retried_ops();
             }
             if (cfg->realtime_latencies) {
-                total_hits += (*i)->m_cg->get_total_hits();
-                total_misses += (*i)->m_cg->get_total_misses();
+                // In --command (arbitrary) mode the SET/GET hit/miss counters
+                // stay zero, so pull the live miss/abort figures from the
+                // arbitrary-command counters instead. Aborts are the EXEC
+                // optimistic-lock subset of misses (see run_stats).
+                if (cfg->arbitrary_commands->is_defined()) {
+                    total_hits += (*i)->m_cg->get_total_arbitrary_hits();
+                    total_misses += (*i)->m_cg->get_total_arbitrary_misses();
+                    total_aborts += (*i)->m_cg->get_total_arbitrary_aborts();
+                } else {
+                    total_hits += (*i)->m_cg->get_total_hits();
+                    total_misses += (*i)->m_cg->get_total_misses();
+                }
             }
             thread_counter++;
             float factor = ((float) (thread_counter - 1) / thread_counter);
@@ -2860,6 +2874,23 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             else
                 snprintf(avg_miss_str, sizeof(avg_miss_str), "  -  ");
 
+            // Abort ratio (--transaction only): EXEC optimistic-lock aborts as a
+            // share of the same lookup denominator. Aborts are a subset of misses,
+            // so abort% <= miss%. It's a blended live indicator across all
+            // arbitrary commands; the authoritative per-command abort rate is in
+            // the final table / "abort rate" warning.
+            char cur_abort_str[16], avg_abort_str[16];
+            if (cur_lookups > 0)
+                snprintf(cur_abort_str, sizeof(cur_abort_str), "%5.2f%%",
+                         100.0 * (double) (total_aborts - prev_aborts) / (double) cur_lookups);
+            else
+                snprintf(cur_abort_str, sizeof(cur_abort_str), "  -  ");
+            if (tot_lookups > 0)
+                snprintf(avg_abort_str, sizeof(avg_abort_str), "%5.2f%%",
+                         100.0 * (double) total_aborts / (double) tot_lookups);
+            else
+                snprintf(avg_abort_str, sizeof(avg_abort_str), "  -  ");
+
             char line1[640];
             int line1_used = 0;
             if (total_connection_errors > 0) {
@@ -2873,6 +2904,13 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
                     snprintf(line1, sizeof(line1),
                              "%s throughput %s (avg: %s) ops/sec   %s/sec (avg: %s/sec)   miss %s (avg: %s)", tag,
                              cur_ops_str, avg_ops_str, cur_bytes_str, bytes_str, cur_miss_str, avg_miss_str);
+            }
+            // Abort tail: only under --transaction so default arbitrary-command
+            // output is unchanged for existing log-scraping.
+            if (cfg->transaction && line1_used > 0 && (size_t) line1_used < sizeof(line1)) {
+                int n = snprintf(line1 + line1_used, sizeof(line1) - line1_used, "   abort %s (avg: %s)", cur_abort_str,
+                                 avg_abort_str);
+                if (n > 0) line1_used += n;
             }
             // Retry/error tail: only printed when --retry-on-error is enabled
             // so existing CI / log-scraping is unaffected by default.
@@ -2980,6 +3018,7 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
 
         prev_hits = total_hits;
         prev_misses = total_misses;
+        prev_aborts = total_aborts;
         prev_errors = total_errors;
         prev_retry_attempts = total_retry_attempts;
 

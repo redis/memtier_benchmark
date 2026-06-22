@@ -125,6 +125,8 @@ cluster_client::cluster_client(client_group *group) :
         m_txn_observed_rotation_seq(0),
         m_txn_staged_key_index(0),
         m_txn_has_staged_key(false),
+        m_txn_round_key_index(0),
+        m_txn_round_key_valid(false),
         m_txn_pin_lost_warned(false)
 {
     memset(m_slot_to_shard, 0, sizeof(m_slot_to_shard));
@@ -176,6 +178,11 @@ void cluster_client::txn_release_pin()
         m_key_index_pools[m_txn_pinned_conn_id]->push(m_txn_staged_key_index);
         m_txn_has_staged_key = false;
     }
+    // Forget the rotation's shared key: a dropped pin restarts the rotation on
+    // a fresh pin/lookahead, which will adopt a new key. Leaving this set would
+    // make the re-pinned rotation reuse the old key while the fresh lookahead
+    // key goes unconsumed -- burning a sequential index at the next wrap.
+    m_txn_round_key_valid = false;
     m_txn_pinned_conn_id = -1;
 }
 
@@ -186,6 +193,7 @@ void cluster_client::disconnect(void)
     // m_connections (which would be an out-of-bounds access).
     m_txn_pinned_conn_id = -1;
     m_txn_has_staged_key = false;
+    m_txn_round_key_valid = false;
     m_txn_pin_lost_warned = false;
 
     unsigned int conn_size = m_connections.size();
@@ -715,6 +723,7 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
             m_txn_observed_rotation_seq = m_arbitrary_command_rotation_seq;
             m_txn_pinned_conn_id = -1;
             m_txn_has_staged_key = false;
+            m_txn_round_key_valid = false;
             m_txn_pin_lost_warned = false;
             /* Wake up connections that were held back by hold_pipeline so
              * they can participate in the new rotation's lookahead. */
@@ -826,17 +835,27 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
             return false;
         }
 
-        /* For keyed commands the lookahead may have pre-generated a key
-         * stored in m_txn_staged_key_index. Use it so the per-iter key
-         * counter advances exactly once per rotation. */
+        /* Every keyed --command in one rotation must resolve to the SAME key so
+         * the whole WATCH/MULTI/EXEC unit hits a single slot -- otherwise the
+         * cluster rejects it with CROSSSLOT. The first keyed command adopts the
+         * lookahead-staged key (or, on the fallback path, generates one) as the
+         * rotation key; every later keyed command reuses it. Reusing the staged
+         * index also keeps the per-iter key counter advancing exactly once per
+         * rotation. */
         if (cmd.keys_count > 0) {
-            if (m_txn_has_staged_key) {
+            if (m_txn_round_key_valid) {
+                m_key_index_pools[conn_id]->push(m_txn_round_key_index);
+            } else if (m_txn_has_staged_key) {
                 m_key_index_pools[conn_id]->push(m_txn_staged_key_index);
+                m_txn_round_key_index = m_txn_staged_key_index;
+                m_txn_round_key_valid = true;
                 m_txn_has_staged_key = false;
             } else if (m_key_index_pools[conn_id]->empty()) {
                 unsigned long long key_index;
                 client::get_key_for_conn(command_index, conn_id, &key_index);
                 m_key_index_pools[conn_id]->push(key_index);
+                m_txn_round_key_index = key_index;
+                m_txn_round_key_valid = true;
             }
         }
         client::create_arbitrary_request(command_index, timestamp, conn_id);
