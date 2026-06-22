@@ -86,6 +86,17 @@ protected:
     // mirror the ratio-counter state machine.
     unsigned long long m_arbitrary_command_rotation_seq;
 
+    // --transaction (non-cluster path): reuse a single generated key for every
+    // __key__ in one --command rotation so a WATCH/MULTI/EXEC unit hits one key
+    // (and therefore one slot), avoiding CROSSSLOT against a slot-enforcing
+    // single endpoint (e.g. a Redis Enterprise proxy). m_txn_rotation_key_seq
+    // records the rotation_seq the cached index was generated for; a mismatch
+    // means a new rotation has started and the key must be regenerated. The
+    // --cluster-mode path has its own equivalent in cluster_client.
+    unsigned long long m_txn_rotation_key_index;
+    bool m_txn_rotation_key_valid;
+    unsigned long long m_txn_rotation_key_seq;
+
     unsigned long long m_tot_set_ops;  // Total number of SET ops
     unsigned long long m_tot_wait_ops; // Total number of WAIT ops
 
@@ -305,6 +316,7 @@ public:
     unsigned long int get_total_misses(void);
     unsigned long long get_total_arbitrary_hits(void);
     unsigned long long get_total_arbitrary_misses(void);
+    unsigned long long get_total_arbitrary_aborts(void);
     unsigned long int get_total_retry_attempts(void);
     unsigned long int get_total_retried_ops(void);
     unsigned long int get_total_errors(void);
