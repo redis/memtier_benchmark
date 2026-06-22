@@ -2498,7 +2498,9 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
     if (cfg->transaction && !cfg->cluster_mode) {
         fprintf(stderr, "warning: --transaction has no effect without --cluster-mode. "
                         "In standalone mode every client uses a single connection so commands "
-                        "are already serialized in order.\n");
+                        "are already serialized in order. Note the cluster-mode behavior of "
+                        "collapsing every __key__ in a rotation to a single key does NOT apply "
+                        "here: each keyed --command keeps its own key.\n");
     }
 
     if ((cfg->cluster_mode && !verify_cluster_option(cfg)) ||
@@ -2588,11 +2590,18 @@ void usage()
         "      --cluster-mode             Run client in cluster mode\n"
         "      --transaction              In --cluster-mode, pin one full rotation of --command entries to\n"
         "                                 a single shard connection so that keyless commands (MULTI/EXEC/\n"
-        "                                 UNWATCH) stay on the same connection as the keyed ones. Hash-tag\n"
-        "                                 your keys so they map to the same slot, otherwise the cross-slot\n"
-        "                                 keyed commands of the same rotation will get MOVED back. In\n"
-        "                                 standalone mode this flag is a no-op (each client already runs\n"
-        "                                 through a single connection). Requires at least one --command.\n"
+        "                                 UNWATCH) stay on the same connection as the keyed ones. Every\n"
+        "                                 __key__ in a rotation resolves to the same key (taken from the\n"
+        "                                 first keyed command's --command-key-pattern), so keyed commands\n"
+        "                                 (e.g. WATCH/GET/SETEX) all hit one slot and one key: the WATCH\n"
+        "                                 guards the key the SETEX writes and the WATCH/MULTI/EXEC unit\n"
+        "                                 runs without CROSSSLOT errors -- no hash-tag needed. Caveat: keep\n"
+        "                                 the literal text around __key__ (including any {tag}) identical\n"
+        "                                 across keyed commands; differing affixes still hash to different\n"
+        "                                 slots and get MOVED. This same-key collapse happens only in\n"
+        "                                 --cluster-mode; in standalone this flag is a no-op (each client\n"
+        "                                 already runs through a single connection and keys are NOT\n"
+        "                                 collapsed). Requires at least one --command.\n"
         "                                 --pipeline > 1 is supported: each rotation is sent contiguously\n"
         "                                 on its pinned connection, so multiple whole transactions can be\n"
         "                                 in flight without interleaving MULTI/EXEC blocks.\n"

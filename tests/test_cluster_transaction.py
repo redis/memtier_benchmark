@@ -40,6 +40,11 @@ TRANSACTION_BREAKAGE_PATTERNS = [
     "DISCARD without MULTI",
 ]
 
+# Cluster rejects a multi-key access whose keys don't all hash to one slot.
+# With --transaction every __key__ in a rotation must resolve to the SAME key,
+# so a WATCH/GET/SETEX rotation stays single-slot even without a hash tag.
+CROSSSLOT_PATTERN = "CROSSSLOT"
+
 
 def _read_stderr(run_config):
     path = "{0}/mb.stderr".format(run_config.results_dir)
@@ -543,6 +548,112 @@ def test_transaction_appears_in_config_and_json_output(env):
             cfg_section.get("transaction"), "true",
             message="JSON configuration.transaction expected 'true', got {!r}".format(
                 cfg_section.get("transaction")))
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_same_key_no_hash_tag_no_crossslot(env):
+    """The exact issue repro: WATCH/GET/MULTI/SETEX/EXEC/UNWATCH where each
+    keyed command uses a bare __key__ with NO hash tag and --command-key-
+    pattern=R. Because --transaction now reuses one key for the whole
+    rotation, all three keyed commands hit a single slot, so the cluster
+    must NOT raise CROSSSLOT and the transaction must stay intact."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    # No hash tag, random key pattern: pre-change this would have generated a
+    # different key per command and the WATCH/MULTI/EXEC unit would be torn
+    # across slots (CROSSSLOT / MOVED).
+    _flush_cluster(env)
+    cmds = [
+        '--command=WATCH __key__',
+        '--command=GET   __key__',
+        '--command=MULTI',
+        '--command=SETEX __key__ 7200 __data__',
+        '--command=EXEC',
+        '--command=UNWATCH',
+        '--command-key-pattern=R',
+        '--key-minimum=1',
+        '--key-maximum=1000',
+    ]
+    ok, run_config, stderr = _run_transaction_workload(env, cmds)
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier_benchmark exited non-zero")
+        _assert_no_transaction_breakage(env, stderr)
+        env.assertTrue(
+            CROSSSLOT_PATTERN not in stderr,
+            message="CROSSSLOT error present — keyed commands in the rotation "
+                    "resolved to different keys/slots instead of sharing one")
+        # Liveness floor: the SETEX inside the transaction must actually have
+        # committed keys. Without this a regression that silently emits no
+        # keyed writes (clean stderr, exit 0) would pass the checks above.
+        total = sum(_dbsize_per_shard(env).values())
+        env.assertGreater(
+            total, 0,
+            message="no keys committed by the SETEX — the transaction "
+                    "produced no side effects")
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_same_key_reused_within_rotation(env):
+    """A SET then an APPEND in the same MULTI/EXEC rotation, both on a bare
+    __key__ with no hash tag, must land on the SAME key. We SET 'aa' then
+    APPEND 'bb'; if both commands share one key every populated key ends up
+    'aabb'. This distinguishes same-key reuse from a dropped/misrouted first
+    command: if the SET were dropped or hit a different key, APPEND-on-missing
+    would leave 'bb' instead of 'aabb'. And if the two commands resolved to
+    different keys with no hash tag they'd hash to different slots and the
+    cluster would reject the transaction with CROSSSLOT."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    _flush_cluster(env)
+    cmds = [
+        '--command=MULTI',
+        '--command=SET    __key__ aa',
+        '--command=APPEND __key__ bb',
+        '--command=EXEC',
+        '--command-key-pattern=R',
+        '--key-prefix=rk-',
+        '--key-minimum=1',
+        '--key-maximum=40',
+    ]
+    ok, run_config, stderr = _run_transaction_workload(
+        env, cmds, threads=1, clients=1, requests=400)
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier_benchmark exited non-zero")
+        _assert_no_transaction_breakage(env, stderr)
+        env.assertTrue(
+            CROSSSLOT_PATTERN not in stderr,
+            message="CROSSSLOT error present — the SET and APPEND in a "
+                    "rotation resolved to different keys")
+
+        # Every populated key across all shards must hold 'aabb', proving the
+        # SET and the APPEND in each rotation targeted the same key (a dropped
+        # or misrouted SET would leave 'bb').
+        total_keys = 0
+        for conn in env.getOSSMasterNodesConnectionList():
+            for key in conn.scan_iter(match="rk-*"):
+                total_keys += 1
+                value = conn.execute_command("GET", key)
+                env.assertEqual(
+                    value, b"aabb",
+                    message="key {!r} holds {!r}, expected 'aabb' — the SET "
+                            "and APPEND in the rotation did not share a "
+                            "key".format(key, value))
+        env.assertGreater(
+            total_keys, 0,
+            message="no rk-* keys were written; the transaction produced no "
+                    "side effects")
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)
