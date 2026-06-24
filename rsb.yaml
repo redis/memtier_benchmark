@@ -1,0 +1,56 @@
+version: 1
+
+name: memtier_benchmark
+
+repo_url: https://github.com/redis/memtier_benchmark.git
+
+install_path: ./deps
+
+targets:
+  build: |
+    set -e
+
+    export PREFIX_DIR="/opt/redislabs"
+    export BUILD_DIR="$(pwd)/staging"
+    export DEPS_DIR="$(pwd)/deps"
+
+    rm -rf output staging
+    mkdir -p "${BUILD_DIR}"
+
+    [ -f configure ] || autoreconf -if
+
+    [ -f Makefile ] || ./configure \
+      PKG_CONFIG_PATH="${DEPS_DIR}/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}" \
+      CPPFLAGS="-I${DEPS_DIR}/include ${CPPFLAGS:-}" \
+      LDFLAGS="-L${DEPS_DIR}/lib ${LDFLAGS:-}" \
+      --prefix="${PREFIX_DIR}"
+
+    make
+    make install DESTDIR="${BUILD_DIR}"
+
+    mkdir -p output
+    cp -a "${BUILD_DIR}${PREFIX_DIR}/." output/
+
+artifacts:
+  - type: runtime
+    name: memtier_benchmark
+    base_dir: output
+    include:
+      - bin/memtier_benchmark
+      - share/bash-completion/completions/memtier_benchmark
+      - share/man/man1/memtier_benchmark.1
+
+dependencies:
+  - name: pcre
+    artifact_name: pcre
+    repository_url: https://github.com/redislabsdev/pcre.git
+    commit_sha: 878dab07bbf1
+    artifact_types:
+      - dev
+
+  - name: libevent
+    artifact_name: libevent
+    repository_url: git@github.com:redislabsdev/libevent.git
+    commit_sha: ae1a21fcbfcc
+    artifact_types:
+      - dev
