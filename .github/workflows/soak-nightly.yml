@@ -31,8 +31,17 @@ jobs:
       contains(github.event.pull_request.labels.*.name, 'run-soak')
     runs-on: ubuntu-22.04
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # Cron + manual dispatch build both the default branch and the 2.4 maintenance
+        # branch; PR-label runs use the event's default (PR) checkout only.
+        branch: ${{ github.event_name != 'pull_request' && fromJSON('["master", "2.4"]') || fromJSON('["__default__"]') }}
+    name: build${{ matrix.branch != '__default__' && format(' ({0})', matrix.branch) || '' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.branch != '__default__' && matrix.branch || '' }}
 
       - name: Install build dependencies
         run: |
@@ -50,7 +59,8 @@ jobs:
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
-          name: memtier-soak-binary
+          # Branch-scoped so the master and 2.4 binaries don't collide.
+          name: memtier-soak-binary-${{ matrix.branch }}
           path: |
             memtier_benchmark
           retention-days: 2
@@ -62,6 +72,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Cross product: each scenario runs against every built branch.
+        branch: ${{ github.event_name != 'pull_request' && fromJSON('["master", "2.4"]') || fromJSON('["__default__"]') }}
         scenario:
           # `test` is the path passed to RLTest --test, relative to tests/
           # (run_tests.sh cds into tests/ before invoking RLTest).
@@ -72,14 +84,16 @@ jobs:
           - { id: S5, test: soak/test_cluster_turbulence.py, minutes: 15, cluster: 1 }
           - { id: S6, test: soak/test_retry_storm.py,        minutes: 10, cluster: 0 }
           - { id: S7, test: soak/test_slow_network.py,       minutes: 10, cluster: 0 }
-    name: ${{ matrix.scenario.id }} ${{ matrix.scenario.test }}
+    name: ${{ matrix.branch != '__default__' && format('{0} ', matrix.branch) || '' }}${{ matrix.scenario.id }} ${{ matrix.scenario.test }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.branch != '__default__' && matrix.branch || '' }}
 
       - name: Download memtier binary
         uses: actions/download-artifact@v4
         with:
-          name: memtier-soak-binary
+          name: memtier-soak-binary-${{ matrix.branch }}
 
       - name: Restore executable permissions
         run: chmod +x memtier_benchmark
@@ -131,7 +145,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: soak-${{ matrix.scenario.id }}-logs
+          name: soak-${{ matrix.branch }}-${{ matrix.scenario.id }}-logs
           path: |
             tests/logs/
             /tmp/RLTest_*

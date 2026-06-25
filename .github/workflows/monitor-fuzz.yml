@@ -41,8 +41,17 @@ jobs:
       contains(github.event.pull_request.labels.*.name, 'run-fuzz')
     runs-on: ubuntu-22.04
     timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        # Cron + manual dispatch fuzz both the default branch and the 2.4 maintenance
+        # branch; PR-label runs use the event's default (PR) checkout only.
+        branch: ${{ github.event_name != 'pull_request' && fromJSON('["master", "2.4"]') || fromJSON('["__default__"]') }}
+    name: monitor-fuzz${{ matrix.branch != '__default__' && format(' ({0})', matrix.branch) || '' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.branch != '__default__' && matrix.branch || '' }}
 
       - name: Install build deps
         run: |
