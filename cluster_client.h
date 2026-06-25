@@ -38,6 +38,19 @@ struct staged_monitor_cmd
 // forward decleration
 class shard_connection;
 
+// One distinct endpoint (host:port) in the discovered cluster topology, with
+// the hash-slot ranges it serves. 2.4 cluster mode is primary-only, so every
+// entry is a primary. Built by cluster_client::build_topology_snapshot() from
+// m_slot_to_shard + m_connections after a CLUSTER SLOTS commit, and consumed by
+// the human-readable startup summary (print_topology_summary) and the captured
+// results-summary counts.
+struct cluster_endpoint_info
+{
+    std::string addr;                              // "host:port"
+    bool is_primary;                               // always true on 2.4 (no replica routing)
+    std::vector<std::pair<int, int> > slot_ranges; // contiguous [start,end] runs
+};
+
 class cluster_client : public client
 {
 protected:
@@ -110,6 +123,18 @@ public:
                                               unsigned long long *key_index);
     virtual bool create_arbitrary_request(unsigned int command_index, struct timeval &timestamp, unsigned int conn_id);
     virtual bool create_mget_request(struct timeval &timestamp, unsigned int conn_id);
+
+    // Build a per-endpoint view of the committed topology: one entry per
+    // distinct host:port that owns slots, each annotated with its contiguous
+    // slot ranges. Called after a CLUSTER SLOTS commit; no lock needed because
+    // each cluster_client is single-threaded.
+    std::vector<cluster_endpoint_info> build_topology_snapshot() const;
+
+    // Emit the "[RUN #N] Cluster topology: ..." block to stderr (endpoint list
+    // with slot ranges, total opened connections, and the aggregate rate-limit
+    // target when --rate-limiting is set). Prints once per run and reprints when
+    // the topology shape changes mid-run.
+    void print_topology_summary() const;
 
     // client manager api's
     virtual void handle_cluster_slots(protocol_response *r);

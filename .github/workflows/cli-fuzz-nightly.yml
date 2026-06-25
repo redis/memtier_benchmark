@@ -25,7 +25,7 @@ on:
         default: '500'
   pull_request:
     types: [labeled, synchronize, reopened]
-    branches: [master, main]
+    branches: [master, main, "2.4"]
 
 permissions:
   contents: read
