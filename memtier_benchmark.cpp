@@ -5156,14 +5156,18 @@ int main(int argc, char *argv[])
                 cfg.threads, cfg.clients);
 
         if (have_cluster_topo) {
+            // With the --clients-start staircase ramp, cfg.clients is the peak
+            // (full-ramp) value, so total connections / rate are the target
+            // fan-out rather than the count necessarily opened; label it.
+            const char *ramp = (cfg.clients_start > 0) ? " at full ramp" : "";
             if (c_replicas > 0)
                 fprintf(outfile, "%-9zu Cluster endpoints (%zu primaries, %zu replicas)\n", c_endpoints, c_primaries,
                         c_replicas);
             else
                 fprintf(outfile, "%-9zu Cluster endpoints (%zu primaries)\n", c_endpoints, c_primaries);
-            fprintf(outfile, "%-9llu Total connections (%u x %u x %zu)\n", c_total_conns, cfg.threads, cfg.clients,
-                    c_endpoints);
-            if (c_has_rate) fprintf(outfile, "%-9llu Aggregate rate-limit target (req/s)\n", c_rate_aggregate);
+            fprintf(outfile, "%-9llu Total connections%s (%u x %u x %zu)\n", c_total_conns, ramp, cfg.threads,
+                    cfg.clients, c_endpoints);
+            if (c_has_rate) fprintf(outfile, "%-9llu Aggregate rate-limit target (req/s)%s\n", c_rate_aggregate, ramp);
         }
 
         fprintf(outfile, "%-9llu %s\n", (unsigned long long) (cfg.requests > 0 ? cfg.requests : cfg.test_time),

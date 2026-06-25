@@ -771,22 +771,20 @@ void cluster_client::print_topology_summary() const
 
     // Process-global gate keyed on (run id, signature). Guarded by a mutex
     // because the signature is wider than a lock-free atomic and several worker
-    // threads can reach this concurrently after a refresh. The first thread to
-    // observe a new (run, shape) prints; the rest return.
+    // threads can reach this concurrently after a refresh. The lock is held
+    // across the whole emit (not just the gate update) so two workers cannot
+    // interleave their blocks or print a superseded topology after a newer one.
     const unsigned int rid = m_config->current_run_id;
-    {
-        static pthread_mutex_t s_mtx = PTHREAD_MUTEX_INITIALIZER;
-        static unsigned int s_last_run = UINT_MAX;
-        static unsigned long long s_last_sig = 0;
-        pthread_mutex_lock(&s_mtx);
-        bool already_printed = (s_last_run == rid && s_last_sig == sig);
-        if (!already_printed) {
-            s_last_run = rid;
-            s_last_sig = sig;
-        }
+    static pthread_mutex_t s_mtx = PTHREAD_MUTEX_INITIALIZER;
+    static unsigned int s_last_run = UINT_MAX;
+    static unsigned long long s_last_sig = 0;
+    pthread_mutex_lock(&s_mtx);
+    if (s_last_run == rid && s_last_sig == sig) {
         pthread_mutex_unlock(&s_mtx);
-        if (already_printed) return;
+        return;
     }
+    s_last_run = rid;
+    s_last_sig = sig;
 
     size_t primaries = 0, replicas = 0;
     for (size_t i = 0; i < eps.size(); i++) {
@@ -827,11 +825,15 @@ void cluster_client::print_topology_summary() const
 
     // Total opened connections = threads x conns-per-thread x endpoints. Each
     // cluster_client opens one shard_connection per distinct endpoint, so the
-    // endpoint count is the per-client connection fan-out.
+    // endpoint count is the per-client connection fan-out. With the
+    // --clients-start staircase ramp, m_config->clients is the peak (full-ramp)
+    // value, so the figure is the target fan-out; flag that so it isn't read as
+    // the count already opened.
+    const char *ramp = (m_config->clients_start > 0) ? " at full ramp" : "";
     const unsigned long long endpoints = (unsigned long long) eps.size();
     const unsigned long long total_conns =
         (unsigned long long) m_config->threads * (unsigned long long) m_config->clients * endpoints;
-    fprintf(stderr, "[RUN #%u] Total connections: %u threads x %u conns/thread x %llu endpoints = %llu\n", rid,
+    fprintf(stderr, "[RUN #%u] Total connections%s: %u threads x %u conns/thread x %llu endpoints = %llu\n", rid, ramp,
             m_config->threads, m_config->clients, endpoints, total_conns);
 
     // --rate-limiting is per-connection; surface the aggregate target only when
@@ -845,9 +847,11 @@ void cluster_client::print_topology_summary() const
         const unsigned long long aggregate = (unsigned long long) m_config->request_rate *
                                              (unsigned long long) m_config->threads *
                                              (unsigned long long) m_config->clients * traffic_eps;
-        fprintf(stderr, "[RUN #%u] Rate limit: %u req/s/conn -> %llu req/s aggregate target\n", rid,
-                m_config->request_rate, aggregate);
+        fprintf(stderr, "[RUN #%u] Rate limit: %u req/s/conn -> %llu req/s aggregate target%s\n", rid,
+                m_config->request_rate, aggregate, ramp);
     }
+
+    pthread_mutex_unlock(&s_mtx);
 }
 
 bool cluster_client::handle_cluster_slots(protocol_response *r)
