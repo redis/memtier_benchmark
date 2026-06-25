@@ -192,6 +192,23 @@ public:
     void set_interrupted(bool interrupted) { m_interrupted = interrupted; }
     bool get_interrupted() const { return m_interrupted; }
 
+    // Cluster topology counts captured once at run end from a cluster_client's
+    // build_topology_snapshot() so the results summary agrees with the one-shot
+    // startup "[RUN #N] Cluster topology" line. 0 when not in cluster mode.
+    // (2.4 cluster mode is primary-only, so replicas is always 0.)
+    size_t m_cluster_endpoints;
+    size_t m_cluster_primaries;
+    size_t m_cluster_replicas;
+    void set_cluster_topology(size_t total, size_t primaries, size_t replicas)
+    {
+        m_cluster_endpoints = total;
+        m_cluster_primaries = primaries;
+        m_cluster_replicas = replicas;
+    }
+    size_t get_endpoint_count() const { return m_cluster_endpoints; }
+    size_t get_primary_endpoint_count() const { return m_cluster_primaries; }
+    size_t get_replica_endpoint_count() const { return m_cluster_replicas; }
+
     void update_get_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency,
                        unsigned int hits, unsigned int misses);
     void update_set_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency);

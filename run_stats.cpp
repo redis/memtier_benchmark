@@ -122,7 +122,14 @@ inline timeval timeval_factorial_average(timeval a, timeval b, unsigned int weig
     return (tv);
 }
 
-run_stats::run_stats(benchmark_config *config) : m_config(config), m_interrupted(false), m_totals(), m_cur_stats(0)
+run_stats::run_stats(benchmark_config *config) :
+        m_config(config),
+        m_interrupted(false),
+        m_totals(),
+        m_cur_stats(0),
+        m_cluster_endpoints(0),
+        m_cluster_primaries(0),
+        m_cluster_replicas(0)
 {
     memset(&m_start_time, 0, sizeof(m_start_time));
     memset(&m_end_time, 0, sizeof(m_end_time));

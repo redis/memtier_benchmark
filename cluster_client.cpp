@@ -44,6 +44,10 @@
 #include <assert.h>
 #endif
 
+#include <atomic>
+#include <map>
+#include <algorithm>
+
 #include "cluster_client.h"
 #include "memtier_benchmark.h"
 #include "obj_gen.h"
@@ -355,6 +359,156 @@ void cluster_client::build_mget_slot_cache()
     }
 }
 
+// "host:port" for a shard_connection, defensive against NULL fields.
+static std::string sc_endpoint_addr(shard_connection *sc)
+{
+    const char *a = sc->get_address();
+    const char *p = sc->get_port();
+    std::string s(a ? a : "?");
+    s += ":";
+    s += (p ? p : "?");
+    return s;
+}
+
+// Sort [start,end] ranges and merge touching/overlapping ones into the minimal
+// set of contiguous ranges.
+static std::vector<std::pair<int, int> > merge_slot_ranges(std::vector<std::pair<int, int> > v)
+{
+    std::sort(v.begin(), v.end());
+    std::vector<std::pair<int, int> > m;
+    for (size_t i = 0; i < v.size(); i++) {
+        if (!m.empty() && v[i].first <= m.back().second + 1)
+            m.back().second = std::max(m.back().second, v[i].second);
+        else
+            m.push_back(v[i]);
+    }
+    return m;
+}
+
+std::vector<cluster_endpoint_info> cluster_client::build_topology_snapshot() const
+{
+    std::vector<cluster_endpoint_info> out;
+    if (m_connections.empty()) return out;
+
+    // Build per-conn_id contiguous slot runs by scanning the slot map once.
+    // m_slot_to_shard[slot] = owning shard_connection id (== index in
+    // m_connections). 2.4 is primary-only -- there are no replica endpoints.
+    // (Uncovered slots default to conn 0 since the map is zero-initialized; a
+    // fully-covered cluster -- the normal case -- assigns every slot.)
+    std::map<unsigned int, std::vector<std::pair<int, int> > > conn_ranges;
+    unsigned int run_conn = m_slot_to_shard[0];
+    int run_start = 0;
+    for (int s = 1; s <= MAX_CLUSTER_HSLOT; s++) {
+        if (m_slot_to_shard[s] != run_conn) {
+            conn_ranges[run_conn].push_back(std::make_pair(run_start, s - 1));
+            run_conn = m_slot_to_shard[s];
+            run_start = s;
+        }
+    }
+    conn_ranges[run_conn].push_back(std::make_pair(run_start, MAX_CLUSTER_HSLOT));
+
+    // Coalesce by distinct endpoint (host:port), preserving first-seen order,
+    // so the count is by node rather than by slot range.
+    std::vector<std::string> order;
+    std::map<std::string, std::vector<std::pair<int, int> > > addr_ranges;
+    for (std::map<unsigned int, std::vector<std::pair<int, int> > >::const_iterator it = conn_ranges.begin();
+         it != conn_ranges.end(); ++it) {
+        unsigned int cid = it->first;
+        if (cid >= m_connections.size() || m_connections[cid] == NULL) continue;
+        std::string addr = sc_endpoint_addr(m_connections[cid]);
+        if (addr_ranges.find(addr) == addr_ranges.end()) order.push_back(addr);
+        std::vector<std::pair<int, int> > &v = addr_ranges[addr];
+        v.insert(v.end(), it->second.begin(), it->second.end());
+    }
+    for (size_t i = 0; i < order.size(); i++) {
+        cluster_endpoint_info info;
+        info.addr = order[i];
+        info.is_primary = true;
+        info.slot_ranges = merge_slot_ranges(addr_ranges[order[i]]);
+        out.push_back(info);
+    }
+    return out;
+}
+
+void cluster_client::print_topology_summary() const
+{
+    std::vector<cluster_endpoint_info> eps = build_topology_snapshot();
+    if (eps.empty()) return;
+
+    // Signature of the topology shape (endpoints + slot ranges). The startup
+    // block prints on the first commit of each run AND reprints when this
+    // signature changes within a run, so a mid-run CLUSTER SLOTS refresh that
+    // alters the topology is logged and stays consistent with the run-end
+    // results summary.
+    unsigned long long sig = 1469598103934665603ULL; // FNV-1a 64-bit offset basis
+    for (size_t i = 0; i < eps.size(); i++) {
+        const cluster_endpoint_info &e = eps[i];
+        for (size_t c = 0; c < e.addr.size(); c++) {
+            sig ^= (unsigned char) e.addr[c];
+            sig *= 1099511628211ULL;
+        }
+        for (size_t r = 0; r < e.slot_ranges.size(); r++) {
+            sig ^= (unsigned long long) e.slot_ranges[r].first;
+            sig *= 1099511628211ULL;
+            sig ^= (unsigned long long) e.slot_ranges[r].second;
+            sig *= 1099511628211ULL;
+        }
+    }
+
+    // Process-global gate keyed on (run id, signature), mutex-guarded because
+    // the signature is wider than a lock-free atomic and several worker threads
+    // can reach this concurrently after a refresh.
+    const unsigned int rid = m_config->current_run_id;
+    {
+        static pthread_mutex_t s_mtx = PTHREAD_MUTEX_INITIALIZER;
+        static unsigned int s_last_run = UINT_MAX;
+        static unsigned long long s_last_sig = 0;
+        pthread_mutex_lock(&s_mtx);
+        bool already_printed = (s_last_run == rid && s_last_sig == sig);
+        if (!already_printed) {
+            s_last_run = rid;
+            s_last_sig = sig;
+        }
+        pthread_mutex_unlock(&s_mtx);
+        if (already_printed) return;
+    }
+
+    fprintf(stderr, "[RUN #%u] Cluster topology: %zu endpoints discovered (%zu primaries)\n", rid, eps.size(),
+            eps.size());
+
+    // One compact line per node: slot count + range count. Cap the list so a
+    // large cluster doesn't flood the log; the count above is authoritative.
+    const size_t LIST_CAP = 40;
+    const size_t shown = eps.size() < LIST_CAP ? eps.size() : LIST_CAP;
+    for (size_t i = 0; i < shown; i++) {
+        const cluster_endpoint_info &e = eps[i];
+        size_t slots = 0;
+        for (size_t r = 0; r < e.slot_ranges.size(); r++)
+            slots += (size_t) (e.slot_ranges[r].second - e.slot_ranges[r].first + 1);
+        const size_t nr = e.slot_ranges.size();
+        const char *rp = (nr == 1) ? "" : "s";
+        const char *sp = (slots == 1) ? "" : "s";
+        fprintf(stderr, "           %-22s primary   %5zu slot%s in %zu range%s\n", e.addr.c_str(), slots, sp, nr, rp);
+    }
+    if (eps.size() > shown) fprintf(stderr, "           ... and %zu more endpoints\n", eps.size() - shown);
+
+    // Total opened connections = threads x conns-per-thread x endpoints. Each
+    // cluster_client opens one shard_connection per distinct endpoint.
+    const unsigned long long endpoints = (unsigned long long) eps.size();
+    const unsigned long long total_conns =
+        (unsigned long long) m_config->threads * (unsigned long long) m_config->clients * endpoints;
+    fprintf(stderr, "[RUN #%u] Total connections: %u threads x %u conns/thread x %llu endpoints = %llu\n", rid,
+            m_config->threads, m_config->clients, endpoints, total_conns);
+
+    // --rate-limiting is per-connection. 2.4 cluster mode is primary-only, so
+    // every connection generates traffic; the aggregate target spans them all.
+    if (m_config->request_rate > 0) {
+        const unsigned long long aggregate = (unsigned long long) m_config->request_rate * total_conns;
+        fprintf(stderr, "[RUN #%u] Rate limit: %u req/s/conn -> %llu req/s aggregate target\n", rid,
+                m_config->request_rate, aggregate);
+    }
+}
+
 void cluster_client::handle_cluster_slots(protocol_response *r)
 {
     /*
@@ -529,6 +683,11 @@ void cluster_client::handle_cluster_slots(protocol_response *r)
             }
         }
     }
+
+    // Emit the one-shot human-readable topology summary now that the slot map
+    // is committed (slot ranges and endpoints are only known here).
+    // print_topology_summary() self-gates to fire once per run / shape.
+    print_topology_summary();
 
     // Rebuild same-slot key index cache for MGET if enabled.
     build_mget_slot_cache();
