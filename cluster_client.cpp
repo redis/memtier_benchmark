@@ -772,12 +772,13 @@ void cluster_client::print_topology_summary() const
         for (size_t r = 0; r < e.slot_ranges.size(); r++)
             slots += (size_t) (e.slot_ranges[r].second - e.slot_ranges[r].first + 1);
         const size_t nr = e.slot_ranges.size();
-        const char *plural = (nr == 1) ? "" : "s";
+        const char *rp = (nr == 1) ? "" : "s";
+        const char *sp = (slots == 1) ? "" : "s";
         if (e.is_primary)
-            fprintf(stderr, "           %-22s primary   %5zu slots in %zu range%s\n", e.addr.c_str(), slots, nr, plural);
+            fprintf(stderr, "           %-22s primary   %5zu slot%s in %zu range%s\n", e.addr.c_str(), slots, sp, nr, rp);
         else
-            fprintf(stderr, "           %-22s replica   %5zu slots in %zu range%s  -> %s\n", e.addr.c_str(), slots, nr,
-                    plural, e.primary_addr.c_str());
+            fprintf(stderr, "           %-22s replica   %5zu slot%s in %zu range%s  -> %s\n", e.addr.c_str(), slots, sp,
+                    nr, rp, e.primary_addr.c_str());
     }
     if (eps.size() > shown)
         fprintf(stderr, "           ... and %zu more endpoints\n", eps.size() - shown);
