@@ -45,6 +45,8 @@
 #endif
 
 #include <atomic>
+#include <map>
+#include <algorithm>
 
 #include "cluster_client.h"
 #include "command_meta.h"
@@ -636,6 +638,21 @@ static std::string sc_endpoint_addr(shard_connection *sc)
     return s;
 }
 
+// Sort [start,end] ranges and merge touching/overlapping ones into the minimal
+// set of contiguous ranges.
+static std::vector<std::pair<int, int> > merge_slot_ranges(std::vector<std::pair<int, int> > v)
+{
+    std::sort(v.begin(), v.end());
+    std::vector<std::pair<int, int> > m;
+    for (size_t i = 0; i < v.size(); i++) {
+        if (!m.empty() && v[i].first <= m.back().second + 1)
+            m.back().second = std::max(m.back().second, v[i].second);
+        else
+            m.push_back(v[i]);
+    }
+    return m;
+}
+
 std::vector<cluster_endpoint_info> cluster_client::build_topology_snapshot() const
 {
     std::vector<cluster_endpoint_info> out;
@@ -643,8 +660,7 @@ std::vector<cluster_endpoint_info> cluster_client::build_topology_snapshot() con
         return out;
 
     // Reconstruct each group's contiguous slot runs by scanning the slot map
-    // once. A group can own several disjoint runs (e.g. after resharding), so
-    // we collect a vector of [start,end] ranges per group index.
+    // once. A group == one CLUSTER SLOTS shard entry (one contiguous range).
     std::vector<std::vector<std::pair<int, int> > > group_ranges(m_shard_groups.size());
     unsigned int run_group = UINT_MAX;
     int run_start = 0;
@@ -660,31 +676,55 @@ std::vector<cluster_endpoint_info> cluster_client::build_topology_snapshot() con
     if (run_group != UINT_MAX && run_group < group_ranges.size())
         group_ranges[run_group].push_back(std::make_pair(run_start, MAX_CLUSTER_HSLOT));
 
-    // Primaries first (in shard order), then replicas, so the printed list
-    // reads "all primaries, then all replicas".
+    // Coalesce by distinct endpoint (host:port). A single node commonly owns
+    // many disjoint slot ranges (striped layouts), each a separate shard_group
+    // that points at the SAME shard_connection; the client opens ONE connection
+    // per node, so the topology must be counted by node, not by group. Merge
+    // every group's ranges into its node's entry and recompute contiguous runs.
+    // First-seen order is preserved for stable output.
+    std::vector<std::string> primary_order;
+    std::map<std::string, std::vector<std::pair<int, int> > > primary_ranges;
+    std::vector<std::string> replica_order;
+    std::map<std::string, std::string> replica_primary; // replica addr -> its primary addr
+    std::map<std::string, std::vector<std::pair<int, int> > > replica_ranges;
+
     for (size_t gi = 0; gi < m_shard_groups.size(); gi++) {
         const shard_group &grp = m_shard_groups[gi];
         if (grp.primary == NULL) continue;
-        cluster_endpoint_info info;
-        info.addr = sc_endpoint_addr(grp.primary);
-        info.is_primary = true;
-        info.slot_ranges = group_ranges[gi];
-        out.push_back(info);
-    }
-    for (size_t gi = 0; gi < m_shard_groups.size(); gi++) {
-        const shard_group &grp = m_shard_groups[gi];
-        if (grp.primary == NULL) continue;
-        std::string primary_addr = sc_endpoint_addr(grp.primary);
+        std::string paddr = sc_endpoint_addr(grp.primary);
+        if (primary_ranges.find(paddr) == primary_ranges.end())
+            primary_order.push_back(paddr);
+        std::vector<std::pair<int, int> > &pr = primary_ranges[paddr];
+        pr.insert(pr.end(), group_ranges[gi].begin(), group_ranges[gi].end());
+
         for (size_t ri = 0; ri < grp.replicas.size(); ri++) {
             shard_connection *rep = grp.replicas[ri];
             if (rep == NULL) continue;
-            cluster_endpoint_info info;
-            info.addr = sc_endpoint_addr(rep);
-            info.is_primary = false;
-            info.primary_addr = primary_addr;
-            info.slot_ranges = group_ranges[gi];
-            out.push_back(info);
+            std::string raddr = sc_endpoint_addr(rep);
+            if (replica_ranges.find(raddr) == replica_ranges.end()) {
+                replica_order.push_back(raddr);
+                replica_primary[raddr] = paddr;
+            }
+            std::vector<std::pair<int, int> > &rr = replica_ranges[raddr];
+            rr.insert(rr.end(), group_ranges[gi].begin(), group_ranges[gi].end());
         }
+    }
+
+    // Primaries first (first-seen order), then replicas.
+    for (size_t i = 0; i < primary_order.size(); i++) {
+        cluster_endpoint_info info;
+        info.addr = primary_order[i];
+        info.is_primary = true;
+        info.slot_ranges = merge_slot_ranges(primary_ranges[primary_order[i]]);
+        out.push_back(info);
+    }
+    for (size_t i = 0; i < replica_order.size(); i++) {
+        cluster_endpoint_info info;
+        info.addr = replica_order[i];
+        info.is_primary = false;
+        info.primary_addr = replica_primary[replica_order[i]];
+        info.slot_ranges = merge_slot_ranges(replica_ranges[replica_order[i]]);
+        out.push_back(info);
     }
     return out;
 }
@@ -721,29 +761,26 @@ void cluster_client::print_topology_summary() const
         fprintf(stderr, "[RUN #%u] Cluster topology: %zu endpoints discovered (%zu primaries)\n", rid, eps.size(),
                 primaries);
 
-    for (size_t i = 0; i < eps.size(); i++) {
+    // One compact line per distinct node: slot count + range count (not the
+    // enumerated ranges -- a striped node can own dozens). Cap the list so a
+    // large cluster doesn't flood the log; the counts above are authoritative.
+    const size_t LIST_CAP = 40;
+    const size_t shown = eps.size() < LIST_CAP ? eps.size() : LIST_CAP;
+    for (size_t i = 0; i < shown; i++) {
         const cluster_endpoint_info &e = eps[i];
-        std::string ranges;
-        char buf[64];
-        for (size_t r = 0; r < e.slot_ranges.size(); r++) {
-            if (r) ranges += ",";
-            if (e.slot_ranges[r].first == e.slot_ranges[r].second)
-                snprintf(buf, sizeof(buf), "%d", e.slot_ranges[r].first);
-            else
-                snprintf(buf, sizeof(buf), "%d-%d", e.slot_ranges[r].first, e.slot_ranges[r].second);
-            ranges += buf;
-        }
+        size_t slots = 0;
+        for (size_t r = 0; r < e.slot_ranges.size(); r++)
+            slots += (size_t) (e.slot_ranges[r].second - e.slot_ranges[r].first + 1);
         const size_t nr = e.slot_ranges.size();
         const char *plural = (nr == 1) ? "" : "s";
-        if (e.is_primary) {
-            fprintf(stderr, "           %-22s primary   slots %-20s (%zu slot range%s)\n", e.addr.c_str(),
-                    ranges.c_str(), nr, plural);
-        } else {
-            std::string link = "-> " + e.primary_addr;
-            fprintf(stderr, "           %-22s replica   %-26s (%zu slot range%s)\n", e.addr.c_str(), link.c_str(), nr,
-                    plural);
-        }
+        if (e.is_primary)
+            fprintf(stderr, "           %-22s primary   %5zu slots in %zu range%s\n", e.addr.c_str(), slots, nr, plural);
+        else
+            fprintf(stderr, "           %-22s replica   %5zu slots in %zu range%s  -> %s\n", e.addr.c_str(), slots, nr,
+                    plural, e.primary_addr.c_str());
     }
+    if (eps.size() > shown)
+        fprintf(stderr, "           ... and %zu more endpoints\n", eps.size() - shown);
 
     // Total opened connections = threads x conns-per-thread x endpoints. Each
     // cluster_client opens one shard_connection per distinct endpoint, so the
