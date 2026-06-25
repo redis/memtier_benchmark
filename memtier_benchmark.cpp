@@ -21,6 +21,12 @@
 #define _XOPEN_SOURCE 600
 #endif
 
+// _GNU_SOURCE exposes getrusage(RUSAGE_THREAD) on glibc (per-thread CPU
+// accounting). Harmless on musl/Alpine, where RUSAGE_THREAD is unconditional.
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
@@ -50,6 +56,8 @@
 #include <ctype.h>
 #include <sys/utsname.h>
 #include <dirent.h>
+#include <arpa/inet.h>  // inet_pton, ntohl/ntohs for prometheus-bind-addr parsing
+#include <netinet/in.h> // struct in_addr / in6_addr / IN6_IS_ADDR_LOOPBACK
 #include <event2/event.h>
 #include <event2/thread.h>
 
@@ -81,13 +89,20 @@
 #include <atomic>
 #include <algorithm>
 
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
+
 #include "client.h"
 #include "cluster_client.h"
 #include "JSON_handler.h"
 #include "obj_gen.h"
 #include "memtier_benchmark.h"
+#include "run_stats_types.h"
 #include "retry_policy.h"
 #include "statsd.h"
+#include "prometheus_metrics.h"
+#include "prometheus_exporter.h"
 
 
 int log_level = 0;
@@ -126,6 +141,14 @@ static void print_all_threads_stack_trace(FILE *fp, int pid, const char *timestr
 
 // Global pointer to threads for crash handler access
 static std::vector<cg_thread *> *g_threads = NULL;
+
+#ifdef HAVE_EVHTTP
+// Ownership handle for the Prometheus exporter (PLAN.md section 3.1, Decisions
+// #2). Lives next to g_threads; cfg.prometheus aliases it. Keeping the global
+// reachable means an exporter deliberately leaked on an exit(1) path stays
+// LSan-reachable (no suppressions). NULL when the exporter is disabled.
+static prometheus_exporter *g_prom_exporter = NULL;
+#endif
 
 // ---------------------------------------------------------------------------
 // Connection-stage supervisor state (declarations in memtier_benchmark.h)
@@ -510,6 +533,56 @@ static const char *get_protocol_name(enum PROTOCOL_TYPE type)
         return "none";
 }
 
+#ifdef HAVE_EVHTTP
+// Comma-joined "key=value" run labels in insertion order (PLAN.md section 5).
+// With json_escape, applies JSON string escaping (\, ", and control chars as
+// \u00XX) because json_handler::write_obj is a raw vfprintf passthrough.
+static std::string prometheus_run_labels_str(struct benchmark_config *cfg, bool json_escape)
+{
+    std::string s;
+    for (size_t i = 0; i < cfg->prometheus_run_labels.size(); i++) {
+        if (i > 0) s += ",";
+        const std::string &k = cfg->prometheus_run_labels[i].first;
+        const std::string &v = cfg->prometheus_run_labels[i].second;
+        std::string kv = k + "=" + v;
+        if (json_escape) {
+            for (size_t j = 0; j < kv.size(); j++) {
+                unsigned char c = (unsigned char) kv[j];
+                if (c == '\\') {
+                    s += "\\\\";
+                } else if (c == '"') {
+                    s += "\\\"";
+                } else if (c < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", (unsigned int) c);
+                    s += buf;
+                } else {
+                    s += (char) c;
+                }
+            }
+        } else {
+            s += kv;
+        }
+    }
+    return s;
+}
+
+// "default" when no custom buckets were given, else %.12g comma-joined seconds
+// (same precision as format_le so parsed-float round-trips). PLAN.md section 5.
+static std::string prometheus_buckets_str(struct benchmark_config *cfg)
+{
+    if (cfg->prometheus_latency_buckets.empty()) return "default";
+    std::string s;
+    char buf[64];
+    for (size_t i = 0; i < cfg->prometheus_latency_buckets.size(); i++) {
+        if (i > 0) s += ",";
+        snprintf(buf, sizeof(buf), "%.12g", cfg->prometheus_latency_buckets[i]);
+        s += buf;
+    }
+    return s;
+}
+#endif // HAVE_EVHTTP
+
 static void config_print(FILE *file, struct benchmark_config *cfg)
 {
     char tmpbuf[512];
@@ -578,7 +651,14 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             "num-slaves = %u-%u\n"
             "wait-timeout = %u-%u\n"
             "json-out-file = %s\n"
-            "print-all-runs = %s\n",
+            "print-all-runs = %s\n"
+#ifdef HAVE_EVHTTP
+            "prometheus-port = %d\n"
+            "prometheus-bind-addr = %s\n"
+            "prometheus-run-labels = %s\n"
+            "prometheus-latency-buckets = %s\n"
+#endif
+            ,
             cfg->server, cfg->port, cfg->uri ? cfg->uri : "", cfg->unix_socket,
             cfg->resolution == AF_UNSPEC ? "Unspecified"
             : cfg->resolution == AF_INET ? "AF_INET"
@@ -601,7 +681,13 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             cfg->thread_conn_start_min_jitter_micros, cfg->thread_conn_start_max_jitter_micros, cfg->multi_key_get,
             cfg->authenticate ? cfg->authenticate : "", cfg->select_db, cfg->no_expiry ? "yes" : "no",
             cfg->wait_ratio.a, cfg->wait_ratio.b, cfg->num_slaves.min, cfg->num_slaves.max, cfg->wait_timeout.min,
-            cfg->wait_timeout.max, cfg->json_out_file, cfg->print_all_runs ? "yes" : "no");
+            cfg->wait_timeout.max, cfg->json_out_file, cfg->print_all_runs ? "yes" : "no"
+#ifdef HAVE_EVHTTP
+            ,
+            cfg->prometheus_port, cfg->prometheus_bind_addr ? cfg->prometheus_bind_addr : "127.0.0.1",
+            prometheus_run_labels_str(cfg, false).c_str(), prometheus_buckets_str(cfg).c_str()
+#endif
+    );
 }
 
 static void config_print_to_json(json_handler *jsonhandler, struct benchmark_config *cfg)
@@ -732,6 +818,16 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
         }
         jsonhandler->write_obj("read_servers", "\"%s\"", read_servers_str.c_str());
     }
+
+#ifdef HAVE_EVHTTP
+    // Prometheus configuration (PLAN.md section 5). None of these are secrets.
+    // Run labels are JSON-escaped because write_obj is a raw vfprintf passthrough.
+    jsonhandler->write_obj("prometheus-port", "%d", cfg->prometheus_port);
+    jsonhandler->write_obj("prometheus-bind-addr", "\"%s\"",
+                           cfg->prometheus_bind_addr ? cfg->prometheus_bind_addr : "127.0.0.1");
+    jsonhandler->write_obj("prometheus-run-labels", "\"%s\"", prometheus_run_labels_str(cfg, true).c_str());
+    jsonhandler->write_obj("prometheus-latency-buckets", "\"%s\"", prometheus_buckets_str(cfg).c_str());
+#endif
 
     jsonhandler->close_nesting();
 }
@@ -882,6 +978,7 @@ static void config_init_defaults(struct benchmark_config *cfg)
     if (!cfg->print_percentiles.is_defined()) cfg->print_percentiles = config_quantiles("50,99,99.9");
     if (!cfg->monitor_pattern) cfg->monitor_pattern = 'S';
     if (cfg->miss_rate_threshold < 0.0) cfg->miss_rate_threshold = 0.01; // Default: warn above 1%
+    if (cfg->cpu_warn_threshold < 0.0) cfg->cpu_warn_threshold = 0.95;   // Default: warn above 95% of a core
     // Default --connection-stage-timeout to 30 s; 0 means "operator disabled".
     if (cfg->connection_stage_timeout == UINT_MAX) cfg->connection_stage_timeout = 30;
 
@@ -890,6 +987,14 @@ static void config_init_defaults(struct benchmark_config *cfg)
     if (!cfg->statsd_prefix) cfg->statsd_prefix = "memtier";
     if (!cfg->statsd_run_label) cfg->statsd_run_label = "default";
     if (!cfg->graphite_port) cfg->graphite_port = 8080;
+
+        // Prometheus defaults - bind-addr only matters if --prometheus-port is set.
+        // NULL at parse time means "user didn't pass it" (so the W1 non-loopback
+        // warning never fires on the default); the loopback default is applied here,
+        // after parsing. PLAN.md section 5.
+#ifdef HAVE_EVHTTP
+    if (!cfg->prometheus_bind_addr) cfg->prometheus_bind_addr = "127.0.0.1";
+#endif
 
 #ifdef USE_TLS
     if (!cfg->tls_protocols) cfg->tls_protocols = REDIS_TLS_PROTO_DEFAULT;
@@ -1005,6 +1110,31 @@ static bool optarg_is_negative(const char *s)
     return *s == '-';
 }
 
+#ifdef HAVE_EVHTTP
+// True if a bracket-free numeric IPv4/IPv6 literal is a loopback address
+// (PLAN.md section 5, W1). IPv4 loopback = 127.0.0.0/8; IPv6 loopback = ::1.
+// 0.0.0.0 and :: are NOT loopback (they are wildcard binds). IPv4-mapped
+// ::ffff:127.0.0.1 is treated as loopback (accepted conservatism). The
+// fallback is false (fail-safe = warn) when the literal does not parse as
+// either family.
+static bool addr_is_loopback(const char *addr)
+{
+    if (addr == NULL) return false;
+    struct in_addr a4;
+    if (inet_pton(AF_INET, addr, &a4) == 1) {
+        return (ntohl(a4.s_addr) >> 24) == 127;
+    }
+    struct in6_addr a6;
+    if (inet_pton(AF_INET6, addr, &a6) == 1) {
+        if (IN6_IS_ADDR_LOOPBACK(&a6)) return true;
+        // IPv4-mapped ::ffff:127.x.x.x -> inspect the embedded v4 octet.
+        if (IN6_IS_ADDR_V4MAPPED(&a6)) return a6.s6_addr[12] == 127;
+        return false;
+    }
+    return false;
+}
+#endif
+
 static int config_parse_args(int argc, char *argv[], struct benchmark_config *cfg)
 {
     enum extended_options
@@ -1068,6 +1198,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_command_stats_breakdown,
         o_command_miss_tracking,
         o_miss_rate_threshold,
+        o_cpu_warn_threshold,
         o_tls,
         o_tls_cert,
         o_tls_key,
@@ -1083,6 +1214,10 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_statsd_prefix,
         o_statsd_run_label,
         o_graphite_port,
+        o_prometheus_port,
+        o_prometheus_bind_addr,
+        o_prometheus_run_label,
+        o_prometheus_latency_buckets,
         o_scan_incremental_iteration,
         o_scan_incremental_max_iterations,
         o_clients_start,
@@ -1185,6 +1320,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         {"command-stats-breakdown", 1, 0, o_command_stats_breakdown},
         {"command-miss-tracking", 1, 0, o_command_miss_tracking},
         {"miss-rate-threshold", 1, 0, o_miss_rate_threshold},
+        {"cpu-warn-threshold", 1, 0, o_cpu_warn_threshold},
         {"rate-limiting", 1, 0, o_rate_limiting},
         {"uri", 1, 0, o_uri},
         {"statsd-host", 1, 0, o_statsd_host},
@@ -1192,6 +1328,12 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         {"statsd-prefix", 1, 0, o_statsd_prefix},
         {"statsd-run-label", 1, 0, o_statsd_run_label},
         {"graphite-port", 1, 0, o_graphite_port},
+#ifdef HAVE_EVHTTP
+        {"prometheus-port", 1, 0, o_prometheus_port},
+        {"prometheus-bind-addr", 1, 0, o_prometheus_bind_addr},
+        {"prometheus-run-label", 1, 0, o_prometheus_run_label},
+        {"prometheus-latency-buckets", 1, 0, o_prometheus_latency_buckets},
+#endif
         {"scan-incremental-iteration", 0, 0, o_scan_incremental_iteration},
         {"scan-incremental-max-iterations", 1, 0, o_scan_incremental_max_iterations},
         {"clients-start", 1, 0, o_clients_start},
@@ -1233,6 +1375,13 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             // Print OpenSSL version if TLS is enabled
 #ifdef USE_TLS
             printf(" openssl=%s", OPENSSL_VERSION_TEXT);
+#endif
+
+            // Print Prometheus exporter availability (compiled in iff HAVE_EVHTTP)
+#ifdef HAVE_EVHTTP
+            printf(" prometheus=yes");
+#else
+            printf(" prometheus=no");
 #endif
 
             printf("\n");
@@ -1906,6 +2055,16 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             cfg->miss_rate_threshold = pct / 100.0;
             break;
         }
+        case o_cpu_warn_threshold: {
+            endptr = NULL;
+            double pct = strtod(optarg, &endptr);
+            if (endptr == optarg || !endptr || *endptr != '\0' || !std::isfinite(pct) || pct < 0.0 || pct > 100.0) {
+                fprintf(stderr, "error: --cpu-warn-threshold must be a percentage between 0 and 100.\n");
+                return -1;
+            }
+            cfg->cpu_warn_threshold = pct / 100.0;
+            break;
+        }
         case o_rate_limiting: {
             endptr = NULL;
             cfg->request_rate = (unsigned int) strtoul(optarg, &endptr, 10);
@@ -2002,6 +2161,127 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 return -1;
             }
             break;
+#ifdef HAVE_EVHTTP
+        case o_prometheus_port: {
+            // strtoul pattern (statsd-port) with three deltas: accept 0,
+            // reject a leading '-' before strtoul wraps it, and bound the
+            // value to [0,65535] BEFORE any narrowing cast (a cast would
+            // silently wrap 70000 -> 4464). PLAN.md section 5 / E1.
+            static const char *E1 = "error: prometheus-port must be a number in the range [0-65535] (0 = ephemeral).\n";
+            if (!optarg || !*optarg || optarg_is_negative(optarg)) {
+                fprintf(stderr, "%s", E1);
+                return -1;
+            }
+            endptr = NULL;
+            unsigned long pport = strtoul(optarg, &endptr, 10);
+            if (!endptr || *endptr != '\0' || pport > 65535) {
+                fprintf(stderr, "%s", E1);
+                return -1;
+            }
+            cfg->prometheus_port = (int) pport;
+            break;
+        }
+        case o_prometheus_bind_addr: {
+            // Numeric IPv4/IPv6 literals only; hostnames (incl. localhost)
+            // rejected (no DNS at startup). Bracketed IPv6 [::1] is accepted
+            // and stripped in place; brackets imply IPv6 ([1.2.3.4] rejected).
+            // PLAN.md section 5 / E2.
+            static const char *E2 = "error: prometheus-bind-addr must be a numeric IPv4 or IPv6 address "
+                                    "(e.g. 127.0.0.1, 0.0.0.0, ::1, ::); hostnames are not supported "
+                                    "(for localhost use 127.0.0.1 or ::1).\n";
+            if (!optarg || !*optarg) {
+                fprintf(stderr, "%s", E2);
+                return -1;
+            }
+            bool bracketed = (optarg[0] == '[');
+            // argv is modifiable (C11 5.1.2.2.1p2; --read-server precedent).
+            char *addr = optarg;
+            if (bracketed) {
+                char *close = strchr(addr, ']');
+                if (!close || *(close + 1) != '\0') { // require "[...]" with nothing after
+                    fprintf(stderr, "%s", E2);
+                    return -1;
+                }
+                *close = '\0';
+                addr = addr + 1; // strip leading '['
+            }
+            struct in_addr a4;
+            struct in6_addr a6;
+            bool ok = false;
+            if (!bracketed && inet_pton(AF_INET, addr, &a4) == 1) ok = true; // v4 only if unbracketed
+            if (!ok && inet_pton(AF_INET6, addr, &a6) == 1) ok = true;       // v6 always tried
+            if (!ok) {
+                fprintf(stderr, "%s", E2);
+                return -1;
+            }
+            cfg->prometheus_bind_addr = addr; // bracket-free literal, points into argv
+            break;
+        }
+        case o_prometheus_run_label: {
+            if (!optarg) {
+                fprintf(stderr, "error: --prometheus-run-label expects KEY=VALUE.\n");
+                return -1;
+            }
+            const char *eq = strchr(optarg, '=');
+            if (eq == NULL) {
+                fprintf(stderr, "error: --prometheus-run-label expects KEY=VALUE.\n");
+                return -1;
+            }
+            std::string key(optarg, (size_t) (eq - optarg));
+            std::string value(eq + 1);
+            switch (prom::validate_prom_label_name(key)) {
+            case prom::LABEL_NAME_OK:
+                break;
+            case prom::LABEL_NAME_TOO_LONG:
+                fprintf(stderr, "error: --prometheus-run-label: label name exceeds 128 bytes.\n");
+                return -1;
+            case prom::LABEL_NAME_INVALID:
+                fprintf(stderr,
+                        "error: --prometheus-run-label: invalid label name '%s' "
+                        "(must match [a-zA-Z_][a-zA-Z0-9_]*).\n",
+                        key.c_str());
+                return -1;
+            case prom::LABEL_NAME_RESERVED_PREFIX:
+                fprintf(stderr,
+                        "error: --prometheus-run-label: label name '%s' is reserved "
+                        "(names beginning with __ are reserved for Prometheus internal use).\n",
+                        key.c_str());
+                return -1;
+            case prom::LABEL_NAME_RESERVED:
+                fprintf(stderr, "error: --prometheus-run-label: label name '%s' is reserved.\n", key.c_str());
+                return -1;
+            }
+            if (value.size() > 256) {
+                fprintf(stderr, "error: --prometheus-run-label: value for '%s' exceeds 256 bytes.\n", key.c_str());
+                return -1;
+            }
+            for (size_t i = 0; i < cfg->prometheus_run_labels.size(); i++) {
+                if (cfg->prometheus_run_labels[i].first == key) {
+                    fprintf(stderr, "error: --prometheus-run-label: duplicate label name '%s'.\n", key.c_str());
+                    return -1;
+                }
+            }
+            if (cfg->prometheus_run_labels.size() >= 16) {
+                fprintf(stderr, "error: --prometheus-run-label: too many labels (max 16).\n");
+                return -1;
+            }
+            cfg->prometheus_run_labels.push_back(std::make_pair(key, value));
+            break;
+        }
+        case o_prometheus_latency_buckets: {
+            std::vector<double> parsed;
+            std::string err, warn;
+            if (!prom::parse_latency_buckets(optarg, parsed, err, warn)) {
+                fprintf(stderr, "%s\n", err.c_str());
+                return -1;
+            }
+            if (!warn.empty()) {
+                fprintf(stderr, "%s\n", warn.c_str());
+            }
+            cfg->prometheus_latency_buckets.swap(parsed); // last wins (cleared + refilled)
+            break;
+        }
+#endif // HAVE_EVHTTP
         case o_scan_incremental_iteration:
             cfg->scan_incremental_iteration = true;
             break;
@@ -2215,16 +2495,46 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         return -1;
     }
 
-    if (cfg->transaction && !cfg->cluster_mode) {
-        fprintf(stderr, "warning: --transaction has no effect without --cluster-mode. "
-                        "In standalone mode every client uses a single connection so commands "
-                        "are already serialized in order.\n");
-    }
-
     if ((cfg->cluster_mode && !verify_cluster_option(cfg)) ||
         (cfg->arbitrary_commands->is_defined() && !verify_arbitrary_command_option(cfg))) {
         return -1;
     }
+
+#ifdef HAVE_EVHTTP
+    // Prometheus post-parse tail (PLAN.md section 5). Runs once, before
+    // config_init_defaults, so a NULL bind-addr still means "unset" and the
+    // default 127.0.0.1 can never trip the W1 warning.
+    {
+        // (1) Dependency check (E12): any non-port prometheus flag requires
+        //     --prometheus-port. prometheus_port < 0 = flag absent.
+        if (cfg->prometheus_port < 0) {
+            const char *dep = NULL;
+            if (cfg->prometheus_bind_addr != NULL)
+                dep = "--prometheus-bind-addr";
+            else if (!cfg->prometheus_run_labels.empty())
+                dep = "--prometheus-run-label";
+            else if (!cfg->prometheus_latency_buckets.empty())
+                dep = "--prometheus-latency-buckets";
+            if (dep != NULL) {
+                fprintf(stderr, "error: %s requires --prometheus-port.\n", dep);
+                return -1;
+            }
+        }
+
+        // (2) One-shot non-loopback warning (W1) when an explicit bind-addr is
+        //     not a loopback address. The default is applied later, so only a
+        //     user-supplied bind-addr is checked here.
+        if (cfg->prometheus_port >= 0 && cfg->prometheus_bind_addr != NULL &&
+            !addr_is_loopback(cfg->prometheus_bind_addr)) {
+            fprintf(stderr,
+                    "warning: --prometheus-bind-addr=%s is not a loopback address; /metrics will be "
+                    "served as unauthenticated plaintext HTTP reachable from other hosts, and anyone "
+                    "who can connect can read benchmark metrics. Restrict access with a firewall or "
+                    "security group, or keep the default 127.0.0.1.\n",
+                    cfg->prometheus_bind_addr);
+        }
+    }
+#endif // HAVE_EVHTTP
 
     return 0;
 }
@@ -2270,16 +2580,24 @@ void usage()
         "  -x, --run-count=NUMBER         Number of full-test iterations to perform\n"
         "  -D, --debug                    Print debug output\n"
         "      --cluster-mode             Run client in cluster mode\n"
-        "      --transaction              In --cluster-mode, pin one full rotation of --command entries to\n"
-        "                                 a single shard connection so that keyless commands (MULTI/EXEC/\n"
-        "                                 UNWATCH) stay on the same connection as the keyed ones. Hash-tag\n"
-        "                                 your keys so they map to the same slot, otherwise the cross-slot\n"
-        "                                 keyed commands of the same rotation will get MOVED back. In\n"
-        "                                 standalone mode this flag is a no-op (each client already runs\n"
-        "                                 through a single connection). Requires at least one --command.\n"
-        "                                 --pipeline > 1 is supported: each rotation is sent contiguously\n"
-        "                                 on its pinned connection, so multiple whole transactions can be\n"
-        "                                 in flight without interleaving MULTI/EXEC blocks.\n"
+        "      --transaction              Treat one full rotation of --command entries as a transactional\n"
+        "                                 unit (e.g. WATCH/GET/MULTI/SETEX/EXEC/UNWATCH). Every __key__ in\n"
+        "                                 a rotation resolves to the same key (taken from the first keyed\n"
+        "                                 command's --command-key-pattern), so all keyed commands hit one\n"
+        "                                 key and one slot: the WATCH guards the key the SETEX writes and\n"
+        "                                 the unit runs without CROSSSLOT errors -- no hash-tag needed.\n"
+        "                                 This same-key behavior applies in every mode, so it also works\n"
+        "                                 against a single endpoint fronting a sharded backend (e.g. a\n"
+        "                                 Redis Enterprise proxy) where keyed commands must share a slot.\n"
+        "                                 In --cluster-mode it additionally pins the whole rotation to the\n"
+        "                                 owning shard connection so the keyless commands (MULTI/EXEC/\n"
+        "                                 UNWATCH) stay with the keyed ones. Caveat: keep the literal text\n"
+        "                                 around __key__ (including any {tag}) identical across keyed\n"
+        "                                 commands; differing affixes still hash to different slots.\n"
+        "                                 Requires at least one --command.\n"
+        "                                 --pipeline > 1 is supported: in --cluster-mode each rotation is\n"
+        "                                 sent contiguously on its pinned connection, so multiple whole\n"
+        "                                 transactions can be in flight without interleaving MULTI/EXEC.\n"
         "                                 Note: if --reconnect-on-error triggers mid-rotation, the\n"
         "                                 interrupted rotation's stats will be inaccurate (server-side\n"
         "                                 WATCH/MULTI state is lost on reconnect).\n"
@@ -2316,6 +2634,10 @@ void usage()
         "                                 Warn when miss rate exceeds this percentage (default: 1.0).\n"
         "                                 Accepts fractional values, e.g. 0.5 for half a percent.\n"
         "                                 0 warns on any miss.\n"
+        "      --cpu-warn-threshold=PERCENTAGE\n"
+        "                                 Warn when a memtier worker thread's CPU exceeds this percentage of a\n"
+        "                                 core (default: 95.0), indicating memtier itself may be the bottleneck\n"
+        "                                 and results may be unreliable. 0 warns on any CPU usage.\n"
         "      --statsd-host=HOST         StatsD server hostname to send real-time metrics (default: none, disabled)\n"
         "      --statsd-port=PORT         StatsD server UDP port (default: 8125)\n"
         "      --statsd-prefix=PREFIX     Prefix for StatsD metric names (default: memtier)\n"
@@ -2323,6 +2645,16 @@ void usage()
         "(default: default)\n"
         "      --graphite-port=PORT       Graphite HTTP port for event annotations (default: 8080 for host access; "
         "use 80 when running inside the Docker network)\n"
+#ifdef HAVE_EVHTTP
+        "      --prometheus-port=PORT     Serve Prometheus metrics on this port at /metrics (default: disabled; "
+        "0 = ephemeral port)\n"
+        "      --prometheus-bind-addr=ADDR  Numeric IPv4/IPv6 address to bind the Prometheus exporter to "
+        "(default: 127.0.0.1; hostnames not supported)\n"
+        "      --prometheus-run-label=KEY=VALUE  Add a constant label to every Prometheus metric (repeatable; max 16)\n"
+        "      --prometheus-latency-buckets=LIST  Comma-separated, strictly ascending latency histogram bounds in "
+        "seconds (default: built-in 26-bound list). Bounds closer than 1%% of their value collapse to the same "
+        "histogram slot and are rejected\n"
+#endif
         "\n"
         "Test Options:\n"
         "  -n, --requests=NUMBER          Number of total requests per client (default: 10000)\n"
@@ -2508,6 +2840,21 @@ struct cg_thread
     bool m_restart_requested;
     unsigned int m_restart_count;
 
+    // Per-thread CPU accounting via getrusage(RUSAGE_THREAD), captured inside
+    // the worker. A restart() spawns a NEW native thread, so RUSAGE_THREAD
+    // resets to 0 each segment; m_cpu_*_usec_acc accumulate completed segments
+    // so the reported total spans all restarts. m_wall_usec_acc is the WALL time
+    // of those same segments, captured at the exact same points as the CPU
+    // snapshots, so cores_used = cpu/wall divides two values over the identical
+    // interval (no setup-vs-serving skew). Only read post-join (race-free).
+    struct rusage m_cpu_start_ru;   // CPU snapshot at the current segment's start
+    struct timeval m_wall_start_tv; // wall snapshot at the same point
+    unsigned long long m_cpu_user_usec_acc;
+    unsigned long long m_cpu_sys_usec_acc;
+    unsigned long long m_wall_usec_acc;
+    bool m_cpu_started; // m_cpu_start_ru/m_wall_start_tv valid for this segment
+    bool m_cpu_valid;   // getrusage(RUSAGE_THREAD) succeeded at least once
+
     cg_thread(unsigned int id, benchmark_config *config, object_generator *obj_gen) :
             m_thread_id(id),
             m_config(config),
@@ -2516,7 +2863,12 @@ struct cg_thread
             m_protocol(NULL),
             m_finished(false),
             m_restart_requested(false),
-            m_restart_count(0)
+            m_restart_count(0),
+            m_cpu_user_usec_acc(0),
+            m_cpu_sys_usec_acc(0),
+            m_wall_usec_acc(0),
+            m_cpu_started(false),
+            m_cpu_valid(false)
     {
         m_protocol = protocol_factory(m_config->protocol);
         assert(m_protocol != NULL);
@@ -2580,8 +2932,139 @@ struct cg_thread
         m_restart_requested = false;
         m_restart_count++;
 
+        // CPU accumulators (m_cpu_*_usec_acc) intentionally persist across
+        // restarts. The new native thread re-snapshots m_cpu_start_ru on entry,
+        // so clear only the per-segment "started" flag.
+        m_cpu_started = false;
+
         // Start new thread
         return pthread_create(&m_thread, NULL, cg_thread_start, (void *) this);
+    }
+};
+
+// Cumulative CPU time (user+system, microseconds) consumed by an arbitrary
+// thread, read WITHOUT perturbing that thread. Used by the live per-second
+// sampler in the monitor loop. On Linux this is pthread_getcpuclockid +
+// clock_gettime (a per-thread CPU clock); on macOS it is Mach thread_info.
+// Returns 0 if the thread's CPU clock cannot be read (treated as no delta).
+static unsigned long long get_thread_cpu_usec(pthread_t thread)
+{
+#ifdef __APPLE__
+    mach_port_t mt = pthread_mach_thread_np(thread);
+    thread_basic_info_data_t info;
+    mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+    if (thread_info(mt, THREAD_BASIC_INFO, (thread_info_t) &info, &count) != KERN_SUCCESS) return 0;
+    return (unsigned long long) info.user_time.seconds * 1000000ULL + info.user_time.microseconds +
+           (unsigned long long) info.system_time.seconds * 1000000ULL + info.system_time.microseconds;
+#else
+    clockid_t cid;
+    if (pthread_getcpuclockid(thread, &cid) != 0) return 0;
+    struct timespec ts;
+    if (clock_gettime(cid, &ts) != 0) return 0;
+    return (unsigned long long) ts.tv_sec * 1000000ULL + (unsigned long long) ts.tv_nsec / 1000ULL;
+#endif
+}
+
+// Fold this worker's current-segment CPU usage (getrusage delta) AND the wall
+// time of the same segment into its across-restart accumulators. Called from
+// inside the worker on every exit path, BEFORE m_finished is set, so the
+// segment is accounted before the monitor loop can observe completion and
+// trigger a restart. The wall bracket is captured at the same two points as the
+// CPU bracket so cores_used = cpu/wall covers one identical interval.
+static void cg_thread_capture_cpu_end(cg_thread *thread)
+{
+#if defined(RUSAGE_THREAD)
+    if (!thread->m_cpu_started) return;
+    struct rusage end_ru;
+    struct timeval end_tv;
+    // Capture in the same order as the start snapshot (CPU then wall) so the
+    // wall window encloses the CPU window symmetrically.
+    int rc = getrusage(RUSAGE_THREAD, &end_ru);
+    gettimeofday(&end_tv, NULL);
+    if (rc == 0) {
+        // ts_diff(a, b) returns b - a in microseconds; rusage CPU time is
+        // monotonic per native thread, so each delta is >= 0.
+        thread->m_cpu_user_usec_acc += (unsigned long long) ts_diff(thread->m_cpu_start_ru.ru_utime, end_ru.ru_utime);
+        thread->m_cpu_sys_usec_acc += (unsigned long long) ts_diff(thread->m_cpu_start_ru.ru_stime, end_ru.ru_stime);
+    }
+    thread->m_wall_usec_acc += (unsigned long long) ts_diff(thread->m_wall_start_tv, end_tv);
+    thread->m_cpu_started = false;
+#else
+    (void) thread;
+#endif
+}
+
+// Advisory per-second CPU sampler driven from the monitor loop. Reads each
+// worker's CPU clock from the MAIN thread (no worker perturbation), converts the
+// delta to "% of a core" over the real wall window, emits a de-duped live
+// high-CPU warning (once per thread, on first crossing), tracks the peak
+// whole-process utilization, and appends a per-second snapshot to a history
+// vector. Finished/restarting workers are skipped so their pthread_t is never
+// read while joined or mid-restart.
+struct cpu_live_sampler
+{
+    std::vector<unsigned long long> thread_prev;
+    std::vector<bool> warned;
+    unsigned long long main_prev;
+    unsigned int second;
+    double peak_pct;
+    double warn_pct;
+    struct timeval prev_tv;
+
+    void init(const std::vector<cg_thread *> &threads, double warn_threshold_fraction)
+    {
+        thread_prev.assign(threads.size(), 0);
+        warned.assign(threads.size(), false);
+        for (size_t t = 0; t < threads.size(); t++)
+            thread_prev[t] = get_thread_cpu_usec(threads[t]->m_thread);
+        main_prev = get_thread_cpu_usec(pthread_self());
+        second = 0;
+        peak_pct = 0.0;
+        warn_pct = warn_threshold_fraction * 100.0;
+        gettimeofday(&prev_tv, NULL);
+    }
+
+    void tick(const std::vector<cg_thread *> &threads, std::vector<per_second_cpu_stats> &history)
+    {
+        second++;
+        struct timeval cur_tv;
+        gettimeofday(&cur_tv, NULL);
+        double wall_usec = (double) ts_diff(prev_tv, cur_tv);
+        if (wall_usec < 1.0) wall_usec = 1.0; // guard against division by zero
+
+        per_second_cpu_stats snap;
+        snap.m_second = second;
+
+        unsigned long long main_cur = get_thread_cpu_usec(pthread_self());
+        unsigned long long main_delta = (main_cur > main_prev) ? main_cur - main_prev : 0;
+        snap.m_main_thread_cpu_pct = (double) main_delta / wall_usec * 100.0;
+        main_prev = main_cur;
+
+        double whole_pct = snap.m_main_thread_cpu_pct;
+        for (size_t t = 0; t < threads.size(); t++) {
+            double pct = 0.0;
+            // Skip finished/restarting workers: a reset clock on a new pthread_t
+            // would yield a bogus delta, and a joined handle is unsafe to read.
+            if (!threads[t]->m_finished) {
+                unsigned long long cur = get_thread_cpu_usec(threads[t]->m_thread);
+                unsigned long long delta = (cur > thread_prev[t]) ? cur - thread_prev[t] : 0;
+                pct = (double) delta / wall_usec * 100.0;
+                thread_prev[t] = cur;
+            }
+            snap.m_thread_cpu_pct.push_back(pct);
+            whole_pct += pct;
+
+            if (pct > warn_pct && !warned[t]) {
+                fprintf(stderr,
+                        "\nwarning: high CPU on thread %u: %.1f%% of a core (threshold %.1f%%) - "
+                        "results may be unreliable\n",
+                        threads[t]->m_thread_id, pct, warn_pct);
+                warned[t] = true;
+            }
+        }
+        if (whole_pct > peak_pct) peak_pct = whole_pct;
+        prev_tv = cur_tv;
+        history.push_back(std::move(snap));
     }
 };
 
@@ -2593,6 +3076,17 @@ static void *cg_thread_start(void *t)
     // overflow on this thread (or any other handler entry) runs on a fresh
     // stack rather than re-faulting on the exhausted one.
     install_alt_signal_stack();
+
+    // Snapshot this segment's starting CPU time and wall time (per-thread) at
+    // the same instant. Accumulators on cg_thread carry prior segments forward
+    // across restarts.
+#if defined(RUSAGE_THREAD)
+    if (getrusage(RUSAGE_THREAD, &thread->m_cpu_start_ru) == 0) {
+        gettimeofday(&thread->m_wall_start_tv, NULL);
+        thread->m_cpu_started = true;
+        thread->m_cpu_valid = true;
+    }
+#endif
 
     try {
         thread->m_cg->run();
@@ -2612,15 +3106,18 @@ static void *cg_thread_start(void *t)
             thread->m_restart_requested = true;
         }
 
+        cg_thread_capture_cpu_end(thread);
         thread->m_finished = true;
     } catch (const std::exception &e) {
         benchmark_error_log("Thread %u caught exception: %s\n", thread->m_thread_id, e.what());
+        cg_thread_capture_cpu_end(thread);
         thread->m_finished = true;
         if (!g_connection_stage_aborted.load(std::memory_order_acquire)) {
             thread->m_restart_requested = true;
         }
     } catch (...) {
         benchmark_error_log("Thread %u caught unknown exception\n", thread->m_thread_id);
+        cg_thread_capture_cpu_end(thread);
         thread->m_finished = true;
         if (!g_connection_stage_aborted.load(std::memory_order_acquire)) {
             thread->m_restart_requested = true;
@@ -2819,6 +3316,155 @@ static void print_staircase_pattern(int run_id, benchmark_config *cfg)
     fprintf(stderr, "\n");
 }
 
+// One-producer-two-transports refactor (PLAN section 3.6c, Decisions #37):
+// the 1 Hz StatsD emit block, relocated verbatim out of run_benchmark()'s
+// progress loop into this file-static producer. It consumes a metrics_snapshot
+// (the one-producer POD from prometheus_metrics.h) so the Prometheus transport
+// can later share the exact same source. This is statsd-ONLY and lives OUTSIDE
+// any HAVE_EVHTTP guard. The byte-identical UDP wire is preserved: the snapshot
+// carries cur/avg_ops_sec et al. as `long` (cast at the fill site), so they
+// route through gauge(long) ("%ld"|g) exactly as before, while progress_pct is
+// `double` (gauge(double), "%.6f"|g) and the latencies go through timing(double)
+// ("%.3f"|ms). The >0 send condition for connection_errors is unchanged.
+static void statsd_publish_tick(statsd_client *statsd, const metrics_snapshot &snap, hdr_histogram *inst_hist_agg,
+                                const std::vector<double> &quantiles)
+{
+    statsd->gauge("ops_sec", snap.cur_ops_sec);
+    statsd->gauge("ops_sec_avg", snap.avg_ops_sec);
+    statsd->gauge("bytes_sec", snap.cur_bytes_sec);
+    statsd->gauge("bytes_sec_avg", snap.avg_bytes_sec);
+    statsd->timing("latency_ms", snap.cur_latency_ms);
+    statsd->timing("latency_avg_ms", snap.avg_latency_ms);
+    statsd->gauge("connections", (long) snap.connections);
+    statsd->gauge("progress_pct", snap.progress_pct);
+    if (snap.run_connection_errors > 0) {
+        statsd->gauge("connection_errors", (long) snap.run_connection_errors);
+    }
+
+    // Send percentile metrics derived from the aggregated instantaneous
+    // histogram (allocated by the caller; shared with the TUI renderer when enabled).
+    if (inst_hist_agg != NULL && hdr_total_count(inst_hist_agg) > 0) {
+        for (std::size_t i = 0; i < quantiles.size(); i++) {
+            double percentile = quantiles[i];
+            int64_t value = hdr_value_at_percentile(inst_hist_agg, percentile);
+            double value_ms = value / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
+
+            // Format the metric name (e.g., "latency_p50", "latency_p99", "latency_p99_9",
+            // "latency_p99_99"). %.10g preserves up to 10 significant digits so deep-tail
+            // percentiles (99.99999, 99.999999) don't round to 100 and collide.
+            char metric_name[40];
+            char pct_str[24];
+            snprintf(pct_str, sizeof(pct_str), "%.10g", percentile);
+            for (char *p = pct_str; *p; p++) {
+                if (*p == '.') *p = '_';
+            }
+            snprintf(metric_name, sizeof(metric_name), "latency_p%s", pct_str);
+
+            statsd->gauge(metric_name, value_ms);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Prometheus producer helper island (PLAN.md section 3.4 / 3.6 / 3.7).
+//
+// All cfg->prometheus access is funnelled through these file-static helpers so
+// the run loop stays ifdef-free: with HAVE_EVHTTP off the #else branch defines
+// empty inline stubs (unnamed params, -Wall-silent) and the producer wiring
+// folds to nothing. All helpers run on the MAIN thread only.
+// ---------------------------------------------------------------------------
+#ifdef HAVE_EVHTTP
+
+// True when the exporter is active.
+static inline bool prom_enabled(benchmark_config *cfg)
+{
+    return cfg->prometheus != NULL;
+}
+
+// Read one client_group's live cumulative counters into a counter_set. These
+// are the TSan-documented benign-race scalar getters (client.h:282-292); safe
+// to sample at 1 Hz from the main thread. Bytes are the split rx/tx getters
+// (never summarize() — it double-counts arbitrary-command bytes). The arbitrary
+// hits/misses sum only the per-command scalar totals in run_stats
+// m_arbitrary_misses[] (never the per-key vectors the worker grow-resizes), so
+// they read race-free at the same off-worker point as the GET hits/misses; the
+// accessors live on client_group/run_stats rather than the client.h:282-292
+// flat-scalar block because the source lives in per-command run_stats state.
+static counter_set prom_read_cg_counters(client_group *cg)
+{
+    counter_set cs;
+    cs.v[MT_OPS] = cg->get_total_ops();
+    cs.v[MT_BYTES_TX] = cg->get_total_bytes_tx();
+    cs.v[MT_BYTES_RX] = cg->get_total_bytes_rx();
+    cs.v[MT_HITS] = cg->get_total_hits();
+    cs.v[MT_MISSES] = cg->get_total_misses();
+    cs.v[MT_ERRORS] = cg->get_total_errors();
+    cs.v[MT_CONN_ERRORS] = cg->get_total_connection_errors();
+    cs.v[MT_RETRY_ATTEMPTS] = cg->get_total_retry_attempts();
+    cs.v[MT_RETRIED_OPS] = cg->get_total_retried_ops();
+    cs.v[MT_ARBITRARY_HITS] = cg->get_total_arbitrary_hits();
+    cs.v[MT_ARBITRARY_MISSES] = cg->get_total_arbitrary_misses();
+    return cs;
+}
+
+// 1 Hz observe: feed every thread's live counters to the monotonic accumulator,
+// then fill the snapshot's cumulative counters from it (non-decreasing totals).
+static void prom_observe_and_fill(benchmark_config *cfg, std::vector<cg_thread *> &threads, metrics_snapshot &snap)
+{
+    monotonic_accumulator &accum = cfg->prometheus->accumulator();
+    for (size_t t = 0; t < threads.size(); t++) {
+        accum.observe_live(t, prom_read_cg_counters(threads[t]->m_cg));
+    }
+    accum.fill(snap.counters);
+}
+
+// Exact post-join fold of one thread's final totals into the accumulator basis,
+// BEFORE its client_group is destroyed (restart or run end). Race-free.
+static void prom_fold_thread(benchmark_config *cfg, size_t t, client_group *cg)
+{
+    cfg->prometheus->accumulator().fold_final(t, prom_read_cg_counters(cg));
+}
+
+// 1 Hz publish: reset the exporter's scratch tick histogram, run the gated
+// per-client aggregation walk over non-finished threads (mirrors the statsd
+// !m_finished gate), then publish the fully-filled snapshot + the tick
+// histogram. PLAN.md section 3.7.
+static void prom_publish_tick(benchmark_config *cfg, const metrics_snapshot &snap, std::vector<cg_thread *> &threads)
+{
+    hdr_histogram *tick = cfg->prometheus->tick_histogram();
+    hdr_reset(tick);
+    for (size_t t = 0; t < threads.size(); t++) {
+        if (!threads[t]->m_finished) {
+            threads[t]->m_cg->aggregate_inst_histogram_if_changed(tick);
+        }
+    }
+    cfg->prometheus->publish(snap, tick);
+}
+
+static void prom_publish_run_start(benchmark_config *cfg, uint32_t run_id)
+{
+    cfg->prometheus->publish_run_start(run_id, cfg->run_count);
+}
+
+static void prom_publish_run_end(benchmark_config *cfg, uint32_t run_id)
+{
+    cfg->prometheus->publish_run_end(run_id, cfg->run_count);
+}
+
+#else // !HAVE_EVHTTP — empty stubs keep the run loop ifdef-free.
+
+static inline bool prom_enabled(benchmark_config *)
+{
+    return false;
+}
+static inline void prom_observe_and_fill(benchmark_config *, std::vector<cg_thread *> &, metrics_snapshot &) {}
+static inline void prom_fold_thread(benchmark_config *, size_t, client_group *) {}
+static inline void prom_publish_tick(benchmark_config *, const metrics_snapshot &, std::vector<cg_thread *> &) {}
+static inline void prom_publish_run_start(benchmark_config *, uint32_t) {}
+static inline void prom_publish_run_end(benchmark_config *, uint32_t) {}
+
+#endif // HAVE_EVHTTP
+
 run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj_gen)
 {
     // Expose the current run id so the cluster topology summary (printed from a
@@ -2864,6 +3510,13 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     // reply to AUTH on the same TCP RTT as the connect).
     connection_stage_supervisor_reset();
 
+    // Snapshot the main thread's CPU time just before launching workers, so the
+    // whole-process CPU aggregate includes the orchestrator/sampler overhead.
+#if defined(RUSAGE_THREAD)
+    struct rusage main_cpu_start_ru;
+    bool main_cpu_valid = (getrusage(RUSAGE_THREAD, &main_cpu_start_ru) == 0);
+#endif
+
     // launch threads
     fprintf(stderr, "[RUN #%u] Launching threads now...\n", run_id);
     for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
@@ -2878,6 +3531,11 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         cfg->statsd->event("Benchmark Started", event_data, "memtier,start");
     }
 
+    // Prometheus run-start publish (PLAN section 3.6d): counters = carried
+    // accumulator totals, run_id/run_count set, all gauges/rates zero (live at
+    // the first 1 Hz tick). Mirrors statsd's zeroing convention.
+    if (prom_enabled(cfg)) prom_publish_run_start(cfg, run_id);
+
     unsigned long int prev_ops = 0;
     unsigned long int prev_bytes = 0;
     unsigned long int prev_duration = 0;
@@ -2886,6 +3544,7 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     unsigned long int cur_bytes_sec = 0;
     unsigned long int prev_hits = 0;
     unsigned long int prev_misses = 0;
+    unsigned long int prev_aborts = 0;
     unsigned long int prev_errors = 0;
     unsigned long int prev_retry_attempts = 0;
 
@@ -2901,6 +3560,14 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     if (cfg->realtime_latencies) {
         hdr_init(LATENCY_HDR_MIN_VALUE, LATENCY_HDR_SEC_MAX_VALUE, LATENCY_HDR_SEC_SIGDIGTS, &rtl_totals_hist);
     }
+
+    // Live (advisory) per-second CPU sampler. The main thread reads each worker's
+    // CPU clock without perturbing it, so this adds no overhead to the workers.
+    // Feeds the per-second JSON detail, the de-duped live high-CPU warning, and
+    // the peak-utilization figure.
+    std::vector<per_second_cpu_stats> cpu_history;
+    cpu_live_sampler cpu_sampler;
+    cpu_sampler.init(threads, cfg->cpu_warn_threshold);
 
     // provide some feedback...
     // NOTE: Reading stats from worker threads without synchronization is a benign race.
@@ -2962,6 +3629,7 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         unsigned long int total_connection_errors = 0;
         unsigned long int total_hits = 0;
         unsigned long int total_misses = 0;
+        unsigned long int total_aborts = 0;
         unsigned long int total_errors = 0;
         unsigned long int total_retry_attempts = 0;
         unsigned long int total_retried_ops = 0;
@@ -2974,6 +3642,12 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
 
                 // Join the failed thread first
                 (*i)->join();
+
+                // Prometheus restart fold (PLAN section 3.6b): fold this
+                // thread's exact post-join totals into the accumulator basis
+                // BEFORE restart() deletes m_cg, so the monotonic counters
+                // survive the client_group replacement.
+                if (prom_enabled(cfg)) prom_fold_thread(cfg, (size_t) (i - threads.begin()), (*i)->m_cg);
 
                 // Attempt to restart
                 if ((*i)->restart() == 0) {
@@ -2995,8 +3669,18 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
                 total_retried_ops += (*i)->m_cg->get_total_retried_ops();
             }
             if (cfg->realtime_latencies) {
-                total_hits += (*i)->m_cg->get_total_hits();
-                total_misses += (*i)->m_cg->get_total_misses();
+                // In --command (arbitrary) mode the SET/GET hit/miss counters
+                // stay zero, so pull the live miss/abort figures from the
+                // arbitrary-command counters instead. Aborts are the EXEC
+                // optimistic-lock subset of misses (see run_stats).
+                if (cfg->arbitrary_commands->is_defined()) {
+                    total_hits += (*i)->m_cg->get_total_arbitrary_hits();
+                    total_misses += (*i)->m_cg->get_total_arbitrary_misses();
+                    total_aborts += (*i)->m_cg->get_total_arbitrary_aborts();
+                } else {
+                    total_hits += (*i)->m_cg->get_total_hits();
+                    total_misses += (*i)->m_cg->get_total_misses();
+                }
             }
             thread_counter++;
             float factor = ((float) (thread_counter - 1) / thread_counter);
@@ -3097,6 +3781,23 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             else
                 snprintf(avg_miss_str, sizeof(avg_miss_str), "  -  ");
 
+            // Abort ratio (--transaction only): EXEC optimistic-lock aborts as a
+            // share of the same lookup denominator. Aborts are a subset of misses,
+            // so abort% <= miss%. It's a blended live indicator across all
+            // arbitrary commands; the authoritative per-command abort rate is in
+            // the final table / "abort rate" warning.
+            char cur_abort_str[16], avg_abort_str[16];
+            if (cur_lookups > 0)
+                snprintf(cur_abort_str, sizeof(cur_abort_str), "%5.2f%%",
+                         100.0 * (double) (total_aborts - prev_aborts) / (double) cur_lookups);
+            else
+                snprintf(cur_abort_str, sizeof(cur_abort_str), "  -  ");
+            if (tot_lookups > 0)
+                snprintf(avg_abort_str, sizeof(avg_abort_str), "%5.2f%%",
+                         100.0 * (double) total_aborts / (double) tot_lookups);
+            else
+                snprintf(avg_abort_str, sizeof(avg_abort_str), "  -  ");
+
             char line1[640];
             int line1_used = 0;
             if (total_connection_errors > 0) {
@@ -3110,6 +3811,13 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
                     snprintf(line1, sizeof(line1),
                              "%s throughput %s (avg: %s) ops/sec   %s/sec (avg: %s/sec)   miss %s (avg: %s)", tag,
                              cur_ops_str, avg_ops_str, cur_bytes_str, bytes_str, cur_miss_str, avg_miss_str);
+            }
+            // Abort tail: only under --transaction so default arbitrary-command
+            // output is unchanged for existing log-scraping.
+            if (cfg->transaction && line1_used > 0 && (size_t) line1_used < sizeof(line1)) {
+                int n = snprintf(line1 + line1_used, sizeof(line1) - line1_used, "   abort %s (avg: %s)", cur_abort_str,
+                                 avg_abort_str);
+                if (n > 0) line1_used += n;
             }
             // Retry/error tail: only printed when --retry-on-error is enabled
             // so existing CI / log-scraping is unaffected by default.
@@ -3217,47 +3925,39 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
 
         prev_hits = total_hits;
         prev_misses = total_misses;
+        prev_aborts = total_aborts;
         prev_errors = total_errors;
         prev_retry_attempts = total_retry_attempts;
 
-        // Send metrics to StatsD if configured
-        if (cfg->statsd != NULL && cfg->statsd->is_enabled()) {
-            cfg->statsd->gauge("ops_sec", (long) cur_ops_sec);
-            cfg->statsd->gauge("ops_sec_avg", (long) ops_sec);
-            cfg->statsd->gauge("bytes_sec", (long) cur_bytes_sec);
-            cfg->statsd->gauge("bytes_sec_avg", (long) bytes_sec);
-            cfg->statsd->timing("latency_ms", cur_latency);
-            cfg->statsd->timing("latency_avg_ms", avg_latency);
-            cfg->statsd->gauge("connections", (long) (display_clients * active_threads));
-            cfg->statsd->gauge("progress_pct", progress);
-            if (total_connection_errors > 0) {
-                cfg->statsd->gauge("connection_errors", (long) total_connection_errors);
-            }
-
-            // Send percentile metrics derived from the aggregated instantaneous
-            // histogram (allocated above; shared with the TUI renderer when enabled).
-            if (inst_hist_agg != NULL && hdr_total_count(inst_hist_agg) > 0) {
-                const std::vector<double> &quantiles = cfg->print_percentiles.quantile_list;
-                for (std::size_t i = 0; i < quantiles.size(); i++) {
-                    double percentile = quantiles[i];
-                    int64_t value = hdr_value_at_percentile(inst_hist_agg, percentile);
-                    double value_ms = value / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
-
-                    // Format the metric name (e.g., "latency_p50", "latency_p99", "latency_p99_9",
-                    // "latency_p99_99"). %.10g preserves up to 10 significant digits so deep-tail
-                    // percentiles (99.99999, 99.999999) don't round to 100 and collide.
-                    char metric_name[40];
-                    char pct_str[24];
-                    snprintf(pct_str, sizeof(pct_str), "%.10g", percentile);
-                    for (char *p = pct_str; *p; p++) {
-                        if (*p == '.') *p = '_';
-                    }
-                    snprintf(metric_name, sizeof(metric_name), "latency_p%s", pct_str);
-
-                    cfg->statsd->gauge(metric_name, value_ms);
-                }
-            }
+        // One-producer-two-transports (PLAN section 3.6c, Decisions #37): build
+        // the metrics_snapshot once from the same loop locals both transports
+        // read, then hand it to each enabled transport. The StatsD path reads
+        // only `connections` + the statsd-only fields and stays byte-identical;
+        // the Prometheus path fills the cumulative counters via the monotonic
+        // accumulator and publishes its own gated tick histogram.
+        bool statsd_on = (cfg->statsd != NULL && cfg->statsd->is_enabled());
+        if (statsd_on || prom_enabled(cfg)) {
+            metrics_snapshot snap;
+            memset(&snap, 0, sizeof(snap));
+            snap.run_id = run_id;
+            snap.run_count = cfg->run_count;
+            snap.active_threads = active_threads;
+            snap.connections = display_clients * active_threads; // :3227 parity, uint32 product
+            snap.progress_pct = progress;
+            snap.cur_ops_sec = (long) cur_ops_sec;
+            snap.avg_ops_sec = (long) ops_sec;
+            snap.cur_bytes_sec = (long) cur_bytes_sec;
+            snap.avg_bytes_sec = (long) bytes_sec;
+            snap.cur_latency_ms = cur_latency;
+            snap.avg_latency_ms = avg_latency;
+            snap.run_connection_errors = total_connection_errors; // RAW per-run (Decisions #11)
+            if (prom_enabled(cfg)) prom_observe_and_fill(cfg, threads, snap);
+            if (statsd_on) statsd_publish_tick(cfg->statsd, snap, inst_hist_agg, cfg->print_percentiles.quantile_list);
+            if (prom_enabled(cfg)) prom_publish_tick(cfg, snap, threads); // gated walk + publish (PLAN 3.7)
         }
+
+        // Per-second CPU sampling (advisory).
+        cpu_sampler.tick(threads, cpu_history);
 
         if (inst_hist_agg != NULL) hdr_close(inst_hist_agg);
     } while (active_threads > 0);
@@ -3286,6 +3986,73 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
         (*i)->join();
         (*i)->m_cg->merge_run_stats(&stats);
+    }
+
+    // -----------------------------------------------------------------
+    // CPU utilization aggregate (memtier's own usage).
+    //
+    // Fold each worker's authoritative getrusage(RUSAGE_THREAD) totals (already
+    // accumulated across restarts inside the worker) into the run_stats. Each
+    // worker's cores_used divides its CPU by ITS OWN wall bracket (captured at
+    // the same points as the CPU snapshots), so there is no setup-vs-serving or
+    // across-restart skew. The whole-process aggregate divides total CPU (all
+    // workers + the main thread) by the longest summed active-serving wall time
+    // across workers, so the aggregate and per-thread figures stay consistent:
+    // the denominator is the window during which work actually happened, not the
+    // main thread's launch->join span which also covers idle teardown. Done
+    // here, post-join, so reads are race-free.
+    // -----------------------------------------------------------------
+    {
+        cpu_summary csum;
+        double worker_total_seconds = 0.0; // workers only, for the saturation %
+        double max_worker_wall = 0.0;
+        for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
+            cg_thread *t = *i;
+            per_thread_cpu_total pt;
+            pt.thread_id = t->m_thread_id;
+            pt.valid = t->m_cpu_valid;
+            pt.user_seconds = (double) t->m_cpu_user_usec_acc / 1e6;
+            pt.sys_seconds = (double) t->m_cpu_sys_usec_acc / 1e6;
+            pt.total_seconds = pt.user_seconds + pt.sys_seconds;
+            pt.wall_seconds = (double) t->m_wall_usec_acc / 1e6;
+            pt.cores_used = (pt.wall_seconds > 0.0) ? pt.total_seconds / pt.wall_seconds : 0.0;
+            stats.add_cpu_thread(pt);
+
+            if (pt.valid && pt.wall_seconds > 0.0) {
+                csum.user_seconds += pt.user_seconds;
+                csum.sys_seconds += pt.sys_seconds;
+                worker_total_seconds += pt.total_seconds;
+                csum.threads_counted++;
+                if (pt.wall_seconds > max_worker_wall) max_worker_wall = pt.wall_seconds;
+            }
+        }
+
+        // Add the main thread's own CPU (orchestrator/sampler overhead) to the
+        // whole-process totals, measured over the matching launch->here interval.
+#if defined(RUSAGE_THREAD)
+        if (main_cpu_valid) {
+            struct rusage main_end_ru;
+            if (getrusage(RUSAGE_THREAD, &main_end_ru) == 0) {
+                csum.user_seconds += (double) ts_diff(main_cpu_start_ru.ru_utime, main_end_ru.ru_utime) / 1e6;
+                csum.sys_seconds += (double) ts_diff(main_cpu_start_ru.ru_stime, main_end_ru.ru_stime) / 1e6;
+            }
+        }
+#endif
+
+        csum.total_seconds = csum.user_seconds + csum.sys_seconds;
+        csum.worker_total_seconds = worker_total_seconds;
+        csum.wall_seconds = max_worker_wall;
+        csum.peak_utilization_pct = cpu_sampler.peak_pct;
+        if (csum.threads_counted > 0 && csum.wall_seconds > 0.0) {
+            csum.cores_used = csum.total_seconds / csum.wall_seconds;
+            // Saturation % is based on WORKER cores only (main thread excluded),
+            // so a value near 100% means the worker threads are saturated and
+            // cannot exceed 100% from main-thread overhead alone.
+            csum.avg_utilization_pct = 100.0 * (worker_total_seconds / csum.wall_seconds) / csum.threads_counted;
+            csum.valid = true;
+        }
+        stats.set_cpu_summary(csum);
+        stats.set_cpu_stats(std::move(cpu_history));
     }
 
     // -----------------------------------------------------------------
@@ -3353,6 +4120,19 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
                 stats.absorb_builtin_get_routing(g.ops_from_primary, g.ops_from_replica);
             }
         }
+    }
+
+    // Prometheus post-join reconcile + run-end publish (PLAN section 3.6e):
+    // fold every thread's exact post-join totals into the accumulator basis
+    // (race-free; m_cg is still alive here, before the deletion loop below),
+    // then publish the run-end snapshot. This guarantees the run-end publish
+    // happens before teardown and the cumulative counters reflect the final,
+    // exact per-thread totals (never summarize() — rx/tx double-count trap).
+    if (prom_enabled(cfg)) {
+        for (size_t t = 0; t < threads.size(); t++) {
+            prom_fold_thread(cfg, t, threads[t]->m_cg);
+        }
+        prom_publish_run_end(cfg, run_id);
     }
 
     // Do we need to produce client stats?
@@ -3539,12 +4319,19 @@ int main(int argc, char *argv[])
     // sentinel before parsing args.
     cfg.max_retries = -1;
     cfg.miss_rate_threshold = -1.0;   // sentinel; config_init_defaults replaces with 0.01
+    cfg.cpu_warn_threshold = -1.0;    // sentinel; config_init_defaults replaces with 0.95
     cfg.command_miss_tracking = true; // Default: auto-track misses for known shapes
     // Sentinel for --connection-stage-timeout: UINT_MAX means "operator did
     // not specify"; config_init_defaults replaces with 30 s. We can't reuse 0
     // as the unset marker because 0 is a valid user-specified "disable the
     // supervisor entirely" value.
     cfg.connection_stage_timeout = UINT_MAX;
+#ifdef HAVE_EVHTTP
+    // Prometheus port sentinel: -1 = flag absent (exporter disabled). 0 is a
+    // valid user value (ephemeral port), so it cannot be the unset marker.
+    cfg.prometheus_port = -1;
+#endif
+    cfg.prometheus = NULL;
 
     if (config_parse_args(argc, argv, &cfg) < 0) {
         usage();
@@ -3925,6 +4712,33 @@ int main(int argc, char *argv[])
             cfg.statsd = NULL;
         }
     }
+
+#ifdef HAVE_EVHTTP
+    // Initialize the Prometheus exporter if configured (PLAN.md section 3.2).
+    // This is AFTER the statsd init block, after evthread_use_pthreads() and
+    // config_init_defaults(). Only when --prometheus-port was given (>= 0; the
+    // sentinel -1 means the flag was absent and the feature stays off). On
+    // start() failure the exporter is freed (delete + NULL) and the process
+    // exits 1 with one stderr line; start() already released any partial
+    // libevent state via free_libevent_state() before returning false.
+    if (cfg.prometheus_port >= 0) {
+        prometheus_exporter::options popts;
+        popts.bind_addr = cfg.prometheus_bind_addr ? cfg.prometheus_bind_addr : "127.0.0.1";
+        popts.port = cfg.prometheus_port;
+        popts.run_labels = cfg.prometheus_run_labels;
+        popts.latency_buckets = cfg.prometheus_latency_buckets;
+        popts.run_count = cfg.run_count;
+        popts.test_time = (int) cfg.test_time;
+        popts.n_threads = cfg.threads;
+        g_prom_exporter = new prometheus_exporter(popts);
+        if (!g_prom_exporter->start()) {
+            delete g_prom_exporter;
+            g_prom_exporter = NULL;
+            exit(1);
+        }
+        cfg.prometheus = g_prom_exporter;
+    }
+#endif
 
     if (cfg.show_config) {
         fprintf(stderr, "============== Configuration values: ==============\n");
@@ -4509,6 +5323,19 @@ int main(int argc, char *argv[])
         delete cfg.statsd;
         cfg.statsd = NULL;
     }
+
+#ifdef HAVE_EVHTTP
+    // Clean up the Prometheus exporter (PLAN.md section 3.2 join point). This is
+    // the first runtime exercise of the stop-event teardown protocol: wake the
+    // listener via the stop-event, join it, free libevent state. It must not
+    // hang. Done before the TLS cleanup, on every normal-exit path.
+    if (g_prom_exporter != NULL) {
+        g_prom_exporter->stop_and_join();
+        delete g_prom_exporter;
+        g_prom_exporter = NULL;
+        cfg.prometheus = NULL;
+    }
+#endif
 
 #ifdef USE_TLS
     if (cfg.tls) {

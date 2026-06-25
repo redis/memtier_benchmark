@@ -195,6 +195,18 @@ protected:
     // this mutex serializes hdr_reset and hdr_add from the main thread.
     reinit_mutex_t m_inst_histogram_mutex;
 
+    // Last inst-totals histogram total_count copied by the Prometheus gated
+    // aggregation (copy_inst_histogram_if_changed). Main-thread-only; plain
+    // int64_t so run_stats stays copyable when collected into vectors post-join.
+    int64_t m_prom_last_copied_total;
+
+    // Per-bucket snapshot of inst_m_totals_latency_histogram as of the previous
+    // gated copy, so copy_inst_histogram_if_changed adds only the positive
+    // per-bucket delta (each latency sample folded at most once) instead of the
+    // whole histogram. safe_hdr_histogram is deep-copyable, so run_stats stays
+    // copyable when collected into vectors post-join. Main-thread-only.
+    safe_hdr_histogram m_prom_last_inst;
+
     // Cumulative hits/misses bookkeeping for arbitrary commands. Indexed by
     // arbitrary command index. Per-key vectors are sized to the spec-resolved
     // key count for that command (or 1 when the command has no spec key
@@ -269,6 +281,26 @@ public:
     std::vector<read_routing_summary> m_arbitrary_read_routing; // per arbitrary-cmd index
     read_routing_summary m_get_read_routing;                    // built-in GET aggregate
 
+    // ---------------------------------------------------------------------
+    // CPU utilization of memtier itself (the load generator).
+    //   m_cpu_summary  - authoritative whole-run aggregate (getrusage-based)
+    //   m_cpu_threads  - authoritative per-worker totals (getrusage-based)
+    //   m_cpu_stats    - advisory per-second per-thread sampler detail
+    // All three are populated by run_benchmark() after the join loop and
+    // consumed by print()/print_json(). They survive the copyable run_stats
+    // (POD doubles + vectors) and are intentionally NOT routed through the
+    // per-client merge()/totals path: per-thread CPU is folded exactly once
+    // from cg_thread, not summed across the N per-client run_stats.
+    // ---------------------------------------------------------------------
+    cpu_summary m_cpu_summary;
+    std::vector<per_thread_cpu_total> m_cpu_threads;
+    std::vector<per_second_cpu_stats> m_cpu_stats;
+
+    void set_cpu_summary(const cpu_summary &s) { m_cpu_summary = s; }
+    void add_cpu_thread(const per_thread_cpu_total &t) { m_cpu_threads.push_back(t); }
+    void set_cpu_stats(std::vector<per_second_cpu_stats> s) { m_cpu_stats = std::move(s); }
+    const cpu_summary &get_cpu_summary() const { return m_cpu_summary; }
+
     // Aggregator: fold the per-endpoint snapshot from one client's
     // shard_connections into m_endpoint_snapshots. Entries are coalesced by
     // (addr, role) so the JSON is at most O(distinct endpoints) regardless
@@ -314,6 +346,15 @@ public:
     // Safely copy instantaneous total latency histogram into target under mutex.
     // Use this instead of a raw pointer getter to avoid data races with worker threads.
     void copy_inst_histogram(hdr_histogram *target) const;
+
+    // Like copy_inst_histogram, but only folds the per-bucket increment since
+    // the previous gated copy (via prom::hdr_add_positive_delta), so each latency
+    // sample is added to target at most once even when two 1 Hz exporter ticks
+    // land within one worker-second. Skips frozen histograms (clients that
+    // stopped completing ops) so a dead connection's last partial second is not
+    // re-added on every tick. Main-thread-only; reads total_count and updates
+    // m_prom_last_inst / m_prom_last_copied_total under m_inst_histogram_mutex.
+    void copy_inst_histogram_if_changed(hdr_histogram *target);
     void save_csv_one_sec_cluster(FILE *f);
     void save_csv_set_get_commands(FILE *f, bool cluster_mode);
     void save_csv_arbitrary_commands_one_sec(FILE *f, arbitrary_command_list &command_list,
@@ -343,6 +384,10 @@ public:
                                const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
     void print_missess_sec_column(output_table &table,
                                   const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
+    // Aborts/sec column, shown only under --transaction. Reports the EXEC
+    // optimistic-lock abort rate (the abort-semantics subset of misses).
+    void print_aborts_sec_column(output_table &table,
+                                 const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
     void print_moved_sec_column(output_table &table,
                                 const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
     void print_ask_sec_column(output_table &table,
@@ -362,6 +407,11 @@ public:
     unsigned int get_duration(void);
     unsigned long int get_duration_usec(void);
     unsigned long int get_total_bytes(void);
+    // rx/tx split of get_total_bytes(); same benign-race pattern. The Prometheus
+    // exporter needs the split (memtier_received_bytes_total /
+    // memtier_sent_bytes_total); never source bytes from summarize().
+    unsigned long int get_total_bytes_rx(void);
+    unsigned long int get_total_bytes_tx(void);
     unsigned long int get_total_ops(void);
     double get_total_latency(void);
     unsigned long int get_total_connection_errors(void);
@@ -372,6 +422,19 @@ public:
     // for live progress display.
     unsigned long int get_total_hits(void);
     unsigned long int get_total_misses(void);
+
+    // Aggregate hits/misses across arbitrary (--command) miss-trackable commands.
+    // Sums only the per-command scalar totals in m_arbitrary_misses[] (assigned
+    // once in setup_arbitrary_commands), never the per-key vectors which the
+    // worker grow-resizes; safe to sample off-worker at 1 Hz like get_total_hits.
+    // unsigned long long because the source fields are 64-bit (run_stats.h
+    // arbitrary_misses_total) and can exceed 32 bits on long runs.
+    unsigned long long get_total_arbitrary_hits(void);
+    unsigned long long get_total_arbitrary_misses(void);
+    // Subset of arbitrary misses that are transaction aborts (EXEC null reply).
+    // Display-only reinterpretation of the miss counter; see is_abort_command_type.
+    unsigned long long get_total_arbitrary_aborts(void);
+    static bool is_abort_command_type(const std::string &command_type);
 
     // Returns true if set_start_time() was called, indicating the client
     // produced (or was ready to produce) meaningful stats data.

@@ -1,6 +1,10 @@
 import glob
 import os
+import re
 import logging
+import time
+import urllib.error
+import urllib.request
 
 MEMTIER_BINARY = os.environ.get("MEMTIER_BINARY", "memtier_benchmark")
 TLS_CERT = os.environ.get("TLS_CERT", "")
@@ -322,6 +326,136 @@ def get_get_call_count(conn):
                 except ValueError:
                     return 0
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Prometheus exporter scrape helpers (shared by tests/test_prometheus.py).
+#
+# The exporter prints exactly one stdout announce line once its socket is
+# bound (PLAN.md §3.2, Decisions #9 / #26):
+#
+#     Prometheus exporter listening on http://127.0.0.1:46127/metrics
+#     Prometheus exporter listening on http://[::1]:46127/metrics   (IPv6)
+#
+# PROM_LISTEN_RE captures the URL (IPv6 host kept bracketed, RFC 3986).
+# ---------------------------------------------------------------------------
+PROM_LISTEN_RE = re.compile(
+    r"Prometheus exporter listening on (http://(?:\[[0-9A-Fa-f:]+\]|[^:/\s]+):\d+/metrics)"
+)
+
+# The byte-exact OpenMetrics/Prometheus 0.0.4 content type the exporter emits
+# (PLAN.md §3.3, prom::CONTENT_TYPE).
+PROM_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
+
+
+def wait_for_prometheus_url(stdout_path, timeout=30.0, interval=0.1):
+    """Poll *stdout_path* for the exporter announce line and return the URL.
+
+    Returns the captured /metrics URL (IPv6 host stays bracketed) or None if
+    the announce line never appears within *timeout* seconds.  The file is
+    re-read each poll because the producer flushes the line asynchronously.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with open(stdout_path) as fh:
+                m = PROM_LISTEN_RE.search(fh.read())
+        except FileNotFoundError:
+            m = None
+        if m:
+            return m.group(1)
+        time.sleep(interval)
+    return None
+
+
+class PromScrape(object):
+    """Result of a single /metrics HTTP GET.
+
+    Attributes:
+      status   -- HTTP status code (int), or None on a connection-level failure
+      body     -- decoded response body (str), or "" on a connection failure
+      headers  -- email.message.Message of response headers, or None
+      error    -- the exception instance on a connection-level failure, else None
+
+    A connection-level failure (refused / reset / timeout) is *not* an
+    exception out of prom_scrape: it is reported as status=None so callers
+    with a "200-or-connection-failure" closed outcome set (F15) can branch
+    cleanly.  HTTP error statuses (404/501/503) are returned as a normal
+    result with the real status code and body (urllib raises HTTPError for
+    >=400, which we catch and unwrap).
+    """
+
+    def __init__(self, status=None, body="", headers=None, error=None):
+        self.status = status
+        self.body = body
+        self.headers = headers
+        self.error = error
+
+    def header(self, name):
+        """Case-insensitive single-header lookup; returns None if absent."""
+        if self.headers is None:
+            return None
+        return self.headers.get(name)
+
+
+def prom_scrape(url, timeout=2.0, method="GET"):
+    """HTTP-scrape *url*, returning a PromScrape.
+
+    * 2xx                       -> status/body/headers populated, error=None
+    * HTTP >= 400 (404/501/503) -> real status + body via HTTPError unwrap
+    * connection-level failure  -> status=None, error set (the process beat
+                                   the scrape to teardown, etc.)
+    """
+    req = urllib.request.Request(url, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            return PromScrape(status=resp.status, body=body, headers=resp.headers)
+    except urllib.error.HTTPError as e:
+        # >= 400: a real HTTP reply (404 / 501 / 503).  Unwrap to a result.
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        return PromScrape(status=e.code, body=body, headers=e.headers)
+    except (urllib.error.URLError, OSError) as e:
+        # Connection refused / reset / timeout: the closed-outcome "the
+        # process beat us to teardown" branch.  Report, don't raise.
+        return PromScrape(status=None, body="", headers=None, error=e)
+
+
+def prom_parse(body):
+    """Parse a Prometheus exposition body into {sample_name: [Sample, ...]}.
+
+    Uses prometheus_client's official text parser (test_requirements.txt pins
+    prometheus_client>=0.20).  The return value is a dict keyed by the *sample*
+    name (so memtier_latency_seconds yields memtier_latency_seconds_bucket,
+    _count, _sum entries) mapping to a list of prometheus_client Sample
+    namedtuples (name, labels, value, timestamp, exemplar).
+
+    Raises on a malformed body so tests that "hard-assert prom_parse" (F2)
+    fail loudly on a corrupt scrape.
+    """
+    from prometheus_client.parser import text_string_to_metric_families
+
+    out = {}
+    for family in text_string_to_metric_families(body):
+        for sample in family.samples:
+            out.setdefault(sample.name, []).append(sample)
+    return out
+
+
+def prom_sample_value(parsed, name, labels=None):
+    """Return the value of the first sample named *name* matching *labels*.
+
+    *parsed* is the dict from prom_parse.  *labels* is an optional dict of
+    label key/value pairs the sample must contain (subset match).  Returns
+    None if no matching sample exists.
+    """
+    for s in parsed.get(name, []):
+        if labels is None or all(s.labels.get(k) == v for k, v in labels.items()):
+            return s.value
+    return None
 
 
 def get_column_csv(filename, column_name):

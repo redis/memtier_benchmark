@@ -108,6 +108,16 @@ protected:
     // corrupting the pool's (command_index, key_index) pair invariant.
     unsigned long long m_txn_staged_key_index;
     bool m_txn_has_staged_key;
+    // Key index adopted as *the* key for the whole pinned rotation. In
+    // --transaction mode every keyed --command in one rotation (e.g.
+    // WATCH/GET/SETEX inside WATCH...MULTI...EXEC) must resolve to the SAME
+    // key so they all hash to one slot -- otherwise the cluster rejects the
+    // transaction with CROSSSLOT. The first keyed command adopts the
+    // lookahead-staged key here; subsequent keyed commands reuse it instead of
+    // generating their own. Reset (m_txn_round_key_valid=false) whenever the
+    // rotation wraps or the pin is dropped mid-rotation.
+    unsigned long long m_txn_round_key_index;
+    bool m_txn_round_key_valid;
     // Set when we emit the "pin connection lost mid-rotation" warning so we
     // don't spam it on every hold_pipeline() call during the outage.
     bool m_txn_pin_lost_warned;

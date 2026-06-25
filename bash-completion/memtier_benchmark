@@ -25,10 +25,10 @@ _memtier_completions()
                    "--select-db" "--wait-ratio" "--num-slaves" "--wait-timeout" "--json-out-file"\
                    "--command" "--command-ratio" "--scan-incremental-max-iterations"\
                    "--clients-start" "--clients-step" "--step-duration"\
-                   "--statsd-host" "--statsd-port" "--statsd-prefix" "--statsd-run-label" "--graphite-port"\
+                   "--statsd-host" "--statsd-port" "--statsd-prefix" "--statsd-run-label" "--graphite-port" "--prometheus-port" "--prometheus-bind-addr" "--prometheus-run-label" "--prometheus-latency-buckets"\
                    "--monitor-input" "--hdr-file-prefix"\
                    "--max-reconnect-attempts" "--reconnect-backoff-factor" "--connection-timeout"\
-                   "--connection-stage-timeout"\
+                   "--connection-stage-timeout" "--cpu-warn-threshold"\
                    "--max-retries" "--retry-backoff-ms" "--retry-backoff-factor" "--retry-on"\
                    "--max-retry-queue" "--failed-keys-file"\
                    "--thread-conn-start-min-jitter-micros" "--thread-conn-start-max-jitter-micros"\

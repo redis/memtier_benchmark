@@ -22,6 +22,7 @@
 #include <atomic>
 #include <vector>
 #include <string>
+#include <utility>
 #include <sys/time.h>
 #include <pthread.h>
 #include "config_types.h"
@@ -32,6 +33,7 @@
 
 // Forward declaration
 class statsd_client;
+class prometheus_exporter;
 
 #define LOGLEVEL_ERROR 0
 #define LOGLEVEL_DEBUG 1
@@ -207,6 +209,7 @@ struct benchmark_config
     bool command_stats_by_type; // true = aggregate by command type (default), false = per command line
     bool command_miss_tracking; // true = auto (track misses for known shapes), false = off
     double miss_rate_threshold; // warn when miss rate exceeds this fraction (default 0.01 = 1%)
+    double cpu_warn_threshold;  // warn when a memtier thread's CPU exceeds this fraction of a core (default 0.95)
     const char *hdr_prefix;
     unsigned int request_rate;
     unsigned int request_per_interval;
@@ -228,6 +231,16 @@ struct benchmark_config
     const char *statsd_run_label;
     unsigned short graphite_port;
     statsd_client *statsd;
+    // Prometheus metrics export (PLAN.md v5 sections 3.1, 5). The four flag
+    // members are guarded; the exporter pointer is unguarded (statsd idiom,
+    // Decisions #25): NULL when disabled or compiled out.
+#ifdef HAVE_EVHTTP
+    int prometheus_port;              // sentinel -1 = unset; 0 = ephemeral; else fixed port
+    const char *prometheus_bind_addr; // NULL until config_init_defaults applies 127.0.0.1
+    std::vector<std::pair<std::string, std::string> > prometheus_run_labels; // raw; renderer escapes
+    std::vector<double> prometheus_latency_buckets;                          // seconds; empty = default
+#endif
+    prometheus_exporter *prometheus; // unguarded ownership alias of g_prom_exporter
     // SCAN incremental cursor iteration
     bool scan_incremental_iteration;
     unsigned int scan_incremental_max_iterations;

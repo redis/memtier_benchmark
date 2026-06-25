@@ -55,6 +55,23 @@
 #include "retry_policy.h"
 
 
+void client::apply_arbitrary_tracking_flags(abstract_protocol *protocol)
+{
+    // Mirror the per-element miss-tracking decision made in setup_client onto a
+    // single protocol. In cluster mode shard connections are *re-created* (not
+    // reconnected in place) on topology reset -- cluster_client::disconnect()
+    // deletes the non-main connections and the next cluster-slots discovery
+    // rebuilds them via create_shard_connection(). Each rebuild clone()s a fresh
+    // protocol with runtime flags reset to defaults, so the flag must be
+    // re-applied here or miss tracking silently never engages for them. (An
+    // in-place reconnect keeps the same protocol object; reset_state() preserves
+    // the flag, so that path needs nothing.) See issue #476.
+    if (protocol == NULL) return;
+    if (m_arbitrary_needs_elem_tracking) {
+        protocol->set_track_elem_misses(true);
+    }
+}
+
 bool client::setup_client(benchmark_config *config, abstract_protocol *protocol, object_generator *objgen)
 {
     m_config = config;
@@ -85,26 +102,31 @@ bool client::setup_client(benchmark_config *config, abstract_protocol *protocol,
         MAIN_CONNECTION->get_protocol()->set_keep_value(true);
     }
 
-    // Enable value keeping for arbitrary-command miss tracking when any
-    // configured command needs reply-array inspection (ArrayPerElementNulls or
-    // EmptyCollection). SingleNullBulk and IntegerMembership use the parser's
-    // existing scalar counters so no materialization is required for them.
+    // Enable per-element miss tracking only when a configured command needs
+    // per-position reply inspection. Only ArrayPerElementNulls
+    // (HMGET/MGET/ZMSCORE/GEOPOS/...) attributes hits/misses per position; the
+    // parser records a per-top-level-element hit bitmap directly
+    // (set_track_elem_misses), with zero reply materialization -- no malloc /
+    // memcpy of element values, no mbulk tree. EmptyCollection
+    // (HGETALL/SMEMBERS/LRANGE) only needs the top-level array length
+    // (response->get_top_array_len()); SingleNullBulk and IntegerMembership use
+    // the parser's scalar counters / status line. None of them keep values.
     if (config->arbitrary_commands->is_defined()) {
-        bool needs_array_walk = false;
         for (size_t i = 0; i < config->arbitrary_commands->size(); ++i) {
             const arbitrary_command &cmd = config->arbitrary_commands->at(i);
             if (!cmd.miss_tracking_enabled || cmd.spec == NULL) continue;
             using memtier::command_meta::ReplyShape;
-            if (cmd.spec->reply_shape == ReplyShape::ArrayPerElementNulls ||
-                cmd.spec->reply_shape == ReplyShape::EmptyCollection) {
-                needs_array_walk = true;
+            if (cmd.spec->reply_shape == ReplyShape::ArrayPerElementNulls) {
+                m_arbitrary_needs_elem_tracking = true;
                 break;
             }
         }
-        if (needs_array_walk) {
-            for (size_t i = 0; i < m_connections.size(); ++i) {
-                m_connections[i]->get_protocol()->set_keep_value(true);
-            }
+        // Apply to the connections that exist now. Connections created later --
+        // notably the per-shard connections that cluster_client builds during
+        // cluster-slots discovery -- pick the flag up via
+        // apply_arbitrary_tracking_flags() at creation time (see issue #476).
+        for (size_t i = 0; i < m_connections.size(); ++i) {
+            apply_arbitrary_tracking_flags(m_connections[i]->get_protocol());
         }
     }
 
@@ -145,11 +167,15 @@ client::client(client_group *group) :
         m_arbitrary_command_ratio_count(0),
         m_executed_command_index(0),
         m_arbitrary_command_rotation_seq(0),
+        m_txn_rotation_key_index(0),
+        m_txn_rotation_key_valid(false),
+        m_txn_rotation_key_seq(0),
         m_tot_set_ops(0),
         m_tot_wait_ops(0),
         m_scan_cursor("0"),
         m_scan_iteration_count(0),
-        m_mget_defer(false)
+        m_mget_defer(false),
+        m_arbitrary_needs_elem_tracking(false)
 {
     m_event_base = group->get_event_base();
 
@@ -176,12 +202,16 @@ client::client(struct event_base *event_base, benchmark_config *config, abstract
         m_arbitrary_command_ratio_count(0),
         m_executed_command_index(0),
         m_arbitrary_command_rotation_seq(0),
+        m_txn_rotation_key_index(0),
+        m_txn_rotation_key_valid(false),
+        m_txn_rotation_key_seq(0),
         m_tot_set_ops(0),
         m_tot_wait_ops(0),
         m_scan_cursor("0"),
         m_scan_iteration_count(0),
         m_keylist(NULL),
-        m_mget_defer(false)
+        m_mget_defer(false),
+        m_arbitrary_needs_elem_tracking(false)
 {
     m_event_base = event_base;
 
@@ -441,10 +471,32 @@ bool client::create_arbitrary_request(unsigned int command_index, struct timeval
         if (arg->type == const_type) {
             cmd_size += m_connections[conn_id]->send_arbitrary_command(arg);
         } else if (arg->type == key_type) {
-            unsigned long long key_index;
-            get_key_response res = get_key_for_conn(command_index, conn_id, &key_index);
-            /* If key not available for this connection, we have a bug of sending partial request */
-            assert(res == available_for_conn);
+            // --transaction: reuse one key for every __key__ in the rotation so
+            // the whole WATCH/MULTI/EXEC unit resolves to a single key/slot.
+            // Non-cluster path only: in --cluster-mode, cluster_client drives the
+            // reuse by pushing the rotation key onto m_key_index_pools and relies
+            // on this method draining it via get_key_for_conn, so the fast path
+            // here would leave the pool un-drained. Also skip the data-import
+            // path, which streams a distinct key per command.
+            const bool txn_reuse =
+                m_config->transaction && !m_config->cluster_mode && (!m_config->data_import || m_config->generate_keys);
+            if (txn_reuse && m_txn_rotation_key_valid && m_txn_rotation_key_seq == m_arbitrary_command_rotation_seq) {
+                // Same rotation as the cached key: regenerate the identical key
+                // string without advancing the per-iter key cursor.
+                m_obj_gen->generate_key(m_txn_rotation_key_index);
+            } else {
+                unsigned long long key_index;
+                get_key_response res = get_key_for_conn(command_index, conn_id, &key_index);
+                /* If key not available for this connection, we have a bug of sending partial request */
+                assert(res == available_for_conn);
+                if (txn_reuse) {
+                    // First keyed command of the rotation: adopt this key for
+                    // the rest of the rotation.
+                    m_txn_rotation_key_index = key_index;
+                    m_txn_rotation_key_valid = true;
+                    m_txn_rotation_key_seq = m_arbitrary_command_rotation_seq;
+                }
+            }
 
             // when we have static data mixed with the key placeholder
             if (arg->has_key_affixes) {
@@ -823,77 +875,38 @@ void client::handle_response(unsigned int conn_id, struct timeval timestamp, req
                 break;
             }
             case ReplyShape::ArrayPerElementNulls: {
-                // Walk the top-level mbulk array. Bucket count is the reply
-                // element count, not the spec key count: HMGET / ZMSCORE
+                // The parser recorded a per-top-level-element hit/miss bitmap at
+                // parse time (set_track_elem_misses) with no materialization --
+                // no value malloc/memcpy, no mbulk tree. Bucket count is the
+                // reply element count, not the spec key count: HMGET / ZMSCORE
                 // have 1 Redis key but produce one reply element per
-                // field/member, so capping to num_keys (==1) would lose all
-                // but the first position. MGET (multi-key spec) naturally
-                // matches reply size 1:1.
-                mbulk_size_el *top = response->get_mbulk_value();
-                if (top != NULL) {
-                    size_t n = top->mbulks_elements.size();
-                    per_key_hit.assign(n, false);
-                    num_keys = (unsigned int) n;
-                    for (size_t i = 0; i < n; ++i) {
-                        mbulk_element *el = top->mbulks_elements[i];
-                        bool h = false;
-                        if (el != NULL) {
-                            // ArrayPerElementNulls covers two reply shapes:
-                            //   - array of (bulk | null bulk): MGET, HMGET,
-                            //     ZMSCORE. Null bulk ($-1) materializes as a
-                            //     bulk_el with value==NULL/value_len==0.
-                            //   - array of (nested-array | null array):
-                            //     GEOPOS, COMMAND INFO, SORT_RO. Null array
-                            //     (*-1) materializes as an mbulk_size_el with
-                            //     no children (indistinguishable from *0,
-                            //     which is also "no value here" in practice).
-                            // is_bulk()/is_mbulk_size() avoid the assert that
-                            // as_bulk()/as_mbulk_size() raise on the wrong
-                            // kind.
-                            if (el->is_bulk()) {
-                                bulk_el *bel = el->as_bulk();
-                                // Hit = the bulk slot carries a value. Use
-                                // value!=NULL (the parser zero-allocates the
-                                // pointer only for $-1 null bulks) so that
-                                // empty-string values ($0\r\n\r\n) count as
-                                // hits when the parser is later extended to
-                                // preserve them. Today the redis_protocol
-                                // parser collapses $0 and $-1 into the same
-                                // representation (value=NULL, value_len=0),
-                                // matching the existing GET path's m_hits
-                                // convention; the value-pointer check is the
-                                // semantically correct one and is forward-
-                                // compatible with a parser that distinguishes.
-                                //
-                                // RESP3 nil "_\r\n" goes through single_type
-                                // and is stored as a bulk_el with is_resp3_null
-                                // set to true. Using the flag (set at parse time)
-                                // avoids false positives from a legitimate bulk
-                                // string whose content happens to be the single
-                                // character '_' (parsed via blob_type, which
-                                // never sets is_resp3_null). Treat it as a miss.
-                                if (bel != NULL && bel->value != NULL && !bel->is_resp3_null) {
-                                    h = true;
-                                }
-                            } else if (el->is_mbulk_size()) {
-                                mbulk_size_el *sub = el->as_mbulk_size();
-                                if (sub != NULL && !sub->mbulks_elements.empty()) {
-                                    h = true;
-                                }
-                            }
-                        }
-                        per_key_hit[i] = h;
-                        if (h) hits++;
-                    }
-                    misses = (num_keys > hits) ? (num_keys - hits) : 0;
-                } else {
-                    // Top-level reply isn't an mbulk (could be +OK, -ERR, a
-                    // single bulk for a misshape, or any non-array reply).
-                    // Account uniformly: a single miss bucket so per-key and
-                    // aggregate counters stay in sync.
+                // field/member; MGET (multi-key spec) matches reply size 1:1.
+                //
+                // The bitmap reproduces the old materialized walk's semantics:
+                //   - bulk leaf: hit iff $N with N>0 (null $-1 and empty $0 are
+                //     misses); RESP3 null '_' is a miss; other single types are
+                //     hits (see track_leaf in protocol.cpp).
+                //   - nested sub-array element (GEOPOS/SORT_RO/...): hit iff the
+                //     sub-array is non-empty (*0 / *-1 are misses).
+                if (response->get_top_array_len() < 0) {
+                    // Top-level reply isn't an array (+OK, -ERR, a single bulk,
+                    // or any non-array misshape). One miss bucket, matching the
+                    // previous get_mbulk_value()==NULL guard.
                     per_key_hit.assign(1, false);
                     num_keys = 1;
                     misses = 1;
+                } else {
+                    const std::vector<uint8_t> &eh = response->get_elem_hits();
+                    size_t n = eh.size();
+                    per_key_hit.assign(n, false);
+                    num_keys = (unsigned int) n;
+                    for (size_t i = 0; i < n; ++i) {
+                        if (eh[i]) {
+                            per_key_hit[i] = true;
+                            hits++;
+                        }
+                    }
+                    misses = (num_keys > hits) ? (num_keys - hits) : 0;
                 }
                 break;
             }
@@ -901,8 +914,24 @@ void client::handle_response(unsigned int conn_id, struct timeval timestamp, req
                 // Heuristic: empty array == missing key. EmptyCollection
                 // commands (SMEMBERS, LRANGE, HGETALL, ...) virtually always
                 // carry exactly 1 key.
-                mbulk_size_el *top = response->get_mbulk_value();
-                bool empty = (top == NULL || top->mbulks_elements.empty());
+                //
+                // We only need the top-level element count, not the element
+                // values, so we avoid set_keep_value() materialization (see the
+                // keep_value gate in setup_client) and read the declared
+                // aggregate length the parser captured from the reply header.
+                // get_top_array_len() is:
+                //   >0  for a populated array/map/set  -> hit (regardless of
+                //       whether the elements are zero-length: the count comes
+                //       from the *N/%N/~N header, not a per-value walk),
+                //    0  for an empty (*0) or null (*-1) collection -> miss,
+                //   -1  when the reply was not a top-level aggregate at all
+                //       (a scalar/bulk misshape) -> miss, matching the previous
+                //       get_mbulk_value()==NULL guard.
+                // This reproduces the old structural check exactly while
+                // staying alloc-free, and is independent of keep_value (it is
+                // captured whether or not an ArrayPerElementNulls command on
+                // the same connection forced materialization on).
+                bool empty = (response->get_top_array_len() <= 0);
                 per_key_hit.assign(num_keys, !empty);
                 hits = empty ? 0 : num_keys;
                 misses = empty ? num_keys : 0;
@@ -1336,6 +1365,28 @@ unsigned long int client_group::get_total_bytes(void)
     return total_bytes;
 }
 
+unsigned long int client_group::get_total_bytes_rx(void)
+{
+    unsigned long int total_bytes_rx = 0;
+    unsigned int count = active_client_count();
+    for (unsigned int i = 0; i < count; i++) {
+        total_bytes_rx += m_clients[i]->get_stats()->get_total_bytes_rx();
+    }
+
+    return total_bytes_rx;
+}
+
+unsigned long int client_group::get_total_bytes_tx(void)
+{
+    unsigned long int total_bytes_tx = 0;
+    unsigned int count = active_client_count();
+    for (unsigned int i = 0; i < count; i++) {
+        total_bytes_tx += m_clients[i]->get_stats()->get_total_bytes_tx();
+    }
+
+    return total_bytes_tx;
+}
+
 unsigned long int client_group::get_total_ops(void)
 {
     unsigned long int total_ops = 0;
@@ -1404,6 +1455,36 @@ unsigned long int client_group::get_total_misses(void)
     return total;
 }
 
+unsigned long long client_group::get_total_arbitrary_hits(void)
+{
+    unsigned long long total = 0;
+    unsigned int count = active_client_count();
+    for (unsigned int i = 0; i < count; i++) {
+        total += m_clients[i]->get_stats()->get_total_arbitrary_hits();
+    }
+    return total;
+}
+
+unsigned long long client_group::get_total_arbitrary_misses(void)
+{
+    unsigned long long total = 0;
+    unsigned int count = active_client_count();
+    for (unsigned int i = 0; i < count; i++) {
+        total += m_clients[i]->get_stats()->get_total_arbitrary_misses();
+    }
+    return total;
+}
+
+unsigned long long client_group::get_total_arbitrary_aborts(void)
+{
+    unsigned long long total = 0;
+    unsigned int count = active_client_count();
+    for (unsigned int i = 0; i < count; i++) {
+        total += m_clients[i]->get_stats()->get_total_arbitrary_aborts();
+    }
+    return total;
+}
+
 unsigned long int client_group::get_total_retry_attempts(void)
 {
     unsigned long int total = 0;
@@ -1454,6 +1535,14 @@ void client_group::aggregate_inst_histogram(hdr_histogram *target)
     for (unsigned int i = 0; i < m_clients.size(); i++) {
         if (!m_clients[i]->get_stats()->has_started()) continue;
         m_clients[i]->get_stats()->copy_inst_histogram(target);
+    }
+}
+
+void client_group::aggregate_inst_histogram_if_changed(hdr_histogram *target)
+{
+    for (unsigned int i = 0; i < m_clients.size(); i++) {
+        if (!m_clients[i]->get_stats()->has_started()) continue;
+        m_clients[i]->get_stats()->copy_inst_histogram_if_changed(target);
     }
 }
 

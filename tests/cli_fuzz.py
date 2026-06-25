@@ -297,6 +297,17 @@ FLAG_SPECS = [
     ("--statsd-prefix", weird_str),
     ("--statsd-run-label", weird_str),
     ("--graphite-port", weird_int),
+    # Prometheus exporter (long-only, all take args). The port is numeric so
+    # it gets the int corpus (empty / overflow / hex / negative); the rest are
+    # free-form strings whose parsers (bind-addr inet_pton, run-label KEY=VALUE
+    # validation, latency-bucket list parsing) must reject cleanly, never crash.
+    # All four parse before any connection, so they are flavor-/server-agnostic;
+    # a --disable-prometheus build treats them as unrecognized options (exit 2),
+    # also a clean OK_RETURN_CODES outcome.
+    ("--prometheus-port", weird_int),
+    ("--prometheus-bind-addr", weird_str),
+    ("--prometheus-run-label", weird_str),
+    ("--prometheus-latency-buckets", weird_str),
     # Test
     ("--rate-limiting", weird_int),
     ("--clients-start", weird_int),

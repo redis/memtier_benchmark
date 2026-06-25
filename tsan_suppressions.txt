@@ -18,7 +18,52 @@ race:run_stats::get_total_connection_errors
 race:totals::update_op
 race:totals::update_connection_error
 
+# Additional benign-race read-side getters exercised by the Prometheus exporter's
+# unconditional 1 Hz producer tick (same class as the display getters above).
+race:run_stats::get_total_bytes_rx
+race:run_stats::get_total_bytes_tx
+race:run_stats::get_total_hits
+race:run_stats::get_total_misses
+race:run_stats::get_total_errors
+race:run_stats::get_total_retry_attempts
+race:run_stats::get_total_retried_ops
+
+# Arbitrary-command hits/misses (#483): the producer tick sums the per-command
+# scalar totals in m_arbitrary_misses[] (run_stats::get_total_arbitrary_hits/
+# misses) while workers bump them in run_stats::update_arbitrary_op_misses. Same
+# benign class as the display getters: the read touches only the monotonic
+# total_hits/total_misses scalars (never the grow-resized per_key_* vectors),
+# live data is approximate, and authoritative totals merge race-free post-join.
+race:run_stats::get_total_arbitrary_hits
+race:run_stats::get_total_arbitrary_misses
+race:run_stats::update_arbitrary_op_misses
+
+# Write-side inline counter bumps read by those getters.
+race:run_stats::inc_error
+race:run_stats::inc_retry_attempt
+race:run_stats::inc_retried_op
+
+# Inst-totals HDR histogram: workers record via hdr_record_value_capped_atomic with
+# NO mutex (run_stats.cpp:44-52); the main thread copies under m_inst_histogram_mutex
+# using plain reads (hdr_add / hdr_total_count inside run_stats::copy_inst_histogram and
+# the gated copy_inst_histogram_if_changed, run_stats.cpp:197-202 + the Prometheus
+# producer tick) — the mutex serializes copy-vs-reset only, so TSan reports
+# atomic-write vs plain-read.
+# Benign: live data is approximate; authoritative histograms merge race-free post-join.
+race:run_stats::copy_inst_histogram
+race:run_stats::copy_inst_histogram_if_changed
+
 # OpenSSL internal races (false positives in libcrypto)
 # These are known benign races within OpenSSL library itself
 race:libcrypto.so*
+
+# Prometheus exporter event loop: the exporter runs its own libevent event_base
+# (epoll) on a dedicated thread, concurrently with the main thread creating
+# benchmark sockets (shard_connection::setup_socket -> socket()). TSan reports a
+# "data race" on a file-descriptor *number* (e.g. epoll_ctl in the exporter
+# thread vs socket() in main) because fd numbers are reused across threads — a
+# known TSan fd-shadow limitation, not a real race: the exporter's event_base and
+# the benchmark sockets are independent kernel objects, and epoll_ctl/socket are
+# kernel-thread-safe. The exporter never touches benchmark connection fds.
+race:prometheus_exporter::thread_entry
 

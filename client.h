@@ -86,6 +86,17 @@ protected:
     // mirror the ratio-counter state machine.
     unsigned long long m_arbitrary_command_rotation_seq;
 
+    // --transaction (non-cluster path): reuse a single generated key for every
+    // __key__ in one --command rotation so a WATCH/MULTI/EXEC unit hits one key
+    // (and therefore one slot), avoiding CROSSSLOT against a slot-enforcing
+    // single endpoint (e.g. a Redis Enterprise proxy). m_txn_rotation_key_seq
+    // records the rotation_seq the cached index was generated for; a mismatch
+    // means a new rotation has started and the key must be regenerated. The
+    // --cluster-mode path has its own equivalent in cluster_client.
+    unsigned long long m_txn_rotation_key_index;
+    bool m_txn_rotation_key_valid;
+    unsigned long long m_txn_rotation_key_seq;
+
     unsigned long long m_tot_set_ops;  // Total number of SET ops
     unsigned long long m_tot_wait_ops; // Total number of WAIT ops
 
@@ -102,6 +113,22 @@ protected:
     //         counter past the threshold to skip the rest of the batch.
     // Only meaningful when create_mget_request() returns false; undefined otherwise.
     bool m_mget_defer;
+
+    // True when at least one configured arbitrary command needs per-element
+    // miss tracking (ArrayPerElementNulls reply shape). Computed once in
+    // setup_client and applied to every shard connection's protocol via
+    // apply_arbitrary_tracking_flags() -- including connections created
+    // dynamically after setup (cluster-slots discovery / reconnect), whose
+    // freshly cloned protocols would otherwise start with the flag cleared.
+    bool m_arbitrary_needs_elem_tracking;
+
+    // Apply the resolved arbitrary-command tracking flags to a single protocol.
+    // Currently a single flag (set_track_elem_misses); plural name is
+    // deliberate so additional per-protocol arbitrary-command setup can be
+    // folded in here without touching the call sites. Idempotent and safe to
+    // call on any connection's protocol at or after setup_client(); a no-op
+    // until setup_client() has computed the flag.
+    void apply_arbitrary_tracking_flags(abstract_protocol *protocol);
 
 public:
     client(client_group *group);
@@ -279,18 +306,24 @@ public:
     std::vector<client *> &get_clients(void) { return m_clients; }
 
     unsigned long int get_total_bytes(void);
+    unsigned long int get_total_bytes_rx(void);
+    unsigned long int get_total_bytes_tx(void);
     unsigned long int get_total_ops(void);
     double get_total_latency(void);
     unsigned long int get_duration_usec(void);
     unsigned long int get_total_connection_errors(void);
     unsigned long int get_total_hits(void);
     unsigned long int get_total_misses(void);
+    unsigned long long get_total_arbitrary_hits(void);
+    unsigned long long get_total_arbitrary_misses(void);
+    unsigned long long get_total_arbitrary_aborts(void);
     unsigned long int get_total_retry_attempts(void);
     unsigned long int get_total_retried_ops(void);
     unsigned long int get_total_errors(void);
 
     void merge_run_stats(run_stats *target);
     void aggregate_inst_histogram(hdr_histogram *target);
+    void aggregate_inst_histogram_if_changed(hdr_histogram *target);
 };
 
 

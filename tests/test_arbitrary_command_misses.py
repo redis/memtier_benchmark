@@ -44,7 +44,8 @@ def _preload_sets(env, prefix):
         conn.sadd("{}{}".format(prefix, i), "a", "b", "c")
 
 
-def _run_benchmark(env, command, miss_tracking="auto", key_prefix=_KEY_PREFIX, requests=_REQUESTS):
+def _run_benchmark(env, command, miss_tracking="auto", key_prefix=_KEY_PREFIX, requests=_REQUESTS,
+                   key_max=_KEY_RANGE_MAX):
     """Run memtier with the given --command and return the parsed mb.json."""
     test_dir = tempfile.mkdtemp()
     benchmark_specs = {
@@ -56,7 +57,7 @@ def _run_benchmark(env, command, miss_tracking="auto", key_prefix=_KEY_PREFIX, r
             "--command-miss-tracking={}".format(miss_tracking),
             "--key-prefix={}".format(key_prefix),
             "--key-minimum=1",
-            "--key-maximum={}".format(_KEY_RANGE_MAX),
+            "--key-maximum={}".format(key_max),
             "--hide-histogram",
         ],
     }
@@ -151,6 +152,39 @@ def test_arbitrary_smembers_empty_collection(env):
                    message="expected SMEMBERS misses on missing keys")
 
 
+def test_arbitrary_smembers_zero_length_member_is_hit(env):
+    """Regression: a set whose only member is the empty string returns a
+    non-empty array (*1 $0) and must count as a HIT, not a miss.
+
+    EmptyCollection miss-tracking classifies emptiness from the reply's
+    declared top-level array length (get_top_array_len()), not from a per-value
+    hit walk. An earlier approach keyed on the parser's non-null-bulk hit
+    counter, which skips zero-length bulks and so misreported this populated
+    set as empty/missing. This test pins the declared-length behaviour."""
+    env.skipOnCluster()
+    set_prefix = "memtier-emptyset-"
+    env.flush()
+    conn = env.getConnection()
+    # Keys 1..3 each hold a single zero-length member; 4..10 stay missing.
+    for i in range(1, _PRELOADED_KEYS + 1):
+        conn.sadd("{}{}".format(set_prefix, i), "")
+
+    result = _run_benchmark(env, "SMEMBERS __key__", key_prefix=set_prefix)
+    per_key = result["ALL STATS"].get("Per-Key Misses", {})
+    env.assertContains("SMEMBERS", per_key)
+    cmd_stats = per_key["SMEMBERS"]
+
+    total_ops = cmd_stats["Total Hits"] + cmd_stats["Total Misses"]
+    env.assertEqual(total_ops, _REQUESTS * 2)
+    # The populated (zero-length-member) sets must register as hits.
+    env.assertTrue(cmd_stats["Total Hits"] > 0,
+                   message="zero-length set member must count as a hit, got "
+                           "{} hits".format(cmd_stats["Total Hits"]))
+    # And the missing keys 4..10 must still register as misses.
+    env.assertTrue(cmd_stats["Total Misses"] > 0,
+                   message="expected misses on missing keys")
+
+
 def test_arbitrary_exists_integer_membership(env):
     """EXISTS — IntegerMembership; integer reply N == hit count."""
     env.skipOnCluster()
@@ -215,6 +249,45 @@ def test_arbitrary_hmget_per_field_buckets(env):
     # the 3 populated keys.
     env.assertTrue(cmd_stats["key[0] Hits"] > 0)
     env.assertTrue(cmd_stats["key[1] Hits"] > 0)
+
+
+def test_arbitrary_hmget_full_coverage_cluster_and_standalone(env):
+    """Every reply position must be accounted for, in BOTH standalone and OSS
+    cluster mode.
+
+    Regression for issue #476: arbitrary-command miss tracking is enabled per
+    connection in setup_client(), but in cluster mode the per-shard connections
+    are created later during cluster-slots discovery and their freshly cloned
+    protocols started with the tracking flag cleared. The result was that only
+    requests routed to the seed connection's shard were accounted -- roughly
+    1/num_shards coverage -- while the rest were silently dropped from the
+    per-key stats.
+
+    This test deliberately does NOT skipOnCluster and asserts FULL coverage
+    (every field position of every request shows up in Total Hits+Misses). No
+    preload is needed: absent keys still produce per-position miss accounting,
+    so the count is topology- and hit-rate-independent. A wide key range
+    ensures keys spread across all shards so non-seed connections are exercised;
+    before the fix this assertion fails on cluster (partial coverage).
+    """
+    fields = ["f0", "f1", "f2", "f3"]
+    command = "HMGET __key__ " + " ".join(fields)
+    # Wide key range so keys land on every shard, exercising non-seed conns.
+    result = _run_benchmark(env, command, key_max=1000)
+    per_key = result["ALL STATS"].get("Per-Key Misses", {})
+    env.assertContains("HMGET", per_key)
+    cmd_stats = per_key["HMGET"]
+
+    total_accounted = cmd_stats["Total Hits"] + cmd_stats["Total Misses"]
+    expected = _REQUESTS * 2 * len(fields)  # requests * clients * fields
+    env.assertEqual(total_accounted, expected,
+                    message="expected full per-position coverage {} but accounted {} "
+                            "(partial coverage indicates cluster shard connections are "
+                            "not tracking misses, issue #476)".format(expected, total_accounted))
+    # One bucket per field position, no phantom extra bucket.
+    for k in range(len(fields)):
+        env.assertContains("key[{}] Hits".format(k), cmd_stats)
+    env.assertNotContains("key[{}] Hits".format(len(fields)), cmd_stats)
 
 
 def test_arbitrary_geopos_nested_array_elements(env):

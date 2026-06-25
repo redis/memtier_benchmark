@@ -114,13 +114,38 @@ jobs:
         sudo apt-get -qq update
         sudo apt-get install lcov autoconf automake pkg-config libevent-dev
 
-    - name: Build without TLS
+    - name: Build without TLS (prometheus default-on)
       run: autoreconf -ivf && ./configure --disable-tls && make -j
 
-    - name: Verify version, libevent
+    - name: Verify version, libevent, prometheus enabled
       run: |
         ./memtier_benchmark --version
+        ./memtier_benchmark --version | grep -q 'prometheus=yes'
         ldd ./memtier_benchmark | grep libevent
+        grep -q '#define HAVE_EVHTTP 1' config.h
+
+    - name: Unit tests (prometheus enabled)
+      run: make check
+
+    - name: Build without TLS and without Prometheus
+      run: make distclean && ./configure --disable-tls --disable-prometheus && make -j
+
+    - name: Verify prometheus compiled out
+      run: |
+        ./memtier_benchmark --version
+        ./memtier_benchmark --version | grep -q 'prometheus=no'
+        grep -q '/\* #undef HAVE_EVHTTP \*/' config.h
+        # The flag must be unrecognized in the disabled flavor (rc 2 + getopt
+        # message). 'if cmd; then' swallows the exit code, so capture it.
+        set +e
+        ./memtier_benchmark --prometheus-port=9221 >notls.out 2>&1
+        rc=$?
+        set -e
+        test "$rc" -eq 2
+        grep -q "unrecognized option '--prometheus-port" notls.out
+
+    - name: Unit tests (prometheus disabled)
+      run: make check
 
   build-ubuntu-latest:
     runs-on: ubuntu-latest
@@ -268,7 +293,7 @@ jobs:
           ./tests/gen-test-certs.sh
 
     - name: Run tests
-      timeout-minutes: 15
+      timeout-minutes: 25
       env: ${{ matrix.test-config.env }}
       run: |
         ./tests/run_tests.sh
@@ -377,7 +402,7 @@ jobs:
         ulimit -n 40960
 
     - name: Run tests for coverage
-      timeout-minutes: 15
+      timeout-minutes: 25
       env:
         OSS_STANDALONE: "1"
         OSS_CLUSTER: "0"
@@ -474,3 +499,59 @@ jobs:
         ./memtier_benchmark --version
         otool -L ./memtier_benchmark | grep libevent
         otool -L ./memtier_benchmark | grep ssl
+
+  promtool-lint:
+    runs-on: ubuntu-latest
+    name: "Prometheus: promtool /metrics lint"
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install dependencies
+      run: |
+        sudo apt-get -qq update
+        sudo apt-get install -y autoconf automake pkg-config libevent-dev libssl-dev redis-server
+        sudo service redis-server stop || true
+
+    - name: Build (prometheus default-on)
+      run: autoreconf -ivf && ./configure && make -j"$(nproc)"
+
+    - name: Install promtool (sha256-pinned release tarball)
+      run: |
+        set -euo pipefail
+        PROM_VERSION=2.53.2
+        PROM_TARBALL="prometheus-${PROM_VERSION}.linux-amd64.tar.gz"
+        PROM_SHA256=60c126740c9cf1206b1e72150dd17914f1c3309bb7dc78a31d4670197ed4fa69
+        curl -fsSLO "https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/${PROM_TARBALL}"
+        echo "${PROM_SHA256}  ${PROM_TARBALL}" | sha256sum -c -
+        tar -xzf "${PROM_TARBALL}"
+        sudo install -m 0755 "prometheus-${PROM_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
+        promtool --version
+
+    - name: Scrape /metrics from a live run and lint it
+      run: |
+        set -euo pipefail
+        redis-server --port 6399 --save '' --daemonize yes
+        for i in $(seq 1 30); do redis-cli -p 6399 ping >/dev/null 2>&1 && break; sleep 0.2; done
+        ./memtier_benchmark -s 127.0.0.1 -p 6399 --test-time=8 --prometheus-port=0 \
+          >mb.out 2>mb.err &
+        MBPID=$!
+        URL=""
+        for i in $(seq 1 100); do
+          URL=$(grep -oP 'listening on \Khttp://[^ ]+/metrics' mb.out || true)
+          [ -n "$URL" ] && break
+          sleep 0.1
+        done
+        [ -n "$URL" ] || { echo "no announce line"; cat mb.out mb.err; exit 1; }
+        sleep 1
+        curl -fsS "$URL" > prom_scrape.txt
+        wait "$MBPID"
+        # rc != 0 OR any output = failure (PLAN.md §7.4e)
+        out=$(promtool check metrics < prom_scrape.txt 2>&1) || { echo "promtool rc != 0"; echo "$out"; exit 1; }
+        if [ -n "$out" ]; then echo "promtool produced output (lint warnings):"; echo "$out"; exit 1; fi
+        echo "promtool check metrics: clean"
+
+    - name: Upload scraped exposition
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: prom_scrape
+        path: prom_scrape.txt

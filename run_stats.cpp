@@ -34,6 +34,7 @@
 #endif
 
 #include "run_stats.h"
+#include "prometheus_metrics.h" // prom::hdr_add_positive_delta (pure layer, always linked)
 
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
@@ -128,8 +129,8 @@ inline timeval timeval_factorial_average(timeval a, timeval b, unsigned int weig
 }
 
 run_stats::run_stats(benchmark_config *config) :
-        m_config(config), m_interrupted(false), m_totals(), m_cur_stats(0), m_cluster_endpoints(0),
-        m_cluster_primaries(0), m_cluster_replicas(0)
+        m_config(config), m_interrupted(false), m_totals(), m_cur_stats(0), m_prom_last_copied_total(0),
+        m_cluster_endpoints(0), m_cluster_primaries(0), m_cluster_replicas(0)
 {
     memset(&m_start_time, 0, sizeof(m_start_time));
     memset(&m_end_time, 0, sizeof(m_end_time));
@@ -200,6 +201,47 @@ void run_stats::copy_inst_histogram(hdr_histogram *target) const
 {
     pthread_mutex_lock(&m_inst_histogram_mutex.mtx);
     hdr_add(target, inst_m_totals_latency_histogram);
+    pthread_mutex_unlock(&m_inst_histogram_mutex.mtx);
+}
+
+void run_stats::copy_inst_histogram_if_changed(hdr_histogram *target)
+{ // Main thread, 1 Hz. Workers bump counts with hdr_record_value_capped_atomic
+    // (lock-free); this read under the copy/reset mutex is the same benign-race
+    // class as copy_inst_histogram (suppressions, tsan_suppressions.txt).
+    //
+    // The inst-totals histogram is reset once per worker-second in
+    // summarize_current_second(). When an exporter tick and that reset drift so
+    // two ticks land within one worker-second, adding the whole histogram on each
+    // tick (the previous behaviour) re-counted samples already folded on the
+    // earlier tick, inflating memtier_latency_seconds buckets and _count. We
+    // instead add only the positive per-bucket delta versus m_prom_last_inst (the
+    // snapshot from the previous gated copy), so every sample is folded at most
+    // once.
+    //
+    // A histogram frozen since the previous gated copy (client stopped completing
+    // ops: cur == last total) is skipped so a dead connection's last partial
+    // second is not re-added each tick. In the rare window where a reset is
+    // masked by enough new samples that total_count still rises, some post-reset
+    // samples may be dropped — an undercount, consistent with the metric's
+    // documented non-authoritative contract, and never a double-count.
+    pthread_mutex_lock(&m_inst_histogram_mutex.mtx);
+    hdr_histogram *inst = inst_m_totals_latency_histogram;
+    hdr_histogram *last = m_prom_last_inst;
+    const int64_t cur = hdr_total_count(inst);
+    if (cur != m_prom_last_copied_total) {
+        if (cur < m_prom_last_copied_total) {
+            // inst was reset since the last copy: all current samples are new.
+            hdr_add(target, inst);
+        } else {
+            // Monotonic growth (no reset, or a reset masked by net growth): add
+            // only the positive per-bucket increment so nothing is re-counted.
+            prom::hdr_add_positive_delta(target, inst, last);
+        }
+        // Snapshot current inst as the baseline for the next delta.
+        hdr_reset(last);
+        hdr_add(last, inst);
+        m_prom_last_copied_total = cur;
+    }
     pthread_mutex_unlock(&m_inst_histogram_mutex.mtx);
 }
 
@@ -418,6 +460,16 @@ unsigned long int run_stats::get_total_bytes(void)
     return m_totals.m_bytes_rx + m_totals.m_bytes_tx;
 }
 
+unsigned long int run_stats::get_total_bytes_rx(void)
+{
+    return m_totals.m_bytes_rx;
+}
+
+unsigned long int run_stats::get_total_bytes_tx(void)
+{
+    return m_totals.m_bytes_tx;
+}
+
 unsigned long int run_stats::get_total_ops(void)
 {
     return m_totals.m_ops;
@@ -441,6 +493,48 @@ unsigned long int run_stats::get_total_hits(void)
 unsigned long int run_stats::get_total_misses(void)
 {
     return m_totals.m_misses;
+}
+
+unsigned long long run_stats::get_total_arbitrary_hits(void)
+{
+    unsigned long long t = 0;
+    for (size_t i = 0; i < m_arbitrary_misses.size(); ++i)
+        t += m_arbitrary_misses[i].total_hits;
+    return t;
+}
+
+unsigned long long run_stats::get_total_arbitrary_misses(void)
+{
+    unsigned long long t = 0;
+    for (size_t i = 0; i < m_arbitrary_misses.size(); ++i)
+        t += m_arbitrary_misses[i].total_misses;
+    return t;
+}
+
+// A command whose null/aborted reply should be reported as a transaction
+// "abort" rather than a cache "miss". Today that is EXEC: in a WATCH/MULTI/EXEC
+// unit, EXEC returns a null array iff the optimistic lock failed (a watched key
+// changed), which is an abort, not a missing key. This is a display-only
+// reinterpretation: the count still lives in the per-command miss counter
+// (m_arbitrary_misses[i].total_misses), so global miss totals are unchanged.
+bool run_stats::is_abort_command_type(const std::string &command_type)
+{
+    return command_type == "EXEC";
+}
+
+// Sum of misses attributed to abort-semantics commands (EXEC). Reuses the miss
+// counter; selection is by command_type so no separate tracking is needed.
+unsigned long long run_stats::get_total_arbitrary_aborts(void)
+{
+    unsigned long long t = 0;
+    if (m_config == NULL || !m_config->arbitrary_commands->is_defined()) return 0;
+    for (size_t i = 0; i < m_arbitrary_misses.size(); ++i) {
+        if (i < m_config->arbitrary_commands->size() &&
+            is_abort_command_type(m_config->arbitrary_commands->at(i).command_type)) {
+            t += m_arbitrary_misses[i].total_misses;
+        }
+    }
+    return t;
 }
 
 #define AVERAGE(total, count) ((unsigned int) ((count) > 0 ? (total) / (count) : 0))
@@ -911,6 +1005,40 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
         m_end_time.tv_sec = (time_t) (total_duration_usec / 1000000);
         m_end_time.tv_usec = (suseconds_t) (total_duration_usec % 1000000);
     }
+
+    // Combine the whole-process CPU aggregate across runs: sum CPU-seconds and
+    // wall-seconds (so cores_used is the time-weighted average), take the max
+    // peak, and recompute the derived fields. Per-second / per-thread CPU detail
+    // is intentionally left empty for the AVERAGE report (it belongs to a single
+    // run; BEST/WORST keep their own).
+    cpu_summary agg_cpu;
+    unsigned int cpu_runs = 0;
+    unsigned int max_threads_counted = 0;
+    for (std::vector<run_stats>::const_iterator i = all_stats.begin(); i != all_stats.end(); i++) {
+        const cpu_summary &cs = i->m_cpu_summary;
+        if (!cs.valid) continue;
+        cpu_runs++;
+        agg_cpu.user_seconds += cs.user_seconds;
+        agg_cpu.sys_seconds += cs.sys_seconds;
+        agg_cpu.total_seconds += cs.total_seconds;
+        agg_cpu.worker_total_seconds += cs.worker_total_seconds;
+        agg_cpu.wall_seconds += cs.wall_seconds;
+        if (cs.peak_utilization_pct > agg_cpu.peak_utilization_pct)
+            agg_cpu.peak_utilization_pct = cs.peak_utilization_pct;
+        if (cs.threads_counted > max_threads_counted) max_threads_counted = cs.threads_counted;
+    }
+    if (cpu_runs > 0 && agg_cpu.wall_seconds > 0.0) {
+        agg_cpu.threads_counted = max_threads_counted;
+        agg_cpu.cores_used = agg_cpu.total_seconds / agg_cpu.wall_seconds;
+        // avg_utilization_pct uses WORKER-only CPU (main excluded), matching the
+        // single-run semantics so it cannot exceed 100% from main-thread overhead.
+        agg_cpu.avg_utilization_pct =
+            max_threads_counted > 0
+                ? 100.0 * (agg_cpu.worker_total_seconds / agg_cpu.wall_seconds) / max_threads_counted
+                : 0.0;
+        agg_cpu.valid = true;
+        m_cpu_summary = agg_cpu;
+    }
 }
 
 void run_stats::merge(const run_stats &other, int iteration)
@@ -1094,7 +1222,8 @@ void result_print_to_json(json_handler *jsonhandler, const char *type, double op
                           double moved, double ask, double kbs, double kbs_rx, double kbs_tx, double latency,
                           long m_total_latency, long ops, double connection_errors_sec, long connection_errors,
                           std::vector<double> quantile_list, struct hdr_histogram *latency_histogram,
-                          std::vector<unsigned int> timestamps, std::vector<one_sec_cmd_stats> timeserie_stats)
+                          std::vector<unsigned int> timestamps, std::vector<one_sec_cmd_stats> timeserie_stats,
+                          double aborts = -1.0)
 {
     if (jsonhandler != NULL) { // Added for double verification in case someone accidently send NULL.
         jsonhandler->open_nesting(type);
@@ -1102,6 +1231,10 @@ void result_print_to_json(json_handler *jsonhandler, const char *type, double op
         jsonhandler->write_obj("Ops/sec", "%.2f", ops_sec);
         jsonhandler->write_obj("Hits/sec", "%.2f", hits);
         jsonhandler->write_obj("Misses/sec", "%.2f", miss);
+
+        // Only emitted under --transaction (callers pass aborts >= 0). Aborts are
+        // the EXEC optimistic-lock subset already included in Misses/sec.
+        if (aborts >= 0) jsonhandler->write_obj("Aborts/sec", "%.2f", aborts);
 
         if (moved >= 0) jsonhandler->write_obj("MOVED/sec", "%.2f", moved);
 
@@ -1271,9 +1404,20 @@ void run_stats::print_type_column(output_table &table, arbitrary_command_list &c
     table_el el;
     table_column column;
 
-    // Type column
+    // Type column. The width is derived from the longest command name, which
+    // for --monitor-input comes from external (and fuzzed) input, so it can be
+    // arbitrarily long. Clamp it to a sane maximum: the fixed-size formatting
+    // buffers driven by column_size here and in output_table::print_header
+    // (char buf[100]) would otherwise overflow -- a memory-safety bug, not a
+    // cosmetic one. The previous `assert(column_size < 100)` aborted the whole
+    // process on such input (and <100 was itself one byte too generous for
+    // print_header's buf[100]). An over-long name still prints, just truncated
+    // to the column width by the snprintf in output_table::print.
+    static const unsigned int MAX_TYPE_COLUMN_SIZE = 64;
     column.column_size = MAX(6, command_list.get_max_command_name_length()) + 1;
-    assert(column.column_size < 100 && "command name too long");
+    if (column.column_size > MAX_TYPE_COLUMN_SIZE) {
+        column.column_size = MAX_TYPE_COLUMN_SIZE;
+    }
 
     // set enough space according to size of command name
     char buf[200];
@@ -1423,6 +1567,62 @@ void run_stats::print_missess_sec_column(output_table &table,
         column.elements.push_back(*el.init_double("%12.2f ", m_totals.m_misses_sec));
         column.elements.push_back(*el.init_str("%12s ", "---"));
         column.elements.push_back(*el.init_double("%12.2f ", m_totals.m_misses_sec));
+    }
+
+    table.add_column(column);
+}
+
+void run_stats::print_aborts_sec_column(output_table &table,
+                                        const std::vector<aggregated_command_type_stats> *aggregated)
+{
+    table_el el;
+    table_column column(12);
+
+    column.elements.push_back(*el.init_str("%12s ", "Aborts/sec"));
+    column.elements.push_back(*el.init_str("%s", "-------------"));
+
+    // Aborts only exist for arbitrary (--command) workloads. This column is
+    // only added under --transaction, which requires --command, so the
+    // arbitrary branch is what actually runs; the SET/GET/Wait branch mirrors
+    // print_missess_sec_column's row layout so the column never misaligns if
+    // the gating ever changes.
+    if (print_arbitrary_commands_results()) {
+        // Only abort-semantics commands (EXEC) contribute; every other row
+        // shows 0.00. The count is the same value carried in that command's
+        // Misses/sec (display-only reinterpretation), so Aborts is a labeled
+        // subset of Misses.
+        unsigned long int test_duration_usec = ts_diff(m_start_time, m_end_time);
+        unsigned long long total_aborts = 0;
+        if (aggregated != nullptr) {
+            for (const auto &agg : *aggregated) {
+                unsigned long long aborts = is_abort_command_type(agg.command_type) ? agg.total_misses : 0;
+                double aborts_sec =
+                    test_duration_usec > 0 ? (double) aborts / (double) test_duration_usec * 1000000.0 : 0.0;
+                column.elements.push_back(*el.init_double("%12.2f ", aborts_sec));
+                total_aborts += aborts;
+            }
+        } else {
+            for (size_t i = 0; i < m_totals.m_ar_commands.size(); i++) {
+                bool is_abort = m_config != NULL && i < m_config->arbitrary_commands->size() &&
+                                is_abort_command_type(m_config->arbitrary_commands->at(i).command_type);
+                unsigned long long aborts =
+                    (is_abort && i < m_arbitrary_misses.size()) ? m_arbitrary_misses[i].total_misses : 0;
+                double aborts_sec =
+                    test_duration_usec > 0 ? (double) aborts / (double) test_duration_usec * 1000000.0 : 0.0;
+                column.elements.push_back(*el.init_double("%12.2f ", aborts_sec));
+                total_aborts += aborts;
+            }
+        }
+        double total_aborts_sec =
+            test_duration_usec > 0 ? (double) total_aborts / (double) test_duration_usec * 1000000.0 : 0.0;
+        column.elements.push_back(*el.init_double("%12.2f ", total_aborts_sec));
+    } else {
+        // SET/GET/Wait layout (no aborts possible): one cell per Type row plus
+        // the Totals cell, matching the other columns' row count.
+        column.elements.push_back(*el.init_str("%12s ", "---"));
+        column.elements.push_back(*el.init_double("%12.2f ", 0.0));
+        column.elements.push_back(*el.init_str("%12s ", "---"));
+        column.elements.push_back(*el.init_double("%12.2f ", 0.0));
     }
 
     table.add_column(column);
@@ -1658,6 +1858,40 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
         jsonhandler->write_obj("Interrupted", "\"%s\"", m_interrupted ? "true" : "false");
         jsonhandler->close_nesting();
     }
+
+    // Whole-process CPU aggregate (memtier's own utilization). Emitted as a
+    // sibling of "Runtime" so the existing Runtime schema is untouched. Only
+    // present when per-thread CPU accounting succeeded (Linux RUSAGE_THREAD).
+    if (jsonhandler != NULL && m_cpu_summary.valid) {
+        jsonhandler->open_nesting("CPU");
+        jsonhandler->write_obj("cpu_user_seconds", "%.3f", m_cpu_summary.user_seconds);
+        jsonhandler->write_obj("cpu_sys_seconds", "%.3f", m_cpu_summary.sys_seconds);
+        jsonhandler->write_obj("cpu_total_seconds", "%.3f", m_cpu_summary.total_seconds);
+        jsonhandler->write_obj("cpu_wall_seconds", "%.3f", m_cpu_summary.wall_seconds);
+        jsonhandler->write_obj("cpu_cores_used", "%.3f", m_cpu_summary.cores_used);
+        jsonhandler->write_obj("avg_cpu_utilization_pct", "%.3f", m_cpu_summary.avg_utilization_pct);
+        jsonhandler->write_obj("peak_cpu_utilization_pct", "%.3f", m_cpu_summary.peak_utilization_pct);
+        jsonhandler->write_obj("threads_counted", "%u", m_cpu_summary.threads_counted);
+        if (!m_cpu_threads.empty()) {
+            jsonhandler->open_nesting("Per Thread");
+            for (size_t i = 0; i < m_cpu_threads.size(); i++) {
+                const per_thread_cpu_total &pt = m_cpu_threads[i];
+                if (!pt.valid) continue;
+                char thread_name[32];
+                snprintf(thread_name, sizeof(thread_name), "Thread %u", pt.thread_id);
+                jsonhandler->open_nesting(thread_name);
+                jsonhandler->write_obj("user_seconds", "%.3f", pt.user_seconds);
+                jsonhandler->write_obj("sys_seconds", "%.3f", pt.sys_seconds);
+                jsonhandler->write_obj("total_seconds", "%.3f", pt.total_seconds);
+                jsonhandler->write_obj("wall_seconds", "%.3f", pt.wall_seconds);
+                jsonhandler->write_obj("cores_used", "%.3f", pt.cores_used);
+                jsonhandler->close_nesting();
+            }
+            jsonhandler->close_nesting();
+        }
+        jsonhandler->close_nesting();
+    }
+
     std::vector<unsigned int> timestamps = get_one_sec_cmd_stats_timestamp();
 
     if (print_arbitrary_commands_results()) {
@@ -1693,7 +1927,9 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
                                      avg_latency, agg.stats.m_total_latency, agg.stats.m_ops,
                                      0.0, // connection_errors_sec (not tracked per command)
                                      0,   // connection_errors (not tracked per command)
-                                     quantiles_list, agg.latency_hist, timestamps, agg.per_second_stats);
+                                     quantiles_list, agg.latency_hist, timestamps, agg.per_second_stats,
+                                     (m_config->transaction && is_abort_command_type(agg.command_type)) ? misses_sec
+                                                                                                        : -1.0);
             }
         } else {
             // Original per-command behavior
@@ -1712,16 +1948,17 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
                     misses_sec = (double) m_arbitrary_misses[i].total_misses / (double) test_duration_usec * 1000000.0;
                 }
 
-                result_print_to_json(jsonhandler, command_name.c_str(), m_totals.m_ar_commands[i].m_ops_sec, hits_sec,
-                                     misses_sec, cluster_mode ? m_totals.m_ar_commands[i].m_moved_sec : -1,
-                                     cluster_mode ? m_totals.m_ar_commands[i].m_ask_sec : -1,
-                                     m_totals.m_ar_commands[i].m_bytes_sec, m_totals.m_ar_commands[i].m_bytes_sec_rx,
-                                     m_totals.m_ar_commands[i].m_bytes_sec_tx, m_totals.m_ar_commands[i].m_latency,
-                                     m_totals.m_ar_commands[i].m_total_latency, m_totals.m_ar_commands[i].m_ops,
-                                     0.0, // connection_errors_sec (not tracked per command)
-                                     0,   // connection_errors (not tracked per command)
-                                     quantiles_list, arbitrary_command_latency_histogram, timestamps,
-                                     arbitrary_command_stats);
+                result_print_to_json(
+                    jsonhandler, command_name.c_str(), m_totals.m_ar_commands[i].m_ops_sec, hits_sec, misses_sec,
+                    cluster_mode ? m_totals.m_ar_commands[i].m_moved_sec : -1,
+                    cluster_mode ? m_totals.m_ar_commands[i].m_ask_sec : -1, m_totals.m_ar_commands[i].m_bytes_sec,
+                    m_totals.m_ar_commands[i].m_bytes_sec_rx, m_totals.m_ar_commands[i].m_bytes_sec_tx,
+                    m_totals.m_ar_commands[i].m_latency, m_totals.m_ar_commands[i].m_total_latency,
+                    m_totals.m_ar_commands[i].m_ops,
+                    0.0, // connection_errors_sec (not tracked per command)
+                    0,   // connection_errors (not tracked per command)
+                    quantiles_list, arbitrary_command_latency_histogram, timestamps, arbitrary_command_stats,
+                    (m_config->transaction && is_abort_command_type(command_list[i].command_type)) ? misses_sec : -1.0);
             }
         }
 
@@ -1806,12 +2043,17 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
             totals_misses_sec = (double) all_misses / (double) dur_usec * 1000000.0;
         }
     }
+    double totals_aborts_sec = -1.0;
+    if (m_config->transaction && print_arbitrary_commands_results()) {
+        unsigned long int dur_usec = ts_diff(m_start_time, m_end_time);
+        totals_aborts_sec = dur_usec > 0 ? (double) get_total_arbitrary_aborts() / (double) dur_usec * 1000000.0 : 0.0;
+    }
     result_print_to_json(jsonhandler, "Totals", m_totals.m_ops_sec, totals_hits_sec, totals_misses_sec,
                          cluster_mode ? m_totals.m_moved_sec : -1, cluster_mode ? m_totals.m_ask_sec : -1,
                          m_totals.m_bytes_sec, m_totals.m_bytes_sec_rx, m_totals.m_bytes_sec_tx, m_totals.m_latency,
                          m_totals.m_total_latency, m_totals.m_ops, m_totals.m_connection_errors_sec,
                          m_totals.m_connection_errors, quantiles_list, m_totals.latency_histogram, timestamps,
-                         total_stats);
+                         total_stats, totals_aborts_sec);
 
     // -----------------------------------------------------------------
     // Read-preference observability (Step 2f).
@@ -1910,6 +2152,31 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
             jsonhandler->open_nesting(ts_str);
             jsonhandler->write_obj("Clients per thread", "%u", active);
             jsonhandler->write_obj("Total clients", "%u", active * m_config->threads);
+            jsonhandler->close_nesting();
+        }
+        jsonhandler->close_nesting();
+    }
+
+    // Per-second, per-thread CPU detail from the live sampler. Advisory: these
+    // are 1s-window "% of a core" samples, distinct from the authoritative "CPU"
+    // aggregate above. Each second carries the main thread plus one "Thread N"
+    // entry per worker.
+    if (jsonhandler != NULL && !m_cpu_stats.empty()) {
+        jsonhandler->open_nesting("CPU Stats");
+        for (size_t i = 0; i < m_cpu_stats.size(); i++) {
+            const per_second_cpu_stats &cs = m_cpu_stats[i];
+            char sec_str[16];
+            snprintf(sec_str, sizeof(sec_str), "%u", cs.m_second);
+            jsonhandler->open_nesting(sec_str);
+            jsonhandler->write_obj("Main Thread", "%.2f", cs.m_main_thread_cpu_pct);
+            // "Thread N" here is the worker's positional index, which equals its
+            // m_thread_id (assigned as the construction index), so these labels
+            // line up 1:1 with the authoritative "CPU" -> "Per Thread" block.
+            for (size_t t = 0; t < cs.m_thread_cpu_pct.size(); t++) {
+                char thread_name[32];
+                snprintf(thread_name, sizeof(thread_name), "Thread %zu", t);
+                jsonhandler->write_obj(thread_name, "%.2f", cs.m_thread_cpu_pct[t]);
+            }
             jsonhandler->close_nesting();
         }
         jsonhandler->close_nesting();
@@ -2054,6 +2321,12 @@ void run_stats::print(FILE *out, benchmark_config *config, const char *header /*
     // Misses/sec column
     print_missess_sec_column(table, aggregated_ptr);
 
+    // Aborts/sec column (transaction mode only): EXEC optimistic-lock aborts,
+    // broken out from the generic Misses column.
+    if (config->transaction) {
+        print_aborts_sec_column(table, aggregated_ptr);
+    }
+
     // Moved & ASK column (relevant only for cluster mode)
     if (config->cluster_mode) {
         print_moved_sec_column(table, aggregated_ptr);
@@ -2090,9 +2363,13 @@ void run_stats::print(FILE *out, benchmark_config *config, const char *header /*
                 if (total == 0) continue;
                 double miss_rate = (double) agg.total_misses / (double) total;
                 if (miss_rate > miss_threshold) {
-                    fprintf(stderr, "warning: %s miss rate %.2f%% above target %.2f%% (%llu misses / %llu ops)\n",
-                            agg.command_type.c_str(), miss_rate * 100.0, miss_threshold * 100.0, agg.total_misses,
-                            total);
+                    // EXEC nulls are optimistic-lock aborts, not cache misses.
+                    // Gated on --transaction to match the Aborts column / JSON /
+                    // live tail: without the flag, output keeps "miss" wording.
+                    const bool abort = config->transaction && is_abort_command_type(agg.command_type);
+                    fprintf(stderr, "warning: %s %s rate %.2f%% above target %.2f%% (%llu %s / %llu ops)\n",
+                            agg.command_type.c_str(), abort ? "abort" : "miss", miss_rate * 100.0,
+                            miss_threshold * 100.0, agg.total_misses, abort ? "aborts" : "misses", total);
                 }
             }
         } else {
@@ -2102,11 +2379,16 @@ void run_stats::print(FILE *out, benchmark_config *config, const char *header /*
                 if (total == 0) continue;
                 double miss_rate = (double) am.total_misses / (double) total;
                 if (miss_rate > miss_threshold) {
-                    const char *cmd_name = i < config->arbitrary_commands->size()
-                                               ? config->arbitrary_commands->at(i).command_type.c_str()
-                                               : "unknown";
-                    fprintf(stderr, "warning: %s miss rate %.2f%% above target %.2f%% (%llu misses / %llu ops)\n",
-                            cmd_name, miss_rate * 100.0, miss_threshold * 100.0, am.total_misses, total);
+                    const std::string &cmd_type = i < config->arbitrary_commands->size()
+                                                      ? config->arbitrary_commands->at(i).command_type
+                                                      : std::string("unknown");
+                    // EXEC nulls are optimistic-lock aborts, not cache misses.
+                    // Gated on --transaction to match the Aborts column / JSON /
+                    // live tail: without the flag, output keeps "miss" wording.
+                    const bool abort = config->transaction && is_abort_command_type(cmd_type);
+                    fprintf(stderr, "warning: %s %s rate %.2f%% above target %.2f%% (%llu %s / %llu ops)\n",
+                            cmd_type.c_str(), abort ? "abort" : "miss", miss_rate * 100.0, miss_threshold * 100.0,
+                            am.total_misses, abort ? "aborts" : "misses", total);
                 }
             }
         }
@@ -2117,6 +2399,37 @@ void run_stats::print(FILE *out, benchmark_config *config, const char *header /*
             if (miss_rate > miss_threshold) {
                 fprintf(stderr, "warning: GET miss rate %.2f%% above target %.2f%% (%lu misses / %llu ops)\n",
                         miss_rate * 100.0, miss_threshold * 100.0, m_totals.m_misses, total);
+            }
+        }
+    }
+
+    // CPU utilization summary for memtier itself. Goes to stderr (like the
+    // miss-rate warning above) so it never corrupts piped / redirected table
+    // output. Only the authoritative getrusage-based aggregate is shown here.
+    if (m_cpu_summary.valid) {
+        fprintf(stderr,
+                "\n"
+                "CPU Utilization Summary\n"
+                "  Total CPU time:   %.3fs  (user %.3fs, sys %.3fs)\n"
+                "  Wall time:        %.3fs\n"
+                "  Cores used:       %.3f   (avg %.1f%% across %u worker threads)\n"
+                "  Peak utilization: %.1f%%\n",
+                m_cpu_summary.total_seconds, m_cpu_summary.user_seconds, m_cpu_summary.sys_seconds,
+                m_cpu_summary.wall_seconds, m_cpu_summary.cores_used, m_cpu_summary.avg_utilization_pct,
+                m_cpu_summary.threads_counted, m_cpu_summary.peak_utilization_pct);
+
+        // End-of-run high-CPU warning (one line per offending thread), computed
+        // from the authoritative per-thread totals. config->cpu_warn_threshold
+        // is a fraction of a single core (default 0.95).
+        const double cpu_threshold = config->cpu_warn_threshold;
+        for (size_t i = 0; i < m_cpu_threads.size(); i++) {
+            const per_thread_cpu_total &pt = m_cpu_threads[i];
+            if (!pt.valid) continue;
+            if (pt.cores_used > cpu_threshold) {
+                fprintf(stderr,
+                        "warning: thread %u averaged %.1f%% of a core over the run (threshold %.1f%%) - "
+                        "memtier may be the bottleneck; results may be unreliable\n",
+                        pt.thread_id, pt.cores_used * 100.0, cpu_threshold * 100.0);
             }
         }
     }
