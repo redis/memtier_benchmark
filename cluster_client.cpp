@@ -746,20 +746,51 @@ std::vector<cluster_endpoint_info> cluster_client::build_topology_snapshot() con
 
 void cluster_client::print_topology_summary() const
 {
-    // Fire exactly once per run across all worker threads. Periodic topology
-    // refreshes within the same run must not reprint, so the gate keys on the
-    // run id rather than a plain "printed" flag.
-    static std::atomic<unsigned int> s_last_printed_run(UINT_MAX);
-    const unsigned int rid = m_config->current_run_id;
-    unsigned int prev = s_last_printed_run.load(std::memory_order_relaxed);
-    if (prev == rid)
-        return;
-    if (!s_last_printed_run.compare_exchange_strong(prev, rid))
-        return; // another thread already printed this run's summary
-
     std::vector<cluster_endpoint_info> eps = build_topology_snapshot();
     if (eps.empty())
         return;
+
+    // Signature of the topology shape (endpoints + roles + slot ranges). The
+    // startup block prints on the first commit of each run AND reprints when
+    // this signature changes within a run, so a mid-run CLUSTER SLOTS refresh
+    // that alters the topology is logged and the stderr output stays consistent
+    // with the run-end results summary (which snapshots the final topology).
+    unsigned long long sig = 1469598103934665603ULL; // FNV-1a 64-bit offset basis
+    for (size_t i = 0; i < eps.size(); i++) {
+        const cluster_endpoint_info &e = eps[i];
+        for (size_t c = 0; c < e.addr.size(); c++) {
+            sig ^= (unsigned char) e.addr[c];
+            sig *= 1099511628211ULL;
+        }
+        sig ^= (e.is_primary ? 0x9E3779B97F4A7C15ULL : 0xC2B2AE3D27D4EB4FULL);
+        sig *= 1099511628211ULL;
+        for (size_t r = 0; r < e.slot_ranges.size(); r++) {
+            sig ^= (unsigned long long) e.slot_ranges[r].first;
+            sig *= 1099511628211ULL;
+            sig ^= (unsigned long long) e.slot_ranges[r].second;
+            sig *= 1099511628211ULL;
+        }
+    }
+
+    // Process-global gate keyed on (run id, signature). Guarded by a mutex
+    // because the signature is wider than a lock-free atomic and several worker
+    // threads can reach this concurrently after a refresh. The first thread to
+    // observe a new (run, shape) prints; the rest return.
+    const unsigned int rid = m_config->current_run_id;
+    {
+        static pthread_mutex_t s_mtx = PTHREAD_MUTEX_INITIALIZER;
+        static unsigned int s_last_run = UINT_MAX;
+        static unsigned long long s_last_sig = 0;
+        pthread_mutex_lock(&s_mtx);
+        bool already_printed = (s_last_run == rid && s_last_sig == sig);
+        if (!already_printed) {
+            s_last_run = rid;
+            s_last_sig = sig;
+        }
+        pthread_mutex_unlock(&s_mtx);
+        if (already_printed)
+            return;
+    }
 
     size_t primaries = 0, replicas = 0;
     for (size_t i = 0; i < eps.size(); i++) {
