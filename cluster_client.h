@@ -55,6 +55,20 @@ struct shard_group
     unsigned int replica_rr_cursor; // per-thread, not atomic
 };
 
+// One distinct endpoint (host:port) in the discovered cluster topology, with
+// the hash-slot ranges it serves. Replicas inherit their primary's ranges and
+// carry primary_addr so the summary can show "replica -> <primary>". Built by
+// cluster_client::build_topology_snapshot() from m_shard_groups +
+// m_slot_to_shard_group after a CLUSTER SLOTS commit, and consumed only by the
+// human-readable startup summary (print_topology_summary).
+struct cluster_endpoint_info
+{
+    std::string addr; // "host:port"
+    bool is_primary;
+    std::string primary_addr;                      // replicas: owning primary's "host:port"; "" for primaries
+    std::vector<std::pair<int, int> > slot_ranges; // contiguous [start,end] runs, primary-owned
+};
+
 class cluster_client : public client
 {
 public:
@@ -232,6 +246,19 @@ public:
         return m_arbitrary_routing_counters;
     }
     const read_routing_counters &get_get_routing_counters() const { return m_get_routing_counters; }
+
+    // Build a per-endpoint view of the committed topology (m_shard_groups +
+    // m_slot_to_shard_group): one entry per distinct host:port, primaries first
+    // then replicas, each annotated with the contiguous slot ranges it serves.
+    // Called only after a successful CLUSTER SLOTS commit; the caller holds no
+    // lock because each cluster_client is single-threaded.
+    std::vector<cluster_endpoint_info> build_topology_snapshot() const;
+
+    // Emit the human-readable "[RUN #N] Cluster topology: ..." block to stderr
+    // (endpoint list with slot ranges, total opened connections, and the
+    // aggregate rate-limit target when --rate-limiting is set). Guarded to fire
+    // exactly once per run across all worker threads.
+    void print_topology_summary() const;
 
     // client manager api's
     virtual bool handle_cluster_slots(protocol_response *r);
