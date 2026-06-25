@@ -63,9 +63,9 @@ struct shard_group
 // human-readable startup summary (print_topology_summary).
 struct cluster_endpoint_info
 {
-    std::string addr;                            // "host:port"
+    std::string addr; // "host:port"
     bool is_primary;
-    std::string primary_addr;                    // replicas: owning primary's "host:port"; "" for primaries
+    std::string primary_addr;                      // replicas: owning primary's "host:port"; "" for primaries
     std::vector<std::pair<int, int> > slot_ranges; // contiguous [start,end] runs, primary-owned
 };
 

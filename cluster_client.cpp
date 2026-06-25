@@ -671,8 +671,7 @@ static std::vector<std::pair<int, int> > merge_slot_ranges(std::vector<std::pair
 std::vector<cluster_endpoint_info> cluster_client::build_topology_snapshot() const
 {
     std::vector<cluster_endpoint_info> out;
-    if (m_shard_groups.empty())
-        return out;
+    if (m_shard_groups.empty()) return out;
 
     // Reconstruct each group's contiguous slot runs by scanning the slot map
     // once. A group == one CLUSTER SLOTS shard entry (one contiguous range).
@@ -707,8 +706,7 @@ std::vector<cluster_endpoint_info> cluster_client::build_topology_snapshot() con
         const shard_group &grp = m_shard_groups[gi];
         if (grp.primary == NULL) continue;
         std::string paddr = sc_endpoint_addr(grp.primary);
-        if (primary_ranges.find(paddr) == primary_ranges.end())
-            primary_order.push_back(paddr);
+        if (primary_ranges.find(paddr) == primary_ranges.end()) primary_order.push_back(paddr);
         std::vector<std::pair<int, int> > &pr = primary_ranges[paddr];
         pr.insert(pr.end(), group_ranges[gi].begin(), group_ranges[gi].end());
 
@@ -747,8 +745,7 @@ std::vector<cluster_endpoint_info> cluster_client::build_topology_snapshot() con
 void cluster_client::print_topology_summary() const
 {
     std::vector<cluster_endpoint_info> eps = build_topology_snapshot();
-    if (eps.empty())
-        return;
+    if (eps.empty()) return;
 
     // Signature of the topology shape (endpoints + roles + slot ranges). The
     // startup block prints on the first commit of each run AND reprints when
@@ -788,8 +785,7 @@ void cluster_client::print_topology_summary() const
             s_last_sig = sig;
         }
         pthread_mutex_unlock(&s_mtx);
-        if (already_printed)
-            return;
+        if (already_printed) return;
     }
 
     size_t primaries = 0, replicas = 0;
@@ -821,13 +817,13 @@ void cluster_client::print_topology_summary() const
         const char *rp = (nr == 1) ? "" : "s";
         const char *sp = (slots == 1) ? "" : "s";
         if (e.is_primary)
-            fprintf(stderr, "           %-22s primary   %5zu slot%s in %zu range%s\n", e.addr.c_str(), slots, sp, nr, rp);
+            fprintf(stderr, "           %-22s primary   %5zu slot%s in %zu range%s\n", e.addr.c_str(), slots, sp, nr,
+                    rp);
         else
             fprintf(stderr, "           %-22s replica   %5zu slot%s in %zu range%s  -> %s\n", e.addr.c_str(), slots, sp,
                     nr, rp, e.primary_addr.c_str());
     }
-    if (eps.size() > shown)
-        fprintf(stderr, "           ... and %zu more endpoints\n", eps.size() - shown);
+    if (eps.size() > shown) fprintf(stderr, "           ... and %zu more endpoints\n", eps.size() - shown);
 
     // Total opened connections = threads x conns-per-thread x endpoints. Each
     // cluster_client opens one shard_connection per distinct endpoint, so the
@@ -844,7 +840,8 @@ void cluster_client::print_topology_summary() const
     // idle and never hit their per-connection limiter).
     if (m_config->request_rate > 0) {
         const unsigned long long traffic_eps =
-            (unsigned long long) primaries + (m_config->read_preference != rp_primary ? (unsigned long long) replicas : 0);
+            (unsigned long long) primaries +
+            (m_config->read_preference != rp_primary ? (unsigned long long) replicas : 0);
         const unsigned long long aggregate = (unsigned long long) m_config->request_rate *
                                              (unsigned long long) m_config->threads *
                                              (unsigned long long) m_config->clients * traffic_eps;

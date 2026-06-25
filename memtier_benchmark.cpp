@@ -5163,8 +5163,7 @@ int main(int argc, char *argv[])
                 fprintf(outfile, "%-9zu Cluster endpoints (%zu primaries)\n", c_endpoints, c_primaries);
             fprintf(outfile, "%-9llu Total connections (%u x %u x %zu)\n", c_total_conns, cfg.threads, cfg.clients,
                     c_endpoints);
-            if (c_has_rate)
-                fprintf(outfile, "%-9llu Aggregate rate-limit target (req/s)\n", c_rate_aggregate);
+            if (c_has_rate) fprintf(outfile, "%-9llu Aggregate rate-limit target (req/s)\n", c_rate_aggregate);
         }
 
         fprintf(outfile, "%-9llu %s\n", (unsigned long long) (cfg.requests > 0 ? cfg.requests : cfg.test_time),
@@ -5179,8 +5178,7 @@ int main(int argc, char *argv[])
                 jsonhandler->write_obj("Cluster primary endpoints", "%zu", c_primaries);
                 jsonhandler->write_obj("Cluster replica endpoints", "%zu", c_replicas);
                 jsonhandler->write_obj("Total connections", "%llu", c_total_conns);
-                if (c_has_rate)
-                    jsonhandler->write_obj("Aggregate rate-limit target", "%llu", c_rate_aggregate);
+                if (c_has_rate) jsonhandler->write_obj("Aggregate rate-limit target", "%llu", c_rate_aggregate);
             }
             jsonhandler->write_obj(cfg.requests > 0 ? "Requests per client" : "Seconds", "%llu",
                                    cfg.requests > 0 ? cfg.requests : (unsigned long long) cfg.test_time);
