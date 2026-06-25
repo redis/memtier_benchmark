@@ -2821,6 +2821,10 @@ static void print_staircase_pattern(int run_id, benchmark_config *cfg)
 
 run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj_gen)
 {
+    // Expose the current run id so the cluster topology summary (printed from a
+    // worker thread once CLUSTER SLOTS commits) can label and gate itself.
+    cfg->current_run_id = (unsigned int) run_id;
+
     fprintf(stderr, "[RUN #%u] Preparing benchmark client...\n", run_id);
 
     // Shared MGET slot cache: allocate fresh for this run so the lazy build
@@ -3294,6 +3298,7 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     // run_benchmark returns the worker pointers are gone, so this is the
     // last chance to capture the state.
     // -----------------------------------------------------------------
+    bool cluster_topology_captured = false;
     for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
         client_group *cg = (*i)->m_cg;
         std::vector<client *> &clients = cg->get_clients();
@@ -3322,6 +3327,24 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             // Per-command Read-Routing counters live on cluster_client.
             cluster_client *cc = dynamic_cast<cluster_client *>(c);
             if (cc != NULL) {
+                // Capture the discovered topology once (identical across clients)
+                // from the same snapshot the startup line uses, so the results
+                // summary's endpoint/connection counts agree with it and exclude
+                // the bootstrap seed connection / dead sockets.
+                if (!cluster_topology_captured) {
+                    std::vector<cluster_endpoint_info> eps = cc->build_topology_snapshot();
+                    if (!eps.empty()) {
+                        size_t prim = 0, rep = 0;
+                        for (size_t e = 0; e < eps.size(); ++e) {
+                            if (eps[e].is_primary)
+                                prim++;
+                            else
+                                rep++;
+                        }
+                        stats.set_cluster_topology(eps.size(), prim, rep);
+                        cluster_topology_captured = true;
+                    }
+                }
                 const std::vector<cluster_client::read_routing_counters> &arr = cc->get_arbitrary_routing_counters();
                 for (size_t ai = 0; ai < arr.size(); ++ai) {
                     stats.absorb_arbitrary_routing(ai, arr[ai].ops_from_primary, arr[ai].ops_from_replica);
@@ -4281,18 +4304,70 @@ int main(int argc, char *argv[])
             stats.save_hdr_arbitrary_commands(&cfg, run_id);
         }
         //
-        // Print some run information
+        // Print some run information.
+        //
+        // In cluster mode, also surface the discovered endpoint count and the
+        // real total connection fan-out (threads x conns/thread x endpoints),
+        // plus the aggregate rate-limit target when --rate-limiting is set.
+        // Counts come from the topology snapshot captured at run end (same
+        // source as the startup "[RUN #N] Cluster topology" line), so the two
+        // agree. The aggregate rate target counts only request-generating
+        // connections (primaries always; replicas only when reads route to
+        // them), since idle replica connections never hit their rate limiter.
+        bool have_cluster_topo = false;
+        size_t c_endpoints = 0, c_primaries = 0, c_replicas = 0;
+        unsigned long long c_total_conns = 0, c_rate_aggregate = 0;
+        bool c_has_rate = false;
+        if (cfg.cluster_mode && !all_stats.empty()) {
+            const run_stats &topo = all_stats.back();
+            c_endpoints = topo.get_endpoint_count();
+            if (c_endpoints > 0) {
+                have_cluster_topo = true;
+                c_primaries = topo.get_primary_endpoint_count();
+                c_replicas = topo.get_replica_endpoint_count();
+                c_total_conns = (unsigned long long) cfg.threads * (unsigned long long) cfg.clients *
+                                (unsigned long long) c_endpoints;
+                if (cfg.request_rate > 0) {
+                    size_t traffic_eps = c_primaries + (cfg.read_preference != rp_primary ? c_replicas : 0);
+                    c_rate_aggregate = (unsigned long long) cfg.request_rate * (unsigned long long) cfg.threads *
+                                       (unsigned long long) cfg.clients * (unsigned long long) traffic_eps;
+                    c_has_rate = true;
+                }
+            }
+        }
+
         fprintf(outfile,
                 "%-9u Threads\n"
-                "%-9u Connections per thread\n"
-                "%-9llu %s\n",
-                cfg.threads, cfg.clients, (unsigned long long) (cfg.requests > 0 ? cfg.requests : cfg.test_time),
+                "%-9u Connections per thread\n",
+                cfg.threads, cfg.clients);
+
+        if (have_cluster_topo) {
+            if (c_replicas > 0)
+                fprintf(outfile, "%-9zu Cluster endpoints (%zu primaries, %zu replicas)\n", c_endpoints, c_primaries,
+                        c_replicas);
+            else
+                fprintf(outfile, "%-9zu Cluster endpoints (%zu primaries)\n", c_endpoints, c_primaries);
+            fprintf(outfile, "%-9llu Total connections (%u x %u x %zu)\n", c_total_conns, cfg.threads, cfg.clients,
+                    c_endpoints);
+            if (c_has_rate)
+                fprintf(outfile, "%-9llu Aggregate rate-limit target (req/s)\n", c_rate_aggregate);
+        }
+
+        fprintf(outfile, "%-9llu %s\n", (unsigned long long) (cfg.requests > 0 ? cfg.requests : cfg.test_time),
                 cfg.requests > 0 ? "Requests per client" : "Seconds");
 
         if (jsonhandler != NULL) {
             jsonhandler->open_nesting("run information");
             jsonhandler->write_obj("Threads", "%u", cfg.threads);
             jsonhandler->write_obj("Connections per thread", "%u", cfg.clients);
+            if (have_cluster_topo) {
+                jsonhandler->write_obj("Cluster endpoints", "%zu", c_endpoints);
+                jsonhandler->write_obj("Cluster primary endpoints", "%zu", c_primaries);
+                jsonhandler->write_obj("Cluster replica endpoints", "%zu", c_replicas);
+                jsonhandler->write_obj("Total connections", "%llu", c_total_conns);
+                if (c_has_rate)
+                    jsonhandler->write_obj("Aggregate rate-limit target", "%llu", c_rate_aggregate);
+            }
             jsonhandler->write_obj(cfg.requests > 0 ? "Requests per client" : "Seconds", "%llu",
                                    cfg.requests > 0 ? cfg.requests : (unsigned long long) cfg.test_time);
             jsonhandler->write_obj("Format version", "%d", 2);

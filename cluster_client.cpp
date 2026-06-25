@@ -44,6 +44,8 @@
 #include <assert.h>
 #endif
 
+#include <atomic>
+
 #include "cluster_client.h"
 #include "command_meta.h"
 #include "memtier_benchmark.h"
@@ -623,6 +625,150 @@ void cluster_client::record_builtin_read_routing(request_type rt, bool from_repl
         m_get_routing_counters.ops_from_primary++;
 }
 
+// "host:port" for a shard_connection, defensive against NULL fields.
+static std::string sc_endpoint_addr(shard_connection *sc)
+{
+    const char *a = sc->get_address();
+    const char *p = sc->get_port();
+    std::string s(a ? a : "?");
+    s += ":";
+    s += (p ? p : "?");
+    return s;
+}
+
+std::vector<cluster_endpoint_info> cluster_client::build_topology_snapshot() const
+{
+    std::vector<cluster_endpoint_info> out;
+    if (m_shard_groups.empty())
+        return out;
+
+    // Reconstruct each group's contiguous slot runs by scanning the slot map
+    // once. A group can own several disjoint runs (e.g. after resharding), so
+    // we collect a vector of [start,end] ranges per group index.
+    std::vector<std::vector<std::pair<int, int> > > group_ranges(m_shard_groups.size());
+    unsigned int run_group = UINT_MAX;
+    int run_start = 0;
+    for (int s = 0; s <= MAX_CLUSTER_HSLOT; s++) {
+        unsigned int g = (s < (int) m_slot_to_shard_group.size()) ? m_slot_to_shard_group[s] : UINT_MAX;
+        if (g != run_group) {
+            if (run_group != UINT_MAX && run_group < group_ranges.size())
+                group_ranges[run_group].push_back(std::make_pair(run_start, s - 1));
+            run_group = g;
+            run_start = s;
+        }
+    }
+    if (run_group != UINT_MAX && run_group < group_ranges.size())
+        group_ranges[run_group].push_back(std::make_pair(run_start, MAX_CLUSTER_HSLOT));
+
+    // Primaries first (in shard order), then replicas, so the printed list
+    // reads "all primaries, then all replicas".
+    for (size_t gi = 0; gi < m_shard_groups.size(); gi++) {
+        const shard_group &grp = m_shard_groups[gi];
+        if (grp.primary == NULL) continue;
+        cluster_endpoint_info info;
+        info.addr = sc_endpoint_addr(grp.primary);
+        info.is_primary = true;
+        info.slot_ranges = group_ranges[gi];
+        out.push_back(info);
+    }
+    for (size_t gi = 0; gi < m_shard_groups.size(); gi++) {
+        const shard_group &grp = m_shard_groups[gi];
+        if (grp.primary == NULL) continue;
+        std::string primary_addr = sc_endpoint_addr(grp.primary);
+        for (size_t ri = 0; ri < grp.replicas.size(); ri++) {
+            shard_connection *rep = grp.replicas[ri];
+            if (rep == NULL) continue;
+            cluster_endpoint_info info;
+            info.addr = sc_endpoint_addr(rep);
+            info.is_primary = false;
+            info.primary_addr = primary_addr;
+            info.slot_ranges = group_ranges[gi];
+            out.push_back(info);
+        }
+    }
+    return out;
+}
+
+void cluster_client::print_topology_summary() const
+{
+    // Fire exactly once per run across all worker threads. Periodic topology
+    // refreshes within the same run must not reprint, so the gate keys on the
+    // run id rather than a plain "printed" flag.
+    static std::atomic<unsigned int> s_last_printed_run(UINT_MAX);
+    const unsigned int rid = m_config->current_run_id;
+    unsigned int prev = s_last_printed_run.load(std::memory_order_relaxed);
+    if (prev == rid)
+        return;
+    if (!s_last_printed_run.compare_exchange_strong(prev, rid))
+        return; // another thread already printed this run's summary
+
+    std::vector<cluster_endpoint_info> eps = build_topology_snapshot();
+    if (eps.empty())
+        return;
+
+    size_t primaries = 0, replicas = 0;
+    for (size_t i = 0; i < eps.size(); i++) {
+        if (eps[i].is_primary)
+            primaries++;
+        else
+            replicas++;
+    }
+
+    if (replicas > 0)
+        fprintf(stderr, "[RUN #%u] Cluster topology: %zu endpoints discovered (%zu primaries, %zu replicas)\n", rid,
+                eps.size(), primaries, replicas);
+    else
+        fprintf(stderr, "[RUN #%u] Cluster topology: %zu endpoints discovered (%zu primaries)\n", rid, eps.size(),
+                primaries);
+
+    for (size_t i = 0; i < eps.size(); i++) {
+        const cluster_endpoint_info &e = eps[i];
+        std::string ranges;
+        char buf[64];
+        for (size_t r = 0; r < e.slot_ranges.size(); r++) {
+            if (r) ranges += ",";
+            if (e.slot_ranges[r].first == e.slot_ranges[r].second)
+                snprintf(buf, sizeof(buf), "%d", e.slot_ranges[r].first);
+            else
+                snprintf(buf, sizeof(buf), "%d-%d", e.slot_ranges[r].first, e.slot_ranges[r].second);
+            ranges += buf;
+        }
+        const size_t nr = e.slot_ranges.size();
+        const char *plural = (nr == 1) ? "" : "s";
+        if (e.is_primary) {
+            fprintf(stderr, "           %-22s primary   slots %-20s (%zu slot range%s)\n", e.addr.c_str(),
+                    ranges.c_str(), nr, plural);
+        } else {
+            std::string link = "-> " + e.primary_addr;
+            fprintf(stderr, "           %-22s replica   %-26s (%zu slot range%s)\n", e.addr.c_str(), link.c_str(), nr,
+                    plural);
+        }
+    }
+
+    // Total opened connections = threads x conns-per-thread x endpoints. Each
+    // cluster_client opens one shard_connection per distinct endpoint, so the
+    // endpoint count is the per-client connection fan-out.
+    const unsigned long long endpoints = (unsigned long long) eps.size();
+    const unsigned long long total_conns =
+        (unsigned long long) m_config->threads * (unsigned long long) m_config->clients * endpoints;
+    fprintf(stderr, "[RUN #%u] Total connections: %u threads x %u conns/thread x %llu endpoints = %llu\n", rid,
+            m_config->threads, m_config->clients, endpoints, total_conns);
+
+    // --rate-limiting is per-connection; surface the aggregate target only when
+    // set. Count only request-generating connections: primaries always, plus
+    // replicas only when reads route to them (otherwise replica connections sit
+    // idle and never hit their per-connection limiter).
+    if (m_config->request_rate > 0) {
+        const unsigned long long traffic_eps =
+            (unsigned long long) primaries + (m_config->read_preference != rp_primary ? (unsigned long long) replicas : 0);
+        const unsigned long long aggregate = (unsigned long long) m_config->request_rate *
+                                             (unsigned long long) m_config->threads *
+                                             (unsigned long long) m_config->clients * traffic_eps;
+        fprintf(stderr, "[RUN #%u] Rate limit: %u req/s/conn -> %llu req/s aggregate target\n", rid,
+                m_config->request_rate, aggregate);
+    }
+}
+
 bool cluster_client::handle_cluster_slots(protocol_response *r)
 {
     /*
@@ -1120,6 +1266,11 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
     // unconditional assign(), just deferred until here).
     m_slot_to_shard_group.swap(new_slot_map);
     m_shard_groups.swap(new_groups);
+
+    // Emit the one-shot human-readable topology summary now that the new
+    // topology is committed (slot ranges and endpoint roles are only known
+    // here). print_topology_summary() self-gates to fire exactly once per run.
+    print_topology_summary();
 
     // check if some connections left with no slots, and need to be closed
     for (unsigned int i = 0; i < prev_connections_size; i++) {

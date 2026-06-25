@@ -216,6 +216,11 @@ struct benchmark_config
     unsigned int clients_step;
     unsigned int step_duration;
     struct timeval benchmark_start_time;
+    // Index of the currently-executing run (1-based), set at the top of
+    // run_benchmark(). Read by cluster_client::handle_cluster_slots() so the
+    // one-shot topology summary it prints can label itself "[RUN #N]" and emit
+    // exactly once per run (runs are sequential, so a plain field is enough).
+    unsigned int current_run_id;
     // StatsD metrics export
     const char *statsd_host;
     unsigned short statsd_port;

@@ -278,6 +278,26 @@ public:
     void absorb_arbitrary_routing(size_t arbitrary_index, unsigned long long primary, unsigned long long replica);
     void absorb_builtin_get_routing(unsigned long long primary, unsigned long long replica);
 
+    // Cluster topology counts captured once at run end from a cluster_client's
+    // build_topology_snapshot() (group-member endpoints only). Counting from
+    // the committed shard groups -- rather than from m_endpoint_snapshots, which
+    // also absorbs the bootstrap seed connection and any transient/dead sockets
+    // -- means the results summary agrees exactly with the one-shot startup
+    // "[RUN #N] Cluster topology" line (same snapshot source). 0 when not in
+    // cluster mode or no topology ever committed.
+    size_t m_cluster_endpoints;
+    size_t m_cluster_primaries;
+    size_t m_cluster_replicas;
+    void set_cluster_topology(size_t total, size_t primaries, size_t replicas)
+    {
+        m_cluster_endpoints = total;
+        m_cluster_primaries = primaries;
+        m_cluster_replicas = replicas;
+    }
+    size_t get_endpoint_count() const { return m_cluster_endpoints; }
+    size_t get_primary_endpoint_count() const { return m_cluster_primaries; }
+    size_t get_replica_endpoint_count() const { return m_cluster_replicas; }
+
     void aggregate_average(const std::vector<run_stats> &all_stats);
     void summarize(totals &result) const;
     void summarize_current_second();
