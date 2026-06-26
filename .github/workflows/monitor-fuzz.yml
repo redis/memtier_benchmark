@@ -72,7 +72,8 @@ jobs:
           REDIS_PORT: "6379"
           # Smaller corpus pass on PR-label runs; larger on nightly/manual.
           FUZZ_ITER: ${{ github.event_name == 'pull_request' && '300' || (inputs.iterations || '2000') }}
-          FUZZ_TIMEOUT: "30"
+          # 90s accommodates ASAN+UBSan overhead × 8 MiB payloads (#443)
+          FUZZ_TIMEOUT: "90"
         run: python3 tests/fuzz/fuzz_monitor_input.py
 
       - name: Upload reproducers on failure

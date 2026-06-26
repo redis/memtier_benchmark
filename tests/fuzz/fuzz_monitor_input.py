@@ -28,6 +28,7 @@ import random
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -254,8 +255,22 @@ def main() -> int:
         return 2
     failures = 0
     total = 0
+    grand_total = FUZZ_ITER * len(seeds)
+    t0 = time.time()
+    # Emit per-iteration progress so a preempted / killed GH-hosted run
+    # still tells us which seed and iteration were in flight. Without this
+    # the driver only prints the startup banner and final summary, leaving
+    # an opaque gap whenever the runner is yanked mid-run.
+    progress_every = int(os.environ.get("FUZZ_PROGRESS_EVERY", "50"))
     for name, payload in seeds.items():
         for i in range(FUZZ_ITER):
+            if progress_every > 0 and total % progress_every == 0:
+                sys.stderr.write(
+                    "fuzz_monitor_input: iter {}/{} elapsed={}s seed={}\n".format(
+                        total, grand_total, int(time.time() - t0), name
+                    )
+                )
+                sys.stderr.flush()
             total += 1
             mutated = mutate(payload)
             ok = run_one(name, mutated)
