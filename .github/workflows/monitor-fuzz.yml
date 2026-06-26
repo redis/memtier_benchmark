@@ -82,8 +82,14 @@ jobs:
           # driver iterates seeds round-robin, so a budget-bounded run still
           # covers every seed. ~3 min for PR-label feedback, ~25 min nightly.
           FUZZ_MAX_SECONDS: ${{ github.event_name == 'pull_request' && '180' || '1500' }}
-          # 90s accommodates ASAN+UBSan overhead × 8 MiB payloads (#443)
-          FUZZ_TIMEOUT: "90"
+          # Per-run timeout distinguishes a finite-but-slow large-payload run
+          # from a true (infinite) hang. 90s was sized in #443; the now-heavier
+          # instrumented build (--read-preference, per-thread CPU tracking,
+          # Prometheus) pushed worst-case 8 MiB grow-mutation processing past it
+          # on CI runners (the same inputs finish in <20s locally), so the
+          # Monitor-Input Fuzz nightly was failing on slowness, not a hang.
+          # Bump to 180s -- real hangs are infinite and still trip it. (#496)
+          FUZZ_TIMEOUT: "180"
         run: python3 tests/fuzz/fuzz_monitor_input.py
 
       - name: Upload reproducers on failure
