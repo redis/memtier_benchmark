@@ -1277,9 +1277,20 @@ void run_stats::print_type_column(output_table &table, arbitrary_command_list &c
     table_el el;
     table_column column;
 
-    // Type column
+    // Type column. The width is derived from the longest command name, which
+    // for --monitor-input comes from external (and fuzzed) input, so it can be
+    // arbitrarily long. Clamp it to a sane maximum: the fixed-size formatting
+    // buffers driven by column_size here and in output_table::print_header
+    // (char buf[100]) would otherwise overflow -- a memory-safety bug, not a
+    // cosmetic one. The previous `assert(column_size < 100)` aborted the whole
+    // process on such input (and <100 was itself one byte too generous for
+    // print_header's buf[100]). An over-long name still prints, just truncated
+    // to the column width by the snprintf in output_table::print.
+    static const unsigned int MAX_TYPE_COLUMN_SIZE = 64;
     column.column_size = MAX(6, command_list.get_max_command_name_length()) + 1;
-    assert(column.column_size < 100 && "command name too long");
+    if (column.column_size > MAX_TYPE_COLUMN_SIZE) {
+        column.column_size = MAX_TYPE_COLUMN_SIZE;
+    }
 
     // set enough space according to size of command name
     char buf[200];
