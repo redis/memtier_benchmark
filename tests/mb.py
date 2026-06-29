@@ -75,12 +75,41 @@ class Benchmark(object):
         with open(os.path.join(self.config.results_dir, name), 'wb') as outfile:
             outfile.write(data)
 
-    def run(self):
+    def run(self, timeout=None):
+        """Run memtier_benchmark to completion.
+
+        timeout: optional hard upper bound (seconds) on the child process.
+        A test that passes one (e.g. soak/test_slow_network uses
+        test_time + 90) gets fail-fast behaviour: on expiry we kill the
+        child, drain its pipes, write a truncated mb.stderr, and return
+        False instead of hanging until the CI job cap.
+
+        Defaults to None (wait indefinitely) to preserve the prior 2.4
+        behaviour for the many existing callers that don't pass a timeout
+        -- adopting master's 240s default here would risk killing long
+        soak/staircase runs that legitimately exceed 240s. (master uses a
+        240s default; 2.4 keeps opt-in to stay regression-free.)
+        """
         logging.debug('  Command: %s', ' '.join(self.args))
         process = subprocess.Popen(
             stdin=None, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             executable=self.binary, args=self.args)
-        _stdout, _stderr = process.communicate()
+        try:
+            _stdout, _stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            logging.error(
+                '  memtier_benchmark exceeded %ds timeout; killing child', timeout)
+            process.kill()
+            try:
+                _stdout, _stderr = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                _stdout, _stderr = b'', b''
+            if _stderr:
+                self.write_file('mb.stderr', _stderr)
+            self.write_file(
+                'mb.timeout',
+                'memtier_benchmark timed out after {}s\n'.format(timeout).encode())
+            return False
         if _stderr:
             logging.debug('  >>> stderr <<<\n%s\n', _stderr)
             self.write_file('mb.stderr', _stderr)
