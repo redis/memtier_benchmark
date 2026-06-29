@@ -115,6 +115,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: monitor-fuzz-repros
-          path: /tmp/fuzz_monitor_*
+          # The driver saves repros via tempfile prefix "mfuzz_" (-> /tmp/mfuzz_*.txt);
+          # the old /tmp/fuzz_monitor_* glob never matched, so failures uploaded
+          # nothing. Cover both to be safe. (#496)
+          path: |
+            /tmp/mfuzz_*
+            /tmp/fuzz_monitor_*
           retention-days: 14
+          if-no-files-found: ignore
           if-no-files-found: ignore
