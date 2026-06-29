@@ -710,6 +710,21 @@ static std::string extract_command_type(const std::string &command_str)
     return cmd_type;
 }
 
+// Connection/protocol-negotiation commands that must not be replayed as a
+// benchmark workload from --monitor-input. Replaying `HELLO <proto>` switches
+// the connection to RESP3 mid-stream, after which memtier's RESP2 reply parser
+// blocks forever on a reply it cannot decode -- and the in-flight read is not
+// bounded by --test-time, so the run wedges until the harness watchdog kills it
+// (issue #482). A captured MONITOR stream legitimately contains HELLO lines
+// (clients negotiate protocol on connect), and the fuzzer mutates toward them,
+// so rather than scrubbing the corpus we skip them here: the loader still runs
+// every other command in the file. cmd_type is already uppercased by
+// extract_command_type(), so the compare is case-insensitive.
+static bool is_unreplayable_monitor_command_type(const std::string &cmd_type_upper)
+{
+    return cmd_type_upper == "HELLO";
+}
+
 bool monitor_command_list::load_from_file(const char *filename)
 {
     FILE *file = fopen(filename, "r");
@@ -723,6 +738,7 @@ bool monitor_command_list::load_from_file(const char *filename)
     ssize_t line_len;
     size_t total_lines = 0;
     size_t skipped_malformed = 0;
+    size_t skipped_unsafe = 0;
 
     // Use getline() for dynamic allocation - handles arbitrarily long lines
     while ((line_len = getline(&line, &line_capacity, file)) != -1) {
@@ -793,10 +809,19 @@ bool monitor_command_list::load_from_file(const char *filename)
                 continue;
             }
 
-            commands.push_back(command_str);
-
-            // Extract and store the command type (e.g., "SET", "GET")
+            // Extract the command type (e.g., "SET", "GET"); already uppercased.
             std::string cmd_type = extract_command_type(command_str);
+
+            // Skip connection/protocol-negotiation commands that wedge the
+            // replay client (e.g. HELLO switching to RESP3); see
+            // is_unreplayable_monitor_command_type().
+            if (is_unreplayable_monitor_command_type(cmd_type)) {
+                skipped_unsafe++;
+                seg_start = seg_end ? seg_end + 1 : line + line_len;
+                continue;
+            }
+
+            commands.push_back(command_str);
             command_types.push_back(cmd_type);
 
             seg_start = seg_end ? seg_end + 1 : line + line_len;
@@ -817,9 +842,10 @@ bool monitor_command_list::load_from_file(const char *filename)
         return false;
     }
 
-    if (skipped_malformed > 0) {
-        fprintf(stderr, "Loaded %zu monitor commands from %zu total lines (%zu malformed line(s) skipped)\n",
-                commands.size(), total_lines, skipped_malformed);
+    if (skipped_malformed > 0 || skipped_unsafe > 0) {
+        fprintf(stderr,
+                "Loaded %zu monitor commands from %zu total lines (%zu malformed, %zu unreplayable line(s) skipped)\n",
+                commands.size(), total_lines, skipped_malformed, skipped_unsafe);
     } else {
         fprintf(stderr, "Loaded %zu monitor commands from %zu total lines\n", commands.size(), total_lines);
     }

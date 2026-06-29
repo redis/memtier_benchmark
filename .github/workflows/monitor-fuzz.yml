@@ -86,13 +86,28 @@ jobs:
           # would take hours and the job was always cancelled at its 35-minute
           # cap -- it never completed once before this budget was added).
           FUZZ_ITER: ${{ github.event_name == 'pull_request' && '300' || (inputs.iterations || '2000') }}
+          # Hard-cap every mutated payload at 2 MiB. GROW_MAX alone is not
+          # enough: mutate() applies up to 4 mutators, so several `grow`s
+          # compound to ~8 MiB regardless. Processing a multi-MB --monitor-input
+          # under the heavier instrumented ASAN+UBSan build runs ~22s/MiB on CI
+          # runners (so ~8 MiB > 180s -- finite-but-slow, not a hang; <20s total
+          # locally). 2 MiB keeps the worst case ~45s, well under the timeout.
+          # Large-input coverage is retained by the 17 MiB / million-line
+          # synthetic seeds. (#496)
+          FUZZ_MAX_BYTES: "2097152"
           # Wall-clock budget for the whole sweep, sized to finish inside the
           # job's timeout-minutes with margin for the build/setup steps. The
           # driver iterates seeds round-robin, so a budget-bounded run still
           # covers every seed. ~3 min for PR-label feedback, ~25 min nightly.
           FUZZ_MAX_SECONDS: ${{ github.event_name == 'pull_request' && '180' || '1500' }}
-          # 90s accommodates ASAN+UBSan overhead × 8 MiB payloads (#443)
-          FUZZ_TIMEOUT: "90"
+          # Per-run timeout distinguishes a finite-but-slow large-payload run
+          # from a true (infinite) hang. 90s was sized in #443; the now-heavier
+          # instrumented build (--read-preference, per-thread CPU tracking,
+          # Prometheus) pushed worst-case 8 MiB grow-mutation processing past it
+          # on CI runners (the same inputs finish in <20s locally), so the
+          # Monitor-Input Fuzz nightly was failing on slowness, not a hang.
+          # Bump to 180s -- real hangs are infinite and still trip it. (#496)
+          FUZZ_TIMEOUT: "180"
         run: python3 tests/fuzz/fuzz_monitor_input.py
 
       - name: Upload reproducers on failure
@@ -100,6 +115,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: monitor-fuzz-repros
-          path: /tmp/fuzz_monitor_*
+          # The driver saves repros via tempfile prefix "mfuzz_" (-> /tmp/mfuzz_*.txt);
+          # the old /tmp/fuzz_monitor_* glob never matched, so failures uploaded
+          # nothing. Cover both to be safe. (#496)
+          path: |
+            /tmp/mfuzz_*
+            /tmp/fuzz_monitor_*
           retention-days: 14
           if-no-files-found: ignore

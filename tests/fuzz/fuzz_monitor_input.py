@@ -52,6 +52,13 @@ SEED = int(os.environ.get("FUZZ_SEED", str(int.from_bytes(os.urandom(4), "big"))
 # uses -max_len=33554432 (32 MiB); 8 MiB is a sensible default that exercises
 # multi-MB monitor lines without blowing the per-run time budget.
 GROW_MAX = int(os.environ.get("FUZZ_GROW_MAX", str(8 * 1024 * 1024)))
+# Hard ceiling on a single mutated payload, applied after all mutators run.
+# This is the *effective* size bound: GROW_MAX only caps one `grow` pass, but
+# mutate() applies up to 4 mutators so several grows (or grow+dup) compound past
+# it -- the worst-case payload is bounded only here. Default 32 MiB (avoid
+# OOMing the runner); CI lowers it (FUZZ_MAX_BYTES) so a multi-MB input stays
+# fast enough to process under the heavier instrumented ASAN+UBSan build. (#496)
+MAX_MUTATION_BYTES = int(os.environ.get("FUZZ_MAX_BYTES", str(32 * 1024 * 1024)))
 # Whether to also fuzz the synthetic >16 MiB single-line and 1M-line seeds. These
 # exercise the heap-allocated split-token buffer and loader memory pressure paths.
 # PR #405 (the VLA stack-overflow fix) has landed, so these are now enabled by
@@ -137,9 +144,10 @@ def mutate(seed_bytes: bytes) -> bytes:
     out = seed_bytes
     for _ in range(random.randint(1, 4)):
         out = random.choice(MUTATORS)(out)
-    # Cap absolute size so we don't OOM the CI runner.
-    if len(out) > 32 * 1024 * 1024:
-        out = out[: 32 * 1024 * 1024]
+    # Cap absolute size (after all mutators) so we don't OOM the CI runner and,
+    # under a low FUZZ_MAX_BYTES, so compounded grows stay fast to process.
+    if len(out) > MAX_MUTATION_BYTES:
+        out = out[:MAX_MUTATION_BYTES]
     return out
 
 
