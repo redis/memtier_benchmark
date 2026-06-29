@@ -96,14 +96,19 @@ class Benchmark(object):
             executable=self.binary, args=self.args)
         try:
             _stdout, _stderr = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as e:
             logging.error(
                 '  memtier_benchmark exceeded %ds timeout; killing child', timeout)
             process.kill()
+            # Preserve whatever stderr was already captured before the timeout
+            # (carried on the TimeoutExpired instance); the post-kill drain
+            # frequently returns empty, which would otherwise lose the log.
+            captured_err = e.stderr or b''
             try:
                 _stdout, _stderr = process.communicate(timeout=5)
             except subprocess.TimeoutExpired:
                 _stdout, _stderr = b'', b''
+            _stderr = captured_err + (_stderr or b'')
             if _stderr:
                 self.write_file('mb.stderr', _stderr)
             self.write_file(
