@@ -123,4 +123,3 @@ jobs:
             /tmp/fuzz_monitor_*
           retention-days: 14
           if-no-files-found: ignore
-          if-no-files-found: ignore
