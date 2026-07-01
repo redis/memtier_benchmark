@@ -546,8 +546,13 @@ jobs:
 
     - name: Upload repo to S3
       run: |
-        # Use --delete to keep repo clean, but we verified RPMs exist above
-        aws s3 sync ./repo "s3://${{ secrets.APT_S3_BUCKET }}/rpm" --delete
+        # Use --delete to keep repo clean, but we verified RPMs exist above.
+        # --acl public-read is REQUIRED: the bucket serves packages.redis.io
+        # through CloudFront via per-object public-read ACLs (the DEB pipeline
+        # gets this for free because deb-s3 defaults objects to public-read).
+        # Plain `aws s3 sync` writes objects private, which returns 403
+        # AccessDenied for every rpm/* path through the CDN (issue #500).
+        aws s3 sync ./repo "s3://${{ secrets.APT_S3_BUCKET }}/rpm" --delete --acl public-read
       env:
         AWS_ACCESS_KEY_ID: ${{ secrets.APT_S3_ACCESS_KEY_ID }}
         AWS_SECRET_ACCESS_KEY: ${{ secrets.APT_S3_SECRET_ACCESS_KEY }}
