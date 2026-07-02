@@ -62,6 +62,15 @@ jobs:
 
         echo "Sample:"; head -5 keys.txt | sed 's/^/  /'
 
+        echo "--- breakdown by top-level component (rpm/<X>/) ---"
+        awk -F/ 'NF>1{print $2}' keys.txt | sort | uniq -c | sort -rn | sed 's/^/  /'
+        echo "--- breakdown by object kind ---"
+        printf "  %6d  *.rpm packages\n"       "$(grep -c '\.rpm$' keys.txt || true)"
+        printf "  %6d  repodata/* metadata\n"  "$(grep -c '/repodata/' keys.txt || true)"
+        printf "  %6d  other\n"                "$(grep -vE '\.rpm$|/repodata/' keys.txt | grep -c . || true)"
+        echo "--- memtier-benchmark objects only ---"
+        printf "  %6d  memtier-benchmark*.rpm\n" "$(grep -c 'memtier-benchmark.*\.rpm$' keys.txt || true)"
+
         if [ "$DRY_RUN" = "true" ]; then
           echo "::notice::DRY RUN — $total objects would be set to public-read. No changes made."
           exit 0
