@@ -1,20 +1,25 @@
-name: Fix RPM Repo ACLs (one-time maintenance)
+name: Fix memtier RPM ACLs (maintenance)
 
-# One-time (re-runnable) admin job to set `public-read` on every object under
-# the shared rpm/ prefix. Needed because `aws s3 sync` in publish-to-yum only
-# re-permissions objects it re-uploads; pre-existing RPMs (e.g. 2.4.0..2.4.3)
-# kept their old private ACL and return 403 through CloudFront (issues #500, #505).
-# This changes ONLY the ACL — object bytes, content-type, and metadata are untouched.
+# Re-runnable admin job that sets `public-read` on memtier_benchmark's own RPM
+# objects in the shared packages.redis.io `rpm/` bucket. Needed because
+# `aws s3 sync` in publish-to-yum only re-permissions objects it re-uploads, so
+# older memtier RPMs can keep a stale private ACL and 403 through CloudFront
+# (issues #500, #505). Changes ONLY the ACL — object bytes/metadata untouched.
+#
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ UNBREAKABLE RULE: this workflow MUST NEVER touch any object that is not a │
+# │ memtier-benchmark package. The `rpm/` bucket is SHARED with other Redis   │
+# │ products (redis, redis-stack-server, redis-tools). Scope is enforced by a │
+# │ basename allowlist (MEMTIER_RE) plus a foreign-product denylist, and the  │
+# │ job HARD-ABORTS if either guard finds anything outside memtier's set.     │
+# │ Do not widen the target set to prefixes, repodata, or "all objects".      │
+# └─────────────────────────────────────────────────────────────────────────┘
 
 on:
   workflow_dispatch:
     inputs:
-      prefix:
-        description: "S3 key prefix to re-permission (must be under rpm/)"
-        required: false
-        default: "rpm/"
       dry_run:
-        description: "List objects and report counts without changing ACLs"
+        description: "List the memtier objects and report counts without changing ACLs"
         required: false
         default: "true"
 
@@ -29,59 +34,71 @@ jobs:
     - name: Verify AWS CLI
       run: aws --version
 
-    - name: Set public-read ACL on all objects under prefix
+    - name: Set public-read ACL on memtier-benchmark RPM objects ONLY
       env:
         AWS_ACCESS_KEY_ID: ${{ secrets.APT_S3_ACCESS_KEY_ID }}
         AWS_SECRET_ACCESS_KEY: ${{ secrets.APT_S3_SECRET_ACCESS_KEY }}
         AWS_DEFAULT_REGION: ${{ secrets.APT_S3_REGION }}
         BUCKET: ${{ secrets.APT_S3_BUCKET }}
-        PREFIX: ${{ github.event.inputs.prefix }}
         DRY_RUN: ${{ github.event.inputs.dry_run }}
       run: |
         set -euo pipefail
 
-        # Guard: never let this loose outside the rpm/ tree.
-        case "$PREFIX" in
-          rpm/|rpm/*) : ;;
-          *) echo "::error::refusing prefix '$PREFIX' — must be 'rpm/' or under it"; exit 1 ;;
-        esac
+        # Allowlist: a memtier-benchmark package RPM, matched by BASENAME so it
+        # can never match another product regardless of directory layout.
+        # Covers memtier-benchmark, -debuginfo, -debugsource.
+        MEMTIER_RE='(^|/)memtier-benchmark(-debuginfo|-debugsource)?-[0-9][^/]*\.rpm$'
+        # Denylist: names of other Redis products that share this bucket. If any
+        # of these ever appears in the target set, something is very wrong.
+        FOREIGN_RE='(^|/)(redis|redis-server|redis-tools|redis-stack|redis-stack-server|redisinsight|redisjson|redissearch|redistimeseries|redisgraph|redisbloom)-[0-9]'
 
-        echo "Listing s3://$BUCKET/$PREFIX ..."
-        # The CLI auto-paginates list-objects-v2 and returns every key.
-        # Tab/newline separated -> one key per line. RPM repo keys contain no
-        # whitespace, so word-splitting on \t\n is safe here.
-        aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "$PREFIX" \
-          --query 'Contents[].Key' --output text | tr '\t' '\n' | sed '/^$/d' > keys.txt
+        echo "Listing s3://$BUCKET/rpm/ ..."
+        # CLI auto-paginates list-objects-v2. RPM keys contain no whitespace, so
+        # splitting on \t\n is safe. We ALWAYS list the whole rpm/ tree, then
+        # filter down to memtier — the scope is the filter, not the prefix.
+        aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "rpm/" \
+          --query 'Contents[].Key' --output text | tr '\t' '\n' | sed '/^$/d' > all_keys.txt
+        echo "Total objects under rpm/: $(wc -l < all_keys.txt | tr -d ' ')"
 
-        total=$(wc -l < keys.txt | tr -d ' ')
-        echo "Found $total objects under $PREFIX"
-        if [ "$total" -eq 0 ]; then
+        # Reduce to memtier's own package objects.
+        grep -E "$MEMTIER_RE" all_keys.txt > keys.txt || true
+        target=$(wc -l < keys.txt | tr -d ' ')
+        echo "memtier-benchmark RPM objects in scope: $target"
+        if [ "$target" -eq 0 ]; then
           echo "Nothing to do."
           exit 0
         fi
 
-        echo "Sample:"; head -5 keys.txt | sed 's/^/  /'
+        # ── GUARD 1: every targeted key MUST match the memtier allowlist ──────
+        if grep -Ev "$MEMTIER_RE" keys.txt | grep -q .; then
+          echo "::error::allowlist guard failed — a non-memtier key is in the target set. Aborting."
+          grep -Ev "$MEMTIER_RE" keys.txt | head -20
+          exit 1
+        fi
+        # ── GUARD 2: no foreign Redis product name may appear in the set ──────
+        if grep -Ei "$FOREIGN_RE" keys.txt | grep -q .; then
+          echo "::error::denylist guard failed — a foreign Redis product package is in the target set. Aborting."
+          grep -Ei "$FOREIGN_RE" keys.txt | head -20
+          exit 1
+        fi
+        # ── GUARD 3: target set must be a strict subset of memtier basenames ──
+        if grep -vE '(^|/)memtier-benchmark' keys.txt | grep -q .; then
+          echo "::error::subset guard failed — a basename outside memtier-benchmark* is present. Aborting."
+          exit 1
+        fi
+        echo "All three scope guards passed — target set is memtier-only."
 
-        echo "--- breakdown by top-level component (rpm/<X>/) ---"
-        awk -F/ 'NF>1{print $2}' keys.txt | sort | uniq -c | sort -rn | sed 's/^/  /'
-        echo "--- breakdown by object kind ---"
-        printf "  %6d  *.rpm packages\n"       "$(grep -c '\.rpm$' keys.txt || true)"
-        printf "  %6d  repodata/* metadata\n"  "$(grep -c '/repodata/' keys.txt || true)"
-        printf "  %6d  other\n"                "$(grep -vE '\.rpm$|/repodata/' keys.txt | grep -c . || true)"
-        echo "--- memtier-benchmark objects only ---"
-        printf "  %6d  memtier-benchmark*.rpm\n" "$(grep -c 'memtier-benchmark.*\.rpm$' keys.txt || true)"
-        echo "--- distinct package-name stems among *.rpm (basename minus version) ---"
-        grep '\.rpm$' keys.txt | sed 's#.*/##; s/-[0-9].*//' | sort | uniq -c | sort -rn | sed 's/^/  /'
-        echo "--- non-memtier *.rpm sample paths ---"
-        grep '\.rpm$' keys.txt | grep -v 'memtier-benchmark' | head -15 | sed 's/^/  /'
+        echo "Distinct memtier package stems in scope:"
+        sed 's#.*/##; s/-[0-9].*//' keys.txt | sort | uniq -c | sort -rn | sed 's/^/  /'
+        echo "Sample keys:"; head -5 keys.txt | sed 's/^/  /'
 
         if [ "$DRY_RUN" = "true" ]; then
-          echo "::notice::DRY RUN — $total objects would be set to public-read. No changes made."
+          echo "::notice::DRY RUN — $target memtier-benchmark objects would be set to public-read. No changes made."
           exit 0
         fi
 
         # Pure ACL change per object. Parallelised; each failure is recorded.
-        echo "Applying public-read ACL to $total objects ..."
+        echo "Applying public-read ACL to $target memtier objects ..."
         : > failures.txt
         # shellcheck disable=SC2016
         cat keys.txt | xargs -P 16 -I{} sh -c '
@@ -90,31 +107,29 @@ jobs:
         ' "$BUCKET" "{}"
 
         fail=$(wc -l < failures.txt | tr -d ' ')
-        ok=$(( total - fail ))
-        echo "Re-permissioned $ok/$total objects (failures: $fail)"
+        ok=$(( target - fail ))
+        echo "Re-permissioned $ok/$target memtier objects (failures: $fail)"
         if [ "$fail" -gt 0 ]; then
           echo "::error::$fail object(s) failed put-object-acl:"; head -20 failures.txt
           exit 1
         fi
 
-    - name: Verify previously-private objects are now public (issue #505)
+    - name: Verify memtier packages are publicly readable
       if: ${{ github.event.inputs.dry_run != 'true' }}
       run: |
         set -euo pipefail
         bad=0
-        # The exact URLs the reporter hit, plus the current release for good measure.
+        # memtier URLs only — never assert on another product's paths.
         for url in \
           "https://packages.redis.io/rpm/el9/x86_64/memtier-benchmark-2.4.0-1.el9.x86_64.rpm" \
           "https://packages.redis.io/rpm/el8/x86_64/memtier-benchmark-2.4.3-1.el8.x86_64.rpm" \
-          "https://packages.redis.io/rpm/el9/x86_64/memtier-benchmark-2.4.4-1.el9.x86_64.rpm" \
-          "https://packages.redis.io/rpm/el9/x86_64/repodata/repomd.xml" ; do
+          "https://packages.redis.io/rpm/el9/x86_64/memtier-benchmark-2.4.4-1.el9.x86_64.rpm" ; do
           code=$(curl -s -o /dev/null -w '%{http_code}' "$url")
           echo "  HTTP $code  $url"
           [ "$code" = "200" ] || bad=$((bad + 1))
         done
-        # CloudFront may briefly serve a cached 403; re-run if so.
         if [ "$bad" -gt 0 ]; then
           echo "::warning::$bad URL(s) not yet 200 — likely CloudFront cache; re-check shortly."
         else
-          echo "All checked URLs return 200."
+          echo "All memtier URLs return 200."
         fi
