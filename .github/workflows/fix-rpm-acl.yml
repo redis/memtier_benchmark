@@ -1,0 +1,107 @@
+name: Fix RPM Repo ACLs (one-time maintenance)
+
+# One-time (re-runnable) admin job to set `public-read` on every object under
+# the shared rpm/ prefix. Needed because `aws s3 sync` in publish-to-yum only
+# re-permissions objects it re-uploads; pre-existing RPMs (e.g. 2.4.0..2.4.3)
+# kept their old private ACL and return 403 through CloudFront (issues #500, #505).
+# This changes ONLY the ACL — object bytes, content-type, and metadata are untouched.
+
+on:
+  workflow_dispatch:
+    inputs:
+      prefix:
+        description: "S3 key prefix to re-permission (must be under rpm/)"
+        required: false
+        default: "rpm/"
+      dry_run:
+        description: "List objects and report counts without changing ACLs"
+        required: false
+        default: "true"
+
+permissions:
+  contents: read
+
+jobs:
+  fix-acl:
+    runs-on: ubuntu-latest
+    environment: build
+    steps:
+    - name: Verify AWS CLI
+      run: aws --version
+
+    - name: Set public-read ACL on all objects under prefix
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.APT_S3_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.APT_S3_SECRET_ACCESS_KEY }}
+        AWS_DEFAULT_REGION: ${{ secrets.APT_S3_REGION }}
+        BUCKET: ${{ secrets.APT_S3_BUCKET }}
+        PREFIX: ${{ github.event.inputs.prefix }}
+        DRY_RUN: ${{ github.event.inputs.dry_run }}
+      run: |
+        set -euo pipefail
+
+        # Guard: never let this loose outside the rpm/ tree.
+        case "$PREFIX" in
+          rpm/|rpm/*) : ;;
+          *) echo "::error::refusing prefix '$PREFIX' — must be 'rpm/' or under it"; exit 1 ;;
+        esac
+
+        echo "Listing s3://$BUCKET/$PREFIX ..."
+        # The CLI auto-paginates list-objects-v2 and returns every key.
+        # Tab/newline separated -> one key per line. RPM repo keys contain no
+        # whitespace, so word-splitting on \t\n is safe here.
+        aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "$PREFIX" \
+          --query 'Contents[].Key' --output text | tr '\t' '\n' | sed '/^$/d' > keys.txt
+
+        total=$(wc -l < keys.txt | tr -d ' ')
+        echo "Found $total objects under $PREFIX"
+        if [ "$total" -eq 0 ]; then
+          echo "Nothing to do."
+          exit 0
+        fi
+
+        echo "Sample:"; head -5 keys.txt | sed 's/^/  /'
+
+        if [ "$DRY_RUN" = "true" ]; then
+          echo "::notice::DRY RUN — $total objects would be set to public-read. No changes made."
+          exit 0
+        fi
+
+        # Pure ACL change per object. Parallelised; each failure is recorded.
+        echo "Applying public-read ACL to $total objects ..."
+        : > failures.txt
+        # shellcheck disable=SC2016
+        cat keys.txt | xargs -P 16 -I{} sh -c '
+          aws s3api put-object-acl --bucket "$0" --key "$1" --acl public-read \
+            || echo "$1" >> failures.txt
+        ' "$BUCKET" "{}"
+
+        fail=$(wc -l < failures.txt | tr -d ' ')
+        ok=$(( total - fail ))
+        echo "Re-permissioned $ok/$total objects (failures: $fail)"
+        if [ "$fail" -gt 0 ]; then
+          echo "::error::$fail object(s) failed put-object-acl:"; head -20 failures.txt
+          exit 1
+        fi
+
+    - name: Verify previously-private objects are now public (issue #505)
+      if: ${{ github.event.inputs.dry_run != 'true' }}
+      run: |
+        set -euo pipefail
+        bad=0
+        # The exact URLs the reporter hit, plus the current release for good measure.
+        for url in \
+          "https://packages.redis.io/rpm/el9/x86_64/memtier-benchmark-2.4.0-1.el9.x86_64.rpm" \
+          "https://packages.redis.io/rpm/el8/x86_64/memtier-benchmark-2.4.3-1.el8.x86_64.rpm" \
+          "https://packages.redis.io/rpm/el9/x86_64/memtier-benchmark-2.4.4-1.el9.x86_64.rpm" \
+          "https://packages.redis.io/rpm/el9/x86_64/repodata/repomd.xml" ; do
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$url")
+          echo "  HTTP $code  $url"
+          [ "$code" = "200" ] || bad=$((bad + 1))
+        done
+        # CloudFront may briefly serve a cached 403; re-run if so.
+        if [ "$bad" -gt 0 ]; then
+          echo "::warning::$bad URL(s) not yet 200 — likely CloudFront cache; re-check shortly."
+        else
+          echo "All checked URLs return 200."
+        fi
