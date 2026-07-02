@@ -70,6 +70,10 @@ jobs:
         printf "  %6d  other\n"                "$(grep -vE '\.rpm$|/repodata/' keys.txt | grep -c . || true)"
         echo "--- memtier-benchmark objects only ---"
         printf "  %6d  memtier-benchmark*.rpm\n" "$(grep -c 'memtier-benchmark.*\.rpm$' keys.txt || true)"
+        echo "--- distinct package-name stems among *.rpm (basename minus version) ---"
+        grep '\.rpm$' keys.txt | sed 's#.*/##; s/-[0-9].*//' | sort | uniq -c | sort -rn | sed 's/^/  /'
+        echo "--- non-memtier *.rpm sample paths ---"
+        grep '\.rpm$' keys.txt | grep -v 'memtier-benchmark' | head -15 | sed 's/^/  /'
 
         if [ "$DRY_RUN" = "true" ]; then
           echo "::notice::DRY RUN — $total objects would be set to public-read. No changes made."
