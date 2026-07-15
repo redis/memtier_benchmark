@@ -26,8 +26,10 @@ Read more at:
 
 ### Installing on Debian and Ubuntu
 
-Pre-compiled binaries are available for these platforms from the packages.redis.io Redis APT
-repository. To configure this repository, use the following steps:
+Pre-compiled binaries are available from the packages.redis.io Redis APT repository for
+Debian 11 (bullseye), 12 (bookworm), and 13 (trixie), and for Ubuntu 20.04 (focal),
+22.04 (jammy), 24.04 (noble), and 26.04 (resolute). To configure this repository, use the
+following steps:
 
 ```
 sudo apt install lsb-release curl gpg
