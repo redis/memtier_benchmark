@@ -1,5 +1,19 @@
 name: Build and Publish to APT
 
+# The set of codenames built and published to the APT repo (packages.redis.io/deb)
+# is driven by the repository variables, NOT by this file:
+#   vars.BUILD_DISTS   - Debian/Ubuntu codenames, one published --codename per entry.
+#                        Expected: focal, jammy, noble, resolute (Ubuntu 20.04/
+#                        22.04/24.04/26.04) + bullseye, bookworm, trixie
+#                        (Debian 11/12/13).
+#   vars.BUILD_ARCHS   - i386, amd64, arm64, armhf.
+#   vars.BUILD_EXCLUDE - dist/arch pairs to skip (Ubuntu dropped i386, so every
+#                        Ubuntu codename excludes it).
+#   vars.SMOKE_TEST_IMAGES - Docker images used to install-test the built .debs.
+# Adding a new distro (e.g. Debian 13 trixie / Ubuntu 26.04 resolute) means adding
+# its codename to BUILD_DISTS and a matching image to SMOKE_TEST_IMAGES; for a new
+# Ubuntu codename also add a {dist,arch:i386} entry to BUILD_EXCLUDE.
+
 on:
   release:
     types: [published]
@@ -10,13 +24,13 @@ on:
         required: true
         default: ""
       build_dists:
-        description: "Distributions to build for (comma-separated, e.g., focal,jammy, noble)"
+        description: "Distributions to build for (comma-separated, e.g., focal,jammy,noble,resolute,bookworm,trixie)"
         required: false
-        default: "focal,jammy,noble"
+        default: "focal,jammy,noble,resolute,bookworm,trixie"
       smoke_test_images:
-        description: "Docker images for smoke testing (comma-separated, e.g., ubuntu:20.04,ubuntu:22.04,ubuntu:24.04)"
+        description: "Docker images for smoke testing (comma-separated, e.g., ubuntu:24.04,ubuntu:26.04,debian:12,debian:13)"
         required: false
-        default: "ubuntu:20.04,ubuntu:22.04,ubuntu:24.04"
+        default: "ubuntu:24.04,ubuntu:26.04,debian:12,debian:13"
       build_runner:
         description: "os in which build steps run on"
         required: false
