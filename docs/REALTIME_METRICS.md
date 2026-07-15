@@ -364,9 +364,9 @@ If you have an existing StatsD-compatible metrics infrastructure:
 
 ## Memtier Grafana dashboard for Graphite datasource
 
-You can import the dashboard from `grafana/dashboards/memtier.json`  into your Grafana instance. You may need to adjust the datasource UID to match your Graphite datasource.
+You can import the dashboard from `grafana/dashboards/memtier.json` into your Grafana instance. You may need to adjust the datasource UID to match your Graphite datasource.
 
 
 ## Memtier Grafana dashboard for Prometheus datasource
 
-You can import the dashboard from `grafana/dashboards/prom-memtier.json` into your Grafana instance. 
+You can import the dashboard from `grafana/dashboards/prom-memtier.json` into your Grafana instance.
