@@ -50,6 +50,9 @@ __pycache__
 !deps/commands_json/*.json
 !deps/commands_json/REDIS_TAG.txt
 
+# Grafana dashboards are JSON by nature
+!grafana/dashboards/*.json
+
 # Code coverage with lcov/gcov
 *.gcno
 *.gcov
