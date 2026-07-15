@@ -140,7 +140,14 @@ jobs:
             sbuild debhelper
           sudo sbuild-adduser $USER
     - name: Prepare sbuild environment
-      run: sudo ./debian/setup_sbuild.sh ${{ matrix.dist }} ${{ env.BUILD_ARCH }}
+      # ports.ubuntu.com (armhf/arm64) is unreachable from Azure-hosted runners, so
+      # point the ports mirror at the Azure mirror; amd64/i386 use the Azure archive
+      # mirror too. `sudo env VAR=...` passes the overrides through the sudo boundary.
+      run: |
+        sudo env \
+          UBUNTU_ARCHIVE_MIRROR=http://azure.archive.ubuntu.com/ubuntu \
+          UBUNTU_PORTS_MIRROR=http://azure.ports.ubuntu.com/ubuntu-ports \
+          ./debian/setup_sbuild.sh ${{ matrix.dist }} ${{ env.BUILD_ARCH }}
     - name: Get source package
       uses: actions/download-artifact@v5
       with:
