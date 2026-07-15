@@ -69,9 +69,9 @@ jobs:
     strategy:
       matrix:
         debian_version:
-          - "debian:bullseye"    # Debian 11 (oldstable)
-          - "debian:bookworm"    # Debian 12 (stable)
-          - "debian:trixie"      # Debian 13 (testing)
+          - "debian:bullseye"    # Debian 11 (oldoldstable)
+          - "debian:bookworm"    # Debian 12 (oldstable)
+          - "debian:trixie"      # Debian 13 (stable)
           - "debian:sid"         # Debian unstable
     container: ${{ matrix.debian_version }}
     name: Test ${{ matrix.debian_version }}
