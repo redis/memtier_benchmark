@@ -279,6 +279,13 @@ To use a generated key or object, enter:
 __key__: Use key generated from Key Options.
 __data__: Use data generated from Object Options.
 .TP
+Commands the server does not answer with exactly one reply per request cannot be
+measured and are rejected: the pub/sub subscribe side
+(\fBSUBSCRIBE\fR, \fBUNSUBSCRIBE\fR, \fBPSUBSCRIBE\fR, \fBPUNSUBSCRIBE\fR,
+\fBSSUBSCRIBE\fR, \fBSUNSUBSCRIBE\fR) and the streaming commands
+(\fBMONITOR\fR, \fBSYNC\fR, \fBPSYNC\fR). \fBPUBLISH\fR is unaffected. In a
+\fB\-\-monitor\-input\fR capture such lines are skipped instead of aborting the run.
+.TP
 \fB\-\-command\-ratio\fR
 The number of times the command is sent in sequence.(default: 1)
 .TP

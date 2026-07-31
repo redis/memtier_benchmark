@@ -178,6 +178,22 @@ You can pipe this output and filter specific patterns with tools such as `grep`,
 >
 > **CR-only line endings** (classic Mac `\r`, and some Windows export tools that emit bare `\r` without a following `\n`) parse correctly; previously the whole file would be read as one giant line and no commands were replayed.
 
+### Commands that cannot be benchmarked
+
+memtier_benchmark books exactly one reply per request, so commands that the server
+does not answer 1:1 are rejected at startup rather than measured:
+
+- **Pub/sub subscribe side** — `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`,
+  `SSUBSCRIBE`, `SUNSUBSCRIBE`. The server confirms once per channel, and after
+  subscribing it delivers messages with no request outstanding. `PUBLISH` is a plain
+  integer reply and remains fully supported.
+- **Streaming commands** — `MONITOR`, `SYNC`, `PSYNC`, which reply once and then emit an
+  unbounded feed.
+
+Passing one of these to `--command` fails with a clear error. In a `--monitor-input`
+capture they are skipped (and counted as "unreplayable line(s) skipped") the same way
+`HELLO` is, so the rest of the capture still replays.
+
 ### Command statistics breakdown
 
 By default, when using arbitrary commands (`--command`), statistics are aggregated by command type (e.g., all SET commands are grouped together, all GET commands are grouped together). You can control this behavior with the `--command-stats-breakdown` option:

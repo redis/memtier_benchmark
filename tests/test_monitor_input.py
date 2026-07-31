@@ -1077,3 +1077,85 @@ def test_monitor_input_large_line_no_stack_overflow(env):
     env.assertTrue(found,
                    message="SET with 16 MiB value did not land in redis "
                            "- memtier may have crashed before sending it")
+
+
+def test_monitor_input_pubsub_lines_skipped(env):
+    """
+    Regression test for issue #515 (Monitor-Input Fuzz nightly SIGABRT).
+
+    Redis answers SUBSCRIBE/PSUBSCRIBE/UNSUBSCRIBE once per channel, but
+    shard_connection books exactly one reply per queued request. Replaying a
+    captured SUBSCRIBE line therefore produced a surplus reply that popped a
+    request which was never queued, driving m_pending_resp negative and
+    tripping the assert in pop_req() (SIGABRT). MONITOR / PSYNC instead stream
+    indefinitely and wedge the run past --test-time.
+
+    A real MONITOR capture legitimately contains these lines, so the loader
+    skips them the same way it already skips HELLO (#482) and still replays
+    every other command in the file.
+
+    The escaped spellings matter: split_command_to_args() unescapes \\ and \\xNN,
+    so `"S\\UBSCRIBE"` puts the bytes SUBSCRIBE on the wire while a raw slice of
+    the line reads S\\UBSCRIBE. Keying the skip off the raw slice would let that
+    line through -- and the in-tree fuzzer manufactures exactly this shape,
+    because quote_storm() inserts literal backslashes at random offsets.
+    """
+    env.skipOnCluster()
+    test_dir = tempfile.mkdtemp()
+    monitor_file = os.path.join(test_dir, "monitor.txt")
+    with open(monitor_file, "w") as f:
+        # Multi-channel: the deterministic SIGABRT.
+        f.write('1764031576.604009 [0 127.0.0.1:51682] "SUBSCRIBE" "chan1" "chan2"\n')
+        # Single-channel: fatal too, as soon as anything publishes.
+        f.write('1764031576.604109 [0 127.0.0.1:51682] "SUBSCRIBE" "chan1"\n')
+        f.write('1764031576.604209 [0 127.0.0.1:51682] "PSUBSCRIBE" "ch*"\n')
+        f.write('1764031576.604309 [0 127.0.0.1:51682] "UNSUBSCRIBE" "chan1" "chan2"\n')
+        f.write('1764031576.604409 [0 127.0.0.1:51682] "MONITOR"\n')
+        # Escape-decoded spellings of the same commands.
+        f.write('1764031576.604509 [0 127.0.0.1:51682] "S\\UBSCRIBE" "chan1" "chan2"\n')
+        f.write('1764031576.604609 [0 127.0.0.1:51682] "\\x53UBSCRIBE" "chan1" "chan2"\n')
+        # These must survive: PUBLISH is a 1:1 integer reply.
+        f.write('1764031576.604709 [0 127.0.0.1:51682] "SET" "key1" "value1"\n')
+        f.write('1764031576.604809 [0 127.0.0.1:51682] "PUBLISH" "chan1" "hello"\n')
+
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--monitor-input={}".format(monitor_file),
+            "--command=__monitor_line@__",
+            "--hide-histogram",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+
+    config = get_default_memtier_config(threads=1, clients=1, requests=None, test_time=2)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    memtier_ok = benchmark.run()
+
+    debugPrintMemtierOnError(config, env)
+    env.assertTrue(memtier_ok,
+                   message="the run must complete: the 7 unreplayable lines are "
+                           "skipped and SET/PUBLISH still replay")
+
+    with open("{0}/mb.stderr".format(config.results_dir)) as stderr:
+        stderr_content = stderr.read()
+        # 7 skipped, 2 replayable left.
+        env.assertTrue(
+            "Loaded 2 monitor commands" in stderr_content,
+            message="expected exactly the 2 replayable commands to load; got: {}".format(
+                stderr_content[-800:]))
+        env.assertTrue(
+            "7 unreplayable line(s) skipped" in stderr_content,
+            message="expected all 7 pub/sub + MONITOR lines to be skipped; got: {}".format(
+                stderr_content[-800:]))
+        # The pre-fix signature.
+        env.assertFalse(
+            "Assertion" in stderr_content,
+            message="replaying the file must not trip an assert; got: {}".format(
+                stderr_content[-800:]))

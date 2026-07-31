@@ -354,6 +354,12 @@ private:
     // foreign-thread read race report.
     std::atomic<int> m_last_pushed_req_type;
 
+    // Rate-limits the "reply with no request outstanding" warning to one per
+    // connection per connect, so a chatty server cannot flood stderr. Reset in
+    // disconnect() -- otherwise a reconnect would inherit the suppression and
+    // the operator would never hear about it again.
+    bool m_unsolicited_reply_warned;
+
     enum connection_state m_connection_state;
     // Topology role; defaults to role_primary. Cluster_client sets it to
     // role_replica after CLUSTER SLOTS reveals the connection is a replica node.

@@ -222,6 +222,7 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_request_per_cur_interval(0),
         m_pending_resp(0),
         m_last_pushed_req_type(-1),
+        m_unsolicited_reply_warned(false),
         m_connection_state(conn_disconnected),
         m_role(role_primary),
         m_hello(setup_done),
@@ -576,6 +577,10 @@ void shard_connection::disconnect()
     // reconnect timer (the timer was freed above), leaving m_reconnecting
     // true would make every future attempt_reconnect call no-op silently.
     m_reconnecting = false;
+
+    // Re-arm the unsolicited-reply warning for the next connection; otherwise
+    // one warning would permanently silence it for the rest of the run.
+    m_unsolicited_reply_warned = false;
 
     // by default no need to send any setup request
     m_authentication = setup_done;
@@ -1062,6 +1067,37 @@ void shard_connection::process_response(void)
     while ((ret = m_protocol->parse_response()) > 0) {
         bool error = false;
         protocol_response *r = m_protocol->get_response();
+
+        // A reply with nothing outstanding is not ours to book. pop_req() would
+        // call front()/pop() on an empty std::queue -- undefined behaviour that
+        // the assert on m_pending_resp only reports afterwards, and that a
+        // -DNDEBUG build would not report at all. Discard the frame instead.
+        //
+        // Reachable from a server that sends more replies than requests: a
+        // multi-reply or streaming command (refused at parse time now, see
+        // is_multi_reply_command()), an out-of-band pub/sub message, or simply a
+        // buggy/hostile endpoint -- the RESP fuzzers in tests/fuzz exist to
+        // produce exactly this. Note the scope: this keeps the client alive and
+        // honest about the frame it dropped, but it is not reply<->request
+        // re-synchronisation. At --pipeline > 1 the queue is rarely empty, so a
+        // surplus reply is instead booked against the next outstanding request
+        // and the correspondence stays shifted; refusing the input up front is
+        // what actually prevents that. (issue #515)
+        if (m_pipeline->empty()) {
+            if (!m_unsolicited_reply_warned) {
+                m_unsolicited_reply_warned = true;
+                benchmark_error_log("warning: server %s:%s sent a reply with no request outstanding; "
+                                    "discarding it. This means the endpoint replies more than once per "
+                                    "request (pub/sub or a streaming command), so the reported latencies "
+                                    "for this connection may be unreliable.\n",
+                                    m_address ? m_address : "?", m_port ? m_port : "?");
+            }
+            // continue, not break: parse_response() has already consumed this
+            // frame's bytes, and fill_pipeline() may disable the bufferevent
+            // once nothing is outstanding, leaving any further frames already in
+            // the read buffer unparsed until the next read event.
+            continue;
+        }
 
         request *req = pop_req();
         switch (req->m_type) {
