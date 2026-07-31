@@ -870,6 +870,17 @@ bool monitor_command_list::load_from_file(const char *filename)
             fprintf(stderr,
                     "error: no valid commands found in monitor input file: %s (%zu malformed line(s) skipped)\n",
                     filename, skipped_malformed);
+        } else if (skipped_unsafe > 0) {
+            // Every line parsed but every one was unreplayable. Say so: telling
+            // the user "no commands found" when we found and deliberately
+            // dropped all of them sends them hunting a capture-format problem
+            // that does not exist. A pub/sub-heavy capture hits this easily now
+            // that the filter covers the whole subscribe + streaming family and
+            // not just HELLO.
+            fprintf(stderr,
+                    "error: no replayable commands in monitor input file: %s (%zu of %zu line(s) skipped as "
+                    "unreplayable -- HELLO, pub/sub subscribe, MONITOR, SYNC and PSYNC cannot be benchmarked)\n",
+                    filename, skipped_unsafe, total_lines);
         } else {
             fprintf(stderr, "error: no commands found in monitor input file: %s\n", filename);
         }

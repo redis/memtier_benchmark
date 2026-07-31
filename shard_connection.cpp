@@ -222,7 +222,7 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_request_per_cur_interval(0),
         m_pending_resp(0),
         m_last_pushed_req_type(-1),
-        m_unsolicited_reply_warned(false),
+        m_unsolicited_reply_warnings(0),
         m_connection_state(conn_disconnected),
         m_role(role_primary),
         m_hello(setup_done),
@@ -577,10 +577,6 @@ void shard_connection::disconnect()
     // reconnect timer (the timer was freed above), leaving m_reconnecting
     // true would make every future attempt_reconnect call no-op silently.
     m_reconnecting = false;
-
-    // Re-arm the unsolicited-reply warning for the next connection; otherwise
-    // one warning would permanently silence it for the rest of the run.
-    m_unsolicited_reply_warned = false;
 
     // by default no need to send any setup request
     m_authentication = setup_done;
@@ -1084,13 +1080,16 @@ void shard_connection::process_response(void)
         // and the correspondence stays shifted; refusing the input up front is
         // what actually prevents that. (issue #515)
         if (m_pipeline->empty()) {
-            if (!m_unsolicited_reply_warned) {
-                m_unsolicited_reply_warned = true;
+            if (m_unsolicited_reply_warnings < UNSOLICITED_REPLY_WARN_MAX) {
+                m_unsolicited_reply_warnings++;
                 benchmark_error_log("warning: server %s:%s sent a reply with no request outstanding; "
                                     "discarding it. This means the endpoint replies more than once per "
                                     "request (pub/sub or a streaming command), so the reported latencies "
-                                    "for this connection may be unreliable.\n",
-                                    m_address ? m_address : "?", m_port ? m_port : "?");
+                                    "and RX bytes for this connection are unreliable.%s\n",
+                                    m_address ? m_address : "?", m_port ? m_port : "?",
+                                    (m_unsolicited_reply_warnings == UNSOLICITED_REPLY_WARN_MAX)
+                                        ? " Suppressing further warnings for this connection."
+                                        : "");
             }
             // continue, not break: parse_response() has already consumed this
             // frame's bytes, and fill_pipeline() may disable the bufferevent

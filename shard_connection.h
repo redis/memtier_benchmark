@@ -354,11 +354,15 @@ private:
     // foreign-thread read race report.
     std::atomic<int> m_last_pushed_req_type;
 
-    // Rate-limits the "reply with no request outstanding" warning to one per
-    // connection per connect, so a chatty server cannot flood stderr. Reset in
-    // disconnect() -- otherwise a reconnect would inherit the suppression and
-    // the operator would never hear about it again.
-    bool m_unsolicited_reply_warned;
+    // Rate-limits the "reply with no request outstanding" warning. Counted over
+    // the connection's whole lifetime (NOT reset in disconnect()): resetting per
+    // connect would emit one line per reconnect, and under
+    // --reconnect-interval=1 --test-time=3600 with a few hundred connections
+    // that is a stderr flood in exactly the automated-harness setting where
+    // nobody reads it. Capping instead of a single one-shot flag still lets a
+    // reconnected connection report the problem.
+    static const unsigned int UNSOLICITED_REPLY_WARN_MAX = 3;
+    unsigned int m_unsolicited_reply_warnings;
 
     enum connection_state m_connection_state;
     // Topology role; defaults to role_primary. Cluster_client sets it to
