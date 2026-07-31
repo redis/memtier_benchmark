@@ -1072,21 +1072,35 @@ void shard_connection::process_response(void)
         // Reachable from a server that sends more replies than requests: a
         // multi-reply or streaming command (refused at parse time now, see
         // is_multi_reply_command()), an out-of-band pub/sub message, or simply a
-        // buggy/hostile endpoint -- the RESP fuzzers in tests/fuzz exist to
-        // produce exactly this. Note the scope: this keeps the client alive and
-        // honest about the frame it dropped, but it is not reply<->request
-        // re-synchronisation. At --pipeline > 1 the queue is rarely empty, so a
-        // surplus reply is instead booked against the next outstanding request
-        // and the correspondence stays shifted; refusing the input up front is
-        // what actually prevents that. (issue #515)
+        // buggy/hostile endpoint. Note the scope, which is narrower than "this
+        // fixes surplus replies":
+        //
+        //   * A *systematic* surplus (every request answered twice -- issue
+        //     #515's actual shape) drains the queue at any pipeline depth, so
+        //     this guard is load-bearing everywhere, not just at --pipeline=1.
+        //     Verified: the pre-fix build aborts at --pipeline 1, 2, 8 and 32
+        //     against a two-replies-per-request endpoint.
+        //   * What the guard cannot do is re-synchronise. A *sporadic* surplus
+        //     that arrives while a request is outstanding is booked against that
+        //     request instead, so the reply<->request correspondence stays
+        //     shifted and the run still reports numbers for it. Refusing the
+        //     input up front (is_multi_reply_command()) is what prevents that;
+        //     this guard only keeps a non-conforming endpoint from corrupting
+        //     memory. See the warning text for what the operator is told.
+        // (issue #515)
         if (m_pipeline->empty()) {
             if (m_unsolicited_reply_warnings < UNSOLICITED_REPLY_WARN_MAX) {
                 m_unsolicited_reply_warnings++;
-                benchmark_error_log("warning: server %s:%s sent a reply with no request outstanding; "
-                                    "discarding it. This means the endpoint replies more than once per "
-                                    "request (pub/sub or a streaming command), so the reported latencies "
-                                    "and RX bytes for this connection are unreliable.%s\n",
-                                    m_address ? m_address : "?", m_port ? m_port : "?",
+                // get_readable_id(), not m_address/m_port: those are NULL under
+                // --unix-socket (client::connect only sets them on the TCP path),
+                // which would print "server ?:?" in the one diagnostic the
+                // operator gets.
+                benchmark_error_log("warning: server %s sent a reply with no request outstanding; discarding "
+                                    "it. The endpoint is answering with more replies than requests (pub/sub "
+                                    "or a streaming command), so this connection's op count, ops/sec, "
+                                    "latencies, hit/miss split and RX bytes are all unreliable -- do not "
+                                    "trust this run's numbers.%s\n",
+                                    get_readable_id(),
                                     (m_unsolicited_reply_warnings == UNSOLICITED_REPLY_WARN_MAX)
                                         ? " Suppressing further warnings for this connection."
                                         : "");
