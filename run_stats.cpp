@@ -1301,9 +1301,9 @@ void result_print_to_json(json_handler *jsonhandler, const char *type, double op
         jsonhandler->open_nesting("Percentile Latencies");
         for (std::size_t i = 0; i < quantile_list.size(); i++) {
             const double quantile = quantile_list[i];
-            char quantile_header[8];
-            // Backwards-compat JSON key shape "pNN.NNN".
-            snprintf(quantile_header, sizeof(quantile_header) - 1, "p%.3f", quantile);
+            char quantile_header[32];
+            // %.10g avoids the truncation/rounding that made "p%.3f" collide on deep percentiles.
+            snprintf(quantile_header, sizeof(quantile_header), "p%.10g", quantile);
             const double value =
                 hdr_value_at_percentile(latency_histogram, quantile) / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
             jsonhandler->write_obj((char *) quantile_header, "%.3f", value);
