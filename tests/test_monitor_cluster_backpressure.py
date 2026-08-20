@@ -130,8 +130,8 @@ def test_monitor_cluster_latency_bounded(env):
 
     totals = js.get("ALL STATS", {}).get("Totals", {})
     env.assertContains("Percentile Latencies", totals)
-    p99 = totals["Percentile Latencies"].get("p99.00")
-    env.assertTrue(p99 is not None, message="p99.00 missing from JSON Totals")
+    p99 = totals["Percentile Latencies"].get("p99")
+    env.assertTrue(p99 is not None, message="p99 missing from JSON Totals")
 
     env.assertTrue(
         p99 < _P99_CEILING_MS,

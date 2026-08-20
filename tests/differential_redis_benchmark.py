@@ -362,7 +362,7 @@ def test_diff_p99_latency_get(redis_server):
                          jp, threads=1, clients=4, requests=5000)
         assert r.returncode == 0, r.stderr
         mt = _read_memtier_json(jp)["ALL STATS"]["Gets"]
-        mt_p99 = float(mt["Percentile Latencies"]["p99.00"])
+        mt_p99 = float(mt["Percentile Latencies"]["p99"])
 
         rb_out = subprocess.run(
             [rb, "-h", "127.0.0.1", "-p", str(port),
