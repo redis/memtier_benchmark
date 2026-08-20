@@ -643,16 +643,16 @@ def test_command_stats_breakdown_by_command(env):
             env.assertTrue("Bytes TX" in second_data)
             # If we had commands on that second, verify latency metrics exist
             if second_data["Count"] > 0:
-                env.assertTrue("p50.00" in second_data)
-                env.assertTrue("p99.00" in second_data)
+                env.assertTrue("p50" in second_data)
+                env.assertTrue("p99" in second_data)
 
         for second_data in get_metrics_ts.values():
             env.assertTrue("Count" in second_data)
             env.assertTrue("Bytes RX" in second_data)
             env.assertTrue("Bytes TX" in second_data)
             if second_data["Count"] > 0:
-                env.assertTrue("p50.00" in second_data)
-                env.assertTrue("p99.00" in second_data)
+                env.assertTrue("p50" in second_data)
+                env.assertTrue("p99" in second_data)
 
 
 def test_command_stats_breakdown_by_line(env):

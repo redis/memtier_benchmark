@@ -253,9 +253,9 @@ def test_default_set_get(env):
             count = second_data["Count"]
             # if we had commands on that second the BW needs to be > 0
             if count > 0:
-                p50 = second_data["p50.00"]
-                p99 = second_data["p99.00"]
-                p999 = second_data["p99.90"]
+                p50 = second_data["p50"]
+                p99 = second_data["p99"]
+                p999 = second_data["p99.9"]
                 env.assertTrue(bytes_rx >= 0)
                 env.assertTrue(bytes_tx >= 0)
                 env.assertTrue(p50 >= 0.0)
@@ -268,9 +268,9 @@ def test_default_set_get(env):
             count = second_data["Count"]
             # if we had commands on that second the BW needs to be > 0
             if count > 0:
-                p50 = second_data["p50.00"]
-                p99 = second_data["p99.00"]
-                p999 = second_data["p99.90"]
+                p50 = second_data["p50"]
+                p99 = second_data["p99"]
+                p999 = second_data["p99.9"]
                 env.assertTrue(bytes_rx >= 0)
                 env.assertTrue(bytes_tx >= 0)
                 env.assertTrue(p50 >= 0.0)
@@ -553,7 +553,7 @@ def test_default_arbitrary_command_keyless(env):
             bytes_tx = second_data["Bytes TX"]
             count = second_data["Count"]
             second_data_total = totals_metrics_ts_v[pos]
-            for metric_name in ["p50.00","p99.00","p99.90"]:
+            for metric_name in ["p50","p99","p99.9"]:
                 if count > 0:
                     metric_value_second_data = second_data[metric_name]
                     metric_value_totals_second_data = second_data_total[metric_name]
@@ -922,7 +922,7 @@ def test_valid_json_using_debug_command(env):
             count = second_data["Count"]
             # if we had commands on that second the BW needs to be > 0
             if count > 0:
-                for latency_metric_name in ["Accumulated Latency","Min Latency","Max Latency","p50.00","p99.00","p99.90"]:
+                for latency_metric_name in ["Accumulated Latency","Min Latency","Max Latency","p50","p99","p99.9"]:
                     metric_value = second_data[latency_metric_name]
                     env.assertTrue(metric_value >= 0.0)
 

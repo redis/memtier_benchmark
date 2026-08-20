@@ -1286,10 +1286,9 @@ void result_print_to_json(json_handler *jsonhandler, const char *type, double op
                 for (std::size_t i = 0; i < quantile_list.size(); i++) {
                     if (i < cmd_stats.summarized_quantile_values.size()) {
                         const double quantile = quantile_list[i];
-                        char quantile_header[8];
-                        // Backwards-compat JSON key shape "pNN.NN" (legacy
-                        // consumers and tests expect this exact format).
-                        snprintf(quantile_header, sizeof(quantile_header) - 1, "p%.2f", quantile);
+                        char quantile_header[32];
+                        // %.10g avoids the truncation/rounding that made "p%.2f" collide on deep percentiles.
+                        snprintf(quantile_header, sizeof(quantile_header), "p%.10g", quantile);
                         const double value = cmd_stats.summarized_quantile_values[i];
                         jsonhandler->write_obj((char *) quantile_header, "%.3f", value);
                     }
