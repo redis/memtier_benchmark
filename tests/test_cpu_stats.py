@@ -168,13 +168,15 @@ def test_cpu_warn_threshold_flag(env):
     # own wall bracket physically cannot exceed ~1.0 core, so this is normally
     # silent. Rather than assert blanket silence (which clock/wall jitter could
     # rarely break at exactly 1.0), assert the warning count is CONSISTENT with
-    # the authoritative JSON: one 'of a core' line per thread with cores_used>1.0.
+    # the authoritative JSON: one end-of-run line per thread with cores_used>1.0.
     specs100 = {"name": env.testName, "args": base_args + ['--cpu-warn-threshold=100']}
     addTLSArgs(specs100, env)
     cfg100 = get_default_memtier_config(threads=1, clients=50, requests=None, test_time=3)
     cfg100, results100 = _run_and_load(env, specs100, cfg100)
     stderr100 = _read_stderr(cfg100)
-    end_warnings = stderr100.count('of a core')
+    # Match only the end-of-run wording: the live per-second warning also says
+    # "of a core" and can fire on a >100% 1s sample (see PER_THREAD_PCT_CEILING).
+    end_warnings = stderr100.count('of a core over the run')
     all100 = results100['ALL STATS']
     if 'CPU' in all100:
         over_one_core = sum(1 for pt in all100['CPU']['Per Thread'].values() if pt['cores_used'] > 1.0)
