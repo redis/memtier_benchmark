@@ -1224,6 +1224,68 @@ void run_stats::summarize(totals &result) const
         (test_duration_usec > 0) ? (double) totals.m_connection_errors / test_duration_usec * 1000000 : 0.0;
 }
 
+// Formats a JSON percentile key for quantiles[idx] using legacy_fmt (the
+// historical "p%.2f"/"p%.3f" shape, reproduced byte-for-byte including its
+// original undersized-buffer truncation -- e.g. requesting p100 alone still
+// renders "p100.0", not "p100.00"/"p100.000" -- since that truncated string
+// is the actual key existing JSON consumers already depend on, bug and all;
+// "fixing" the truncation here would itself be a breaking change for every
+// caller relying on today's output).
+//
+// If that legacy key would collide with another quantile's legacy key,
+// escalate to full "p%.10g" precision; if two quantiles are close enough
+// that even %.10g collides, escalate once more to "p%.17g" (a double's
+// round-trip-exact precision, so any two non-identical doubles are
+// guaranteed to format distinctly). Only quantiles that actually collide
+// change key shape at all -- every other requested percentile keeps the
+// exact key existing JSON consumers already rely on.
+static void legacy_percentile_key(char *buf, size_t bufsize, const char *legacy_fmt, double quantile)
+{
+    char truncated[8];
+    snprintf(truncated, sizeof(truncated) - 1, legacy_fmt, quantile);
+    snprintf(buf, bufsize, "%s", truncated);
+}
+
+static bool legacy_keys_collide(const std::vector<double> &quantiles, size_t idx, const char *legacy_fmt)
+{
+    char mine[8];
+    legacy_percentile_key(mine, sizeof(mine), legacy_fmt, quantiles[idx]);
+    for (size_t j = 0; j < quantiles.size(); j++) {
+        if (j == idx) continue;
+        char other[8];
+        legacy_percentile_key(other, sizeof(other), legacy_fmt, quantiles[j]);
+        if (strcmp(mine, other) == 0) return true;
+    }
+    return false;
+}
+
+static bool precise_keys_collide(const std::vector<double> &quantiles, size_t idx, const char *precise_fmt)
+{
+    char mine[32];
+    snprintf(mine, sizeof(mine), precise_fmt, quantiles[idx]);
+    for (size_t j = 0; j < quantiles.size(); j++) {
+        if (j == idx) continue;
+        char other[32];
+        snprintf(other, sizeof(other), precise_fmt, quantiles[j]);
+        if (strcmp(mine, other) == 0) return true;
+    }
+    return false;
+}
+
+static void format_percentile_key(char *buf, size_t bufsize, const std::vector<double> &quantiles, size_t idx,
+                                  const char *legacy_fmt)
+{
+    if (!legacy_keys_collide(quantiles, idx, legacy_fmt)) {
+        legacy_percentile_key(buf, bufsize, legacy_fmt, quantiles[idx]);
+        return;
+    }
+    if (!precise_keys_collide(quantiles, idx, "p%.10g")) {
+        snprintf(buf, bufsize, "p%.10g", quantiles[idx]);
+        return;
+    }
+    snprintf(buf, bufsize, "p%.17g", quantiles[idx]);
+}
+
 void result_print_to_json(json_handler *jsonhandler, const char *type, double ops_sec, double hits, double miss,
                           double moved, double ask, double kbs, double kbs_rx, double kbs_tx, double latency,
                           long m_total_latency, long ops, double connection_errors_sec, long connection_errors,
@@ -1285,10 +1347,10 @@ void result_print_to_json(json_handler *jsonhandler, const char *type, double op
                 jsonhandler->write_obj("Max Latency", "%.3f", cmd_stats.m_max_latency);
                 for (std::size_t i = 0; i < quantile_list.size(); i++) {
                     if (i < cmd_stats.summarized_quantile_values.size()) {
-                        const double quantile = quantile_list[i];
                         char quantile_header[32];
-                        // %.10g avoids the truncation/rounding that made "p%.2f" collide on deep percentiles.
-                        snprintf(quantile_header, sizeof(quantile_header), "p%.10g", quantile);
+                        // Keeps the historical "p%.2f" key for quantiles that don't collide;
+                        // only falls back to full precision for the ones that do.
+                        format_percentile_key(quantile_header, sizeof(quantile_header), quantile_list, i, "p%.2f");
                         const double value = cmd_stats.summarized_quantile_values[i];
                         jsonhandler->write_obj((char *) quantile_header, "%.3f", value);
                     }
@@ -1301,8 +1363,9 @@ void result_print_to_json(json_handler *jsonhandler, const char *type, double op
         for (std::size_t i = 0; i < quantile_list.size(); i++) {
             const double quantile = quantile_list[i];
             char quantile_header[32];
-            // %.10g avoids the truncation/rounding that made "p%.3f" collide on deep percentiles.
-            snprintf(quantile_header, sizeof(quantile_header), "p%.10g", quantile);
+            // Keeps the historical "p%.3f" key for quantiles that don't collide;
+            // only falls back to full precision for the ones that do.
+            format_percentile_key(quantile_header, sizeof(quantile_header), quantile_list, i, "p%.3f");
             const double value =
                 hdr_value_at_percentile(latency_histogram, quantile) / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
             jsonhandler->write_obj((char *) quantile_header, "%.3f", value);
