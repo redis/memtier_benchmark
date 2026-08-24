@@ -3,24 +3,24 @@ Regression tests for JSON percentile-key formatting in result_print_to_json().
 
 Both the "Percentile Latencies" and "Time-Serie" JSON blocks built their
 key with a fixed-decimal snprintf() into an undersized buffer
-(char[8], sizeof(buf)-1 passed as the size). For --print-percentiles
-values with three or more decimal places this silently truncated/rounded
-distinct quantiles onto the same key -- e.g. 99.99 and 99.991 both
-collapsed to "p99.99", and the second value silently overwrote the first
-in the JSON object.
+(char[8], sizeof(buf)-1 passed as the size). The format rounds and the
+buffer then truncates, so for --print-percentiles values with three or
+more decimal places the key names a different number than the value it
+holds: 99.999 is keyed "p99.99" or "p100.0". Where two requested
+quantiles landed on the same wrecked key -- 99.99 and 99.991 both
+"p99.99" -- the second value silently overwrote the first.
 
 The fix keeps the historical fixed-decimal key ("p50.00", "p99.00",
-"p99.90", ...) for any quantile that doesn't collide with another
-requested quantile under that format, and only falls back to full
-("p%.10g") precision for the specific quantiles that would otherwise
-collide. This test pins both halves of that invariant:
+"p99.90", ...) for every quantile it can still name exactly, and escalates
+to "p%.10g", then "p%.17g", only for the ones it cannot. These tests pin
+both halves of that invariant:
 
-  1. Deep, colliding percentile requests no longer lose data -- every
-     requested quantile gets its own distinct, correctly-valued key.
-  2. The common case (the default 50,99,99.9, which never collided) keeps
-     the exact legacy key shape ("p50.00" etc.) that existing JSON
-     consumers already depend on -- this fix must not be a breaking
-     change for anyone not already hitting the collision bug.
+  1. Every requested quantile gets a key that parses back to it, and
+     therefore a distinct one -- whether or not it collided with another
+     request, since a mislabelled key is wrong on its own.
+  2. Keys that already named their quantile correctly do not move, and do
+     not move because of what else was requested alongside them. The
+     default (50,99,99.9) is byte-for-byte unchanged.
 
 Run:
     TEST=test_json_percentile_key_collision.py OSS_STANDALONE=1 ./tests/run_tests.sh
@@ -93,17 +93,15 @@ def test_percentile_keys_distinct_for_deep_tail_totals(env):
             message=f"Expected {len(requested)} distinct percentile keys, "
                     f"got {len(percentile_keys)}: {sorted(percentile_keys.keys())}")
         for p in requested:
-            # Every requested quantile must be recoverable from some key --
-            # not asserting an exact key string here since the whole point
-            # of the fix is that only the colliding entries change shape;
-            # this just confirms none of them silently vanished. Compare
-            # numerically (not by string-stripping trailing zeros, which
-            # would mangle a whole number like "50" into "5").
+            # Not asserting exact key strings: which quantiles keep the legacy
+            # shape is the implementation detail under test elsewhere. What
+            # every key must do is parse back to the quantile it holds, which
+            # is also what makes two of them impossible to confuse.
             target = float(p)
-            matches = [k for k in percentile_keys if abs(float(k[1:]) - target) < 1e-6]
+            matches = [k for k in percentile_keys if float(k[1:]) == target]
             env.assertTrue(
                 len(matches) == 1,
-                message=f"Expected exactly one key for quantile {p}, found {matches} "
+                message=f"Expected exactly one key naming quantile {p}, found {matches} "
                         f"in {sorted(percentile_keys.keys())}")
 
     _run_and_check(env, ["--print-percentiles={}".format(DEEP_PERCENTILES)], check)
@@ -133,14 +131,16 @@ def test_percentile_keys_distinct_for_deep_tail_time_serie(env):
 
 
 def test_percentile_keys_distinct_even_when_full_precision_also_collides(env):
-    """Two quantiles can be close enough that even the "p%.10g" fallback
-    can't tell them apart (they agree in their first 10 significant
-    digits). This requires a second escalation to "p%.17g" -- a double's
+    """Two quantiles can be close enough that they agree in their first 10
+    significant digits, so "p%.10g" still can't name either of them
+    exactly. That forces the second escalation to "p%.17g" -- a double's
     round-trip-exact precision -- so any two non-bit-identical doubles are
-    still guaranteed distinct keys. This is a stricter version of the
-    deep-tail test above: those percentiles only collided at the legacy
-    (2-3 decimal) format and were already resolved by %.10g; these don't
-    separate until the second escalation."""
+    still guaranteed distinct keys.
+
+    Also pins that escalation is not contagious: 99.9 is named exactly by
+    the legacy "p99.90", so it keeps that key even though 99.900000001
+    sits right next to it and has to go all the way to %.17g. A key that
+    was already correct must not change shape because of its neighbours."""
     close_percentiles = "99.9,99.900000001,99.99999991,99.99999992"
 
     def check(results):
@@ -150,8 +150,53 @@ def test_percentile_keys_distinct_even_when_full_precision_also_collides(env):
             len(percentile_keys), 4,
             message=f"Expected 4 distinct percentile keys for near-identical "
                     f"quantiles, got {len(percentile_keys)}: {sorted(percentile_keys)}")
+        env.assertTrue(
+            "p99.90" in percentile_keys,
+            message=f"99.9 is named exactly by its legacy key and must keep it "
+                    f"regardless of neighbouring quantiles, got {sorted(percentile_keys)}")
 
     _run_and_check(env, ["--print-percentiles={}".format(close_percentiles)], check)
+
+
+# 99.9999 requested alone collides with nothing, so a collision-driven fix
+# leaves it untouched -- but the legacy formats still round it up and
+# truncate it to "p100.0", labelling a deep percentile as the maximum.
+# Nothing is missing from the JSON and no key is duplicated; the document
+# is just silently wrong, which is why the invariant has to be "the key
+# names its quantile" rather than "the key is unique".
+LONE_DEEP_PERCENTILE = "99.9999"
+
+
+def test_percentile_key_names_its_quantile_without_any_collision(env):
+    """A single deep percentile must still be keyed by the quantile it
+    holds, not by whatever the legacy format rounded it to."""
+    def check(results):
+        totals = results["ALL STATS"]["Totals"]
+        target = float(LONE_DEEP_PERCENTILE)
+
+        def assert_named_exactly(keys, where):
+            percentile_keys = {k for k in keys if re.match(r"^p\d", k)}
+            env.assertEqual(
+                len(percentile_keys), 1,
+                message=f"{where}: expected exactly one percentile key, "
+                        f"got {sorted(percentile_keys)}")
+            key = percentile_keys.pop()
+            env.assertEqual(
+                float(key[1:]), target,
+                message=f"{where}: key '{key}' does not name the requested "
+                        f"quantile {LONE_DEEP_PERCENTILE} it holds")
+
+        assert_named_exactly(totals["Percentile Latencies"].keys(), "Percentile Latencies")
+
+        checked_a_bucket = False
+        for bucket in totals["Time-Serie"].values():
+            if bucket.get("Count", 0) <= 0:
+                continue
+            checked_a_bucket = True
+            assert_named_exactly(bucket.keys(), "Time-Serie bucket")
+        env.assertTrue(checked_a_bucket, message="No populated Time-Serie bucket found to check")
+
+    _run_and_check(env, ["--print-percentiles={}".format(LONE_DEEP_PERCENTILE)], check)
 
 
 def test_percentile_keys_backward_compatible_for_default_config(env):

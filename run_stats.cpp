@@ -1224,21 +1224,17 @@ void run_stats::summarize(totals &result) const
         (test_duration_usec > 0) ? (double) totals.m_connection_errors / test_duration_usec * 1000000 : 0.0;
 }
 
-// Formats a JSON percentile key for quantiles[idx] using legacy_fmt (the
-// historical "p%.2f"/"p%.3f" shape, reproduced byte-for-byte including its
-// original undersized-buffer truncation -- e.g. requesting p100 alone still
-// renders "p100.0", not "p100.00"/"p100.000" -- since that truncated string
-// is the actual key existing JSON consumers already depend on, bug and all;
-// "fixing" the truncation here would itself be a breaking change for every
-// caller relying on today's output).
-//
-// If that legacy key would collide with another quantile's legacy key,
-// escalate to full "p%.10g" precision; if two quantiles are close enough
-// that even %.10g collides, escalate once more to "p%.17g" (a double's
-// round-trip-exact precision, so any two non-identical doubles are
-// guaranteed to format distinctly). Only quantiles that actually collide
-// change key shape at all -- every other requested percentile keeps the
-// exact key existing JSON consumers already rely on.
+// True if key ("pNN.NN") parses back to exactly the quantile it labels.
+static bool percentile_key_is_exact(const char *key, double quantile)
+{
+    char *end = NULL;
+    const double parsed = strtod(key + 1, &end);
+    return end != key + 1 && *end == '\0' && parsed == quantile;
+}
+
+// Renders the historical "p%.2f"/"p%.3f" key byte-for-byte, including the
+// original undersized-buffer truncation (100 renders "p100.0", not "p100.00"),
+// since that truncated string is the key existing JSON consumers already read.
 static void legacy_percentile_key(char *buf, size_t bufsize, const char *legacy_fmt, double quantile)
 {
     char truncated[8];
@@ -1246,44 +1242,28 @@ static void legacy_percentile_key(char *buf, size_t bufsize, const char *legacy_
     snprintf(buf, bufsize, "%s", truncated);
 }
 
-static bool legacy_keys_collide(const std::vector<double> &quantiles, size_t idx, const char *legacy_fmt)
+// Formats a JSON percentile key, keeping the legacy shape for every quantile it
+// can still name exactly and escalating precision only for the ones it cannot.
+//
+// The legacy formats round and then truncate, so any quantile with more than two
+// effective decimals gets a key that names a different number: 99.999 renders
+// "p99.99" or "p100.0". Such a key is wrong on its own -- whether some other
+// requested quantile happens to render to the same string is a separate,
+// downstream symptom -- so the test is whether the key round-trips, not whether
+// it collides.
+//
+// That also makes collisions impossible without checking for them: an accepted
+// key parses back to its own quantile, so two distinct quantiles cannot share
+// one. "p%.17g" round-trips every binary64, so the escalation always terminates.
+static void format_percentile_key(char *buf, size_t bufsize, double quantile, const char *legacy_fmt)
 {
-    char mine[8];
-    legacy_percentile_key(mine, sizeof(mine), legacy_fmt, quantiles[idx]);
-    for (size_t j = 0; j < quantiles.size(); j++) {
-        if (j == idx) continue;
-        char other[8];
-        legacy_percentile_key(other, sizeof(other), legacy_fmt, quantiles[j]);
-        if (strcmp(mine, other) == 0) return true;
-    }
-    return false;
-}
+    legacy_percentile_key(buf, bufsize, legacy_fmt, quantile);
+    if (percentile_key_is_exact(buf, quantile)) return;
 
-static bool precise_keys_collide(const std::vector<double> &quantiles, size_t idx, const char *precise_fmt)
-{
-    char mine[32];
-    snprintf(mine, sizeof(mine), precise_fmt, quantiles[idx]);
-    for (size_t j = 0; j < quantiles.size(); j++) {
-        if (j == idx) continue;
-        char other[32];
-        snprintf(other, sizeof(other), precise_fmt, quantiles[j]);
-        if (strcmp(mine, other) == 0) return true;
-    }
-    return false;
-}
+    snprintf(buf, bufsize, "p%.10g", quantile);
+    if (percentile_key_is_exact(buf, quantile)) return;
 
-static void format_percentile_key(char *buf, size_t bufsize, const std::vector<double> &quantiles, size_t idx,
-                                  const char *legacy_fmt)
-{
-    if (!legacy_keys_collide(quantiles, idx, legacy_fmt)) {
-        legacy_percentile_key(buf, bufsize, legacy_fmt, quantiles[idx]);
-        return;
-    }
-    if (!precise_keys_collide(quantiles, idx, "p%.10g")) {
-        snprintf(buf, bufsize, "p%.10g", quantiles[idx]);
-        return;
-    }
-    snprintf(buf, bufsize, "p%.17g", quantiles[idx]);
+    snprintf(buf, bufsize, "p%.17g", quantile);
 }
 
 void result_print_to_json(json_handler *jsonhandler, const char *type, double ops_sec, double hits, double miss,
@@ -1348,9 +1328,7 @@ void result_print_to_json(json_handler *jsonhandler, const char *type, double op
                 for (std::size_t i = 0; i < quantile_list.size(); i++) {
                     if (i < cmd_stats.summarized_quantile_values.size()) {
                         char quantile_header[32];
-                        // Keeps the historical "p%.2f" key for quantiles that don't collide;
-                        // only falls back to full precision for the ones that do.
-                        format_percentile_key(quantile_header, sizeof(quantile_header), quantile_list, i, "p%.2f");
+                        format_percentile_key(quantile_header, sizeof(quantile_header), quantile_list[i], "p%.2f");
                         const double value = cmd_stats.summarized_quantile_values[i];
                         jsonhandler->write_obj((char *) quantile_header, "%.3f", value);
                     }
@@ -1363,9 +1341,7 @@ void result_print_to_json(json_handler *jsonhandler, const char *type, double op
         for (std::size_t i = 0; i < quantile_list.size(); i++) {
             const double quantile = quantile_list[i];
             char quantile_header[32];
-            // Keeps the historical "p%.3f" key for quantiles that don't collide;
-            // only falls back to full precision for the ones that do.
-            format_percentile_key(quantile_header, sizeof(quantile_header), quantile_list, i, "p%.3f");
+            format_percentile_key(quantile_header, sizeof(quantile_header), quantile, "p%.3f");
             const double value =
                 hdr_value_at_percentile(latency_histogram, quantile) / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
             jsonhandler->write_obj((char *) quantile_header, "%.3f", value);
