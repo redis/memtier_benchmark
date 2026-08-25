@@ -113,10 +113,10 @@ Use available images on Docker Hub:
 
 ```
 # latest stable release
-$ docker run --rm redis/memtier_benchmark:latest --help
+$ docker run --rm redislab/memtier_benchmark:latest --help
 
 # master branch edge build
-$ docker run --rm redis/memtier_benchmark:edge --help
+$ docker run --rm redislab/memtier_benchmark:edge --help
 ```
 
 Or, build locally:
