@@ -52,6 +52,7 @@
 #include "client.h"
 #include "cluster_client.h"
 #include "config_types.h"
+#include "rate_limiter.h"
 #include "retry_policy.h"
 
 
@@ -76,10 +77,13 @@ bool client::setup_client(benchmark_config *config, abstract_protocol *protocol,
 {
     m_config = config;
     assert(m_config != NULL);
-    unsigned long long total_num_of_clients = config->clients * config->threads;
+    unsigned long long total_num_of_clients = static_cast<unsigned long long>(config->clients) * config->threads;
+    m_request_rate_phase_microsecond =
+        calculate_rate_limit_phase(config->request_interval_microsecond, config->next_client_idx, total_num_of_clients);
 
     // create main connection
-    shard_connection *conn = new shard_connection(m_connections.size(), this, m_config, m_event_base, protocol);
+    shard_connection *conn = new shard_connection(m_connections.size(), this, m_config, m_event_base, protocol,
+                                                  m_request_rate_phase_microsecond);
     m_connections.push_back(conn);
 
     m_obj_gen = objgen->clone();
@@ -175,7 +179,8 @@ client::client(client_group *group) :
         m_scan_cursor("0"),
         m_scan_iteration_count(0),
         m_mget_defer(false),
-        m_arbitrary_needs_elem_tracking(false)
+        m_arbitrary_needs_elem_tracking(false),
+        m_request_rate_phase_microsecond(0)
 {
     m_event_base = group->get_event_base();
 
@@ -211,7 +216,8 @@ client::client(struct event_base *event_base, benchmark_config *config, abstract
         m_scan_iteration_count(0),
         m_keylist(NULL),
         m_mget_defer(false),
-        m_arbitrary_needs_elem_tracking(false)
+        m_arbitrary_needs_elem_tracking(false),
+        m_request_rate_phase_microsecond(0)
 {
     m_event_base = event_base;
 

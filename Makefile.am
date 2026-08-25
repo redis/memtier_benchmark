@@ -80,12 +80,15 @@ memtier_benchmark_LDADD = \
 # layer + hdr_histogram (a leaf dep). No $(LIBEVENT_CFLAGS) by design (hygiene
 # only; purity is enforced by the S10 grep audit). -I$(srcdir) is required for
 # VPATH builds.
-check_PROGRAMS = prometheus_metrics_test
+check_PROGRAMS = prometheus_metrics_test rate_limiter_test
 prometheus_metrics_test_SOURCES = tests/unit/prometheus_metrics_test.cpp \
     prometheus_metrics.cpp prometheus_metrics.h \
     deps/hdr_histogram/hdr_histogram.c deps/hdr_histogram/hdr_histogram.h
 prometheus_metrics_test_CPPFLAGS = -I$(srcdir)
 prometheus_metrics_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+rate_limiter_test_SOURCES = tests/unit/rate_limiter_test.cpp rate_limiter.h
+rate_limiter_test_CPPFLAGS = -I$(srcdir)
+rate_limiter_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 TESTS = $(check_PROGRAMS)
 
 @CODE_COVERAGE_RULES@

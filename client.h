@@ -122,6 +122,11 @@ protected:
     // freshly cloned protocols would otherwise start with the flag cleared.
     bool m_arbitrary_needs_elem_tracking;
 
+    // Offset this logical client's rate-limit refill timer within one interval.
+    // All shard connections owned by the client share the same command stream
+    // and therefore the same phase.
+    unsigned int m_request_rate_phase_microsecond;
+
     // Apply the resolved arbitrary-command tracking flags to a single protocol.
     // Currently a single flag (set_track_elem_misses); plural name is
     // deliberate so additional per-protocol arbitrary-command setup can be

@@ -145,7 +145,8 @@ class shard_connection
 
 public:
     shard_connection(unsigned int id, connections_manager *conn_man, benchmark_config *config,
-                     struct event_base *event_base, abstract_protocol *abs_protocol);
+                     struct event_base *event_base, abstract_protocol *abs_protocol,
+                     unsigned int request_rate_phase_microsecond = 0);
     ~shard_connection();
 
     void set_address_port(const char *address, const char *port);
@@ -338,6 +339,8 @@ private:
     abstract_protocol *m_protocol;
     std::queue<request *> *m_pipeline;
     unsigned int m_request_per_cur_interval; // number requests to send during the current interval
+    unsigned int m_request_rate_phase_microsecond;
+    bool m_request_rate_phase_pending;
 
     // Pending-response counter. Mutated only by the connection's owning worker
     // thread (push_req/pop_req on the libevent callback) but read from the
