@@ -19,10 +19,23 @@ name: Claude Automated Issue Triage
 # "model never directly posts" and "hard secret-scan gate" design does).
 # Never set `show_full_output: true`; never enable `ACTIONS_STEP_DEBUG` on
 # this workflow.
+#
+# `workflow_dispatch` lets a maintainer manually run this against an
+# already-open issue (e.g. one opened before this workflow existed) --
+# `gh workflow run claude-issue-triage.yml -f issue_number=123 --repo redis/memtier_benchmark`.
+# Requires repo write access to invoke, so the anonymous-trigger concern
+# doesn't apply here -- but the issue *content* is still attacker-controlled
+# text, so every mitigation below still applies the same way either trigger.
 
 on:
   issues:
     types: [opened]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number to triage"
+        required: true
+        type: number
 
 permissions:
   contents: read
@@ -31,10 +44,15 @@ permissions:
 
 jobs:
   claude-triage:
-    # Skip the repo's own maintainers/members -- see header comment.
-    if: github.event.issue.author_association != 'OWNER' && github.event.issue.author_association != 'MEMBER' && github.event.issue.author_association != 'COLLABORATOR'
+    # Skip the repo's own maintainers/members on the automatic trigger -- see
+    # header comment. Doesn't apply to a manual workflow_dispatch -- a
+    # maintainer explicitly asking for triage on a specific issue number is
+    # an intentional override.
+    if: github.event_name == 'workflow_dispatch' || (github.event.issue.author_association != 'OWNER' && github.event.issue.author_association != 'MEMBER' && github.event.issue.author_association != 'COLLABORATOR')
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      ISSUE_NUMBER: ${{ github.event.inputs.issue_number || github.event.issue.number }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -51,7 +69,7 @@ jobs:
 
           prompt: |
             REPO: ${{ github.repository }}
-            ISSUE NUMBER: ${{ github.event.issue.number }}
+            ISSUE NUMBER: ${{ env.ISSUE_NUMBER }}
 
             Read this newly-opened issue's title and body via `gh issue view`.
 
@@ -111,7 +129,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           STRUCTURED_OUTPUT: ${{ steps.claude.outputs.structured_output }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
           set -euo pipefail
 
