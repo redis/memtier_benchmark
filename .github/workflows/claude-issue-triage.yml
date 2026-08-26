@@ -121,7 +121,7 @@ jobs:
 
           claude_args: |
             --allowedTools "Bash(gh issue view:*),Bash(gh issue list:*),Bash(gh pr list:*)"
-            --max-turns 6
+            --max-turns 35
             --json-schema '{"type":"object","properties":{"skip_comment":{"type":"boolean","description":"true if the issue is already clear/actionable and needs no comment"},"comment_body":{"type":"string","description":"The triage comment text, empty string if skip_comment is true"}},"required":["skip_comment","comment_body"]}'
 
       - name: Post comment (only after a deterministic secret-pattern check)

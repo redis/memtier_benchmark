@@ -42,6 +42,15 @@ name: Claude Automated PR Review
 #     on this workflow -- per the action's own docs both can leak
 #     tokens/credentials into public step logs.
 #
+# Re-review on push: `synchronize` re-runs this on every commit pushed to the
+# PR (in addition to `opened`), so a push/review/iterate loop stays current.
+# This multiplies the "no rate limiting" residual risk below by every commit
+# pushed by anyone -- including fork contributors -- not just once per PR.
+# To avoid piling up one comment per push, the posting step below edits the
+# SAME comment in place (found by an invisible `<!-- claude-pr-review:auto -->`
+# marker written by the shell step, never by the model) instead of creating a
+# new one each time.
+#
 # Residual risks not fully closed by the above (see PR description for the
 # full writeup): no volume/rate limiting on how many times this can fire
 # (set a spend alert on the API key); Claude Code's Bash allowlist matching
@@ -61,7 +70,7 @@ name: Claude Automated PR Review
 
 on:
   pull_request_target:
-    types: [opened]
+    types: [opened, synchronize]
   workflow_dispatch:
     inputs:
       pr_number:
@@ -85,6 +94,7 @@ jobs:
     timeout-minutes: 15
     env:
       PR_NUMBER: ${{ github.event.inputs.pr_number || github.event.pull_request.number }}
+      REPO: ${{ github.repository }}
     steps:
       - name: Checkout base branch only (never the untrusted PR head)
         uses: actions/checkout@v6
@@ -156,7 +166,7 @@ jobs:
 
           claude_args: |
             --allowedTools "Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr list:*)"
-            --max-turns 8
+            --max-turns 35
             --json-schema '{"type":"object","properties":{"skip_comment":{"type":"boolean","description":"true if this routine/out-of-scope PR should get no comment at all"},"comment_body":{"type":"string","description":"The review comment text, empty string if skip_comment is true"}},"required":["skip_comment","comment_body"]}'
 
       - name: Post comment (only after a deterministic secret-pattern check)
@@ -173,7 +183,12 @@ jobs:
             exit 0
           fi
 
-          echo "$STRUCTURED_OUTPUT" | jq -r '.comment_body' > review_body.txt
+          # Deterministic marker, not model-controlled -- identifies our own
+          # comment across re-runs so a re-review updates it in place instead
+          # of piling up one comment per push.
+          MARKER="<!-- claude-pr-review:auto -->"
+          echo "$MARKER" > review_body.txt
+          echo "$STRUCTURED_OUTPUT" | jq -r '.comment_body' >> review_body.txt
 
           # Hard, deterministic gate -- independent of anything the model was told.
           # Known secret shapes for what THIS workflow has access to (Anthropic API
@@ -183,4 +198,13 @@ jobs:
             exit 1
           fi
 
-          gh pr comment "$PR_NUMBER" --body-file review_body.txt
+          EXISTING_ID=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
+            -q '.[] | select(.user.login == "github-actions[bot]") | select(.body | startswith("<!-- claude-pr-review:auto -->")) | .id' \
+            | tail -n1)
+
+          if [ -n "$EXISTING_ID" ]; then
+            echo "Updating prior automated review comment (id $EXISTING_ID) in place."
+            gh api "repos/$REPO/issues/comments/$EXISTING_ID" -X PATCH -f body=@review_body.txt >/dev/null
+          else
+            gh pr comment "$PR_NUMBER" --body-file review_body.txt
+          fi
