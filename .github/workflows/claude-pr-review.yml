@@ -32,8 +32,9 @@ name: Claude Automated PR Review
 #     through a deterministic secret-pattern grep as a hard gate (not just a
 #     prompt instruction), writes it to a file, and posts via
 #     `--body-file` (never shell-interpolated) to the PR number taken from
-#     `github.event.pull_request.number` -- i.e. the workflow, not the model,
-#     decides which PR gets commented on and whether posting happens at all.
+#     the workflow's own trigger context (`$PR_NUMBER`, computed once at job
+#     level -- see below) -- i.e. the workflow, not the model, decides which
+#     PR gets commented on and whether posting happens at all.
 #   - `permissions` grants no `contents: write` -- this workflow can comment,
 #     it cannot push code, merge, or approve/dismiss reviews (those `gh pr`
 #     subcommands are also outside the read-only allowlist).
@@ -48,10 +49,25 @@ name: Claude Automated PR Review
 # from the outside -- the fork-based dry run in the rollout plan should
 # include one deliberate prompt-injection attempt before this is trusted
 # against real traffic.
+#
+# `workflow_dispatch` lets a maintainer manually run this against an
+# already-open PR (e.g. one opened before this workflow existed) --
+# `gh workflow run claude-pr-review.yml -f pr_number=123 --repo redis/memtier_benchmark`.
+# workflow_dispatch itself already requires repo write access to invoke, so
+# the "anonymous external author implicitly triggers a privileged run"
+# concern doesn't apply to this path -- but the PR *content* being reviewed
+# is still attacker-controlled text, so every mitigation above still applies
+# exactly the same way regardless of how the run was triggered.
 
 on:
   pull_request_target:
     types: [opened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to review"
+        required: true
+        type: number
 
 permissions:
   contents: read
@@ -59,12 +75,16 @@ permissions:
 
 jobs:
   claude-review:
-    # Skip bot-authored PRs (e.g. Dependabot) -- real maintainer history on
-    # this repo shows no substantive engagement with these; an AI review
-    # comment here is pure noise, not a courtesy.
-    if: github.event.pull_request.user.type != 'Bot'
+    # Skip bot-authored PRs (e.g. Dependabot) on the automatic trigger -- real
+    # maintainer history on this repo shows no substantive engagement with
+    # these, an AI review comment here is pure noise, not a courtesy. Doesn't
+    # apply to a manual workflow_dispatch -- a maintainer explicitly asking
+    # for a review of a specific PR number is an intentional override.
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.user.type != 'Bot'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      PR_NUMBER: ${{ github.event.inputs.pr_number || github.event.pull_request.number }}
     steps:
       - name: Checkout base branch only (never the untrusted PR head)
         uses: actions/checkout@v6
@@ -81,7 +101,7 @@ jobs:
 
           prompt: |
             REPO: ${{ github.repository }}
-            PR NUMBER: ${{ github.event.pull_request.number }}
+            PR NUMBER: ${{ env.PR_NUMBER }}
 
             Use the memtier-maintainer-review skill (.claude/skills/memtier-maintainer-review/)
             to review this pull request in the authentic voice and standards of this
@@ -144,7 +164,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           STRUCTURED_OUTPUT: ${{ steps.claude.outputs.structured_output }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
 
