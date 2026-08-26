@@ -240,7 +240,8 @@ void cluster_client::disconnect(void)
 
 shard_connection *cluster_client::create_shard_connection(abstract_protocol *abs_protocol)
 {
-    shard_connection *sc = new shard_connection(m_connections.size(), this, m_config, m_event_base, abs_protocol);
+    shard_connection *sc = new shard_connection(m_connections.size(), this, m_config, m_event_base, abs_protocol,
+                                                m_request_rate_phase_microsecond);
     assert(sc != NULL);
 
     // The shard_connection ctor clones abs_protocol, and clone() resets runtime

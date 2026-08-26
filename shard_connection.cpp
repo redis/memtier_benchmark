@@ -213,13 +213,16 @@ verify_request::~verify_request(void)
 }
 
 shard_connection::shard_connection(unsigned int id, connections_manager *conns_man, benchmark_config *config,
-                                   struct event_base *event_base, abstract_protocol *abs_protocol) :
+                                   struct event_base *event_base, abstract_protocol *abs_protocol,
+                                   unsigned int request_rate_phase_microsecond) :
         m_address(NULL),
         m_port(NULL),
         m_unix_sockaddr(NULL),
         m_bev(NULL),
         m_event_timer(NULL),
         m_request_per_cur_interval(0),
+        m_request_rate_phase_microsecond(request_rate_phase_microsecond),
+        m_request_rate_phase_pending(request_rate_phase_microsecond > 0),
         m_pending_resp(0),
         m_last_pushed_req_type(-1),
         m_connection_state(conn_disconnected),
@@ -1436,7 +1439,12 @@ void shard_connection::handle_event(short events)
 
         /* Set timer for request rate (create or recreate after reconnect) */
         if (m_config->request_rate && m_event_timer == NULL) {
-            struct timeval interval = {0, (int) m_config->request_interval_microsecond};
+            unsigned int first_interval_microsecond = m_config->request_interval_microsecond;
+            if (m_request_rate_phase_pending) {
+                first_interval_microsecond += m_request_rate_phase_microsecond;
+            }
+            struct timeval interval = {(time_t) (first_interval_microsecond / 1000000U),
+                                       (suseconds_t) (first_interval_microsecond % 1000000U)};
             m_request_per_cur_interval = m_config->request_per_interval;
             m_event_timer = event_new(m_event_base, -1, EV_PERSIST, cluster_client_timer_handler, (void *) this);
             event_add(m_event_timer, &interval);
@@ -1486,6 +1494,16 @@ void shard_connection::handle_event(short events)
 
 void shard_connection::handle_timer_event(void)
 {
+    // The first timeout includes this connection's phase. Switch to the common
+    // refill interval after it fires so the phase remains stable thereafter.
+    if (m_request_rate_phase_pending) {
+        struct timeval interval = {(time_t) (m_config->request_interval_microsecond / 1000000U),
+                                   (suseconds_t) (m_config->request_interval_microsecond % 1000000U)};
+        m_request_rate_phase_pending = false;
+        event_del(m_event_timer);
+        event_add(m_event_timer, &interval);
+    }
+
     m_request_per_cur_interval = m_config->request_per_interval;
 
     if (m_conns_manager->finished() && m_conns_manager->all_connections_idle()) {
