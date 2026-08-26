@@ -204,7 +204,7 @@ jobs:
 
           if [ -n "$EXISTING_ID" ]; then
             echo "Updating prior automated review comment (id $EXISTING_ID) in place."
-            gh api "repos/$REPO/issues/comments/$EXISTING_ID" -X PATCH -f body=@review_body.txt >/dev/null
+            gh api "repos/$REPO/issues/comments/$EXISTING_ID" -X PATCH -F body=@review_body.txt >/dev/null
           else
             gh pr comment "$PR_NUMBER" --body-file review_body.txt
           fi
