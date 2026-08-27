@@ -760,12 +760,12 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
     jsonhandler->write_obj("multi_key_get", "%u", cfg->multi_key_get);
     jsonhandler->write_obj("authenticate", "\"%s\"", cfg->authenticate ? cfg->authenticate : "");
     jsonhandler->write_obj("select-db", "%d", cfg->select_db);
-    jsonhandler->write_obj("client-no-touch", "\"%s\"", cfg->client_no_touch ? "true" : "false");
     jsonhandler->write_obj("no-expiry", "\"%s\"", cfg->no_expiry ? "true" : "false");
     jsonhandler->write_obj("wait-ratio", "\"%u:%u\"", cfg->wait_ratio.a, cfg->wait_ratio.b);
     jsonhandler->write_obj("num-slaves", "\"%u:%u\"", cfg->num_slaves.min, cfg->num_slaves.max);
     jsonhandler->write_obj("wait-timeout", "\"%u-%u\"", cfg->wait_timeout.min, cfg->wait_timeout.max);
     jsonhandler->write_obj("print-all-runs", "\"%s\"", cfg->print_all_runs ? "true" : "false");
+    jsonhandler->write_obj("client-no-touch", "\"%s\"", cfg->client_no_touch ? "true" : "false");
     if (cfg->clients_start > 0) {
         jsonhandler->write_obj("clients_start", "%u", cfg->clients_start);
         jsonhandler->write_obj("clients_step", "%u", cfg->clients_step);
@@ -2720,7 +2720,10 @@ void usage()
         "      --select-db=DB             DB number to select, when testing a redis server\n"
         "      --client-no-touch          Send CLIENT NO-TOUCH ON as a connection-setup command\n"
         "                                 (redis protocol only, Redis 7.2+), so the benchmark's own\n"
-        "                                 traffic does not refresh key LRU/LFU access recency\n"
+        "                                 traffic does not refresh key LRU/LFU access recency.\n"
+        "                                 Best-effort: a connection that reconnects under\n"
+        "                                 --retry-on-error may resume sending traffic before\n"
+        "                                 NO-TOUCH is re-sent on it (see issue #527)\n"
         "      --distinct-client-seed     Use a different random seed for each client\n"
         "      --randomize                random seed based on timestamp (default is constant value)\n"
         "\n"

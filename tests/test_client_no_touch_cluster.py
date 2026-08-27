@@ -21,10 +21,14 @@ CI cell:
 
 1. test_client_no_touch_lands_on_replica_discovered_via_cluster_slots
    targets a replica connection, via get_cluster_replica_connections()
-   (tests/include.py). Its env.skip() fallback exists for the gossip-
-   visibility gap issue #462 describes; this repo's pinned RLTest fork
-   already fixes that (real CLUSTER MEET/REPLICATE, not bare --slaveof),
-   so it isn't expected to fire here.
+   (tests/include.py). This is the only CI cell that runs this file, and
+   it always sets OSS_CLUSTER_REPLICAS=1, so finding zero replica
+   connections here is a hard failure (env.assertTrue), not a skip: this
+   repo's pinned RLTest fork fixes the gossip-visibility gap issue #462
+   describes (real CLUSTER MEET/REPLICATE, not bare --slaveof), and a
+   silent skip would let the cell go green while only exercising the
+   non-seed-primary case below -- exactly the coverage gap this cell
+   exists to close.
 
 2. test_client_no_touch_lands_on_non_seed_primary_discovered_via_cluster_slots
    needs no replicas: any shard beyond memtier's single bootstrap seed
@@ -123,13 +127,14 @@ def test_client_no_touch_lands_on_replica_discovered_via_cluster_slots(env):
     env.skipOnVersionSmaller("7.2")
 
     replica_conns = get_cluster_replica_connections(env)
+    env.assertTrue(
+        len(replica_conns) > 0,
+        message="expected at least one replica connection (OSS_CLUSTER_REPLICAS=1 "
+                "is always set for this test's CI cell); "
+                "get_cluster_replica_connections() returned none -- see module "
+                "docstring for why this is a hard failure here, not a skip",
+    )
     if not replica_conns:
-        # Defensive fallback -- see module docstring. Not expected to fire
-        # in this repo's own CI matrix (this repo's pinned RLTest fork
-        # makes replicas real cluster-gossip members), but
-        # get_cluster_replica_connections() already emits its own stderr
-        # warning if --use-slaves was set and still produced none.
-        env.skip()
         return
 
     _run_and_check_no_touch(
