@@ -222,16 +222,21 @@ def agg_keyspace_range(master_nodes_connections):
     return overall_keyspace_range
 
 
-def env_started_with_slaves(env):
-    """True if RLTest was launched with useSlaves=True (--use-slaves).
+def env_started_with_slaves():
+    """True if RLTest was launched with --use-slaves.
 
-    Use getattr() chains because RLTest's env.envRunner shape varies
-    across versions.
+    Reads the OSS_CLUSTER_REPLICAS environment variable directly rather
+    than introspecting RLTest's env.envRunner.useSlaves/use_slaves (whose
+    shape isn't guaranteed across RLTest versions -- if it drifts, that
+    check silently returns False instead of failing loudly). run_tests.sh
+    passes --use-slaves to RLTest if and only if OSS_CLUSTER_REPLICAS=1,
+    and that variable is already in the test process's environment (set
+    by the CI job's env: block, or by hand for local runs), so it's the
+    more durable signal.
     """
-    runner = getattr(env, "envRunner", None)
-    if runner is None:
-        return False
-    return bool(getattr(runner, "useSlaves", False) or getattr(runner, "use_slaves", False))
+    import os
+
+    return os.environ.get("OSS_CLUSTER_REPLICAS") == "1"
 
 
 def get_cluster_replica_connections(env):
@@ -298,7 +303,7 @@ def get_cluster_replica_connections(env):
     # advertises zero replicas, emit a loud warning so the silent skip
     # is at least visible in test output.
     if not conns:
-        if env_started_with_slaves(env):
+        if env_started_with_slaves():
             sys.stderr.write(
                 "warning: OSS_CLUSTER_REPLICAS=1 is set and RLTest started "
                 "slave nodes,\nbut CLUSTER NODES shows zero replicas "

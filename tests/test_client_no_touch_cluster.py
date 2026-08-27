@@ -25,15 +25,11 @@ asan.yml, tsan.yml and ubsan.yml, none of which start replicas at all.
 1. test_client_no_touch_lands_on_replica_discovered_via_cluster_slots
    targets a replica connection, via get_cluster_replica_connections()
    (tests/include.py). Whether an empty result is a hard failure or a
-   skip depends on env_started_with_slaves(env) (tests/include.py): in
-   the dedicated cell above, zero replica connections is a hard failure
-   (env.assertTrue) -- this repo's pinned RLTest fork fixes the
-   gossip-visibility gap issue #462 describes (real CLUSTER
-   MEET/REPLICATE, not bare --slaveof), so a silent skip there would let
-   the cell go green while only exercising the non-seed-primary case
-   below, exactly the coverage gap this cell exists to close. In the
-   plain cluster cells, which never asked RLTest for replicas, an empty
-   result is expected and the test skips.
+   skip depends on env_started_with_slaves() (tests/include.py): a hard
+   failure in the dedicated cell above (where a silent skip would let the
+   cell go green while only exercising the non-seed-primary case below --
+   exactly the coverage gap this cell exists to close), a skip in the
+   plain cluster cells, which never asked RLTest for replicas.
 
 2. test_client_no_touch_lands_on_non_seed_primary_discovered_via_cluster_slots
    needs no replicas: any shard beyond memtier's single bootstrap seed
@@ -134,7 +130,7 @@ def test_client_no_touch_lands_on_replica_discovered_via_cluster_slots(env):
 
     replica_conns = get_cluster_replica_connections(env)
     if not replica_conns:
-        if env_started_with_slaves(env):
+        if env_started_with_slaves():
             # RLTest was asked for replicas (OSS_CLUSTER_REPLICAS=1's
             # --use-slaves) but produced none -- see module docstring for
             # why this is a hard failure rather than a skip here.

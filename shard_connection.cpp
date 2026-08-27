@@ -693,7 +693,7 @@ const char *shard_connection::get_last_request_type()
     case rt_readonly:
         return "READONLY";
     case rt_no_touch:
-        return "CLIENT NO-TOUCH";
+        return "CLIENT_NO-TOUCH";
     default:
         return "none";
     }
@@ -945,13 +945,7 @@ bool shard_connection::peer_client_has_any_setup_in_progress() const
     // Deliberately gates on is_ready_for_reads(), not is_conn_setup_done():
     // a peer stuck at setup_sent on AUTH/HELLO/NO-TOUCH is NOT treated as
     // mid-setup here, matching is_ready_for_reads()'s own scope (see its
-    // comment in shard_connection.h). Widening this to the full ladder was
-    // tried during this feature's review and reverted: it would have
-    // counted a peer that exhausted --max-reconnect-attempts on one of
-    // those commands as permanently "in progress" rather than bounded by
-    // connection_stage_should_abort(), and whether that window is actually
-    // bounded in every case was never confirmed -- so it was left as-is
-    // rather than landed on an unverified assumption.
+    // comment in shard_connection.h).
     if (m_conns_manager == NULL) return false;
     const std::vector<shard_connection *> &peers = m_conns_manager->get_connections();
     for (size_t i = 0; i < peers.size(); i++) {
