@@ -10,6 +10,8 @@ serves as the negative control proving the test methodology is sound.
 Run with:
   TEST=test_client_no_touch.py OSS_STANDALONE=1 ./tests/run_tests.sh
 """
+import json
+import os
 import tempfile
 import time
 
@@ -71,6 +73,15 @@ def _run_get_only(env, test_dir, name, extra_args, test_time=3):
     memtier_ok = benchmark.run()
     debugPrintMemtierOnError(run_config, env)
     env.assertTrue(memtier_ok == True)
+    return run_config
+
+
+def _get_count(run_config):
+    """Read ALL STATS.Gets.Count from mb.json -- the number of GET ops the
+    run actually completed, independent of OBJECT IDLETIME."""
+    with open(os.path.join(run_config.results_dir, "mb.json")) as f:
+        data = json.load(f)
+    return data["ALL STATS"]["Gets"]["Count"]
 
 
 def test_client_no_touch_preserves_idle_time(env):
@@ -97,7 +108,15 @@ def test_client_no_touch_preserves_idle_time(env):
                        message="idle time should have accrued before the run; got {}".format(idle_before))
 
         test_dir = tempfile.mkdtemp()
-        _run_get_only(env, test_dir, env.testName, ['--client-no-touch'], test_time=3)
+        run_config = _run_get_only(env, test_dir, env.testName, ['--client-no-touch'], test_time=3)
+
+        # Without this, the test would pass vacuously if the run sent zero
+        # GETs against _KEY for any reason: idle time only ever grows on its
+        # own, so "idle_after >= idle_before" alone doesn't prove any GET
+        # traffic actually happened under --client-no-touch specifically.
+        get_count = _get_count(run_config)
+        env.assertTrue(get_count > 0,
+                       message="expected GET traffic against {}; got Count={}".format(_KEY, get_count))
 
         idle_after = master_connection.execute_command("OBJECT", "IDLETIME", _KEY)
         env.assertTrue(

@@ -985,9 +985,13 @@ void shard_connection::send_conn_setup_commands(struct timeval timestamp)
     }
 
     // CLIENT NO-TOUCH: --client-no-touch only, every connection (primary and
-    // replica alike, unlike READONLY below). Sent after HELLO (needs the
-    // protocol negotiated) and before READONLY/CLUSTER SLOTS, mirroring the
-    // other setup steps.
+    // replica alike, unlike READONLY below). Sent after HELLO and before
+    // READONLY/CLUSTER SLOTS. This whole ladder is written in one pipelined
+    // pass with no wait for any reply in between, so what actually matters
+    // is wire order, not HELLO's negotiation having completed by the time
+    // NO-TOUCH is parsed -- CLIENT NO-TOUCH's reply is a plain +OK, parsed
+    // the same way regardless of RESP2/RESP3. The position after HELLO is
+    // just ladder-ordering consistency with the other steps below.
     //
     // Use bufferevent_write rather than a plain protocol-level evbuffer_add call, for the
     // same reason the READONLY step below does: a connection whose FD was attached to the

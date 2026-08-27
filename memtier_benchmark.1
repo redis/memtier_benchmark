@@ -266,7 +266,11 @@ DB number to select, when testing a redis server
 \fB\-\-client\-no\-touch\fR
 Send CLIENT NO\-TOUCH ON as a connection\-setup command (redis
 protocol only, Redis 7.2+), so the benchmark's own traffic does
-not refresh key LRU/LFU access recency
+not refresh key LRU/LFU access recency. Known gap: under
+\fB\-\-retry\-on\-error\fR, a request replayed right after a
+reconnect can currently reach the server before NO\-TOUCH is
+re\-armed on the new connection (github.com/redis/memtier_benchmark
+issue #527)
 .TP
 \fB\-\-distinct\-client\-seed\fR
 Use a different random seed for each client

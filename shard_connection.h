@@ -216,6 +216,20 @@ public:
         if (m_role == role_replica && m_readonly_state != setup_done) return false;
         return true;
     }
+    // Note: deliberately does NOT check m_no_touch_state, unlike
+    // is_conn_setup_done() (the send gate, which does). The two predicates
+    // answer different questions -- is_conn_setup_done() asks "is it safe to
+    // send more work on this connection", is_ready_for_reads() asks "has
+    // this connection been chosen as a routing target elsewhere" -- and
+    // CLIENT NO-TOUCH is placed ahead of READONLY/CLUSTER SLOTS in
+    // send_conn_setup_commands() specifically so its wire bytes are always
+    // ahead of both by the time either check could matter: a connection
+    // that is_ready_for_reads() would call routable is therefore always one
+    // where NO-TOUCH has already been written (though not necessarily
+    // acked). Checking it here would only ever make this return false
+    // *more* conservatively than is_conn_setup_done() already does, with no
+    // corresponding correctness gain -- fill_pipeline() is what actually
+    // holds new work until is_conn_setup_done() is true.
 
     // ----------------------------------------------------------------------
     // Read-preference observability hooks
