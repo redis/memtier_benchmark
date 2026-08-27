@@ -168,7 +168,22 @@ def test_client_no_touch_lands_on_non_seed_primary_discovered_via_cluster_slots(
     # the CLUSTER SLOTS reply loop.
     import redis as _redis
     non_seed = master_nodes_list[1]
-    non_seed_conn = _redis.Redis(host=non_seed.get("host") or "127.0.0.1", port=non_seed["port"])
+    conn_kwargs = {"host": "127.0.0.1", "port": non_seed["port"]}
+    if getattr(env, "useTLS", False):
+        # Mirrors tests/test_mget_protocol.py's _get_redis_conn(): skip
+        # server cert verification (self-signed test certs, CN rarely
+        # matches "127.0.0.1"). Without this, a TLS-cluster matrix cell's
+        # plain connection silently fails and the MONITOR thread's broad
+        # except swallows it -- "monitor observed: []", not an obvious TLS
+        # handshake error.
+        from include import TLS_CERT, TLS_KEY
+        conn_kwargs["ssl"] = True
+        conn_kwargs["ssl_cert_reqs"] = "none"
+        if TLS_CERT:
+            conn_kwargs["ssl_certfile"] = TLS_CERT
+        if TLS_KEY:
+            conn_kwargs["ssl_keyfile"] = TLS_KEY
+    non_seed_conn = _redis.Redis(**conn_kwargs)
 
     stop_event = threading.Event()
     results = []
