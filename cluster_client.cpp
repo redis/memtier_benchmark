@@ -600,6 +600,7 @@ bool cluster_client::classify_read(const request *req) const
     case rt_cluster_slots:
     case rt_hello:
     case rt_readonly:
+    case rt_no_touch:
         return false;
     case rt_arbitrary: {
         const arbitrary_request *ar = static_cast<const arbitrary_request *>(req);

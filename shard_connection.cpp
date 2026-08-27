@@ -232,6 +232,7 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_db_selection(setup_done),
         m_cluster_slots(setup_done),
         m_readonly_state(setup_done),
+        m_no_touch_state(setup_done),
         m_reconnect_attempts(0),
         m_current_backoff_delay(1.0),
         m_reconnect_timer(NULL),
@@ -459,6 +460,9 @@ int shard_connection::connect(struct connect_info *addr)
     m_readonly_state = (m_role == role_replica && m_config->cluster_mode && is_redis_protocol(m_config->protocol))
                            ? setup_none
                            : setup_done;
+    // CLIENT NO-TOUCH: every connection, redis protocol only. Re-armed on
+    // every reconnect because the flag is connection-scoped on the server.
+    m_no_touch_state = m_config->client_no_touch ? setup_none : setup_done;
 
     // setup socket
     int sockfd = setup_socket(addr);
@@ -531,7 +535,7 @@ void shard_connection::disconnect()
             // Only setup commands have no serialized capture (we never attempt
             // capture for those) — drop those.
             if (req->m_type == rt_auth || req->m_type == rt_select_db || req->m_type == rt_cluster_slots ||
-                req->m_type == rt_hello || req->m_type == rt_readonly) {
+                req->m_type == rt_hello || req->m_type == rt_readonly || req->m_type == rt_no_touch) {
                 delete req;
                 continue;
             }
@@ -586,6 +590,7 @@ void shard_connection::disconnect()
     m_cluster_slots = setup_done;
     m_hello = setup_done;
     m_readonly_state = setup_done;
+    m_no_touch_state = setup_done;
 
     // Drop any partial RESP parser state. A TCP RST received mid-bulk
     // (especially while draining a RESP3 push frame) would otherwise leave
@@ -685,6 +690,8 @@ const char *shard_connection::get_last_request_type()
         return "HELLO";
     case rt_readonly:
         return "READONLY";
+    case rt_no_touch:
+        return "CLIENT_NO-TOUCH";
     default:
         return "none";
     }
@@ -729,6 +736,7 @@ void shard_connection::push_req(request *req)
     case rt_cluster_slots:
     case rt_hello:
     case rt_readonly:
+    case rt_no_touch:
         break;
     }
     if (m_config->request_rate) {
@@ -918,7 +926,7 @@ void shard_connection::drain_replay_queue_after_reconnect()
 bool shard_connection::is_conn_setup_done()
 {
     return m_authentication == setup_done && m_db_selection == setup_done && m_cluster_slots == setup_done &&
-           m_hello == setup_done && m_readonly_state == setup_done;
+           m_hello == setup_done && m_readonly_state == setup_done && m_no_touch_state == setup_done;
 }
 
 bool shard_connection::peer_client_has_any_setup_in_progress() const
@@ -972,6 +980,16 @@ void shard_connection::send_conn_setup_commands(struct timeval timestamp)
         m_protocol->configure_protocol(m_config->protocol);
         push_req(new request(rt_hello, 0, &timestamp, 0));
         m_hello = setup_sent;
+    }
+
+    // CLIENT NO-TOUCH: --client-no-touch only, every connection. Sent after
+    // HELLO (needs the protocol negotiated) and before READONLY/CLUSTER
+    // SLOTS, mirroring the other setup steps.
+    if (m_no_touch_state == setup_none) {
+        benchmark_debug_log("sending CLIENT NO-TOUCH command.\n");
+        m_protocol->write_command_client_no_touch();
+        push_req(new request(rt_no_touch, 0, &timestamp, 0));
+        m_no_touch_state = setup_sent;
     }
 
     // READONLY: replica connections only (cluster mode). Sent after AUTH/SELECT/
@@ -1159,6 +1177,20 @@ void shard_connection::process_response(void)
             } else {
                 m_hello = setup_done;
                 benchmark_debug_log("HELLO successful.\n");
+            }
+            break;
+        case rt_no_touch:
+            if (r->is_error()) {
+                benchmark_error_log("error: CLIENT NO-TOUCH failed [%s]\n", r->get_status());
+                {
+                    char buf[256];
+                    snprintf(buf, sizeof(buf), "CLIENT NO-TOUCH failed: %s", r->get_status() ? r->get_status() : "");
+                    report_connection_stage_failure(buf);
+                }
+                error = true;
+            } else {
+                m_no_touch_state = setup_done;
+                benchmark_debug_log("CLIENT NO-TOUCH successful.\n");
             }
             break;
         case rt_readonly:

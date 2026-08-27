@@ -758,6 +758,7 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
     jsonhandler->write_obj("multi_key_get", "%u", cfg->multi_key_get);
     jsonhandler->write_obj("authenticate", "\"%s\"", cfg->authenticate ? cfg->authenticate : "");
     jsonhandler->write_obj("select-db", "%d", cfg->select_db);
+    jsonhandler->write_obj("client-no-touch", "\"%s\"", cfg->client_no_touch ? "true" : "false");
     jsonhandler->write_obj("no-expiry", "\"%s\"", cfg->no_expiry ? "true" : "false");
     jsonhandler->write_obj("wait-ratio", "\"%u:%u\"", cfg->wait_ratio.a, cfg->wait_ratio.b);
     jsonhandler->write_obj("num-slaves", "\"%u:%u\"", cfg->num_slaves.min, cfg->num_slaves.max);
@@ -1183,6 +1184,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_generate_keys,
         o_multi_key_get,
         o_select_db,
+        o_client_no_touch,
         o_no_expiry,
         o_wait_ratio,
         o_num_slaves,
@@ -1303,6 +1305,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         {"multi-key-get", 1, 0, o_multi_key_get},
         {"authenticate", 1, 0, 'a'},
         {"select-db", 1, 0, o_select_db},
+        {"client-no-touch", 0, 0, o_client_no_touch},
         {"no-expiry", 0, 0, o_no_expiry},
         {"wait-ratio", 1, 0, o_wait_ratio},
         {"num-slaves", 1, 0, o_num_slaves},
@@ -1883,6 +1886,9 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 fprintf(stderr, "error: select-db must be greater or equal zero.\n");
                 return -1;
             }
+            break;
+        case o_client_no_touch:
+            cfg->client_no_touch = true;
             break;
         case o_no_expiry:
             cfg->no_expiry = true;
@@ -2710,6 +2716,9 @@ void usage()
         "                                 In cluster mode, keys are probed from the key space so that all\n"
         "                                 keys in one batch route to the same shard (no hash-tag prefix).\n"
         "      --select-db=DB             DB number to select, when testing a redis server\n"
+        "      --client-no-touch          Send CLIENT NO-TOUCH ON as a connection-setup command (redis "
+        "protocol only, Redis 7.0+), so the benchmark's own traffic does not refresh key LRU/LFU access "
+        "recency\n"
         "      --distinct-client-seed     Use a different random seed for each client\n"
         "      --randomize                random seed based on timestamp (default is constant value)\n"
         "\n"
@@ -5011,6 +5020,10 @@ int main(int argc, char *argv[])
 
     if (cfg.select_db > 0 && !is_redis_protocol(cfg.protocol)) {
         fprintf(stderr, "error: select-db can only be used with redis protocol.\n");
+        usage();
+    }
+    if (cfg.client_no_touch && !is_redis_protocol(cfg.protocol)) {
+        fprintf(stderr, "error: client-no-touch can only be used with redis protocol.\n");
         usage();
     }
     if (cfg.multi_key_get > 0 && cfg.protocol == PROTOCOL_MEMCACHE_BINARY) {

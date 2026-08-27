@@ -269,6 +269,10 @@ public:
     // serve reads). Not applicable to memcached; the memcached implementations
     // assert(0) since the READONLY ladder is only fired for cluster replicas.
     virtual int write_command_readonly() = 0;
+    // Send CLIENT NO-TOUCH ON (redis protocol only; --client-no-touch).
+    // Not applicable to memcached; the memcached implementations assert(0)
+    // since the ladder step is only armed when the redis protocol is in use.
+    virtual int write_command_client_no_touch() = 0;
     virtual int write_command_set(const char *key, int key_len, const char *value, int value_len, int expiry,
                                   unsigned int offset) = 0;
     virtual int write_command_get(const char *key, int key_len, unsigned int offset) = 0;

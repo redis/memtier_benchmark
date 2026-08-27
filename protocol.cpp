@@ -274,6 +274,7 @@ public:
     virtual int configure_protocol(enum PROTOCOL_TYPE type);
     virtual int write_command_cluster_slots();
     virtual int write_command_readonly();
+    virtual int write_command_client_no_touch();
     virtual int write_command_set(const char *key, int key_len, const char *value, int value_len, int expiry,
                                   unsigned int offset);
     virtual int write_command_get(const char *key, int key_len, unsigned int offset);
@@ -424,6 +425,23 @@ int redis_protocol::write_command_readonly()
                         "$8\r\n"
                         "READONLY\r\n",
                         16);
+
+    return size;
+}
+
+int redis_protocol::write_command_client_no_touch()
+{
+    int size = 0;
+
+    size = evbuffer_add(m_write_buf,
+                        "*3\r\n"
+                        "$6\r\n"
+                        "CLIENT\r\n"
+                        "$8\r\n"
+                        "NO-TOUCH\r\n"
+                        "$2\r\n"
+                        "ON\r\n",
+                        38);
 
     return size;
 }
@@ -1050,6 +1068,7 @@ public:
     virtual int configure_protocol(enum PROTOCOL_TYPE type);
     virtual int write_command_cluster_slots();
     virtual int write_command_readonly();
+    virtual int write_command_client_no_touch();
     virtual int write_command_set(const char *key, int key_len, const char *value, int value_len, int expiry,
                                   unsigned int offset);
     virtual int write_command_get(const char *key, int key_len, unsigned int offset);
@@ -1084,6 +1103,11 @@ int memcache_text_protocol::write_command_cluster_slots()
 }
 
 int memcache_text_protocol::write_command_readonly()
+{
+    assert(0);
+}
+
+int memcache_text_protocol::write_command_client_no_touch()
 {
     assert(0);
 }
@@ -1287,6 +1311,7 @@ public:
     virtual int configure_protocol(enum PROTOCOL_TYPE type);
     virtual int write_command_cluster_slots();
     virtual int write_command_readonly();
+    virtual int write_command_client_no_touch();
     virtual int write_command_set(const char *key, int key_len, const char *value, int value_len, int expiry,
                                   unsigned int offset);
     virtual int write_command_get(const char *key, int key_len, unsigned int offset);
@@ -1353,6 +1378,11 @@ int memcache_binary_protocol::write_command_cluster_slots()
 }
 
 int memcache_binary_protocol::write_command_readonly()
+{
+    assert(0);
+}
+
+int memcache_binary_protocol::write_command_client_no_touch()
 {
     assert(0);
 }
