@@ -162,3 +162,60 @@ def test_without_client_no_touch_resets_idle_time(env):
         )
     finally:
         master_connection.config_set("maxmemory-policy", orig_policy)
+
+
+def test_client_no_touch_rejected_by_server_fails_loudly(env):
+    """--client-no-touch must fail the connection loudly if the server
+    rejects CLIENT NO-TOUCH, not silently run with the flag doing nothing.
+
+    Exercises the "unsupported/erroring server fails loudly" claim from
+    this feature's design without needing an actual pre-7.2 server: an ACL
+    user with 'client|no-touch' denied gets the identical -NOPERM rejection
+    an old server's -ERR unknown command would produce, on a real 7.2+
+    server (the same one every other test in this file already runs
+    against).
+    """
+    env.skipOnCluster()
+    env.skipOnVersionSmaller("7.2")
+
+    master_connection = env.getOSSMasterNodesConnectionList()[0]
+    user = "nt-no-perm-user"
+    password = "nt-no-perm-pw"
+    master_connection.execute_command(
+        "ACL", "SETUSER", user, "on", ">" + password, "~*", "+@all", "-client|no-touch"
+    )
+    try:
+        config = get_default_memtier_config(threads=1, clients=1, test_time=3)
+        config['memtier_benchmark']['requests'] = None
+
+        args = [
+            '--authenticate', '{}:{}'.format(user, password),
+            '--client-no-touch',
+            '--max-reconnect-attempts', '1',
+            '--connection-stage-timeout', '3',
+        ]
+        benchmark_specs = {"name": env.testName, "args": args}
+        addTLSArgs(benchmark_specs, env)
+        add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+
+        test_dir = tempfile.mkdtemp()
+        run_config = RunConfig(test_dir, env.testName, config, {})
+        ensure_clean_benchmark_folder(run_config.results_dir)
+        benchmark = Benchmark.from_json(run_config, benchmark_specs)
+
+        memtier_ok = benchmark.run()
+        env.assertTrue(
+            memtier_ok == False,
+            message="expected memtier to fail loudly when the server rejects CLIENT NO-TOUCH, "
+                   "but it exited successfully",
+        )
+
+        stderr_path = os.path.join(run_config.results_dir, "mb.stderr")
+        with open(stderr_path) as f:
+            stderr = f.read()
+        env.assertTrue(
+            "CLIENT NO-TOUCH failed" in stderr,
+            message="expected 'CLIENT NO-TOUCH failed' in stderr; got: {!r}".format(stderr),
+        )
+    finally:
+        master_connection.execute_command("ACL", "DELUSER", user)

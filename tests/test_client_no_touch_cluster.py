@@ -1,0 +1,134 @@
+"""
+Cluster-mode regression test: CLIENT NO-TOUCH must land on a shard
+connection discovered via a live CLUSTER SLOTS reply, not just on the
+bootstrap seed connection.
+
+Why this matters: send_conn_setup_commands() sends CLIENT NO-TOUCH via
+bufferevent_write() rather than a plain protocol-level evbuffer_add call,
+specifically because a connection whose FD was attached via
+bufferevent_socket_new() + a later bufferevent_socket_connect() (the path
+cluster_client::connect_shard_connection() uses for every shard connection
+except the single bootstrap seed connection -- every replica, and every
+primary beyond the first, discovered from a CLUSTER SLOTS reply) does not
+get its first user-level send's EPOLLOUT armed by the evbuffer notify
+callback on its own. tests/test_client_no_touch.py (standalone-only) can't
+exercise this: every connection in a standalone run IS the bootstrap seed
+connection.
+
+This test targets a replica connection specifically, since every replica
+is always created via the "discovered, not bootstrap" path -- unlike a
+second primary, which is only reachable by genuinely resharding a live
+cluster mid-run.
+
+Known harness limitation: get_cluster_replica_connections() returns an
+empty list under RLTest's --use-slaves (the resulting slaves are not
+cluster-gossip members -- see README.md "Testing limitations" and
+https://github.com/redis/memtier_benchmark/issues/462, filed for the
+identical gap affecting the --read-preference test suite). This test
+skips gracefully in that case, matching tests/test_read_preference_failover.py's
+established pattern, and will start actually verifying once #462 lands.
+In the meantime this was verified manually against a real
+`redis-cli --cluster create`-equivalent cluster with cluster-aware
+replicas via `redis-cli MONITOR` (see PR #526's description).
+
+Run with:
+  TEST=test_client_no_touch_cluster.py OSS_CLUSTER=1 OSS_CLUSTER_REPLICAS=1 ./tests/run_tests.sh
+"""
+
+import tempfile
+import threading
+import time
+
+from include import (
+    add_required_env_arguments,
+    addTLSArgs,
+    debugPrintMemtierOnError,
+    ensure_clean_benchmark_folder,
+    get_cluster_replica_connections,
+    get_default_memtier_config,
+)
+from mb import Benchmark, RunConfig
+
+
+def _capture_monitor(conn, results, stop_event):
+    try:
+        with conn.monitor() as m:
+            while not stop_event.is_set():
+                try:
+                    results.append(m.next_command())
+                except Exception:
+                    break
+    except Exception:
+        pass
+
+
+def test_client_no_touch_lands_on_replica_discovered_via_cluster_slots(env):
+    if not env.isCluster():
+        env.skip()
+        return
+    env.skipOnVersionSmaller("7.2")
+
+    replica_conns = get_cluster_replica_connections(env)
+    if not replica_conns:
+        # Known harness gap (README "Testing limitations", issue #462) --
+        # get_cluster_replica_connections() already emitted its own stderr
+        # warning if --use-slaves was set but produced no gossip-visible
+        # replicas.
+        env.skip()
+        return
+
+    replica_conn = replica_conns[0]
+    stop_event = threading.Event()
+    results = []
+    monitor_thread = threading.Thread(
+        target=_capture_monitor, args=(replica_conn, results, stop_event), daemon=True
+    )
+    monitor_thread.start()
+    # Give the MONITOR subscription time to be acknowledged before memtier
+    # connects, mirroring tests/test_mget_protocol.py's established pattern.
+    time.sleep(0.15)
+
+    try:
+        config = get_default_memtier_config(threads=1, clients=1, test_time=3)
+        config['memtier_benchmark']['requests'] = None
+
+        args = [
+            '--cluster-mode',
+            '--client-no-touch',
+            '--read-preference', 'secondaryPreferred',
+            '--ratio', '0:1',
+            '--key-pattern', 'R:R',
+            '--key-minimum', '1',
+            '--key-maximum', '1000',
+        ]
+        benchmark_specs = {"name": env.testName, "args": args}
+        addTLSArgs(benchmark_specs, env)
+        add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+
+        test_dir = tempfile.mkdtemp()
+        run_config = RunConfig(test_dir, env.testName, config, {})
+        ensure_clean_benchmark_folder(run_config.results_dir)
+        benchmark = Benchmark.from_json(run_config, benchmark_specs)
+
+        memtier_ok = benchmark.run()
+        debugPrintMemtierOnError(run_config, env)
+        env.assertTrue(memtier_ok == True)
+    finally:
+        stop_event.set()
+        time.sleep(0.3)
+        try:
+            replica_conn.connection_pool.disconnect()
+        except Exception:
+            pass
+        monitor_thread.join(timeout=5)
+
+    no_touch_seen = any(
+        entry.get("command", "").upper().startswith("CLIENT NO-TOUCH")
+        for entry in results
+    )
+    env.assertTrue(
+        no_touch_seen,
+        message="expected CLIENT NO-TOUCH ON to land on the replica connection "
+               "(discovered via CLUSTER SLOTS, not the bootstrap seed connection); "
+               "monitor observed: {}".format([e.get("command") for e in results][:20]),
+    )

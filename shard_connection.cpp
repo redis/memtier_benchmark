@@ -985,24 +985,15 @@ void shard_connection::send_conn_setup_commands(struct timeval timestamp)
     }
 
     // CLIENT NO-TOUCH: --client-no-touch only, every connection (primary and
-    // replica alike, unlike READONLY below). Sent after HELLO and before
-    // READONLY/CLUSTER SLOTS. This whole ladder is written in one pipelined
-    // pass with no wait for any reply in between, so what actually matters
-    // is wire order, not HELLO's negotiation having completed by the time
-    // NO-TOUCH is parsed -- CLIENT NO-TOUCH's reply is a plain +OK, parsed
-    // the same way regardless of RESP2/RESP3. The position after HELLO is
-    // just ladder-ordering consistency with the other steps below.
+    // replica alike, unlike READONLY below). Position after HELLO / before
+    // READONLY-CLUSTER SLOTS is ladder-ordering consistency, not a
+    // dependency: this ladder is written in one pipelined pass with no wait
+    // for any reply in between, so wire order is what matters, and CLIENT
+    // NO-TOUCH's +OK reply parses the same regardless of RESP2/RESP3.
     //
-    // Use bufferevent_write rather than a plain protocol-level evbuffer_add call, for the
-    // same reason the READONLY step below does: a connection whose FD was attached to the
-    // bufferevent via
-    // bufferevent_socket_new + a subsequent bufferevent_socket_connect (the path used for any
-    // shard connection -- primary or replica -- discovered through a live CLUSTER SLOTS
-    // refresh, not just the bootstrap seed connection) does not get its first user-level send's
-    // EPOLLOUT armed by the evbuffer notify callback. Unlike READONLY, CLIENT NO-TOUCH is armed
-    // on primaries too, and a newly-discovered primary has no later setup command to
-    // incidentally force the flush -- so it needs the same bufferevent_write treatment on its
-    // own merits, not just when paired with a replica's READONLY.
+    // bufferevent_write instead of a protocol-level evbuffer_add call: same
+    // reason as READONLY below (see its comment), except CLIENT NO-TOUCH
+    // also arms on primaries, where READONLY's own send never has to.
     if (m_no_touch_state == setup_none) {
         benchmark_debug_log("sending CLIENT NO-TOUCH command.\n");
         static const char NO_TOUCH_CMD[] = "*3\r\n$6\r\nCLIENT\r\n$8\r\nNO-TOUCH\r\n$2\r\nON\r\n";

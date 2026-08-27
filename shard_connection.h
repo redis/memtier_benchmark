@@ -206,6 +206,14 @@ public:
     // TCP connected, cluster-slots ladder done, and (for replicas) the
     // READONLY ladder also done. Primaries satisfy the last condition
     // trivially because m_readonly_state is initialised to setup_done.
+    //
+    // Deliberately does NOT check m_no_touch_state, unlike the send gate
+    // is_conn_setup_done() (which does): CLIENT NO-TOUCH is placed ahead of
+    // READONLY/CLUSTER SLOTS in send_conn_setup_commands(), so anything this
+    // routing-eligibility check would call ready already has NO-TOUCH's
+    // bytes ahead of it on the wire. Checking it here would only make this
+    // more conservative with no correctness gain -- fill_pipeline() is what
+    // actually holds new work until is_conn_setup_done() is true.
     bool is_ready_for_reads() const
     {
         if (m_connection_state != conn_connected) return false;
@@ -216,20 +224,6 @@ public:
         if (m_role == role_replica && m_readonly_state != setup_done) return false;
         return true;
     }
-    // Note: deliberately does NOT check m_no_touch_state, unlike
-    // is_conn_setup_done() (the send gate, which does). The two predicates
-    // answer different questions -- is_conn_setup_done() asks "is it safe to
-    // send more work on this connection", is_ready_for_reads() asks "has
-    // this connection been chosen as a routing target elsewhere" -- and
-    // CLIENT NO-TOUCH is placed ahead of READONLY/CLUSTER SLOTS in
-    // send_conn_setup_commands() specifically so its wire bytes are always
-    // ahead of both by the time either check could matter: a connection
-    // that is_ready_for_reads() would call routable is therefore always one
-    // where NO-TOUCH has already been written (though not necessarily
-    // acked). Checking it here would only ever make this return false
-    // *more* conservatively than is_conn_setup_done() already does, with no
-    // corresponding correctness gain -- fill_pipeline() is what actually
-    // holds new work until is_conn_setup_done() is true.
 
     // ----------------------------------------------------------------------
     // Read-preference observability hooks
