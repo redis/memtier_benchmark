@@ -1,12 +1,16 @@
 redis>=3.0.0
-# TEMPORARY: pinned to a fork branch that teaches RLTest's ClusterEnv to add
+# TEMPORARY: pinned to a fork commit that teaches RLTest's ClusterEnv to add
 # replica shards to the OSS cluster (CLUSTER MEET + CLUSTER REPLICATE) instead
 # of merely wiring them with --slaveof. Without this, --use-slaves replicas are
 # invisible to cluster gossip and the read-preference matrix cell that
 # exercises OSS-CLUSTER + replicas silently degenerates into a master-only
-# topology. Revert to git+https://github.com/RedisLabsModules/RLTest.git@master
-# once upstream PR https://github.com/RedisLabsModules/RLTest/pull/253 merges.
-git+https://github.com/fcostaoliveira/RLTest.git@fix/cluster-aware-replicas
+# topology. Pinned to a commit SHA rather than the fix/cluster-aware-replicas
+# branch name so a force-push/rename/delete on that branch can't move what
+# tests/test_client_no_touch_cluster.py hard-asserts against out from under
+# CI (or a stale local checkout). Revert to
+# git+https://github.com/RedisLabsModules/RLTest.git@master once upstream PR
+# https://github.com/RedisLabsModules/RLTest/pull/253 merges.
+git+https://github.com/fcostaoliveira/RLTest.git@4808b5f63f55788c094b111e1adecd00b9716a00
 # pytest + hypothesis power the CLI argument fuzzer (tests/test_cli_fuzz.py,
 # issue #410). The fuzzer is gated by MEMTIER_FUZZ=1 so it's only pulled in
 # on demand; pinning them here keeps the bootstrap reproducible.
