@@ -15,31 +15,22 @@ callback on its own. tests/test_client_no_touch.py (standalone-only) can't
 exercise this: every connection in a standalone run IS the bootstrap seed
 connection.
 
-Two tests, two ways to land a connection on the "discovered" path:
+Two tests, two ways to land a connection on the "discovered" path, both
+run for real (not skipped) by the "OSS-CLUSTER + replicas: client-no-touch"
+CI cell:
 
 1. test_client_no_touch_lands_on_replica_discovered_via_cluster_slots
-   targets a replica connection. README.md's "Testing limitations" section
-   and issue #462 describe RLTest's --use-slaves as producing slaves that
-   never join cluster gossip (started via --slaveof only), which would
-   make get_cluster_replica_connections() return empty and this test skip.
-   As of the "OSS-CLUSTER + replicas: client-no-touch" CI cell added for
-   this test, that does not reproduce: this repo's pinned RLTest fork
-   (tests/test_requirements.txt) already issues real CLUSTER MEET +
-   CLUSTER REPLICATE for --use-slaves nodes, so CLUSTER NODES does show
-   them and this test genuinely runs and verifies -- confirmed by the
-   READONLY command immediately following CLIENT NO-TOUCH ON in the
-   captured MONITOR output. The env.skip() below is kept as a defensive
-   fallback for whichever RLTest configuration #462 actually describes,
-   not because it is expected to fire in the current matrix.
+   targets a replica connection, via get_cluster_replica_connections()
+   (tests/include.py). Its env.skip() fallback exists for the gossip-
+   visibility gap issue #462 describes; this repo's pinned RLTest fork
+   already fixes that (real CLUSTER MEET/REPLICATE, not bare --slaveof),
+   so it isn't expected to fire here.
 
 2. test_client_no_touch_lands_on_non_seed_primary_discovered_via_cluster_slots
-   needs no replicas at all: cluster_client's CLUSTER-SLOTS-reply loop
-   connects every primary shard beyond memtier's single bootstrap seed
-   connection (master_nodes_list[0], the -s/-p argument) via
-   connect_shard_connection() -- the exact same "discovered" path replicas
-   use -- so any additional shard in a multi-shard cluster (the default
-   SHARDS=3 OSS-CLUSTER matrix cell already provides this) already
-   exercises it.
+   needs no replicas: any shard beyond memtier's single bootstrap seed
+   connection (master_nodes_list[0]) is connected via the identical
+   "discovered" path, so the default SHARDS=3 matrix cell already exercises
+   it on its own.
 
 Run with:
   TEST=test_client_no_touch_cluster.py OSS_CLUSTER=1 ./tests/run_tests.sh

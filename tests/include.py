@@ -30,7 +30,7 @@ def get_redis_conn_for_node(env, node, **extra_kwargs):
     """
     import redis as _redis
 
-    kwargs = {"host": "127.0.0.1", "port": node["port"]}
+    kwargs = {"host": node.get("host") or "127.0.0.1", "port": node["port"]}
     if getattr(env, "useTLS", False):
         kwargs["ssl"] = True
         kwargs["ssl_cert_reqs"] = "none"
@@ -269,13 +269,11 @@ def get_cluster_replica_connections(env):
             port = int(port_str)
         except ValueError:
             continue
-        # get_redis_conn_for_node() ignores the gossiped host and always
-        # dials 127.0.0.1, matching every other test connection in this
-        # suite (everything runs on localhost); TLS-aware, unlike the
-        # bare redis.Redis(host, port) this used to build directly.
+        # TLS-aware now, unlike the bare redis.Redis(host, port) this used
+        # to build directly; still dials the gossiped host, same as before.
         conns.append(
             get_redis_conn_for_node(
-                env, {"port": port}, decode_responses=True, socket_connect_timeout=5
+                env, {"host": host, "port": port}, decode_responses=True, socket_connect_timeout=5
             )
         )
 
