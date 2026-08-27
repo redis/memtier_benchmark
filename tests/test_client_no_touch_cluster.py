@@ -18,28 +18,28 @@ connection.
 Two tests, two ways to land a connection on the "discovered" path:
 
 1. test_client_no_touch_lands_on_replica_discovered_via_cluster_slots
-   targets a replica connection. Known harness limitation:
-   get_cluster_replica_connections() returns an empty list under RLTest's
-   --use-slaves (the resulting slaves are not cluster-gossip members -- see
-   README.md "Testing limitations" and
-   https://github.com/redis/memtier_benchmark/issues/462, filed for the
-   identical gap affecting the --read-preference test suite). This test
-   skips gracefully in that case, matching
-   tests/test_read_preference_failover.py's established pattern, and will
-   start actually verifying once #462 lands. In the meantime this was
-   verified manually against a real `redis-cli --cluster create`-equivalent
-   cluster with cluster-aware replicas via `redis-cli MONITOR` (see PR
-   #526's description).
+   targets a replica connection. README.md's "Testing limitations" section
+   and issue #462 describe RLTest's --use-slaves as producing slaves that
+   never join cluster gossip (started via --slaveof only), which would
+   make get_cluster_replica_connections() return empty and this test skip.
+   As of the "OSS-CLUSTER + replicas: client-no-touch" CI cell added for
+   this test, that does not reproduce: this repo's pinned RLTest fork
+   (tests/test_requirements.txt) already issues real CLUSTER MEET +
+   CLUSTER REPLICATE for --use-slaves nodes, so CLUSTER NODES does show
+   them and this test genuinely runs and verifies -- confirmed by the
+   READONLY command immediately following CLIENT NO-TOUCH ON in the
+   captured MONITOR output. The env.skip() below is kept as a defensive
+   fallback for whichever RLTest configuration #462 actually describes,
+   not because it is expected to fire in the current matrix.
 
 2. test_client_no_touch_lands_on_non_seed_primary_discovered_via_cluster_slots
-   sidesteps that gap entirely and DOES run in the standard CI matrix (no
-   --use-slaves needed): cluster_client's CLUSTER-SLOTS-reply loop connects
-   every primary shard beyond memtier's single bootstrap seed connection
-   (master_nodes_list[0], the -s/-p argument) via connect_shard_connection()
-   -- the exact same "discovered" path replicas use -- so any additional
-   shard in a multi-shard cluster (the default SHARDS=3 OSS-CLUSTER matrix
-   cell already provides this) already exercises it, with zero dependency
-   on replica gossip visibility.
+   needs no replicas at all: cluster_client's CLUSTER-SLOTS-reply loop
+   connects every primary shard beyond memtier's single bootstrap seed
+   connection (master_nodes_list[0], the -s/-p argument) via
+   connect_shard_connection() -- the exact same "discovered" path replicas
+   use -- so any additional shard in a multi-shard cluster (the default
+   SHARDS=3 OSS-CLUSTER matrix cell already provides this) already
+   exercises it.
 
 Run with:
   TEST=test_client_no_touch_cluster.py OSS_CLUSTER=1 ./tests/run_tests.sh
@@ -133,10 +133,11 @@ def test_client_no_touch_lands_on_replica_discovered_via_cluster_slots(env):
 
     replica_conns = get_cluster_replica_connections(env)
     if not replica_conns:
-        # Known harness gap (README "Testing limitations", issue #462) --
-        # get_cluster_replica_connections() already emitted its own stderr
-        # warning if --use-slaves was set but produced no gossip-visible
-        # replicas.
+        # Defensive fallback -- see module docstring. Not expected to fire
+        # in this repo's own CI matrix (this repo's pinned RLTest fork
+        # makes replicas real cluster-gossip members), but
+        # get_cluster_replica_connections() already emits its own stderr
+        # warning if --use-slaves was set and still produced none.
         env.skip()
         return
 
