@@ -15,15 +15,18 @@ TLS_PROTOCOLS = os.environ.get("TLS_PROTOCOLS", "")
 VERBOSE = bool(int(os.environ.get("VERBOSE","0")))
 
 
-def get_redis_conn_for_node(env, node):
+def get_redis_conn_for_node(env, node, **extra_kwargs):
     """Return a redis.Redis connection to a specific cluster/master node dict
     (as returned by env.getMasterNodesList(), or a replica dict with a
-    'port' key), TLS-aware.
+    'port'/'host' key), TLS-aware.
 
-    Shared by tests/test_mget_protocol.py's _get_redis_conn() and
-    tests/test_client_no_touch_cluster.py: skip server cert verification
+    Shared by tests/test_mget_protocol.py's _get_redis_conn(),
+    tests/test_client_no_touch_cluster.py, and
+    get_cluster_replica_connections() below: skip server cert verification
     (self-signed test certs, CN rarely matches "127.0.0.1") and present the
-    client cert/key when the env is TLS.
+    client cert/key when the env is TLS. extra_kwargs are passed through to
+    redis.Redis() as-is (e.g. decode_responses, socket_connect_timeout) and
+    take precedence over the TLS defaults if they overlap.
     """
     import redis as _redis
 
@@ -35,6 +38,7 @@ def get_redis_conn_for_node(env, node):
             kwargs["ssl_certfile"] = TLS_CERT
         if TLS_KEY:
             kwargs["ssl_keyfile"] = TLS_KEY
+    kwargs.update(extra_kwargs)
     return _redis.Redis(**kwargs)
 
 
@@ -236,7 +240,6 @@ def get_cluster_replica_connections(env):
     the full background.
     """
     import sys
-    import redis as _redis
 
     if not env.isCluster():
         return []
@@ -266,12 +269,13 @@ def get_cluster_replica_connections(env):
             port = int(port_str)
         except ValueError:
             continue
+        # get_redis_conn_for_node() ignores the gossiped host and always
+        # dials 127.0.0.1, matching every other test connection in this
+        # suite (everything runs on localhost); TLS-aware, unlike the
+        # bare redis.Redis(host, port) this used to build directly.
         conns.append(
-            _redis.Redis(
-                host=host,
-                port=port,
-                decode_responses=True,
-                socket_connect_timeout=5,
+            get_redis_conn_for_node(
+                env, {"port": port}, decode_responses=True, socket_connect_timeout=5
             )
         )
 
