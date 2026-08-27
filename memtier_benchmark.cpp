@@ -2717,7 +2717,7 @@ void usage()
         "                                 keys in one batch route to the same shard (no hash-tag prefix).\n"
         "      --select-db=DB             DB number to select, when testing a redis server\n"
         "      --client-no-touch          Send CLIENT NO-TOUCH ON as a connection-setup command\n"
-        "                                 (redis protocol only, Redis 7.0+), so the benchmark's own\n"
+        "                                 (redis protocol only, Redis 7.2+), so the benchmark's own\n"
         "                                 traffic does not refresh key LRU/LFU access recency\n"
         "      --distinct-client-seed     Use a different random seed for each client\n"
         "      --randomize                random seed based on timestamp (default is constant value)\n"
