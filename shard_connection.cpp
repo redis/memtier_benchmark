@@ -460,9 +460,12 @@ int shard_connection::connect(struct connect_info *addr)
     m_readonly_state = (m_role == role_replica && m_config->cluster_mode && is_redis_protocol(m_config->protocol))
                            ? setup_none
                            : setup_done;
-    // CLIENT NO-TOUCH: every connection, redis protocol only. Re-armed on
+    // CLIENT NO-TOUCH: every connection, redis protocol only (CLI validation
+    // already rejects --client-no-touch on other protocols; re-checked here
+    // for defense-in-depth, matching the READONLY guard above). Re-armed on
     // every reconnect because the flag is connection-scoped on the server.
-    m_no_touch_state = m_config->client_no_touch ? setup_none : setup_done;
+    m_no_touch_state =
+        (m_config->client_no_touch && is_redis_protocol(m_config->protocol)) ? setup_none : setup_done;
 
     // setup socket
     int sockfd = setup_socket(addr);
@@ -982,12 +985,25 @@ void shard_connection::send_conn_setup_commands(struct timeval timestamp)
         m_hello = setup_sent;
     }
 
-    // CLIENT NO-TOUCH: --client-no-touch only, every connection. Sent after
-    // HELLO (needs the protocol negotiated) and before READONLY/CLUSTER
-    // SLOTS, mirroring the other setup steps.
+    // CLIENT NO-TOUCH: --client-no-touch only, every connection (primary and
+    // replica alike, unlike READONLY below). Sent after HELLO (needs the
+    // protocol negotiated) and before READONLY/CLUSTER SLOTS, mirroring the
+    // other setup steps.
+    //
+    // Use bufferevent_write rather than going through protocol::write_command_client_no_touch
+    // (which adds to the bufferevent's output evbuffer directly), for the same reason the
+    // READONLY step below does: a connection whose FD was attached to the bufferevent via
+    // bufferevent_socket_new + a subsequent bufferevent_socket_connect (the path used for any
+    // shard connection -- primary or replica -- discovered through a live CLUSTER SLOTS
+    // refresh, not just the bootstrap seed connection) does not get its first user-level send's
+    // EPOLLOUT armed by the evbuffer notify callback. Unlike READONLY, CLIENT NO-TOUCH is armed
+    // on primaries too, and a newly-discovered primary has no later setup command to
+    // incidentally force the flush -- so it needs the same bufferevent_write treatment on its
+    // own merits, not just when paired with a replica's READONLY.
     if (m_no_touch_state == setup_none) {
         benchmark_debug_log("sending CLIENT NO-TOUCH command.\n");
-        m_protocol->write_command_client_no_touch();
+        static const char NO_TOUCH_CMD[] = "*3\r\n$6\r\nCLIENT\r\n$8\r\nNO-TOUCH\r\n$2\r\nON\r\n";
+        bufferevent_write(m_bev, NO_TOUCH_CMD, sizeof(NO_TOUCH_CMD) - 1);
         push_req(new request(rt_no_touch, 0, &timestamp, 0));
         m_no_touch_state = setup_sent;
     }
