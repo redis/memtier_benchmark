@@ -1497,21 +1497,6 @@ void shard_connection::handle_event(short events)
             event_add(m_event_timer, &interval);
         }
 
-        // Re-arm the connection-setup ladder (AUTH/SELECT/HELLO/CLIENT NO-TOUCH/
-        // READONLY/CLUSTER SLOTS) before anything else goes back on the wire on
-        // this fresh connection. It has none of that connection-scoped
-        // server-side state yet, so replayed (or fresh) application traffic
-        // must not be able to race ahead of it: a redis connection processes a
-        // pipelined stream strictly in receipt order, so writing the ladder
-        // first guarantees it lands before any later write below. No-op in the
-        // common case (no ladder step configured): is_conn_setup_done() is
-        // already true and send_conn_setup_commands() has nothing to send.
-        if (!is_conn_setup_done()) {
-            struct timeval now;
-            gettimeofday(&now, NULL);
-            send_conn_setup_commands(now);
-        }
-
         // After (re)connect: replay any in-flight requests that survived the
         // disconnect. This must happen *before* fill_pipeline() so the old
         // requests get back on the wire first; otherwise pipeline ordering

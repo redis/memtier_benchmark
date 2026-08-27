@@ -85,23 +85,28 @@ def test_client_no_touch_preserves_idle_time(env):
     master_connection = env.getOSSMasterNodesConnectionList()[0]
     # OBJECT IDLETIME is unsupported under LFU eviction policies; pin to a
     # policy that tracks it so the test is robust to the env's defaults.
+    # Restored afterward -- this connects to the shared master, and other
+    # tests running later in the same env should not inherit the override.
+    orig_policy = master_connection.config_get("maxmemory-policy")["maxmemory-policy"]
     master_connection.config_set("maxmemory-policy", "noeviction")
+    try:
+        master_connection.set(_KEY, "v")
+        master_connection.get(_KEY)  # reset idle time to 0
+        idle_before = _wait_for_idle_time(master_connection, _KEY, lambda idle: idle >= 2)
+        env.assertTrue(idle_before >= 2,
+                       message="idle time should have accrued before the run; got {}".format(idle_before))
 
-    master_connection.set(_KEY, "v")
-    master_connection.get(_KEY)  # reset idle time to 0
-    idle_before = _wait_for_idle_time(master_connection, _KEY, lambda idle: idle >= 2)
-    env.assertTrue(idle_before >= 2,
-                   message="idle time should have accrued before the run; got {}".format(idle_before))
+        test_dir = tempfile.mkdtemp()
+        _run_get_only(env, test_dir, env.testName, ['--client-no-touch'], test_time=3)
 
-    test_dir = tempfile.mkdtemp()
-    _run_get_only(env, test_dir, env.testName, ['--client-no-touch'], test_time=3)
-
-    idle_after = master_connection.execute_command("OBJECT", "IDLETIME", _KEY)
-    env.assertTrue(
-        idle_after >= idle_before,
-        message="--client-no-touch should not reset idle time; before={} after={}".format(
-            idle_before, idle_after),
-    )
+        idle_after = master_connection.execute_command("OBJECT", "IDLETIME", _KEY)
+        env.assertTrue(
+            idle_after >= idle_before,
+            message="--client-no-touch should not reset idle time; before={} after={}".format(
+                idle_before, idle_after),
+        )
+    finally:
+        master_connection.config_set("maxmemory-policy", orig_policy)
 
 
 def test_without_client_no_touch_resets_idle_time(env):
@@ -118,20 +123,23 @@ def test_without_client_no_touch_resets_idle_time(env):
     env.skipOnVersionSmaller("7.2")
 
     master_connection = env.getOSSMasterNodesConnectionList()[0]
+    orig_policy = master_connection.config_get("maxmemory-policy")["maxmemory-policy"]
     master_connection.config_set("maxmemory-policy", "noeviction")
+    try:
+        master_connection.set(_KEY, "v")
+        master_connection.get(_KEY)  # reset idle time to 0
+        idle_before = _wait_for_idle_time(master_connection, _KEY, lambda idle: idle >= 2)
+        env.assertTrue(idle_before >= 2,
+                       message="idle time should have accrued before the run; got {}".format(idle_before))
 
-    master_connection.set(_KEY, "v")
-    master_connection.get(_KEY)  # reset idle time to 0
-    idle_before = _wait_for_idle_time(master_connection, _KEY, lambda idle: idle >= 2)
-    env.assertTrue(idle_before >= 2,
-                   message="idle time should have accrued before the run; got {}".format(idle_before))
+        test_dir = tempfile.mkdtemp()
+        _run_get_only(env, test_dir, env.testName, [], test_time=3)
 
-    test_dir = tempfile.mkdtemp()
-    _run_get_only(env, test_dir, env.testName, [], test_time=3)
-
-    idle_after = _wait_for_idle_time(master_connection, _KEY, lambda idle: idle < idle_before)
-    env.assertTrue(
-        idle_after < idle_before,
-        message="without --client-no-touch, idle time should reset; before={} after={}".format(
-            idle_before, idle_after),
-    )
+        idle_after = _wait_for_idle_time(master_connection, _KEY, lambda idle: idle < idle_before)
+        env.assertTrue(
+            idle_after < idle_before,
+            message="without --client-no-touch, idle time should reset; before={} after={}".format(
+                idle_before, idle_after),
+        )
+    finally:
+        master_connection.config_set("maxmemory-policy", orig_policy)
