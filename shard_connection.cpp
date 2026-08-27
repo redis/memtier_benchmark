@@ -464,8 +464,7 @@ int shard_connection::connect(struct connect_info *addr)
     // already rejects --client-no-touch on other protocols; re-checked here
     // for defense-in-depth, matching the READONLY guard above). Re-armed on
     // every reconnect because the flag is connection-scoped on the server.
-    m_no_touch_state =
-        (m_config->client_no_touch && is_redis_protocol(m_config->protocol)) ? setup_none : setup_done;
+    m_no_touch_state = (m_config->client_no_touch && is_redis_protocol(m_config->protocol)) ? setup_none : setup_done;
 
     // setup socket
     int sockfd = setup_socket(addr);
@@ -990,9 +989,9 @@ void shard_connection::send_conn_setup_commands(struct timeval timestamp)
     // protocol negotiated) and before READONLY/CLUSTER SLOTS, mirroring the
     // other setup steps.
     //
-    // Use bufferevent_write rather than going through protocol::write_command_client_no_touch
-    // (which adds to the bufferevent's output evbuffer directly), for the same reason the
-    // READONLY step below does: a connection whose FD was attached to the bufferevent via
+    // Use bufferevent_write rather than a plain protocol-level evbuffer_add call, for the
+    // same reason the READONLY step below does: a connection whose FD was attached to the
+    // bufferevent via
     // bufferevent_socket_new + a subsequent bufferevent_socket_connect (the path used for any
     // shard connection -- primary or replica -- discovered through a live CLUSTER SLOTS
     // refresh, not just the bootstrap seed connection) does not get its first user-level send's
@@ -1496,6 +1495,21 @@ void shard_connection::handle_event(short events)
             m_request_per_cur_interval = m_config->request_per_interval;
             m_event_timer = event_new(m_event_base, -1, EV_PERSIST, cluster_client_timer_handler, (void *) this);
             event_add(m_event_timer, &interval);
+        }
+
+        // Re-arm the connection-setup ladder (AUTH/SELECT/HELLO/CLIENT NO-TOUCH/
+        // READONLY/CLUSTER SLOTS) before anything else goes back on the wire on
+        // this fresh connection. It has none of that connection-scoped
+        // server-side state yet, so replayed (or fresh) application traffic
+        // must not be able to race ahead of it: a redis connection processes a
+        // pipelined stream strictly in receipt order, so writing the ladder
+        // first guarantees it lands before any later write below. No-op in the
+        // common case (no ladder step configured): is_conn_setup_done() is
+        // already true and send_conn_setup_commands() has nothing to send.
+        if (!is_conn_setup_done()) {
+            struct timeval now;
+            gettimeofday(&now, NULL);
+            send_conn_setup_commands(now);
         }
 
         // After (re)connect: replay any in-flight requests that survived the
