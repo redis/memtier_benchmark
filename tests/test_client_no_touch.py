@@ -55,6 +55,10 @@ def _run_get_only(env, test_dir, name, extra_args, test_time=3):
 def test_client_no_touch_preserves_idle_time(env):
     """--client-no-touch: GET traffic must not reset OBJECT IDLETIME."""
     env.skipOnCluster()
+    # CLIENT NO-TOUCH is Redis 7.0+; older servers reject it and memtier
+    # fails the connection loudly (working as intended), which isn't what
+    # this test is checking.
+    env.skipOnVersionSmaller("7.0")
 
     master_connection = env.getOSSMasterNodesConnectionList()[0]
     # OBJECT IDLETIME is unsupported under LFU eviction policies; pin to a
@@ -86,6 +90,10 @@ def test_without_client_no_touch_resets_idle_time(env):
     --client-no-touch, ordinary reads DO update recency.
     """
     env.skipOnCluster()
+    # CLIENT NO-TOUCH is Redis 7.0+; older servers reject it and memtier
+    # fails the connection loudly (working as intended), which isn't what
+    # this test is checking.
+    env.skipOnVersionSmaller("7.0")
 
     master_connection = env.getOSSMasterNodesConnectionList()[0]
     master_connection.config_set("maxmemory-policy", "noeviction")
