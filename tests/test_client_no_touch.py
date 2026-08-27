@@ -13,6 +13,7 @@ Run with:
 import json
 import os
 import tempfile
+import threading
 import time
 
 from include import (
@@ -21,6 +22,8 @@ from include import (
     addTLSArgs,
     ensure_clean_benchmark_folder,
     debugPrintMemtierOnError,
+    capture_monitor,
+    get_redis_conn_for_node,
 )
 from mb import Benchmark, RunConfig
 
@@ -219,3 +222,119 @@ def test_client_no_touch_rejected_by_server_fails_loudly(env):
         )
     finally:
         master_connection.execute_command("ACL", "DELUSER", user)
+
+
+def test_client_no_touch_resent_after_reconnect(env):
+    """--client-no-touch must be re-sent (and take effect again) after a
+    forced reconnect, not just on the initial connection.
+
+    m_no_touch_state is re-armed to setup_none in connect() on every
+    (re)connect, since CLIENT NO-TOUCH is connection-scoped server-side --
+    a killed connection forgets it entirely. That claim was previously only
+    manually verified (a reconnect stress run in the PR's test plan, not a
+    committed test). This proves it with MONITOR: kill the one live memtier
+    connection mid-run and confirm CLIENT NO-TOUCH ON appears on the wire a
+    second time once memtier reconnects.
+    """
+    env.skipOnCluster()
+    env.skipOnVersionSmaller("7.2")
+
+    master_connection = env.getOSSMasterNodesConnectionList()[0]
+    monitor_conn = get_redis_conn_for_node(
+        env, env.getMasterNodesList()[0], decode_responses=True
+    )
+
+    stop_event = threading.Event()
+    results = []
+    errors = []
+    monitor_thread = threading.Thread(
+        target=capture_monitor, args=(monitor_conn, results, stop_event, errors), daemon=True
+    )
+    monitor_thread.start()
+    # Let the MONITOR subscription land before memtier connects.
+    time.sleep(0.15)
+
+    config = get_default_memtier_config(threads=1, clients=1, test_time=7)
+    config['memtier_benchmark']['requests'] = None
+    args = [
+        '--command', 'GET __key__',
+        '--key-minimum', '1',
+        '--key-maximum', '1',
+        '--key-prefix', _KEY_PREFIX,
+        '--client-no-touch',
+        '--reconnect-on-error',
+        '--max-reconnect-attempts', '5',
+        '--reconnect-backoff-factor', '1.0',
+        '--connection-timeout', '5',
+    ]
+    benchmark_specs = {"name": env.testName, "args": args}
+    addTLSArgs(benchmark_specs, env)
+    add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+
+    test_dir = tempfile.mkdtemp()
+    run_config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(run_config.results_dir)
+    benchmark = Benchmark.from_json(run_config, benchmark_specs)
+
+    run_result = {}
+
+    def _run():
+        run_result['ok'] = benchmark.run()
+
+    run_thread = threading.Thread(target=_run)
+    run_thread.start()
+
+    # Give memtier time to connect, finish its setup ladder, and start
+    # steady-state traffic before killing its connection.
+    time.sleep(2.0)
+
+    killed_any = False
+    clients = master_connection.execute_command("CLIENT", "LIST")
+    if isinstance(clients, bytes):
+        clients = clients.decode("utf-8")
+    for line in clients.strip().split("\n"):
+        if not line.strip():
+            continue
+        info = {}
+        for part in line.split(" "):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                info[k] = v
+        if info.get("cmd", "").startswith("client"):
+            continue  # our own CLIENT LIST connection
+        if "O" in info.get("flags", ""):
+            continue  # the MONITOR connection
+        if "id" in info:
+            master_connection.execute_command("CLIENT", "KILL", "ID", info["id"])
+            killed_any = True
+    env.assertTrue(killed_any, message="expected to find and kill the live memtier connection")
+
+    run_thread.join(timeout=20)
+
+    stop_event.set()
+    time.sleep(0.3)
+    try:
+        monitor_conn.connection_pool.disconnect()
+    except Exception:
+        pass
+    monitor_thread.join(timeout=5)
+
+    debugPrintMemtierOnError(run_config, env)
+    env.assertTrue(
+        run_result.get('ok') == True,
+        message="benchmark should complete successfully after reconnecting",
+    )
+
+    no_touch_count = sum(
+        1 for entry in results
+        if entry.get("command", "").upper().startswith("CLIENT NO-TOUCH")
+    )
+    env.assertTrue(
+        no_touch_count >= 2,
+        message="expected CLIENT NO-TOUCH ON at least twice (initial connect + "
+                "post-reconnect); observed {} times. monitor observed: {}{}".format(
+                    no_touch_count,
+                    [e.get("command") for e in results][:30],
+                    "; MONITOR thread error: {!r}".format(errors[0]) if errors else "",
+                ),
+    )

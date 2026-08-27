@@ -26,6 +26,12 @@ def get_redis_conn_for_node(env, node, **extra_kwargs):
     passed through to redis.Redis() as-is (e.g. decode_responses,
     socket_connect_timeout) and take precedence over the TLS defaults if
     they overlap.
+
+    Unlike test_mget_protocol.py's near-identical _get_redis_conn(), this
+    has no env.isUnixSocket() branch -- fine for the cluster-only caller
+    above (cluster mode doesn't run over a unix socket), but don't reach
+    for this helper from a standalone/unix-socket-capable test without
+    adding one.
     """
     import redis as _redis
 

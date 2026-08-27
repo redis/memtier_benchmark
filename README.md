@@ -145,6 +145,19 @@ $ memtier_benchmark --help
 
 for command line options.
 
+### Known limitations
+
+**Connection-setup ordering under `--retry-on-error`.** memtier sends a
+per-connection setup ladder (AUTH, SELECT, HELLO, CLIENT NO-TOUCH,
+READONLY) before any user-level traffic on that connection. Under
+`--retry-on-error`, a small window exists where a replayed, retried, or
+MOVED-redirected request can reach the server on a connection whose ladder
+hasn't finished yet -- see issue #527 for the full finding. This isn't
+specific to any one setup step: landing in the wrong DB under
+`--select-db` is a worse instance of the same gap than one key's LRU/LFU
+recency being wrong under `--client-no-touch`. Not yet fixed; tracked in
+#527.
+
 ### Using monitor input files
 
 You can replay real command streams by pointing memtier_benchmark to a monitor log file with the `--monitor-input=/path/to/file` option. Special commands such as `__monitor_line1__` pick a specific entry from the file, while `__monitor_line@__` selects commands at runtime (optionally combined with `--monitor-pattern` and `--command-ratio`). For example, the following command replays the first command from the file on each request:
