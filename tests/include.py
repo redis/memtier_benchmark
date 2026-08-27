@@ -231,12 +231,16 @@ def get_cluster_replica_connections(env):
 
     When the env was started with ``--use-slaves`` (RLTest's useSlaves=True)
     but CLUSTER NODES advertises no replicas, this helper emits a loud
-    stderr warning before returning an empty list.  This is the known
-    RLTest harness gap: ``--use-slaves`` starts replicas via ``--slaveof``
-    *without* ``--cluster-enabled yes``, so the slave processes are
-    standalone and never join cluster gossip.  See the
-    ``Read Preference -> Testing limitations`` section in README.md for
-    the full background.
+    stderr warning before returning an empty list, as a defensive fallback.
+    README.md's ``Read Preference -> Testing limitations`` section and
+    issue #462 describe this as expected under plain RLTest's
+    ``--use-slaves`` (starts replicas via ``--slaveof`` *without*
+    ``--cluster-enabled yes``, so they never join cluster gossip) -- but
+    this repo's pinned RLTest fork (tests/test_requirements.txt) already
+    fixes that (real ``CLUSTER MEET``/``CLUSTER REPLICATE``), confirmed by
+    tests/test_client_no_touch_cluster.py genuinely running (not skipping)
+    against a replica in this repo's own CI. The warning path here is not
+    expected to fire in this repo's current test dependencies.
     """
     import sys
     import redis as _redis
