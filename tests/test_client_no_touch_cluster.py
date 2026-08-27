@@ -83,7 +83,8 @@ def _run_and_check_no_touch(env, conn, extra_args):
         config['memtier_benchmark']['requests'] = None
 
         args = [
-            '--cluster-mode',
+            # add_required_env_arguments() below appends --cluster-mode
+            # itself once env.isCluster() is true; no need to pass it here.
             '--client-no-touch',
             '--key-pattern', 'R:R',
             '--key-minimum', '1',

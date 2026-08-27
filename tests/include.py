@@ -20,11 +20,10 @@ def get_redis_conn_for_node(env, node):
     (as returned by env.getMasterNodesList(), or a replica dict with a
     'port' key), TLS-aware.
 
-    Generalizes the per-test TLS-connection boilerplate that used to be
-    duplicated inline (tests/test_mget_protocol.py's _get_redis_conn(),
-    tests/test_client_no_touch_cluster.py's non_seed_conn setup): skip
-    server cert verification (self-signed test certs, CN rarely matches
-    "127.0.0.1") and present the client cert/key when the env is TLS.
+    Shared by tests/test_mget_protocol.py's _get_redis_conn() and
+    tests/test_client_no_touch_cluster.py: skip server cert verification
+    (self-signed test certs, CN rarely matches "127.0.0.1") and present the
+    client cert/key when the env is TLS.
     """
     import redis as _redis
 
