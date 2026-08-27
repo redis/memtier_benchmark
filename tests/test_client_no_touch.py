@@ -26,21 +26,22 @@ _KEY_PREFIX = "nt-test-"
 _KEY = _KEY_PREFIX + "1"
 
 
-def _wait_for_idle_time_below(master_connection, key, threshold, timeout=3.0, interval=0.2):
-    """Poll OBJECT IDLETIME until it drops below `threshold` or `timeout` elapses.
+def _wait_for_idle_time(master_connection, key, until, timeout=5.0, interval=0.2):
+    """Poll OBJECT IDLETIME until `until(idle)` is true or `timeout` elapses.
 
     Redis's idle-time clock (server.lruclock) is a 1-second-quantized value
     refreshed by serverCron, not a live timestamp -- see LRU_CLOCK() in
-    evict.c. On a loaded/throttled CI host, a cron tick can lag by a second
-    or more, so a single immediate check right after the benchmark run can
-    observe a stale value even though the key was genuinely just touched.
-    Poll for the expected drop instead of asserting on one snapshot; a real
-    regression (GETs not updating recency when they should) still fails
-    once the timeout is exhausted.
+    evict.c. On a loaded/throttled CI host a cron tick can lag by a second
+    or more, so a single snapshot right after a fixed sleep (or right after
+    a benchmark run) can observe a stale value in either direction: too low
+    ("idle time should have accrued" firing early) or too high (a real
+    reset not yet reflected). Poll for the expected condition instead of
+    asserting on one snapshot; a genuine regression still fails once the
+    timeout is exhausted.
     """
     deadline = time.time() + timeout
     idle = master_connection.execute_command("OBJECT", "IDLETIME", key)
-    while idle >= threshold and time.time() < deadline:
+    while not until(idle) and time.time() < deadline:
         time.sleep(interval)
         idle = master_connection.execute_command("OBJECT", "IDLETIME", key)
     return idle
@@ -88,8 +89,7 @@ def test_client_no_touch_preserves_idle_time(env):
 
     master_connection.set(_KEY, "v")
     master_connection.get(_KEY)  # reset idle time to 0
-    time.sleep(2)
-    idle_before = master_connection.execute_command("OBJECT", "IDLETIME", _KEY)
+    idle_before = _wait_for_idle_time(master_connection, _KEY, lambda idle: idle >= 2)
     env.assertTrue(idle_before >= 2,
                    message="idle time should have accrued before the run; got {}".format(idle_before))
 
@@ -121,16 +121,15 @@ def test_without_client_no_touch_resets_idle_time(env):
     master_connection.config_set("maxmemory-policy", "noeviction")
 
     master_connection.set(_KEY, "v")
-    master_connection.get(_KEY)
-    time.sleep(2)
-    idle_before = master_connection.execute_command("OBJECT", "IDLETIME", _KEY)
+    master_connection.get(_KEY)  # reset idle time to 0
+    idle_before = _wait_for_idle_time(master_connection, _KEY, lambda idle: idle >= 2)
     env.assertTrue(idle_before >= 2,
                    message="idle time should have accrued before the run; got {}".format(idle_before))
 
     test_dir = tempfile.mkdtemp()
     _run_get_only(env, test_dir, env.testName, [], test_time=3)
 
-    idle_after = _wait_for_idle_time_below(master_connection, _KEY, idle_before)
+    idle_after = _wait_for_idle_time(master_connection, _KEY, lambda idle: idle < idle_before)
     env.assertTrue(
         idle_after < idle_before,
         message="without --client-no-touch, idle time should reset; before={} after={}".format(
