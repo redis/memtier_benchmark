@@ -53,24 +53,75 @@ import time
 from include import (
     add_required_env_arguments,
     addTLSArgs,
+    capture_monitor,
     debugPrintMemtierOnError,
     ensure_clean_benchmark_folder,
     get_cluster_replica_connections,
     get_default_memtier_config,
+    get_redis_conn_for_node,
 )
 from mb import Benchmark, RunConfig
 
 
-def _capture_monitor(conn, results, stop_event):
+def _run_and_check_no_touch(env, conn, extra_args):
+    """Attach MONITOR to conn, run a --client-no-touch cluster-mode
+    benchmark, and assert CLIENT NO-TOUCH ON was observed. `conn` is
+    disconnected as part of cleanup."""
+    stop_event = threading.Event()
+    results = []
+    errors = []
+    monitor_thread = threading.Thread(
+        target=capture_monitor, args=(conn, results, stop_event, errors), daemon=True
+    )
+    monitor_thread.start()
+    # Give the MONITOR subscription time to be acknowledged before memtier
+    # connects, mirroring tests/test_mget_protocol.py's established pattern.
+    time.sleep(0.15)
+
     try:
-        with conn.monitor() as m:
-            while not stop_event.is_set():
-                try:
-                    results.append(m.next_command())
-                except Exception:
-                    break
-    except Exception:
-        pass
+        config = get_default_memtier_config(threads=1, clients=1, test_time=3)
+        config['memtier_benchmark']['requests'] = None
+
+        args = [
+            '--cluster-mode',
+            '--client-no-touch',
+            '--key-pattern', 'R:R',
+            '--key-minimum', '1',
+            '--key-maximum', '1000',
+        ] + extra_args
+        benchmark_specs = {"name": env.testName, "args": args}
+        addTLSArgs(benchmark_specs, env)
+        add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+
+        test_dir = tempfile.mkdtemp()
+        run_config = RunConfig(test_dir, env.testName, config, {})
+        ensure_clean_benchmark_folder(run_config.results_dir)
+        benchmark = Benchmark.from_json(run_config, benchmark_specs)
+
+        memtier_ok = benchmark.run()
+        debugPrintMemtierOnError(run_config, env)
+        env.assertTrue(memtier_ok == True)
+    finally:
+        stop_event.set()
+        time.sleep(0.3)
+        try:
+            conn.connection_pool.disconnect()
+        except Exception:
+            pass
+        monitor_thread.join(timeout=5)
+
+    no_touch_seen = any(
+        entry.get("command", "").upper().startswith("CLIENT NO-TOUCH")
+        for entry in results
+    )
+    env.assertTrue(
+        no_touch_seen,
+        message="expected CLIENT NO-TOUCH ON on the monitored connection; "
+               "monitor observed: {}{}".format(
+                   [e.get("command") for e in results][:20],
+                   "; MONITOR thread error: {!r}".format(errors[0]) if errors else "",
+               ),
+    )
 
 
 def test_client_no_touch_lands_on_replica_discovered_via_cluster_slots(env):
@@ -88,60 +139,8 @@ def test_client_no_touch_lands_on_replica_discovered_via_cluster_slots(env):
         env.skip()
         return
 
-    replica_conn = replica_conns[0]
-    stop_event = threading.Event()
-    results = []
-    monitor_thread = threading.Thread(
-        target=_capture_monitor, args=(replica_conn, results, stop_event), daemon=True
-    )
-    monitor_thread.start()
-    # Give the MONITOR subscription time to be acknowledged before memtier
-    # connects, mirroring tests/test_mget_protocol.py's established pattern.
-    time.sleep(0.15)
-
-    try:
-        config = get_default_memtier_config(threads=1, clients=1, test_time=3)
-        config['memtier_benchmark']['requests'] = None
-
-        args = [
-            '--cluster-mode',
-            '--client-no-touch',
-            '--read-preference', 'secondaryPreferred',
-            '--ratio', '0:1',
-            '--key-pattern', 'R:R',
-            '--key-minimum', '1',
-            '--key-maximum', '1000',
-        ]
-        benchmark_specs = {"name": env.testName, "args": args}
-        addTLSArgs(benchmark_specs, env)
-        add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
-
-        test_dir = tempfile.mkdtemp()
-        run_config = RunConfig(test_dir, env.testName, config, {})
-        ensure_clean_benchmark_folder(run_config.results_dir)
-        benchmark = Benchmark.from_json(run_config, benchmark_specs)
-
-        memtier_ok = benchmark.run()
-        debugPrintMemtierOnError(run_config, env)
-        env.assertTrue(memtier_ok == True)
-    finally:
-        stop_event.set()
-        time.sleep(0.3)
-        try:
-            replica_conn.connection_pool.disconnect()
-        except Exception:
-            pass
-        monitor_thread.join(timeout=5)
-
-    no_touch_seen = any(
-        entry.get("command", "").upper().startswith("CLIENT NO-TOUCH")
-        for entry in results
-    )
-    env.assertTrue(
-        no_touch_seen,
-        message="expected CLIENT NO-TOUCH ON to land on the replica connection "
-               "(discovered via CLUSTER SLOTS, not the bootstrap seed connection); "
-               "monitor observed: {}".format([e.get("command") for e in results][:20]),
+    _run_and_check_no_touch(
+        env, replica_conns[0], ['--read-preference', 'secondaryPreferred', '--ratio', '0:1']
     )
 
 
@@ -166,73 +165,5 @@ def test_client_no_touch_lands_on_non_seed_primary_discovered_via_cluster_slots(
     # master_nodes_list[0] is memtier's -s/-p bootstrap seed (see
     # add_required_env_arguments); any other entry is only ever reached via
     # the CLUSTER SLOTS reply loop.
-    import redis as _redis
-    non_seed = master_nodes_list[1]
-    conn_kwargs = {"host": "127.0.0.1", "port": non_seed["port"]}
-    if getattr(env, "useTLS", False):
-        # Mirrors tests/test_mget_protocol.py's _get_redis_conn(): skip
-        # server cert verification (self-signed test certs, CN rarely
-        # matches "127.0.0.1"). Without this, a TLS-cluster matrix cell's
-        # plain connection silently fails and the MONITOR thread's broad
-        # except swallows it -- "monitor observed: []", not an obvious TLS
-        # handshake error.
-        from include import TLS_CERT, TLS_KEY
-        conn_kwargs["ssl"] = True
-        conn_kwargs["ssl_cert_reqs"] = "none"
-        if TLS_CERT:
-            conn_kwargs["ssl_certfile"] = TLS_CERT
-        if TLS_KEY:
-            conn_kwargs["ssl_keyfile"] = TLS_KEY
-    non_seed_conn = _redis.Redis(**conn_kwargs)
-
-    stop_event = threading.Event()
-    results = []
-    monitor_thread = threading.Thread(
-        target=_capture_monitor, args=(non_seed_conn, results, stop_event), daemon=True
-    )
-    monitor_thread.start()
-    time.sleep(0.15)
-
-    try:
-        config = get_default_memtier_config(threads=1, clients=1, test_time=3)
-        config['memtier_benchmark']['requests'] = None
-
-        args = [
-            '--cluster-mode',
-            '--client-no-touch',
-            '--ratio', '1:1',
-            '--key-pattern', 'R:R',
-            '--key-minimum', '1',
-            '--key-maximum', '1000',
-        ]
-        benchmark_specs = {"name": env.testName, "args": args}
-        addTLSArgs(benchmark_specs, env)
-        add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
-
-        test_dir = tempfile.mkdtemp()
-        run_config = RunConfig(test_dir, env.testName, config, {})
-        ensure_clean_benchmark_folder(run_config.results_dir)
-        benchmark = Benchmark.from_json(run_config, benchmark_specs)
-
-        memtier_ok = benchmark.run()
-        debugPrintMemtierOnError(run_config, env)
-        env.assertTrue(memtier_ok == True)
-    finally:
-        stop_event.set()
-        time.sleep(0.3)
-        try:
-            non_seed_conn.connection_pool.disconnect()
-        except Exception:
-            pass
-        monitor_thread.join(timeout=5)
-
-    no_touch_seen = any(
-        entry.get("command", "").upper().startswith("CLIENT NO-TOUCH")
-        for entry in results
-    )
-    env.assertTrue(
-        no_touch_seen,
-        message="expected CLIENT NO-TOUCH ON to land on the non-seed primary shard "
-               "connection (discovered via CLUSTER SLOTS, not the bootstrap seed "
-               "connection); monitor observed: {}".format([e.get("command") for e in results][:20]),
-    )
+    non_seed_conn = get_redis_conn_for_node(env, master_nodes_list[1])
+    _run_and_check_no_touch(env, non_seed_conn, ['--ratio', '1:1'])

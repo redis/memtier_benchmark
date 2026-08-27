@@ -15,6 +15,55 @@ TLS_PROTOCOLS = os.environ.get("TLS_PROTOCOLS", "")
 VERBOSE = bool(int(os.environ.get("VERBOSE","0")))
 
 
+def get_redis_conn_for_node(env, node):
+    """Return a redis.Redis connection to a specific cluster/master node dict
+    (as returned by env.getMasterNodesList(), or a replica dict with a
+    'port' key), TLS-aware.
+
+    Generalizes the per-test TLS-connection boilerplate that used to be
+    duplicated inline (tests/test_mget_protocol.py's _get_redis_conn(),
+    tests/test_client_no_touch_cluster.py's non_seed_conn setup): skip
+    server cert verification (self-signed test certs, CN rarely matches
+    "127.0.0.1") and present the client cert/key when the env is TLS.
+    """
+    import redis as _redis
+
+    kwargs = {"host": "127.0.0.1", "port": node["port"]}
+    if getattr(env, "useTLS", False):
+        kwargs["ssl"] = True
+        kwargs["ssl_cert_reqs"] = "none"
+        if TLS_CERT:
+            kwargs["ssl_certfile"] = TLS_CERT
+        if TLS_KEY:
+            kwargs["ssl_keyfile"] = TLS_KEY
+    return _redis.Redis(**kwargs)
+
+
+def capture_monitor(conn, results, stop_event, errors=None):
+    """Thread target: append each MONITOR entry from conn to results until
+    stop_event is set.
+
+    If errors is given (a list), any exception that ends the loop -- most
+    usefully a TLS handshake failure against a connection built without the
+    right TLS kwargs -- is appended to it instead of being silently
+    swallowed. A caller whose assertion then finds zero captured commands
+    can report errors[0] instead of a bare "observed: []" that gives no clue
+    why.
+    """
+    try:
+        with conn.monitor() as m:
+            while not stop_event.is_set():
+                try:
+                    results.append(m.next_command())
+                except Exception as e:
+                    if errors is not None:
+                        errors.append(e)
+                    break
+    except Exception as e:
+        if errors is not None:
+            errors.append(e)
+
+
 def ensure_tls_protocols(master_nodes_connections):
     if TLS_PROTOCOLS != "":
         # if we've specified the TLS_PROTOCOLS env variable ensure the server enforces thos protocol versions

@@ -693,7 +693,7 @@ const char *shard_connection::get_last_request_type()
     case rt_readonly:
         return "READONLY";
     case rt_no_touch:
-        return "CLIENT_NO-TOUCH";
+        return "CLIENT NO-TOUCH";
     default:
         return "none";
     }
