@@ -1017,8 +1017,9 @@ void shard_connection::send_conn_setup_commands(struct timeval timestamp)
         // first user-level send, so the bytes sit in the output buffer forever and the
         // connect-callback handle_event path has no chance to flush them. bufferevent_write
         // routes through bufferevent_trigger_nolock_ which forces the EPOLLOUT registration.
-        // Primaries don't hit this because all setup states default to setup_done, so
-        // send_conn_setup_commands is a no-op for them.
+        // Primaries don't hit this specific branch because m_readonly_state defaults to
+        // setup_done for them -- unlike CLIENT NO-TOUCH above, which does arm and send for
+        // primaries too, send_conn_setup_commands as a whole is not a no-op for them.
         static const char READONLY_CMD[] = "*1\r\n$8\r\nREADONLY\r\n";
         bufferevent_write(m_bev, READONLY_CMD, sizeof(READONLY_CMD) - 1);
         push_req(new request(rt_readonly, 0, &timestamp, 0));

@@ -15,23 +15,34 @@ callback on its own. tests/test_client_no_touch.py (standalone-only) can't
 exercise this: every connection in a standalone run IS the bootstrap seed
 connection.
 
-This test targets a replica connection specifically, since every replica
-is always created via the "discovered, not bootstrap" path -- unlike a
-second primary, which is only reachable by genuinely resharding a live
-cluster mid-run.
+Two tests, two ways to land a connection on the "discovered" path:
 
-Known harness limitation: get_cluster_replica_connections() returns an
-empty list under RLTest's --use-slaves (the resulting slaves are not
-cluster-gossip members -- see README.md "Testing limitations" and
-https://github.com/redis/memtier_benchmark/issues/462, filed for the
-identical gap affecting the --read-preference test suite). This test
-skips gracefully in that case, matching tests/test_read_preference_failover.py's
-established pattern, and will start actually verifying once #462 lands.
-In the meantime this was verified manually against a real
-`redis-cli --cluster create`-equivalent cluster with cluster-aware
-replicas via `redis-cli MONITOR` (see PR #526's description).
+1. test_client_no_touch_lands_on_replica_discovered_via_cluster_slots
+   targets a replica connection. Known harness limitation:
+   get_cluster_replica_connections() returns an empty list under RLTest's
+   --use-slaves (the resulting slaves are not cluster-gossip members -- see
+   README.md "Testing limitations" and
+   https://github.com/redis/memtier_benchmark/issues/462, filed for the
+   identical gap affecting the --read-preference test suite). This test
+   skips gracefully in that case, matching
+   tests/test_read_preference_failover.py's established pattern, and will
+   start actually verifying once #462 lands. In the meantime this was
+   verified manually against a real `redis-cli --cluster create`-equivalent
+   cluster with cluster-aware replicas via `redis-cli MONITOR` (see PR
+   #526's description).
+
+2. test_client_no_touch_lands_on_non_seed_primary_discovered_via_cluster_slots
+   sidesteps that gap entirely and DOES run in the standard CI matrix (no
+   --use-slaves needed): cluster_client's CLUSTER-SLOTS-reply loop connects
+   every primary shard beyond memtier's single bootstrap seed connection
+   (master_nodes_list[0], the -s/-p argument) via connect_shard_connection()
+   -- the exact same "discovered" path replicas use -- so any additional
+   shard in a multi-shard cluster (the default SHARDS=3 OSS-CLUSTER matrix
+   cell already provides this) already exercises it, with zero dependency
+   on replica gossip visibility.
 
 Run with:
+  TEST=test_client_no_touch_cluster.py OSS_CLUSTER=1 ./tests/run_tests.sh
   TEST=test_client_no_touch_cluster.py OSS_CLUSTER=1 OSS_CLUSTER_REPLICAS=1 ./tests/run_tests.sh
 """
 
@@ -131,4 +142,82 @@ def test_client_no_touch_lands_on_replica_discovered_via_cluster_slots(env):
         message="expected CLIENT NO-TOUCH ON to land on the replica connection "
                "(discovered via CLUSTER SLOTS, not the bootstrap seed connection); "
                "monitor observed: {}".format([e.get("command") for e in results][:20]),
+    )
+
+
+def test_client_no_touch_lands_on_non_seed_primary_discovered_via_cluster_slots(env):
+    """Same assertion, but on a second PRIMARY shard instead of a replica --
+    this one actually runs in the standard CI matrix (no --use-slaves, no
+    #462 dependency), since any shard beyond memtier's single bootstrap seed
+    connection is connected via the same "discovered from CLUSTER SLOTS"
+    path a replica is."""
+    if not env.isCluster():
+        env.skip()
+        return
+    env.skipOnVersionSmaller("7.2")
+
+    master_nodes_list = env.getMasterNodesList()
+    if len(master_nodes_list) < 2:
+        # Single-shard cluster: every connection IS the bootstrap seed, same
+        # as standalone. Nothing to exercise here.
+        env.skip()
+        return
+
+    # master_nodes_list[0] is memtier's -s/-p bootstrap seed (see
+    # add_required_env_arguments); any other entry is only ever reached via
+    # the CLUSTER SLOTS reply loop.
+    import redis as _redis
+    non_seed = master_nodes_list[1]
+    non_seed_conn = _redis.Redis(host=non_seed.get("host") or "127.0.0.1", port=non_seed["port"])
+
+    stop_event = threading.Event()
+    results = []
+    monitor_thread = threading.Thread(
+        target=_capture_monitor, args=(non_seed_conn, results, stop_event), daemon=True
+    )
+    monitor_thread.start()
+    time.sleep(0.15)
+
+    try:
+        config = get_default_memtier_config(threads=1, clients=1, test_time=3)
+        config['memtier_benchmark']['requests'] = None
+
+        args = [
+            '--cluster-mode',
+            '--client-no-touch',
+            '--ratio', '1:1',
+            '--key-pattern', 'R:R',
+            '--key-minimum', '1',
+            '--key-maximum', '1000',
+        ]
+        benchmark_specs = {"name": env.testName, "args": args}
+        addTLSArgs(benchmark_specs, env)
+        add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+        test_dir = tempfile.mkdtemp()
+        run_config = RunConfig(test_dir, env.testName, config, {})
+        ensure_clean_benchmark_folder(run_config.results_dir)
+        benchmark = Benchmark.from_json(run_config, benchmark_specs)
+
+        memtier_ok = benchmark.run()
+        debugPrintMemtierOnError(run_config, env)
+        env.assertTrue(memtier_ok == True)
+    finally:
+        stop_event.set()
+        time.sleep(0.3)
+        try:
+            non_seed_conn.connection_pool.disconnect()
+        except Exception:
+            pass
+        monitor_thread.join(timeout=5)
+
+    no_touch_seen = any(
+        entry.get("command", "").upper().startswith("CLIENT NO-TOUCH")
+        for entry in results
+    )
+    env.assertTrue(
+        no_touch_seen,
+        message="expected CLIENT NO-TOUCH ON to land on the non-seed primary shard "
+               "connection (discovered via CLUSTER SLOTS, not the bootstrap seed "
+               "connection); monitor observed: {}".format([e.get("command") for e in results][:20]),
     )

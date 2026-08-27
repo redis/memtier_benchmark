@@ -208,12 +208,26 @@ public:
     // trivially because m_readonly_state is initialised to setup_done.
     //
     // Deliberately does NOT check m_no_touch_state, unlike the send gate
-    // is_conn_setup_done() (which does): CLIENT NO-TOUCH is placed ahead of
-    // READONLY/CLUSTER SLOTS in send_conn_setup_commands(), so anything this
-    // routing-eligibility check would call ready already has NO-TOUCH's
-    // bytes ahead of it on the wire. Checking it here would only make this
-    // more conservative with no correctness gain -- fill_pipeline() is what
-    // actually holds new work until is_conn_setup_done() is true.
+    // is_conn_setup_done() (which does). That's only actually guaranteed
+    // ordering-safe for replicas: m_no_touch_state is sent ahead of
+    // READONLY in send_conn_setup_commands(), so a connection that gets
+    // here through the m_readonly_state branch below already has NO-TOUCH's
+    // bytes ahead of it on the wire. For a primary, m_cluster_slots stays
+    // setup_done trivially (only MAIN_CONNECTION ever arms it) and
+    // m_role != role_replica, so this can return true the instant
+    // m_connection_state flips to conn_connected -- before
+    // send_conn_setup_commands() has written NO-TOUCH at all. It's still
+    // safe to omit the check because nothing actually routes traffic
+    // through the connection on this basis alone: fill_pipeline() is the
+    // one thing that sends work, and it holds until the separate
+    // is_conn_setup_done() gate (which does include m_no_touch_state) is
+    // true. The other caller, peer_client_has_any_setup_in_progress(), asks
+    // a related but different question ("is this peer still mid-setup");
+    // a peer that is conn_connected but hasn't finished NO-TOUCH yet will
+    // answer "ready" here too early for that caller's purposes. Believed
+    // harmless (that caller doesn't route through the peer either), but
+    // that's a weaker claim than "no correctness gain" for this specific
+    // check in isolation.
     bool is_ready_for_reads() const
     {
         if (m_connection_state != conn_connected) return false;
