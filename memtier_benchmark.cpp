@@ -646,6 +646,7 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             "multi_key_get = %u\n"
             "authenticate = %s\n"
             "select-db = %d\n"
+            "client-no-touch = %s\n"
             "no-expiry = %s\n"
             "wait-ratio = %u:%u\n"
             "num-slaves = %u-%u\n"
@@ -679,9 +680,10 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             cfg->retry_backoff_factor, cfg->retry_on_filter ? cfg->retry_on_filter : "", cfg->max_retry_queue,
             cfg->failed_keys_file ? cfg->failed_keys_file : "", cfg->connection_timeout, cfg->connection_stage_timeout,
             cfg->thread_conn_start_min_jitter_micros, cfg->thread_conn_start_max_jitter_micros, cfg->multi_key_get,
-            cfg->authenticate ? cfg->authenticate : "", cfg->select_db, cfg->no_expiry ? "yes" : "no",
-            cfg->wait_ratio.a, cfg->wait_ratio.b, cfg->num_slaves.min, cfg->num_slaves.max, cfg->wait_timeout.min,
-            cfg->wait_timeout.max, cfg->json_out_file, cfg->print_all_runs ? "yes" : "no"
+            cfg->authenticate ? cfg->authenticate : "", cfg->select_db, cfg->client_no_touch ? "yes" : "no",
+            cfg->no_expiry ? "yes" : "no", cfg->wait_ratio.a, cfg->wait_ratio.b, cfg->num_slaves.min,
+            cfg->num_slaves.max, cfg->wait_timeout.min, cfg->wait_timeout.max, cfg->json_out_file,
+            cfg->print_all_runs ? "yes" : "no"
 #ifdef HAVE_EVHTTP
             ,
             cfg->prometheus_port, cfg->prometheus_bind_addr ? cfg->prometheus_bind_addr : "127.0.0.1",

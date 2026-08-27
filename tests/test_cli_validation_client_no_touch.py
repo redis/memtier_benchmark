@@ -6,8 +6,9 @@ Redis server — we invoke the binary with subprocess, expect a specific exit
 code and a clear message in stderr.
 
 Tests covered:
-  1. --client-no-touch with a non-redis protocol is a hard error.
-  2. --client-no-touch with the (default) redis protocol is accepted at
+  1. --client-no-touch with -P memcache_text is a hard error.
+  2. --client-no-touch with -P memcache_binary is a hard error.
+  3. --client-no-touch with the (default) redis protocol is accepted at
      parse time.
 
 Run with:
