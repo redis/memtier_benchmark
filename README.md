@@ -286,19 +286,16 @@ dedicated CI cell (`OSS-CLUSTER + replicas: client-no-touch`).
 The `read-preference` tests below (`test_read_preference_*.py`) still gate
 on `get_cluster_replica_connections()`'s original defensive skip path,
 written against the un-patched harness behavior this fork no longer has.
-Issue #462 (filed by this PR) originally tracked bootstrapping a real
-`redis-cli --cluster create` cluster to work around the gap; with the fork
-already fixing it, what's left is updating those five test files to assert
-rather than skip, which hasn't been done yet.
+Issue #462 originally tracked bootstrapping a real `redis-cli --cluster
+create` cluster to work around the gap; with the fork already fixing it,
+what's left is updating those five test files to assert rather than skip,
+which hasn't been done yet (see the issue for the current status).
 
 The production read-routing code was verified empirically against real
 `redis-cli --cluster create` clusters with cluster-aware replicas under
 both RESP2 and RESP3. See PR #456 round-18 reviewer reports for the
 measurements: all four modes (primary, secondary, secondaryPreferred,
 nearest) route reads correctly to replicas, with zero leakage to primaries.
-
-A follow-up fixture that bootstraps a real `redis-cli --cluster create`
-cluster within the test harness is tracked in issue #462 (filed by this PR).
 
 ### Using rate-limiting for informed benchmarking
 

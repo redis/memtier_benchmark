@@ -29,7 +29,12 @@ asan.yml, tsan.yml and ubsan.yml, none of which start replicas at all.
    failure in the dedicated cell above (where a silent skip would let the
    cell go green while only exercising the non-seed-primary case below --
    exactly the coverage gap this cell exists to close), a skip in the
-   plain cluster cells, which never asked RLTest for replicas.
+   plain cluster cells, which never asked RLTest for replicas. This makes
+   it the first test in the repo to hard-require the pinned RLTest fork's
+   cluster-aware --use-slaves behavior (see tests/test_requirements.txt)
+   rather than skip on its absence -- if that fork branch moves, or
+   upstream RLTest#253 lands with different semantics, this is the test
+   that goes red.
 
 2. test_client_no_touch_lands_on_non_seed_primary_discovered_via_cluster_slots
    needs no replicas: any shard beyond memtier's single bootstrap seed

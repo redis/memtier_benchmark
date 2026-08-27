@@ -693,6 +693,9 @@ const char *shard_connection::get_last_request_type()
     case rt_readonly:
         return "READONLY";
     case rt_no_touch:
+        // Underscore, not a space -- like CLUSTER_SLOTS above, so this
+        // stays a single space-delimited token in the last_cmd=%s field of
+        // the hang-diagnostic line (DEVELOPMENT.md documents that format).
         return "CLIENT_NO-TOUCH";
     default:
         return "none";
