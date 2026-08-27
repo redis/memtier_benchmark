@@ -76,3 +76,12 @@ def test_client_no_touch_accepted_for_redis_protocol(env):
         message="redis protocol should not trigger rejection; stderr: {!r}".format(
             result.stderr),
     )
+    # Guard against a vacuous pass: the assertion above would also go green
+    # if --client-no-touch were missing from long_options[] entirely and
+    # getopt rejected it as unrecognized, since that message doesn't
+    # contain "client-no-touch can only be used with redis protocol" either.
+    env.assertFalse(
+        "unrecognized option" in result.stderr,
+        message="--client-no-touch was not recognized as a valid option; stderr: {!r}".format(
+            result.stderr),
+    )
