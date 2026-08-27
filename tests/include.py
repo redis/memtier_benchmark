@@ -20,13 +20,12 @@ def get_redis_conn_for_node(env, node, **extra_kwargs):
     (as returned by env.getMasterNodesList(), or a replica dict with a
     'port'/'host' key), TLS-aware.
 
-    Shared by tests/test_mget_protocol.py's _get_redis_conn(),
-    tests/test_client_no_touch_cluster.py, and
-    get_cluster_replica_connections() below: skip server cert verification
-    (self-signed test certs, CN rarely matches "127.0.0.1") and present the
-    client cert/key when the env is TLS. extra_kwargs are passed through to
-    redis.Redis() as-is (e.g. decode_responses, socket_connect_timeout) and
-    take precedence over the TLS defaults if they overlap.
+    Used by tests/test_client_no_touch_cluster.py: skip server cert
+    verification (self-signed test certs, CN rarely matches "127.0.0.1")
+    and present the client cert/key when the env is TLS. extra_kwargs are
+    passed through to redis.Redis() as-is (e.g. decode_responses,
+    socket_connect_timeout) and take precedence over the TLS defaults if
+    they overlap.
     """
     import redis as _redis
 
@@ -240,6 +239,7 @@ def get_cluster_replica_connections(env):
     the full background.
     """
     import sys
+    import redis as _redis
 
     if not env.isCluster():
         return []
@@ -269,11 +269,12 @@ def get_cluster_replica_connections(env):
             port = int(port_str)
         except ValueError:
             continue
-        # TLS-aware now, unlike the bare redis.Redis(host, port) this used
-        # to build directly; still dials the gossiped host, same as before.
         conns.append(
-            get_redis_conn_for_node(
-                env, {"host": host, "port": port}, decode_responses=True, socket_connect_timeout=5
+            _redis.Redis(
+                host=host,
+                port=port,
+                decode_responses=True,
+                socket_connect_timeout=5,
             )
         )
 

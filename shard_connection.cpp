@@ -925,7 +925,7 @@ void shard_connection::drain_replay_queue_after_reconnect()
     }
 }
 
-bool shard_connection::is_conn_setup_done()
+bool shard_connection::is_conn_setup_done() const
 {
     return m_authentication == setup_done && m_db_selection == setup_done && m_cluster_slots == setup_done &&
            m_hello == setup_done && m_readonly_state == setup_done && m_no_touch_state == setup_done;
@@ -935,12 +935,17 @@ bool shard_connection::peer_client_has_any_setup_in_progress() const
 {
     // Walk every shard_connection on the same client. A peer "is mid-setup"
     // if it is either climbing the setup ladder (conn_in_progress) OR
-    // already TCP-connected but not yet ready for reads (HELLO/CLUSTER
-    // SLOTS/READONLY pending). Dead/disconnected peers don't count — they
-    // either gave up too, or they're racing us toward their own terminal
-    // exit. Reconnect-pending peers (conn_disconnected but with
-    // m_reconnect_attempts > 0 and m_reconnecting true) also count because
-    // their timer is armed and they may yet rejoin the setup ladder.
+    // already TCP-connected but hasn't finished the full setup ladder yet.
+    // Uses is_conn_setup_done() rather than is_ready_for_reads(): the two
+    // ask different questions (send-gate vs. routing-eligibility -- see
+    // is_ready_for_reads()'s own comment) and is_ready_for_reads() doesn't
+    // wait on AUTH/SELECT/HELLO/CLIENT NO-TOUCH the way this caller's own
+    // "is mid-setup" question needs to. Dead/disconnected peers don't
+    // count — they either gave up too, or they're racing us toward their
+    // own terminal exit. Reconnect-pending peers (conn_disconnected but
+    // with m_reconnect_attempts > 0 and m_reconnecting true) also count
+    // because their timer is armed and they may yet rejoin the setup
+    // ladder.
     if (m_conns_manager == NULL) return false;
     const std::vector<shard_connection *> &peers = m_conns_manager->get_connections();
     for (size_t i = 0; i < peers.size(); i++) {
@@ -950,7 +955,7 @@ bool shard_connection::peer_client_has_any_setup_in_progress() const
         if (st == conn_in_progress) {
             return true;
         }
-        if (st == conn_connected && !peer->is_ready_for_reads()) {
+        if (st == conn_connected && !peer->is_conn_setup_done()) {
             return true;
         }
         if (st == conn_disconnected && peer->m_reconnecting) {

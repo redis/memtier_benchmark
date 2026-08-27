@@ -304,7 +304,7 @@ private:
     int setup_socket(struct connect_info *addr);
     void set_readable_id();
 
-    bool is_conn_setup_done();
+    bool is_conn_setup_done() const;
     void send_conn_setup_commands(struct timeval timestamp);
 
     // True iff any peer connection on this client is still climbing the

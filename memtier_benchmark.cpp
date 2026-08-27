@@ -2720,8 +2720,7 @@ void usage()
         "      --select-db=DB             DB number to select, when testing a redis server\n"
         "      --client-no-touch          Send CLIENT NO-TOUCH ON as a connection-setup command\n"
         "                                 (redis protocol only, Redis 7.2+), so the benchmark's own\n"
-        "                                 traffic does not refresh key LRU/LFU access recency. Caveat\n"
-        "                                 under --retry-on-error: see startup warning\n"
+        "                                 traffic does not refresh key LRU/LFU access recency\n"
         "      --distinct-client-seed     Use a different random seed for each client\n"
         "      --randomize                random seed based on timestamp (default is constant value)\n"
         "\n"
@@ -5028,15 +5027,6 @@ int main(int argc, char *argv[])
     if (cfg.client_no_touch && !is_redis_protocol(cfg.protocol)) {
         fprintf(stderr, "error: client-no-touch can only be used with redis protocol.\n");
         usage();
-    }
-    if (cfg.client_no_touch && cfg.retry_on_error) {
-        // See https://github.com/redis/memtier_benchmark/issues/527: a request
-        // replayed right after a reconnect can currently reach the server
-        // before CLIENT NO-TOUCH ON is re-sent on the new connection, silently
-        // touching that key's recency for that one request.
-        fprintf(stderr, "warning: --client-no-touch with --retry-on-error: a request replayed after a "
-                        "reconnect can land before NO-TOUCH is re-armed on the new connection, silently "
-                        "touching that key's recency (github.com/redis/memtier_benchmark issue #527).\n");
     }
     if (cfg.multi_key_get > 0 && cfg.protocol == PROTOCOL_MEMCACHE_BINARY) {
         fprintf(stderr, "error: --multi-key-get is not supported with memcache_binary.\n");
