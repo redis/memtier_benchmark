@@ -222,6 +222,18 @@ def agg_keyspace_range(master_nodes_connections):
     return overall_keyspace_range
 
 
+def env_started_with_slaves(env):
+    """True if RLTest was launched with useSlaves=True (--use-slaves).
+
+    Use getattr() chains because RLTest's env.envRunner shape varies
+    across versions.
+    """
+    runner = getattr(env, "envRunner", None)
+    if runner is None:
+        return False
+    return bool(getattr(runner, "useSlaves", False) or getattr(runner, "use_slaves", False))
+
+
 def get_cluster_replica_connections(env):
     """Return List[redis.Redis] for every replica advertised by CLUSTER NODES.
 
@@ -284,17 +296,9 @@ def get_cluster_replica_connections(env):
 
     # If RLTest was launched with useSlaves=True but CLUSTER NODES
     # advertises zero replicas, emit a loud warning so the silent skip
-    # is at least visible in test output.  Use getattr() chains because
-    # RLTest's env.envRunner shape varies across versions.
+    # is at least visible in test output.
     if not conns:
-        use_slaves = False
-        runner = getattr(env, "envRunner", None)
-        if runner is not None:
-            use_slaves = bool(
-                getattr(runner, "useSlaves", False)
-                or getattr(runner, "use_slaves", False)
-            )
-        if use_slaves:
+        if env_started_with_slaves(env):
             sys.stderr.write(
                 "warning: OSS_CLUSTER_REPLICAS=1 is set and RLTest started "
                 "slave nodes,\nbut CLUSTER NODES shows zero replicas "

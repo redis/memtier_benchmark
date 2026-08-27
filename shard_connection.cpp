@@ -946,12 +946,12 @@ bool shard_connection::peer_client_has_any_setup_in_progress() const
     // a peer stuck at setup_sent on AUTH/HELLO/NO-TOUCH is NOT treated as
     // mid-setup here, matching is_ready_for_reads()'s own scope (see its
     // comment in shard_connection.h). Widening this to the full ladder was
-    // tried and reverted -- it left a peer that exhausted
-    // --max-reconnect-attempts on one of those commands counted as
-    // permanently "in progress", which risked silently starving read
-    // routing around it instead of bounding the wait. Left for whoever
-    // resolves #527 to revisit alongside the rest of the setup-ladder-bypass
-    // class.
+    // tried during this feature's review and reverted: it would have
+    // counted a peer that exhausted --max-reconnect-attempts on one of
+    // those commands as permanently "in progress" rather than bounded by
+    // connection_stage_should_abort(), and whether that window is actually
+    // bounded in every case was never confirmed -- so it was left as-is
+    // rather than landed on an unverified assumption.
     if (m_conns_manager == NULL) return false;
     const std::vector<shard_connection *> &peers = m_conns_manager->get_connections();
     for (size_t i = 0; i < peers.size(); i++) {

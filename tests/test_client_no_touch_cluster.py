@@ -15,20 +15,25 @@ callback on its own. tests/test_client_no_touch.py (standalone-only) can't
 exercise this: every connection in a standalone run IS the bootstrap seed
 connection.
 
-Two tests, two ways to land a connection on the "discovered" path, both
-run for real (not skipped) by the "OSS-CLUSTER + replicas: client-no-touch"
-CI cell:
+Two tests, two ways to land a connection on the "discovered" path. Only
+the dedicated "OSS-CLUSTER + replicas: client-no-touch" CI cell (which
+sets OSS_CLUSTER_REPLICAS=1, so RLTest is started with --use-slaves) runs
+both for real; this file is also collected -- with no TEST: pin -- by the
+plain "OSS-CLUSTER API: TCP Plaintext"/"TCP TLS" cells in ci.yml,
+asan.yml, tsan.yml and ubsan.yml, none of which start replicas at all.
 
 1. test_client_no_touch_lands_on_replica_discovered_via_cluster_slots
    targets a replica connection, via get_cluster_replica_connections()
-   (tests/include.py). This is the only CI cell that runs this file, and
-   it always sets OSS_CLUSTER_REPLICAS=1, so finding zero replica
-   connections here is a hard failure (env.assertTrue), not a skip: this
-   repo's pinned RLTest fork fixes the gossip-visibility gap issue #462
-   describes (real CLUSTER MEET/REPLICATE, not bare --slaveof), and a
-   silent skip would let the cell go green while only exercising the
-   non-seed-primary case below -- exactly the coverage gap this cell
-   exists to close.
+   (tests/include.py). Whether an empty result is a hard failure or a
+   skip depends on env_started_with_slaves(env) (tests/include.py): in
+   the dedicated cell above, zero replica connections is a hard failure
+   (env.assertTrue) -- this repo's pinned RLTest fork fixes the
+   gossip-visibility gap issue #462 describes (real CLUSTER
+   MEET/REPLICATE, not bare --slaveof), so a silent skip there would let
+   the cell go green while only exercising the non-seed-primary case
+   below, exactly the coverage gap this cell exists to close. In the
+   plain cluster cells, which never asked RLTest for replicas, an empty
+   result is expected and the test skips.
 
 2. test_client_no_touch_lands_on_non_seed_primary_discovered_via_cluster_slots
    needs no replicas: any shard beyond memtier's single bootstrap seed
@@ -51,6 +56,7 @@ from include import (
     capture_monitor,
     debugPrintMemtierOnError,
     ensure_clean_benchmark_folder,
+    env_started_with_slaves,
     get_cluster_replica_connections,
     get_default_memtier_config,
     get_redis_conn_for_node,
@@ -127,14 +133,21 @@ def test_client_no_touch_lands_on_replica_discovered_via_cluster_slots(env):
     env.skipOnVersionSmaller("7.2")
 
     replica_conns = get_cluster_replica_connections(env)
-    env.assertTrue(
-        len(replica_conns) > 0,
-        message="expected at least one replica connection (OSS_CLUSTER_REPLICAS=1 "
-                "is always set for this test's CI cell); "
-                "get_cluster_replica_connections() returned none -- see module "
-                "docstring for why this is a hard failure here, not a skip",
-    )
     if not replica_conns:
+        if env_started_with_slaves(env):
+            # RLTest was asked for replicas (OSS_CLUSTER_REPLICAS=1's
+            # --use-slaves) but produced none -- see module docstring for
+            # why this is a hard failure rather than a skip here.
+            env.assertTrue(
+                False,
+                message="expected at least one replica connection: RLTest was "
+                        "started with --use-slaves but get_cluster_replica_connections() "
+                        "returned none",
+            )
+        else:
+            # Plain cluster cell (no TEST: pin collects this file too) --
+            # never asked for replicas, so finding none is expected.
+            env.skip()
         return
 
     _run_and_check_no_touch(

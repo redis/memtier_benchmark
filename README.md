@@ -274,13 +274,22 @@ new top-level blocks (emitted only when `--cluster-mode` is on AND
 
 ### Testing limitations
 
-The `OSS-CLUSTER + replicas: read-preference` CI matrix cell exercises the
-RLTest harness with `--use-slaves`, which starts replicas using `--slaveof`
-without `--cluster-enabled yes`. The resulting slave nodes are not part of
-cluster gossip - `CLUSTER SLOTS` returns empty replica arrays from each
-master, so memtier_benchmark cannot discover them. The test helper's
-`get_cluster_replica_connections()` gate detects this and skips the tests
-with a stderr warning.
+This repo's pinned RLTest fork (`tests/test_requirements.txt`) fixes the
+gossip-visibility gap this section used to describe: `--use-slaves` starts
+replicas via real `CLUSTER MEET`/`CLUSTER REPLICATE`, so they do join
+cluster gossip and `CLUSTER SLOTS` sees them. This is confirmed by
+`tests/test_client_no_touch_cluster.py`'s
+`test_client_no_touch_lands_on_replica_discovered_via_cluster_slots`,
+which requires (not skips-if-missing) a discovered replica in its own
+dedicated CI cell (`OSS-CLUSTER + replicas: client-no-touch`).
+
+The `read-preference` tests below (`test_read_preference_*.py`) still gate
+on `get_cluster_replica_connections()`'s original defensive skip path,
+written against the un-patched harness behavior this fork no longer has.
+Issue #462 (filed by this PR) originally tracked bootstrapping a real
+`redis-cli --cluster create` cluster to work around the gap; with the fork
+already fixing it, what's left is updating those five test files to assert
+rather than skip, which hasn't been done yet.
 
 The production read-routing code was verified empirically against real
 `redis-cli --cluster create` clusters with cluster-aware replicas under
