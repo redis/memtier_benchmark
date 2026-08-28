@@ -187,6 +187,10 @@ struct benchmark_config
     struct mget_slot_cache *mget_cache; // NULL unless cluster_mode && multi_key_get > 0
     const char *authenticate;
     int select_db;
+    // Sends CLIENT NO-TOUCH ON as a connection-setup command on every
+    // connection, so the benchmarked workload never itself refreshes
+    // LRU/LFU access recency for the keys it touches. Redis protocol only.
+    bool client_no_touch;
     const char *uri;
     bool no_expiry;
     bool resolve_on_connect;

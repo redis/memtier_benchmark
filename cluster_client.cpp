@@ -600,6 +600,7 @@ bool cluster_client::classify_read(const request *req) const
     case rt_cluster_slots:
     case rt_hello:
     case rt_readonly:
+    case rt_no_touch:
         return false;
     case rt_arbitrary: {
         const arbitrary_request *ar = static_cast<const arbitrary_request *>(req);
@@ -1942,10 +1943,10 @@ get_key_response cluster_client::get_key_for_conn(unsigned int command_index, un
     // setup_done check for reads too. Queueing onto the target's pool is
     // safe regardless of m_cluster_slots: the target's own fill_pipeline
     // calls is_conn_setup_done() (m_authentication && m_db_selection &&
-    // m_cluster_slots && m_hello && m_readonly_state all == setup_done)
-    // BEFORE draining the pool, so the queued read is held until the
-    // ladder completes and the slot map is valid. This mirrors the
-    // cross-shard write fix (a257fc2): producer side does not duplicate
+    // m_cluster_slots && m_hello && m_readonly_state && m_no_touch_state
+    // all == setup_done) BEFORE draining the pool, so the queued read is
+    // held until the ladder completes and the slot map is valid. This
+    // mirrors the cross-shard write fix (a257fc2): producer side does not duplicate
     // the readiness check that the drain side already enforces.
     //
     // The READONLY ack concern is already handled by is_conn_setup_done()'s

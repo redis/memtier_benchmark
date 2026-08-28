@@ -232,6 +232,7 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_db_selection(setup_done),
         m_cluster_slots(setup_done),
         m_readonly_state(setup_done),
+        m_no_touch_state(setup_done),
         m_reconnect_attempts(0),
         m_current_backoff_delay(1.0),
         m_reconnect_timer(NULL),
@@ -459,6 +460,11 @@ int shard_connection::connect(struct connect_info *addr)
     m_readonly_state = (m_role == role_replica && m_config->cluster_mode && is_redis_protocol(m_config->protocol))
                            ? setup_none
                            : setup_done;
+    // CLIENT NO-TOUCH: every connection, redis protocol only (CLI validation
+    // already rejects --client-no-touch on other protocols; re-checked here
+    // for defense-in-depth, matching the READONLY guard above). Re-armed on
+    // every reconnect because the flag is connection-scoped on the server.
+    m_no_touch_state = (m_config->client_no_touch && is_redis_protocol(m_config->protocol)) ? setup_none : setup_done;
 
     // setup socket
     int sockfd = setup_socket(addr);
@@ -531,7 +537,7 @@ void shard_connection::disconnect()
             // Only setup commands have no serialized capture (we never attempt
             // capture for those) — drop those.
             if (req->m_type == rt_auth || req->m_type == rt_select_db || req->m_type == rt_cluster_slots ||
-                req->m_type == rt_hello || req->m_type == rt_readonly) {
+                req->m_type == rt_hello || req->m_type == rt_readonly || req->m_type == rt_no_touch) {
                 delete req;
                 continue;
             }
@@ -586,6 +592,7 @@ void shard_connection::disconnect()
     m_cluster_slots = setup_done;
     m_hello = setup_done;
     m_readonly_state = setup_done;
+    m_no_touch_state = setup_done;
 
     // Drop any partial RESP parser state. A TCP RST received mid-bulk
     // (especially while draining a RESP3 push frame) would otherwise leave
@@ -685,6 +692,11 @@ const char *shard_connection::get_last_request_type()
         return "HELLO";
     case rt_readonly:
         return "READONLY";
+    case rt_no_touch:
+        // Underscore, not a space -- like CLUSTER_SLOTS above, so this
+        // stays a single space-delimited token in the last_cmd=%s field of
+        // the hang-diagnostic line (DEVELOPMENT.md documents that format).
+        return "CLIENT_NO-TOUCH";
     default:
         return "none";
     }
@@ -729,6 +741,7 @@ void shard_connection::push_req(request *req)
     case rt_cluster_slots:
     case rt_hello:
     case rt_readonly:
+    case rt_no_touch:
         break;
     }
     if (m_config->request_rate) {
@@ -915,22 +928,28 @@ void shard_connection::drain_replay_queue_after_reconnect()
     }
 }
 
-bool shard_connection::is_conn_setup_done()
+bool shard_connection::is_conn_setup_done() const
 {
     return m_authentication == setup_done && m_db_selection == setup_done && m_cluster_slots == setup_done &&
-           m_hello == setup_done && m_readonly_state == setup_done;
+           m_hello == setup_done && m_readonly_state == setup_done && m_no_touch_state == setup_done;
 }
 
 bool shard_connection::peer_client_has_any_setup_in_progress() const
 {
     // Walk every shard_connection on the same client. A peer "is mid-setup"
     // if it is either climbing the setup ladder (conn_in_progress) OR
-    // already TCP-connected but not yet ready for reads (HELLO/CLUSTER
-    // SLOTS/READONLY pending). Dead/disconnected peers don't count — they
+    // already TCP-connected but not yet ready for reads (CLUSTER
+    // SLOTS/READONLY pending -- is_ready_for_reads() doesn't gate on HELLO,
+    // see below). Dead/disconnected peers don't count — they
     // either gave up too, or they're racing us toward their own terminal
     // exit. Reconnect-pending peers (conn_disconnected but with
     // m_reconnect_attempts > 0 and m_reconnecting true) also count because
     // their timer is armed and they may yet rejoin the setup ladder.
+    //
+    // Gates on is_ready_for_reads(), not is_conn_setup_done(): a peer stuck
+    // at setup_sent on AUTH/HELLO/NO-TOUCH is NOT treated as mid-setup here,
+    // matching is_ready_for_reads()'s own scope (see its comment in
+    // shard_connection.h).
     if (m_conns_manager == NULL) return false;
     const std::vector<shard_connection *> &peers = m_conns_manager->get_connections();
     for (size_t i = 0; i < peers.size(); i++) {
@@ -989,12 +1008,31 @@ void shard_connection::send_conn_setup_commands(struct timeval timestamp)
         // first user-level send, so the bytes sit in the output buffer forever and the
         // connect-callback handle_event path has no chance to flush them. bufferevent_write
         // routes through bufferevent_trigger_nolock_ which forces the EPOLLOUT registration.
-        // Primaries don't hit this because all setup states default to setup_done, so
-        // send_conn_setup_commands is a no-op for them.
+        // Primaries don't hit this specific branch because m_readonly_state defaults to
+        // setup_done for them -- unlike CLIENT NO-TOUCH below, which does arm and send for
+        // primaries too, send_conn_setup_commands as a whole is not a no-op for them.
         static const char READONLY_CMD[] = "*1\r\n$8\r\nREADONLY\r\n";
         bufferevent_write(m_bev, READONLY_CMD, sizeof(READONLY_CMD) - 1);
         push_req(new request(rt_readonly, 0, &timestamp, 0));
         m_readonly_state = setup_sent;
+    }
+
+    // CLIENT NO-TOUCH: --client-no-touch only, every connection (primary and
+    // replica alike, unlike READONLY above). Appended after READONLY, not
+    // threaded in earlier, so AUTH/SELECT/HELLO/READONLY keep the relative
+    // wire order they've always had -- this ladder is one pipelined pass
+    // with no wait for any reply in between, so nothing depends on going
+    // before READONLY specifically.
+    //
+    // bufferevent_write: follows READONLY's precedent above; whether that
+    // precedent holds is open -- see #532 -- but bufferevent_write is safe
+    // either way.
+    if (m_no_touch_state == setup_none) {
+        benchmark_debug_log("sending CLIENT NO-TOUCH command.\n");
+        static const char NO_TOUCH_CMD[] = "*3\r\n$6\r\nCLIENT\r\n$8\r\nNO-TOUCH\r\n$2\r\nON\r\n";
+        bufferevent_write(m_bev, NO_TOUCH_CMD, sizeof(NO_TOUCH_CMD) - 1);
+        push_req(new request(rt_no_touch, 0, &timestamp, 0));
+        m_no_touch_state = setup_sent;
     }
 
     if (m_cluster_slots == setup_none) {
@@ -1159,6 +1197,27 @@ void shard_connection::process_response(void)
             } else {
                 m_hello = setup_done;
                 benchmark_debug_log("HELLO successful.\n");
+            }
+            break;
+        case rt_no_touch:
+            if (r->is_error()) {
+                benchmark_error_log("error: CLIENT NO-TOUCH failed [%s]\n", r->get_status());
+                {
+                    char buf[256];
+                    // Hint leads, not trails, since r->get_status() is
+                    // server-controlled and unbounded against this
+                    // fixed-size buffer. "May", not "requires": an ACL
+                    // denial hits this same message on a fully current
+                    // server too.
+                    snprintf(buf, sizeof(buf),
+                             "CLIENT NO-TOUCH failed (may require Redis 7.2+ or be denied by ACL): %s",
+                             r->get_status() ? r->get_status() : "");
+                    report_connection_stage_failure(buf);
+                }
+                error = true;
+            } else {
+                m_no_touch_state = setup_done;
+                benchmark_debug_log("CLIENT NO-TOUCH successful.\n");
             }
             break;
         case rt_readonly:

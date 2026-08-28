@@ -263,6 +263,13 @@ keys in one batch route to the same shard (no hash\-tag prefix).
 \fB\-\-select\-db\fR=\fI\,DB\/\fR
 DB number to select, when testing a redis server
 .TP
+\fB\-\-client\-no\-touch\fR
+Send CLIENT NO\-TOUCH ON as a connection\-setup command (redis
+protocol only, Redis 7.2+), so the benchmark's own traffic does
+not refresh key LRU/LFU access recency. On an older/rejecting
+server the connection fails loudly rather than silently running
+with the flag doing nothing
+.TP
 \fB\-\-distinct\-client\-seed\fR
 Use a different random seed for each client
 .TP
