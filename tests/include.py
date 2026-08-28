@@ -228,21 +228,6 @@ def agg_keyspace_range(master_nodes_connections):
     return overall_keyspace_range
 
 
-def env_started_with_slaves():
-    """True if RLTest was launched with --use-slaves for *this* invocation.
-
-    Checks sys.argv: run_tests.sh's run_tests() spawns a fresh `python3 -m
-    RLTest` subprocess per invocation, so sys.argv is scoped correctly to
-    the current run even when a single shell process makes more than one
-    invocation (e.g. a plain-cluster pass and a replicas pass back to
-    back). Doesn't depend on RLTest's env.envRunner.useSlaves/use_slaves
-    attribute shape, which isn't guaranteed across RLTest versions.
-    """
-    import sys
-
-    return "--use-slaves" in sys.argv
-
-
 def get_cluster_replica_connections(env):
     """Return List[redis.Redis] for every replica advertised by CLUSTER NODES.
 
@@ -263,6 +248,7 @@ def get_cluster_replica_connections(env):
     against a replica in this repo's own CI. The warning path here is not
     expected to fire in this repo's current test dependencies.
     """
+    import os
     import sys
     import redis as _redis
 
@@ -305,9 +291,13 @@ def get_cluster_replica_connections(env):
 
     # If RLTest was launched with useSlaves=True but CLUSTER NODES
     # advertises zero replicas, emit a loud warning so the silent skip
-    # is at least visible in test output.
+    # is at least visible in test output. MEMTIER_CLUSTER_REPLICAS_EXPECTED
+    # is set by run_tests.sh only inside the specific subshell that passes
+    # --use-slaves to RLTest -- the same signal
+    # test_client_no_touch_cluster.py's hard-fail gate uses, so there's one
+    # way to answer "did this invocation ask for replicas", not two.
     if not conns:
-        if env_started_with_slaves():
+        if os.environ.get("MEMTIER_CLUSTER_REPLICAS_EXPECTED") == "1":
             sys.stderr.write(
                 "warning: OSS_CLUSTER_REPLICAS=1 is set and RLTest started "
                 "slave nodes,\nbut CLUSTER NODES shows zero replicas "

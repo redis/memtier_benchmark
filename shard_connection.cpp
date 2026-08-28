@@ -938,8 +938,9 @@ bool shard_connection::peer_client_has_any_setup_in_progress() const
 {
     // Walk every shard_connection on the same client. A peer "is mid-setup"
     // if it is either climbing the setup ladder (conn_in_progress) OR
-    // already TCP-connected but not yet ready for reads (HELLO/CLUSTER
-    // SLOTS/READONLY pending). Dead/disconnected peers don't count — they
+    // already TCP-connected but not yet ready for reads (CLUSTER
+    // SLOTS/READONLY pending -- is_ready_for_reads() doesn't gate on HELLO,
+    // see below). Dead/disconnected peers don't count — they
     // either gave up too, or they're racing us toward their own terminal
     // exit. Reconnect-pending peers (conn_disconnected but with
     // m_reconnect_attempts > 0 and m_reconnecting true) also count because

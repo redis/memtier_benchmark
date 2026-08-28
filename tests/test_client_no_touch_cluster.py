@@ -5,15 +5,17 @@ bootstrap seed connection.
 
 Why this matters: send_conn_setup_commands() sends CLIENT NO-TOUCH via
 bufferevent_write() rather than a plain protocol-level evbuffer_add call,
-specifically because a connection whose FD was attached via
-bufferevent_socket_new() + a later bufferevent_socket_connect() (the path
-cluster_client::connect_shard_connection() uses for every shard connection
-except the single bootstrap seed connection -- every replica, and every
-primary beyond the first, discovered from a CLUSTER SLOTS reply) does not
-get its first user-level send's EPOLLOUT armed by the evbuffer notify
-callback on its own. tests/test_client_no_touch.py (standalone-only) can't
-exercise this: every connection in a standalone run IS the bootstrap seed
-connection.
+following the same precedent set by READONLY for connections discovered
+via a live CLUSTER SLOTS reply (every shard beyond the single bootstrap
+seed connection) -- cluster_client::connect_shard_connection() attaches
+those via bufferevent_socket_new() + a later bufferevent_socket_connect().
+Whether that precedent's original EPOLLOUT-arming diagnosis actually holds
+is an open question (see #532); bufferevent_write is safe either way, and
+this test exists to prove the actual observable behavior -- CLIENT
+NO-TOUCH reaching the server on a discovered connection -- regardless of
+which write path turns out to be necessary. tests/test_client_no_touch.py
+(standalone-only) can't exercise this: every connection in a standalone
+run IS the bootstrap seed connection.
 
 Two tests, two ways to land a connection on the "discovered" path. Only
 the dedicated "OSS-CLUSTER + replicas: client-no-touch" CI cell (which
