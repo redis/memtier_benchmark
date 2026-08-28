@@ -31,6 +31,20 @@ _KEY_PREFIX = "nt-test-"
 _KEY = _KEY_PREFIX + "1"
 
 
+def _client_ids(conn):
+    """Return the set of client ids currently in CLIENT LIST."""
+    raw = conn.execute_command("CLIENT", "LIST")
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    ids = set()
+    for line in raw.strip().split("\n"):
+        for part in line.split(" "):
+            if part.startswith("id="):
+                ids.add(part.split("=", 1)[1])
+                break
+    return ids
+
+
 def _wait_for_idle_time(master_connection, key, until, timeout=5.0, interval=0.2):
     """Poll OBJECT IDLETIME until `until(idle)` is true or `timeout` elapses.
 
@@ -254,6 +268,14 @@ def test_client_no_touch_resent_after_reconnect(env):
     # Let the MONITOR subscription land before memtier connects.
     time.sleep(0.15)
 
+    # Snapshot every client id already connected to this shared env (this
+    # test file's earlier tests, master_connection's own connection, the
+    # MONITOR connection above) before memtier connects, so the kill step
+    # below only ever targets connections that appear *after* this point --
+    # i.e. memtier's, not anything left idle by an earlier test in this
+    # file or by this test's own bookkeeping connections.
+    pre_run_ids = _client_ids(master_connection)
+
     config = get_default_memtier_config(threads=1, clients=1, test_time=7)
     config['memtier_benchmark']['requests'] = None
     args = [
@@ -288,26 +310,14 @@ def test_client_no_touch_resent_after_reconnect(env):
     # steady-state traffic before killing its connection.
     time.sleep(2.0)
 
-    killed_any = False
-    clients = master_connection.execute_command("CLIENT", "LIST")
-    if isinstance(clients, bytes):
-        clients = clients.decode("utf-8")
-    for line in clients.strip().split("\n"):
-        if not line.strip():
-            continue
-        info = {}
-        for part in line.split(" "):
-            if "=" in part:
-                k, v = part.split("=", 1)
-                info[k] = v
-        if info.get("cmd", "").startswith("client"):
-            continue  # our own CLIENT LIST connection
-        if "O" in info.get("flags", ""):
-            continue  # the MONITOR connection
-        if "id" in info:
-            master_connection.execute_command("CLIENT", "KILL", "ID", info["id"])
-            killed_any = True
-    env.assertTrue(killed_any, message="expected to find and kill the live memtier connection")
+    new_ids = _client_ids(master_connection) - pre_run_ids
+    env.assertTrue(
+        len(new_ids) > 0,
+        message="expected at least one new client connection (memtier's) since the "
+                "pre-run snapshot; found none to kill",
+    )
+    for client_id in new_ids:
+        master_connection.execute_command("CLIENT", "KILL", "ID", client_id)
 
     run_thread.join(timeout=20)
 

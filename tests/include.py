@@ -20,29 +20,29 @@ def get_redis_conn_for_node(env, node, **extra_kwargs):
     (as returned by env.getMasterNodesList(), or a replica dict with a
     'port'/'host' key), TLS-aware.
 
-    Used by tests/test_client_no_touch_cluster.py: skip server cert
-    verification (self-signed test certs, CN rarely matches "127.0.0.1")
-    and present the client cert/key when the env is TLS. extra_kwargs are
-    passed through to redis.Redis() as-is (e.g. decode_responses,
-    socket_connect_timeout) and take precedence over the TLS defaults if
-    they overlap.
+    Skips server cert verification (self-signed test certs, CN rarely
+    matches "127.0.0.1") and presents the client cert/key when the env is
+    TLS. extra_kwargs are passed through to redis.Redis() as-is (e.g.
+    decode_responses, socket_connect_timeout) and take precedence over the
+    TLS/unix-socket defaults if they overlap.
 
-    Unlike test_mget_protocol.py's near-identical _get_redis_conn(), this
-    has no env.isUnixSocket() branch -- fine for the cluster-only caller
-    above (cluster mode doesn't run over a unix socket), but don't reach
-    for this helper from a standalone/unix-socket-capable test without
-    adding one.
+    Used directly by tests/test_client_no_touch_cluster.py (cluster mode,
+    never a unix socket) and, via test_mget_protocol.py's _get_redis_conn()
+    wrapper, by standalone tests that may run over one.
     """
     import redis as _redis
 
-    kwargs = {"host": node.get("host") or "127.0.0.1", "port": node["port"]}
-    if getattr(env, "useTLS", False):
-        kwargs["ssl"] = True
-        kwargs["ssl_cert_reqs"] = "none"
-        if TLS_CERT:
-            kwargs["ssl_certfile"] = TLS_CERT
-        if TLS_KEY:
-            kwargs["ssl_keyfile"] = TLS_KEY
+    if env.isUnixSocket():
+        kwargs = {"unix_socket_path": node["unix_socket_path"]}
+    else:
+        kwargs = {"host": node.get("host") or "127.0.0.1", "port": node["port"]}
+        if getattr(env, "useTLS", False):
+            kwargs["ssl"] = True
+            kwargs["ssl_cert_reqs"] = "none"
+            if TLS_CERT:
+                kwargs["ssl_certfile"] = TLS_CERT
+            if TLS_KEY:
+                kwargs["ssl_keyfile"] = TLS_KEY
     kwargs.update(extra_kwargs)
     return _redis.Redis(**kwargs)
 

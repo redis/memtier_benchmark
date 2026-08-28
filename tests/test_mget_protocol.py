@@ -19,17 +19,13 @@ import tempfile
 import threading
 import time
 
-import redis
-
 from include import (
-    TLS_CACERT,
-    TLS_CERT,
-    TLS_KEY,
     add_required_env_arguments,
     addTLSArgs,
     debugPrintMemtierOnError,
     ensure_clean_benchmark_folder,
     get_default_memtier_config,
+    get_redis_conn_for_node,
 )
 from mb import Benchmark, RunConfig
 
@@ -39,22 +35,8 @@ from mb import Benchmark, RunConfig
 # ---------------------------------------------------------------------------
 
 def _get_redis_conn(env):
-    """Return a redis.Redis connection that matches the test environment."""
-    master_nodes_list = env.getMasterNodesList()
-    if env.isUnixSocket():
-        return redis.Redis(unix_socket_path=master_nodes_list[0]["unix_socket_path"])
-    kwargs = {"host": "127.0.0.1", "port": master_nodes_list[0]["port"]}
-    if getattr(env, "useTLS", False):
-        # Skip server cert verification: test certs are self-signed and the CN
-        # rarely matches "127.0.0.1", which would cause hostname-check failure.
-        # The server still verifies the client cert via ssl_certfile/ssl_keyfile.
-        kwargs["ssl"] = True
-        kwargs["ssl_cert_reqs"] = "none"
-        if TLS_CERT:
-            kwargs["ssl_certfile"] = TLS_CERT
-        if TLS_KEY:
-            kwargs["ssl_keyfile"] = TLS_KEY
-    return redis.Redis(**kwargs)
+    """Return a redis.Redis connection to this env's single master node."""
+    return get_redis_conn_for_node(env, env.getMasterNodesList()[0])
 
 
 def _capture_monitor(conn, results, stop_event):
