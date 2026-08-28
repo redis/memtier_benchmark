@@ -225,6 +225,7 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_request_rate_phase_pending(request_rate_phase_microsecond > 0),
         m_pending_resp(0),
         m_last_pushed_req_type(-1),
+        m_unsolicited_reply_warnings(0),
         m_connection_state(conn_disconnected),
         m_role(role_primary),
         m_hello(setup_done),
@@ -1065,6 +1066,54 @@ void shard_connection::process_response(void)
     while ((ret = m_protocol->parse_response()) > 0) {
         bool error = false;
         protocol_response *r = m_protocol->get_response();
+
+        // A reply with nothing outstanding is not ours to book. pop_req() would
+        // call front()/pop() on an empty std::queue -- undefined behaviour that
+        // the assert on m_pending_resp only reports afterwards, and that a
+        // -DNDEBUG build would not report at all. Discard the frame instead.
+        //
+        // Reachable from a server that sends more replies than requests: a
+        // multi-reply or streaming command (refused at parse time now, see
+        // is_multi_reply_command()), an out-of-band pub/sub message, or simply a
+        // buggy/hostile endpoint. Note the scope, which is narrower than "this
+        // fixes surplus replies":
+        //
+        //   * A *systematic* surplus (every request answered twice -- issue
+        //     #515's actual shape) drains the queue at any pipeline depth, so
+        //     this guard is load-bearing everywhere, not just at --pipeline=1.
+        //     Verified: the pre-fix build aborts at --pipeline 1, 2, 8 and 32
+        //     against a two-replies-per-request endpoint.
+        //   * What the guard cannot do is re-synchronise. A *sporadic* surplus
+        //     that arrives while a request is outstanding is booked against that
+        //     request instead, so the reply<->request correspondence stays
+        //     shifted and the run still reports numbers for it. Refusing the
+        //     input up front (is_multi_reply_command()) is what prevents that;
+        //     this guard only keeps a non-conforming endpoint from corrupting
+        //     memory. See the warning text for what the operator is told.
+        // (issue #515)
+        if (m_pipeline->empty()) {
+            if (m_unsolicited_reply_warnings < UNSOLICITED_REPLY_WARN_MAX) {
+                m_unsolicited_reply_warnings++;
+                // get_readable_id(), not m_address/m_port: those are NULL under
+                // --unix-socket (client::connect only sets them on the TCP path),
+                // which would print "server ?:?" in the one diagnostic the
+                // operator gets.
+                benchmark_error_log("warning: server %s sent a reply with no request outstanding; discarding "
+                                    "it. The endpoint is answering with more replies than requests (pub/sub "
+                                    "or a streaming command), so this connection's op count, ops/sec, "
+                                    "latencies, hit/miss split and RX bytes are all unreliable -- do not "
+                                    "trust this run's numbers.%s\n",
+                                    get_readable_id(),
+                                    (m_unsolicited_reply_warnings == UNSOLICITED_REPLY_WARN_MAX)
+                                        ? " Suppressing further warnings for this connection."
+                                        : "");
+            }
+            // continue, not break: parse_response() has already consumed this
+            // frame's bytes, and fill_pipeline() may disable the bufferevent
+            // once nothing is outstanding, leaving any further frames already in
+            // the read buffer unparsed until the next read event.
+            continue;
+        }
 
         request *req = pop_req();
         switch (req->m_type) {

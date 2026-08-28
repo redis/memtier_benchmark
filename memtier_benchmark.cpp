@@ -1951,6 +1951,25 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                                 cmd.command_args[0].data.c_str());
                         return -1;
                     }
+                    // Commands whose replies are not 1:1 with the request cannot
+                    // be timed as operations, and replaying them corrupts the
+                    // pending-response accounting: the surplus reply pops a
+                    // request that was never queued and trips the assert in
+                    // shard_connection::pop_req() (SIGABRT), or -- under RESP3,
+                    // where the confirmations are out-of-band push frames --
+                    // never retires the request and wedges the run past
+                    // --test-time. Reject at parse time so the user gets a
+                    // readable error instead of a crash (issue #515), same
+                    // treatment as the placeholder guard above.
+                    if (is_multi_reply_command(cmd.command_args[0].data)) {
+                        fprintf(stderr,
+                                "error: --command '%s' is not supported: the server does not answer it with "
+                                "exactly one reply per request (pub/sub replies once per channel; MONITOR and "
+                                "PSYNC stream continuously), so memtier cannot account or time it as an "
+                                "operation.\n",
+                                cmd.command_args[0].data.c_str());
+                        return -1;
+                    }
                     // Resolve key positions and reply shape from the static
                     // command_meta registry (vendored Redis commands.json).
                     // Memcached / module / unknown commands return spec=null
@@ -2722,6 +2741,11 @@ void usage()
         "                                 To use a generated key or object, enter:\n"
         "                                   __key__: Use key generated from Key Options.\n"
         "                                   __data__: Use data generated from Object Options.\n"
+        "                                 Commands the server does not answer with exactly one reply per\n"
+        "                                 request cannot be timed and are rejected: the pub/sub subscribe\n"
+        "                                 side (SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, PUNSUBSCRIBE,\n"
+        "                                 SSUBSCRIBE, SUNSUBSCRIBE) and the streaming commands (MONITOR,\n"
+        "                                 SYNC, PSYNC). PUBLISH is unaffected.\n"
         "      --command-ratio            The number of times the command is sent in sequence.(default: 1)\n"
         "      --command-key-pattern      Key pattern for the command (default: R):\n"
         "                                 G for Gaussian distribution.\n"
