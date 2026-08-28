@@ -336,9 +336,22 @@ def test_client_no_touch_resent_after_reconnect(env):
     run_thread = threading.Thread(target=_run)
     run_thread.start()
 
-    # Give memtier time to connect, finish its setup ladder, and start
-    # steady-state traffic before killing its connection.
-    time.sleep(2.0)
+    # Poll for the first-connection CLIENT NO-TOUCH ON to actually show up
+    # on the MONITOR feed before killing, instead of a fixed sleep: on a
+    # tight startup budget (this file has no TEST: pin in the OSS_STANDALONE
+    # cells of asan.yml/tsan.yml/ubsan.yml) a fixed delay can fire before
+    # memtier has even connected, leaving no client id to kill -- a hard
+    # assert, not a retry. Polling the already-populated `results` list ties
+    # the wait to the actual condition this test needs (NO-TOUCH sent once,
+    # so reconnecting can prove it's sent a second time), not a guess at
+    # how long connecting + the setup ladder takes.
+    deadline = time.time() + 15.0
+    while time.time() < deadline:
+        if any(e.get("command", "").upper().startswith("CLIENT NO-TOUCH") for e in results):
+            break
+        time.sleep(0.1)
+    else:
+        env.assertTrue(False, message="CLIENT NO-TOUCH ON never showed up on the initial connection")
 
     new_ids = set(_client_list(master_connection)) - pre_run_ids
     env.assertTrue(

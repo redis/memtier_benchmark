@@ -25,10 +25,6 @@ def get_redis_conn_for_node(env, node, **extra_kwargs):
     TLS. extra_kwargs are passed through to redis.Redis() as-is (e.g.
     decode_responses, socket_connect_timeout) and take precedence over the
     TLS/unix-socket defaults if they overlap.
-
-    Used directly by tests/test_client_no_touch_cluster.py (cluster mode,
-    never a unix socket) and, via test_mget_protocol.py's _get_redis_conn()
-    wrapper, by standalone tests that may run over one.
     """
     import redis as _redis
 
@@ -248,7 +244,6 @@ def get_cluster_replica_connections(env):
     against a replica in this repo's own CI. The warning path here is not
     expected to fire in this repo's current test dependencies.
     """
-    import os
     import sys
     import redis as _redis
 

@@ -1018,20 +1018,15 @@ void shard_connection::send_conn_setup_commands(struct timeval timestamp)
     }
 
     // CLIENT NO-TOUCH: --client-no-touch only, every connection (primary and
-    // replica alike, unlike READONLY above). Appended after AUTH/SELECT/
-    // HELLO/READONLY rather than threaded in earlier so those four keep the
-    // relative wire order they've always had; this ladder is written in one
-    // pipelined pass with no wait for any reply in between, so nothing here
-    // depends on going before READONLY specifically -- CLIENT NO-TOUCH's
-    // +OK reply parses the same regardless of RESP2/RESP3.
+    // replica alike, unlike READONLY above). Appended after READONLY, not
+    // threaded in earlier, so AUTH/SELECT/HELLO/READONLY keep the relative
+    // wire order they've always had -- this ladder is one pipelined pass
+    // with no wait for any reply in between, so nothing depends on going
+    // before READONLY specifically.
     //
-    // bufferevent_write instead of a protocol-level evbuffer_add call:
-    // matches the precedent set by READONLY above (see its comment) rather
-    // than independently justified here. Whether that precedent's original
-    // diagnosis holds is itself an open question -- see #532 -- but
-    // bufferevent_write is safe regardless (same wire bytes, no behavior
-    // change), so this follows it rather than diverging while that's
-    // unresolved.
+    // bufferevent_write: follows READONLY's precedent above; whether that
+    // precedent holds is open -- see #532 -- but bufferevent_write is safe
+    // either way.
     if (m_no_touch_state == setup_none) {
         benchmark_debug_log("sending CLIENT NO-TOUCH command.\n");
         static const char NO_TOUCH_CMD[] = "*3\r\n$6\r\nCLIENT\r\n$8\r\nNO-TOUCH\r\n$2\r\nON\r\n";
