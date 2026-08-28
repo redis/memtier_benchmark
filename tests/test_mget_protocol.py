@@ -22,6 +22,7 @@ import time
 from include import (
     add_required_env_arguments,
     addTLSArgs,
+    capture_monitor,
     debugPrintMemtierOnError,
     ensure_clean_benchmark_folder,
     get_default_memtier_config,
@@ -39,34 +40,11 @@ def _get_redis_conn(env):
     return get_redis_conn_for_node(env, env.getMasterNodesList()[0])
 
 
-def _capture_monitor(conn, results, stop_event):
-    """
-    Thread target: call Monitor.next_command() in a loop until stop_event is
-    set, appending each parsed command dict to *results*.
-
-    next_command() blocks on the network read; we rely on the connection
-    being closed (disconnect()) after stop_event is set to unblock the last
-    pending read.
-    """
-    try:
-        with conn.monitor() as m:
-            while not stop_event.is_set():
-                try:
-                    cmd = m.next_command()
-                    results.append(cmd)
-                except Exception:
-                    # Connection closed by _stop_monitor() or a transient read
-                    # error; either way we are done.
-                    break
-    except Exception:
-        pass
-
-
 def _start_monitor(conn):
     """Start a background MONITOR thread.  Returns (thread, results, stop_event)."""
     results = []
     stop_event = threading.Event()
-    t = threading.Thread(target=_capture_monitor,
+    t = threading.Thread(target=capture_monitor,
                          args=(conn, results, stop_event),
                          daemon=True)
     t.start()

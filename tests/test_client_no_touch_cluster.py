@@ -141,9 +141,12 @@ def test_client_no_touch_lands_on_replica_discovered_via_cluster_slots(env):
             # why this is a hard failure rather than a skip here.
             env.assertTrue(
                 False,
-                message="expected at least one replica connection: RLTest was "
-                        "started with --use-slaves but get_cluster_replica_connections() "
-                        "returned none",
+                message="test-harness problem, not a memtier bug: RLTest was started "
+                        "with --use-slaves (OSS_CLUSTER_REPLICAS=1) but CLUSTER NODES "
+                        "shows zero replicas -- the pinned RLTest fork "
+                        "(tests/test_requirements.txt) isn't producing cluster-visible "
+                        "replicas the way it did when this test was written. This test "
+                        "never got as far as sending CLIENT NO-TOUCH.",
             )
         else:
             # Plain cluster cell (no TEST: pin collects this file too) --
