@@ -945,10 +945,12 @@ bool shard_connection::peer_client_has_any_setup_in_progress() const
     // m_reconnect_attempts > 0 and m_reconnecting true) also count because
     // their timer is armed and they may yet rejoin the setup ladder.
     //
-    // Deliberately gates on is_ready_for_reads(), not is_conn_setup_done():
-    // a peer stuck at setup_sent on AUTH/HELLO/NO-TOUCH is NOT treated as
-    // mid-setup here, matching is_ready_for_reads()'s own scope (see its
-    // comment in shard_connection.h).
+    // Gates on is_ready_for_reads(), not is_conn_setup_done(): a peer stuck
+    // at setup_sent on AUTH/HELLO/NO-TOUCH is NOT treated as mid-setup here,
+    // matching is_ready_for_reads()'s own scope (see its comment in
+    // shard_connection.h). This is the safer of two options tried, not a
+    // settled design -- whether the wider gate's livelock risk was real is
+    // still an open question, see #529.
     if (m_conns_manager == NULL) return false;
     const std::vector<shard_connection *> &peers = m_conns_manager->get_connections();
     for (size_t i = 0; i < peers.size(); i++) {
@@ -1203,7 +1205,14 @@ void shard_connection::process_response(void)
                 benchmark_error_log("error: CLIENT NO-TOUCH failed [%s]\n", r->get_status());
                 {
                     char buf[256];
-                    snprintf(buf, sizeof(buf), "CLIENT NO-TOUCH failed: %s", r->get_status() ? r->get_status() : "");
+                    // The trailing reminder (not a diagnosis -- an ACL denial like
+                    // this feature's own test uses fails here too, on a fully
+                    // current server) puts the version floor in front of whoever
+                    // actually hits this: pointing --client-no-touch at a pre-7.2
+                    // server, where the only other signal is whatever -ERR text
+                    // that server chose to send.
+                    snprintf(buf, sizeof(buf), "CLIENT NO-TOUCH failed: %s (this command requires Redis 7.2+)",
+                             r->get_status() ? r->get_status() : "");
                     report_connection_stage_failure(buf);
                 }
                 error = true;
