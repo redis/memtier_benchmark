@@ -1024,9 +1024,13 @@ void shard_connection::send_conn_setup_commands(struct timeval timestamp)
     // depends on going before READONLY specifically -- CLIENT NO-TOUCH's
     // +OK reply parses the same regardless of RESP2/RESP3.
     //
-    // bufferevent_write instead of a protocol-level evbuffer_add call: same
-    // reason as READONLY above (see its comment), except CLIENT NO-TOUCH
-    // also arms on primaries, where READONLY's own send never has to.
+    // bufferevent_write instead of a protocol-level evbuffer_add call:
+    // matches the precedent set by READONLY above (see its comment) rather
+    // than independently justified here. Whether that precedent's original
+    // diagnosis holds is itself an open question -- see #532 -- but
+    // bufferevent_write is safe regardless (same wire bytes, no behavior
+    // change), so this follows it rather than diverging while that's
+    // unresolved.
     if (m_no_touch_state == setup_none) {
         benchmark_debug_log("sending CLIENT NO-TOUCH command.\n");
         static const char NO_TOUCH_CMD[] = "*3\r\n$6\r\nCLIENT\r\n$8\r\nNO-TOUCH\r\n$2\r\nON\r\n";
