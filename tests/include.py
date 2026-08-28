@@ -231,20 +231,12 @@ def agg_keyspace_range(master_nodes_connections):
 def env_started_with_slaves():
     """True if RLTest was launched with --use-slaves for *this* invocation.
 
-    Checks sys.argv, not the OSS_CLUSTER_REPLICAS environment variable (an
-    earlier version of this helper did, and got it wrong): run_tests.sh can
-    run multiple independent `python3 -m RLTest ...` invocations from one
-    shell process -- e.g. OSS_CLUSTER=1 OSS_CLUSTER_REPLICAS=1 together (this
-    file's own module docstring's second example) runs a plain cluster pass
-    with no --use-slaves, then a replicas pass with it -- and
-    OSS_CLUSTER_REPLICAS stays "1" in the environment for *both*, which made
-    the environment-variable version true even during the pass that never
-    asked for slaves. run_tests.sh's run_tests() spawns a fresh `python3 -m
-    RLTest` subprocess per invocation, so sys.argv is scoped correctly per
-    run. It also doesn't depend on RLTest's env.envRunner.useSlaves/
-    use_slaves attribute shape, which isn't guaranteed across RLTest
-    versions -- the original reason this helper stopped introspecting that
-    attribute directly.
+    Checks sys.argv: run_tests.sh's run_tests() spawns a fresh `python3 -m
+    RLTest` subprocess per invocation, so sys.argv is scoped correctly to
+    the current run even when a single shell process makes more than one
+    invocation (e.g. a plain-cluster pass and a replicas pass back to
+    back). Doesn't depend on RLTest's env.envRunner.useSlaves/use_slaves
+    attribute shape, which isn't guaranteed across RLTest versions.
     """
     import sys
 

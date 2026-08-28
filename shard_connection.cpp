@@ -1204,14 +1204,11 @@ void shard_connection::process_response(void)
                 benchmark_error_log("error: CLIENT NO-TOUCH failed [%s]\n", r->get_status());
                 {
                     char buf[256];
-                    // Hint leads, not trails: r->get_status() is server-
-                    // controlled and unbounded against this fixed-size
-                    // buffer, so anything after it can get silently
-                    // truncated, and the hint is the whole reason this
-                    // string exists. Phrased as "may" rather than asserting
-                    // either cause: an ACL denial (see this feature's own
-                    // test) hits this same message on a fully current
-                    // server, so it isn't only ever a version problem.
+                    // Hint leads, not trails, since r->get_status() is
+                    // server-controlled and unbounded against this
+                    // fixed-size buffer. "May", not "requires": an ACL
+                    // denial hits this same message on a fully current
+                    // server too.
                     snprintf(buf, sizeof(buf),
                              "CLIENT NO-TOUCH failed (may require Redis 7.2+ or be denied by ACL): %s",
                              r->get_status() ? r->get_status() : "");

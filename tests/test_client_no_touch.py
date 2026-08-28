@@ -31,18 +31,40 @@ _KEY_PREFIX = "nt-test-"
 _KEY = _KEY_PREFIX + "1"
 
 
-def _client_ids(conn):
-    """Return the set of client ids currently in CLIENT LIST."""
+def _client_list(conn):
+    """Return {id: flags} for every entry currently in CLIENT LIST."""
     raw = conn.execute_command("CLIENT", "LIST")
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8")
-    ids = set()
+    clients = {}
     for line in raw.strip().split("\n"):
+        info = {}
         for part in line.split(" "):
-            if part.startswith("id="):
-                ids.add(part.split("=", 1)[1])
-                break
-    return ids
+            if "=" in part:
+                k, v = part.split("=", 1)
+                info[k] = v
+        if "id" in info:
+            clients[info["id"]] = info.get("flags", "")
+    return clients
+
+
+def _wait_for_monitor_registered(control_conn, timeout=5.0, interval=0.05):
+    """Poll CLIENT LIST (via control_conn) until a connection with the
+    MONITOR flag ('O') shows up.
+
+    conn.monitor() sends MONITOR over a lazily-connected redis-py socket
+    that doesn't open until first use, so a fixed sleep before treating the
+    subscription as "up" can race on a loaded runner -- if it fires too
+    early, a caller that then snapshots CLIENT LIST for a later before/after
+    diff would miss the MONITOR connection's id and could end up killing its
+    own MONITOR connection. Poll instead.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if any("O" in flags for flags in _client_list(control_conn).values()):
+            return True
+        time.sleep(interval)
+    return False
 
 
 def _wait_for_idle_time(master_connection, key, until, timeout=5.0, interval=0.2):
@@ -265,8 +287,16 @@ def test_client_no_touch_resent_after_reconnect(env):
         target=capture_monitor, args=(monitor_conn, results, stop_event, errors), daemon=True
     )
     monitor_thread.start()
-    # Let the MONITOR subscription land before memtier connects.
-    time.sleep(0.15)
+    # Poll (not a fixed sleep) until the MONITOR subscription actually shows
+    # up in CLIENT LIST -- conn.monitor()'s underlying socket connects lazily
+    # on first use, so a fixed delay can race on a loaded runner. If it fires
+    # before MONITOR is actually up, the snapshot below wouldn't include the
+    # MONITOR connection's id, and the kill step would treat it as "new" (a
+    # memtier connection) and kill its own MONITOR mid-run.
+    env.assertTrue(
+        _wait_for_monitor_registered(master_connection),
+        message="MONITOR subscription never showed up in CLIENT LIST",
+    )
 
     # Snapshot every client id already connected to this shared env (this
     # test file's earlier tests, master_connection's own connection, the
@@ -274,7 +304,7 @@ def test_client_no_touch_resent_after_reconnect(env):
     # below only ever targets connections that appear *after* this point --
     # i.e. memtier's, not anything left idle by an earlier test in this
     # file or by this test's own bookkeeping connections.
-    pre_run_ids = _client_ids(master_connection)
+    pre_run_ids = set(_client_list(master_connection))
 
     config = get_default_memtier_config(threads=1, clients=1, test_time=7)
     config['memtier_benchmark']['requests'] = None
@@ -310,7 +340,7 @@ def test_client_no_touch_resent_after_reconnect(env):
     # steady-state traffic before killing its connection.
     time.sleep(2.0)
 
-    new_ids = _client_ids(master_connection) - pre_run_ids
+    new_ids = set(_client_list(master_connection)) - pre_run_ids
     env.assertTrue(
         len(new_ids) > 0,
         message="expected at least one new client connection (memtier's) since the "

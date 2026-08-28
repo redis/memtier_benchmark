@@ -24,17 +24,18 @@ asan.yml, tsan.yml and ubsan.yml, none of which start replicas at all.
 
 1. test_client_no_touch_lands_on_replica_discovered_via_cluster_slots
    targets a replica connection, via get_cluster_replica_connections()
-   (tests/include.py). Whether an empty result is a hard failure or a
-   skip depends on env_started_with_slaves() (tests/include.py): a hard
-   failure in the dedicated cell above (where a silent skip would let the
-   cell go green while only exercising the non-seed-primary case below --
-   exactly the coverage gap this cell exists to close), a skip in the
-   plain cluster cells, which never asked RLTest for replicas. This makes
-   it the first test in the repo to hard-require the pinned RLTest fork's
-   cluster-aware --use-slaves behavior (see tests/test_requirements.txt)
-   rather than skip on its absence -- if that fork branch moves, or
-   upstream RLTest#253 lands with different semantics, this is the test
-   that goes red.
+   (tests/include.py). Whether an empty result is a hard failure or a skip
+   depends on the MEMTIER_CLUSTER_REPLICAS_EXPECTED environment variable,
+   which run_tests.sh sets only inside the specific subshell that passes
+   --use-slaves to RLTest: a hard failure in the dedicated cell above
+   (where a silent skip would let the cell go green while only exercising
+   the non-seed-primary case below -- exactly the coverage gap this cell
+   exists to close), a skip in the plain cluster cells, which never asked
+   RLTest for replicas. This makes it the first test in the repo to
+   hard-require the pinned RLTest fork's cluster-aware --use-slaves
+   behavior (see tests/test_requirements.txt) rather than skip on its
+   absence -- if that fork branch moves, or upstream RLTest#253 lands with
+   different semantics, this is the test that goes red.
 
 2. test_client_no_touch_lands_on_non_seed_primary_discovered_via_cluster_slots
    needs no replicas: any shard beyond memtier's single bootstrap seed
@@ -47,6 +48,7 @@ Run with:
   TEST=test_client_no_touch_cluster.py OSS_CLUSTER=1 OSS_CLUSTER_REPLICAS=1 ./tests/run_tests.sh
 """
 
+import os
 import tempfile
 import threading
 import time
@@ -57,7 +59,6 @@ from include import (
     capture_monitor,
     debugPrintMemtierOnError,
     ensure_clean_benchmark_folder,
-    env_started_with_slaves,
     get_cluster_replica_connections,
     get_default_memtier_config,
     get_redis_conn_for_node,
@@ -135,10 +136,15 @@ def test_client_no_touch_lands_on_replica_discovered_via_cluster_slots(env):
 
     replica_conns = get_cluster_replica_connections(env)
     if not replica_conns:
-        if env_started_with_slaves():
-            # RLTest was asked for replicas (OSS_CLUSTER_REPLICAS=1's
-            # --use-slaves) but produced none -- see module docstring for
-            # why this is a hard failure rather than a skip here.
+        if os.environ.get("MEMTIER_CLUSTER_REPLICAS_EXPECTED") == "1":
+            # run_tests.sh sets this only inside the OSS_CLUSTER_REPLICAS=1
+            # subshell that actually passes --use-slaves to RLTest -- a
+            # purpose-built signal for exactly this gate, not inferred from
+            # OSS_CLUSTER_REPLICAS (which stays "1" in the environment even
+            # during a separate, replica-less invocation the same script run
+            # can also make -- see run_tests.sh's own comment) or from
+            # RLTest's own argv/attributes. See module docstring for why an
+            # empty result here is a hard failure rather than a skip.
             env.assertTrue(
                 False,
                 message="test-harness problem, not a memtier bug: RLTest was started "

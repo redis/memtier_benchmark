@@ -195,6 +195,19 @@ With the default `command` breakdown, you'll see aggregated stats for "Sets" and
 
 > **Note:** When using `--command-stats-breakdown=command`, the JSON output's Time-Serie percentiles (p50, p99, etc.) for aggregated command types are approximate. They reflect only one of the underlying commands rather than a true merge of all commands of that type. Totals, counts, bytes, and average latency are correctly aggregated.
 
+## Known limitations
+
+**Connection-setup ordering under `--retry-on-error`.** memtier sends a
+per-connection setup ladder (AUTH, SELECT, HELLO, READONLY, CLIENT
+NO-TOUCH) before any user-level traffic on that connection. Under
+`--retry-on-error`, a small window exists where a replayed, retried, or
+MOVED-redirected request can reach the server on a connection whose ladder
+hasn't finished yet -- see issue #527 for the full finding. This isn't
+specific to any one setup step, and isn't specific to cluster mode or
+read-preference either: landing in the wrong DB under `--select-db` is a
+worse instance of the same gap than one key's LRU/LFU recency being wrong
+under `--client-no-touch`. Not yet fixed; tracked in #527.
+
 ## Crash Reporting
 
 memtier_benchmark includes built-in crash handling that automatically generates detailed bug reports when the program crashes. If you encounter a crash, the tool will print a comprehensive report including:
@@ -296,19 +309,6 @@ The production read-routing code was verified empirically against real
 both RESP2 and RESP3. See PR #456 round-18 reviewer reports for the
 measurements: all four modes (primary, secondary, secondaryPreferred,
 nearest) route reads correctly to replicas, with zero leakage to primaries.
-
-### Known limitations
-
-**Connection-setup ordering under `--retry-on-error`.** memtier sends a
-per-connection setup ladder (AUTH, SELECT, HELLO, READONLY, CLIENT
-NO-TOUCH) before any user-level traffic on that connection. Under
-`--retry-on-error`, a small window exists where a replayed, retried, or
-MOVED-redirected request can reach the server on a connection whose ladder
-hasn't finished yet -- see issue #527 for the full finding. This isn't
-specific to any one setup step: landing in the wrong DB under
-`--select-db` is a worse instance of the same gap than one key's LRU/LFU
-recency being wrong under `--client-no-touch`. Not yet fixed; tracked in
-#527.
 
 ### Using rate-limiting for informed benchmarking
 

@@ -137,8 +137,16 @@ E=0
 # RLTest's --use-slaves flag tells RLTest to start replica nodes alongside each
 # master so that read-preference tests can route traffic to replicas.  The
 # shard count is taken from the SHARDS variable (default: 3).
+#
+# MEMTIER_CLUSTER_REPLICAS_EXPECTED=1 is set only inside this subshell (not
+# globally, unlike OSS_CLUSTER_REPLICAS itself) so tests can tell "this
+# specific RLTest invocation passed --use-slaves" from "OSS_CLUSTER_REPLICAS=1
+# was set somewhere in this script's environment" -- those differ when
+# OSS_CLUSTER=1 and OSS_CLUSTER_REPLICAS=1 are both set, since that runs the
+# plain-cluster block above (no --use-slaves) and this one, and the latter
+# variable stays "1" in the environment for both.
 [[ $OSS_CLUSTER_REPLICAS == 1 ]] && {
-	(ROOT_FOLDER=$ROOT TLS_KEY=$TLS_KEY TLS_CERT=$TLS_CERT TLS_CACERT=$TLS_CACERT MEMTIER_BINARY=$MEMTIER_BINARY RLTEST_ARGS="${RLTEST_ARGS} --env oss-cluster --shards-count $SHARDS --use-slaves" run_tests "tests on OSS cluster with replicas (read-preference)")
+	(ROOT_FOLDER=$ROOT TLS_KEY=$TLS_KEY TLS_CERT=$TLS_CERT TLS_CACERT=$TLS_CACERT MEMTIER_BINARY=$MEMTIER_BINARY MEMTIER_CLUSTER_REPLICAS_EXPECTED=1 RLTEST_ARGS="${RLTEST_ARGS} --env oss-cluster --shards-count $SHARDS --use-slaves" run_tests "tests on OSS cluster with replicas (read-preference)")
 	((E |= $?))
 } || true
 
