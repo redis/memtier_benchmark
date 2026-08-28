@@ -56,6 +56,7 @@ enum PROTOCOL_TYPE
     PROTOCOL_RESP3,
     PROTOCOL_MEMCACHE_TEXT,
     PROTOCOL_MEMCACHE_BINARY,
+    PROTOCOL_MEMCACHE_META,
 };
 
 // ---------------------------------------------------------------------------

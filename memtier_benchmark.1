@@ -29,7 +29,8 @@ Force IPv6 address resolution.
 .TP
 \fB\-P\fR, \fB\-\-protocol\fR=\fI\,PROTOCOL\/\fR
 Protocol to use (default: redis).
-other supported protocols are resp2, resp3, memcache_text and memcache_binary.
+other supported protocols are resp2, resp3, memcache_text, memcache_binary and memcache_meta
+(the modern Memcached meta-command protocol, available in memcached 1.6+).
 when using one of resp2 or resp3 the redis protocol version will be set via HELLO command.
 .TP
 \fB\-a\fR, \fB\-\-authenticate\fR=\fI\,CREDENTIALS\/\fR Authenticate using specified credentials.
