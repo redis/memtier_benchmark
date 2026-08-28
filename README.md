@@ -300,8 +300,8 @@ nearest) route reads correctly to replicas, with zero leakage to primaries.
 ### Known limitations
 
 **Connection-setup ordering under `--retry-on-error`.** memtier sends a
-per-connection setup ladder (AUTH, SELECT, HELLO, CLIENT NO-TOUCH,
-READONLY) before any user-level traffic on that connection. Under
+per-connection setup ladder (AUTH, SELECT, HELLO, READONLY, CLIENT
+NO-TOUCH) before any user-level traffic on that connection. Under
 `--retry-on-error`, a small window exists where a replayed, retried, or
 MOVED-redirected request can reach the server on a connection whose ladder
 hasn't finished yet -- see issue #527 for the full finding. This isn't
