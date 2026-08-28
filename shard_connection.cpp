@@ -992,24 +992,6 @@ void shard_connection::send_conn_setup_commands(struct timeval timestamp)
         m_hello = setup_sent;
     }
 
-    // CLIENT NO-TOUCH: --client-no-touch only, every connection (primary and
-    // replica alike, unlike READONLY below). Position after HELLO / before
-    // READONLY-CLUSTER SLOTS is ladder-ordering consistency, not a
-    // dependency: this ladder is written in one pipelined pass with no wait
-    // for any reply in between, so wire order is what matters, and CLIENT
-    // NO-TOUCH's +OK reply parses the same regardless of RESP2/RESP3.
-    //
-    // bufferevent_write instead of a protocol-level evbuffer_add call: same
-    // reason as READONLY below (see its comment), except CLIENT NO-TOUCH
-    // also arms on primaries, where READONLY's own send never has to.
-    if (m_no_touch_state == setup_none) {
-        benchmark_debug_log("sending CLIENT NO-TOUCH command.\n");
-        static const char NO_TOUCH_CMD[] = "*3\r\n$6\r\nCLIENT\r\n$8\r\nNO-TOUCH\r\n$2\r\nON\r\n";
-        bufferevent_write(m_bev, NO_TOUCH_CMD, sizeof(NO_TOUCH_CMD) - 1);
-        push_req(new request(rt_no_touch, 0, &timestamp, 0));
-        m_no_touch_state = setup_sent;
-    }
-
     // READONLY: replica connections only (cluster mode). Sent after AUTH/SELECT/
     // HELLO so any earlier failure is surfaced first, and before CLUSTER SLOTS
     // so the slot-discovery command itself is allowed (the server otherwise
@@ -1026,12 +1008,31 @@ void shard_connection::send_conn_setup_commands(struct timeval timestamp)
         // connect-callback handle_event path has no chance to flush them. bufferevent_write
         // routes through bufferevent_trigger_nolock_ which forces the EPOLLOUT registration.
         // Primaries don't hit this specific branch because m_readonly_state defaults to
-        // setup_done for them -- unlike CLIENT NO-TOUCH above, which does arm and send for
+        // setup_done for them -- unlike CLIENT NO-TOUCH below, which does arm and send for
         // primaries too, send_conn_setup_commands as a whole is not a no-op for them.
         static const char READONLY_CMD[] = "*1\r\n$8\r\nREADONLY\r\n";
         bufferevent_write(m_bev, READONLY_CMD, sizeof(READONLY_CMD) - 1);
         push_req(new request(rt_readonly, 0, &timestamp, 0));
         m_readonly_state = setup_sent;
+    }
+
+    // CLIENT NO-TOUCH: --client-no-touch only, every connection (primary and
+    // replica alike, unlike READONLY above). Appended after AUTH/SELECT/
+    // HELLO/READONLY rather than threaded in earlier so those four keep the
+    // relative wire order they've always had; this ladder is written in one
+    // pipelined pass with no wait for any reply in between, so nothing here
+    // depends on going before READONLY specifically -- CLIENT NO-TOUCH's
+    // +OK reply parses the same regardless of RESP2/RESP3.
+    //
+    // bufferevent_write instead of a protocol-level evbuffer_add call: same
+    // reason as READONLY above (see its comment), except CLIENT NO-TOUCH
+    // also arms on primaries, where READONLY's own send never has to.
+    if (m_no_touch_state == setup_none) {
+        benchmark_debug_log("sending CLIENT NO-TOUCH command.\n");
+        static const char NO_TOUCH_CMD[] = "*3\r\n$6\r\nCLIENT\r\n$8\r\nNO-TOUCH\r\n$2\r\nON\r\n";
+        bufferevent_write(m_bev, NO_TOUCH_CMD, sizeof(NO_TOUCH_CMD) - 1);
+        push_req(new request(rt_no_touch, 0, &timestamp, 0));
+        m_no_touch_state = setup_sent;
     }
 
     if (m_cluster_slots == setup_none) {
@@ -1203,15 +1204,16 @@ void shard_connection::process_response(void)
                 benchmark_error_log("error: CLIENT NO-TOUCH failed [%s]\n", r->get_status());
                 {
                     char buf[256];
-                    // Version note leads, not trails: r->get_status() is
-                    // server-controlled and unbounded, and this buffer is
-                    // fixed-size, so anything after it can get silently
-                    // truncated -- the note is the whole reason this string
-                    // exists, so it can't be the part that's optional. It's
-                    // a reminder, not a diagnosis: an ACL denial (see this
-                    // feature's own test) fails here too, on a fully
-                    // current server.
-                    snprintf(buf, sizeof(buf), "CLIENT NO-TOUCH failed (this command requires Redis 7.2+): %s",
+                    // Hint leads, not trails: r->get_status() is server-
+                    // controlled and unbounded against this fixed-size
+                    // buffer, so anything after it can get silently
+                    // truncated, and the hint is the whole reason this
+                    // string exists. Phrased as "may" rather than asserting
+                    // either cause: an ACL denial (see this feature's own
+                    // test) hits this same message on a fully current
+                    // server, so it isn't only ever a version problem.
+                    snprintf(buf, sizeof(buf),
+                             "CLIENT NO-TOUCH failed (may require Redis 7.2+ or be denied by ACL): %s",
                              r->get_status() ? r->get_status() : "");
                     report_connection_stage_failure(buf);
                 }
