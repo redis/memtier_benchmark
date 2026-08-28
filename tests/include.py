@@ -68,6 +68,42 @@ def capture_monitor(conn, results, stop_event, errors=None):
             errors.append(e)
 
 
+def client_list(conn):
+    """Return {id: flags} for every entry currently in CLIENT LIST."""
+    raw = conn.execute_command("CLIENT", "LIST")
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    clients = {}
+    for line in raw.strip().split("\n"):
+        info = {}
+        for part in line.split(" "):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                info[k] = v
+        if "id" in info:
+            clients[info["id"]] = info.get("flags", "")
+    return clients
+
+
+def wait_for_monitor_registered(control_conn, timeout=5.0, interval=0.05):
+    """Poll CLIENT LIST (via control_conn) until a connection with the
+    MONITOR flag ('O') shows up.
+
+    conn.monitor() sends MONITOR over a lazily-connected redis-py socket
+    that doesn't open until first use, so a fixed sleep before treating the
+    subscription as "up" can race on a loaded runner -- if it fires too
+    early, a caller that then snapshots CLIENT LIST for a later before/after
+    diff would miss the MONITOR connection's id and could end up killing its
+    own MONITOR connection. Poll instead.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if any("O" in flags for flags in client_list(control_conn).values()):
+            return True
+        time.sleep(interval)
+    return False
+
+
 def ensure_tls_protocols(master_nodes_connections):
     if TLS_PROTOCOLS != "":
         # if we've specified the TLS_PROTOCOLS env variable ensure the server enforces thos protocol versions
@@ -224,6 +260,21 @@ def agg_keyspace_range(master_nodes_connections):
     return overall_keyspace_range
 
 
+def replicas_expected():
+    """True if this RLTest invocation is expected to have replicas.
+
+    ORs two signals rather than picking one: MEMTIER_CLUSTER_REPLICAS_EXPECTED,
+    which run_tests.sh sets only inside the specific subshell that passes
+    --use-slaves to RLTest (the precise, correctly-scoped signal for the
+    normal run_tests.sh path), and sys.argv, so someone invoking `python3 -m
+    RLTest --use-slaves ...` directly -- bypassing run_tests.sh entirely --
+    still gets the loud warning / hard-fail instead of a silent skip.
+    """
+    import sys
+
+    return os.environ.get("MEMTIER_CLUSTER_REPLICAS_EXPECTED") == "1" or "--use-slaves" in sys.argv
+
+
 def get_cluster_replica_connections(env):
     """Return List[redis.Redis] for every replica advertised by CLUSTER NODES.
 
@@ -284,15 +335,12 @@ def get_cluster_replica_connections(env):
             )
         )
 
-    # If RLTest was launched with useSlaves=True but CLUSTER NODES
-    # advertises zero replicas, emit a loud warning so the silent skip
-    # is at least visible in test output. MEMTIER_CLUSTER_REPLICAS_EXPECTED
-    # is set by run_tests.sh only inside the specific subshell that passes
-    # --use-slaves to RLTest -- the same signal
-    # test_client_no_touch_cluster.py's hard-fail gate uses, so there's one
-    # way to answer "did this invocation ask for replicas", not two.
+    # If RLTest was launched expecting replicas but CLUSTER NODES advertises
+    # zero, emit a loud warning so the silent skip is at least visible in
+    # test output. Same replicas_expected() signal test_client_no_touch_cluster.py's
+    # hard-fail gate uses.
     if not conns:
-        if os.environ.get("MEMTIER_CLUSTER_REPLICAS_EXPECTED") == "1":
+        if replicas_expected():
             sys.stderr.write(
                 "warning: OSS_CLUSTER_REPLICAS=1 is set and RLTest started "
                 "slave nodes,\nbut CLUSTER NODES shows zero replicas "

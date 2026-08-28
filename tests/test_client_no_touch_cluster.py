@@ -27,9 +27,8 @@ asan.yml, tsan.yml and ubsan.yml, none of which start replicas at all.
 1. test_client_no_touch_lands_on_replica_discovered_via_cluster_slots
    targets a replica connection, via get_cluster_replica_connections()
    (tests/include.py). Whether an empty result is a hard failure or a skip
-   depends on the MEMTIER_CLUSTER_REPLICAS_EXPECTED environment variable,
-   which run_tests.sh sets only inside the specific subshell that passes
-   --use-slaves to RLTest: a hard failure in the dedicated cell above
+   depends on replicas_expected() (tests/include.py): a hard failure in
+   the dedicated cell above
    (where a silent skip would let the cell go green while only exercising
    the non-seed-primary case below -- exactly the coverage gap this cell
    exists to close), a skip in the plain cluster cells, which never asked
@@ -50,7 +49,6 @@ Run with:
   TEST=test_client_no_touch_cluster.py OSS_CLUSTER=1 OSS_CLUSTER_REPLICAS=1 ./tests/run_tests.sh
 """
 
-import os
 import tempfile
 import threading
 import time
@@ -64,6 +62,8 @@ from include import (
     get_cluster_replica_connections,
     get_default_memtier_config,
     get_redis_conn_for_node,
+    replicas_expected,
+    wait_for_monitor_registered,
 )
 from mb import Benchmark, RunConfig
 
@@ -79,9 +79,25 @@ def _run_and_check_no_touch(env, conn, extra_args):
         target=capture_monitor, args=(conn, results, stop_event, errors), daemon=True
     )
     monitor_thread.start()
-    # Give the MONITOR subscription time to be acknowledged before memtier
-    # connects, mirroring tests/test_mget_protocol.py's established pattern.
-    time.sleep(0.15)
+    # Poll (not a fixed sleep) until the MONITOR subscription actually shows
+    # up in CLIENT LIST -- this file is collected by the asan/tsan/ubsan
+    # cluster cells too, the slowest runners, where a missed MONITOR attach
+    # costs a red build rather than a retry. Needs its own connection to the
+    # *same* node `conn` is monitoring (CLIENT LIST is per-server, and
+    # `conn` itself is busy in capture_monitor's thread) -- pull host/port
+    # from conn's own connection kwargs specifically, not a blind ** of the
+    # whole dict (redis-py's ConnectionPool carries internal bookkeeping
+    # keys there that aren't valid Redis() constructor arguments), and
+    # rebuild via get_redis_conn_for_node() for the same TLS handling `conn`
+    # itself was built with.
+    conn_kwargs = conn.connection_pool.connection_kwargs
+    control_conn = get_redis_conn_for_node(
+        env, {"host": conn_kwargs.get("host"), "port": conn_kwargs["port"]}
+    )
+    env.assertTrue(
+        wait_for_monitor_registered(control_conn),
+        message="MONITOR subscription never showed up in CLIENT LIST",
+    )
 
     try:
         config = get_default_memtier_config(threads=1, clients=1, test_time=3)
@@ -114,6 +130,10 @@ def _run_and_check_no_touch(env, conn, extra_args):
             conn.connection_pool.disconnect()
         except Exception:
             pass
+        try:
+            control_conn.connection_pool.disconnect()
+        except Exception:
+            pass
         monitor_thread.join(timeout=5)
 
     no_touch_seen = any(
@@ -138,15 +158,9 @@ def test_client_no_touch_lands_on_replica_discovered_via_cluster_slots(env):
 
     replica_conns = get_cluster_replica_connections(env)
     if not replica_conns:
-        if os.environ.get("MEMTIER_CLUSTER_REPLICAS_EXPECTED") == "1":
-            # run_tests.sh sets this only inside the OSS_CLUSTER_REPLICAS=1
-            # subshell that actually passes --use-slaves to RLTest -- a
-            # purpose-built signal for exactly this gate, not inferred from
-            # OSS_CLUSTER_REPLICAS (which stays "1" in the environment even
-            # during a separate, replica-less invocation the same script run
-            # can also make -- see run_tests.sh's own comment) or from
-            # RLTest's own argv/attributes. See module docstring for why an
-            # empty result here is a hard failure rather than a skip.
+        if replicas_expected():
+            # See module docstring for why an empty result here is a hard
+            # failure rather than a skip.
             env.assertTrue(
                 False,
                 message="test-harness problem, not a memtier bug: RLTest was started "
