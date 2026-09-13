@@ -19,17 +19,14 @@ import tempfile
 import threading
 import time
 
-import redis
-
 from include import (
-    TLS_CACERT,
-    TLS_CERT,
-    TLS_KEY,
     add_required_env_arguments,
     addTLSArgs,
+    capture_monitor,
     debugPrintMemtierOnError,
     ensure_clean_benchmark_folder,
     get_default_memtier_config,
+    get_redis_conn_for_node,
 )
 from mb import Benchmark, RunConfig
 
@@ -39,52 +36,15 @@ from mb import Benchmark, RunConfig
 # ---------------------------------------------------------------------------
 
 def _get_redis_conn(env):
-    """Return a redis.Redis connection that matches the test environment."""
-    master_nodes_list = env.getMasterNodesList()
-    if env.isUnixSocket():
-        return redis.Redis(unix_socket_path=master_nodes_list[0]["unix_socket_path"])
-    kwargs = {"host": "127.0.0.1", "port": master_nodes_list[0]["port"]}
-    if getattr(env, "useTLS", False):
-        # Skip server cert verification: test certs are self-signed and the CN
-        # rarely matches "127.0.0.1", which would cause hostname-check failure.
-        # The server still verifies the client cert via ssl_certfile/ssl_keyfile.
-        kwargs["ssl"] = True
-        kwargs["ssl_cert_reqs"] = "none"
-        if TLS_CERT:
-            kwargs["ssl_certfile"] = TLS_CERT
-        if TLS_KEY:
-            kwargs["ssl_keyfile"] = TLS_KEY
-    return redis.Redis(**kwargs)
-
-
-def _capture_monitor(conn, results, stop_event):
-    """
-    Thread target: call Monitor.next_command() in a loop until stop_event is
-    set, appending each parsed command dict to *results*.
-
-    next_command() blocks on the network read; we rely on the connection
-    being closed (disconnect()) after stop_event is set to unblock the last
-    pending read.
-    """
-    try:
-        with conn.monitor() as m:
-            while not stop_event.is_set():
-                try:
-                    cmd = m.next_command()
-                    results.append(cmd)
-                except Exception:
-                    # Connection closed by _stop_monitor() or a transient read
-                    # error; either way we are done.
-                    break
-    except Exception:
-        pass
+    """Return a redis.Redis connection to this env's single master node."""
+    return get_redis_conn_for_node(env, env.getMasterNodesList()[0])
 
 
 def _start_monitor(conn):
     """Start a background MONITOR thread.  Returns (thread, results, stop_event)."""
     results = []
     stop_event = threading.Event()
-    t = threading.Thread(target=_capture_monitor,
+    t = threading.Thread(target=capture_monitor,
                          args=(conn, results, stop_event),
                          daemon=True)
     t.start()

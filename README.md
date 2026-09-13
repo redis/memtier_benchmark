@@ -195,6 +195,19 @@ With the default `command` breakdown, you'll see aggregated stats for "Sets" and
 
 > **Note:** When using `--command-stats-breakdown=command`, the JSON output's Time-Serie percentiles (p50, p99, etc.) for aggregated command types are approximate. They reflect only one of the underlying commands rather than a true merge of all commands of that type. Totals, counts, bytes, and average latency are correctly aggregated.
 
+## Known limitations
+
+**Connection-setup ordering under `--retry-on-error`.** memtier sends a
+per-connection setup ladder (AUTH, SELECT, HELLO, READONLY, CLIENT
+NO-TOUCH) before any user-level traffic on that connection. Under
+`--retry-on-error`, a small window exists where a replayed, retried, or
+MOVED-redirected request can reach the server on a connection whose ladder
+hasn't finished yet -- see issue #527 for the full finding. This isn't
+specific to any one setup step, and isn't specific to cluster mode or
+read-preference either: landing in the wrong DB under `--select-db` is a
+worse instance of the same gap than one key's LRU/LFU recency being wrong
+under `--client-no-touch`. Not yet fixed; tracked in #527.
+
 ## Crash Reporting
 
 memtier_benchmark includes built-in crash handling that automatically generates detailed bug reports when the program crashes. If you encounter a crash, the tool will print a comprehensive report including:
@@ -274,22 +287,28 @@ new top-level blocks (emitted only when `--cluster-mode` is on AND
 
 ### Testing limitations
 
-The `OSS-CLUSTER + replicas: read-preference` CI matrix cell exercises the
-RLTest harness with `--use-slaves`, which starts replicas using `--slaveof`
-without `--cluster-enabled yes`. The resulting slave nodes are not part of
-cluster gossip - `CLUSTER SLOTS` returns empty replica arrays from each
-master, so memtier_benchmark cannot discover them. The test helper's
-`get_cluster_replica_connections()` gate detects this and skips the tests
-with a stderr warning.
+This repo's pinned RLTest fork (`tests/test_requirements.txt`) fixes the
+gossip-visibility gap this section used to describe: `--use-slaves` starts
+replicas via real `CLUSTER MEET`/`CLUSTER REPLICATE`, so they do join
+cluster gossip and `CLUSTER SLOTS` sees them. This is confirmed by
+`tests/test_client_no_touch_cluster.py`'s
+`test_client_no_touch_lands_on_replica_discovered_via_cluster_slots`,
+which requires (not skips-if-missing) a discovered replica in its own
+dedicated CI cell (`OSS-CLUSTER + replicas: client-no-touch`).
+
+The `read-preference` tests below (`test_read_preference_*.py`) still gate
+on `get_cluster_replica_connections()`'s original defensive skip path,
+written against the un-patched harness behavior this fork no longer has.
+Issue #462 originally tracked bootstrapping a real `redis-cli --cluster
+create` cluster to work around the gap; with the fork already fixing it,
+what's left is updating those five test files to assert rather than skip,
+which hasn't been done yet (see the issue for the current status).
 
 The production read-routing code was verified empirically against real
 `redis-cli --cluster create` clusters with cluster-aware replicas under
 both RESP2 and RESP3. See PR #456 round-18 reviewer reports for the
 measurements: all four modes (primary, secondary, secondaryPreferred,
 nearest) route reads correctly to replicas, with zero leakage to primaries.
-
-A follow-up fixture that bootstraps a real `redis-cli --cluster create`
-cluster within the test harness is tracked in issue #462 (filed by this PR).
 
 ### Using rate-limiting for informed benchmarking
 

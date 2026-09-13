@@ -73,7 +73,8 @@ enum request_type
     rt_select_db,
     rt_cluster_slots,
     rt_hello,
-    rt_readonly
+    rt_readonly,
+    rt_no_touch
 };
 struct request
 {
@@ -205,6 +206,10 @@ public:
     // TCP connected, cluster-slots ladder done, and (for replicas) the
     // READONLY ladder also done. Primaries satisfy the last condition
     // trivially because m_readonly_state is initialised to setup_done.
+    //
+    // Also deliberately excludes m_no_touch_state, same as m_authentication,
+    // m_db_selection and m_hello above -- fill_pipeline() gates actual sends
+    // on the separate is_conn_setup_done() check, which does include it.
     bool is_ready_for_reads() const
     {
         if (m_connection_state != conn_connected) return false;
@@ -299,7 +304,7 @@ private:
     int setup_socket(struct connect_info *addr);
     void set_readable_id();
 
-    bool is_conn_setup_done();
+    bool is_conn_setup_done() const;
     void send_conn_setup_commands(struct timeval timestamp);
 
     // True iff any peer connection on this client is still climbing the
@@ -372,6 +377,10 @@ private:
     // role_replica; primaries skip the stage entirely. Re-armed on every
     // reconnect because READONLY is connection-scoped on the server side.
     enum setup_state m_readonly_state;
+    // CLIENT NO-TOUCH ladder stage. Only ever leaves setup_done when
+    // --client-no-touch is set; re-armed on every reconnect because
+    // NO-TOUCH is connection-scoped on the server side.
+    enum setup_state m_no_touch_state;
 
     // Reconnection state tracking
     unsigned int m_reconnect_attempts;
