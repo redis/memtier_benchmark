@@ -10,9 +10,12 @@ import json
 import os
 import re
 import tempfile
+import time
 from collections import defaultdict
+from unittest.mock import patch
 
-from redis.exceptions import ResponseError
+from redis import ConnectionPool, Redis
+from redis.exceptions import ResponseError, TimeoutError
 
 from include import (
     add_required_env_arguments,
@@ -73,27 +76,42 @@ def _read_file(run_config, name):
         return stream.read()
 
 
-def _capture(conn, benchmark):
-    """Capture RESP arguments without redis-py's lossy joined MONITOR string."""
+def _capture(conn, benchmark, capture_timeout=10):
+    """Capture RESP arguments with bounded I/O and drain time after the benchmark."""
     records = []
     marker = b"collection-scan-test-finished"
-    with conn.monitor() as monitor:
-        ok = benchmark.run()
-        conn.echo(marker)
-        while True:
-            raw = monitor.connection.read_response()
-            if isinstance(raw, bytes):
-                raw = raw.decode("latin1")
-            # Redis MONITOR uses C-escaped quoted strings, which are also valid
-            # Python byte literals. latin1 preserves bytes before unescaping.
-            location, command = raw.split("] ", 1)
-            args = tuple(ast.literal_eval('b' + match.group(0))
-                         for match in _QUOTED_ARGUMENT.finditer(command))
-            if args == (b"ECHO", marker):
-                break
-            if args and args[0].upper() in (b"SCAN", b"HSCAN", b"SSCAN", b"ZSCAN"):
-                records.append((location.split(" ", 1)[1], args))
-    return ok, records
+    # Preserve RLTest's TLS/auth/DB settings without changing its shared pool.
+    connection_kwargs = dict(conn.connection_pool.connection_kwargs)
+    connection_kwargs.pop("retry", None)
+    connection_kwargs.pop("retry_on_error", None)
+    connection_kwargs.update(socket_timeout=min(capture_timeout, 1),
+                             socket_connect_timeout=capture_timeout,
+                             retry_on_timeout=False)
+    pool = ConnectionPool(connection_class=conn.connection_pool.connection_class,
+                          **connection_kwargs)
+    capture_conn = Redis(connection_pool=pool)
+    try:
+        with capture_conn.monitor() as monitor:
+            ok = benchmark.run()
+            deadline = time.monotonic() + capture_timeout
+            capture_conn.echo(marker)
+            while time.monotonic() < deadline:
+                raw = monitor.connection.read_response()
+                if isinstance(raw, bytes):
+                    raw = raw.decode("latin1")
+                # Redis MONITOR uses C-escaped quoted strings, which are also
+                # valid Python byte literals. latin1 preserves escaped bytes.
+                location, command = raw.split("] ", 1)
+                args = tuple(ast.literal_eval('b' + match.group(0))
+                             for match in _QUOTED_ARGUMENT.finditer(command))
+                if args == (b"ECHO", marker):
+                    return ok, records
+                if args and args[0].upper() in (b"SCAN", b"HSCAN", b"SSCAN", b"ZSCAN"):
+                    records.append((location.split(" ", 1)[1], args))
+            raise TimeoutError("MONITOR capture deadline expired before completion marker")
+    finally:
+        capture_conn.close()
+        pool.disconnect()
 
 
 def _run(env, command, args=(), requests=80, threads=1, clients=1,
@@ -392,3 +410,81 @@ def test_collection_scan_reconnect_preserves_walk(env):
         logical_records = [("single-client", args) for _, args in records]
         _, continuations = _assert_walk(env, conn, logical_records, sequential_keys=keys)
         env.assertGreater(continuations, 0)
+
+
+def test_collection_scan_capture_missing_marker_times_out(env):
+    """A lost completion marker must fail promptly and leave RLTest usable."""
+    env.skipOnCluster()
+    conn = env.getConnection()
+    original_settings = dict(conn.connection_pool.connection_kwargs)
+
+    class FailedBenchmark:
+        def run(self):
+            return False
+
+    # A failed benchmark still sends the marker and drains normally.
+    env.assertEqual(_capture(conn, FailedBenchmark()), (False, []))
+    started = time.monotonic()
+    with patch.object(Redis, "echo", return_value=None):
+        try:
+            _capture(conn, FailedBenchmark(), capture_timeout=0.2)
+        except TimeoutError:
+            pass
+        else:
+            env.assertTrue(False, message="A missing MONITOR marker must time out")
+    env.assertLess(time.monotonic() - started, 5)
+    # Continuous unrelated traffic must hit the absolute deadline even though
+    # each individual read succeeds. Start the injection after MONITOR's ACK.
+    responses = patch.object(conn.connection_pool.connection_class, "read_response",
+                             return_value=b'0 [0 127.0.0.1:1] "ECHO" "unrelated"')
+
+    class BusyBenchmark:
+        def run(self):
+            responses.start()
+            return False
+
+    started = time.monotonic()
+    try:
+        with patch.object(Redis, "echo", return_value=None):
+            try:
+                _capture(conn, BusyBenchmark(), capture_timeout=0.2)
+            except TimeoutError as error:
+                env.assertContains("capture deadline", str(error))
+            else:
+                env.assertTrue(False, message="Continuous MONITOR traffic must time out")
+    finally:
+        responses.stop()
+    env.assertLess(time.monotonic() - started, 5)
+    env.assertEqual(conn.connection_pool.connection_kwargs, original_settings)
+    env.assertTrue(conn.ping())
+
+
+def test_scan_generated_match_stays_fixed_per_walk(env):
+    """SCAN pins generated MATCH values, then regenerates them at the next walk."""
+    env.skipOnCluster()
+    conn = env.getConnection()
+    pipe = conn.pipeline()
+    for i in range(200):
+        pipe.set("generated-match:" + str(i), "value")
+    pipe.execute()
+    for placeholder, options in (
+        ("__key__", ["--key-prefix", "generated-match:", "--command-key-pattern", "S",
+                     "--key-minimum", "1", "--key-maximum", "3"]),
+        ("__data__", ["--random-data", "--data-size", "16"]),
+    ):
+        _, records, _ = _run(env, "SCAN 0 MATCH " + placeholder + " COUNT 1",
+                             options + ["--scan-incremental-max-iterations", "2"],
+                             requests=24)
+        initial_values = []
+        for _, args in records:
+            if args[1] == b"0":
+                initial_values.append(args[3])
+            else:
+                env.assertEqual(args[3], initial_values[-1],
+                                message="Generated MATCH changed during a SCAN walk")
+        env.assertEqual(len(initial_values), 8)
+        if placeholder == "__key__":
+            env.assertEqual(initial_values, [
+                ("generated-match:" + str(i % 3 + 1)).encode() for i in range(8)])
+        else:
+            env.assertEqual(len(set(initial_values)), 8)
