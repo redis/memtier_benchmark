@@ -506,6 +506,7 @@ bool client::create_arbitrary_request(unsigned int command_index, struct timeval
             }
 
             if (m_config->scan_incremental_iteration) {
+                assert(i < m_scan_args.size());
                 m_scan_args[i] = arg->data_prefix;
                 m_scan_args[i].append(m_obj_gen->get_key(), m_obj_gen->get_key_len());
                 m_scan_args[i].append(arg->data_suffix);
@@ -560,6 +561,7 @@ bool client::create_arbitrary_request(unsigned int command_index, struct timeval
             assert(value_len > 0);
 
             if (m_config->scan_incremental_iteration) {
+                assert(i < m_scan_args.size());
                 m_scan_args[i].assign(value, value_len);
             }
             cmd_size += m_connections[conn_id]->send_arbitrary_command(arg, value, value_len);
@@ -586,6 +588,7 @@ bool client::create_scan_continuation_request(struct timeval &timestamp, unsigne
             cmd_size +=
                 m_connections[conn_id]->send_arbitrary_command(arg, m_scan_cursor.c_str(), m_scan_cursor.length());
         } else if (arg->type == key_type || arg->type == data_type) {
+            assert(i < m_scan_args.size());
             const std::string &value = m_scan_args[i];
             cmd_size += m_connections[conn_id]->send_arbitrary_command(arg, value.data(), value.size());
         }
