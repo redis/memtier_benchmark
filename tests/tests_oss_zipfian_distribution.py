@@ -356,6 +356,24 @@ def test_zipfian_and_sequential_simultaneous_arbitrary_commands(env):
     _, key_counts_by_command = get_combined_key_counts_by_command(monitor_threads)
     hset_keys = key_counts_by_command.get("HSET", Counter())
     hgetall_keys = key_counts_by_command.get("HGETALL", Counter())
+    # RLTest assertions are soft by default: stop before min/max or int() can
+    # replace the actual capture failure with an unrelated Python exception.
+    numbers_by_command = {}
+    for command, counts in (("HSET", hset_keys), ("HGETALL", hgetall_keys)):
+        if not counts:
+            env.assertTrue(False, message=f"No {command} commands captured by MONITOR")
+            return
+        numbers = []
+        for key in counts:
+            if not key.startswith("memtier-"):
+                env.assertTrue(False, message=f"Unexpected {command} key: {key!r}")
+                return
+            try:
+                numbers.append(int(key[len("memtier-"):]))
+            except ValueError:
+                env.assertTrue(False, message=f"Invalid numeric suffix in {command} key: {key!r}")
+                return
+        numbers_by_command[command] = numbers
     combined_key_counts = hset_keys + hgetall_keys
 
     # Verify we have reasonable key distribution
@@ -402,15 +420,7 @@ def test_zipfian_and_sequential_simultaneous_arbitrary_commands(env):
     # Instead, verify each command's pattern independently. The low-range tests
     # above already verify the Zipf exponent and skew.
     requests_per_client = config["memtier_benchmark"]["requests"]
-    numbers_by_command = {}
-    for command, counts in (("HSET", hset_keys), ("HGETALL", hgetall_keys)):
-        env.assertTrue(counts, message=f"No {command} commands captured by MONITOR")
-        numbers = []
-        for key in counts:
-            env.assertTrue(key.startswith("memtier-"),
-                           message=f"Unexpected {command} key: {key!r}")
-            numbers.append(int(key[len("memtier-"):]))
-        numbers_by_command[command] = numbers
+    for command, numbers in numbers_by_command.items():
         env.assertGreaterEqual(len(numbers), requests_per_client // 4,
                                message=f"{command} must exercise many distinct keys")
         env.assertGreaterEqual(min(numbers), key_min)
@@ -422,8 +432,12 @@ def test_zipfian_and_sequential_simultaneous_arbitrary_commands(env):
                       message="Zipfian HSET must sample broadly across this high key range")
 
     sequential_numbers = numbers_by_command["HGETALL"]
-    # Allow cluster routing lookahead beyond the nominal half-requests prefix,
-    # while remaining far below the full 50001-key interval.
+    # The 1:1 workload nominally uses requests_per_client / 2 sequential keys.
+    # cluster_client::get_key_for_conn generates before routing, so deferred
+    # attempts can consume indices without completing commands. Four times the
+    # nominal prefix (2 * requests_per_client) is a conservative margin for this
+    # healthy, static-cluster workload, not a general bound under routing errors
+    # or retries. It still excludes sampling across the full 50001-key interval.
     env.assertLessEqual(max(sequential_numbers), key_min + 2 * requests_per_client,
                         message="Sequential HGETALL must stay near the beginning of the range")
     sequential_span = max(sequential_numbers) - min(sequential_numbers) + 1
@@ -447,7 +461,10 @@ def test_zipfian_and_sequential_simultaneous_arbitrary_commands(env):
         env.assertTrue(hset_ratio > 0.2)
         env.assertTrue(hgetall_ratio > 0.2)
 
-    # Validate complete capture against both Redis and structured benchmark stats.
+    # This static-cluster workload does not enable --retry-on-error. The
+    # expected server-call count above already requires every command to execute;
+    # unexpected redirects/errors should fail, not be normalized as retries.
+    # Validate complete capture against Redis and structured benchmark stats.
     with open(os.path.join(run_config.results_dir, "mb.json")) as stream:
         all_stats = json.load(stream)["ALL STATS"]
     for counts, label, calls in ((hset_keys, "Hsets", hset_calls),

@@ -45,6 +45,10 @@ jobs:
         sed -i \
           -e '/bullseye-security/s|http://deb.debian.org/debian-security|http://snapshot.debian.org/archive/debian-security/20260903T220410Z|' \
           -e '/bullseye-security/s|^deb |deb [check-valid-until=no] |' /etc/apt/sources.list
+        grep -Eq '^deb \[check-valid-until=no\] http://snapshot\.debian\.org/archive/debian-security/20260903T220410Z bullseye-security([[:space:]]|$)' /etc/apt/sources.list || {
+          echo 'Bullseye security snapshot source was not configured' >&2
+          exit 1
+        }
 
     - name: Checkout Code for ubuntu:bionic
       if: matrix.image == 'ubuntu:bionic'
@@ -93,6 +97,10 @@ jobs:
         sed -i \
           -e '/bullseye-security/s|http://deb.debian.org/debian-security|http://snapshot.debian.org/archive/debian-security/20260903T220410Z|' \
           -e '/bullseye-security/s|^deb |deb [check-valid-until=no] |' /etc/apt/sources.list
+        grep -Eq '^deb \[check-valid-until=no\] http://snapshot\.debian\.org/archive/debian-security/20260903T220410Z bullseye-security([[:space:]]|$)' /etc/apt/sources.list || {
+          echo 'Bullseye security snapshot source was not configured' >&2
+          exit 1
+        }
 
     - name: Install git and basic tools
       run: |
@@ -532,9 +540,27 @@ jobs:
         make
     - name: Verify version, libevent, openssl
       run: |
+        set -euo pipefail
         ./memtier_benchmark --version | grep 'OpenSSL 1.0.2'
-        otool -L ./memtier_benchmark | grep libevent
-        otool -L ./memtier_benchmark | grep 'libssl.1.0.0'
+        binary_links="$(otool -L ./memtier_benchmark)"
+        printf '%s\n' "$binary_links" | grep '/libssl\.1\.0\.0\.dylib '
+        event_libraries="$(printf '%s\n' "$binary_links" | awk 'NR > 1 && $1 ~ /\/libevent[^/]*\.dylib$/ { print $1 }')"
+        test -n "$event_libraries"
+        # Check every libevent component, including its own dependencies: a
+        # missing custom .pc file must never silently fall back to Homebrew.
+        printf '%s\n' ./memtier_benchmark "$event_libraries" |
+          while IFS= read -r library; do
+            otool -L "$library" | awk -v event_prefix="$RUNNER_TEMP/libevent-openssl-1.0/lib/" '
+              NR > 1 && $1 ~ /\/libevent[^/]*\.dylib$/ && index($1, event_prefix) != 1 {
+                print "Unexpected libevent dependency: " $1 > "/dev/stderr"; bad = 1
+              }
+              NR > 1 && $1 ~ /\/lib(ssl|crypto)[^/]*\.dylib$/ &&
+                $1 !~ /\/lib(ssl|crypto)\.1\.0\.0\.dylib$/ {
+                print "Unexpected OpenSSL dependency: " $1 > "/dev/stderr"; bad = 1
+              }
+              END { exit bad }
+            '
+          done
         otool -L "$RUNNER_TEMP/libevent-openssl-1.0/lib/libevent_openssl.dylib" | grep 'libssl.1.0.0'
 
   promtool-lint:
