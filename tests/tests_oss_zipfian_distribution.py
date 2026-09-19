@@ -1,9 +1,13 @@
 from collections import Counter
 import math
+import json
+import os
 import tempfile
 from itertools import pairwise
 
-from zipfian_benchmark_runner import ZipfianBenchmarkRunner, MonitorThread
+from zipfian_benchmark_runner import (
+    ZipfianBenchmarkRunner, MonitorThread, get_combined_key_counts_by_command,
+)
 from include import (
     addTLSArgs,
     get_default_memtier_config,
@@ -334,6 +338,8 @@ def test_zipfian_and_sequential_simultaneous_arbitrary_commands(env):
         monitor_thread = MonitorThread(conn)
         monitor_thread.start()
         monitor_threads.append(monitor_thread)
+        env.assertTrue(monitor_thread.ready.wait(timeout=10),
+                       message="MONITOR must be active before starting the benchmark")
 
     # Run the benchmark with both commands
     memtier_ok = benchmark.run()
@@ -347,10 +353,10 @@ def test_zipfian_and_sequential_simultaneous_arbitrary_commands(env):
     assert_minimum_memtier_outcomes(run_config, env, memtier_ok, overall_expected_request_count, overall_request_count)
 
     # Collect and combine results from all monitor threads
-    combined_key_counts = Counter()
-    for thread in monitor_threads:
-        thread.join()
-        combined_key_counts.update(thread.key_counts)
+    _, key_counts_by_command = get_combined_key_counts_by_command(monitor_threads)
+    hset_keys = key_counts_by_command.get("HSET", Counter())
+    hgetall_keys = key_counts_by_command.get("HGETALL", Counter())
+    combined_key_counts = hset_keys + hgetall_keys
 
     # Verify we have reasonable key distribution
     env.assertTrue(len(combined_key_counts) > 100)  # Should access many different keys
@@ -389,12 +395,40 @@ def test_zipfian_and_sequential_simultaneous_arbitrary_commands(env):
         coverage_ratio = key_range_covered / expected_range
         env.assertTrue(coverage_ratio > 0.1)  # Should cover at least 10% of range
 
-    # The combined pattern should show mixed characteristics:
-    # - Some zipfian influence from HSET operations
-    # - Some sequential influence from HGETALL operations
-    # - Overall less extreme than pure zipfian but not completely uniform
-    correlation = analyze_zipfian_correlation(combined_key_counts)
-    env.assertTrue(-0.6 < correlation < -0.2)  # Mixed pattern: moderate negative correlation
+    # Zipf probabilities here use absolute key indices: 1/950000 differs
+    # from 1/1000000 by only about 5%. A fixed Pearson interval for the pooled
+    # frequency histogram is not a valid invariant; cluster scheduling changes
+    # the sequential tail frequencies even with identical Zipf samples.
+    # Instead, verify each command's pattern independently. The low-range tests
+    # above already verify the Zipf exponent and skew.
+    requests_per_client = config["memtier_benchmark"]["requests"]
+    numbers_by_command = {}
+    for command, counts in (("HSET", hset_keys), ("HGETALL", hgetall_keys)):
+        env.assertTrue(counts, message=f"No {command} commands captured by MONITOR")
+        numbers = []
+        for key in counts:
+            env.assertTrue(key.startswith("memtier-"),
+                           message=f"Unexpected {command} key: {key!r}")
+            numbers.append(int(key[len("memtier-"):]))
+        numbers_by_command[command] = numbers
+        env.assertGreaterEqual(len(numbers), requests_per_client // 4,
+                               message=f"{command} must exercise many distinct keys")
+        env.assertGreaterEqual(min(numbers), key_min)
+        env.assertLessEqual(max(numbers), key_max)
+
+    random_numbers = numbers_by_command["HSET"]
+    env.assertGreater(max(random_numbers) - min(random_numbers),
+                      0.8 * (key_max - key_min),
+                      message="Zipfian HSET must sample broadly across this high key range")
+
+    sequential_numbers = numbers_by_command["HGETALL"]
+    # Allow cluster routing lookahead beyond the nominal half-requests prefix,
+    # while remaining far below the full 50001-key interval.
+    env.assertLessEqual(max(sequential_numbers), key_min + 2 * requests_per_client,
+                        message="Sequential HGETALL must stay near the beginning of the range")
+    sequential_span = max(sequential_numbers) - min(sequential_numbers) + 1
+    env.assertGreaterEqual(len(sequential_numbers) / sequential_span, 0.9,
+                           message="Sequential HGETALL must cover a dense key interval")
 
     # Verify both command types were executed
     hset_calls = merged_command_stats.get("cmdstat_hset", {}).get("calls", 0)
@@ -412,3 +446,11 @@ def test_zipfian_and_sequential_simultaneous_arbitrary_commands(env):
         # Both commands should contribute significantly (at least 20% each)
         env.assertTrue(hset_ratio > 0.2)
         env.assertTrue(hgetall_ratio > 0.2)
+
+    # Validate complete capture against both Redis and structured benchmark stats.
+    with open(os.path.join(run_config.results_dir, "mb.json")) as stream:
+        all_stats = json.load(stream)["ALL STATS"]
+    for counts, label, calls in ((hset_keys, "Hsets", hset_calls),
+                                 (hgetall_keys, "Hgetalls", hgetall_calls)):
+        env.assertEqual(sum(counts.values()), calls)
+        env.assertEqual(all_stats[label]["Count"], calls)

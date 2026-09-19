@@ -21,6 +21,7 @@ class MonitorThread(threading.Thread):
     def __init__(self, connection, stop_commands: set[str] = None):
         threading.Thread.__init__(self)
         self.monitor: redis.client.Monitor = connection.monitor()
+        self.ready = threading.Event()
         self.stop_commands: set[str] = stop_commands or {
             "INFO COMMANDSTATS",
             "FLUSHALL",
@@ -31,6 +32,8 @@ class MonitorThread(threading.Thread):
     def run(self):
         try:
             with self.monitor as m:
+                # The context manager has received the MONITOR acknowledgement.
+                self.ready.set()
                 for command_info in m.listen():
                     command = command_info.get("command")
 
