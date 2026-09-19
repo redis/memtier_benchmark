@@ -306,14 +306,14 @@ R for Random selection.
 Enable cursor iteration for SCAN, SSCAN, HSCAN and ZSCAN.
 Use \fB\-\-command=\fR"SCAN 0 ..." or \fB\-\-command=\fR"HSCAN key 0 ...", etc.
 Automatically follows the cursor returned by each response.
-Sends "SCAN 0 ..." initially, then "SCAN <cursor> ..." until
+Sends the supplied command initially and updates its cursor until
 the cursor returns 0, then restarts. Requires \fB\-\-pipeline\fR 1.
-Stats are reported separately for "SCAN 0" and "SCAN <cursor>".
-Collection keys and generated arguments stay fixed per iteration.
+Stats separate "<COMMAND> 0" from "<COMMAND> <cursor>".
+Collection keys and generated arguments stay fixed per cursor walk.
 Requires one \fB\-\-command\fR and standalone Redis (no cluster mode).
 .TP
 \fB\-\-scan\-incremental\-max\-iterations\fR=\fI\,NUMBER\/\fR
-Maximum number of continuation SCANs per iteration cycle
+Maximum number of continuations per cursor walk
 (default: 0, follow cursor until it returns 0).
 .TP
 \fB\-\-command\-is\-read\fR
