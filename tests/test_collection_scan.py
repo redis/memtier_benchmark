@@ -115,6 +115,9 @@ def _run(env, command, args=(), requests=80, threads=1, clients=1,
             env.assertEqual(len(records), requests * threads * clients)
             if incremental:
                 name = command.split()[0].capitalize()
+                stdout = _read_file(run_config, "mb.stdout")
+                env.assertContains(name.upper() + " 0", stdout)
+                env.assertContains(name.upper() + " <cursor>", stdout)
                 initial = stats[name + " 0s"]["Count"]
                 continuation = stats[name + " <cursor>s"]["Count"]
                 cursor_pos = 1 if name == "Scan" else 2
@@ -292,10 +295,12 @@ def test_collection_scan_invalid_configurations(env):
     """Reject missing operands, pipelining, multiple commands, and cluster mode."""
     for command in COMMANDS:
         cases = [
+            ([], "SCAN, SSCAN, HSCAN or ZSCAN"),
             (["--command", command], "cursor"),
             (["--command", command + " key"], "cursor"),
             (["--command", command + " key 0", "--pipeline", "2"], "pipeline"),
-            (["--command", command + " key 0", "--command", "PING"], "exactly one"),
+            (["--command", command + " key 0", "--command", "PING"],
+             "exactly one --command (SCAN, SSCAN, HSCAN or ZSCAN)"),
             (["--command", command + " key 0", "--cluster-mode"], "cluster"),
         ]
         # Cluster rejection is deliberately checked in the cluster matrix too;

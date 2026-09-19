@@ -4645,7 +4645,8 @@ int main(int argc, char *argv[])
             exit(1);
         }
         if (!cfg.arbitrary_commands->is_defined()) {
-            fprintf(stderr, "error: --scan-incremental-iteration requires --command with a SCAN command.\n");
+            fprintf(stderr,
+                    "error: --scan-incremental-iteration requires --command with SCAN, SSCAN, HSCAN or ZSCAN.\n");
             exit(1);
         }
         if (cfg.cluster_mode) {
@@ -4659,7 +4660,9 @@ int main(int argc, char *argv[])
             if (!cfg.arbitrary_commands->at(i).stats_only) real_cmd_count++;
         }
         if (real_cmd_count != 1) {
-            fprintf(stderr, "error: --scan-incremental-iteration requires exactly one --command (a SCAN command).\n");
+            fprintf(
+                stderr,
+                "error: --scan-incremental-iteration requires exactly one --command (SCAN, SSCAN, HSCAN or ZSCAN).\n");
             exit(1);
         }
 

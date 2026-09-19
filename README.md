@@ -213,7 +213,9 @@ affixes) throughout a walk. A new walk selects new generated arguments.
 preserved; option availability depends on the Redis server version.
 `--scan-incremental-max-iterations=N` caps the number of continuation requests
 per walk (zero means unlimited). Statistics separate initial requests, such as
-`HSCAN 0`, from continuations, such as `HSCAN <cursor>`.
+`HSCAN 0`, from continuations, such as `HSCAN <cursor>`. For compatibility, the
+initial statistics label remains `0` even when the command specifies a nonzero
+starting cursor; each new walk restarts at that supplied cursor.
 
 ## Crash Reporting
 

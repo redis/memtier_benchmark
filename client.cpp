@@ -103,6 +103,7 @@ bool client::setup_client(benchmark_config *config, abstract_protocol *protocol,
 
     // Enable value keeping for SCAN incremental iteration (needed to extract cursor from response)
     if (config->scan_incremental_iteration) {
+        m_scan_args.resize(config->arbitrary_commands->at(0).command_args.size());
         MAIN_CONNECTION->get_protocol()->set_keep_value(true);
     }
 
@@ -508,10 +509,10 @@ bool client::create_arbitrary_request(unsigned int command_index, struct timeval
                 m_scan_args[i] = arg->data_prefix;
                 m_scan_args[i].append(m_obj_gen->get_key(), m_obj_gen->get_key_len());
                 m_scan_args[i].append(arg->data_suffix);
-            }
-
-            // when we have static data mixed with the key placeholder
-            if (arg->has_key_affixes) {
+                cmd_size +=
+                    m_connections[conn_id]->send_arbitrary_command(arg, m_scan_args[i].data(), m_scan_args[i].size());
+            } else if (arg->has_key_affixes) {
+                // Static data mixed with the key placeholder.
                 // Pre-calculate total length to avoid reallocations
                 const char *key = m_obj_gen->get_key();
                 unsigned int key_len = m_obj_gen->get_key_len();
@@ -670,8 +671,7 @@ void client::create_request(struct timeval timestamp, unsigned int conn_id)
                 }
             } else {
                 // Send initial SCAN 0, stats to index 0
-                m_scan_args.resize(m_config->arbitrary_commands->at(0).command_args.size());
-                // Each new scan cycle starts a new single-command transaction rotation.
+                // Release the transaction key pin before selecting the next scan key.
                 m_txn_rotation_key_valid = false;
                 if (create_arbitrary_request(0, timestamp, conn_id)) {
                     m_reqs_generated++;
