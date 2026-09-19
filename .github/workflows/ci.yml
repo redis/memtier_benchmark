@@ -544,17 +544,17 @@ jobs:
         ./memtier_benchmark --version | grep 'OpenSSL 1.0.2'
         binary_links="$(otool -L ./memtier_benchmark)"
         printf '%s\n' "$binary_links" | grep '/libssl\.1\.0\.0\.dylib '
-        event_libraries="$(printf '%s\n' "$binary_links" | awk 'NR > 1 && $1 ~ /\/libevent[^/]*\.dylib$/ { print $1 }')"
+        event_libraries="$(printf '%s\n' "$binary_links" | awk 'NR > 1 && $1 ~ /\/libevent[^\/]*\.dylib$/ { print $1 }')"
         test -n "$event_libraries"
         # Check every libevent component, including its own dependencies: a
         # missing custom .pc file must never silently fall back to Homebrew.
         printf '%s\n' ./memtier_benchmark "$event_libraries" |
           while IFS= read -r library; do
             otool -L "$library" | awk -v event_prefix="$RUNNER_TEMP/libevent-openssl-1.0/lib/" '
-              NR > 1 && $1 ~ /\/libevent[^/]*\.dylib$/ && index($1, event_prefix) != 1 {
+              NR > 1 && $1 ~ /\/libevent[^\/]*\.dylib$/ && index($1, event_prefix) != 1 {
                 print "Unexpected libevent dependency: " $1 > "/dev/stderr"; bad = 1
               }
-              NR > 1 && $1 ~ /\/lib(ssl|crypto)[^/]*\.dylib$/ &&
+              NR > 1 && $1 ~ /\/lib(ssl|crypto)[^\/]*\.dylib$/ &&
                 $1 !~ /\/lib(ssl|crypto)\.1\.0\.0\.dylib$/ {
                 print "Unexpected OpenSSL dependency: " $1 > "/dev/stderr"; bad = 1
               }
