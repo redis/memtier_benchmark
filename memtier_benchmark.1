@@ -309,6 +309,8 @@ Automatically follows the cursor returned by each response.
 Sends the supplied command initially and updates its cursor until
 the cursor returns 0, then restarts. Requires \fB\-\-pipeline\fR 1.
 Stats separate "<COMMAND> 0" from "<COMMAND> <cursor>".
+For compatibility, the initial statistics label remains 0 even with a nonzero
+starting cursor; each new walk starts at the supplied cursor.
 Collection keys and generated arguments stay fixed per cursor walk.
 Requires one \fB\-\-command\fR and standalone Redis (no cluster mode).
 .TP

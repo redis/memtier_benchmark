@@ -209,6 +209,9 @@ memtier_benchmark --command="ZSCAN myzset 0 COUNT 100" --scan-incremental-iterat
 
 Each client keeps its own cursor and generated arguments (including `__key__`
 affixes) throughout a walk. A new walk selects new generated arguments.
+For existing `SCAN` workloads, this changes generated `MATCH` arguments:
+`SCAN 0 MATCH __data__` now reuses the initial pattern until the walk ends,
+instead of regenerating it for each continuation.
 `MATCH`, `COUNT`, and command-specific options such as `HSCAN NOVALUES` are
 preserved; option availability depends on the Redis server version.
 `--scan-incremental-max-iterations=N` caps the number of continuation requests
