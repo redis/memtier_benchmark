@@ -102,6 +102,7 @@ protected:
 
     // SCAN incremental cursor iteration state
     std::string m_scan_cursor;
+    std::vector<std::string> m_scan_args; // Generated argument bytes retained for the current cursor chain.
     unsigned int m_scan_iteration_count;
 
     keylist *m_keylist; // used to construct multi commands

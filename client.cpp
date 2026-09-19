@@ -504,6 +504,12 @@ bool client::create_arbitrary_request(unsigned int command_index, struct timeval
                 }
             }
 
+            if (m_config->scan_incremental_iteration) {
+                m_scan_args[i] = arg->data_prefix;
+                m_scan_args[i].append(m_obj_gen->get_key(), m_obj_gen->get_key_len());
+                m_scan_args[i].append(arg->data_suffix);
+            }
+
             // when we have static data mixed with the key placeholder
             if (arg->has_key_affixes) {
                 // Pre-calculate total length to avoid reallocations
@@ -552,6 +558,9 @@ bool client::create_arbitrary_request(unsigned int command_index, struct timeval
             assert(value != NULL);
             assert(value_len > 0);
 
+            if (m_config->scan_incremental_iteration) {
+                m_scan_args[i].assign(value, value_len);
+            }
             cmd_size += m_connections[conn_id]->send_arbitrary_command(arg, value, value_len);
         }
     }
@@ -575,18 +584,9 @@ bool client::create_scan_continuation_request(struct timeval &timestamp, unsigne
         } else if (arg->type == scan_cursor_type) {
             cmd_size +=
                 m_connections[conn_id]->send_arbitrary_command(arg, m_scan_cursor.c_str(), m_scan_cursor.length());
-        } else if (arg->type == key_type) {
-            unsigned long long key_index;
-            get_key_response res = get_key_for_conn(0, conn_id, &key_index);
-            assert(res == available_for_conn);
-            cmd_size +=
-                m_connections[conn_id]->send_arbitrary_command(arg, m_obj_gen->get_key(), m_obj_gen->get_key_len());
-        } else if (arg->type == data_type) {
-            unsigned int value_len;
-            const char *value = m_obj_gen->get_value(0, &value_len);
-            assert(value != NULL);
-            assert(value_len > 0);
-            cmd_size += m_connections[conn_id]->send_arbitrary_command(arg, value, value_len);
+        } else if (arg->type == key_type || arg->type == data_type) {
+            const std::string &value = m_scan_args[i];
+            cmd_size += m_connections[conn_id]->send_arbitrary_command(arg, value.data(), value.size());
         }
     }
 
@@ -670,6 +670,9 @@ void client::create_request(struct timeval timestamp, unsigned int conn_id)
                 }
             } else {
                 // Send initial SCAN 0, stats to index 0
+                m_scan_args.resize(m_config->arbitrary_commands->at(0).command_args.size());
+                // Each new scan cycle starts a new single-command transaction rotation.
+                m_txn_rotation_key_valid = false;
                 if (create_arbitrary_request(0, timestamp, conn_id)) {
                     m_reqs_generated++;
                 }

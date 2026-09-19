@@ -2738,12 +2738,14 @@ void usage()
         "                                 S for Sequential selection.\n"
         "                                 R for Random selection.\n"
         "      --scan-incremental-iteration\n"
-        "                                 Enable SCAN cursor iteration mode. When used with\n"
-        "                                 --command=\"SCAN 0 [MATCH pattern] [COUNT count] [TYPE type]\",\n"
-        "                                 automatically follows the cursor returned by each SCAN response.\n"
+        "                                 Enable cursor iteration for SCAN, SSCAN, HSCAN and ZSCAN.\n"
+        "                                 Use --command=\"SCAN 0 ...\" or --command=\"HSCAN key 0 ...\", etc.\n"
+        "                                 Automatically follows the cursor returned by each response.\n"
         "                                 Sends \"SCAN 0 ...\" initially, then \"SCAN <cursor> ...\" until\n"
         "                                 the cursor returns 0, then restarts. Requires --pipeline 1.\n"
         "                                 Stats are reported separately for \"SCAN 0\" and \"SCAN <cursor>\".\n"
+        "                                 Collection keys and generated arguments stay fixed per iteration.\n"
+        "                                 Requires one --command and standalone Redis (no cluster mode).\n"
         "      --scan-incremental-max-iterations=NUMBER\n"
         "                                 Maximum number of continuation SCANs per iteration cycle\n"
         "                                 (default: 0, follow cursor until it returns 0).\n"
@@ -4651,7 +4653,7 @@ int main(int argc, char *argv[])
             exit(1);
         }
 
-        // Validate exactly one command and it must be SCAN
+        // A cursor chain belongs to exactly one command and one client connection.
         size_t real_cmd_count = 0;
         for (size_t i = 0; i < cfg.arbitrary_commands->size(); i++) {
             if (!cfg.arbitrary_commands->at(i).stats_only) real_cmd_count++;
@@ -4662,41 +4664,33 @@ int main(int argc, char *argv[])
         }
 
         arbitrary_command &scan_cmd = cfg.arbitrary_commands->at(0);
-        if (strcasecmp(scan_cmd.command_type.c_str(), "SCAN") != 0) {
-            fprintf(stderr, "error: --scan-incremental-iteration requires the command to be a SCAN command.\n");
+        const std::string command_type = scan_cmd.command_type;
+        const bool keyspace_scan = strcasecmp(command_type.c_str(), "SCAN") == 0;
+        if (!keyspace_scan && strcasecmp(command_type.c_str(), "SSCAN") != 0 &&
+            strcasecmp(command_type.c_str(), "HSCAN") != 0 && strcasecmp(command_type.c_str(), "ZSCAN") != 0) {
+            fprintf(stderr, "error: --scan-incremental-iteration requires a SCAN, SSCAN, HSCAN or ZSCAN command.\n");
             exit(1);
         }
-        if (scan_cmd.command_args.size() < 2) {
-            fprintf(stderr, "error: SCAN command must have at least a cursor argument (e.g., 'SCAN 0').\n");
+        const size_t cursor_index = keyspace_scan ? 1 : 2;
+        if (scan_cmd.command_args.size() <= cursor_index) {
+            fprintf(stderr, "error: %s command requires %s cursor argument (e.g., '%s %s0').\n", command_type.c_str(),
+                    keyspace_scan ? "a" : "a key and a", command_type.c_str(), keyspace_scan ? "" : "key ");
             exit(1);
         }
 
-        // Set display names for initial SCAN command
-        scan_cmd.command_name = "SCAN 0";
-        scan_cmd.command_type = "SCAN 0";
+        // Copy parsed arguments so quoting, empty strings and binary escapes survive.
+        // Only the cursor changes; generated arguments are retained by each client.
+        cfg.scan_continuation_command = new arbitrary_command(scan_cmd);
+        cfg.scan_continuation_command->command_args[cursor_index].data = SCAN_CURSOR_PLACEHOLDER;
+        cfg.scan_continuation_command->command_name = command_type + " <cursor>";
+        cfg.scan_continuation_command->command_type = command_type + " <cursor>";
+        scan_cmd.command_name = command_type + " 0";
+        scan_cmd.command_type = command_type + " 0";
 
-        // Build continuation command string: replace cursor (arg[1]) with placeholder
-        std::string cont_cmd_str = "SCAN " SCAN_CURSOR_PLACEHOLDER;
-        for (unsigned int i = 2; i < scan_cmd.command_args.size(); i++) {
-            cont_cmd_str += " ";
-            cont_cmd_str += scan_cmd.command_args[i].data;
-        }
-
-        // Create the continuation command (stored separately, not in the list)
-        cfg.scan_continuation_command = new arbitrary_command(cont_cmd_str.c_str());
-        cfg.scan_continuation_command->command_name = "SCAN <cursor>";
-        cfg.scan_continuation_command->command_type = "SCAN <cursor>";
-        if (!cfg.scan_continuation_command->split_command_to_args()) {
-            fprintf(stderr, "error: failed to parse SCAN continuation command.\n");
-            delete cfg.scan_continuation_command;
-            cfg.scan_continuation_command = NULL;
-            return -1;
-        }
-
-        // Add a stats-only entry to arbitrary_commands for continuation stats tracking (index 1)
-        arbitrary_command stats_cmd(cont_cmd_str.c_str());
-        stats_cmd.command_name = "SCAN <cursor>";
-        stats_cmd.command_type = "SCAN <cursor>";
+        // Index 1 tracks continuation statistics without entering the command rotation.
+        arbitrary_command stats_cmd(command_type.c_str());
+        stats_cmd.command_name = command_type + " <cursor>";
+        stats_cmd.command_type = command_type + " <cursor>";
         stats_cmd.stats_only = true;
         cfg.arbitrary_commands->add_command(stats_cmd);
     }

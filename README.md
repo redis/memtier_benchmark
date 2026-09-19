@@ -195,6 +195,26 @@ With the default `command` breakdown, you'll see aggregated stats for "Sets" and
 
 > **Note:** When using `--command-stats-breakdown=command`, the JSON output's Time-Serie percentiles (p50, p99, etc.) for aggregated command types are approximate. They reflect only one of the underlying commands rather than a true merge of all commands of that type. Totals, counts, bytes, and average latency are correctly aggregated.
 
+### Cursor iteration
+
+`--scan-incremental-iteration` follows the cursors returned by `SCAN`, `SSCAN`,
+`HSCAN`, and `ZSCAN`, restarting when the cursor returns zero. Use one `--command`,
+`--pipeline=1`, and a standalone Redis endpoint. For example:
+
+```sh
+memtier_benchmark --command="SSCAN myset 0 COUNT 100" --scan-incremental-iteration --pipeline=1
+memtier_benchmark --command="HSCAN __key__ 0 MATCH field:* COUNT 100" --scan-incremental-iteration --pipeline=1
+memtier_benchmark --command="ZSCAN myzset 0 COUNT 100" --scan-incremental-iteration --pipeline=1
+```
+
+Each client keeps its own cursor and generated arguments (including `__key__`
+affixes) throughout a walk. A new walk selects new generated arguments.
+`MATCH`, `COUNT`, and command-specific options such as `HSCAN NOVALUES` are
+preserved; option availability depends on the Redis server version.
+`--scan-incremental-max-iterations=N` caps the number of continuation requests
+per walk (zero means unlimited). Statistics separate initial requests, such as
+`HSCAN 0`, from continuations, such as `HSCAN <cursor>`.
+
 ## Crash Reporting
 
 memtier_benchmark includes built-in crash handling that automatically generates detailed bug reports when the program crashes. If you encounter a crash, the tool will print a comprehensive report including:
