@@ -37,6 +37,15 @@ jobs:
     container: ${{ matrix.image }}
     name: Build ${{ matrix.image }}
     steps:
+    - name: Use the final Bullseye security snapshot
+      if: matrix.image == 'debian:bullseye'
+      # Post-EOL security package removals: https://bugs.debian.org/1147093
+      # Keep signature verification; only this immutable snapshot ignores expiry.
+      run: |
+        sed -i \
+          -e '/bullseye-security/s|http://deb.debian.org/debian-security|http://snapshot.debian.org/archive/debian-security/20260903T220410Z|' \
+          -e '/bullseye-security/s|^deb |deb [check-valid-until=no] |' /etc/apt/sources.list
+
     - name: Checkout Code for ubuntu:bionic
       if: matrix.image == 'ubuntu:bionic'
       uses: actions/checkout@v6
@@ -76,6 +85,15 @@ jobs:
     container: ${{ matrix.debian_version }}
     name: Test ${{ matrix.debian_version }}
     steps:
+    - name: Use the final Bullseye security snapshot
+      if: matrix.debian_version == 'debian:bullseye'
+      # Post-EOL security package removals: https://bugs.debian.org/1147093
+      # Keep signature verification; only this immutable snapshot ignores expiry.
+      run: |
+        sed -i \
+          -e '/bullseye-security/s|http://deb.debian.org/debian-security|http://snapshot.debian.org/archive/debian-security/20260903T220410Z|' \
+          -e '/bullseye-security/s|^deb |deb [check-valid-until=no] |' /etc/apt/sources.list
+
     - name: Install git and basic tools
       run: |
         apt-get update -qq
@@ -489,16 +507,35 @@ jobs:
     steps:
     - uses: actions/checkout@v6
     - name: Install dependencies
-      run: brew install autoconf automake libtool libevent pkg-config
+      run: brew install autoconf automake libtool pkg-config
     - name: Install openssl v1.0.2
       run: brew install rbenv/tap/openssl@1.0
+    - name: Build libevent against openssl v1.0.2
+      # Homebrew's libevent uses OpenSSL 3; mixing it with 1.0.2 selects
+      # incompatible headers and loads two SSL ABIs into the same process.
+      run: |
+        legacy_ssl_prefix="$(brew --prefix openssl@1.0)"
+        cd "$RUNNER_TEMP"
+        curl -fsSL --retry 3 -O https://github.com/libevent/libevent/releases/download/release-2.1.12-stable/libevent-2.1.12-stable.tar.gz
+        echo '92e6de1be9ec176428fd2367677e61ceffc2ee1cb119035037a27d346b0403bb  libevent-2.1.12-stable.tar.gz' | shasum -a 256 -c -
+        tar -xzf libevent-2.1.12-stable.tar.gz
+        cd libevent-2.1.12-stable
+        PKG_CONFIG_PATH="$legacy_ssl_prefix/lib/pkgconfig" \
+          CPPFLAGS="-I$legacy_ssl_prefix/include" LDFLAGS="-L$legacy_ssl_prefix/lib" \
+          ./configure --prefix="$RUNNER_TEMP/libevent-openssl-1.0" --disable-samples --disable-libevent-regress
+        make -j3
+        make install
     - name: Build
-      run: autoreconf -ivf && PKG_CONFIG_PATH=`brew --prefix openssl@1.0`/lib/pkgconfig ./configure && make
+      run: |
+        autoreconf -ivf
+        PKG_CONFIG_PATH="$RUNNER_TEMP/libevent-openssl-1.0/lib/pkgconfig:$(brew --prefix openssl@1.0)/lib/pkgconfig" ./configure
+        make
     - name: Verify version, libevent, openssl
       run: |
-        ./memtier_benchmark --version
+        ./memtier_benchmark --version | grep 'OpenSSL 1.0.2'
         otool -L ./memtier_benchmark | grep libevent
-        otool -L ./memtier_benchmark | grep ssl
+        otool -L ./memtier_benchmark | grep 'libssl.1.0.0'
+        otool -L "$RUNNER_TEMP/libevent-openssl-1.0/lib/libevent_openssl.dylib" | grep 'libssl.1.0.0'
 
   promtool-lint:
     runs-on: ubuntu-latest
