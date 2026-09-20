@@ -432,6 +432,7 @@ def test_zipfian_and_sequential_simultaneous_arbitrary_commands(env):
                       message="Zipfian HSET must sample broadly across this high key range")
 
     sequential_numbers = numbers_by_command["HGETALL"]
+    # S clients independently repeat the same prefix; only P partitions ranges.
     # The 1:1 workload nominally uses requests_per_client / 2 sequential keys.
     # cluster_client::get_key_for_conn generates before routing, so deferred
     # attempts can consume indices without completing commands. Four times the

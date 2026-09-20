@@ -144,6 +144,8 @@ class ZipfianBenchmarkRunner:
             monitor_thread = MonitorThread(conn)
             monitor_thread.start()
             monitor_threads.append(monitor_thread)
+            self.env.assertTrue(monitor_thread.ready.wait(timeout=10),
+                                message="MONITOR must be active before starting the benchmark")
 
         # Run the benchmark
         memtier_ok = benchmark.run()
@@ -221,6 +223,8 @@ class ZipfianBenchmarkRunner:
             monitor_thread = MonitorThread(conn)
             monitor_thread.start()
             monitor_threads.append(monitor_thread)
+            self.env.assertTrue(monitor_thread.ready.wait(timeout=10),
+                                message="MONITOR must be active before starting the benchmark")
 
         # Run the benchmark
         memtier_ok = benchmark.run()
