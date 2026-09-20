@@ -202,7 +202,7 @@ def test_collection_scan_generated_keys_and_caps(env):
     """Independent clients pin their generated key and advance once per cycle."""
     env.skipOnCluster()
     conn = env.getConnection()
-    # Exercise both the stack and heap paths for placeholder affixes.
+    # Preserve short and long placeholder affixes in cached scan arguments.
     for command in COMMANDS:
         for prefix in ("{", "p" * 1100):
             keys = [(prefix + "iter:" + str(i) + "}:tail").encode() for i in range(1, 4)]
