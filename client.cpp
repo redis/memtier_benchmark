@@ -475,6 +475,7 @@ bool client::create_arbitrary_request(unsigned int command_index, struct timeval
     }
 
     // Normal arbitrary command handling
+    const bool scan_incremental_iteration = m_config->scan_incremental_iteration;
     for (unsigned int i = 0; i < cmd.command_args.size(); i++) {
         const command_arg *arg = &cmd.command_args[i];
         if (arg->type == const_type) {
@@ -507,7 +508,7 @@ bool client::create_arbitrary_request(unsigned int command_index, struct timeval
                 }
             }
 
-            if (m_config->scan_incremental_iteration) {
+            if (scan_incremental_iteration) {
                 assert(i < m_scan_args.size());
                 m_scan_args[i] = arg->data_prefix;
                 m_scan_args[i].append(m_obj_gen->get_key(), m_obj_gen->get_key_len());
@@ -562,7 +563,7 @@ bool client::create_arbitrary_request(unsigned int command_index, struct timeval
             assert(value != NULL);
             assert(value_len > 0);
 
-            if (m_config->scan_incremental_iteration) {
+            if (scan_incremental_iteration) {
                 assert(i < m_scan_args.size());
                 m_scan_args[i].assign(value, value_len);
             }

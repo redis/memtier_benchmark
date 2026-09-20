@@ -212,6 +212,8 @@ affixes) throughout a walk. A new walk selects new generated arguments.
 For existing `SCAN` workloads, this changes generated `MATCH` arguments:
 `SCAN 0 MATCH __data__` now reuses the initial pattern until the walk ends,
 instead of regenerating it for each continuation.
+Likewise, `SCAN 0 MATCH __key__` advances the key generator once per walk rather
+than once per request, so the same request budget can visit fewer generated patterns.
 `MATCH`, `COUNT`, and command-specific options such as `HSCAN NOVALUES` are
 preserved; option availability depends on the Redis server version.
 `--scan-incremental-max-iterations=N` caps the number of continuation requests
