@@ -559,7 +559,7 @@ jobs:
                 print "Unexpected OpenSSL dependency: " $1 > "/dev/stderr"; bad = 1
               }
               END { exit bad }
-            '
+            ' || exit 1
           done
         otool -L "$RUNNER_TEMP/libevent-openssl-1.0/lib/libevent_openssl.dylib" | grep 'libssl.1.0.0'
 
