@@ -103,7 +103,8 @@ bool client::setup_client(benchmark_config *config, abstract_protocol *protocol,
 
     // Enable value keeping for SCAN incremental iteration (needed to extract cursor from response)
     if (config->scan_incremental_iteration) {
-        // Both initial and continuation requests index the generated-argument cache.
+        // The copied commands have matching argument indices; bound both consumers
+        // of the generated-argument cache even in release builds.
         m_scan_args.resize(std::max(config->arbitrary_commands->at(0).command_args.size(),
                                     config->scan_continuation_command->command_args.size()));
         MAIN_CONNECTION->get_protocol()->set_keep_value(true);

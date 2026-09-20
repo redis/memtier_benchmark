@@ -4684,6 +4684,7 @@ int main(int argc, char *argv[])
         // Copy parsed arguments so quoting, empty strings and binary escapes survive.
         // Only the cursor changes; generated arguments are retained by each client.
         cfg.scan_continuation_command = new arbitrary_command(scan_cmd);
+        // The separate formatting pass below classifies this as scan_cursor_type.
         cfg.scan_continuation_command->command_args[cursor_index].data = SCAN_CURSOR_PLACEHOLDER;
         cfg.scan_continuation_command->command_name = command_type + " <cursor>";
         cfg.scan_continuation_command->command_type = command_type + " <cursor>";
