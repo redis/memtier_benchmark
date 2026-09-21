@@ -488,7 +488,13 @@ jobs:
     - name: Build
       run: autoreconf -ivf && PKG_CONFIG_PATH=`brew --prefix openssl@${{ matrix.openssl }}`/lib/pkgconfig ./configure && make
     - name: Unit tests
-      run: make check
+      run: |
+        if ! make check; then
+          cat test-suite.log
+          otool -L ./socket_options_test
+          lldb --batch -o run -o 'thread backtrace all' -o 'image list' -- ./socket_options_test
+          exit 1
+        fi
     - name: Verify version, libevent, openssl
       run: |
         ./memtier_benchmark --version
@@ -506,7 +512,13 @@ jobs:
     - name: Build
       run: autoreconf -ivf && PKG_CONFIG_PATH=`brew --prefix openssl@1.1`/lib/pkgconfig ./configure && make
     - name: Unit tests
-      run: make check
+      run: |
+        if ! make check; then
+          cat test-suite.log
+          otool -L ./socket_options_test
+          lldb --batch -o run -o 'thread backtrace all' -o 'image list' -- ./socket_options_test
+          exit 1
+        fi
     - name: Verify version, libevent, openssl
       run: |
         ./memtier_benchmark --version
@@ -543,7 +555,13 @@ jobs:
         PKG_CONFIG_PATH="$RUNNER_TEMP/libevent-openssl-1.0/lib/pkgconfig:$(brew --prefix openssl@1.0)/lib/pkgconfig" ./configure
         make
     - name: Unit tests
-      run: make check
+      run: |
+        if ! make check; then
+          cat test-suite.log
+          otool -L ./socket_options_test
+          lldb --batch -o run -o 'thread backtrace all' -o 'image list' -- ./socket_options_test
+          exit 1
+        fi
     - name: Verify version, libevent, openssl
       run: |
         set -euo pipefail
