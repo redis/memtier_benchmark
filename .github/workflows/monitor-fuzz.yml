@@ -3,9 +3,9 @@ name: Monitor-Input Fuzz
 # Black-box fuzz driver for arbitrary_command::split_command_to_args() +
 # monitor_command_list::load_from_file(). Mutates the in-tree seed corpus
 # (tests/fuzz/monitor_input_corpus/) and runs memtier_benchmark
-# --monitor-input=<mutated> --command="__monitor_line@__" against a local
-# redis. Flags SIGSEGV, glibc "stack smashing detected", AddressSanitizer
-# reports, and 30-second timeouts. (Fixes #408 partial -- CI wiring
+# --monitor-input=<mutated> --command="__monitor_line@__" against a private
+# RESP sink that acknowledges requests without executing commands. Flags
+# SIGSEGV, glibc "stack smashing detected", sanitizer reports and timeouts. (Fixes #408 partial -- CI wiring
 # follow-up to the in-tree driver.)
 #
 # Trigger surface:
@@ -58,7 +58,7 @@ jobs:
           sudo apt-get -qq update
           sudo apt-get install -y \
             build-essential autoconf automake pkg-config \
-            libevent-dev libssl-dev zlib1g-dev redis-server
+            libevent-dev libssl-dev zlib1g-dev
 
       - uses: actions/setup-python@v5
         with:
@@ -70,15 +70,27 @@ jobs:
           ./configure --enable-sanitizers --enable-ubsan
           make -j
 
-      - name: Start local redis
+      # Use the workflow revision's harness for every target binary, including
+      # maintenance branches whose own fuzz driver may predate fixture fixes.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: .fuzz-harness
+          sparse-checkout: tests/fuzz
+
+      - name: Record source and harness revisions
         run: |
-          redis-server --daemonize yes --port 6379 --save "" --logfile redis.log
+          git rev-parse HEAD
+          git -C .fuzz-harness rev-parse HEAD
+
+      - name: Test fuzz harness and command sink
+        env:
+          MEMTIER: ${{ github.workspace }}/memtier_benchmark
+        run: python3 -m unittest discover -s .fuzz-harness/tests/fuzz -p 'test_*.py'
 
       - name: Run fuzz driver
         env:
           MEMTIER: ${{ github.workspace }}/memtier_benchmark
-          REDIS_HOST: 127.0.0.1
-          REDIS_PORT: "6379"
           # Smaller corpus pass on PR-label runs; larger on nightly/manual.
           # FUZZ_ITER is an upper bound on per-seed iterations; the run is
           # actually bounded by FUZZ_MAX_SECONDS below (a mutation that starts a
@@ -108,13 +120,13 @@ jobs:
           # Monitor-Input Fuzz nightly was failing on slowness, not a hang.
           # Bump to 180s -- real hangs are infinite and still trip it. (#496)
           FUZZ_TIMEOUT: "180"
-        run: python3 tests/fuzz/fuzz_monitor_input.py
+        run: python3 .fuzz-harness/tests/fuzz/fuzz_monitor_input.py
 
       - name: Upload reproducers on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: monitor-fuzz-repros
+          name: monitor-fuzz-repros-${{ matrix.branch }}
           # The driver saves repros via tempfile prefix "mfuzz_" (-> /tmp/mfuzz_*.txt);
           # the old /tmp/fuzz_monitor_* glob never matched, so failures uploaded
           # nothing. Cover both to be safe. (#496)

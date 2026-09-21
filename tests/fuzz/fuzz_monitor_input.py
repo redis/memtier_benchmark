@@ -4,7 +4,13 @@ Fuzzer driver for memtier_benchmark's --monitor-input parser.
 
 Loads every file in tests/fuzz/monitor_input_corpus/, applies a random chain of
 byte-level mutators, writes the result to a temp file, and runs memtier_benchmark
-with --monitor-input pointing at it. The contract under test is "the loader must
+with --monitor-input pointing at it and a private RESP command sink as its server.
+The sink acknowledges complete requests without executing them: mutated WAIT,
+HELLO, Pub/Sub or administrative commands cannot block or change server state.
+This exercises the loader, tokenizer and request serialization, not Redis command
+semantics (which belong in the integration tests).
+
+The contract under test is "the loader must
 report and exit cleanly on any input — never crash". A SIGSEGV, glibc
 'stack smashing detected', sanitizer report, or a timeout is a failure. Any
 non-zero exit (parse error, no commands found, connection refused) is fine.
@@ -17,8 +23,6 @@ Two synthetic seeds are produced at iteration time rather than checked in:
 
 Environment:
   FUZZ_ITER     iterations per seed (default 50)
-  REDIS_HOST    default 127.0.0.1
-  REDIS_PORT    default 6379
   MEMTIER       path to memtier_benchmark binary (default: ../../memtier_benchmark)
   FUZZ_SEED     PRNG seed for reproducible runs (default: os.urandom-derived)
   FUZZ_TIMEOUT  per-run timeout in seconds (default 30)
@@ -36,13 +40,13 @@ import tempfile
 import time
 from pathlib import Path
 
+from resp_command_sink import RESPCommandSink
+
 HERE = Path(__file__).resolve().parent
 CORPUS_DIR = HERE / "monitor_input_corpus"
 DEFAULT_MEMTIER = HERE.parent.parent / "memtier_benchmark"
 
 FUZZ_ITER = int(os.environ.get("FUZZ_ITER", "50"))
-REDIS_HOST = os.environ.get("REDIS_HOST", "127.0.0.1")
-REDIS_PORT = os.environ.get("REDIS_PORT", "6379")
 MEMTIER = Path(os.environ.get("MEMTIER", str(DEFAULT_MEMTIER)))
 FUZZ_TIMEOUT = int(os.environ.get("FUZZ_TIMEOUT", "60"))
 SEED = int(os.environ.get("FUZZ_SEED", str(int.from_bytes(os.urandom(4), "big"))))
@@ -168,22 +172,21 @@ def generate_synthetic_seeds() -> dict:
     }
 
 
-def run_one(seed_name: str, mutated: bytes) -> bool:
+def run_one(seed_name: str, mutated: bytes, sink, require_requests=False) -> bool:
     """Run memtier on a single mutated payload. Return True on clean exit."""
+    initial_requests = sink.request_count
     with tempfile.NamedTemporaryFile(prefix="mfuzz_", suffix=".txt", delete=False) as f:
         f.write(mutated)
         mpath = f.name
     try:
-        # Use --test-time (with a small cap) instead of --requests so a
-        # slow-but-not-crashing run (e.g. AUTH errors against an unauthenticated
-        # server) doesn't trip the harness timeout. (The two are mutually
-        # exclusive in memtier.) The loader is exercised regardless.
+        # Keep the runtime workload short; the outer timeout still catches
+        # loader/formatter hangs even before any connection is established.
         cmd = [
             str(MEMTIER),
             "--monitor-input={}".format(mpath),
             "--command=__monitor_line@__",
-            "--server={}".format(REDIS_HOST),
-            "--port={}".format(REDIS_PORT),
+            "--server={}".format(sink.host),
+            "--port={}".format(sink.port),
             "--test-time=2",
             "--clients=1",
             "--threads=1",
@@ -203,6 +206,7 @@ def run_one(seed_name: str, mutated: bytes) -> bool:
                 timeout=FUZZ_TIMEOUT,
             )
         except subprocess.TimeoutExpired as e:
+            sink.wait_idle()
             sys.stderr.write(
                 "FAIL [{}] timed out after {}s -- repro saved at {}\n".format(
                     seed_name, FUZZ_TIMEOUT, mpath
@@ -234,6 +238,19 @@ def run_one(seed_name: str, mutated: bytes) -> bool:
                 )
                 sys.stderr.write(blob.decode("utf-8", "replace")[-2048:] + "\n")
                 return False
+        # A broken sink or malformed serialized request must not look like an
+        # acceptable memtier parse-error exit. Wait for EOF/error accounting
+        # before inspecting the background handler's result.
+        if not sink.wait_idle():
+            sys.stderr.write("FAIL [{}] command sink did not become idle -- repro at {}\n".format(
+                seed_name, mpath))
+            return False
+        # Errors persist for the whole sweep, including after diagnostic capping.
+        errors = sink.errors
+        if errors or (require_requests and sink.request_count == initial_requests):
+            sys.stderr.write("FAIL [{}] command sink: {} -- repro at {}\n".format(
+                seed_name, errors or "no complete request received", mpath))
+            return False
         # Crash checks passed -- now safe to allowlist known-nonfatal parser
         # assertions on an otherwise-clean exit.
         if any(p in blob for p in KNOWN_NONFATAL_ASSERTIONS):
@@ -248,7 +265,7 @@ def run_one(seed_name: str, mutated: bytes) -> bool:
         raise
 
 
-def main() -> int:
+def fuzz(sink) -> int:
     if not MEMTIER.exists():
         sys.stderr.write("memtier_benchmark binary not found at {}\n".format(MEMTIER))
         return 2
@@ -266,6 +283,16 @@ def main() -> int:
     if not seeds:
         sys.stderr.write("no seeds found\n")
         return 2
+    # Prove the executable reached the sink; otherwise connection failures
+    # could make an entire fuzz sweep appear green without exercising requests.
+    if not run_one("sink-preflight", b'1.0 [0 127.0.0.1:1] "PING"\n',
+                   sink, require_requests=True):
+        return 1
+    # Run saved regressions unchanged, not just random mutations of them.
+    regressions = HERE / "monitor_input_regressions"
+    for path in sorted(regressions.glob("*.txt")):
+        if not run_one(path.name, path.read_bytes(), sink, require_requests=True):
+            return 1
     failures = 0
     total = 0
     grand_total = FUZZ_ITER * len(seeds)
@@ -309,7 +336,7 @@ def main() -> int:
                 sys.stderr.flush()
             total += 1
             mutated = mutate(payload)
-            ok = run_one(name, mutated)
+            ok = run_one(name, mutated, sink)
             if not ok:
                 failures += 1
     sys.stderr.write(
@@ -318,6 +345,11 @@ def main() -> int:
         )
     )
     return 1 if failures else 0
+
+
+def main() -> int:
+    with RESPCommandSink() as sink:
+        return fuzz(sink)
 
 
 if __name__ == "__main__":
