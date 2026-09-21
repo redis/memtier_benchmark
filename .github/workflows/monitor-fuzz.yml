@@ -5,8 +5,8 @@ name: Monitor-Input Fuzz
 # (tests/fuzz/monitor_input_corpus/) and runs memtier_benchmark
 # --monitor-input=<mutated> --command="__monitor_line@__" against a private
 # RESP sink that acknowledges requests without executing commands. Flags
-# SIGSEGV, glibc "stack smashing detected", sanitizer reports and timeouts. (Fixes #408 partial -- CI wiring
-# follow-up to the in-tree driver.)
+# SIGSEGV, glibc "stack smashing detected", sanitizer reports and timeouts.
+# (Fixes #408 partial -- CI wiring follow-up to the in-tree driver.)
 #
 # Trigger surface:
 #   * nightly cron with FUZZ_ITER=2000 (high-iteration smoke for new
@@ -94,8 +94,8 @@ jobs:
           # Smaller corpus pass on PR-label runs; larger on nightly/manual.
           # FUZZ_ITER is an upper bound on per-seed iterations; the run is
           # also bounded by FUZZ_MAX_SECONDS below. Each invocation parses its
-          # full input and replays at most 100 sequential requests; repeated
-          # large-input parsing can still exhaust the job without a sweep cap.
+          # full input and replays 1–100 sequential requests, scaled down for
+          # large inputs. Repeated parsing still needs a sweep time cap.
           FUZZ_ITER: ${{ github.event_name == 'pull_request' && '300' || (inputs.iterations || '2000') }}
           # Hard-cap every mutated payload at 2 MiB. GROW_MAX alone is not
           # enough: mutate() applies up to 4 mutators, so several `grow`s

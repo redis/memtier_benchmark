@@ -282,16 +282,13 @@ class RESPCommandSinkTests(unittest.TestCase):
 
     def test_error_storage_is_bounded_without_hiding_new_failures(self):
         with RESPCommandSink() as sink:
-            initial_count = sink.error_count
-            self.assertEqual(initial_count, 0)
-            for index in range(sink.MAX_ERRORS + 1):
+            self.assertEqual(sink.take_errors(), ())
+            for _ in range(sink.MAX_ERRORS + 1):
                 with self.connect(sink) as connection:
                     connection.sendall(b"invalid\r\n")
                     self.assertEqual(connection.recv(1), b"")
-                self.assertEqual(sink.error_count, index + 1)
             self.assertTrue(sink.wait_idle())
             before = sink.errors
-            before_count = sink.error_count
             self.assertEqual(len(before), sink.MAX_ERRORS + 1)
             self.assertEqual(before[-1], "1 additional sink errors")
             with self.connect(sink) as connection:
@@ -301,13 +298,36 @@ class RESPCommandSinkTests(unittest.TestCase):
             self.assertEqual(len(sink.errors), len(before))
             self.assertNotEqual(sink.errors, before)
             self.assertEqual(sink.errors[-1], "2 additional sink errors")
-            self.assertEqual(sink.error_count, before_count + 1)
+            capped = sink.take_errors()
+            self.assertEqual(capped[-1], "2 additional sink errors")
+            self.assertEqual(sink.errors, ())
+            self.assertEqual(sink.take_errors(), ())
             with self.connect(sink) as connection:
                 connection.sendall(frame(b"PING"))
                 self.assertEqual(receive(connection, 5), b"+OK\r\n")
             self.assertTrue(sink.wait_idle())
-            self.assertEqual(sink.error_count, before_count + 1)
-            self.assertEqual(initial_count, 0)
+            self.assertEqual(sink.take_errors(), ())
+            self.assertEqual(before[-1], "1 additional sink errors")
+            self.assertEqual(capped[-1], "2 additional sink errors")
+
+    def test_later_input_keeps_its_own_diagnostic_after_earlier_errors_are_taken(self):
+        with RESPCommandSink() as sink:
+            for _ in range(39):
+                with self.connect(sink) as connection:
+                    connection.sendall(b"invalid\r\n")
+                    self.assertEqual(connection.recv(1), b"")
+            self.assertTrue(sink.wait_idle())
+            earlier = sink.take_errors()
+            self.assertEqual(earlier[-1], "7 additional sink errors")
+            with self.connect(sink) as connection:
+                connection.sendall(b"*9223372036854775808\r\n")
+                self.assertEqual(connection.recv(1), b"")
+            self.assertTrue(sink.wait_idle())
+            current = sink.take_errors()
+            self.assertEqual(len(current), 1)
+            self.assertIn("exceeds signed 64-bit range", current[0])
+            self.assertNotIn(current[0], earlier)
+            self.assertEqual(sink.errors, ())
 
     def test_listener_bind_failure_closes_its_socket(self):
         socket_class = socket.socket
@@ -344,7 +364,7 @@ class RESPCommandSinkTests(unittest.TestCase):
                 connection.sendall(b"invalid\r\n")
                 self.assertEqual(connection.recv(1), b"")
         self.assertTrue(sink.wait_idle())
-        self.assertEqual(sink.error_count, sink.MAX_ERRORS)
+        self.assertEqual(len(sink.errors), sink.MAX_ERRORS)
         original_serve = sink._serve
         blocked = threading.Event()
         release = threading.Event()
@@ -366,7 +386,7 @@ class RESPCommandSinkTests(unittest.TestCase):
                         RuntimeError, "^RESP sink threads did not stop before close deadline$"):
                     sink.close()
                 self.assertLess(time.monotonic() - started, 1)
-                self.assertEqual(sink.error_count, sink.MAX_ERRORS + 1)
+                self.assertEqual(len(sink.errors), sink.MAX_ERRORS + 1)
                 self.assertEqual(sink.errors[-1], "1 additional sink errors")
             finally:
                 release.set()

@@ -10,8 +10,7 @@ HELLO, Pub/Sub or administrative commands cannot block or change server state.
 This exercises the loader, tokenizer and request serialization, not Redis command
 semantics (which belong in the integration tests).
 
-The contract under test is "the loader must
-report and exit cleanly on any input — never crash". A SIGSEGV, glibc
+The loader must report and exit cleanly on any input, never crash. A SIGSEGV, glibc
 'stack smashing detected', sanitizer report, or a timeout is a failure. Any
 non-zero exit (parse error, no commands found, connection refused) is fine for
 mutated inputs. The valid preflight and saved regressions additionally require
@@ -177,20 +176,22 @@ def generate_synthetic_seeds() -> dict:
 def run_one(seed_name: str, mutated: bytes, sink, require_requests=False) -> bool:
     """Run memtier on a single mutated payload. Return True on clean exit."""
     initial_requests = sink.request_count
-    initial_errors = sink.error_count
     with tempfile.NamedTemporaryFile(prefix="mfuzz_", suffix=".txt", delete=False) as f:
         f.write(mutated)
         mpath = f.name
     try:
         # Finish a bounded request count, rather than canceling an in-flight
         # large frame at a time limit. The outer timeout still catches hangs.
+        # Small corpus files get a full sequential pass (up to 100 requests).
+        # Scale down for large inputs so replay does not amplify their cost.
+        requests = max(1, min(100, (2 * 1024 * 1024) // max(1, len(mutated))))
         cmd = [
             str(MEMTIER),
             "--monitor-input={}".format(mpath),
             "--command=__monitor_line@__",
             "--server={}".format(sink.host),
             "--port={}".format(sink.port),
-            "--requests=100",
+            "--requests={}".format(requests),
             "--monitor-pattern=S",
             "--clients=1",
             "--threads=1",
@@ -211,6 +212,7 @@ def run_one(seed_name: str, mutated: bytes, sink, require_requests=False) -> boo
             )
         except subprocess.TimeoutExpired as e:
             sink.wait_idle()
+            errors = sink.take_errors()
             sys.stderr.write(
                 "FAIL [{}] timed out after {}s -- repro saved at {}\n".format(
                     seed_name, FUZZ_TIMEOUT, mpath
@@ -218,10 +220,13 @@ def run_one(seed_name: str, mutated: bytes, sink, require_requests=False) -> boo
             )
             if e.stderr:
                 sys.stderr.write(e.stderr.decode("utf-8", "replace")[-2048:] + "\n")
+            if errors:
+                sys.stderr.write("command sink: {}\n".format(errors))
             return False
-        # Drain this producer even when memtier crashed, before the next input
-        # snapshots its error counter. Preserve crash diagnostics as the priority.
+        # Drain this producer even when memtier crashed, before processing
+        # another input. Preserve crash diagnostics as the priority.
         idle = sink.wait_idle()
+        errors = sink.take_errors()
         blob = (proc.stdout or b"") + (proc.stderr or b"")
         # IMPORTANT: check crash signals / sanitizer patterns BEFORE the
         # known-nonfatal allowlist. A run can produce a parser assertion
@@ -252,9 +257,6 @@ def run_one(seed_name: str, mutated: bytes, sink, require_requests=False) -> boo
             sys.stderr.write("FAIL [{}] command sink did not become idle -- repro at {}\n".format(
                 seed_name, mpath))
             return False
-        # The counter keeps increasing after diagnostic storage is capped, and
-        # earlier inputs' failures must not be attributed to this reproducer.
-        errors = sink.errors if sink.error_count > initial_errors else ()
         if errors or (require_requests and sink.request_count == initial_requests):
             sys.stderr.write("FAIL [{}] command sink: {} -- repro at {}\n".format(
                 seed_name, errors or "no complete request received", mpath))
@@ -312,8 +314,8 @@ def fuzz(sink) -> int:
     progress_every = int(os.environ.get("FUZZ_PROGRESS_EVERY", "50"))
     # Bound the sweep as well as each subprocess: large loader inputs and many
     # launches can exhaust a CI job even with a finite request count per run.
-    # The loader reads the entire input; replay is limited to 100 sequential
-    # requests. Round-robin seeds spread the available budget across the corpus.
+    # The loader reads the entire input; replay uses 1–100 sequential requests,
+    # scaled down for large inputs. Round-robin seeds share the available budget.
     max_seconds = int(os.environ.get("FUZZ_MAX_SECONDS", "0"))
     seed_items = list(seeds.items())
     budget_hit = False

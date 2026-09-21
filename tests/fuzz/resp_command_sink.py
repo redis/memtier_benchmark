@@ -107,17 +107,19 @@ class RESPCommandSink:
             return self._request_count
 
     @property
-    def error_count(self):
-        """Return all failures, including diagnostics omitted by the storage cap."""
-        with self._condition:
-            return len(self._errors) + self._dropped_errors
-
-    @property
     def errors(self):
         with self._condition:
             result = tuple(self._errors)
             if self._dropped_errors:
                 result += ("{} additional sink errors".format(self._dropped_errors),)
+            return result
+
+    def take_errors(self):
+        """Atomically return and clear diagnostics after a producer is drained."""
+        with self._condition:
+            result = self.errors
+            self._errors.clear()
+            self._dropped_errors = 0
             return result
 
     def _record_error(self, message):

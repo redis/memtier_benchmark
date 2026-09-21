@@ -18,8 +18,9 @@ class DriverOracleTests(unittest.TestCase):
         patch = mock.patch.object(driver.tempfile, 'tempdir', self.directory.name)
         patch.start()
         self.addCleanup(patch.stop)
-        self.sink = mock.Mock(host='127.0.0.1', port=1, request_count=0, error_count=0, errors=())
+        self.sink = mock.Mock(host='127.0.0.1', port=1, request_count=0)
         self.sink.wait_idle.return_value = True
+        self.sink.take_errors.return_value = ()
 
     def run_result(self, code=0, stderr=b'', **kwargs):
         result = subprocess.CompletedProcess([], code, b'', stderr)
@@ -39,6 +40,7 @@ class DriverOracleTests(unittest.TestCase):
         self.assertEqual(len(list(Path(self.directory.name).iterdir())), 5)
 
     def test_timeout_remains_a_failure(self):
+        self.sink.take_errors.return_value = ('partial request during timeout',)
         with mock.patch.object(driver.subprocess, 'run',
                                side_effect=subprocess.TimeoutExpired([], 1, stderr=b'last output')), \
                 contextlib.redirect_stderr(io.StringIO()):
@@ -46,13 +48,12 @@ class DriverOracleTests(unittest.TestCase):
         self.assertEqual(len(list(Path(self.directory.name).iterdir())), 1)
 
     def test_sink_failure_cannot_be_accepted_as_parse_error(self):
-        self.sink.errors = ('invalid RESP',)
-        type(self.sink).error_count = mock.PropertyMock(side_effect=[0, 1])
+        self.sink.take_errors.return_value = ('invalid RESP',)
         self.assertFalse(self.run_result(code=2))
 
     def test_previous_sink_errors_do_not_blame_a_later_input(self):
-        self.sink.errors = ('earlier invalid RESP',)
-        self.sink.error_count = 1
+        self.sink.take_errors.side_effect = [('earlier invalid RESP',), ()]
+        self.assertFalse(self.run_result(code=2))
         self.assertTrue(self.run_result(code=2))
 
     def test_request_count_workload_does_not_cancel_partial_frames(self):
@@ -146,7 +147,7 @@ class MonitorReplayTests(unittest.TestCase):
             self.assertTrue(driver.run_one('large-request-budget', payload, sink,
                                            require_requests=True))
             self.assertTrue(sink.wait_idle())
-            self.assertEqual(sink.request_count, 100)
+            self.assertEqual(sink.request_count, 1)
             self.assertFalse(sink.errors)
 
     def test_saved_nightly_inputs_finish_without_server_side_effects(self):
