@@ -177,7 +177,7 @@ jobs:
       # Keep normal builds unchanged; only this extra test compilation gets
       # zero initialization so the original uninitialized argument fails reliably.
       run: |
-        make -W tests/unit/socket_options_test.cpp socket_options_test socket_options_test_CXXFLAGS='-std=c++11 -Wall -Werror=vla -g -ftrivial-auto-var-init=zero'
+        make -W tests/unit/socket_options_test.cpp socket_options_test SOCKET_TEST_EXTRA_CXXFLAGS=-ftrivial-auto-var-init=zero
         ./socket_options_test
 
   build-ubuntu-latest:
@@ -487,7 +487,6 @@ jobs:
       matrix:
         openssl: ["3.0", "3"]
     runs-on: macos-latest
-    continue-on-error: true
     steps:
     - uses: actions/checkout@v6
     - name: Install dependencies
