@@ -1471,10 +1471,14 @@ void shard_connection::handle_event(short events)
     if (events & BEV_EVENT_ERROR) {
         bool ssl_error = false;
 #ifdef USE_TLS
-        unsigned long sslerr;
-        while ((sslerr = bufferevent_get_openssl_error(m_bev))) {
-            ssl_error = true;
-            benchmark_error_log("TLS connection error: %s\n", ERR_reason_error_string(sslerr));
+        // Only TLS connections have an OpenSSL bufferevent. libevent 2.2
+        // requires that type when querying its OpenSSL error queue.
+        if (m_config->openssl_ctx != NULL) {
+            unsigned long sslerr;
+            while ((sslerr = bufferevent_get_openssl_error(m_bev))) {
+                ssl_error = true;
+                benchmark_error_log("TLS connection error: %s\n", ERR_reason_error_string(sslerr));
+            }
         }
 #endif
         if (!ssl_error && errno) {
