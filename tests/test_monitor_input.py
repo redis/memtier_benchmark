@@ -504,6 +504,7 @@ def test_monitor_random_reproducible_without_randomize(env):
     ]
 
     config_dict = get_default_memtier_config(threads=1, clients=1, requests=100)
+    expected_requests = get_expected_request_count(config_dict)
     master_nodes_list = env.getMasterNodesList()
 
     # Helper function to run benchmark and get command counts
@@ -513,9 +514,14 @@ def test_monitor_random_reproducible_without_randomize(env):
 
         benchmark_specs = {"name": run_name, "args": base_args.copy()}
         addTLSArgs(benchmark_specs, env)
-        add_required_env_arguments(benchmark_specs, config_dict.copy(), env, master_nodes_list)
+        add_required_env_arguments(benchmark_specs, config_dict, env, master_nodes_list)
 
-        config = RunConfig(run_dir, run_name, config_dict.copy(), {})
+        # Catch a discarded helper mutation even when the fixture uses port 6379.
+        if not env.isUnixSocket() and config_dict.get('redis_process_port') != master_nodes_list[0]['port']:
+            env.assertEqual(config_dict.get('redis_process_port'), master_nodes_list[0]['port'],
+                            message="The Redis fixture port must reach RunConfig explicitly")
+            return {}
+        config = RunConfig(run_dir, run_name, config_dict, {})
         ensure_clean_benchmark_folder(config.results_dir)
 
         benchmark = Benchmark.from_json(config, benchmark_specs)
@@ -536,6 +542,8 @@ def test_monitor_random_reproducible_without_randomize(env):
                     if isinstance(val, bytes):
                         val = val.decode("utf-8")
                     counts[key] = int(val)
+        env.assertEqual(sum(counts.values()), expected_requests,
+                        message="Each run must execute its full INCR budget on the configured Redis")
         return counts
 
     # Clear any existing keys
