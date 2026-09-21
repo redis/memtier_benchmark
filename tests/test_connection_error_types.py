@@ -9,7 +9,7 @@ from include import MEMTIER_BINARY
 
 def _run_failure(env, port, tls=False):
     args = [MEMTIER_BINARY, "--server=127.0.0.1", "--port={}".format(port),
-            "--threads=1", "--clients=1", "--test-time=2",
+            "--threads=1", "--clients=1", "--test-time=5",
             "--reconnect-on-error", "--max-reconnect-attempts=1",
             "--connection-timeout=1"]
     if tls:
@@ -33,9 +33,9 @@ def test_plaintext_connection_refused(env):
 
 
 def test_tls_handshake_failure(env):
-    help_text = subprocess.run([MEMTIER_BINARY, "--help"], capture_output=True,
-                               text=True, timeout=10).stdout
-    if "--tls " not in help_text and "--tls\n" not in help_text:
+    version = subprocess.run([MEMTIER_BINARY, "--version"], capture_output=True,
+                             text=True, timeout=10, check=True).stdout
+    if " openssl=" not in version:
         env.skip()
         return
 
