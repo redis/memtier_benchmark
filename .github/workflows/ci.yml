@@ -133,6 +133,9 @@ jobs:
 
   build-notls:
     runs-on: ubuntu-latest
+    env:
+      # Make a reintroduced uninitialized socket-option argument fail reliably.
+      CXXFLAGS: -g -O2 -ftrivial-auto-var-init=zero
     steps:
     - uses: actions/checkout@v6
     - name: Install dependencies

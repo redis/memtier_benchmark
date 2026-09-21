@@ -103,7 +103,14 @@ static void check_connections(struct connect_info &address, const char *unix_pat
 #endif
     event_base *base = event_base_new();
     abstract_protocol *protocol = protocol_factory(config.protocol);
-    if (!check(base != NULL && protocol != NULL, context, "create event base and protocol")) exit(1);
+    if (!check(base != NULL && protocol != NULL, context, "create event base and protocol")) {
+        delete protocol;
+        if (base != NULL) event_base_free(base);
+#ifdef USE_TLS
+        if (config.openssl_ctx != NULL) SSL_CTX_free(config.openssl_ctx);
+#endif
+        return;
+    }
     {
         // connect() creates/configures the socket synchronously. Disconnect
         // before dispatching the loop, so no callbacks use the unused manager.
