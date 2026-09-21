@@ -458,17 +458,13 @@ def _matches_disconnect(text):
 
 def test_diff_server_killed_mid_stream(redis_server):
     """Both memtier and ``redis-cli --pipe`` must emit a connection-loss
-    diagnostic when the server dies mid-stream. ``redis-cli --pipe``
-    additionally exits non-zero.
+    diagnostic when the server dies mid-stream, and both must exit
+    non-zero.
 
-    Known divergence: memtier master does *not* exit non-zero on
-    server kill — its thread-restart loop (added recently for soak
-    stability) keeps retrying connections indefinitely. We assert the
-    diagnostic-emission contract for memtier and the stronger
-    diagnostic-plus-nonzero-exit contract for redis-cli. Tightening
-    memtier to also exit non-zero would either require a new flag
-    (e.g. ``--max-thread-restarts``) or a behavior change; both are
-    out of scope for this test PR. Tracked under follow-up for #414.
+    memtier used to diverge here: a silent worker-thread restart loop
+    kept retrying and the process did not exit non-zero on server kill
+    (follow-up for #414). Without --reconnect-on-error a dead connection
+    now ends its worker and fails the run.
     """
     port, proc = redis_server
     rb_cli = _require(REDIS_CLI)
@@ -488,15 +484,22 @@ def test_diff_server_killed_mid_stream(redis_server):
         time.sleep(1.5)
         proc.kill()
         proc.wait(timeout=5)
+        mt_timed_out = False
         try:
             mt_stdout, mt_stderr = mt_proc.communicate(timeout=30)
         except subprocess.TimeoutExpired:
+            mt_timed_out = True
             mt_proc.kill()
             mt_stdout, mt_stderr = mt_proc.communicate()
         combined_mt = (mt_stdout or "") + "\n" + (mt_stderr or "")
         assert _matches_disconnect(combined_mt), (
             f"memtier did not log a disconnect diagnostic; "
             f"stdout={mt_stdout!r}; stderr={mt_stderr!r}")
+        assert not mt_timed_out, (
+            "memtier kept running after the server was killed; "
+            f"stderr={mt_stderr!r}")
+        assert mt_proc.returncode != 0, (
+            "memtier exited 0 against a server killed mid-run")
 
     payload = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n" * 5000
     cli_proc = subprocess.run(

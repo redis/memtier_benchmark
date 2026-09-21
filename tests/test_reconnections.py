@@ -610,3 +610,96 @@ def test_reconnect_backoff_cap_60s(env):
         60.0,
         message="Backoff exceeded 60 s cap: {:.2f} s observed".format(max_observed),
     )
+
+
+def _run_with_mid_run_client_kill(env, extra_args, test_time, kill_after):
+    """Run memtier with --test-time=test_time, CLIENT KILL every normal client
+    once, kill_after seconds in, and return (return_code, elapsed, stderr)."""
+    import subprocess
+
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--pipeline=1",
+            "--ratio=1:1",
+            "--key-pattern=R:R",
+            "--key-minimum=1",
+            "--key-maximum=10000",
+            "--hide-histogram",
+        ] + extra_args,
+    }
+    addTLSArgs(benchmark_specs, env)
+
+    config = get_default_memtier_config(threads=2, clients=2, requests=None, test_time=test_time)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    test_dir = tempfile.mkdtemp()
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    master_nodes_connections = env.getOSSMasterNodesConnectionList()
+
+    stderr_path = "{0}/mb.stderr".format(config.results_dir)
+    started = time.time()
+    with open("{0}/mb.stdout".format(config.results_dir), "w") as stdout_f, open(stderr_path, "w") as stderr_f:
+        proc = subprocess.Popen(benchmark.args, stdout=stdout_f, stderr=stderr_f, cwd=config.results_dir)
+        time.sleep(kill_after)
+        for conn in master_nodes_connections:
+            conn.execute_command("CLIENT", "KILL", "TYPE", "normal")
+        try:
+            return_code = proc.wait(timeout=6 * test_time)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            return_code = proc.wait(timeout=10)
+    elapsed = time.time() - started
+
+    with open(stderr_path) as f:
+        stderr_content = f.read()
+    env.debugPrint("memtier exit code: {}, elapsed {:.1f}s".format(return_code, elapsed), True)
+    env.debugPrint("STDERR:\n{}".format(stderr_content[:2000]), True)
+    return return_code, elapsed, stderr_content
+
+
+def test_connection_kill_without_reconnect_fails_on_time(env):
+    """
+    Without --reconnect-on-error, connections killed mid-run must END the run
+    as a failure. They must not cause the worker threads to be silently
+    rebuilt: a rebuilt thread started a fresh --test-time window with fresh
+    stats, so the run took (kill time + a full --test-time), up to five times
+    over, while reporting the requested duration; it discarded the ops recorded
+    before the kill; and it exited 0.
+    """
+    env.skipOnCluster()
+    test_time, kill_after = 8, 2
+    rc, elapsed, stderr_content = _run_with_mid_run_client_kill(env, [], test_time, kill_after)
+
+    env.assertNotEqual(rc, 0, message="a run whose connections were killed must not exit 0")
+    env.assertFalse("Restarting thread" in stderr_content, message="a worker thread was silently restarted")
+    env.assertTrue("unrecovered connection errors" in stderr_content, message="the failure was not reported")
+    # A restart re-runs the full window, so the run would take at least
+    # kill_after + test_time. Ending on the failure takes about kill_after.
+    env.assertLess(elapsed, test_time, message="run took {:.1f}s for --test-time={}".format(elapsed, test_time))
+
+
+def test_connection_kill_with_reconnect_is_not_rerun(env):
+    """
+    With --reconnect-on-error, connections killed mid-run are recovered and the
+    run ends at --test-time with exit 0. The recovered connection errors must
+    not cause the worker threads to be re-run afterwards: that discarded the
+    whole completed window, reported a second one in its place, and doubled
+    the wall time.
+    """
+    env.skipOnCluster()
+    test_time, kill_after = 8, 2
+    rc, elapsed, stderr_content = _run_with_mid_run_client_kill(
+        env, ["--reconnect-on-error", "--max-reconnect-attempts=10"], test_time, kill_after
+    )
+
+    env.assertEqual(rc, 0)
+    env.assertFalse("Restarting thread" in stderr_content, message="a worker thread was silently restarted")
+    # A re-run takes about 2 * test_time; an honest run takes test_time plus
+    # process start-up and teardown.
+    env.assertLess(
+        elapsed, test_time + 4, message="run took {:.1f}s for --test-time={}".format(elapsed, test_time)
+    )

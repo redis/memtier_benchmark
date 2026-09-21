@@ -134,6 +134,13 @@ static volatile sig_atomic_t g_interrupted = 0;
 // the run loop to decide between exit(0) and exit(2).
 static std::atomic<bool> g_connection_stage_aborted{false};
 
+// Set by run_benchmark() (main thread, after joining the workers) when any
+// worker thread ended on connection failures it could not recover from (or an
+// exception) instead of on the run's own stop condition (--test-time /
+// --requests). Such a run did not measure what was asked for; main() then
+// exits 1.
+static bool g_worker_failed = false;
+
 // Forward declarations
 struct cg_thread;
 static void print_client_list(FILE *fp, int pid, const char *timestr);
@@ -178,7 +185,7 @@ void connection_stage_supervisor_reset(void)
     g_conn_stage_streak_start_sec.store(0, std::memory_order_release);
     // Must reset g_connection_stage_aborted as well: with --run-count > 1, a
     // run-1 abort would otherwise leave the flag latched into run 2,
-    // suppressing legitimate thread restarts in cg_thread_start() and
+    // suppressing the worker-failure report in cg_thread_start() and
     // forcing main() to exit with code 2 even after subsequent runs succeed.
     g_connection_stage_aborted.store(false, std::memory_order_release);
     struct timeval now;
@@ -2671,7 +2678,8 @@ void usage()
         "      --ratio=RATIO              Set:Get ratio (default: 1:10)\n"
         "      --pipeline=NUMBER          Number of concurrent pipelined requests (default: 1)\n"
         "      --reconnect-interval=NUM   Number of requests after which re-connection is performed\n"
-        "      --reconnect-on-error       Enable automatic reconnection on connection errors (default: disabled)\n"
+        "      --reconnect-on-error       Enable automatic reconnection on connection errors (default: disabled).\n"
+        "                                 Without it, a lost connection ends its thread and the run exits 1.\n"
         "      --max-reconnect-attempts=NUM Maximum number of reconnection attempts (default: 0, unlimited)\n"
         "      --reconnect-backoff-factor=NUM Backoff factor for reconnection delays (default: 0, no backoff)\n"
         "      --retry-on-error           Resend a request when the server returns a transient error or the\n"
@@ -2837,16 +2845,20 @@ struct cg_thread
     abstract_protocol *m_protocol;
     pthread_t m_thread;
     std::atomic<bool> m_finished; // Atomic to prevent data race between worker thread write and main thread read
-    bool m_restart_requested;
-    unsigned int m_restart_count;
+    // Set by the worker, before m_finished, when some of its clients were cut
+    // off by connection failures it could not recover from (or it threw),
+    // rather than all ending on the run's stop condition. Read by the main
+    // thread only after join(). The worker is NOT re-run: a replacement
+    // client_group would start a fresh --test-time window and fresh stats,
+    // silently stretching the run and discarding what was measured.
+    bool m_failed;
 
     // Per-thread CPU accounting via getrusage(RUSAGE_THREAD), captured inside
-    // the worker. A restart() spawns a NEW native thread, so RUSAGE_THREAD
-    // resets to 0 each segment; m_cpu_*_usec_acc accumulate completed segments
-    // so the reported total spans all restarts. m_wall_usec_acc is the WALL time
-    // of those same segments, captured at the exact same points as the CPU
-    // snapshots, so cores_used = cpu/wall divides two values over the identical
-    // interval (no setup-vs-serving skew). Only read post-join (race-free).
+    // the worker. m_cpu_*_usec_acc hold the worker's CPU time and
+    // m_wall_usec_acc the WALL time of the same interval, captured at the exact
+    // same points as the CPU snapshots, so cores_used = cpu/wall divides two
+    // values over the identical interval (no setup-vs-serving skew). Only read
+    // post-join (race-free).
     struct rusage m_cpu_start_ru;   // CPU snapshot at the current segment's start
     struct timeval m_wall_start_tv; // wall snapshot at the same point
     unsigned long long m_cpu_user_usec_acc;
@@ -2862,8 +2874,7 @@ struct cg_thread
             m_cg(NULL),
             m_protocol(NULL),
             m_finished(false),
-            m_restart_requested(false),
-            m_restart_count(0),
+            m_failed(false),
             m_cpu_user_usec_acc(0),
             m_cpu_sys_usec_acc(0),
             m_wall_usec_acc(0),
@@ -2908,38 +2919,6 @@ struct cg_thread
         ret = pthread_join(m_thread, (void **) &retval);
         assert(ret == 0);
     }
-
-    int restart(void)
-    {
-        // Clean up existing client group
-        if (m_cg != NULL) {
-            delete m_cg;
-        }
-
-        // Create new client group
-        m_cg = new client_group(m_config, m_protocol, m_obj_gen);
-
-        // Create all clients upfront, prepare initial batch
-        if (m_cg->create_clients(m_config->clients) < (int) m_config->clients) return -1;
-        if (m_config->clients_start > 0) {
-            if (m_cg->prepare_count(m_config->clients_start) < 0) return -1;
-        } else {
-            if (m_cg->prepare() < 0) return -1;
-        }
-
-        // Reset state
-        m_finished = false;
-        m_restart_requested = false;
-        m_restart_count++;
-
-        // CPU accumulators (m_cpu_*_usec_acc) intentionally persist across
-        // restarts. The new native thread re-snapshots m_cpu_start_ru on entry,
-        // so clear only the per-segment "started" flag.
-        m_cpu_started = false;
-
-        // Start new thread
-        return pthread_create(&m_thread, NULL, cg_thread_start, (void *) this);
-    }
 };
 
 // Cumulative CPU time (user+system, microseconds) consumed by an arbitrary
@@ -2965,12 +2944,12 @@ static unsigned long long get_thread_cpu_usec(pthread_t thread)
 #endif
 }
 
-// Fold this worker's current-segment CPU usage (getrusage delta) AND the wall
-// time of the same segment into its across-restart accumulators. Called from
-// inside the worker on every exit path, BEFORE m_finished is set, so the
-// segment is accounted before the monitor loop can observe completion and
-// trigger a restart. The wall bracket is captured at the same two points as the
-// CPU bracket so cores_used = cpu/wall covers one identical interval.
+// Fold this worker's CPU usage (getrusage delta) AND the wall time of the same
+// interval into its accumulators. Called from inside the worker on every exit
+// path, BEFORE m_finished is set, so the interval is accounted before the
+// monitor loop can observe completion. The wall bracket is captured at the same
+// two points as the CPU bracket so cores_used = cpu/wall covers one identical
+// interval.
 static void cg_thread_capture_cpu_end(cg_thread *thread)
 {
 #if defined(RUSAGE_THREAD)
@@ -2999,8 +2978,8 @@ static void cg_thread_capture_cpu_end(cg_thread *thread)
 // delta to "% of a core" over the real wall window, emits a de-duped live
 // high-CPU warning (once per thread, on first crossing), tracks the peak
 // whole-process utilization, and appends a per-second snapshot to a history
-// vector. Finished/restarting workers are skipped so their pthread_t is never
-// read while joined or mid-restart.
+// vector. Finished workers are skipped so their pthread_t is never read while
+// joined.
 struct cpu_live_sampler
 {
     std::vector<unsigned long long> thread_prev;
@@ -3043,8 +3022,7 @@ struct cpu_live_sampler
         double whole_pct = snap.m_main_thread_cpu_pct;
         for (size_t t = 0; t < threads.size(); t++) {
             double pct = 0.0;
-            // Skip finished/restarting workers: a reset clock on a new pthread_t
-            // would yield a bogus delta, and a joined handle is unsafe to read.
+            // Skip finished workers: a joined handle is unsafe to read.
             if (!threads[t]->m_finished) {
                 unsigned long long cur = get_thread_cpu_usec(threads[t]->m_thread);
                 unsigned long long delta = (cur > thread_prev[t]) ? cur - thread_prev[t] : 0;
@@ -3077,9 +3055,8 @@ static void *cg_thread_start(void *t)
     // stack rather than re-faulting on the exhausted one.
     install_alt_signal_stack();
 
-    // Snapshot this segment's starting CPU time and wall time (per-thread) at
-    // the same instant. Accumulators on cg_thread carry prior segments forward
-    // across restarts.
+    // Snapshot this worker's starting CPU time and wall time (per-thread) at
+    // the same instant.
 #if defined(RUSAGE_THREAD)
     if (getrusage(RUSAGE_THREAD, &thread->m_cpu_start_ru) == 0) {
         gettimeofday(&thread->m_wall_start_tv, NULL);
@@ -3091,19 +3068,28 @@ static void *cg_thread_start(void *t)
     try {
         thread->m_cg->run();
 
-        // Check if we should restart due to connection failures
-        // If the thread finished but still has time left and connection errors, request restart
+        // A worker has one legitimate end: each client reached its stop
+        // condition (--test-time elapsed / --requests done) and set its end
+        // time. Connection errors that --reconnect-on-error recovered from do
+        // not change that, so they are not checked here. A client that has no
+        // end time was cut off: its connection died and was not recovered
+        // (--reconnect-on-error off, or its attempts exhausted) and the event
+        // loop was broken. This worker then stopped short of the window it was
+        // asked to measure. Report it; run_benchmark() fails the run after the
+        // join. The worker is deliberately NOT restarted -- see
+        // cg_thread::m_failed.
         //
-        // Exception: do NOT request restart if the connection-stage
-        // supervisor already gave up. Restarting would re-enter the same
-        // doomed handshake (AUTH against no-auth server, SELECT against
-        // missing DB, etc.) and silently re-trigger the same failure mode
-        // we just aborted on, masking the abort code from exit.
-        if (thread->m_cg->get_total_connection_errors() > 0 &&
-            !g_connection_stage_aborted.load(std::memory_order_acquire)) {
-            benchmark_error_log("Thread %u finished due to connection failures, requesting restart.\n",
-                                thread->m_thread_id);
-            thread->m_restart_requested = true;
+        // Ctrl+C and the connection-stage supervisor end the loop through
+        // client_group::interrupt(), which stamps end times from the main
+        // thread; neither is a worker failure (the latter exits 2 itself).
+        unsigned int unended = thread->m_cg->count_unended_clients();
+        if (unended > 0 && !g_interrupted && !g_connection_stage_aborted.load(std::memory_order_acquire)) {
+            benchmark_error_log("Thread %u: %u client(s) stopped early on unrecovered connection errors.\n",
+                                thread->m_thread_id, unended);
+            thread->m_failed = true;
+            // Stamp the cut-off clients' end time now, as interrupt() does, so
+            // the recorded duration is the time actually spent.
+            thread->m_cg->finalize_all_clients();
         }
 
         cg_thread_capture_cpu_end(thread);
@@ -3111,17 +3097,17 @@ static void *cg_thread_start(void *t)
     } catch (const std::exception &e) {
         benchmark_error_log("Thread %u caught exception: %s\n", thread->m_thread_id, e.what());
         cg_thread_capture_cpu_end(thread);
-        thread->m_finished = true;
         if (!g_connection_stage_aborted.load(std::memory_order_acquire)) {
-            thread->m_restart_requested = true;
+            thread->m_failed = true;
         }
+        thread->m_finished = true;
     } catch (...) {
         benchmark_error_log("Thread %u caught unknown exception\n", thread->m_thread_id);
         cg_thread_capture_cpu_end(thread);
-        thread->m_finished = true;
         if (!g_connection_stage_aborted.load(std::memory_order_acquire)) {
-            thread->m_restart_requested = true;
+            thread->m_failed = true;
         }
+        thread->m_finished = true;
     }
 
     return t;
@@ -3419,7 +3405,7 @@ static void prom_observe_and_fill(benchmark_config *cfg, std::vector<cg_thread *
 }
 
 // Exact post-join fold of one thread's final totals into the accumulator basis,
-// BEFORE its client_group is destroyed (restart or run end). Race-free.
+// BEFORE its client_group is destroyed at run end. Race-free.
 static void prom_fold_thread(benchmark_config *cfg, size_t t, client_group *cg)
 {
     cfg->prometheus->accumulator().fold_final(t, prom_read_cg_counters(cg));
@@ -3635,28 +3621,6 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         unsigned long int total_retried_ops = 0;
 
         for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
-            // Check if thread needs restart
-            if ((*i)->m_finished && (*i)->m_restart_requested && (*i)->m_restart_count < 5) {
-                benchmark_error_log("Restarting thread %u (restart #%u)...\n", (*i)->m_thread_id,
-                                    (*i)->m_restart_count + 1);
-
-                // Join the failed thread first
-                (*i)->join();
-
-                // Prometheus restart fold (PLAN section 3.6b): fold this
-                // thread's exact post-join totals into the accumulator basis
-                // BEFORE restart() deletes m_cg, so the monotonic counters
-                // survive the client_group replacement.
-                if (prom_enabled(cfg)) prom_fold_thread(cfg, (size_t) (i - threads.begin()), (*i)->m_cg);
-
-                // Attempt to restart
-                if ((*i)->restart() == 0) {
-                    benchmark_error_log("Thread %u restarted successfully.\n", (*i)->m_thread_id);
-                } else {
-                    benchmark_error_log("Failed to restart thread %u.\n", (*i)->m_thread_id);
-                }
-            }
-
             if (!(*i)->m_finished) active_threads++;
 
             total_ops += (*i)->m_cg->get_total_ops();
@@ -3983,20 +3947,36 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     // join all threads back and unify stats
     run_stats stats(cfg);
 
+    unsigned int failed_threads = 0;
     for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
         (*i)->join();
+        if ((*i)->m_failed) failed_threads++;
         (*i)->m_cg->merge_run_stats(&stats);
+    }
+
+    // A failed worker stopped before the run's stop condition, so this run
+    // did not measure the requested window: its clients' durations differ from
+    // the others', and the merged duration and rates mix them. Say so, and fail
+    // the invocation (main() exits 1) rather than pass the numbers off as a
+    // normal result. --reconnect-on-error makes dropped connections part of
+    // the workload instead.
+    if (failed_threads > 0) {
+        fprintf(stderr,
+                "error: [RUN #%u] %u of %u thread(s) ended before the requested %s was reached (see errors "
+                "above); the results of this run are not valid.\n",
+                run_id, failed_threads, (unsigned int) threads.size(),
+                cfg->requests > 0 ? "request count" : "test time");
+        g_worker_failed = true;
     }
 
     // -----------------------------------------------------------------
     // CPU utilization aggregate (memtier's own usage).
     //
-    // Fold each worker's authoritative getrusage(RUSAGE_THREAD) totals (already
-    // accumulated across restarts inside the worker) into the run_stats. Each
-    // worker's cores_used divides its CPU by ITS OWN wall bracket (captured at
-    // the same points as the CPU snapshots), so there is no setup-vs-serving or
-    // across-restart skew. The whole-process aggregate divides total CPU (all
-    // workers + the main thread) by the longest summed active-serving wall time
+    // Fold each worker's authoritative getrusage(RUSAGE_THREAD) totals (captured
+    // inside the worker) into the run_stats. Each worker's cores_used divides
+    // its CPU by ITS OWN wall bracket (captured at the same points as the CPU
+    // snapshots), so there is no setup-vs-serving skew. The whole-process
+    // aggregate divides total CPU (all workers + the main thread) by the longest summed active-serving wall time
     // across workers, so the aggregate and per-thread figures stay consistent:
     // the denominator is the window during which work actually happened, not the
     // main thread's launch->join span which also covers idle teardown. Done
@@ -5327,6 +5307,11 @@ int main(int argc, char *argv[])
     // usage(), but those exits happen before main reaches this point).
     if (g_connection_stage_aborted.load(std::memory_order_acquire)) {
         return 2;
+    }
+    // A worker thread ended before the run's stop condition (see
+    // run_benchmark()); the results above do not cover the requested run.
+    if (g_worker_failed) {
+        return 1;
     }
     return 0;
 }
