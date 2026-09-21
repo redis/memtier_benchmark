@@ -883,6 +883,9 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
     char *host_start = ptr;
 
     if (auth_end) {
+        if (cfg->authenticate) {
+            fprintf(stderr, "warning: both URI and --authenticate specified, URI takes precedence.\n");
+        }
         // Own URI credentials separately from the borrowed --authenticate argument.
         *auth_end = '\0';
         uri_authenticate = ptr;
@@ -924,6 +927,9 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
 
     // Own URI hosts separately from a borrowed --server argument or the default.
     if (strlen(host_start) > 0) {
+        if (cfg->server && strcmp(cfg->server, "localhost") != 0) {
+            fprintf(stderr, "warning: both URI and --host/--server specified, URI takes precedence.\n");
+        }
         uri_server = host_start;
         cfg->server = uri_server.c_str();
     }
@@ -4524,14 +4530,8 @@ int main(int argc, char *argv[])
     // Process URI if provided
     if (cfg.uri) {
         // Check for conflicts with individual connection parameters
-        if (cfg.server && strcmp(cfg.server, "localhost") != 0) {
-            fprintf(stderr, "warning: both URI and --host/--server specified, URI takes precedence.\n");
-        }
         if (cfg.port && cfg.port != 6379) {
             fprintf(stderr, "warning: both URI and --port specified, URI takes precedence.\n");
-        }
-        if (cfg.authenticate) {
-            fprintf(stderr, "warning: both URI and --authenticate specified, URI takes precedence.\n");
         }
         if (cfg.select_db) {
             fprintf(stderr, "warning: both URI and --select-db specified, URI takes precedence.\n");

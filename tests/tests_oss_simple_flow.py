@@ -1018,47 +1018,53 @@ def test_uri_authentication_ownership(env):
     auth = '--authenticate={}'.format(credentials)
     bad_auth = '--authenticate={}:incorrect'.format(user)
     empty_host_uri = '--uri=redis://:{}'.format(nodes[0]['port'])
+    # Each case pins whether auth and host precedence warnings are appropriate.
     cases = [
-        ('wrong-named-user-password', [bad_auth]),
-        ('cli-before-uri', [auth, uri]),
-        ('cli-after-uri', [uri, auth]),
-        ('uri-before-cli', [authenticated_uri, bad_auth]),
-        ('uri-after-cli', [bad_auth, authenticated_uri]),
-        ('auth-only', [auth]),
-        ('repeated-auth', [bad_auth, '-a', credentials, uri]),
-        ('repeated-uri', [authenticated_uri, uri, auth]),
-        ('uri-only', [authenticated_uri]),
-        ('empty-host-cli-server', [auth, empty_host_uri]),
+        ('wrong-named-user-password', [bad_auth], False, False),
+        ('cli-before-uri', [auth, uri], False, True),
+        ('cli-after-uri', [uri, auth], False, True),
+        ('uri-before-cli', [authenticated_uri, bad_auth], True, True),
+        ('uri-after-cli', [bad_auth, authenticated_uri], True, True),
+        ('auth-only', [auth], False, False),
+        ('repeated-auth', [bad_auth, '-a', credentials, uri], False, True),
+        ('repeated-uri', [authenticated_uri, uri, auth], False, True),
+        ('uri-only', [authenticated_uri], False, True),
+        ('empty-host-cli-server', [auth, empty_host_uri], False, False),
+        ('uri-no-cli-server', [auth, uri], False, False),
+        ('uri-localhost-cli-server', [auth, uri, '--server=localhost'], False, False),
     ]
     if nodes[0].get('host') in (None, 'localhost', '127.0.0.1'):
-        cases.append(('empty-host-default-server', [auth, empty_host_uri, '--ipv4']))
+        cases.append(('empty-host-default-server', [auth, empty_host_uri, '--ipv4'], False, False))
     created = []
     try:
         for connection in connections:
             connection.execute_command('ACL', 'SETUSER', user, 'reset', 'on',
                                        '>' + password, '~*', '+@all')
             created.append(connection)
-        for name, args in cases:
+        for name, args, auth_warning, host_warning in cases:
             specs = {'name': env.testName + '-' + name,
                      'args': args + ['--ratio=1:0', '--hide-histogram',
                                      '--connection-stage-timeout=5']}
             addTLSArgs(specs, env)
             config = get_default_memtier_config(threads=1, clients=1, requests=10)
             add_required_env_arguments(specs, config, env, nodes)
-            if name == 'empty-host-default-server':
-                # The URI supplies the private port; exercise the default host
-                # without Benchmark inserting an explicit --server argument.
+            if name in ('empty-host-default-server', 'uri-no-cli-server'):
+                # The URI supplies the private port; keep Benchmark from
+                # inserting an explicit --server argument.
                 config['memtier_benchmark']['explicit_connect_args'] = True
             with tempfile.TemporaryDirectory() as directory:
                 config = RunConfig(directory, specs['name'], config, {})
                 ensure_clean_benchmark_folder(config.results_dir)
                 benchmark = Benchmark.from_json(config, specs)
                 ok = benchmark.run(timeout=20)
+                with open(os.path.join(config.results_dir, 'mb.stderr')) as result:
+                    stderr = result.read()
+                env.assertEqual('both URI and --authenticate specified' in stderr, auth_warning, message=name)
+                env.assertEqual('both URI and --host/--server specified' in stderr, host_warning, message=name)
                 if name == 'wrong-named-user-password':
                     env.assertFalse(ok, message=name)
                     env.assertFalse(os.path.exists(os.path.join(config.results_dir, 'mb.timeout')))
-                    with open(os.path.join(config.results_dir, 'mb.stderr')) as result:
-                        env.assertContains('authentication failed', result.read())
+                    env.assertContains('authentication failed', stderr)
                     continue
                 if not ok:
                     debugPrintMemtierOnError(config, env)
