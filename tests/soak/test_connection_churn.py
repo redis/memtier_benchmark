@@ -1,8 +1,8 @@
 """
 S4 -- Connection churn vs server restart.
 
-Runs memtier with ``--reconnect-interval=10`` for ~5 minutes against a
-standalone Redis. A sidecar thread issues ``CLIENT KILL TYPE normal``
+Runs memtier with ``--reconnect-interval=10`` and ``--reconnect-on-error``
+for ~5 minutes against a standalone Redis. A sidecar thread issues ``CLIENT KILL TYPE normal``
 every 30 seconds, mimicking a server restart from memtier's POV (forced
 EOF on every client socket).
 
@@ -10,6 +10,11 @@ Pass conditions:
   * memtier exits 0
   * the run survives all the killing
   * we observed at least one kill round
+
+``--reconnect-on-error`` is what lets the run survive: without it a killed
+connection ends its worker thread and the run exits non-zero. (memtier used
+to rebuild such threads silently, with a fresh --test-time window and fresh
+stats, which is what this test previously relied on.)
 
 NOTE: We use ``CLIENT KILL`` rather than ``SHUTDOWN`` because RLTest does
 not auto-restart standalone servers. ``CLIENT KILL TYPE normal`` exercises
@@ -46,6 +51,7 @@ def test_connection_churn_survives_kills(env):
         "name": env.testName,
         "args": [
             "--reconnect-interval=10",
+            "--reconnect-on-error",
             "--test-time={}".format(test_time),
             "--hide-histogram",
         ],

@@ -171,7 +171,7 @@ def test_key_pattern_g_valid_range_accepted(env):
     # parser path. Bound the run tightly so a TLS-only environment can't
     # keep the subprocess alive past _run_memtier's 10s timeout:
     # --connection-timeout=1 fails fast on the bad handshake and
-    # --max-reconnect-attempts=1 caps the post-fail thread-restart loop.
+    # --max-reconnect-attempts=1 bounds the reconnect attempts after a failure.
     # --requests=1 keeps the successful-connect path trivially short on
     # plaintext cells.
     result = _run_memtier(_common_args(env) + [

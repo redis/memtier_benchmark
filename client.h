@@ -145,6 +145,9 @@ public:
     int prepare(void);
     bool initialized(void);
     run_stats *get_stats(void) { return &m_stats; }
+    // True once set_end_time() ran: the client reached its stop condition
+    // (finished()) or was finalized by client_group::finalize_all_clients().
+    bool end_time_set(void) const { return m_end_set; }
 
     virtual get_key_response get_key_for_conn(unsigned int command_index, unsigned int conn_id,
                                               unsigned long long *key_index);
@@ -302,6 +305,7 @@ public:
     void interrupt(void);
     void finalize_all_clients(void);
     void set_all_clients_interrupted(void);
+    unsigned int count_unended_clients(void);
 
     void write_client_stats(const char *prefix);
 

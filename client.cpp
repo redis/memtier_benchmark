@@ -1362,6 +1362,22 @@ void client_group::finalize_all_clients(void)
     }
 }
 
+// Connected (prepare()-d) clients that have no end time once the event loop
+// has returned. A live connection keeps the loop running until its client
+// reaches its stop condition and calls set_end_time(), so a client without one
+// was cut off by a connection failure that broke the loop -- including one
+// that failed before sending its first request. Clients a staircase ramp never
+// connected are not counted.
+unsigned int client_group::count_unended_clients(void)
+{
+    unsigned int count = 0;
+    unsigned int active = active_client_count();
+    for (unsigned int i = 0; i < active && i < m_clients.size(); i++) {
+        if (!m_clients[i]->end_time_set()) count++;
+    }
+    return count;
+}
+
 void client_group::set_all_clients_interrupted(void)
 {
     // Iterate ALL clients for the same reason as finalize_all_clients.

@@ -1615,10 +1615,11 @@ void shard_connection::attempt_reconnect(const char *error_context)
             disconnect();
             return;
         }
-        benchmark_error_log("Maximum reconnection attempts (%u) exceeded for %s, triggering thread restart.\n",
+        benchmark_error_log("Maximum reconnection attempts (%u) exceeded for %s, ending this thread.\n",
                             m_config->max_reconnect_attempts, error_context);
         disconnect();
-        // Break the event loop to trigger thread restart
+        // Break the event loop: the thread ends and run_benchmark() fails the
+        // run. It is not restarted.
         event_base_loopbreak(m_event_base);
     }
 }
@@ -1684,11 +1685,12 @@ void shard_connection::handle_reconnect_timer_event()
                 // skip it. Just return — no loopbreak, no further retries.
                 return;
             }
-            benchmark_error_log("Maximum reconnection attempts (%u) exceeded, triggering thread restart.\n",
+            benchmark_error_log("Maximum reconnection attempts (%u) exceeded, ending this thread.\n",
                                 m_config->max_reconnect_attempts);
-            // Break the event loop to trigger thread restart. No state reset
-            // needed here: the thread is torn down and the shard_connection
-            // object destroyed before any field could be read again.
+            // Break the event loop: the thread ends and run_benchmark() fails
+            // the run. It is not restarted. No state reset needed here: the
+            // thread is finished and the shard_connection object destroyed
+            // before any field could be read again.
             event_base_loopbreak(m_event_base);
         }
     } else {

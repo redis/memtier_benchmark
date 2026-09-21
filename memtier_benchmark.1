@@ -203,7 +203,8 @@ Number of concurrent pipelined requests (default: 1)
 Number of requests after which re\-connection is performed
 .TP
 \fB\-\-reconnect\-on\-error\fR
-Enable automatic reconnection on connection errors (default: disabled)
+Enable automatic reconnection on connection errors (default: disabled).
+Without it, a lost connection ends its thread and the run exits 1.
 .HP
 \fB\-\-max\-reconnect\-attempts\fR=\fI\,NUM\/\fR Maximum number of reconnection attempts (default: 0, unlimited)
 .HP

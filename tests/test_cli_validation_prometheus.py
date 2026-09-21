@@ -8,12 +8,13 @@ specific exit code and a canonical message (the §5 E1-E12 / W1 / W2 / W2b
 strings) as a stderr substring.  This mirrors test_cli_validation_read_preference.py.
 
 A subtlety pinned by this suite: on this CI substrate a *connection failure*
-(dead port) also exits with code 2, so exit code alone cannot distinguish a
-parse rejection from a failed run.  The canonical error/warning *string* is
+(dead port) also exits non-zero (1, or 2 if --connection-stage-timeout fires
+first), so exit code alone cannot distinguish a parse rejection from a failed
+run.  The canonical error/warning *string* is
 therefore the real discriminator:
   * reject cases    -> exit 2 AND the canonical message present;
   * accept cases    -> the canonical reject message absent (rc may be 0 or a
-                       connection-failure 2; we never run a real workload);
+                       connection-failure 1 or 2; we never run a real workload);
   * warn-accept     -> the canonical reject message absent AND the warning
                        present exactly once.
 
