@@ -513,9 +513,10 @@ def test_monitor_random_reproducible_without_randomize(env):
 
         benchmark_specs = {"name": run_name, "args": base_args.copy()}
         addTLSArgs(benchmark_specs, env)
-        add_required_env_arguments(benchmark_specs, config_dict.copy(), env, master_nodes_list)
+        run_config_dict = config_dict.copy()
+        add_required_env_arguments(benchmark_specs, run_config_dict, env, master_nodes_list)
 
-        config = RunConfig(run_dir, run_name, config_dict.copy(), {})
+        config = RunConfig(run_dir, run_name, run_config_dict, {})
         ensure_clean_benchmark_folder(config.results_dir)
 
         benchmark = Benchmark.from_json(config, benchmark_specs)
@@ -536,6 +537,9 @@ def test_monitor_random_reproducible_without_randomize(env):
                     if isinstance(val, bytes):
                         val = val.decode("utf-8")
                     counts[key] = int(val)
+        env.assertTrue(counts, message="The configured Redis must receive monitor commands")
+        env.assertEqual(sum(counts.values()), 100,
+                        message="Each run must execute all 100 INCR commands on the configured Redis")
         return counts
 
     # Clear any existing keys
