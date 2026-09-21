@@ -74,13 +74,14 @@ memtier_benchmark_LDADD = \
 	$(LIBSSL_LIBS)
 
 
-# Unit-test harness for the pure metrics layer (prometheus_metrics.{h,cpp}).
+check_PROGRAMS = prometheus_metrics_test rate_limiter_test socket_options_test
+
+# The metrics test links only the pure layer (prometheus_metrics.{h,cpp}).
 # First `make check` program in the repo. The metrics layer is config-free and
 # libevent-free (Decisions #52 purity contract), so this links only the metrics
 # layer + hdr_histogram (a leaf dep). No $(LIBEVENT_CFLAGS) by design (hygiene
 # only; purity is enforced by the S10 grep audit). -I$(srcdir) is required for
 # VPATH builds.
-check_PROGRAMS = prometheus_metrics_test rate_limiter_test
 prometheus_metrics_test_SOURCES = tests/unit/prometheus_metrics_test.cpp \
     prometheus_metrics.cpp prometheus_metrics.h \
     deps/hdr_histogram/hdr_histogram.c deps/hdr_histogram/hdr_histogram.h
@@ -89,6 +90,16 @@ prometheus_metrics_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 rate_limiter_test_SOURCES = tests/unit/rate_limiter_test.cpp rate_limiter.h
 rate_limiter_test_CPPFLAGS = -I$(srcdir)
 rate_limiter_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+# Exercise the real connection setup with a test-only socket descriptor recorder.
+# The test includes shard_connection.cpp; do not compile it a second time here.
+socket_options_test_SOURCES = tests/unit/socket_options_test.cpp
+socket_options_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
+SOCKET_TEST_EXTRA_CXXFLAGS =
+socket_options_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g $(SOCKET_TEST_EXTRA_CXXFLAGS)
+# Per-target memtier_benchmark_CPPFLAGS give these objects their target prefix.
+# Reuse the real client RTTI for UBSan; the test supplies main and shard_connection.
+socket_options_test_LDADD = $(filter-out memtier_benchmark-memtier_benchmark.$(OBJEXT) \
+    memtier_benchmark-shard_connection.$(OBJEXT),$(memtier_benchmark_OBJECTS)) $(memtier_benchmark_LDADD)
 TESTS = $(check_PROGRAMS)
 
 @CODE_COVERAGE_RULES@

@@ -394,7 +394,6 @@ void shard_connection::setup_event(int sockfd)
 
 int shard_connection::setup_socket(struct connect_info *addr)
 {
-    int flags;
     int sockfd;
 
     if (m_unix_sockaddr != NULL) {
@@ -410,7 +409,8 @@ int shard_connection::setup_socket(struct connect_info *addr)
         }
 
 
-        int error = setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, (void *) &flags, sizeof(flags));
+        const int enabled = 1;
+        int error = setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled));
         assert(error == 0);
 
         /*
@@ -424,12 +424,12 @@ int shard_connection::setup_socket(struct connect_info *addr)
         error = setsockopt(sockfd, SOL_SOCKET, SO_LINGER, (void *) &ling, sizeof(ling));
         assert(error == 0);
 
-        error = setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, (void *) &flags, sizeof(flags));
+        error = setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
         assert(error == 0);
     }
 
     // set non-blocking behavior
-    flags = 1;
+    int flags;
     if ((flags = fcntl(sockfd, F_GETFL, 0)) < 0 || fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) < 0) {
         close(sockfd);
         return -1;
