@@ -83,7 +83,7 @@ The normal build uses your installed libevent. To evaluate **2.2.2-alpha**
 without replacing the system library, install it in a separate prefix with the
 checksum-pinned helper below. This is an alpha release, not a new minimum
 requirement. The helper defaults to **2.1.13-stable** when `LIBEVENT_VERSION` is
-unset. It requires CMake, curl, tar, `shasum`, and OpenSSL development files in
+unset. It requires CMake, curl, tar, `sha256sum` (or `shasum` on macOS), and OpenSSL development files in
 addition to the normal build prerequisites.
 
 From a clean source checkout on Linux:
@@ -121,8 +121,12 @@ The 2.2 series includes the configurable read limit and bufferevent integration
 ([upstream issue #798](https://github.com/libevent/libevent/issues/798)), which
 can affect pipelined benchmark throughput. Pin the same libevent build when
 comparing results; changing the library changes the benchmark client.
-The dedicated libevent compatibility workflow tests both pinned versions while
-leaving the existing distribution-library CI builds in place.
+The dedicated libevent compatibility workflow runs the full standalone and
+cluster test suites against both pinned versions. It runs automatically for
+changes to the build helper, configuration, or this workflow, weekly on the
+default branch, and on demand via `workflow_dispatch`. Ordinary source changes
+continue to use the existing distribution-library CI builds; the alpha adds no
+new minimum dependency requirement.
 
 ### Code Style
 

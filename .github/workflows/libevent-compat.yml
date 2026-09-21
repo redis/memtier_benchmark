@@ -3,9 +3,25 @@ name: Libevent compatibility
 on:
   push:
     branches: [master, main]
+    paths:
+      - '.github/workflows/libevent-compat.yml'
+      - '.github/workflows/ci.yml'
+      - 'scripts/build-libevent.sh'
+      - 'scripts/build-macos-libevent.sh'
+      - 'configure.ac'
+      - 'Makefile.am'
   pull_request:
     branches: [master, main]
+    paths:
+      - '.github/workflows/libevent-compat.yml'
+      - '.github/workflows/ci.yml'
+      - 'scripts/build-libevent.sh'
+      - 'scripts/build-macos-libevent.sh'
+      - 'configure.ac'
+      - 'Makefile.am'
   workflow_dispatch:
+  schedule:
+    - cron: '23 3 * * 1'
 
 permissions:
   contents: read
@@ -13,7 +29,7 @@ permissions:
 jobs:
   compatibility:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -42,7 +58,7 @@ jobs:
           autoreconf -ivf
           configure_args=()
           if [[ "$MODE" == no-tls ]]; then
-            configure_args+=(--disable-tls --disable-prometheus)
+            configure_args+=(--disable-tls)
           fi
           PKG_CONFIG_PATH="$RUNNER_TEMP/libevent/lib/pkgconfig" \
             LDFLAGS="-Wl,-rpath,$RUNNER_TEMP/libevent/lib" ./configure "${configure_args[@]}"
@@ -69,21 +85,7 @@ jobs:
           OSS_CLUSTER: '1'
           PARALLELISM: '2'
           TLS: ${{ matrix.mode == 'tls' && '1' || '0' }}
-          TEST: >-
-            tests_oss_simple_flow.py test_scan.py test_collection_scan.py
-            test_reconnections.py test_transaction_pipeline.py
-            test_mget_standalone.py test_mget_cluster.py test_mget_protocol.py
-            test_json_output_integrity.py test_retry_on_error.py
-            test_sigpipe_immunity.py test_sigpipe_tls_rst.py test_tls_logging.py
-            test_prometheus.py test_prometheus_redaction.py
-          MODE: ${{ matrix.mode }}
-        run: |
-          if [[ "$MODE" == no-tls ]]; then
-            TEST="${TEST//test_prometheus.py/}"
-            TEST="${TEST//test_prometheus_redaction.py/}"
-            export TEST
-          fi
-          ./tests/run_tests.sh
+        run: ./tests/run_tests.sh
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v5

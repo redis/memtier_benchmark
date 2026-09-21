@@ -25,10 +25,15 @@ trap 'rm -rf "$build_root"' EXIT
 archive="$build_root/libevent-$version.tar.gz"
 curl -fsSL --retry 3 -o "$archive" \
     "https://github.com/libevent/libevent/releases/download/release-$version/libevent-$version.tar.gz"
-printf '%s  %s\n' "$checksum" "$archive" | shasum -a 256 -c -
+if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s  %s\n' "$checksum" "$archive" | sha256sum -c -
+else
+    printf '%s  %s\n' "$checksum" "$archive" | shasum -a 256 -c -
+fi
 tar -xzf "$archive" -C "$build_root"
 cmake -S "$build_root/libevent-$version" -B "$build_root/build" \
     -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
     -DEVENT__LIBRARY_TYPE=SHARED \
     -DEVENT__DISABLE_OPENSSL=OFF \
     -DEVENT__DISABLE_MBEDTLS=ON \
