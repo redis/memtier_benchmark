@@ -91,12 +91,11 @@ rate_limiter_test_CPPFLAGS = -I$(srcdir)
 rate_limiter_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 # Exercise the real connection setup with a test-only socket descriptor recorder.
 # The test includes shard_connection.cpp; do not compile it a second time here.
-socket_options_test_SOURCES = tests/unit/socket_options_test.cpp \
-    protocol.cpp config_types.cpp command_meta.cpp retry_policy.cpp \
-    tests/fuzz/fuzz_stubs.cpp
+socket_options_test_SOURCES = tests/unit/socket_options_test.cpp
 socket_options_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
 socket_options_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
-socket_options_test_LDADD = $(memtier_benchmark_LDADD)
+socket_options_test_LDADD = $(filter-out memtier_benchmark-memtier_benchmark.$(OBJEXT) \
+    memtier_benchmark-shard_connection.$(OBJEXT),$(memtier_benchmark_OBJECTS)) $(memtier_benchmark_LDADD)
 TESTS = $(check_PROGRAMS)
 
 @CODE_COVERAGE_RULES@

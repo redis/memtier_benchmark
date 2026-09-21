@@ -48,11 +48,7 @@ static int recording_socket(int domain, int type, int protocol)
 #undef socket
 
 // Connection callbacks are not dispatched in this test. Fail loudly if the
-// test starts reaching statistics or process-wide connection-stage reporting.
-void run_stats::update_connection_error(struct timeval *)
-{
-    abort();
-}
+// test starts reaching process-wide connection-stage reporting.
 void report_connection_stage_failure(const char *)
 {
     abort();
@@ -60,6 +56,13 @@ void report_connection_stage_failure(const char *)
 void report_connection_stage_success()
 {
     abort();
+}
+
+void benchmark_log_file_line(int, const char *, unsigned int, const char *, ...) {}
+void benchmark_log(int, const char *, ...) {}
+bool is_redis_protocol(enum PROTOCOL_TYPE type)
+{
+    return type == PROTOCOL_REDIS_DEFAULT || type == PROTOCOL_RESP2 || type == PROTOCOL_RESP3;
 }
 
 static int failures = 0;
