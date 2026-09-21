@@ -487,6 +487,8 @@ jobs:
       run: brew install autoconf automake libtool libevent openssl@${{ matrix.openssl }}
     - name: Build
       run: autoreconf -ivf && PKG_CONFIG_PATH=`brew --prefix openssl@${{ matrix.openssl }}`/lib/pkgconfig ./configure && make
+    - name: Unit tests
+      run: make check
     - name: Verify version, libevent, openssl
       run: |
         ./memtier_benchmark --version
@@ -503,6 +505,8 @@ jobs:
       run: brew install autoconf automake libtool libevent openssl@1.1
     - name: Build
       run: autoreconf -ivf && PKG_CONFIG_PATH=`brew --prefix openssl@1.1`/lib/pkgconfig ./configure && make
+    - name: Unit tests
+      run: make check
     - name: Verify version, libevent, openssl
       run: |
         ./memtier_benchmark --version
@@ -538,6 +542,8 @@ jobs:
         autoreconf -ivf
         PKG_CONFIG_PATH="$RUNNER_TEMP/libevent-openssl-1.0/lib/pkgconfig:$(brew --prefix openssl@1.0)/lib/pkgconfig" ./configure
         make
+    - name: Unit tests
+      run: make check
     - name: Verify version, libevent, openssl
       run: |
         set -euo pipefail
