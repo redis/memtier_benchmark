@@ -103,7 +103,11 @@ static void check_connections(struct connect_info &address, const char *unix_pat
     config.unix_socket = unix_path;
 #ifdef USE_TLS
     if (tls) {
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
         config.openssl_ctx = SSL_CTX_new(SSLv23_client_method());
+#else
+        config.openssl_ctx = SSL_CTX_new(TLS_client_method());
+#endif
         if (!check(config.openssl_ctx != NULL, context, "create TLS context")) return;
     }
 #endif
@@ -234,7 +238,7 @@ static void test_unix()
 
 int main()
 {
-#ifdef USE_TLS
+#if defined(USE_TLS) && OPENSSL_VERSION_NUMBER < 0x10100000L
     SSL_library_init();
 #endif
     test_tcp(AF_INET);
