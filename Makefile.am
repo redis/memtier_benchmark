@@ -80,7 +80,7 @@ memtier_benchmark_LDADD = \
 # layer + hdr_histogram (a leaf dep). No $(LIBEVENT_CFLAGS) by design (hygiene
 # only; purity is enforced by the S10 grep audit). -I$(srcdir) is required for
 # VPATH builds.
-check_PROGRAMS = prometheus_metrics_test rate_limiter_test
+check_PROGRAMS = prometheus_metrics_test rate_limiter_test socket_options_test
 prometheus_metrics_test_SOURCES = tests/unit/prometheus_metrics_test.cpp \
     prometheus_metrics.cpp prometheus_metrics.h \
     deps/hdr_histogram/hdr_histogram.c deps/hdr_histogram/hdr_histogram.h
@@ -89,6 +89,14 @@ prometheus_metrics_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 rate_limiter_test_SOURCES = tests/unit/rate_limiter_test.cpp rate_limiter.h
 rate_limiter_test_CPPFLAGS = -I$(srcdir)
 rate_limiter_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+# Exercise the real connection setup with a test-only socket descriptor recorder.
+# The test includes shard_connection.cpp; do not compile it a second time here.
+socket_options_test_SOURCES = tests/unit/socket_options_test.cpp \
+    protocol.cpp config_types.cpp command_meta.cpp retry_policy.cpp \
+    tests/fuzz/fuzz_stubs.cpp
+socket_options_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
+socket_options_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+socket_options_test_LDADD = $(memtier_benchmark_LDADD)
 TESTS = $(check_PROGRAMS)
 
 @CODE_COVERAGE_RULES@
