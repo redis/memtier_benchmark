@@ -4,10 +4,17 @@ Fuzzer driver for memtier_benchmark's --monitor-input parser.
 
 Loads every file in tests/fuzz/monitor_input_corpus/, applies a random chain of
 byte-level mutators, writes the result to a temp file, and runs memtier_benchmark
-with --monitor-input pointing at it. The contract under test is "the loader must
-report and exit cleanly on any input — never crash". A SIGSEGV, glibc
+with --monitor-input pointing at it and a private RESP command sink as its server.
+The sink acknowledges complete requests without executing them: mutated WAIT,
+HELLO, Pub/Sub or administrative commands cannot block or change server state.
+This exercises the loader, tokenizer and request serialization, not Redis command
+semantics (which belong in the integration tests).
+
+The loader must report and exit cleanly on any input, never crash. A SIGSEGV, glibc
 'stack smashing detected', sanitizer report, or a timeout is a failure. Any
-non-zero exit (parse error, no commands found, connection refused) is fine.
+non-zero exit (parse error, no commands found, connection refused) is fine for
+mutated inputs. The valid preflight and saved regressions additionally require
+complete requests, so lost connectivity cannot make those checks pass vacuously.
 
 Two synthetic seeds are produced at iteration time rather than checked in:
   * 15_huge_single_line  - one SET line whose value is >16 MiB (the regression
@@ -17,8 +24,6 @@ Two synthetic seeds are produced at iteration time rather than checked in:
 
 Environment:
   FUZZ_ITER     iterations per seed (default 50)
-  REDIS_HOST    default 127.0.0.1
-  REDIS_PORT    default 6379
   MEMTIER       path to memtier_benchmark binary (default: ../../memtier_benchmark)
   FUZZ_SEED     PRNG seed for reproducible runs (default: os.urandom-derived)
   FUZZ_TIMEOUT  per-run timeout in seconds (default 30)
@@ -36,13 +41,13 @@ import tempfile
 import time
 from pathlib import Path
 
+from resp_command_sink import RESPCommandSink
+
 HERE = Path(__file__).resolve().parent
 CORPUS_DIR = HERE / "monitor_input_corpus"
 DEFAULT_MEMTIER = HERE.parent.parent / "memtier_benchmark"
 
 FUZZ_ITER = int(os.environ.get("FUZZ_ITER", "50"))
-REDIS_HOST = os.environ.get("REDIS_HOST", "127.0.0.1")
-REDIS_PORT = os.environ.get("REDIS_PORT", "6379")
 MEMTIER = Path(os.environ.get("MEMTIER", str(DEFAULT_MEMTIER)))
 FUZZ_TIMEOUT = int(os.environ.get("FUZZ_TIMEOUT", "60"))
 SEED = int(os.environ.get("FUZZ_SEED", str(int.from_bytes(os.urandom(4), "big"))))
@@ -168,23 +173,26 @@ def generate_synthetic_seeds() -> dict:
     }
 
 
-def run_one(seed_name: str, mutated: bytes) -> bool:
+def run_one(seed_name: str, mutated: bytes, sink, require_requests=False) -> bool:
     """Run memtier on a single mutated payload. Return True on clean exit."""
+    initial_requests = sink.request_count
     with tempfile.NamedTemporaryFile(prefix="mfuzz_", suffix=".txt", delete=False) as f:
         f.write(mutated)
         mpath = f.name
     try:
-        # Use --test-time (with a small cap) instead of --requests so a
-        # slow-but-not-crashing run (e.g. AUTH errors against an unauthenticated
-        # server) doesn't trip the harness timeout. (The two are mutually
-        # exclusive in memtier.) The loader is exercised regardless.
+        # Finish a bounded request count, rather than canceling an in-flight
+        # large frame at a time limit. The outer timeout still catches hangs.
+        # Small corpus files get a full sequential pass (up to 100 requests).
+        # Scale down for large inputs so replay does not amplify their cost.
+        requests = max(1, min(100, (2 * 1024 * 1024) // max(1, len(mutated))))
         cmd = [
             str(MEMTIER),
             "--monitor-input={}".format(mpath),
             "--command=__monitor_line@__",
-            "--server={}".format(REDIS_HOST),
-            "--port={}".format(REDIS_PORT),
-            "--test-time=2",
+            "--server={}".format(sink.host),
+            "--port={}".format(sink.port),
+            "--requests={}".format(requests),
+            "--monitor-pattern=S",
             "--clients=1",
             "--threads=1",
             "--hide-histogram",
@@ -203,6 +211,8 @@ def run_one(seed_name: str, mutated: bytes) -> bool:
                 timeout=FUZZ_TIMEOUT,
             )
         except subprocess.TimeoutExpired as e:
+            sink.wait_idle()
+            errors = sink.take_errors()
             sys.stderr.write(
                 "FAIL [{}] timed out after {}s -- repro saved at {}\n".format(
                     seed_name, FUZZ_TIMEOUT, mpath
@@ -210,7 +220,13 @@ def run_one(seed_name: str, mutated: bytes) -> bool:
             )
             if e.stderr:
                 sys.stderr.write(e.stderr.decode("utf-8", "replace")[-2048:] + "\n")
+            if errors:
+                sys.stderr.write("command sink: {}\n".format(errors))
             return False
+        # Drain this producer even when memtier crashed, before processing
+        # another input. Preserve crash diagnostics as the priority.
+        idle = sink.wait_idle()
+        errors = sink.take_errors()
         blob = (proc.stdout or b"") + (proc.stderr or b"")
         # IMPORTANT: check crash signals / sanitizer patterns BEFORE the
         # known-nonfatal allowlist. A run can produce a parser assertion
@@ -234,6 +250,17 @@ def run_one(seed_name: str, mutated: bytes) -> bool:
                 )
                 sys.stderr.write(blob.decode("utf-8", "replace")[-2048:] + "\n")
                 return False
+        # A broken sink or malformed serialized request must not look like an
+        # acceptable memtier parse-error exit. Wait for EOF/error accounting
+        # before inspecting the background handler's result.
+        if not idle:
+            sys.stderr.write("FAIL [{}] command sink did not become idle -- repro at {}\n".format(
+                seed_name, mpath))
+            return False
+        if errors or (require_requests and sink.request_count == initial_requests):
+            sys.stderr.write("FAIL [{}] command sink: {} -- repro at {}\n".format(
+                seed_name, errors or "no complete request received", mpath))
+            return False
         # Crash checks passed -- now safe to allowlist known-nonfatal parser
         # assertions on an otherwise-clean exit.
         if any(p in blob for p in KNOWN_NONFATAL_ASSERTIONS):
@@ -248,7 +275,7 @@ def run_one(seed_name: str, mutated: bytes) -> bool:
         raise
 
 
-def main() -> int:
+def fuzz(sink) -> int:
     if not MEMTIER.exists():
         sys.stderr.write("memtier_benchmark binary not found at {}\n".format(MEMTIER))
         return 2
@@ -266,6 +293,16 @@ def main() -> int:
     if not seeds:
         sys.stderr.write("no seeds found\n")
         return 2
+    # Prove the executable reached the sink; otherwise connection failures
+    # could make an entire fuzz sweep appear green without exercising requests.
+    if not run_one("sink-preflight", b'1.0 [0 127.0.0.1:1] "PING"\n',
+                   sink, require_requests=True):
+        return 1
+    # Run saved regressions unchanged, not just random mutations of them.
+    regressions = HERE / "monitor_input_regressions"
+    for path in sorted(regressions.glob("*.txt")):
+        if not run_one(path.name, path.read_bytes(), sink, require_requests=True):
+            return 1
     failures = 0
     total = 0
     grand_total = FUZZ_ITER * len(seeds)
@@ -275,16 +312,10 @@ def main() -> int:
     # the driver only prints the startup banner and final summary, leaving
     # an opaque gap whenever the runner is yanked mid-run.
     progress_every = int(os.environ.get("FUZZ_PROGRESS_EVERY", "50"))
-    # Wall-clock budget for the whole sweep. FUZZ_ITER alone wildly overshoots
-    # the CI job timeout: every mutation that starts a benchmark runs for
-    # --test-time seconds (2s here), and a mutation that wedges a connection
-    # runs until the --test-time backstop (a few more seconds), so
-    # FUZZ_ITER * seeds easily implies hours of work. Before this cap the job
-    # was always cancelled at its 35-minute limit (it never completed once).
-    # FUZZ_MAX_SECONDS bounds the run so it always finishes and reports the
-    # failures found within the budget; 0 disables it. Seeds are iterated
-    # round-robin (iteration-major) so a time-bounded run spreads coverage
-    # across every seed instead of spending the whole budget on the first few.
+    # Bound the sweep as well as each subprocess: large loader inputs and many
+    # launches can exhaust a CI job even with a finite request count per run.
+    # The loader reads the entire input; replay uses 1–100 sequential requests,
+    # scaled down for large inputs. Round-robin seeds share the available budget.
     max_seconds = int(os.environ.get("FUZZ_MAX_SECONDS", "0"))
     seed_items = list(seeds.items())
     budget_hit = False
@@ -309,7 +340,7 @@ def main() -> int:
                 sys.stderr.flush()
             total += 1
             mutated = mutate(payload)
-            ok = run_one(name, mutated)
+            ok = run_one(name, mutated, sink)
             if not ok:
                 failures += 1
     sys.stderr.write(
@@ -318,6 +349,11 @@ def main() -> int:
         )
     )
     return 1 if failures else 0
+
+
+def main() -> int:
+    with RESPCommandSink() as sink:
+        return fuzz(sink)
 
 
 if __name__ == "__main__":
