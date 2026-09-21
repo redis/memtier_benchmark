@@ -43,14 +43,14 @@ $ sudo apt-get install build-essential autoconf automake \
 To build natively on macOS, use Homebrew to install the required dependencies:
 
 ```
-$ brew install autoconf automake libtool libevent pkg-config openssl@3.0 clang-format
+$ brew install autoconf automake libtool libevent pkg-config openssl@3 clang-format
 ```
 
 When running `./configure`, if it fails to find libssl it may be necessary to
 tweak the `PKG_CONFIG_PATH` environment variable:
 
 ```
-PKG_CONFIG_PATH=`brew --prefix openssl@3.0`/lib/pkgconfig ./configure
+PKG_CONFIG_PATH=`brew --prefix openssl@3`/lib/pkgconfig ./configure
 ```
 
 ### Building and Installing
@@ -76,6 +76,53 @@ $ ./configure CXXFLAGS="-g -O0 -Wall"
 ```
 
 This disables optimizations (`-O0`), making it easier to step through code in a debugger, but should not be used for performance testing or production.
+
+### Opt-in libevent 2.2.2-alpha build
+
+The normal build uses your installed libevent. To evaluate **2.2.2-alpha**
+without replacing the system library, install it in a separate prefix with the
+checksum-pinned helper below. This is an alpha release, not a new minimum
+requirement. The helper defaults to **2.1.13-stable** when `LIBEVENT_VERSION` is
+unset. It requires CMake, curl, tar, `shasum`, and OpenSSL development files in
+addition to the normal build prerequisites.
+
+From a clean source checkout on Linux:
+
+```bash
+# Use a fresh prefix for each version; the helper rejects nonempty prefixes.
+event_prefix="$PWD/.local/libevent-2.2.2-alpha"
+LIBEVENT_VERSION=2.2.2-alpha bash scripts/build-libevent.sh "$event_prefix"
+autoreconf -ivf
+mkdir -p build-libevent-alpha
+cd build-libevent-alpha
+PKG_CONFIG_PATH="$event_prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
+  LDFLAGS="-Wl,-rpath,$event_prefix/lib" ../configure
+make -j2
+make check
+./memtier_benchmark --version
+ldd ./memtier_benchmark
+```
+
+`--version` already reports the **runtime** library, for example
+`libevent=2.2.2-alpha-dev`. Check that `ldd` resolves every libevent component
+from the selected prefix. The runtime search path above keeps this build using
+that prefix without a global `LD_LIBRARY_PATH`. Use a new build directory when
+switching dependency versions; if the source tree was configured in place,
+run `make distclean` before creating an out-of-tree build. Subsequent `make`
+runs within the same build directory are incremental.
+
+On macOS, also select the same Homebrew OpenSSL for libevent and memtier: pass
+`-DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"` to the helper and include that
+OpenSSL prefix's `lib/pkgconfig` in `PKG_CONFIG_PATH`. Inspect linkage with
+`otool -L` instead of `ldd`.
+
+Libevent 2.1.13 still limits individual plaintext evbuffer reads to 4 KiB.
+The 2.2 series includes the configurable read limit and bufferevent integration
+([upstream issue #798](https://github.com/libevent/libevent/issues/798)), which
+can affect pipelined benchmark throughput. Pin the same libevent build when
+comparing results; changing the library changes the benchmark client.
+The dedicated libevent compatibility workflow tests both pinned versions while
+leaving the existing distribution-library CI builds in place.
 
 ### Code Style
 

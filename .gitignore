@@ -33,6 +33,8 @@ version.h
 /build-noprom/
 /build-asan/
 /build-tsan/
+/build-libevent-*/
+/.local/libevent-*/
 /.venv/
 
 # tls helper related files

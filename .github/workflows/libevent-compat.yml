@@ -1,0 +1,98 @@
+name: Libevent compatibility
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compatibility:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        libevent: [2.1.13-stable, 2.2.2-alpha]
+        mode: [plaintext, tls, no-tls]
+    name: libevent ${{ matrix.libevent }} (${{ matrix.mode }})
+    env:
+      LIBEVENT_VERSION: ${{ matrix.libevent }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential autoconf automake pkg-config cmake libssl-dev zlib1g-dev redis-server
+          sudo service redis-server stop
+          python -m pip install -r tests/test_requirements.txt
+      - name: Build pinned libevent
+        run: bash scripts/build-libevent.sh "$RUNNER_TEMP/libevent"
+      - name: Build memtier
+        env:
+          MODE: ${{ matrix.mode }}
+        run: |
+          autoreconf -ivf
+          configure_args=()
+          if [[ "$MODE" == no-tls ]]; then
+            configure_args+=(--disable-tls --disable-prometheus)
+          fi
+          PKG_CONFIG_PATH="$RUNNER_TEMP/libevent/lib/pkgconfig" \
+            LDFLAGS="-Wl,-rpath,$RUNNER_TEMP/libevent/lib" ./configure "${configure_args[@]}"
+          make -j2
+          make check
+      - name: Verify runtime version and linkage
+        run: |
+          ./memtier_benchmark --version | tee version.txt
+          # Alpha releases append -dev to the runtime version string.
+          expected="$LIBEVENT_VERSION"
+          if [[ "$expected" == *-alpha ]]; then expected+=-dev; fi
+          grep -F " libevent=$expected " version.txt
+          ldd ./memtier_benchmark | tee linkage.txt
+          awk -v prefix="$RUNNER_TEMP/libevent/lib/" '
+            /libevent[^ ]* =>/ { found++; if (index($3, prefix) != 1) exit 1 }
+            END { if (!found) exit 1 }
+          ' linkage.txt
+      - name: Generate TLS certificates
+        if: matrix.mode == 'tls'
+        run: ./tests/gen-test-certs.sh
+      - name: Integration tests (standalone and cluster)
+        env:
+          OSS_STANDALONE: '1'
+          OSS_CLUSTER: '1'
+          PARALLELISM: '2'
+          TLS: ${{ matrix.mode == 'tls' && '1' || '0' }}
+          TEST: >-
+            tests_oss_simple_flow.py test_scan.py test_collection_scan.py
+            test_reconnections.py test_transaction_pipeline.py
+            test_mget_standalone.py test_mget_cluster.py test_mget_protocol.py
+            test_json_output_integrity.py test_retry_on_error.py
+            test_sigpipe_immunity.py test_sigpipe_tls_rst.py test_tls_logging.py
+            test_prometheus.py test_prometheus_redaction.py
+          MODE: ${{ matrix.mode }}
+        run: |
+          if [[ "$MODE" == no-tls ]]; then
+            TEST="${TEST//test_prometheus.py/}"
+            TEST="${TEST//test_prometheus_redaction.py/}"
+            export TEST
+          fi
+          ./tests/run_tests.sh
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: libevent-${{ matrix.libevent }}-${{ matrix.mode }}
+          path: |
+            version.txt
+            linkage.txt
+            config.log
+            test-suite.log
+            tests/logs/
+          retention-days: 7
