@@ -10,6 +10,9 @@ on:
       - 'scripts/build-macos-libevent.sh'
       - 'configure.ac'
       - 'Makefile.am'
+      - 'tests/run_tests.sh'
+      - 'tests/test_requirements.txt'
+      - 'tests/gen-test-certs.sh'
   pull_request:
     branches: [master, main]
     paths:
@@ -19,6 +22,9 @@ on:
       - 'scripts/build-macos-libevent.sh'
       - 'configure.ac'
       - 'Makefile.am'
+      - 'tests/run_tests.sh'
+      - 'tests/test_requirements.txt'
+      - 'tests/gen-test-certs.sh'
   workflow_dispatch:
   schedule:
     - cron: '23 3 * * 1'

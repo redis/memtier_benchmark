@@ -123,7 +123,7 @@ can affect pipelined benchmark throughput. Pin the same libevent build when
 comparing results; changing the library changes the benchmark client.
 The dedicated libevent compatibility workflow runs the full standalone and
 cluster test suites against both pinned versions. It runs automatically for
-changes to the build helper, configuration, or this workflow, weekly on the
+changes to the build/test harness, configuration, or this workflow, weekly on the
 default branch, and on demand via `workflow_dispatch`. Ordinary source changes
 continue to use the existing distribution-library CI builds; the alpha adds no
 new minimum dependency requirement.
