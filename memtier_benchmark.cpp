@@ -864,6 +864,9 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
         // Regular Redis connection
     } else if (strcmp(ptr, "rediss") == 0) {
 #ifdef USE_TLS
+        if (cfg->tls) {
+            fprintf(stderr, "warning: both URI and --tls specified, URI takes precedence.\n");
+        }
         cfg->tls = true;
 #else
         fprintf(stderr, "error: TLS not supported in this build.\n");
@@ -906,6 +909,9 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
                 free(uri_copy);
                 return -1;
             }
+            if (cfg->select_db) {
+                fprintf(stderr, "warning: both URI and --select-db specified, URI takes precedence.\n");
+            }
             cfg->select_db = db;
         }
     }
@@ -922,12 +928,15 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
             free(uri_copy);
             return -1;
         }
+        if (cfg->port) {
+            fprintf(stderr, "warning: both URI and --port specified, URI takes precedence.\n");
+        }
         cfg->port = (unsigned short) port;
     }
 
     // Own URI hosts separately from a borrowed --server argument or the default.
     if (strlen(host_start) > 0) {
-        if (cfg->server && strcmp(cfg->server, "localhost") != 0) {
+        if (cfg->server) {
             fprintf(stderr, "warning: both URI and --host/--server specified, URI takes precedence.\n");
         }
         uri_server = host_start;
@@ -4301,6 +4310,7 @@ int main(int argc, char *argv[])
         fprintf(stderr, "warning: core dumps may not be generated on crash\n");
     }
 
+    // Keep URI storage alive for cfg and its workers; neither string changes after parsing.
     std::string uri_authenticate;
     std::string uri_server;
     benchmark_config cfg = benchmark_config();
@@ -4529,19 +4539,6 @@ int main(int argc, char *argv[])
 
     // Process URI if provided
     if (cfg.uri) {
-        // Check for conflicts with individual connection parameters
-        if (cfg.port && cfg.port != 6379) {
-            fprintf(stderr, "warning: both URI and --port specified, URI takes precedence.\n");
-        }
-        if (cfg.select_db) {
-            fprintf(stderr, "warning: both URI and --select-db specified, URI takes precedence.\n");
-        }
-#ifdef USE_TLS
-        if (cfg.tls) {
-            fprintf(stderr, "warning: both URI and --tls specified, URI takes precedence.\n");
-        }
-#endif
-
         if (parse_uri(cfg.uri, &cfg, uri_authenticate, uri_server) < 0) {
             exit(1);
         }
