@@ -1004,7 +1004,7 @@ def test_uri_with_database_selection(env):
 
 
 def test_uri_authentication_ownership(env):
-    """CLI credentials stay borrowed; URI credentials override them in either order."""
+    """URI fields own storage; omitted fields retain CLI credentials and CLI/default hosts."""
     env.skipOnUnixSocket()
     env.skipOnVersionSmaller('6.0.0')  # Named users require Redis ACL support.
     nodes = env.getMasterNodesList()
@@ -1016,16 +1016,22 @@ def test_uri_authentication_ownership(env):
     uri = '--uri=redis://{}'.format(endpoint)
     authenticated_uri = '--uri=redis://{}@{}'.format(credentials, endpoint)
     auth = '--authenticate={}'.format(credentials)
+    bad_auth = '--authenticate={}:incorrect'.format(user)
+    empty_host_uri = '--uri=redis://:{}'.format(nodes[0]['port'])
     cases = [
+        ('wrong-named-user-password', [bad_auth]),
         ('cli-before-uri', [auth, uri]),
         ('cli-after-uri', [uri, auth]),
-        ('uri-before-cli', [authenticated_uri, '--authenticate=incorrect']),
-        ('uri-after-cli', ['--authenticate=incorrect', authenticated_uri]),
+        ('uri-before-cli', [authenticated_uri, bad_auth]),
+        ('uri-after-cli', [bad_auth, authenticated_uri]),
         ('auth-only', [auth]),
-        ('repeated-auth', ['--authenticate=incorrect', '-a', credentials, uri]),
+        ('repeated-auth', [bad_auth, '-a', credentials, uri]),
         ('repeated-uri', [authenticated_uri, uri, auth]),
         ('uri-only', [authenticated_uri]),
+        ('empty-host-cli-server', [auth, empty_host_uri]),
     ]
+    if nodes[0].get('host') in (None, 'localhost', '127.0.0.1'):
+        cases.append(('empty-host-default-server', [auth, empty_host_uri, '--ipv4']))
     created = []
     try:
         for connection in connections:
@@ -1039,11 +1045,21 @@ def test_uri_authentication_ownership(env):
             addTLSArgs(specs, env)
             config = get_default_memtier_config(threads=1, clients=1, requests=10)
             add_required_env_arguments(specs, config, env, nodes)
+            if name == 'empty-host-default-server':
+                # The URI supplies the private port; exercise the default host
+                # without Benchmark inserting an explicit --server argument.
+                config['memtier_benchmark']['explicit_connect_args'] = True
             with tempfile.TemporaryDirectory() as directory:
                 config = RunConfig(directory, specs['name'], config, {})
                 ensure_clean_benchmark_folder(config.results_dir)
                 benchmark = Benchmark.from_json(config, specs)
                 ok = benchmark.run(timeout=20)
+                if name == 'wrong-named-user-password':
+                    env.assertFalse(ok, message=name)
+                    env.assertFalse(os.path.exists(os.path.join(config.results_dir, 'mb.timeout')))
+                    with open(os.path.join(config.results_dir, 'mb.stderr')) as result:
+                        env.assertContains('authentication failed', result.read())
+                    continue
                 if not ok:
                     debugPrintMemtierOnError(config, env)
                 env.assertTrue(ok, message=name)

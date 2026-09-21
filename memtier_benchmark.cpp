@@ -834,7 +834,8 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
 
 // Parse URI and populate config fields
 // Returns 0 on success, -1 on error
-static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string &uri_authenticate)
+static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string &uri_authenticate,
+                     std::string &uri_server)
 {
     if (!uri || strlen(uri) == 0) {
         fprintf(stderr, "error: empty URI provided.\n");
@@ -921,9 +922,10 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
         cfg->port = (unsigned short) port;
     }
 
-    // Set host
+    // Own URI hosts separately from a borrowed --server argument or the default.
     if (strlen(host_start) > 0) {
-        cfg->server = strdup(host_start);
+        uri_server = host_start;
+        cfg->server = uri_server.c_str();
     }
 
     free(uri_copy);
@@ -4294,6 +4296,7 @@ int main(int argc, char *argv[])
     }
 
     std::string uri_authenticate;
+    std::string uri_server;
     benchmark_config cfg = benchmark_config();
     cfg.arbitrary_commands = new arbitrary_command_list();
     cfg.monitor_commands = new monitor_command_list();
@@ -4539,7 +4542,7 @@ int main(int argc, char *argv[])
         }
 #endif
 
-        if (parse_uri(cfg.uri, &cfg, uri_authenticate) < 0) {
+        if (parse_uri(cfg.uri, &cfg, uri_authenticate, uri_server) < 0) {
             exit(1);
         }
 
@@ -5287,13 +5290,6 @@ int main(int argc, char *argv[])
 
     if (cfg.monitor_commands != NULL) {
         delete cfg.monitor_commands;
-    }
-
-    // Clean up the host string allocated during URI parsing.
-    if (cfg.uri) {
-        if (cfg.server) {
-            free((void *) cfg.server);
-        }
     }
 
     // Clean up StatsD client
