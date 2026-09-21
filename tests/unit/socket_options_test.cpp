@@ -48,8 +48,8 @@ static int recording_socket(int domain, int type, int protocol)
 #include "shard_connection.cpp"
 #undef socket
 
-// Connection callbacks are not dispatched in this test. Fail loudly if the
-// test starts reaching process-wide connection-stage reporting.
+// No Redis requests are sent. Fail loudly if the test starts reaching
+// process-wide connection-stage reporting.
 void report_connection_stage_failure(const char *)
 {
     abort();
@@ -92,7 +92,13 @@ static void check_option(int fd, int level, int option, const char *context, con
 
 static void check_connections(struct connect_info &address, const char *unix_path, bool tls, const char *context)
 {
+    arbitrary_command_list commands;
     benchmark_config config = {};
+    config.arbitrary_commands = &commands;
+    config.clients = config.threads = 1;
+    config.key_pattern = "S:S";
+    // A zero-depth pipeline lets connection callbacks run without sending Redis requests.
+    config.pipeline = 0;
     config.protocol = PROTOCOL_REDIS_DEFAULT;
     config.unix_socket = unix_path;
 #ifdef USE_TLS
@@ -112,9 +118,11 @@ static void check_connections(struct connect_info &address, const char *unix_pat
         return;
     }
     {
-        // connect() creates/configures the socket synchronously. Disconnect
-        // before dispatching the loop, so no callbacks use the unused manager.
-        shard_connection connection(0, NULL, &config, base, protocol);
+        // Use a real client: connection/error callbacks require its manager and statistics.
+        object_generator generator;
+        generator.set_data_size_fixed(1);
+        client manager(base, &config, protocol, &generator);
+        shard_connection &connection = *manager.get_connections().front();
         connection.set_address_port("localhost", "0");
         for (unsigned int attempt = 0; attempt != 3; ++attempt) {
             char label[128];
@@ -133,6 +141,13 @@ static void check_connections(struct connect_info &address, const char *unix_pat
                 if (check(getsockopt(fd, SOL_SOCKET, SO_LINGER, &linger_value, &len) == 0, label, "SO_LINGER")) {
                     check(linger_value.l_onoff != 0 && linger_value.l_linger == 0, label, "abortive close enabled");
                 }
+            }
+            if (unix_path != NULL) {
+                // Unix connect completes immediately; dispatch its queued callback while
+                // the real manager is alive, rather than relying on callback suppression.
+                event_base_loop(base, EVLOOP_NONBLOCK);
+                check(connection.get_connection_state() == conn_connected, label, "Unix connect callback completes");
+                check(manager.get_reqs_generated() == 0, label, "connection callback sends no requests");
             }
             connection.disconnect();
             // libevent can defer bufferevent destruction until the loop runs.
