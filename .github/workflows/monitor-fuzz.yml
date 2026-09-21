@@ -93,10 +93,9 @@ jobs:
           MEMTIER: ${{ github.workspace }}/memtier_benchmark
           # Smaller corpus pass on PR-label runs; larger on nightly/manual.
           # FUZZ_ITER is an upper bound on per-seed iterations; the run is
-          # actually bounded by FUZZ_MAX_SECONDS below (a mutation that starts a
-          # benchmark runs for --test-time seconds, so the full FUZZ_ITER sweep
-          # would take hours and the job was always cancelled at its 35-minute
-          # cap -- it never completed once before this budget was added).
+          # also bounded by FUZZ_MAX_SECONDS below. Each invocation parses its
+          # full input and replays at most 100 sequential requests; repeated
+          # large-input parsing can still exhaust the job without a sweep cap.
           FUZZ_ITER: ${{ github.event_name == 'pull_request' && '300' || (inputs.iterations || '2000') }}
           # Hard-cap every mutated payload at 2 MiB. GROW_MAX alone is not
           # enough: mutate() applies up to 4 mutators, so several `grow`s

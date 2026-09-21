@@ -282,12 +282,16 @@ class RESPCommandSinkTests(unittest.TestCase):
 
     def test_error_storage_is_bounded_without_hiding_new_failures(self):
         with RESPCommandSink() as sink:
-            for _ in range(sink.MAX_ERRORS + 1):
+            initial_count = sink.error_count
+            self.assertEqual(initial_count, 0)
+            for index in range(sink.MAX_ERRORS + 1):
                 with self.connect(sink) as connection:
                     connection.sendall(b"invalid\r\n")
                     self.assertEqual(connection.recv(1), b"")
+                self.assertEqual(sink.error_count, index + 1)
             self.assertTrue(sink.wait_idle())
             before = sink.errors
+            before_count = sink.error_count
             self.assertEqual(len(before), sink.MAX_ERRORS + 1)
             self.assertEqual(before[-1], "1 additional sink errors")
             with self.connect(sink) as connection:
@@ -297,6 +301,13 @@ class RESPCommandSinkTests(unittest.TestCase):
             self.assertEqual(len(sink.errors), len(before))
             self.assertNotEqual(sink.errors, before)
             self.assertEqual(sink.errors[-1], "2 additional sink errors")
+            self.assertEqual(sink.error_count, before_count + 1)
+            with self.connect(sink) as connection:
+                connection.sendall(frame(b"PING"))
+                self.assertEqual(receive(connection, 5), b"+OK\r\n")
+            self.assertTrue(sink.wait_idle())
+            self.assertEqual(sink.error_count, before_count + 1)
+            self.assertEqual(initial_count, 0)
 
     def test_listener_bind_failure_closes_its_socket(self):
         socket_class = socket.socket
@@ -326,6 +337,14 @@ class RESPCommandSinkTests(unittest.TestCase):
 
     def test_blocked_worker_obeys_idle_and_close_deadlines(self):
         sink = RESPCommandSink(close_timeout=0.1)
+        sink.__enter__()
+        self.addCleanup(sink.close)
+        for _ in range(sink.MAX_ERRORS):
+            with self.connect(sink) as connection:
+                connection.sendall(b"invalid\r\n")
+                self.assertEqual(connection.recv(1), b"")
+        self.assertTrue(sink.wait_idle())
+        self.assertEqual(sink.error_count, sink.MAX_ERRORS)
         original_serve = sink._serve
         blocked = threading.Event()
         release = threading.Event()
@@ -336,7 +355,6 @@ class RESPCommandSinkTests(unittest.TestCase):
             release.wait(5)
 
         with patch.object(sink, "_serve", delayed_cleanup):
-            sink.__enter__()
             try:
                 with self.connect(sink) as connection:
                     connection.sendall(frame(b"PING"))
@@ -344,9 +362,12 @@ class RESPCommandSinkTests(unittest.TestCase):
                 self.assertTrue(blocked.wait(2))
                 self.assertFalse(sink.wait_idle(timeout=0.1))
                 started = time.monotonic()
-                with self.assertRaisesRegex(RuntimeError, "threads did not stop"):
+                with self.assertRaisesRegex(
+                        RuntimeError, "^RESP sink threads did not stop before close deadline$"):
                     sink.close()
                 self.assertLess(time.monotonic() - started, 1)
+                self.assertEqual(sink.error_count, sink.MAX_ERRORS + 1)
+                self.assertEqual(sink.errors[-1], "1 additional sink errors")
             finally:
                 release.set()
                 sink.close()

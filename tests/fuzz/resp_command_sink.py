@@ -107,6 +107,12 @@ class RESPCommandSink:
             return self._request_count
 
     @property
+    def error_count(self):
+        """Return all failures, including diagnostics omitted by the storage cap."""
+        with self._condition:
+            return len(self._errors) + self._dropped_errors
+
+    @property
     def errors(self):
         with self._condition:
             result = tuple(self._errors)
@@ -262,8 +268,9 @@ class RESPCommandSink:
         for thread in threads:
             thread.join(max(0, deadline - time.monotonic()))
         if any(thread.is_alive() for thread in threads):
-            self._record_error("RESP sink threads did not stop before close deadline")
-            raise RuntimeError(self.errors[-1])
+            message = "RESP sink threads did not stop before close deadline"
+            self._record_error(message)
+            raise RuntimeError(message)
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()

@@ -18,7 +18,7 @@ class DriverOracleTests(unittest.TestCase):
         patch = mock.patch.object(driver.tempfile, 'tempdir', self.directory.name)
         patch.start()
         self.addCleanup(patch.stop)
-        self.sink = mock.Mock(host='127.0.0.1', port=1, request_count=0, errors=())
+        self.sink = mock.Mock(host='127.0.0.1', port=1, request_count=0, error_count=0, errors=())
         self.sink.wait_idle.return_value = True
 
     def run_result(self, code=0, stderr=b'', **kwargs):
@@ -47,7 +47,22 @@ class DriverOracleTests(unittest.TestCase):
 
     def test_sink_failure_cannot_be_accepted_as_parse_error(self):
         self.sink.errors = ('invalid RESP',)
+        type(self.sink).error_count = mock.PropertyMock(side_effect=[0, 1])
         self.assertFalse(self.run_result(code=2))
+
+    def test_previous_sink_errors_do_not_blame_a_later_input(self):
+        self.sink.errors = ('earlier invalid RESP',)
+        self.sink.error_count = 1
+        self.assertTrue(self.run_result(code=2))
+
+    def test_request_count_workload_does_not_cancel_partial_frames(self):
+        with mock.patch.object(driver.subprocess, 'run',
+                               return_value=subprocess.CompletedProcess([], 0, b'', b'')) as run:
+            self.assertTrue(driver.run_one('request-count', b'input', self.sink))
+        arguments = run.call_args.args[0]
+        self.assertIn('--requests=100', arguments)
+        self.assertIn('--monitor-pattern=S', arguments)
+        self.assertFalse(any(argument.startswith('--test-time') for argument in arguments))
 
     def test_sink_drain_failure_is_reported(self):
         self.sink.wait_idle.return_value = False
@@ -125,6 +140,15 @@ class SweepTests(unittest.TestCase):
 
 @unittest.skipUnless(driver.MEMTIER.is_file(), 'build memtier or set MEMTIER to run replay regressions')
 class MonitorReplayTests(unittest.TestCase):
+    def test_large_valid_command_finishes_all_replies_before_disconnect(self):
+        payload = (b'1.0 [0 127.0.0.1:1] "SET" "key" "' + b'x' * (1024 * 1024) + b'"\n')
+        with RESPCommandSink() as sink:
+            self.assertTrue(driver.run_one('large-request-budget', payload, sink,
+                                           require_requests=True))
+            self.assertTrue(sink.wait_idle())
+            self.assertEqual(sink.request_count, 100)
+            self.assertFalse(sink.errors)
+
     def test_saved_nightly_inputs_finish_without_server_side_effects(self):
         paths = sorted((driver.HERE / 'monitor_input_regressions').glob('*.txt'))
         self.assertEqual({path.name for path in paths},

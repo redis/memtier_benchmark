@@ -13,7 +13,9 @@ semantics (which belong in the integration tests).
 The contract under test is "the loader must
 report and exit cleanly on any input — never crash". A SIGSEGV, glibc
 'stack smashing detected', sanitizer report, or a timeout is a failure. Any
-non-zero exit (parse error, no commands found, connection refused) is fine.
+non-zero exit (parse error, no commands found, connection refused) is fine for
+mutated inputs. The valid preflight and saved regressions additionally require
+complete requests, so lost connectivity cannot make those checks pass vacuously.
 
 Two synthetic seeds are produced at iteration time rather than checked in:
   * 15_huge_single_line  - one SET line whose value is >16 MiB (the regression
@@ -175,19 +177,21 @@ def generate_synthetic_seeds() -> dict:
 def run_one(seed_name: str, mutated: bytes, sink, require_requests=False) -> bool:
     """Run memtier on a single mutated payload. Return True on clean exit."""
     initial_requests = sink.request_count
+    initial_errors = sink.error_count
     with tempfile.NamedTemporaryFile(prefix="mfuzz_", suffix=".txt", delete=False) as f:
         f.write(mutated)
         mpath = f.name
     try:
-        # Keep the runtime workload short; the outer timeout still catches
-        # loader/formatter hangs even before any connection is established.
+        # Finish a bounded request count, rather than canceling an in-flight
+        # large frame at a time limit. The outer timeout still catches hangs.
         cmd = [
             str(MEMTIER),
             "--monitor-input={}".format(mpath),
             "--command=__monitor_line@__",
             "--server={}".format(sink.host),
             "--port={}".format(sink.port),
-            "--test-time=2",
+            "--requests=100",
+            "--monitor-pattern=S",
             "--clients=1",
             "--threads=1",
             "--hide-histogram",
@@ -215,6 +219,9 @@ def run_one(seed_name: str, mutated: bytes, sink, require_requests=False) -> boo
             if e.stderr:
                 sys.stderr.write(e.stderr.decode("utf-8", "replace")[-2048:] + "\n")
             return False
+        # Drain this producer even when memtier crashed, before the next input
+        # snapshots its error counter. Preserve crash diagnostics as the priority.
+        idle = sink.wait_idle()
         blob = (proc.stdout or b"") + (proc.stderr or b"")
         # IMPORTANT: check crash signals / sanitizer patterns BEFORE the
         # known-nonfatal allowlist. A run can produce a parser assertion
@@ -241,12 +248,13 @@ def run_one(seed_name: str, mutated: bytes, sink, require_requests=False) -> boo
         # A broken sink or malformed serialized request must not look like an
         # acceptable memtier parse-error exit. Wait for EOF/error accounting
         # before inspecting the background handler's result.
-        if not sink.wait_idle():
+        if not idle:
             sys.stderr.write("FAIL [{}] command sink did not become idle -- repro at {}\n".format(
                 seed_name, mpath))
             return False
-        # Errors persist for the whole sweep, including after diagnostic capping.
-        errors = sink.errors
+        # The counter keeps increasing after diagnostic storage is capped, and
+        # earlier inputs' failures must not be attributed to this reproducer.
+        errors = sink.errors if sink.error_count > initial_errors else ()
         if errors or (require_requests and sink.request_count == initial_requests):
             sys.stderr.write("FAIL [{}] command sink: {} -- repro at {}\n".format(
                 seed_name, errors or "no complete request received", mpath))
@@ -302,16 +310,10 @@ def fuzz(sink) -> int:
     # the driver only prints the startup banner and final summary, leaving
     # an opaque gap whenever the runner is yanked mid-run.
     progress_every = int(os.environ.get("FUZZ_PROGRESS_EVERY", "50"))
-    # Wall-clock budget for the whole sweep. FUZZ_ITER alone wildly overshoots
-    # the CI job timeout: every mutation that starts a benchmark runs for
-    # --test-time seconds (2s here), and a mutation that wedges a connection
-    # runs until the --test-time backstop (a few more seconds), so
-    # FUZZ_ITER * seeds easily implies hours of work. Before this cap the job
-    # was always cancelled at its 35-minute limit (it never completed once).
-    # FUZZ_MAX_SECONDS bounds the run so it always finishes and reports the
-    # failures found within the budget; 0 disables it. Seeds are iterated
-    # round-robin (iteration-major) so a time-bounded run spreads coverage
-    # across every seed instead of spending the whole budget on the first few.
+    # Bound the sweep as well as each subprocess: large loader inputs and many
+    # launches can exhaust a CI job even with a finite request count per run.
+    # The loader reads the entire input; replay is limited to 100 sequential
+    # requests. Round-robin seeds spread the available budget across the corpus.
     max_seconds = int(os.environ.get("FUZZ_MAX_SECONDS", "0"))
     seed_items = list(seeds.items())
     budget_hit = False

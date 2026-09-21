@@ -5,7 +5,8 @@ The driver runs them before its random mutations and requires actual RESP reques
 * `wait_forever.txt`: mutated WAIT 0 0 to WAIT 8 0, which can block indefinitely
   on a real standalone Redis server without replicas.
 * `hello_protocol_switch.txt`: contains a replayed HELLO 3, which changes the
-  server protocol while the benchmark's parser still expects RESP2.
+  server protocol while the benchmark's parser still expects RESP2. Its unchanged
+  3,089 bytes include NUL bytes at offsets 452 and 561, so Git displays it as binary.
 
 The command sink acknowledges these requests without executing them. These are
 regressions for isolation of the parser-fuzz target, not claims that arbitrary
