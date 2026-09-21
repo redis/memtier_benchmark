@@ -1003,6 +1003,75 @@ def test_uri_with_database_selection(env):
     env.assertTrue(memtier_ok)
 
 
+def test_uri_authentication_ownership(env):
+    """CLI credentials stay borrowed; URI credentials override them in either order."""
+    env.skipOnUnixSocket()
+    env.skipOnVersionSmaller('6.0.0')  # Named users require Redis ACL support.
+    nodes = env.getMasterNodesList()
+    connections = env.getOSSMasterNodesConnectionList()
+    user = 'memtier-uri-auth-ownership'
+    password = 'uri-auth-password:with-colon'
+    credentials = '{}:{}'.format(user, password)
+    endpoint = '{}:{}'.format(nodes[0].get('host') or '127.0.0.1', nodes[0]['port'])
+    uri = '--uri=redis://{}'.format(endpoint)
+    authenticated_uri = '--uri=redis://{}@{}'.format(credentials, endpoint)
+    auth = '--authenticate={}'.format(credentials)
+    cases = [
+        ('cli-before-uri', [auth, uri]),
+        ('cli-after-uri', [uri, auth]),
+        ('uri-before-cli', [authenticated_uri, '--authenticate=incorrect']),
+        ('uri-after-cli', ['--authenticate=incorrect', authenticated_uri]),
+        ('auth-only', [auth]),
+        ('repeated-auth', ['--authenticate=incorrect', '-a', credentials, uri]),
+        ('repeated-uri', [authenticated_uri, uri, auth]),
+        ('uri-only', [authenticated_uri]),
+    ]
+    created = []
+    try:
+        for connection in connections:
+            connection.execute_command('ACL', 'SETUSER', user, 'reset', 'on',
+                                       '>' + password, '~*', '+@all')
+            created.append(connection)
+        for name, args in cases:
+            specs = {'name': env.testName + '-' + name,
+                     'args': args + ['--ratio=1:0', '--hide-histogram',
+                                     '--connection-stage-timeout=5']}
+            addTLSArgs(specs, env)
+            config = get_default_memtier_config(threads=1, clients=1, requests=10)
+            add_required_env_arguments(specs, config, env, nodes)
+            with tempfile.TemporaryDirectory() as directory:
+                config = RunConfig(directory, specs['name'], config, {})
+                ensure_clean_benchmark_folder(config.results_dir)
+                benchmark = Benchmark.from_json(config, specs)
+                ok = benchmark.run(timeout=20)
+                if not ok:
+                    debugPrintMemtierOnError(config, env)
+                env.assertTrue(ok, message=name)
+                if not ok:
+                    continue
+                with open(os.path.join(config.results_dir, 'mb.json')) as result:
+                    stats = json.load(result)['ALL STATS']
+                env.assertEqual(stats['Sets']['Count'], 10, message=name)
+                env.assertEqual(stats['Totals']['Count'], 10, message=name)
+    finally:
+        for connection in created:
+            connection.execute_command('ACL', 'DELUSER', user)
+
+
+def test_uri_authentication_parse_errors(env):
+    """Reject invalid URI fields even after URI credentials replace CLI auth."""
+    for uri, error in [
+        ('redis://user:password@127.0.0.1:invalid', 'invalid port number'),
+        ('redis://password@127.0.0.1:1/invalid', 'invalid database number'),
+        ('invalid://user:password@127.0.0.1:1', 'unsupported URI scheme'),
+    ]:
+        result = subprocess.run(
+            [MEMTIER_BINARY, '--authenticate=cli-password', '--uri=' + uri],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+        env.assertEqual(result.returncode, 1)
+        env.assertContains(error, result.stderr.decode('utf-8', 'replace'))
+
+
 def test_uri_invalid_scheme(env):
     """Test URI with invalid scheme"""
     # Test invalid scheme

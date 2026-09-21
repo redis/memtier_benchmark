@@ -834,7 +834,7 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
 
 // Parse URI and populate config fields
 // Returns 0 on success, -1 on error
-static int parse_uri(const char *uri, struct benchmark_config *cfg)
+static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string &uri_authenticate)
 {
     if (!uri || strlen(uri) == 0) {
         fprintf(stderr, "error: empty URI provided.\n");
@@ -882,29 +882,10 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg)
     char *host_start = ptr;
 
     if (auth_end) {
-        // Authentication present
+        // Own URI credentials separately from the borrowed --authenticate argument.
         *auth_end = '\0';
-        char *colon = strchr(ptr, ':');
-        if (colon) {
-            // user:password format
-            *colon = '\0';
-            char *user = ptr;
-            char *password = colon + 1;
-
-            // Combine as user:password for authenticate field
-            int auth_len = strlen(user) + strlen(password) + 2;
-            char *auth_str = (char *) malloc(auth_len);
-            if (!auth_str) {
-                fprintf(stderr, "error: memory allocation failed.\n");
-                free(uri_copy);
-                return -1;
-            }
-            snprintf(auth_str, auth_len, "%s:%s", user, password);
-            cfg->authenticate = auth_str;
-        } else {
-            // Just password (default user)
-            cfg->authenticate = strdup(ptr);
-        }
+        uri_authenticate = ptr;
+        cfg->authenticate = uri_authenticate.c_str();
         host_start = auth_end + 1;
     }
 
@@ -4312,6 +4293,7 @@ int main(int argc, char *argv[])
         fprintf(stderr, "warning: core dumps may not be generated on crash\n");
     }
 
+    std::string uri_authenticate;
     benchmark_config cfg = benchmark_config();
     cfg.arbitrary_commands = new arbitrary_command_list();
     cfg.monitor_commands = new monitor_command_list();
@@ -4557,7 +4539,7 @@ int main(int argc, char *argv[])
         }
 #endif
 
-        if (parse_uri(cfg.uri, &cfg) < 0) {
+        if (parse_uri(cfg.uri, &cfg, uri_authenticate) < 0) {
             exit(1);
         }
 
@@ -5307,13 +5289,10 @@ int main(int argc, char *argv[])
         delete cfg.monitor_commands;
     }
 
-    // Clean up dynamically allocated strings from URI parsing
+    // Clean up the host string allocated during URI parsing.
     if (cfg.uri) {
         if (cfg.server) {
             free((void *) cfg.server);
-        }
-        if (cfg.authenticate) {
-            free((void *) cfg.authenticate);
         }
     }
 
