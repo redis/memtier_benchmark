@@ -517,8 +517,9 @@ def test_monitor_random_reproducible_without_randomize(env):
         add_required_env_arguments(benchmark_specs, config_dict, env, master_nodes_list)
 
         # Catch a discarded helper mutation even when the fixture uses port 6379.
-        if not env.isUnixSocket() and 'redis_process_port' not in config_dict:
-            env.assertTrue(False, message="The Redis fixture port must reach RunConfig explicitly")
+        if not env.isUnixSocket() and config_dict.get('redis_process_port') != master_nodes_list[0]['port']:
+            env.assertEqual(config_dict.get('redis_process_port'), master_nodes_list[0]['port'],
+                            message="The Redis fixture port must reach RunConfig explicitly")
             return {}
         config = RunConfig(run_dir, run_name, config_dict, {})
         ensure_clean_benchmark_folder(config.results_dir)
