@@ -10,6 +10,9 @@ on:
       - 'scripts/build-macos-libevent.sh'
       - 'configure.ac'
       - 'Makefile.am'
+      - 'shard_connection.cpp'
+      - 'tests/test_connection_error_types.py'
+      - 'tests/test_reconnections.py'
       - 'tests/run_tests.sh'
       - 'tests/test_requirements.txt'
       - 'tests/gen-test-certs.sh'
@@ -22,6 +25,9 @@ on:
       - 'scripts/build-macos-libevent.sh'
       - 'configure.ac'
       - 'Makefile.am'
+      - 'shard_connection.cpp'
+      - 'tests/test_connection_error_types.py'
+      - 'tests/test_reconnections.py'
       - 'tests/run_tests.sh'
       - 'tests/test_requirements.txt'
       - 'tests/gen-test-certs.sh'
@@ -44,6 +50,11 @@ jobs:
     name: libevent ${{ matrix.libevent }} (${{ matrix.mode }})
     env:
       LIBEVENT_VERSION: ${{ matrix.libevent }}
+      # Instrument the dependency too: memtier-only ASan cannot catch invalid
+      # accesses performed inside an uninstrumented libevent error accessor.
+      SANITIZE: ${{ matrix.libevent == '2.2.2-alpha' && matrix.mode == 'plaintext' && '1' || '0' }}
+      ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -56,7 +67,13 @@ jobs:
           sudo service redis-server stop
           python -m pip install -r tests/test_requirements.txt
       - name: Build pinned libevent
-        run: bash scripts/build-libevent.sh "$RUNNER_TEMP/libevent"
+        run: |
+          cmake_args=()
+          if [[ "$SANITIZE" == 1 ]]; then
+            cmake_args+=('-DCMAKE_C_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer -g')
+            cmake_args+=('-DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=address,undefined')
+          fi
+          bash scripts/build-libevent.sh "$RUNNER_TEMP/libevent" "${cmake_args[@]}"
       - name: Build memtier
         env:
           MODE: ${{ matrix.mode }}
@@ -65,6 +82,9 @@ jobs:
           configure_args=()
           if [[ "$MODE" == no-tls ]]; then
             configure_args+=(--disable-tls)
+          fi
+          if [[ "$SANITIZE" == 1 ]]; then
+            configure_args+=(--enable-sanitizers --enable-ubsan)
           fi
           PKG_CONFIG_PATH="$RUNNER_TEMP/libevent/lib/pkgconfig" \
             LDFLAGS="-Wl,-rpath,$RUNNER_TEMP/libevent/lib" ./configure "${configure_args[@]}"

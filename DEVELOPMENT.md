@@ -123,10 +123,15 @@ can affect pipelined benchmark throughput. Pin the same libevent build when
 comparing results; changing the library changes the benchmark client.
 The dedicated libevent compatibility workflow runs the full standalone and
 cluster test suites against both pinned versions. It runs automatically for
-changes to the build/test harness, configuration, or this workflow, weekly on the
+changes to the build/test harness, connection implementation, configuration, or this workflow, weekly on the
 default branch, and on demand via `workflow_dispatch`. Ordinary source changes
 continue to use the existing distribution-library CI builds; the alpha adds no
 new minimum dependency requirement.
+The alpha plaintext job instruments both memtier and libevent with ASan/UBSan,
+including the connection-failure and reconnect paths. Alpha 2.2.2 currently
+returns no queued OpenSSL errors from its accessor for a TLS bufferevent, so
+detailed TLS failure diagnostics can differ from stable even when failure and
+reconnect handling still work.
 
 ### Code Style
 
@@ -608,4 +613,3 @@ If you encounter a crash, please report it by opening an issue on [GitHub](https
 3. System information (OS, architecture, library versions)
 4. Steps to reproduce the crash (if known)
 5. Core dump or gdb backtrace (if available)
-
