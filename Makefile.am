@@ -94,6 +94,8 @@ rate_limiter_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 socket_options_test_SOURCES = tests/unit/socket_options_test.cpp
 socket_options_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
 socket_options_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+# Per-target memtier_benchmark_CPPFLAGS give these objects their target prefix.
+# Reuse the real client RTTI for UBSan; the test supplies main and shard_connection.
 socket_options_test_LDADD = $(filter-out memtier_benchmark-memtier_benchmark.$(OBJEXT) \
     memtier_benchmark-shard_connection.$(OBJEXT),$(memtier_benchmark_OBJECTS)) $(memtier_benchmark_LDADD)
 TESTS = $(check_PROGRAMS)

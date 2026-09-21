@@ -43,6 +43,7 @@ static int recording_socket(int domain, int type, int protocol)
     return observed_socket;
 }
 
+// Include the system socket declarations above before replacing the call name.
 #define socket recording_socket
 #include "shard_connection.cpp"
 #undef socket
@@ -58,6 +59,8 @@ void report_connection_stage_success()
     abort();
 }
 
+// These main-owned helpers also appear in tests/fuzz/fuzz_stubs.cpp. That file's
+// object_generator stubs conflict with the real objects needed for client RTTI.
 void benchmark_log_file_line(int, const char *, unsigned int, const char *, ...) {}
 void benchmark_log(int, const char *, ...) {}
 bool is_redis_protocol(enum PROTOCOL_TYPE type)
@@ -80,8 +83,9 @@ static void check_option(int fd, int level, int option, const char *context, con
 {
     int value = -1;
     socklen_t len = sizeof(value);
-    if (check(getsockopt(fd, level, option, &value, &len) == 0, context, name) && value != 1) {
-        fprintf(stderr, "FAIL [%s]: %s = %d, expected 1\n", context, name, value);
+    // Boolean socket options need only be nonzero: BSD can return a bit mask.
+    if (check(getsockopt(fd, level, option, &value, &len) == 0, context, name) && value == 0) {
+        fprintf(stderr, "FAIL [%s]: %s = 0, expected enabled\n", context, name);
         ++failures;
     }
 }
@@ -117,6 +121,11 @@ static void check_connections(struct connect_info &address, const char *unix_pat
             if (unix_path == NULL) {
                 check_option(fd, SOL_SOCKET, SO_KEEPALIVE, label, "SO_KEEPALIVE");
                 check_option(fd, IPPROTO_TCP, TCP_NODELAY, label, "TCP_NODELAY");
+                struct linger linger_value = {};
+                socklen_t len = sizeof(linger_value);
+                if (check(getsockopt(fd, SOL_SOCKET, SO_LINGER, &linger_value, &len) == 0, label, "SO_LINGER")) {
+                    check(linger_value.l_onoff != 0 && linger_value.l_linger == 0, label, "abortive close enabled");
+                }
             }
             connection.disconnect();
             // libevent can defer bufferevent destruction until the loop runs.
