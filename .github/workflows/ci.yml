@@ -133,9 +133,6 @@ jobs:
 
   build-notls:
     runs-on: ubuntu-latest
-    env:
-      # Make a reintroduced uninitialized socket-option argument fail reliably.
-      CXXFLAGS: -g -O2 -ftrivial-auto-var-init=zero
     steps:
     - uses: actions/checkout@v6
     - name: Install dependencies
@@ -175,6 +172,13 @@ jobs:
 
     - name: Unit tests (prometheus disabled)
       run: make check
+
+    - name: Deterministic socket option regression
+      # Keep normal builds unchanged; only this extra test compilation gets
+      # zero initialization so the original uninitialized argument fails reliably.
+      run: |
+        make -W tests/unit/socket_options_test.cpp socket_options_test socket_options_test_CXXFLAGS='-std=c++11 -Wall -Werror=vla -g -ftrivial-auto-var-init=zero'
+        ./socket_options_test
 
   build-ubuntu-latest:
     runs-on: ubuntu-latest
@@ -481,19 +485,28 @@ jobs:
   build-macos:
     strategy:
       matrix:
-        openssl: ["3.0"]
+        openssl: ["3.0", "3"]
     runs-on: macos-latest
     continue-on-error: true
     steps:
     - uses: actions/checkout@v6
     - name: Install dependencies
       run: brew install autoconf automake libtool pkg-config openssl@${{ matrix.openssl }}
+    - name: Install Homebrew libevent for the default OpenSSL
+      if: matrix.openssl == '3'
+      run: brew install libevent
     - name: Build libevent against the selected OpenSSL
+      if: matrix.openssl != '3'
       run: bash scripts/build-macos-libevent.sh "$(brew --prefix openssl@${{ matrix.openssl }})"
     - name: Build
       run: |
         autoreconf -ivf
-        PKG_CONFIG_PATH="$RUNNER_TEMP/libevent-memtier/lib/pkgconfig:$(brew --prefix openssl@${{ matrix.openssl }})/lib/pkgconfig" ./configure
+        if [ '${{ matrix.openssl }}' = '3' ]; then
+          event_prefix="$(brew --prefix libevent)"
+        else
+          event_prefix="$RUNNER_TEMP/libevent-memtier"
+        fi
+        PKG_CONFIG_PATH="$event_prefix/lib/pkgconfig:$(brew --prefix openssl@${{ matrix.openssl }})/lib/pkgconfig" ./configure
         make
     - name: Unit tests
       run: |
@@ -506,7 +519,11 @@ jobs:
         ./memtier_benchmark --version
         otool -L ./memtier_benchmark | grep libevent
         otool -L ./memtier_benchmark | grep ssl
-        bash scripts/check-macos-tls-links.sh "$(brew --prefix openssl@${{ matrix.openssl }})"
+        if [ '${{ matrix.openssl }}' = '3' ]; then
+          bash scripts/check-macos-tls-links.sh "$(brew --prefix openssl@3)" "$(brew --prefix libevent)"
+        else
+          bash scripts/check-macos-tls-links.sh "$(brew --prefix openssl@${{ matrix.openssl }})"
+        fi
 
   # macos-13 has been retired as of December 2025, so use macos-14
   # macos-14 details: https://github.com/actions/runner-images/blob/main/images/macos/macos-14-Readme.md
@@ -545,6 +562,7 @@ jobs:
       run: brew install autoconf automake libtool pkg-config
     - name: Install openssl v1.0.2
       run: brew install rbenv/tap/openssl@1.0
+    # Retain the already-tested legacy libevent version; upgrading it is separate.
     - name: Build libevent against openssl v1.0.2
       # Homebrew's libevent uses OpenSSL 3; mixing it with 1.0.2 selects
       # incompatible headers and loads two SSL ABIs into the same process.
@@ -577,23 +595,7 @@ jobs:
         ./memtier_benchmark --version | grep 'OpenSSL 1.0.2'
         binary_links="$(otool -L ./memtier_benchmark)"
         printf '%s\n' "$binary_links" | grep '/libssl\.1\.0\.0\.dylib '
-        event_libraries="$(printf '%s\n' "$binary_links" | awk 'NR > 1 && $1 ~ /\/libevent[^\/]*\.dylib$/ { print $1 }')"
-        test -n "$event_libraries"
-        # Check every libevent component, including its own dependencies: a
-        # missing custom .pc file must never silently fall back to Homebrew.
-        printf '%s\n' ./memtier_benchmark "$event_libraries" |
-          while IFS= read -r library; do
-            otool -L "$library" | awk -v event_prefix="$RUNNER_TEMP/libevent-openssl-1.0/lib/" '
-              NR > 1 && $1 ~ /\/libevent[^\/]*\.dylib$/ && index($1, event_prefix) != 1 {
-                print "Unexpected libevent dependency: " $1 > "/dev/stderr"; bad = 1
-              }
-              NR > 1 && $1 ~ /\/lib(ssl|crypto)[^\/]*\.dylib$/ &&
-                $1 !~ /\/lib(ssl|crypto)\.1\.0\.0\.dylib$/ {
-                print "Unexpected OpenSSL dependency: " $1 > "/dev/stderr"; bad = 1
-              }
-              END { exit bad }
-            ' || exit 1
-          done
+        bash scripts/check-macos-tls-links.sh "$(brew --prefix openssl@1.0)" "$RUNNER_TEMP/libevent-openssl-1.0"
         otool -L "$RUNNER_TEMP/libevent-openssl-1.0/lib/libevent_openssl.dylib" | grep 'libssl.1.0.0'
 
   promtool-lint:

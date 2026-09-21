@@ -74,13 +74,14 @@ memtier_benchmark_LDADD = \
 	$(LIBSSL_LIBS)
 
 
-# Unit-test harness for the pure metrics layer (prometheus_metrics.{h,cpp}).
+check_PROGRAMS = prometheus_metrics_test rate_limiter_test socket_options_test
+
+# The metrics test links only the pure layer (prometheus_metrics.{h,cpp}).
 # First `make check` program in the repo. The metrics layer is config-free and
 # libevent-free (Decisions #52 purity contract), so this links only the metrics
 # layer + hdr_histogram (a leaf dep). No $(LIBEVENT_CFLAGS) by design (hygiene
 # only; purity is enforced by the S10 grep audit). -I$(srcdir) is required for
 # VPATH builds.
-check_PROGRAMS = prometheus_metrics_test rate_limiter_test socket_options_test
 prometheus_metrics_test_SOURCES = tests/unit/prometheus_metrics_test.cpp \
     prometheus_metrics.cpp prometheus_metrics.h \
     deps/hdr_histogram/hdr_histogram.c deps/hdr_histogram/hdr_histogram.h

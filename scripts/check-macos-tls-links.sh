@@ -2,8 +2,8 @@
 # Reject foreign SSL/libevent installations, including another OpenSSL 3.x copy.
 set -euo pipefail
 
-ssl_prefix="${1:?usage: check-macos-tls-links.sh OPENSSL_PREFIX}"
-event_prefix="${RUNNER_TEMP:?}/libevent-memtier/lib/"
+ssl_prefix="${1:?usage: check-macos-tls-links.sh OPENSSL_PREFIX [LIBEVENT_PREFIX]}"
+event_prefix="${2:-${RUNNER_TEMP:?}/libevent-memtier}/lib/"
 binary_links="$(otool -L ./memtier_benchmark)"
 printf '%s\n' "$binary_links"
 event_libraries="$(printf '%s\n' "$binary_links" | awk 'NR > 1 && $1 ~ /\/libevent[^\/]*\.dylib$/ { print $1 }')"
