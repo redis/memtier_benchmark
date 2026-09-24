@@ -332,6 +332,7 @@ private:
     std::string m_readable_id;
 
     struct sockaddr_un *m_unix_sockaddr;
+    int m_unix_sockaddrlen;
     struct bufferevent *m_bev;
     struct event_base *m_event_base;
     struct event *m_event_timer;

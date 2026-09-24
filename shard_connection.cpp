@@ -218,6 +218,7 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_address(NULL),
         m_port(NULL),
         m_unix_sockaddr(NULL),
+        m_unix_sockaddrlen(0),
         m_bev(NULL),
         m_event_timer(NULL),
         m_request_per_cur_interval(0),
@@ -253,9 +254,19 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_unix_sockaddr = (struct sockaddr_un *) malloc(sizeof(struct sockaddr_un));
         assert(m_unix_sockaddr != NULL);
 
+        memset(m_unix_sockaddr, 0, sizeof(struct sockaddr_un));
         m_unix_sockaddr->sun_family = AF_UNIX;
-        strncpy(m_unix_sockaddr->sun_path, m_config->unix_socket, sizeof(m_unix_sockaddr->sun_path) - 1);
-        m_unix_sockaddr->sun_path[sizeof(m_unix_sockaddr->sun_path) - 1] = '\0';
+
+        // Consider any Unix socket path prefixed with @ an abstract socket.
+        // In this scenario, sun_path[0] must be a null byte, and addrlen should be terminated at
+        // exactly the socket name length; see the manpage for unix(7).
+        if (m_config->unix_socket[0] == '@') {
+            strncpy(&m_unix_sockaddr->sun_path[1], &m_config->unix_socket[1], strlen(m_config->unix_socket) - 1);
+            m_unix_sockaddrlen = offsetof(struct sockaddr_un, sun_path) + strlen(m_config->unix_socket);
+        } else {
+            strncpy(m_unix_sockaddr->sun_path, m_config->unix_socket, sizeof(m_unix_sockaddr->sun_path) - 1);
+            m_unix_sockaddrlen = sizeof(struct sockaddr_un);
+        }
     }
 
     m_protocol = abs_protocol->clone();
@@ -477,7 +488,7 @@ int shard_connection::connect(struct connect_info *addr)
     m_connection_state = conn_in_progress;
 
     if (bufferevent_socket_connect(m_bev, m_unix_sockaddr ? (struct sockaddr *) m_unix_sockaddr : addr->ci_addr,
-                                   m_unix_sockaddr ? sizeof(struct sockaddr_un) : addr->ci_addrlen) == -1) {
+                                   m_unix_sockaddr ? m_unix_sockaddrlen : addr->ci_addrlen) == -1) {
         disconnect();
 
         benchmark_error_log("connect failed, error = %s\n", strerror(errno));
