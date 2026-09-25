@@ -237,6 +237,31 @@ public:
     }
 };
 
+// True for commands whose replies are not 1:1 with the request, either because
+// the server answers once per argument or because the command turns the
+// connection into a server-push stream. memtier's pipeline books exactly one
+// reply per queued request (shard_connection::push_req / pop_req), so these
+// cannot be measured as operations at all:
+//
+//   SUBSCRIBE a b  -> two replies for one request. Under RESP2 the surplus
+//                     reply pops a request that was never queued and
+//                     m_pending_resp underflows (SIGABRT, issue #515). Under
+//                     RESP3 the confirmations arrive as out-of-band push
+//                     frames, which parse_response() drains without retiring
+//                     the request, so the connection never quiesces and the
+//                     run wedges past --test-time.
+//   MONITOR        -> "+OK" then an unbounded feed of other clients' commands.
+//   SYNC / PSYNC   -> an RDB payload followed by an unbounded replication feed.
+//
+// Note that arity is not a safe discriminator: a single-channel SUBSCRIBE is
+// also fatal as soon as anyone publishes to that channel, because the message
+// arrives with no request outstanding. The whole family is refused.
+//
+// The argument is matched case-insensitively. Pass the *decoded* command token
+// (arbitrary_command::command_args[0].data), never a raw slice of the input
+// line -- see the call site in monitor_command_list::load_from_file().
+bool is_multi_reply_command(const std::string &cmd_name);
+
 struct monitor_command_list
 {
 private:

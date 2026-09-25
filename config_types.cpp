@@ -710,19 +710,46 @@ static std::string extract_command_type(const std::string &command_str)
     return cmd_type;
 }
 
-// Connection/protocol-negotiation commands that must not be replayed as a
-// benchmark workload from --monitor-input. Replaying `HELLO <proto>` switches
-// the connection to RESP3 mid-stream, after which memtier's RESP2 reply parser
-// blocks forever on a reply it cannot decode -- and the in-flight read is not
-// bounded by --test-time, so the run wedges until the harness watchdog kills it
-// (issue #482). A captured MONITOR stream legitimately contains HELLO lines
-// (clients negotiate protocol on connect), and the fuzzer mutates toward them,
-// so rather than scrubbing the corpus we skip them here: the loader still runs
-// every other command in the file. cmd_type is already uppercased by
-// extract_command_type(), so the compare is case-insensitive.
-static bool is_unreplayable_monitor_command_type(const std::string &cmd_type_upper)
+// See the contract in config_types.h.
+bool is_multi_reply_command(const std::string &cmd_name)
 {
-    return cmd_type_upper == "HELLO";
+    std::string upper(cmd_name);
+    std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
+
+    return upper == "SUBSCRIBE" || upper == "UNSUBSCRIBE" || upper == "PSUBSCRIBE" || upper == "PUNSUBSCRIBE" ||
+           upper == "SSUBSCRIBE" || upper == "SUNSUBSCRIBE" || upper == "MONITOR" || upper == "SYNC" ||
+           upper == "PSYNC";
+}
+
+// Commands that must not be replayed as a benchmark workload from
+// --monitor-input, because replaying them breaks the reply accounting rather
+// than measuring anything:
+//
+//   HELLO -- switches the connection to RESP3 mid-stream, after which memtier's
+//     RESP2 reply parser blocks forever on a reply it cannot decode. The
+//     in-flight read is not bounded by --test-time, so the run wedges until the
+//     harness watchdog kills it (issue #482).
+//   the pub/sub + streaming family -- see is_multi_reply_command() (issue #515).
+//
+// A captured MONITOR stream legitimately contains both (clients negotiate
+// protocol on connect; applications subscribe), and the fuzzer mutates toward
+// them, so rather than scrubbing the corpus we skip them here: the loader still
+// runs every other command in the file.
+//
+// IMPORTANT: cmd_name must be the *decoded* first argv token, not a raw slice of
+// the input line. arbitrary_command::split_command_to_args() unescapes \\ and
+// \xNN sequences, so the line `[ p ] 1.0 [0 1:1] "S\UBSCRIBE" "a" "b"` has a raw
+// command type of `S\UBSCRIBE` while the bytes actually put on the wire are
+// `SUBSCRIBE`. Matching the raw slice would let that line through -- and the
+// in-tree fuzzer manufactures exactly this shape, since quote_storm()
+// (tests/fuzz/fuzz_monitor_input.py) inserts literal backslashes at random
+// offsets. Both comparisons are case-insensitive.
+static bool is_unreplayable_monitor_command_type(const std::string &cmd_name)
+{
+    std::string upper(cmd_name);
+    std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
+
+    return upper == "HELLO" || is_multi_reply_command(upper);
 }
 
 bool monitor_command_list::load_from_file(const char *filename)
@@ -812,10 +839,17 @@ bool monitor_command_list::load_from_file(const char *filename)
             // Extract the command type (e.g., "SET", "GET"); already uppercased.
             std::string cmd_type = extract_command_type(command_str);
 
-            // Skip connection/protocol-negotiation commands that wedge the
-            // replay client (e.g. HELLO switching to RESP3); see
-            // is_unreplayable_monitor_command_type().
-            if (is_unreplayable_monitor_command_type(cmd_type)) {
+            // Skip commands that break the reply accounting instead of
+            // measuring anything (HELLO, pub/sub, MONITOR, replication); see
+            // is_unreplayable_monitor_command_type(). Keyed off the probe's
+            // decoded argv[0] -- the bytes that would actually go on the wire --
+            // and NOT off cmd_type, which is a raw slice of the line and so can
+            // be escaped past the filter (`"S\UBSCRIBE"`). probe is guaranteed
+            // to have split successfully here; a zero-token split cannot reach
+            // this point because split_command_to_args() failing was handled
+            // above, but fall back to cmd_type if there are no args at all.
+            const std::string &wire_cmd_name = probe.command_args.empty() ? cmd_type : probe.command_args[0].data;
+            if (is_unreplayable_monitor_command_type(wire_cmd_name)) {
                 skipped_unsafe++;
                 seg_start = seg_end ? seg_end + 1 : line + line_len;
                 continue;
@@ -836,6 +870,17 @@ bool monitor_command_list::load_from_file(const char *filename)
             fprintf(stderr,
                     "error: no valid commands found in monitor input file: %s (%zu malformed line(s) skipped)\n",
                     filename, skipped_malformed);
+        } else if (skipped_unsafe > 0) {
+            // Every line parsed but every one was unreplayable. Say so: telling
+            // the user "no commands found" when we found and deliberately
+            // dropped all of them sends them hunting a capture-format problem
+            // that does not exist. A pub/sub-heavy capture hits this easily now
+            // that the filter covers the whole subscribe + streaming family and
+            // not just HELLO.
+            fprintf(stderr,
+                    "error: no replayable commands in monitor input file: %s (%zu of %zu line(s) skipped as "
+                    "unreplayable -- HELLO, pub/sub subscribe, MONITOR, SYNC and PSYNC cannot be benchmarked)\n",
+                    filename, skipped_unsafe, total_lines);
         } else {
             fprintf(stderr, "error: no commands found in monitor input file: %s\n", filename);
         }

@@ -85,7 +85,7 @@ def _wait_for_port(host, port, timeout=5.0):
     return False
 
 
-def _run_fixture(env, fixture_name, cluster_mode=False):
+def _run_fixture(env, fixture_name, cluster_mode=False, pipeline=2):
     """Spin up mock_redis_resp_fuzzer + memtier for one fixture.
 
     When *cluster_mode* is True, memtier is launched with ``--cluster-mode``
@@ -161,7 +161,10 @@ def _run_fixture(env, fixture_name, cluster_mode=False):
                 "--ratio=1:0",
                 "--hide-histogram",
                 # Run a tiny pipeline so the parser exercises mbulk paths.
-                "--pipeline=2",
+                # Overridable: a surplus-reply fixture needs --pipeline=1, since
+                # at a deeper pipeline the extra frame is absorbed by the next
+                # outstanding request and the empty-pipeline path is never taken.
+                "--pipeline={}".format(pipeline),
                 # Suppress the JSON output - we only care about exit/stderr.
                 "--json-out-file=/dev/null",
             ]
@@ -205,10 +208,10 @@ def _run_fixture(env, fixture_name, cluster_mode=False):
     return (crashed, needle_hit, hung, exit_code, stderr_text)
 
 
-def _assert_no_crash(env, fixture_name, cluster_mode=False):
+def _assert_no_crash(env, fixture_name, cluster_mode=False, pipeline=2):
     """Run one fixture and assert no crash / no hang / no needle."""
     crashed, needle_hit, hung, exit_code, stderr_text = _run_fixture(
-        env, fixture_name, cluster_mode=cluster_mode
+        env, fixture_name, cluster_mode=cluster_mode, pipeline=pipeline
     )
 
     # _run_fixture returns a "mock server failed to bind" stderr_text when
@@ -338,9 +341,49 @@ def test_resp3_push_unsolicited(env):
 
 
 def test_unsolicited_reply(env):
+    """A surplus reply must be discarded, not popped off an empty pipeline.
+
+    Regression test for issue #515. The fixture serves two `+OK` frames once,
+    so at ``--pipeline=1`` memtier has exactly one request outstanding and the
+    second frame arrives with nothing to book it against. Before the fix that
+    called front()/pop() on an empty std::queue and drove m_pending_resp
+    negative -> assert -> SIGABRT (release builds included; the default
+    CXXFLAGS carry no -DNDEBUG).
+
+    ``pipeline=1`` is load-bearing: at the harness default of 2 the surplus
+    frame is absorbed as the second request's reply, m_pipeline is never empty,
+    and this fixture passes even on a build with no guard at all -- which is
+    why it did not catch #515 in the first place.
+
+    Asserting the warning, not just the absence of a crash, is what makes this
+    a test of the guard rather than of the exit code: a refactor that hoists
+    pop_req() above the empty check would still exit 0 here.
+    """
     if _skip_if_unsupported(env):
         return
-    _assert_no_crash(env, "unsolicited_reply.bin")
+    crashed, needle_hit, hung, exit_code, stderr_text = _run_fixture(
+        env, "unsolicited_reply.bin", pipeline=1
+    )
+    if stderr_text == "mock server failed to bind":
+        env.skip()
+        return
+
+    env.assertFalse(
+        crashed,
+        message="memtier crashed on a surplus reply (exit_code={}); stderr: {}".format(
+            exit_code, stderr_text[-1000:]
+        ),
+    )
+    env.assertIsNone(
+        needle_hit,
+        message="crash needle {!r} in stderr: {}".format(needle_hit, stderr_text[-1000:]),
+    )
+    env.assertFalse(hung, message="memtier hung on a surplus reply")
+    env.assertTrue(
+        "no request outstanding" in stderr_text,
+        message="expected the unsolicited-reply guard to report the discarded "
+                "frame; got stderr: {}".format(stderr_text[-1000:]),
+    )
 
 
 def test_cluster_slots_malformed(env):
