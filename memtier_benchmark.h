@@ -129,6 +129,7 @@ struct benchmark_config
     unsigned long long requests;
     unsigned int clients;
     unsigned int threads;
+    bool pin_threads; // Opt-in Linux worker affinity; disabled by value initialization.
     unsigned int test_time;
     config_ratio ratio;
     unsigned int pipeline;

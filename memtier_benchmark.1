@@ -179,6 +179,15 @@ Number of clients per thread (default: 50)
 .TP
 \fB\-t\fR, \fB\-\-threads\fR=\fI\,NUMBER\/\fR
 Number of threads (default: 4)
+On Linux, a startup warning is printed if worker threads outnumber the allowed
+logical CPUs, with or without \fB\-\-pin\-threads\fR. CPU contention may limit
+throughput and increase latency; this warning does not measure performance loss.
+.TP
+\fB\-\-pin\-threads\fR
+Pin workers round-robin to the CPUs allowed by taskset or a container cpuset
+before starting work (Linux only). Disabled by default. If workers outnumber
+allowed CPUs, multiple workers share each CPU. This does not reserve CPUs or
+pin the main thread.
 .TP
 \fB\-\-test\-time\fR=\fI\,SECS\/\fR
 Number of seconds to run the test
