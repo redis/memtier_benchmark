@@ -1,0 +1,126 @@
+name: Libevent compatibility
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - '.github/workflows/libevent-compat.yml'
+      - '.github/workflows/ci.yml'
+      - 'scripts/build-libevent.sh'
+      - 'scripts/build-macos-libevent.sh'
+      - 'configure.ac'
+      - 'Makefile.am'
+      - 'shard_connection.cpp'
+      - 'tests/test_connection_error_types.py'
+      - 'tests/test_reconnections.py'
+      - 'tests/run_tests.sh'
+      - 'tests/test_requirements.txt'
+      - 'tests/gen-test-certs.sh'
+  pull_request:
+    branches: [master, main]
+    paths:
+      - '.github/workflows/libevent-compat.yml'
+      - '.github/workflows/ci.yml'
+      - 'scripts/build-libevent.sh'
+      - 'scripts/build-macos-libevent.sh'
+      - 'configure.ac'
+      - 'Makefile.am'
+      - 'shard_connection.cpp'
+      - 'tests/test_connection_error_types.py'
+      - 'tests/test_reconnections.py'
+      - 'tests/run_tests.sh'
+      - 'tests/test_requirements.txt'
+      - 'tests/gen-test-certs.sh'
+  workflow_dispatch:
+  schedule:
+    - cron: '23 3 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  compatibility:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        libevent: [2.1.13-stable, 2.2.2-alpha]
+        mode: [plaintext, tls, no-tls]
+    name: libevent ${{ matrix.libevent }} (${{ matrix.mode }})
+    env:
+      LIBEVENT_VERSION: ${{ matrix.libevent }}
+      # Instrument the dependency too: memtier-only ASan cannot catch invalid
+      # accesses performed inside an uninstrumented libevent error accessor.
+      SANITIZE: ${{ matrix.libevent == '2.2.2-alpha' && matrix.mode == 'plaintext' && '1' || '0' }}
+      ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential autoconf automake pkg-config cmake libssl-dev zlib1g-dev redis-server
+          sudo service redis-server stop
+          python -m pip install -r tests/test_requirements.txt
+      - name: Build pinned libevent
+        run: |
+          cmake_args=()
+          if [[ "$SANITIZE" == 1 ]]; then
+            cmake_args+=('-DCMAKE_C_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer -g')
+            cmake_args+=('-DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=address,undefined')
+          fi
+          bash scripts/build-libevent.sh "$RUNNER_TEMP/libevent" "${cmake_args[@]}"
+      - name: Build memtier
+        env:
+          MODE: ${{ matrix.mode }}
+        run: |
+          autoreconf -ivf
+          configure_args=()
+          if [[ "$MODE" == no-tls ]]; then
+            configure_args+=(--disable-tls)
+          fi
+          if [[ "$SANITIZE" == 1 ]]; then
+            configure_args+=(--enable-sanitizers --enable-ubsan)
+          fi
+          PKG_CONFIG_PATH="$RUNNER_TEMP/libevent/lib/pkgconfig" \
+            LDFLAGS="-Wl,-rpath,$RUNNER_TEMP/libevent/lib" ./configure "${configure_args[@]}"
+          make -j2
+          make check
+      - name: Verify runtime version and linkage
+        run: |
+          ./memtier_benchmark --version | tee version.txt
+          # Alpha releases append -dev to the runtime version string.
+          expected="$LIBEVENT_VERSION"
+          if [[ "$expected" == *-alpha ]]; then expected+=-dev; fi
+          grep -F " libevent=$expected " version.txt
+          ldd ./memtier_benchmark | tee linkage.txt
+          awk -v prefix="$RUNNER_TEMP/libevent/lib/" '
+            /libevent[^ ]* =>/ { found++; if (index($3, prefix) != 1) exit 1 }
+            END { if (!found) exit 1 }
+          ' linkage.txt
+      - name: Generate TLS certificates
+        if: matrix.mode == 'tls'
+        run: ./tests/gen-test-certs.sh
+      - name: Integration tests (standalone and cluster)
+        env:
+          OSS_STANDALONE: '1'
+          OSS_CLUSTER: '1'
+          PARALLELISM: '2'
+          TLS: ${{ matrix.mode == 'tls' && '1' || '0' }}
+        run: ./tests/run_tests.sh
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: libevent-${{ matrix.libevent }}-${{ matrix.mode }}
+          path: |
+            version.txt
+            linkage.txt
+            config.log
+            test-suite.log
+            tests/logs/
+          retention-days: 7
