@@ -80,6 +80,10 @@
 #define REDIS_TLS_PROTO_DEFAULT (REDIS_TLS_PROTO_TLSv1_2)
 #endif
 
+#if OPENSSL_VERSION_NUMBER >= 0x40000000L
+static bool bitmask_is_contiguous(unsigned int mask);
+#endif
+
 #endif
 
 #include <cmath>
