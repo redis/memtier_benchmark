@@ -1298,7 +1298,7 @@ void shard_connection::process_response(void)
         if ((m_config->requests != m_conns_manager->get_reqs_processed()) &&
             ((m_conns_manager->get_reqs_processed() % m_config->reconnect_interval) == 0)) {
             assert(m_pipeline->size() == 0);
-            benchmark_debug_log("reconnecting, m_reqs_processed = %u\n", m_conns_manager->get_reqs_processed());
+            benchmark_debug_log("reconnecting, m_reqs_processed = %llu\n", m_conns_manager->get_reqs_processed());
 
             // client manage connection & disconnection of shard
             m_conns_manager->disconnect();

@@ -153,10 +153,10 @@ void statsd_client::gauge(const char *name, double value)
     send_metric(name, val_str, "g");
 }
 
-void statsd_client::gauge(const char *name, long value)
+void statsd_client::gauge(const char *name, long long value)
 {
     char val_str[64];
-    snprintf(val_str, sizeof(val_str), "%ld", value);
+    snprintf(val_str, sizeof(val_str), "%lld", value);
     send_metric(name, val_str, "g");
 }
 

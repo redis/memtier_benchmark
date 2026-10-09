@@ -748,8 +748,8 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
     jsonhandler->write_obj("verify_only", "\"%s\"", cfg->verify_only ? "true" : "false");
     jsonhandler->write_obj("generate_keys", "\"%s\"", cfg->generate_keys ? "true" : "false");
     jsonhandler->write_obj("key_prefix", "\"%s\"", cfg->key_prefix);
-    jsonhandler->write_obj("key_minimum", "%11u", cfg->key_minimum);
-    jsonhandler->write_obj("key_maximum", "%11u", cfg->key_maximum);
+    jsonhandler->write_obj("key_minimum", "%11llu", cfg->key_minimum);
+    jsonhandler->write_obj("key_maximum", "%11llu", cfg->key_maximum);
     jsonhandler->write_obj("key_pattern", "\"%s\"", cfg->key_pattern);
     jsonhandler->write_obj("key_stddev", "%f", cfg->key_stddev);
     jsonhandler->write_obj("key_median", "%f", cfg->key_median);
@@ -3125,14 +3125,14 @@ static void *cg_thread_start(void *t)
 // 1234567 -> "1,234,567". Falls back to bare digits if the destination
 // buffer is too small. Used by --realtime-latencies to make per-second
 // throughput readable at a glance.
-static void format_with_commas(unsigned long int n, char *out, size_t sz)
+static void format_with_commas(unsigned long long int n, char *out, size_t sz)
 {
     char raw[32];
-    snprintf(raw, sizeof(raw), "%lu", n);
+    snprintf(raw, sizeof(raw), "%llu", n);
     size_t len = strlen(raw);
     size_t commas = (len > 0) ? (len - 1) / 3 : 0;
     if (len + commas + 1 > sz) {
-        snprintf(out, sz, "%lu", n);
+        snprintf(out, sz, "%llu", n);
         return;
     }
     char *w = out + len + commas;
@@ -3145,7 +3145,7 @@ static void format_with_commas(unsigned long int n, char *out, size_t sz)
     }
 }
 
-void size_to_str(unsigned long int size, char *buf, int buf_len)
+void size_to_str(unsigned long long int size, char *buf, int buf_len)
 {
     if (size >= 1024 * 1024 * 1024) {
         snprintf(buf, buf_len, "%.2fGB", (float) size / (1024 * 1024 * 1024));
@@ -3317,7 +3317,7 @@ static void print_staircase_pattern(int run_id, benchmark_config *cfg)
 // can later share the exact same source. This is statsd-ONLY and lives OUTSIDE
 // any HAVE_EVHTTP guard. The byte-identical UDP wire is preserved: the snapshot
 // carries cur/avg_ops_sec et al. as `long` (cast at the fill site), so they
-// route through gauge(long) ("%ld"|g) exactly as before, while progress_pct is
+// route through gauge(long long) ("%lld"|g) exactly as before, while progress_pct is
 // `double` (gauge(double), "%.6f"|g) and the latencies go through timing(double)
 // ("%.3f"|ms). The >0 send condition for connection_errors is unchanged.
 static void statsd_publish_tick(statsd_client *statsd, const metrics_snapshot &snap, hdr_histogram *inst_hist_agg,
@@ -3329,10 +3329,10 @@ static void statsd_publish_tick(statsd_client *statsd, const metrics_snapshot &s
     statsd->gauge("bytes_sec_avg", snap.avg_bytes_sec);
     statsd->timing("latency_ms", snap.cur_latency_ms);
     statsd->timing("latency_avg_ms", snap.avg_latency_ms);
-    statsd->gauge("connections", (long) snap.connections);
+    statsd->gauge("connections", (long long) snap.connections);
     statsd->gauge("progress_pct", snap.progress_pct);
     if (snap.run_connection_errors > 0) {
-        statsd->gauge("connection_errors", (long) snap.run_connection_errors);
+        statsd->gauge("connection_errors", (long long) snap.run_connection_errors);
     }
 
     // Send percentile metrics derived from the aggregated instantaneous
@@ -3530,17 +3530,17 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     // the first 1 Hz tick). Mirrors statsd's zeroing convention.
     if (prom_enabled(cfg)) prom_publish_run_start(cfg, run_id);
 
-    unsigned long int prev_ops = 0;
-    unsigned long int prev_bytes = 0;
-    unsigned long int prev_duration = 0;
+    unsigned long long int prev_ops = 0;
+    unsigned long long int prev_bytes = 0;
+    unsigned long long int prev_duration = 0;
     double prev_latency = 0, cur_latency = 0;
-    unsigned long int cur_ops_sec = 0;
-    unsigned long int cur_bytes_sec = 0;
-    unsigned long int prev_hits = 0;
-    unsigned long int prev_misses = 0;
-    unsigned long int prev_aborts = 0;
-    unsigned long int prev_errors = 0;
-    unsigned long int prev_retry_attempts = 0;
+    unsigned long long int cur_ops_sec = 0;
+    unsigned long long int cur_bytes_sec = 0;
+    unsigned long long int prev_hits = 0;
+    unsigned long long int prev_misses = 0;
+    unsigned long long int prev_aborts = 0;
+    unsigned long long int prev_errors = 0;
+    unsigned long long int prev_retry_attempts = 0;
 
     // Detect once whether stderr is a real terminal. --realtime-latencies uses
     // this to choose between in-place cursor-up redraw and plain-append output.
@@ -3575,7 +3575,7 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         // Check for Ctrl+C interrupt
         if (g_interrupted) {
             // Calculate elapsed time before interrupting
-            unsigned long int elapsed_duration = 0;
+            unsigned long long int elapsed_duration = 0;
             unsigned int thread_counter = 0;
             for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
                 thread_counter++;
@@ -3615,18 +3615,18 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             }
         }
 
-        unsigned long int total_ops = 0;
-        unsigned long int total_bytes = 0;
-        unsigned long int duration = 0;
+        unsigned long long int total_ops = 0;
+        unsigned long long int total_bytes = 0;
+        unsigned long long int duration = 0;
         unsigned int thread_counter = 0;
         double total_latency = 0;
-        unsigned long int total_connection_errors = 0;
-        unsigned long int total_hits = 0;
-        unsigned long int total_misses = 0;
-        unsigned long int total_aborts = 0;
-        unsigned long int total_errors = 0;
-        unsigned long int total_retry_attempts = 0;
-        unsigned long int total_retried_ops = 0;
+        unsigned long long int total_connection_errors = 0;
+        unsigned long long int total_hits = 0;
+        unsigned long long int total_misses = 0;
+        unsigned long long int total_aborts = 0;
+        unsigned long long int total_errors = 0;
+        unsigned long long int total_retry_attempts = 0;
+        unsigned long long int total_retried_ops = 0;
 
         for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
             if (!(*i)->m_finished) active_threads++;
@@ -3659,26 +3659,26 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             duration = factor * duration + (float) (*i)->m_cg->get_duration_usec() / thread_counter;
         }
 
-        unsigned long int cur_ops = total_ops - prev_ops;
-        unsigned long int cur_bytes = total_bytes - prev_bytes;
-        unsigned long int cur_duration = duration - prev_duration;
+        unsigned long long int cur_ops = total_ops - prev_ops;
+        unsigned long long int cur_bytes = total_bytes - prev_bytes;
+        unsigned long long int cur_duration = duration - prev_duration;
         double cur_total_latency = total_latency - prev_latency;
         prev_ops = total_ops;
         prev_bytes = total_bytes;
         prev_latency = total_latency;
         prev_duration = duration;
 
-        unsigned long int ops_sec = 0;
-        unsigned long int bytes_sec = 0;
+        unsigned long long int ops_sec = 0;
+        unsigned long long int bytes_sec = 0;
         double avg_latency = 0;
         if (duration > 1) {
-            ops_sec = (long) ((double) total_ops / duration * 1000000);
-            bytes_sec = (long) ((double) total_bytes / duration * 1000000);
+            ops_sec = (unsigned long long) ((double) total_ops / duration * 1000000);
+            bytes_sec = (unsigned long long) ((double) total_bytes / duration * 1000000);
             avg_latency = ((double) total_latency / 1000 / total_ops);
         }
         if (cur_duration > 1 && active_threads == cfg->threads) {
-            cur_ops_sec = (long) ((double) cur_ops / cur_duration * 1000000);
-            cur_bytes_sec = (long) ((double) cur_bytes / cur_duration * 1000000);
+            cur_ops_sec = (unsigned long long) ((double) cur_ops / cur_duration * 1000000);
+            cur_bytes_sec = (unsigned long long) ((double) cur_bytes / cur_duration * 1000000);
             cur_latency = ((double) cur_total_latency / 1000 / cur_ops);
         }
 
@@ -3739,8 +3739,8 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             format_with_commas(ops_sec, avg_ops_str, sizeof(avg_ops_str));
 
             // Miss ratio: per-second (delta) and cumulative.
-            unsigned long int cur_lookups = (total_hits - prev_hits) + (total_misses - prev_misses);
-            unsigned long int tot_lookups = total_hits + total_misses;
+            unsigned long long int cur_lookups = (total_hits - prev_hits) + (total_misses - prev_misses);
+            unsigned long long int tot_lookups = total_hits + total_misses;
             char cur_miss_str[16], avg_miss_str[16];
             if (cur_lookups > 0)
                 snprintf(cur_miss_str, sizeof(cur_miss_str), "%5.2f%%",
@@ -3775,8 +3775,8 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             if (total_connection_errors > 0) {
                 line1_used = snprintf(
                     line1, sizeof(line1),
-                    "%s throughput %s (avg: %s) ops/sec   %s/sec (avg: %s/sec)   miss %s (avg: %s)   conn_err %lu", tag,
-                    cur_ops_str, avg_ops_str, cur_bytes_str, bytes_str, cur_miss_str, avg_miss_str,
+                    "%s throughput %s (avg: %s) ops/sec   %s/sec (avg: %s/sec)   miss %s (avg: %s)   conn_err %llu",
+                    tag, cur_ops_str, avg_ops_str, cur_bytes_str, bytes_str, cur_miss_str, avg_miss_str,
                     total_connection_errors);
             } else {
                 line1_used =
@@ -3794,10 +3794,10 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             // Retry/error tail: only printed when --retry-on-error is enabled
             // so existing CI / log-scraping is unaffected by default.
             if (cfg->retry_on_error && line1_used > 0 && (size_t) line1_used < sizeof(line1)) {
-                unsigned long int cur_errors = total_errors - prev_errors;
-                unsigned long int cur_retries = total_retry_attempts - prev_retry_attempts;
+                unsigned long long int cur_errors = total_errors - prev_errors;
+                unsigned long long int cur_retries = total_retry_attempts - prev_retry_attempts;
                 snprintf(line1 + line1_used, sizeof(line1) - line1_used,
-                         "   errors %lu (+%lu)   retries %lu (+%lu)   retried_ops %lu", total_errors, cur_errors,
+                         "   errors %llu (+%llu)   retries %llu (+%llu)   retried_ops %llu", total_errors, cur_errors,
                          total_retry_attempts, cur_retries, total_retried_ops);
             }
 
@@ -3866,13 +3866,13 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         } else if (total_connection_errors > 0) {
             // Only show connection errors if there are any (backwards compatible output)
             fprintf(stderr,
-                    "[RUN #%u %.0f%%, %3u secs] %2u threads %2u conns %lu conn errors: %11lu ops, %7lu (avg: %7lu) "
+                    "[RUN #%u %.0f%%, %3u secs] %2u threads %2u conns %llu conn errors: %11llu ops, %7llu (avg: %7llu) "
                     "ops/sec, %s/sec (avg: %s/sec), %5.2f (avg: %5.2f) msec latency",
                     run_id, progress, (unsigned int) (duration / 1000000), active_threads, display_clients,
                     total_connection_errors, total_ops, cur_ops_sec, ops_sec, cur_bytes_str, bytes_str, cur_latency,
                     avg_latency);
             if (cfg->retry_on_error) {
-                fprintf(stderr, "   errors %lu (+%lu)   retries %lu (+%lu)   retried_ops %lu", total_errors,
+                fprintf(stderr, "   errors %llu (+%llu)   retries %llu (+%llu)   retried_ops %llu", total_errors,
                         total_errors - prev_errors, total_retry_attempts, total_retry_attempts - prev_retry_attempts,
                         total_retried_ops);
             }
@@ -3880,16 +3880,16 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         } else if (cfg->retry_on_error && (total_errors > 0 || total_retry_attempts > 0)) {
             // Quick path when only request-level errors / retries are non-zero.
             fprintf(stderr,
-                    "[RUN #%u %.0f%%, %3u secs] %2u threads %2u conns: %11lu ops, %7lu (avg: %7lu) ops/sec, %s/sec "
-                    "(avg: %s/sec), %5.2f (avg: %5.2f) msec latency   errors %lu (+%lu)   retries %lu (+%lu)   "
-                    "retried_ops %lu\r",
+                    "[RUN #%u %.0f%%, %3u secs] %2u threads %2u conns: %11llu ops, %7llu (avg: %7llu) ops/sec, %s/sec "
+                    "(avg: %s/sec), %5.2f (avg: %5.2f) msec latency   errors %llu (+%llu)   retries %llu (+%llu)   "
+                    "retried_ops %llu\r",
                     run_id, progress, (unsigned int) (duration / 1000000), active_threads, display_clients, total_ops,
                     cur_ops_sec, ops_sec, cur_bytes_str, bytes_str, cur_latency, avg_latency, total_errors,
                     total_errors - prev_errors, total_retry_attempts, total_retry_attempts - prev_retry_attempts,
                     total_retried_ops);
         } else {
             fprintf(stderr,
-                    "[RUN #%u %.0f%%, %3u secs] %2u threads %2u conns: %11lu ops, %7lu (avg: %7lu) ops/sec, %s/sec "
+                    "[RUN #%u %.0f%%, %3u secs] %2u threads %2u conns: %11llu ops, %7llu (avg: %7llu) ops/sec, %s/sec "
                     "(avg: %s/sec), %5.2f (avg: %5.2f) msec latency\r",
                     run_id, progress, (unsigned int) (duration / 1000000), active_threads, display_clients, total_ops,
                     cur_ops_sec, ops_sec, cur_bytes_str, bytes_str, cur_latency, avg_latency);
@@ -3916,10 +3916,10 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             snap.active_threads = active_threads;
             snap.connections = display_clients * active_threads; // :3227 parity, uint32 product
             snap.progress_pct = progress;
-            snap.cur_ops_sec = (long) cur_ops_sec;
-            snap.avg_ops_sec = (long) ops_sec;
-            snap.cur_bytes_sec = (long) cur_bytes_sec;
-            snap.avg_bytes_sec = (long) bytes_sec;
+            snap.cur_ops_sec = (long long) cur_ops_sec;
+            snap.avg_ops_sec = (long long) ops_sec;
+            snap.cur_bytes_sec = (long long) cur_bytes_sec;
+            snap.avg_bytes_sec = (long long) bytes_sec;
             snap.cur_latency_ms = cur_latency;
             snap.avg_latency_ms = avg_latency;
             snap.run_connection_errors = total_connection_errors; // RAW per-run (Decisions #11)
@@ -3943,11 +3943,11 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         cfg->statsd->event("Benchmark Completed", event_data, "memtier,end");
 
         // Zero out gauges so the graph shows the run has ended
-        cfg->statsd->gauge("ops_sec", (long) 0);
-        cfg->statsd->gauge("ops_sec_avg", (long) 0);
-        cfg->statsd->gauge("bytes_sec", (long) 0);
-        cfg->statsd->gauge("bytes_sec_avg", (long) 0);
-        cfg->statsd->gauge("progress_pct", (long) 0);
+        cfg->statsd->gauge("ops_sec", (long long) 0);
+        cfg->statsd->gauge("ops_sec_avg", (long long) 0);
+        cfg->statsd->gauge("bytes_sec", (long long) 0);
+        cfg->statsd->gauge("bytes_sec_avg", (long long) 0);
+        cfg->statsd->gauge("progress_pct", (long long) 0);
     }
 
     fprintf(stderr, "\n\n");
@@ -5187,7 +5187,7 @@ int main(int argc, char *argv[])
             run_stats *worst = NULL;
             run_stats *best = NULL;
             for (std::vector<run_stats>::iterator i = all_stats.begin(); i != all_stats.end(); i++) {
-                unsigned long usecs = i->get_duration_usec();
+                unsigned long long usecs = i->get_duration_usec();
                 unsigned int ops_sec = (int) (((double) i->get_total_ops() / (usecs > 0 ? usecs : 1)) * 1000000);
                 if (ops_sec < min_ops_sec || worst == NULL) {
                     min_ops_sec = ops_sec;

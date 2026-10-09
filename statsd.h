@@ -92,9 +92,9 @@ public:
     void gauge(const char *name, double value);
 
     /**
-     * Send a gauge metric with long value.
+     * Send a gauge metric with long long value.
      */
-    void gauge(const char *name, long value);
+    void gauge(const char *name, long long value);
 
     /**
      * Send a timing metric (in milliseconds).

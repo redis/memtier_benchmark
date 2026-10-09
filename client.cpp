@@ -1383,9 +1383,9 @@ void client_group::set_all_clients_interrupted(void)
     }
 }
 
-unsigned long int client_group::get_total_bytes(void)
+unsigned long long int client_group::get_total_bytes(void)
 {
-    unsigned long int total_bytes = 0;
+    unsigned long long int total_bytes = 0;
     unsigned int count = active_client_count();
     for (unsigned int i = 0; i < count; i++) {
         total_bytes += m_clients[i]->get_stats()->get_total_bytes();
@@ -1394,9 +1394,9 @@ unsigned long int client_group::get_total_bytes(void)
     return total_bytes;
 }
 
-unsigned long int client_group::get_total_bytes_rx(void)
+unsigned long long int client_group::get_total_bytes_rx(void)
 {
-    unsigned long int total_bytes_rx = 0;
+    unsigned long long int total_bytes_rx = 0;
     unsigned int count = active_client_count();
     for (unsigned int i = 0; i < count; i++) {
         total_bytes_rx += m_clients[i]->get_stats()->get_total_bytes_rx();
@@ -1405,9 +1405,9 @@ unsigned long int client_group::get_total_bytes_rx(void)
     return total_bytes_rx;
 }
 
-unsigned long int client_group::get_total_bytes_tx(void)
+unsigned long long int client_group::get_total_bytes_tx(void)
 {
-    unsigned long int total_bytes_tx = 0;
+    unsigned long long int total_bytes_tx = 0;
     unsigned int count = active_client_count();
     for (unsigned int i = 0; i < count; i++) {
         total_bytes_tx += m_clients[i]->get_stats()->get_total_bytes_tx();
@@ -1416,9 +1416,9 @@ unsigned long int client_group::get_total_bytes_tx(void)
     return total_bytes_tx;
 }
 
-unsigned long int client_group::get_total_ops(void)
+unsigned long long int client_group::get_total_ops(void)
 {
-    unsigned long int total_ops = 0;
+    unsigned long long int total_ops = 0;
     unsigned int count = active_client_count();
     for (unsigned int i = 0; i < count; i++) {
         total_ops += m_clients[i]->get_stats()->get_total_ops();
@@ -1438,9 +1438,9 @@ double client_group::get_total_latency(void)
     return total_latency;
 }
 
-unsigned long int client_group::get_duration_usec(void)
+unsigned long long int client_group::get_duration_usec(void)
 {
-    unsigned long int duration = 0;
+    unsigned long long int duration = 0;
     unsigned int thread_counter = 1;
     unsigned int count = active_client_count();
     for (unsigned int i = 0; i < count; i++) {
@@ -1453,9 +1453,9 @@ unsigned long int client_group::get_duration_usec(void)
     return duration;
 }
 
-unsigned long int client_group::get_total_connection_errors(void)
+unsigned long long int client_group::get_total_connection_errors(void)
 {
-    unsigned long int total_errors = 0;
+    unsigned long long int total_errors = 0;
     unsigned int count = active_client_count();
     for (unsigned int i = 0; i < count; i++) {
         total_errors += m_clients[i]->get_stats()->get_total_connection_errors();
@@ -1464,9 +1464,9 @@ unsigned long int client_group::get_total_connection_errors(void)
     return total_errors;
 }
 
-unsigned long int client_group::get_total_hits(void)
+unsigned long long int client_group::get_total_hits(void)
 {
-    unsigned long int total = 0;
+    unsigned long long int total = 0;
     unsigned int count = active_client_count();
     for (unsigned int i = 0; i < count; i++) {
         total += m_clients[i]->get_stats()->get_total_hits();
@@ -1474,9 +1474,9 @@ unsigned long int client_group::get_total_hits(void)
     return total;
 }
 
-unsigned long int client_group::get_total_misses(void)
+unsigned long long int client_group::get_total_misses(void)
 {
-    unsigned long int total = 0;
+    unsigned long long int total = 0;
     unsigned int count = active_client_count();
     for (unsigned int i = 0; i < count; i++) {
         total += m_clients[i]->get_stats()->get_total_misses();
@@ -1514,9 +1514,9 @@ unsigned long long client_group::get_total_arbitrary_aborts(void)
     return total;
 }
 
-unsigned long int client_group::get_total_retry_attempts(void)
+unsigned long long int client_group::get_total_retry_attempts(void)
 {
-    unsigned long int total = 0;
+    unsigned long long int total = 0;
     unsigned int count = active_client_count();
     for (unsigned int i = 0; i < count; i++) {
         total += m_clients[i]->get_stats()->get_total_retry_attempts();
@@ -1524,9 +1524,9 @@ unsigned long int client_group::get_total_retry_attempts(void)
     return total;
 }
 
-unsigned long int client_group::get_total_retried_ops(void)
+unsigned long long int client_group::get_total_retried_ops(void)
 {
-    unsigned long int total = 0;
+    unsigned long long int total = 0;
     unsigned int count = active_client_count();
     for (unsigned int i = 0; i < count; i++) {
         total += m_clients[i]->get_stats()->get_total_retried_ops();
@@ -1534,9 +1534,9 @@ unsigned long int client_group::get_total_retried_ops(void)
     return total;
 }
 
-unsigned long int client_group::get_total_errors(void)
+unsigned long long int client_group::get_total_errors(void)
 {
-    unsigned long int total = 0;
+    unsigned long long int total = 0;
     unsigned int count = active_client_count();
     for (unsigned int i = 0; i < count; i++) {
         total += m_clients[i]->get_stats()->get_total_errors();

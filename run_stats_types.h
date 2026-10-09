@@ -77,9 +77,9 @@ public:
 class one_sec_cmd_stats
 {
 public:
-    unsigned long int m_bytes_rx;
-    unsigned long int m_bytes_tx;
-    unsigned long int m_ops;
+    unsigned long long int m_bytes_rx;
+    unsigned long long int m_bytes_tx;
+    unsigned long long int m_ops;
     unsigned int m_hits;
     unsigned int m_misses;
     unsigned int m_moved;
@@ -116,8 +116,8 @@ public:
     void setup(size_t n_arbitrary_commands);
     void reset();
     void merge(const ar_one_sec_cmd_stats &other);
-    unsigned long int ops();
-    unsigned long int bytes();
+    unsigned long long int ops();
+    unsigned long long int bytes();
     unsigned long long int total_latency();
     size_t size() const;
     one_sec_cmd_stats &at(std::size_t idx) { return m_commands.at(idx); }
@@ -228,11 +228,11 @@ public:
     double m_ask_sec;
     double m_latency;
     unsigned long long int m_total_latency;
-    unsigned long int m_ops;
+    unsigned long long int m_ops;
     totals_cmd();
     void add(const totals_cmd &other);
     void aggregate_average(size_t stats_size);
-    void summarize(const one_sec_cmd_stats &other, unsigned long test_duration_usec);
+    void summarize(const one_sec_cmd_stats &other, unsigned long long test_duration_usec);
 };
 
 class ar_totals_cmd
@@ -242,7 +242,7 @@ public:
     void setup(size_t n_arbitrary_commands);
     void add(const ar_totals_cmd &other);
     void aggregate_average(size_t stats_size);
-    void summarize(const ar_one_sec_cmd_stats &other, unsigned long test_duration_usec);
+    void summarize(const ar_one_sec_cmd_stats &other, unsigned long long test_duration_usec);
     size_t size() const;
 
     totals_cmd &at(std::size_t idx) { return m_commands.at(idx); }
@@ -275,16 +275,16 @@ public:
     double m_latency;
     unsigned long long int m_total_latency;
     // number of bytes received
-    unsigned long int m_bytes_rx;
+    unsigned long long int m_bytes_rx;
     // number of bytes sent
-    unsigned long int m_bytes_tx;
-    unsigned long int m_ops;
+    unsigned long long int m_bytes_tx;
+    unsigned long long int m_ops;
     // Lock-free running totals for live progress display. Workers bump these
     // from update_op() without synchronization; the main thread reads via
     // get_total_hits()/get_total_misses(). Same benign-race pattern as m_ops.
-    unsigned long int m_hits;
-    unsigned long int m_misses;
-    unsigned long int m_connection_errors;
+    unsigned long long int m_hits;
+    unsigned long long int m_misses;
+    unsigned long long int m_connection_errors;
     double m_connection_errors_sec;
     // Retry/error counters. Same benign-race pattern as m_ops: incremented
     // lock-free by workers, read from the main thread for progress display.
@@ -294,15 +294,15 @@ public:
     //   m_errors           number of requests that ultimately failed (retries
     //                      exhausted or permanent error). Excludes connection
     //                      errors which already have their own counter.
-    unsigned long int m_retry_attempts;
-    unsigned long int m_retried_ops;
-    unsigned long int m_errors;
+    unsigned long long int m_retry_attempts;
+    unsigned long long int m_retried_ops;
+    unsigned long long int m_errors;
     totals();
     void setup_arbitrary_commands(size_t n_arbitrary_commands);
     void add(const totals &other);
-    void update_op(unsigned long int bytes_rx, unsigned long int bytes_tx, unsigned int latency);
-    void update_op(unsigned long int bytes_rx, unsigned long int bytes_tx, unsigned int latency, unsigned int hits,
-                   unsigned int misses);
+    void update_op(unsigned long long int bytes_rx, unsigned long long int bytes_tx, unsigned int latency);
+    void update_op(unsigned long long int bytes_rx, unsigned long long int bytes_tx, unsigned int latency,
+                   unsigned int hits, unsigned int misses);
     void update_connection_error();
 };
 
