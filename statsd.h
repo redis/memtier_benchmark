@@ -19,10 +19,8 @@
 #ifndef _STATSD_H
 #define _STATSD_H
 
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <netdb.h>
+#include "platform_compat.h"
+#include <event2/util.h>
 
 /**
  * Simple StatsD client for sending metrics over UDP.
@@ -40,7 +38,7 @@
 class statsd_client
 {
 private:
-    int m_socket;
+    evutil_socket_t m_socket;
     struct sockaddr_in m_server_addr;
     char m_prefix[256];
     char m_run_label[128];
@@ -92,9 +90,9 @@ public:
     void gauge(const char *name, double value);
 
     /**
-     * Send a gauge metric with long value.
+     * Send a gauge metric with long long value.
      */
-    void gauge(const char *name, long value);
+    void gauge(const char *name, long long value);
 
     /**
      * Send a timing metric (in milliseconds).

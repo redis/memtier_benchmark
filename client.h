@@ -21,9 +21,7 @@
 
 #include <stdlib.h>
 #include <stdio.h>
-#include <netdb.h>
-#include <sys/socket.h>
-#include <sys/un.h>
+#include "platform_compat.h"
 #include <vector>
 #include <queue>
 #include <atomic>
@@ -315,21 +313,21 @@ public:
     object_generator *get_obj_gen(void) { return m_obj_gen; }
     std::vector<client *> &get_clients(void) { return m_clients; }
 
-    unsigned long int get_total_bytes(void);
-    unsigned long int get_total_bytes_rx(void);
-    unsigned long int get_total_bytes_tx(void);
-    unsigned long int get_total_ops(void);
+    unsigned long long int get_total_bytes(void);
+    unsigned long long int get_total_bytes_rx(void);
+    unsigned long long int get_total_bytes_tx(void);
+    unsigned long long int get_total_ops(void);
     double get_total_latency(void);
-    unsigned long int get_duration_usec(void);
-    unsigned long int get_total_connection_errors(void);
-    unsigned long int get_total_hits(void);
-    unsigned long int get_total_misses(void);
+    unsigned long long int get_duration_usec(void);
+    unsigned long long int get_total_connection_errors(void);
+    unsigned long long int get_total_hits(void);
+    unsigned long long int get_total_misses(void);
     unsigned long long get_total_arbitrary_hits(void);
     unsigned long long get_total_arbitrary_misses(void);
     unsigned long long get_total_arbitrary_aborts(void);
-    unsigned long int get_total_retry_attempts(void);
-    unsigned long int get_total_retried_ops(void);
-    unsigned long int get_total_errors(void);
+    unsigned long long int get_total_retry_attempts(void);
+    unsigned long long int get_total_retried_ops(void);
+    unsigned long long int get_total_errors(void);
 
     void merge_run_stats(run_stats *target);
     void aggregate_inst_histogram(hdr_histogram *target);

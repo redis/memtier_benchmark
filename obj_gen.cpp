@@ -34,6 +34,21 @@
 #include "obj_gen.h"
 #include "memtier_benchmark.h"
 
+#ifdef MEMTIER_JRAND48_SHIM
+#include <stdint.h>
+// 48-bit LCG as specified for jrand48(): X = (0x5DEECE66D * X + 0xB) mod 2^48,
+// returns the high 32 bits of X as a signed value.
+static long jrand48(unsigned short xsubi[3])
+{
+    uint64_t x = (uint64_t) xsubi[0] | ((uint64_t) xsubi[1] << 16) | ((uint64_t) xsubi[2] << 32);
+    x = (x * UINT64_C(0x5DEECE66D) + UINT64_C(0xB)) & UINT64_C(0xFFFFFFFFFFFF);
+    xsubi[0] = (unsigned short) x;
+    xsubi[1] = (unsigned short) (x >> 16);
+    xsubi[2] = (unsigned short) (x >> 32);
+    return (int32_t) (x >> 16);
+}
+#endif
+
 random_generator::random_generator()
 {
     set_seed(0);
@@ -48,7 +63,7 @@ void random_generator::set_seed(int seed)
 
     int ret = initstate_r(seed, m_state_array, sizeof(m_state_array), &m_data_blob);
     assert(ret == 0);
-#elif (defined HAVE_DRAND48)
+#elif (defined HAVE_DRAND48) || (defined MEMTIER_JRAND48_SHIM)
     memset(&m_data_blob, 0, sizeof(m_data_blob));
     size_t seed_size = sizeof(seed); // get MIN size between seed and m_data_blob
     if (seed_size > sizeof(m_data_blob)) seed_size = sizeof(m_data_blob);
@@ -72,7 +87,7 @@ unsigned long long random_generator::get_random()
     ret = random_r(&m_data_blob, &rn);
     assert(ret == 0);
     llrn |= rn;
-#elif (defined HAVE_DRAND48)
+#elif (defined HAVE_DRAND48) || (defined MEMTIER_JRAND48_SHIM)
     long rn;
     // jrand48's range is -2^31..+2^31 (i.e. all 32 bits)
     rn = jrand48(m_data_blob);
@@ -92,7 +107,7 @@ unsigned long long random_generator::get_random_max() const
 {
 #ifdef HAVE_RANDOM_R
     return 0x3fffffffffffffff; // 62 bits
-#elif (defined HAVE_DRAND48)
+#elif (defined HAVE_DRAND48) || (defined MEMTIER_JRAND48_SHIM)
     return 0x7fffffffffffffff; // 63 bits
 #endif
 }

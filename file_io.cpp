@@ -57,7 +57,7 @@ bool file_reader::open_file(void)
 
     if (m_file != NULL) fclose(m_file);
 
-    m_file = fopen(m_filename, "r");
+    m_file = fopen(m_filename, "rb");
     if (!m_file) {
         perror(m_filename);
         return false;
@@ -285,7 +285,7 @@ file_writer::~file_writer()
 
 bool file_writer::open_file(void)
 {
-    m_file = fopen(m_filename, "w");
+    m_file = fopen(m_filename, "wb");
     if (m_file == NULL) {
         perror(m_filename);
         return false;

@@ -1,0 +1,83 @@
+name: Windows
+
+# Native Windows build with MSYS2 / MinGW-w64 (UCRT64). Builds the tree with
+# zero tolerance for compiler warnings, runs the unit tests and a smoke test
+# against the stdlib RESP sink in tests/fuzz (no Redis server needed).
+
+on:
+  push:
+    branches: [master, main, '2.*']
+  pull_request:
+    branches: [master, main, '2.*']
+
+permissions:
+  contents: read
+
+jobs:
+  build-mingw-ucrt64:
+    name: Build and smoke test (MSYS2 UCRT64)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Set up MSYS2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: UCRT64
+        update: true
+        install: >-
+          autoconf-wrapper
+          automake-wrapper
+          libtool
+          make
+          git
+        pacboy: >-
+          gcc:p
+          pkgconf:p
+          libevent:p
+          openssl:p
+          zlib:p
+          python:p
+
+    - name: Trust the workspace
+      # The checkout is owned by a different Windows user than the one MSYS2
+      # git runs as; without this version.sh cannot read the commit hash.
+      run: git config --global --add safe.directory '*'
+
+    - name: Build
+      # Refresh the index first so that version.sh does not report a dirty tree.
+      run: |
+        git update-index -q --refresh
+        autoreconf -ivf
+        ./configure
+        make -j"$(nproc)" > build.log 2>&1 || { cat build.log; exit 1; }
+        cat build.log
+
+    - name: Fail on compiler warnings
+      # Match compiler diagnostics ("file:line:col: warning:") only, not e.g.
+      # "libtool: warning: ..." or paths that happen to contain "warning".
+      run: |
+        if grep -E '^[^ ]+:[0-9]+:[0-9]+: warning:' build.log | grep -v '^deps/'; then
+          echo "::error::the build produced warnings outside deps/"
+          exit 1
+        fi
+
+    - name: Unit tests
+      run: make check
+
+    - name: Verify version output
+      run: |
+        ./memtier_benchmark.exe --version | tee version.txt
+        grep -Eq 'sha=[0-9a-f]{8}:' version.txt
+        if grep -q 'sha=00000000' version.txt; then
+          echo "::error::the build did not pick up the git commit hash"
+          exit 1
+        fi
+        grep -q 'bits=64' version.txt
+
+    - name: Smoke test
+      run: python tests/windows_smoke.py ./memtier_benchmark.exe

@@ -53,6 +53,72 @@ tweak the `PKG_CONFIG_PATH` environment variable:
 PKG_CONFIG_PATH=`brew --prefix openssl@3.0`/lib/pkgconfig ./configure
 ```
 
+### Windows (MSYS2 / MinGW-w64)
+
+memtier_benchmark builds natively on Windows with the MinGW-w64 toolchain
+from [MSYS2](https://www.msys2.org/) and requires Windows 10 or later (it
+targets API level 0x0A00 and uses `afunix.h`). It is tested with the UCRT64
+environment (GCC 16.2, libevent 2.1.13, OpenSSL 3.6). In an MSYS2 shell,
+install the prerequisites:
+
+```
+$ pacman -S --needed autoconf-wrapper automake-wrapper libtool make git \
+    mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-pkgconf \
+    mingw-w64-ucrt-x86_64-libevent mingw-w64-ucrt-x86_64-openssl \
+    mingw-w64-ucrt-x86_64-zlib mingw-w64-ucrt-x86_64-python
+```
+
+`git` provides the commit hash shown by `--version` (it is `00000000` without
+it) and Python is only needed to run `tests/windows_smoke.py`. Then, from an
+MSYS2 **UCRT64** shell:
+
+```
+$ autoreconf -ivf
+$ ./configure
+$ make
+$ make check
+```
+
+The result is `./memtier_benchmark.exe`. It needs the MinGW runtime DLLs from
+`C:\msys64\ucrt64\bin`, which the UCRT64 shell already has on its `PATH`. To
+run it elsewhere, copy the executable together with `libcrypto-3-x64.dll`,
+`libevent-7.dll`, `libevent_core-7.dll`, `libevent_extra-7.dll`,
+`libevent_openssl-7.dll`, `libgcc_s_seh-1.dll`, `libssl-3-x64.dll`,
+`libstdc++-6.dll`, `libwinpthread-1.dll` and `zlib1.dll` from that directory.
+
+Alternatively, link statically so that the executable depends only on Windows
+system DLLs (about 18 MB). The following is an example that was verified with
+the MSYS2 packages listed above at the time of writing; the library list may
+need adjusting when those packages change. Delete the executable and relink
+with:
+
+```
+$ rm memtier_benchmark.exe
+$ make LDFLAGS=-all-static \
+    LIBS='-lz -lcrypto -lws2_32 -lgdi32 -lcrypt32 -ladvapi32 -luser32 -liphlpapi -lws2_32'
+```
+
+`tests/windows_smoke.py` runs a few end-to-end checks against a built
+executable without needing a Redis server (`python tests/windows_smoke.py
+./memtier_benchmark.exe`). The RLTest integration suite is not run in CI on
+Windows. It can be run locally against a Windows Redis-compatible server such
+as Memurai, but RLTest needs a small local shim for that (a stand-in for
+`fcntl`, the POSIX signal names the tests reference, the hard-coded `/tmp`
+paths and, for Memurai, its `--version` output format). Some tests need POSIX
+signals or `/proc` (the crash-handler, SIGINT and SIGPIPE-immunity tests) and
+cannot pass on Windows.
+
+Limitations of the Windows build:
+
+* `--unix-socket` is not supported and is rejected with an error.
+* libevent uses its `win32` backend, which is based on `select()`. It may
+  scale worse than `epoll` on Linux at very high connection counts.
+* CPU usage is read with `GetThreadTimes()`, which advances in scheduler ticks
+  of about 15.6 ms, so very short runs and the per-second CPU samples are coarse.
+* The crash report is best-effort. It is printed for unhandled exceptions such
+  as access violations, but not for `abort()` or failed assertions, and the
+  stack trace holds only raw addresses of the crashing thread.
+
 ### Building and Installing
 
 After downloading the source tree, use standard autoconf/automake commands:

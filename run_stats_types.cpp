@@ -139,9 +139,9 @@ void ar_one_sec_cmd_stats::merge(const ar_one_sec_cmd_stats &other)
     }
 }
 
-unsigned long int ar_one_sec_cmd_stats::ops()
+unsigned long long int ar_one_sec_cmd_stats::ops()
 {
-    unsigned long int total_ops = 0;
+    unsigned long long int total_ops = 0;
     for (size_t i = 0; i < m_commands.size(); i++) {
         total_ops += m_commands[i].m_ops;
     }
@@ -150,9 +150,9 @@ unsigned long int ar_one_sec_cmd_stats::ops()
 }
 
 
-unsigned long int ar_one_sec_cmd_stats::bytes()
+unsigned long long int ar_one_sec_cmd_stats::bytes()
 {
-    unsigned long int total_bytes = 0;
+    unsigned long long int total_bytes = 0;
     for (size_t i = 0; i < m_commands.size(); i++) {
         total_bytes += m_commands[i].m_bytes_rx;
         total_bytes += m_commands[i].m_bytes_tx;
@@ -250,7 +250,7 @@ void totals_cmd::aggregate_average(size_t stats_size)
     m_latency /= stats_size;
 }
 
-void totals_cmd::summarize(const one_sec_cmd_stats &other, unsigned long test_duration_usec)
+void totals_cmd::summarize(const one_sec_cmd_stats &other, unsigned long long test_duration_usec)
 {
     m_ops = other.m_ops;
     m_total_latency = other.m_total_latency;
@@ -287,7 +287,7 @@ void ar_totals_cmd::aggregate_average(size_t stats_size)
     }
 }
 
-void ar_totals_cmd::summarize(const ar_one_sec_cmd_stats &other, unsigned long test_duration_usec)
+void ar_totals_cmd::summarize(const ar_one_sec_cmd_stats &other, unsigned long long test_duration_usec)
 {
     for (size_t i = 0; i < m_commands.size(); i++) {
         m_commands[i].summarize(other.at(i), test_duration_usec);
@@ -364,7 +364,7 @@ void totals::add(const totals &other)
     hdr_add(latency_histogram, other.latency_histogram);
 }
 
-void totals::update_op(unsigned long int bytes_rx, unsigned long int bytes_tx, unsigned int latency)
+void totals::update_op(unsigned long long int bytes_rx, unsigned long long int bytes_tx, unsigned int latency)
 {
     m_bytes_rx += bytes_rx;
     m_bytes_tx += bytes_tx;
@@ -374,8 +374,8 @@ void totals::update_op(unsigned long int bytes_rx, unsigned long int bytes_tx, u
     hdr_record_value_capped(latency_histogram, latency);
 }
 
-void totals::update_op(unsigned long int bytes_rx, unsigned long int bytes_tx, unsigned int latency, unsigned int hits,
-                       unsigned int misses)
+void totals::update_op(unsigned long long int bytes_rx, unsigned long long int bytes_tx, unsigned int latency,
+                       unsigned int hits, unsigned int misses)
 {
     update_op(bytes_rx, bytes_tx, latency);
     m_hits += hits;

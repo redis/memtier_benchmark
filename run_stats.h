@@ -48,8 +48,8 @@ struct reinit_mutex_t
 
 inline long long int ts_diff(struct timeval a, struct timeval b)
 {
-    unsigned long long aval = a.tv_sec * 1000000 + a.tv_usec;
-    unsigned long long bval = b.tv_sec * 1000000 + b.tv_usec;
+    long long aval = (long long) a.tv_sec * 1000000 + a.tv_usec;
+    long long bval = (long long) b.tv_sec * 1000000 + b.tv_usec;
 
     return bval - aval;
 }
@@ -243,9 +243,9 @@ public:
     void inc_retried_op() { m_totals.m_retried_ops++; }
     void inc_error() { m_totals.m_errors++; }
 
-    unsigned long int get_total_retry_attempts() const { return m_totals.m_retry_attempts; }
-    unsigned long int get_total_retried_ops() const { return m_totals.m_retried_ops; }
-    unsigned long int get_total_errors() const { return m_totals.m_errors; }
+    unsigned long long int get_total_retry_attempts() const { return m_totals.m_retry_attempts; }
+    unsigned long long int get_total_retried_ops() const { return m_totals.m_retried_ops; }
+    unsigned long long int get_total_errors() const { return m_totals.m_errors; }
 
     void update_moved_get_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency);
     void update_moved_set_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency);
@@ -283,8 +283,8 @@ public:
 
     // ---------------------------------------------------------------------
     // CPU utilization of memtier itself (the load generator).
-    //   m_cpu_summary  - authoritative whole-run aggregate (getrusage-based)
-    //   m_cpu_threads  - authoritative per-worker totals (getrusage-based)
+    //   m_cpu_summary  - authoritative whole-run aggregate (per-thread CPU accounting)
+    //   m_cpu_threads  - authoritative per-worker totals (per-thread CPU accounting)
     //   m_cpu_stats    - advisory per-second per-thread sampler detail
     // All three are populated by run_benchmark() after the join loop and
     // consumed by print()/print_json(). They survive the copyable run_stats
@@ -340,8 +340,8 @@ public:
     std::vector<one_sec_cmd_stats> get_one_sec_cmd_stats_totals();
     std::vector<one_sec_cmd_stats> get_one_sec_cmd_stats_arbitrary_command(unsigned int pos);
     std::vector<unsigned int> get_one_sec_cmd_stats_timestamp();
-    void save_csv_one_sec(FILE *f, unsigned long int &total_get_ops, unsigned long int &total_set_ops,
-                          unsigned long int &total_wait_ops);
+    void save_csv_one_sec(FILE *f, unsigned long long int &total_get_ops, unsigned long long int &total_set_ops,
+                          unsigned long long int &total_wait_ops);
 
     // Safely copy instantaneous total latency histogram into target under mutex.
     // Use this instead of a raw pointer getter to avoid data races with worker threads.
@@ -358,7 +358,7 @@ public:
     void save_csv_one_sec_cluster(FILE *f);
     void save_csv_set_get_commands(FILE *f, bool cluster_mode);
     void save_csv_arbitrary_commands_one_sec(FILE *f, arbitrary_command_list &command_list,
-                                             std::vector<unsigned long int> &total_arbitrary_commands_ops);
+                                             std::vector<unsigned long long int> &total_arbitrary_commands_ops);
     void save_csv_arbitrary_commands(FILE *f, arbitrary_command_list &command_list);
     bool save_hdr_percentiles_print_format(struct hdr_histogram *hdr, char *filename);
     bool save_hdr_log_format(struct hdr_histogram *hdr, char *filename, char *header);
@@ -405,23 +405,23 @@ public:
     void print(FILE *file, benchmark_config *config, const char *header = NULL, json_handler *jsonhandler = NULL);
 
     unsigned int get_duration(void);
-    unsigned long int get_duration_usec(void);
-    unsigned long int get_total_bytes(void);
+    unsigned long long int get_duration_usec(void);
+    unsigned long long int get_total_bytes(void);
     // rx/tx split of get_total_bytes(); same benign-race pattern. The Prometheus
     // exporter needs the split (memtier_received_bytes_total /
     // memtier_sent_bytes_total); never source bytes from summarize().
-    unsigned long int get_total_bytes_rx(void);
-    unsigned long int get_total_bytes_tx(void);
-    unsigned long int get_total_ops(void);
+    unsigned long long int get_total_bytes_rx(void);
+    unsigned long long int get_total_bytes_tx(void);
+    unsigned long long int get_total_ops(void);
     double get_total_latency(void);
-    unsigned long int get_total_connection_errors(void);
+    unsigned long long int get_total_connection_errors(void);
 
     // Cumulative hits/misses on GET ops since the run started. Reads scalar
     // counters in m_totals incremented per-op by the owning worker. Same
     // benign-race pattern as get_total_ops()/get_total_bytes() — used only
     // for live progress display.
-    unsigned long int get_total_hits(void);
-    unsigned long int get_total_misses(void);
+    unsigned long long int get_total_hits(void);
+    unsigned long long int get_total_misses(void);
 
     // Aggregate hits/misses across arbitrary (--command) miss-trackable commands.
     // Sums only the per-command scalar totals in m_arbitrary_misses[] (assigned

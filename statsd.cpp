@@ -25,9 +25,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <ctype.h>
 #include <sys/time.h>
+#include <event2/util.h>
 
 #include "statsd.h"
 
@@ -54,21 +54,19 @@ bool statsd_client::init(const char *host, unsigned short port, const char *pref
     // Create UDP socket
     m_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (m_socket < 0) {
-        fprintf(stderr, "statsd: failed to create UDP socket: %s\n", strerror(errno));
+        fprintf(stderr, "statsd: failed to create UDP socket: %s\n",
+                evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR()));
         return false;
     }
 
     // Set socket to non-blocking to avoid blocking on send
-    int flags = fcntl(m_socket, F_GETFL, 0);
-    if (flags >= 0) {
-        fcntl(m_socket, F_SETFL, flags | O_NONBLOCK);
-    }
+    evutil_make_socket_nonblocking(m_socket);
 
     // Resolve hostname
     struct hostent *server = gethostbyname(host);
     if (server == NULL) {
         fprintf(stderr, "statsd: failed to resolve host '%s'\n", host);
-        ::close(m_socket);
+        evutil_closesocket(m_socket);
         m_socket = -1;
         return false;
     }
@@ -124,7 +122,7 @@ bool statsd_client::init(const char *host, unsigned short port, const char *pref
 void statsd_client::close()
 {
     if (m_socket >= 0) {
-        ::close(m_socket);
+        evutil_closesocket(m_socket);
         m_socket = -1;
     }
     m_enabled = false;
@@ -153,10 +151,10 @@ void statsd_client::gauge(const char *name, double value)
     send_metric(name, val_str, "g");
 }
 
-void statsd_client::gauge(const char *name, long value)
+void statsd_client::gauge(const char *name, long long value)
 {
     char val_str[64];
-    snprintf(val_str, sizeof(val_str), "%ld", value);
+    snprintf(val_str, sizeof(val_str), "%lld", value);
     send_metric(name, val_str, "g");
 }
 
@@ -174,22 +172,28 @@ void statsd_client::event(const char *what, const char *data, const char *tags)
     }
 
     // Create a TCP socket for HTTP POST to Graphite events API
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    evutil_socket_t sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
         return;
     }
 
     // Set socket timeout to avoid blocking
+#ifdef _WIN32
+    DWORD timeout = 2000;
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char *) &timeout, sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *) &timeout, sizeof(timeout));
+#else
     struct timeval tv;
     tv.tv_sec = 2;
     tv.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char *) &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *) &tv, sizeof(tv));
+#endif
 
     // Resolve hostname
     struct hostent *server = gethostbyname(m_graphite_host);
     if (server == NULL) {
-        ::close(sock);
+        evutil_closesocket(sock);
         return;
     }
 
@@ -202,7 +206,7 @@ void statsd_client::event(const char *what, const char *data, const char *tags)
 
     // Connect
     if (connect(sock, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
-        ::close(sock);
+        evutil_closesocket(sock);
         return;
     }
 
@@ -238,5 +242,5 @@ void statsd_client::event(const char *what, const char *data, const char *tags)
         send(sock, request, req_len, 0);
     }
 
-    ::close(sock);
+    evutil_closesocket(sock);
 }

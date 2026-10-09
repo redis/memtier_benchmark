@@ -3,6 +3,7 @@ Simple replacement for mbdirector package.
 Contains only the Benchmark and RunConfig classes needed for tests.
 """
 import os
+import re
 import subprocess
 import logging
 
@@ -28,8 +29,11 @@ class RunConfig(object):
         self.explicit_connect_args = bool(
             mbconfig.get('explicit_connect_args'))
 
+        # RLTest test names look like "file.py:test_name"; ':' (and other
+        # reserved characters) cannot appear in Windows directory names.
+        safe_name = re.sub(r'[<>:"/\\|?*]', '_', name)
         self.results_dir = os.path.join(base_results_dir,
-                                        '{:04}_{}'.format(self.id, name))
+                                        '{:04}_{}'.format(self.id, safe_name))
 
     def __repr__(self):
         return '<RunConfig id={}>'.format(self.id)

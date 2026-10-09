@@ -23,7 +23,7 @@
 #include <pthread.h>
 #endif
 
-#include <netinet/in.h>
+#include "platform_compat.h"
 
 #include <vector>
 #include <string>

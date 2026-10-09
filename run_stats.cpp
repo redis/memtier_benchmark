@@ -34,6 +34,7 @@
 #endif
 
 #include "run_stats.h"
+#include "platform_compat.h"
 #include "prometheus_metrics.h" // prom::hdr_add_positive_delta (pure layer, always linked)
 
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
@@ -103,13 +104,13 @@ void output_table::print(FILE *out, const char *header)
 
 ///////////////////////////////////////////////////////////////////////////
 
-inline unsigned long int ts_diff_now(struct timeval a)
+inline unsigned long long int ts_diff_now(struct timeval a)
 {
     struct timeval b;
 
     gettimeofday(&b, NULL);
-    unsigned long long aval = a.tv_sec * 1000000 + a.tv_usec;
-    unsigned long long bval = b.tv_sec * 1000000 + b.tv_usec;
+    long long aval = (long long) a.tv_sec * 1000000 + a.tv_usec;
+    long long bval = (long long) b.tv_sec * 1000000 + b.tv_usec;
 
     return bval - aval;
 }
@@ -451,7 +452,7 @@ unsigned int run_stats::get_duration(void)
     return m_cur_stats.m_second;
 }
 
-unsigned long int run_stats::get_duration_usec(void)
+unsigned long long int run_stats::get_duration_usec(void)
 {
     if (!m_started.flag.load(std::memory_order_acquire)) return 0;
     if (m_end_time.tv_sec > 0) {
@@ -461,22 +462,22 @@ unsigned long int run_stats::get_duration_usec(void)
     }
 }
 
-unsigned long int run_stats::get_total_bytes(void)
+unsigned long long int run_stats::get_total_bytes(void)
 {
     return m_totals.m_bytes_rx + m_totals.m_bytes_tx;
 }
 
-unsigned long int run_stats::get_total_bytes_rx(void)
+unsigned long long int run_stats::get_total_bytes_rx(void)
 {
     return m_totals.m_bytes_rx;
 }
 
-unsigned long int run_stats::get_total_bytes_tx(void)
+unsigned long long int run_stats::get_total_bytes_tx(void)
 {
     return m_totals.m_bytes_tx;
 }
 
-unsigned long int run_stats::get_total_ops(void)
+unsigned long long int run_stats::get_total_ops(void)
 {
     return m_totals.m_ops;
 }
@@ -486,17 +487,17 @@ double run_stats::get_total_latency(void)
     return m_totals.m_latency;
 }
 
-unsigned long int run_stats::get_total_connection_errors(void)
+unsigned long long int run_stats::get_total_connection_errors(void)
 {
     return m_totals.m_connection_errors;
 }
 
-unsigned long int run_stats::get_total_hits(void)
+unsigned long long int run_stats::get_total_hits(void)
 {
     return m_totals.m_hits;
 }
 
-unsigned long int run_stats::get_total_misses(void)
+unsigned long long int run_stats::get_total_misses(void)
 {
     return m_totals.m_misses;
 }
@@ -546,8 +547,8 @@ unsigned long long run_stats::get_total_arbitrary_aborts(void)
 #define AVERAGE(total, count) ((unsigned int) ((count) > 0 ? (total) / (count) : 0))
 #define USEC_FORMAT(value) (value) / 1000000, (value) % 1000000
 
-void run_stats::save_csv_one_sec(FILE *f, unsigned long int &total_get_ops, unsigned long int &total_set_ops,
-                                 unsigned long int &total_wait_ops)
+void run_stats::save_csv_one_sec(FILE *f, unsigned long long int &total_get_ops, unsigned long long int &total_set_ops,
+                                 unsigned long long int &total_wait_ops)
 {
     fprintf(f, "Per-Second Benchmark Data\n");
     fprintf(
@@ -559,7 +560,7 @@ void run_stats::save_csv_one_sec(FILE *f, unsigned long int &total_get_ops, unsi
     total_set_ops = 0;
     total_wait_ops = 0;
     for (std::list<one_second_stats>::iterator i = m_stats.begin(); i != m_stats.end(); i++) {
-        fprintf(f, "%u,%lu,%u.%06u,%lu,%lu,%lu,%lu,%u.%06u,%lu,%lu,%lu,%u,%u,%lu,%u.%06u\n", i->m_second,
+        fprintf(f, "%u,%llu,%u.%06u,%llu,%llu,%llu,%llu,%u.%06u,%llu,%llu,%llu,%u,%u,%llu,%u.%06u\n", i->m_second,
                 i->m_set_cmd.m_ops, USEC_FORMAT(AVERAGE(i->m_set_cmd.m_total_latency, i->m_set_cmd.m_ops)),
                 i->m_set_cmd.m_bytes_rx + i->m_set_cmd.m_bytes_tx, i->m_set_cmd.m_bytes_tx, i->m_set_cmd.m_bytes_rx,
                 i->m_get_cmd.m_ops, USEC_FORMAT(AVERAGE(i->m_get_cmd.m_total_latency, i->m_get_cmd.m_ops)),
@@ -649,9 +650,9 @@ void run_stats::save_csv_one_sec_cluster(FILE *f)
 
 void run_stats::save_csv_set_get_commands(FILE *f, bool cluster_mode)
 {
-    unsigned long int total_get_ops;
-    unsigned long int total_set_ops;
-    unsigned long int total_wait_ops;
+    unsigned long long int total_get_ops;
+    unsigned long long int total_set_ops;
+    unsigned long long int total_wait_ops;
 
     // save per second data
     save_csv_one_sec(f, total_get_ops, total_set_ops, total_wait_ops);
@@ -696,7 +697,7 @@ void run_stats::save_csv_set_get_commands(FILE *f, bool cluster_mode)
 }
 
 void run_stats::save_csv_arbitrary_commands_one_sec(FILE *f, arbitrary_command_list &command_list,
-                                                    std::vector<unsigned long int> &total_arbitrary_commands_ops)
+                                                    std::vector<unsigned long long int> &total_arbitrary_commands_ops)
 {
     fprintf(f, "Per-Second Benchmark Arbitrary Commands Data\n");
 
@@ -718,7 +719,7 @@ void run_stats::save_csv_arbitrary_commands_one_sec(FILE *f, arbitrary_command_l
         for (unsigned int i = 0; i < stat->m_ar_commands.size(); i++) {
             one_sec_cmd_stats &arbitrary_command_stats = stat->m_ar_commands[i];
 
-            fprintf(f, "%lu,%u.%06u,%lu,%lu,%lu,", arbitrary_command_stats.m_ops,
+            fprintf(f, "%llu,%u.%06u,%llu,%llu,%llu,", arbitrary_command_stats.m_ops,
                     USEC_FORMAT(AVERAGE(arbitrary_command_stats.m_total_latency, arbitrary_command_stats.m_ops)),
                     arbitrary_command_stats.m_bytes_rx + arbitrary_command_stats.m_bytes_tx,
                     arbitrary_command_stats.m_bytes_tx, arbitrary_command_stats.m_bytes_rx);
@@ -732,7 +733,7 @@ void run_stats::save_csv_arbitrary_commands_one_sec(FILE *f, arbitrary_command_l
 
 void run_stats::save_csv_arbitrary_commands(FILE *f, arbitrary_command_list &command_list)
 {
-    std::vector<unsigned long int> total_arbitrary_commands_ops(command_list.size());
+    std::vector<unsigned long long int> total_arbitrary_commands_ops(command_list.size());
 
     // save per second data
     save_csv_arbitrary_commands_one_sec(f, command_list, total_arbitrary_commands_ops);
@@ -789,10 +790,12 @@ bool run_stats::save_hdr_log_format(struct hdr_histogram *hdr, char *filename, c
     if (hdr_total_count(hdr) > 0) {
         // Prepare output file
         FILE *hdr_outfile;
-        struct timespec start_timespec;
-        struct timespec end_timespec;
-        TIMEVAL_TO_TIMESPEC(&m_start_time, &start_timespec);
-        TIMEVAL_TO_TIMESPEC(&m_end_time, &end_timespec);
+        hdr_timespec start_timespec;
+        hdr_timespec end_timespec;
+        start_timespec.tv_sec = m_start_time.tv_sec;
+        start_timespec.tv_nsec = m_start_time.tv_usec * 1000;
+        end_timespec.tv_sec = m_end_time.tv_sec;
+        end_timespec.tv_nsec = m_end_time.tv_usec * 1000;
         hdr_outfile = fopen(filename, "w");
         if (!hdr_outfile) {
             perror(filename);
@@ -915,13 +918,14 @@ bool run_stats::save_csv(const char *filename, benchmark_config *config)
 
 void run_stats::debug_dump(void)
 {
-    benchmark_debug_log("run_stats: start_time={%u,%u} end_time={%u,%u}\n", m_start_time.tv_sec, m_start_time.tv_usec,
-                        m_end_time.tv_sec, m_end_time.tv_usec);
+    benchmark_debug_log("run_stats: start_time={%lld,%lld} end_time={%lld,%lld}\n", (long long) m_start_time.tv_sec,
+                        (long long) m_start_time.tv_usec, (long long) m_end_time.tv_sec,
+                        (long long) m_end_time.tv_usec);
 
     for (std::list<one_second_stats>::iterator i = m_stats.begin(); i != m_stats.end(); i++) {
         benchmark_debug_log(
             "  %u: get latency=%u.%ums, set latency=%u.%ums, wait latency=%u.%ums"
-            "m_ops_set/get/wait=%u/%u/%u, m_bytes_set/get=%u/%u, m_get_hit/miss=%u/%u\n",
+            "m_ops_set/get/wait=%llu/%llu/%llu, m_bytes_set/get=%llu/%llu, m_get_hit/miss=%u/%u\n",
             i->m_second, USEC_FORMAT(AVERAGE(i->m_get_cmd.m_total_latency, i->m_get_cmd.m_ops)),
             USEC_FORMAT(AVERAGE(i->m_set_cmd.m_total_latency, i->m_set_cmd.m_ops)),
             USEC_FORMAT(AVERAGE(i->m_wait_cmd.m_total_latency, i->m_wait_cmd.m_ops)), i->m_set_cmd.m_ops,
@@ -1172,7 +1176,7 @@ void run_stats::summarize(totals &result) const
     // Also include current stats that haven't been rolled yet
     totals.merge(m_cur_stats);
 
-    unsigned long int test_duration_usec = ts_diff(m_start_time, m_end_time);
+    unsigned long long int test_duration_usec = ts_diff(m_start_time, m_end_time);
 
     // total ops, bytes
     result.m_ops =
@@ -1268,10 +1272,10 @@ static void format_percentile_key(char *buf, size_t bufsize, double quantile, co
 
 void result_print_to_json(json_handler *jsonhandler, const char *type, double ops_sec, double hits, double miss,
                           double moved, double ask, double kbs, double kbs_rx, double kbs_tx, double latency,
-                          long m_total_latency, long ops, double connection_errors_sec, long connection_errors,
-                          std::vector<double> quantile_list, struct hdr_histogram *latency_histogram,
-                          std::vector<unsigned int> timestamps, std::vector<one_sec_cmd_stats> timeserie_stats,
-                          double aborts = -1.0)
+                          long long m_total_latency, long long ops, double connection_errors_sec,
+                          long long connection_errors, std::vector<double> quantile_list,
+                          struct hdr_histogram *latency_histogram, std::vector<unsigned int> timestamps,
+                          std::vector<one_sec_cmd_stats> timeserie_stats, double aborts = -1.0)
 {
     if (jsonhandler != NULL) { // Added for double verification in case someone accidently send NULL.
         jsonhandler->open_nesting(type);
@@ -1539,7 +1543,7 @@ void run_stats::print_hits_sec_column(output_table &table, const std::vector<agg
     column.elements.push_back(*el.init_str("%s", "-------------"));
 
     if (print_arbitrary_commands_results()) {
-        unsigned long int test_duration_usec = ts_diff(m_start_time, m_end_time);
+        unsigned long long int test_duration_usec = ts_diff(m_start_time, m_end_time);
         unsigned long long total_hits = 0;
         if (aggregated != nullptr) {
             for (const auto &agg : *aggregated) {
@@ -1583,7 +1587,7 @@ void run_stats::print_missess_sec_column(output_table &table,
     column.elements.push_back(*el.init_str("%s", "-------------"));
 
     if (print_arbitrary_commands_results()) {
-        unsigned long int test_duration_usec = ts_diff(m_start_time, m_end_time);
+        unsigned long long int test_duration_usec = ts_diff(m_start_time, m_end_time);
         unsigned long long total_misses = 0;
         if (aggregated != nullptr) {
             for (const auto &agg : *aggregated) {
@@ -1635,7 +1639,7 @@ void run_stats::print_aborts_sec_column(output_table &table,
         // shows 0.00. The count is the same value carried in that command's
         // Misses/sec (display-only reinterpretation), so Aborts is a labeled
         // subset of Misses.
-        unsigned long int test_duration_usec = ts_diff(m_start_time, m_end_time);
+        unsigned long long int test_duration_usec = ts_diff(m_start_time, m_end_time);
         unsigned long long total_aborts = 0;
         if (aggregated != nullptr) {
             for (const auto &agg : *aggregated) {
@@ -1893,8 +1897,8 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
 {
     if (jsonhandler != NULL) { // Added for double verification in case someone accidently send NULL.
         jsonhandler->open_nesting("Runtime");
-        const unsigned long long start_time_ms = (m_start_time.tv_sec * 1000000 + m_start_time.tv_usec) / 1000;
-        const unsigned long long end_time_ms = (m_end_time.tv_sec * 1000000 + m_end_time.tv_usec) / 1000;
+        const long long start_time_ms = ((long long) m_start_time.tv_sec * 1000000 + m_start_time.tv_usec) / 1000;
+        const long long end_time_ms = ((long long) m_end_time.tv_sec * 1000000 + m_end_time.tv_usec) / 1000;
         jsonhandler->write_obj("Start time", "%lld", start_time_ms);
         jsonhandler->write_obj("Finish time", "%lld", end_time_ms);
         jsonhandler->write_obj("Total duration", "%lld", end_time_ms - start_time_ms);
@@ -1905,7 +1909,7 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
 
     // Whole-process CPU aggregate (memtier's own utilization). Emitted as a
     // sibling of "Runtime" so the existing Runtime schema is untouched. Only
-    // present when per-thread CPU accounting succeeded (Linux RUSAGE_THREAD).
+    // present when per-thread CPU accounting succeeded (Linux RUSAGE_THREAD, Windows GetThreadTimes).
     if (jsonhandler != NULL && m_cpu_summary.valid) {
         jsonhandler->open_nesting("CPU");
         jsonhandler->write_obj("cpu_user_seconds", "%.3f", m_cpu_summary.user_seconds);
@@ -1939,7 +1943,7 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
     std::vector<unsigned int> timestamps = get_one_sec_cmd_stats_timestamp();
 
     if (print_arbitrary_commands_results()) {
-        unsigned long int test_duration_usec = ts_diff(m_start_time, m_end_time);
+        unsigned long long int test_duration_usec = ts_diff(m_start_time, m_end_time);
         if (aggregated != nullptr) {
             // Use aggregated stats by command type. Sum hits/misses across the
             // member command indices so the displayed Hits/sec for "Gets"
@@ -2070,7 +2074,7 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
     double totals_hits_sec = m_totals.m_hits_sec;
     double totals_misses_sec = m_totals.m_misses_sec;
     if (print_arbitrary_commands_results()) {
-        unsigned long int dur_usec = ts_diff(m_start_time, m_end_time);
+        unsigned long long int dur_usec = ts_diff(m_start_time, m_end_time);
         if (dur_usec > 0) {
             unsigned long long all_hits = 0, all_misses = 0;
             for (size_t j = 0; j < m_arbitrary_misses.size(); ++j) {
@@ -2089,7 +2093,7 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
     }
     double totals_aborts_sec = -1.0;
     if (m_config->transaction && print_arbitrary_commands_results()) {
-        unsigned long int dur_usec = ts_diff(m_start_time, m_end_time);
+        unsigned long long int dur_usec = ts_diff(m_start_time, m_end_time);
         totals_aborts_sec = dur_usec > 0 ? (double) get_total_arbitrary_aborts() / (double) dur_usec * 1000000.0 : 0.0;
     }
     result_print_to_json(jsonhandler, "Totals", m_totals.m_ops_sec, totals_hits_sec, totals_misses_sec,
@@ -2441,7 +2445,7 @@ void run_stats::print(FILE *out, benchmark_config *config, const char *header /*
         if (total > 0) {
             double miss_rate = (double) m_totals.m_misses / (double) total;
             if (miss_rate > miss_threshold) {
-                fprintf(stderr, "warning: GET miss rate %.2f%% above target %.2f%% (%lu misses / %llu ops)\n",
+                fprintf(stderr, "warning: GET miss rate %.2f%% above target %.2f%% (%llu misses / %llu ops)\n",
                         miss_rate * 100.0, miss_threshold * 100.0, m_totals.m_misses, total);
             }
         }
@@ -2449,7 +2453,7 @@ void run_stats::print(FILE *out, benchmark_config *config, const char *header /*
 
     // CPU utilization summary for memtier itself. Goes to stderr (like the
     // miss-rate warning above) so it never corrupts piped / redirected table
-    // output. Only the authoritative getrusage-based aggregate is shown here.
+    // output. Only the authoritative per-thread-CPU-accounting aggregate is shown here.
     if (m_cpu_summary.valid) {
         fprintf(stderr,
                 "\n"

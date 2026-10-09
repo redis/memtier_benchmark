@@ -23,10 +23,9 @@
 #include <climits>
 #include <queue>
 #include <string>
-#include <netdb.h>
-#include <sys/socket.h>
-#include <sys/un.h>
+#include "platform_compat.h"
 #include <event2/event.h>
+#include <event2/util.h>
 #include <event2/buffer.h>
 #include <event2/bufferevent.h>
 
@@ -296,8 +295,8 @@ public:
     bool retry_queue_full() const;
 
 private:
-    void setup_event(int sockfd);
-    int setup_socket(struct connect_info *addr);
+    void setup_event(evutil_socket_t sockfd);
+    evutil_socket_t setup_socket(struct connect_info *addr);
     void set_readable_id();
 
     bool is_conn_setup_done();

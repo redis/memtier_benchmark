@@ -219,7 +219,11 @@ void failed_keys_logger::log_failure(const struct timeval &ts, const char *comma
     char tsbuf[64];
     struct tm tmbuf;
     time_t sec = (time_t) ts.tv_sec;
+#ifdef _WIN32
+    gmtime_s(&tmbuf, &sec);
+#else
     gmtime_r(&sec, &tmbuf);
+#endif
     unsigned long usec = (unsigned long) ts.tv_usec;
     if (usec > 999999UL) usec = 999999UL;
     snprintf(tsbuf, sizeof(tsbuf), "%04d-%02d-%02dT%02d:%02d:%02d.%06luZ", tmbuf.tm_year + 1900, tmbuf.tm_mon + 1,

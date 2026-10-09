@@ -476,3 +476,28 @@ def test_worker_unknown_exception_finalizes_partial_json(env):
 
 def test_worker_finalization_failure_skips_process_cleanup(env):
     _assert_worker_exception_stats(env, unknown=True, finalization_failure=True)
+
+
+def test_json_configuration_escapes_string_values(env):
+    """String values in the "configuration" section must be valid JSON.
+
+    A quote or backslash in a configuration value (e.g. --key-prefix, or an
+    --out-file path containing a backslash) used to be emitted verbatim,
+    producing a document json.load() could not parse.
+    """
+    prefix = 'q"b\\s:'
+    test_dir = tempfile.mkdtemp()
+    benchmark, run_config = _build_benchmark(
+        env, test_dir, extra_args=["--ratio=1:1", "--key-prefix=" + prefix],
+        threads=1, clients=1, requests=100)
+    ok = benchmark.run()
+    failed_asserts = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier_benchmark exited non-zero")
+        configuration = _read_json(run_config, env)["configuration"]
+        env.assertEqual(configuration["key_prefix"], prefix)
+        env.assertEqual(os.path.normcase(configuration["out_file"]),
+                        os.path.normcase(os.path.join(run_config.results_dir, "mb.stdout")))
+    finally:
+        if env.getNumberOfFailedAssertion() > failed_asserts:
+            debugPrintMemtierOnError(run_config, env)

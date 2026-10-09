@@ -23,16 +23,11 @@
 #ifdef HAVE_SYS_TYPES_H
 #include <sys/types.h>
 #endif
-#ifdef HAVE_FCNTL_H
-#include <fcntl.h>
-#endif
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-#ifdef HAVE_SYS_SOCKET_H
-#include <sys/socket.h>
-#endif
+#include "platform_compat.h"
 #ifdef HAVE_NETINET_TCP_H
 #include <netinet/tcp.h>
 #endif
@@ -359,7 +354,7 @@ shard_connection::~shard_connection()
     }
 }
 
-void shard_connection::setup_event(int sockfd)
+void shard_connection::setup_event(evutil_socket_t sockfd)
 {
     if (m_bev) {
         bufferevent_free(m_bev);
@@ -392,9 +387,9 @@ void shard_connection::setup_event(int sockfd)
     m_protocol->set_buffers(bufferevent_get_input(m_bev), bufferevent_get_output(m_bev));
 }
 
-int shard_connection::setup_socket(struct connect_info *addr)
+evutil_socket_t shard_connection::setup_socket(struct connect_info *addr)
 {
-    int sockfd;
+    evutil_socket_t sockfd;
 
     if (m_unix_sockaddr != NULL) {
         sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -410,7 +405,7 @@ int shard_connection::setup_socket(struct connect_info *addr)
 
 
         const int enabled = 1;
-        int error = setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled));
+        int error = setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, (const char *) &enabled, sizeof(enabled));
         assert(error == 0);
 
         /*
@@ -421,22 +416,51 @@ int shard_connection::setup_socket(struct connect_info *addr)
         struct linger ling;
         ling.l_onoff = 1;  // Enable SO_LINGER
         ling.l_linger = 0; // Discard any unsent data and close immediately
-        error = setsockopt(sockfd, SOL_SOCKET, SO_LINGER, (void *) &ling, sizeof(ling));
+        error = setsockopt(sockfd, SOL_SOCKET, SO_LINGER, (const char *) &ling, sizeof(ling));
         assert(error == 0);
 
-        error = setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
+        error = setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, (const char *) &enabled, sizeof(enabled));
         assert(error == 0);
     }
 
     // set non-blocking behavior
-    int flags;
-    if ((flags = fcntl(sockfd, F_GETFL, 0)) < 0 || fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) < 0) {
-        close(sockfd);
+    if (evutil_make_socket_nonblocking(sockfd) < 0) {
+        evutil_closesocket(sockfd);
         return -1;
     }
 
     return sockfd;
 }
+
+#ifdef _WIN32
+// bufferevent_socket_connect() with an address calls connect() and, on the
+// expected WSAEWOULDBLOCK, getsockopt(SO_ERROR) to look for an immediate error.
+// While a connect is in flight that getsockopt() blocks for 10-15 ms (even on
+// loopback), and since all connections are opened one after another before the
+// benchmark starts, setup time grows with threads * clients. Issue the
+// non-blocking connect() here and give libevent the in-flight socket (NULL
+// address), which then waits for the socket to become writable exactly as it
+// does after its own WSAEWOULDBLOCK; failures are reported through the event
+// callback as before. If connect() fails immediately with anything else, return
+// -1 without calling connect() a second time (as bufferevent_socket_connect()
+// with an address would); the caller reports the Winsock error, which is left
+// in place for it to read.
+static int bufferevent_connect_nonblocking(struct bufferevent *bev, evutil_socket_t sockfd, const struct sockaddr *sa,
+                                           int socklen)
+{
+    if (::connect(sockfd, sa, socklen) == 0) {
+        return bufferevent_socket_connect(bev, NULL, 0);
+    }
+
+    // The errors libevent treats as "connect in progress" on Windows.
+    int err = WSAGetLastError();
+    if (err == WSAEWOULDBLOCK || err == WSAEINTR || err == WSAEINPROGRESS || err == WSAEINVAL) {
+        return bufferevent_socket_connect(bev, NULL, 0);
+    }
+
+    return -1;
+}
+#endif
 
 int shard_connection::connect(struct connect_info *addr)
 {
@@ -461,9 +485,9 @@ int shard_connection::connect(struct connect_info *addr)
                            : setup_done;
 
     // setup socket
-    int sockfd = setup_socket(addr);
+    evutil_socket_t sockfd = setup_socket(addr);
     if (sockfd < 0) {
-        fprintf(stderr, "Failed to setup socket: %s\n", strerror(errno));
+        fprintf(stderr, "Failed to setup socket: %s\n", evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR()));
         return -1;
     }
 
@@ -476,11 +500,19 @@ int shard_connection::connect(struct connect_info *addr)
     // call connect
     m_connection_state = conn_in_progress;
 
-    if (bufferevent_socket_connect(m_bev, m_unix_sockaddr ? (struct sockaddr *) m_unix_sockaddr : addr->ci_addr,
-                                   m_unix_sockaddr ? sizeof(struct sockaddr_un) : addr->ci_addrlen) == -1) {
+    const struct sockaddr *sa = m_unix_sockaddr ? (struct sockaddr *) m_unix_sockaddr : addr->ci_addr;
+    int socklen = m_unix_sockaddr ? sizeof(struct sockaddr_un) : addr->ci_addrlen;
+#ifdef _WIN32
+    int ret = bufferevent_connect_nonblocking(m_bev, sockfd, sa, socklen);
+#else
+    int ret = bufferevent_socket_connect(m_bev, sa, socklen);
+#endif
+    if (ret == -1) {
+        // Read the error before disconnect() can overwrite it.
+        int err = EVUTIL_SOCKET_ERROR();
         disconnect();
 
-        benchmark_error_log("connect failed, error = %s\n", strerror(errno));
+        benchmark_error_log("connect failed, error = %s\n", evutil_socket_error_to_string(err));
         return -1;
     }
 
@@ -635,7 +667,7 @@ int shard_connection::get_local_port()
         return -1;
     }
 
-    int fd = bufferevent_getfd(m_bev);
+    evutil_socket_t fd = bufferevent_getfd(m_bev);
     if (fd < 0) {
         return -1;
     }
@@ -1298,7 +1330,7 @@ void shard_connection::process_response(void)
         if ((m_config->requests != m_conns_manager->get_reqs_processed()) &&
             ((m_conns_manager->get_reqs_processed() % m_config->reconnect_interval) == 0)) {
             assert(m_pipeline->size() == 0);
-            benchmark_debug_log("reconnecting, m_reqs_processed = %u\n", m_conns_manager->get_reqs_processed());
+            benchmark_debug_log("reconnecting, m_reqs_processed = %llu\n", m_conns_manager->get_reqs_processed());
 
             // client manage connection & disconnection of shard
             m_conns_manager->disconnect();
@@ -1445,8 +1477,9 @@ void shard_connection::handle_event(short events)
             if (m_request_rate_phase_pending) {
                 first_interval_microsecond += m_request_rate_phase_microsecond;
             }
-            struct timeval interval = {(time_t) (first_interval_microsecond / 1000000U),
-                                       (suseconds_t) (first_interval_microsecond % 1000000U)};
+            struct timeval interval;
+            interval.tv_sec = first_interval_microsecond / 1000000U;
+            interval.tv_usec = first_interval_microsecond % 1000000U;
             m_request_per_cur_interval = m_config->request_per_interval;
             m_event_timer = event_new(m_event_base, -1, EV_PERSIST, cluster_client_timer_handler, (void *) this);
             event_add(m_event_timer, &interval);
@@ -1479,8 +1512,8 @@ void shard_connection::handle_event(short events)
             benchmark_error_log("TLS connection error: %s\n", ERR_reason_error_string(sslerr));
         }
 #endif
-        if (!ssl_error && errno) {
-            benchmark_error_log("Connection error: %s\n", strerror(errno));
+        if (!ssl_error && EVUTIL_SOCKET_ERROR()) {
+            benchmark_error_log("Connection error: %s\n", evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR()));
         }
 
         attempt_reconnect("Connection error");
@@ -1499,8 +1532,9 @@ void shard_connection::handle_timer_event(void)
     // The first timeout includes this connection's phase. Switch to the common
     // refill interval after it fires so the phase remains stable thereafter.
     if (m_request_rate_phase_pending) {
-        struct timeval interval = {(time_t) (m_config->request_interval_microsecond / 1000000U),
-                                   (suseconds_t) (m_config->request_interval_microsecond % 1000000U)};
+        struct timeval interval;
+        interval.tv_sec = m_config->request_interval_microsecond / 1000000U;
+        interval.tv_usec = m_config->request_interval_microsecond % 1000000U;
         m_request_rate_phase_pending = false;
         event_del(m_event_timer);
         event_add(m_event_timer, &interval);

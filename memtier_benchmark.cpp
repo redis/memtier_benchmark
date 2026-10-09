@@ -45,19 +45,24 @@
 #include <assert.h>
 #include <errno.h>
 #include <sys/time.h>
+#ifndef _WIN32
 #include <sys/resource.h>
+#endif
 #include <signal.h>
 #include <fcntl.h>
 #ifdef HAVE_EXECINFO_H
 #include <execinfo.h>
 #endif
+#ifndef _WIN32
 #include <ucontext.h>
+#endif
 #include <time.h>
 #include <ctype.h>
+#ifndef _WIN32
 #include <sys/utsname.h>
+#endif
 #include <dirent.h>
-#include <arpa/inet.h>  // inet_pton, ntohl/ntohs for prometheus-bind-addr parsing
-#include <netinet/in.h> // struct in_addr / in6_addr / IN6_IS_ADDR_LOOPBACK
+#include "platform_compat.h"
 #include <event2/event.h>
 #include <event2/thread.h>
 
@@ -95,6 +100,45 @@ static bool bitmask_is_contiguous(unsigned int mask);
 
 #ifdef __APPLE__
 #include <mach/mach.h>
+#endif
+
+#ifdef _WIN32
+// Windows has no getrusage(). Emulate the one call this file makes,
+// getrusage(RUSAGE_THREAD), with GetThreadTimes(). The values are scheduler
+// accounted, so they advance in clock ticks (~15.6 ms), not continuously.
+#define RUSAGE_THREAD 1
+
+struct rusage
+{
+    struct timeval ru_utime;
+    struct timeval ru_stime;
+};
+
+// FILETIME durations are in 100 ns units.
+static unsigned long long filetime_to_usec(const FILETIME &ft)
+{
+    return (((unsigned long long) ft.dwHighDateTime << 32) | ft.dwLowDateTime) / 10;
+}
+
+static int getrusage(int who, struct rusage *ru)
+{
+    if (who != RUSAGE_THREAD) {
+        errno = EINVAL;
+        return -1;
+    }
+    FILETIME creation_time, exit_time, kernel_time, user_time;
+    if (!GetThreadTimes(GetCurrentThread(), &creation_time, &exit_time, &kernel_time, &user_time)) {
+        errno = EINVAL;
+        return -1;
+    }
+    unsigned long long user_usec = filetime_to_usec(user_time);
+    unsigned long long kernel_usec = filetime_to_usec(kernel_time);
+    ru->ru_utime.tv_sec = (long) (user_usec / 1000000);
+    ru->ru_utime.tv_usec = (long) (user_usec % 1000000);
+    ru->ru_stime.tv_sec = (long) (kernel_usec / 1000000);
+    ru->ru_stime.tv_usec = (long) (kernel_usec % 1000000);
+    return 0;
+}
 #endif
 
 #include "client.h"
@@ -286,6 +330,7 @@ bool connection_stage_should_abort(unsigned int timeout_secs, std::string *out_l
 // allocating from the main heap. We also skip installation when something
 // upstream (e.g. ASan/LSan/UBSan's own runtime) has already registered an
 // alt stack for us; replacing theirs would break their crash reporting.
+#ifndef _WIN32
 #define MEMTIER_ALT_STACK_SIZE (64 * 1024)
 static __thread char tls_altstack_buf[MEMTIER_ALT_STACK_SIZE];
 static __thread bool tls_altstack_installed = false;
@@ -315,6 +360,9 @@ static void install_alt_signal_stack(void)
         tls_altstack_installed = true;
     }
 }
+#else
+static void install_alt_signal_stack(void) {}
+#endif
 
 // Signal handler for Ctrl+C
 static void sigint_handler(int signum)
@@ -323,6 +371,81 @@ static void sigint_handler(int signum)
     g_interrupted = 1;
 }
 
+// Report tail shared by the POSIX signal handler and the Windows exception
+// filter: system and version information, the client list and the closing
+// banner.
+static void print_crash_report_tail(const char *timestr)
+{
+    // Print system information
+    fprintf(stderr, "\n[%d] %s # --- INFO OUTPUT\n", getpid(), timestr);
+
+#ifdef _WIN32
+    // RtlGetVersion, unlike GetVersionEx, is not subject to manifest-based
+    // version lying.
+    typedef LONG(WINAPI * rtl_get_version_fn)(PRTL_OSVERSIONINFOW);
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    rtl_get_version_fn rtl_get_version = ntdll ? (rtl_get_version_fn) GetProcAddress(ntdll, "RtlGetVersion") : NULL;
+    RTL_OSVERSIONINFOW os_version;
+    memset(&os_version, 0, sizeof(os_version));
+    os_version.dwOSVersionInfoSize = sizeof(os_version);
+    if (rtl_get_version != NULL && rtl_get_version(&os_version) == 0) {
+        fprintf(stderr, "[%d] %s # os:Windows %lu.%lu.%lu\n", getpid(), timestr, os_version.dwMajorVersion,
+                os_version.dwMinorVersion, os_version.dwBuildNumber);
+    }
+#else
+    struct utsname name;
+    if (uname(&name) == 0) {
+        fprintf(stderr, "[%d] %s # os:%s %s %s\n", getpid(), timestr, name.sysname, name.release, name.machine);
+    }
+#endif
+
+    fprintf(stderr, "[%d] %s # memtier_version:%s\n", getpid(), timestr, PACKAGE_VERSION);
+    fprintf(stderr, "[%d] %s # memtier_git_sha1:%s\n", getpid(), timestr, MEMTIER_GIT_SHA1);
+    fprintf(stderr, "[%d] %s # memtier_git_dirty:%s\n", getpid(), timestr, MEMTIER_GIT_DIRTY);
+
+#if defined(__x86_64__) || defined(_M_X64)
+    fprintf(stderr, "[%d] %s # arch_bits:64\n", getpid(), timestr);
+#elif defined(__i386__) || defined(_M_IX86)
+    fprintf(stderr, "[%d] %s # arch_bits:32\n", getpid(), timestr);
+#elif defined(__aarch64__)
+    fprintf(stderr, "[%d] %s # arch_bits:64\n", getpid(), timestr);
+#elif defined(__arm__)
+    fprintf(stderr, "[%d] %s # arch_bits:32\n", getpid(), timestr);
+#else
+    fprintf(stderr, "[%d] %s # arch_bits:unknown\n", getpid(), timestr);
+#endif
+
+#ifdef __GNUC__
+    fprintf(stderr, "[%d] %s # gcc_version:%d.%d.%d\n", getpid(), timestr, __GNUC__, __GNUC_MINOR__,
+            __GNUC_PATCHLEVEL__);
+#endif
+
+    fprintf(stderr, "[%d] %s # libevent_version:%s\n", getpid(), timestr, event_get_version());
+
+#ifdef USE_TLS
+    fprintf(stderr, "[%d] %s # openssl_version:%s\n", getpid(), timestr, OPENSSL_VERSION_TEXT);
+#endif
+
+    // Print client connection information
+    print_client_list(stderr, getpid(), timestr);
+
+#ifdef _WIN32
+    fprintf(stderr, "[%d] %s # For more information, please check the crash dump if available.\n", getpid(), timestr);
+    fprintf(stderr, "[%d] %s # To enable crash dumps, configure Windows Error Reporting LocalDumps:\n", getpid(),
+            timestr);
+    fprintf(stderr, "[%d] %s # HKLM\\SOFTWARE\\Microsoft\\Windows\\Windows Error Reporting\\LocalDumps\n", getpid(),
+            timestr);
+#else
+    fprintf(stderr, "[%d] %s # For more information, please check the core dump if available.\n", getpid(), timestr);
+    fprintf(stderr, "[%d] %s # To enable core dumps: ulimit -c unlimited\n", getpid(), timestr);
+    fprintf(stderr, "[%d] %s # Core pattern: /proc/sys/kernel/core_pattern\n", getpid(), timestr);
+#endif
+
+    fprintf(stderr, "\n=== MEMTIER_BENCHMARK BUG REPORT END. Make sure to include from START to END. ===\n\n");
+    fprintf(stderr, "       Please report this bug by opening an issue on github.com/redis/memtier_benchmark\n\n");
+}
+
+#ifndef _WIN32
 // Crash handler - prints stack trace and other debugging information
 static void crash_handler(int sig, siginfo_t *info, void *secret)
 {
@@ -376,50 +499,7 @@ static void crash_handler(int sig, siginfo_t *info, void *secret)
     // Print stack trace for all threads
     print_all_threads_stack_trace(stderr, getpid(), timestr);
 
-    // Print system information
-    fprintf(stderr, "\n[%d] %s # --- INFO OUTPUT\n", getpid(), timestr);
-
-    struct utsname name;
-    if (uname(&name) == 0) {
-        fprintf(stderr, "[%d] %s # os:%s %s %s\n", getpid(), timestr, name.sysname, name.release, name.machine);
-    }
-
-    fprintf(stderr, "[%d] %s # memtier_version:%s\n", getpid(), timestr, PACKAGE_VERSION);
-    fprintf(stderr, "[%d] %s # memtier_git_sha1:%s\n", getpid(), timestr, MEMTIER_GIT_SHA1);
-    fprintf(stderr, "[%d] %s # memtier_git_dirty:%s\n", getpid(), timestr, MEMTIER_GIT_DIRTY);
-
-#if defined(__x86_64__) || defined(_M_X64)
-    fprintf(stderr, "[%d] %s # arch_bits:64\n", getpid(), timestr);
-#elif defined(__i386__) || defined(_M_IX86)
-    fprintf(stderr, "[%d] %s # arch_bits:32\n", getpid(), timestr);
-#elif defined(__aarch64__)
-    fprintf(stderr, "[%d] %s # arch_bits:64\n", getpid(), timestr);
-#elif defined(__arm__)
-    fprintf(stderr, "[%d] %s # arch_bits:32\n", getpid(), timestr);
-#else
-    fprintf(stderr, "[%d] %s # arch_bits:unknown\n", getpid(), timestr);
-#endif
-
-#ifdef __GNUC__
-    fprintf(stderr, "[%d] %s # gcc_version:%d.%d.%d\n", getpid(), timestr, __GNUC__, __GNUC_MINOR__,
-            __GNUC_PATCHLEVEL__);
-#endif
-
-    fprintf(stderr, "[%d] %s # libevent_version:%s\n", getpid(), timestr, event_get_version());
-
-#ifdef USE_TLS
-    fprintf(stderr, "[%d] %s # openssl_version:%s\n", getpid(), timestr, OPENSSL_VERSION_TEXT);
-#endif
-
-    // Print client connection information
-    print_client_list(stderr, getpid(), timestr);
-
-    fprintf(stderr, "[%d] %s # For more information, please check the core dump if available.\n", getpid(), timestr);
-    fprintf(stderr, "[%d] %s # To enable core dumps: ulimit -c unlimited\n", getpid(), timestr);
-    fprintf(stderr, "[%d] %s # Core pattern: /proc/sys/kernel/core_pattern\n", getpid(), timestr);
-
-    fprintf(stderr, "\n=== MEMTIER_BENCHMARK BUG REPORT END. Make sure to include from START to END. ===\n\n");
-    fprintf(stderr, "       Please report this bug by opening an issue on github.com/redis/memtier_benchmark\n\n");
+    print_crash_report_tail(timestr);
 
     // Remove the handler and re-raise the signal to generate core dump
     struct sigaction act;
@@ -490,6 +570,40 @@ static void setup_crash_handlers(void)
     alarm_act.sa_handler = SIG_DFL;
     sigaction(SIGALRM, &alarm_act, NULL);
 }
+#else
+// Best-effort crash report for unhandled SEH exceptions (access violation,
+// illegal instruction, ...). abort() and assert() failures do not reach it.
+static LONG WINAPI crash_exception_filter(EXCEPTION_POINTERS *info)
+{
+    // One report per process: a fault inside this filter, or a second
+    // crashing thread, must not re-enter it.
+    static volatile LONG reporting = 0;
+    if (InterlockedExchange(&reporting, 1) != 0) return EXCEPTION_CONTINUE_SEARCH;
+
+    char timestr[64];
+    time_t now = time(NULL);
+    strftime(timestr, sizeof(timestr), "%d %b %Y %H:%M:%S", localtime(&now));
+
+    const EXCEPTION_RECORD *rec = info->ExceptionRecord;
+    fprintf(stderr, "\n\n=== MEMTIER_BENCHMARK BUG REPORT START: Cut & paste starting from here ===\n");
+    fprintf(stderr, "[%d] %s # memtier_benchmark crashed by unhandled exception\n", getpid(), timestr);
+    fprintf(stderr, "[%d] %s # Crashed running exception <0x%08lx>\n", getpid(), timestr, rec->ExceptionCode);
+    fprintf(stderr, "[%d] %s # Fault address: %p\n", getpid(), timestr, rec->ExceptionAddress);
+    if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2) {
+        fprintf(stderr, "[%d] %s # Access violation: %s address %p\n", getpid(), timestr,
+                rec->ExceptionInformation[0] == 0 ? "reading" : "writing", (void *) rec->ExceptionInformation[1]);
+    }
+
+    print_all_threads_stack_trace(stderr, getpid(), timestr);
+    print_crash_report_tail(timestr);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void setup_crash_handlers(void)
+{
+    SetUnhandledExceptionFilter(crash_exception_filter);
+}
+#endif
 
 void benchmark_log_file_line(int level, const char *filename, unsigned int line, const char *fmt, ...)
 {
@@ -546,34 +660,13 @@ static const char *get_protocol_name(enum PROTOCOL_TYPE type)
 
 #ifdef HAVE_EVHTTP
 // Comma-joined "key=value" run labels in insertion order (PLAN.md section 5).
-// With json_escape, applies JSON string escaping (\, ", and control chars as
-// \u00XX) because json_handler::write_obj is a raw vfprintf passthrough.
-static std::string prometheus_run_labels_str(struct benchmark_config *cfg, bool json_escape)
+// Unescaped: json_handler::write_obj escapes string values itself.
+static std::string prometheus_run_labels_str(struct benchmark_config *cfg)
 {
     std::string s;
     for (size_t i = 0; i < cfg->prometheus_run_labels.size(); i++) {
         if (i > 0) s += ",";
-        const std::string &k = cfg->prometheus_run_labels[i].first;
-        const std::string &v = cfg->prometheus_run_labels[i].second;
-        std::string kv = k + "=" + v;
-        if (json_escape) {
-            for (size_t j = 0; j < kv.size(); j++) {
-                unsigned char c = (unsigned char) kv[j];
-                if (c == '\\') {
-                    s += "\\\\";
-                } else if (c == '"') {
-                    s += "\\\"";
-                } else if (c < 0x20) {
-                    char buf[8];
-                    snprintf(buf, sizeof(buf), "\\u%04x", (unsigned int) c);
-                    s += buf;
-                } else {
-                    s += (char) c;
-                }
-            }
-        } else {
-            s += kv;
-        }
+        s += cfg->prometheus_run_labels[i].first + "=" + cfg->prometheus_run_labels[i].second;
     }
     return s;
 }
@@ -696,7 +789,7 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
 #ifdef HAVE_EVHTTP
             ,
             cfg->prometheus_port, cfg->prometheus_bind_addr ? cfg->prometheus_bind_addr : "127.0.0.1",
-            prometheus_run_labels_str(cfg, false).c_str(), prometheus_buckets_str(cfg).c_str()
+            prometheus_run_labels_str(cfg).c_str(), prometheus_buckets_str(cfg).c_str()
 #endif
     );
 }
@@ -748,8 +841,8 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
     jsonhandler->write_obj("verify_only", "\"%s\"", cfg->verify_only ? "true" : "false");
     jsonhandler->write_obj("generate_keys", "\"%s\"", cfg->generate_keys ? "true" : "false");
     jsonhandler->write_obj("key_prefix", "\"%s\"", cfg->key_prefix);
-    jsonhandler->write_obj("key_minimum", "%11u", cfg->key_minimum);
-    jsonhandler->write_obj("key_maximum", "%11u", cfg->key_maximum);
+    jsonhandler->write_obj("key_minimum", "%11llu", cfg->key_minimum);
+    jsonhandler->write_obj("key_maximum", "%11llu", cfg->key_maximum);
     jsonhandler->write_obj("key_pattern", "\"%s\"", cfg->key_pattern);
     jsonhandler->write_obj("key_stddev", "%f", cfg->key_stddev);
     jsonhandler->write_obj("key_median", "%f", cfg->key_median);
@@ -832,11 +925,11 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
 
 #ifdef HAVE_EVHTTP
     // Prometheus configuration (PLAN.md section 5). None of these are secrets.
-    // Run labels are JSON-escaped because write_obj is a raw vfprintf passthrough.
+    // Run labels are free-form; write_obj escapes quoted string values.
     jsonhandler->write_obj("prometheus-port", "%d", cfg->prometheus_port);
     jsonhandler->write_obj("prometheus-bind-addr", "\"%s\"",
                            cfg->prometheus_bind_addr ? cfg->prometheus_bind_addr : "127.0.0.1");
-    jsonhandler->write_obj("prometheus-run-labels", "\"%s\"", prometheus_run_labels_str(cfg, true).c_str());
+    jsonhandler->write_obj("prometheus-run-labels", "\"%s\"", prometheus_run_labels_str(cfg).c_str());
     jsonhandler->write_obj("prometheus-latency-buckets", "\"%s\"", prometheus_buckets_str(cfg).c_str());
 #endif
 
@@ -1407,8 +1500,13 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             cfg->server = optarg;
             break;
         case 'S':
+#ifdef _WIN32
+            fprintf(stderr, "error: --unix-socket is not supported on Windows.\n");
+            return -1;
+#else
             cfg->unix_socket = optarg;
             break;
+#endif
         case 'p':
             endptr = NULL;
             cfg->port = (unsigned short) strtoul(optarg, &endptr, 10);
@@ -1501,8 +1599,12 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             cfg->distinct_client_seed++;
             break;
         case o_randomize:
+#ifdef _WIN32
+            cfg->randomize = (int) (generate_random_seed() & 0x7fffffff);
+#else
             srandom(generate_random_seed());
             cfg->randomize = random();
+#endif
             break;
         case 'n':
             endptr = NULL;
@@ -2928,7 +3030,8 @@ struct cg_thread
 // Cumulative CPU time (user+system, microseconds) consumed by an arbitrary
 // thread, read WITHOUT perturbing that thread. Used by the live per-second
 // sampler in the monitor loop. On Linux this is pthread_getcpuclockid +
-// clock_gettime (a per-thread CPU clock); on macOS it is Mach thread_info.
+// clock_gettime (a per-thread CPU clock); on macOS it is Mach thread_info; on
+// Windows it is GetThreadTimes().
 // Returns 0 if the thread's CPU clock cannot be read (treated as no delta).
 static unsigned long long get_thread_cpu_usec(pthread_t thread)
 {
@@ -2939,6 +3042,11 @@ static unsigned long long get_thread_cpu_usec(pthread_t thread)
     if (thread_info(mt, THREAD_BASIC_INFO, (thread_info_t) &info, &count) != KERN_SUCCESS) return 0;
     return (unsigned long long) info.user_time.seconds * 1000000ULL + info.user_time.microseconds +
            (unsigned long long) info.system_time.seconds * 1000000ULL + info.system_time.microseconds;
+#elif defined(_WIN32)
+    FILETIME creation_time, exit_time, kernel_time, user_time;
+    if (!GetThreadTimes((HANDLE) pthread_gethandle(thread), &creation_time, &exit_time, &kernel_time, &user_time))
+        return 0;
+    return filetime_to_usec(kernel_time) + filetime_to_usec(user_time);
 #else
     clockid_t cid;
     if (pthread_getcpuclockid(thread, &cid) != 0) return 0;
@@ -3125,14 +3233,14 @@ static void *cg_thread_start(void *t)
 // 1234567 -> "1,234,567". Falls back to bare digits if the destination
 // buffer is too small. Used by --realtime-latencies to make per-second
 // throughput readable at a glance.
-static void format_with_commas(unsigned long int n, char *out, size_t sz)
+static void format_with_commas(unsigned long long int n, char *out, size_t sz)
 {
     char raw[32];
-    snprintf(raw, sizeof(raw), "%lu", n);
+    snprintf(raw, sizeof(raw), "%llu", n);
     size_t len = strlen(raw);
     size_t commas = (len > 0) ? (len - 1) / 3 : 0;
     if (len + commas + 1 > sz) {
-        snprintf(out, sz, "%lu", n);
+        snprintf(out, sz, "%llu", n);
         return;
     }
     char *w = out + len + commas;
@@ -3145,7 +3253,7 @@ static void format_with_commas(unsigned long int n, char *out, size_t sz)
     }
 }
 
-void size_to_str(unsigned long int size, char *buf, int buf_len)
+void size_to_str(unsigned long long int size, char *buf, int buf_len)
 {
     if (size >= 1024 * 1024 * 1024) {
         snprintf(buf, buf_len, "%.2fGB", (float) size / (1024 * 1024 * 1024));
@@ -3234,6 +3342,15 @@ static void print_all_threads_stack_trace(FILE *fp, int pid, const char *timestr
     if (trace_size > 1) {
         backtrace_symbols_fd(trace + 1, trace_size - 1, fileno(fp));
     }
+#elif defined(_WIN32)
+    // Raw return addresses only. Subtract the image base printed first to get
+    // an RVA, add the PE ImageBase and resolve with addr2line against the exe.
+    void *frames[62];
+    USHORT frame_count = CaptureStackBackTrace(0, 62, frames, NULL);
+    fprintf(fp, "[%d] %s #   image base: %p\n", pid, timestr, (void *) GetModuleHandleA(NULL));
+    for (USHORT i = 0; i < frame_count; i++) {
+        fprintf(fp, "[%d] %s #   %p\n", pid, timestr, frames[i]);
+    }
 #else
     fprintf(fp, "[%d] %s #   (backtrace not available on this platform)\n", pid, timestr);
 #endif
@@ -3317,7 +3434,7 @@ static void print_staircase_pattern(int run_id, benchmark_config *cfg)
 // can later share the exact same source. This is statsd-ONLY and lives OUTSIDE
 // any HAVE_EVHTTP guard. The byte-identical UDP wire is preserved: the snapshot
 // carries cur/avg_ops_sec et al. as `long` (cast at the fill site), so they
-// route through gauge(long) ("%ld"|g) exactly as before, while progress_pct is
+// route through gauge(long long) ("%lld"|g) exactly as before, while progress_pct is
 // `double` (gauge(double), "%.6f"|g) and the latencies go through timing(double)
 // ("%.3f"|ms). The >0 send condition for connection_errors is unchanged.
 static void statsd_publish_tick(statsd_client *statsd, const metrics_snapshot &snap, hdr_histogram *inst_hist_agg,
@@ -3329,10 +3446,10 @@ static void statsd_publish_tick(statsd_client *statsd, const metrics_snapshot &s
     statsd->gauge("bytes_sec_avg", snap.avg_bytes_sec);
     statsd->timing("latency_ms", snap.cur_latency_ms);
     statsd->timing("latency_avg_ms", snap.avg_latency_ms);
-    statsd->gauge("connections", (long) snap.connections);
+    statsd->gauge("connections", (long long) snap.connections);
     statsd->gauge("progress_pct", snap.progress_pct);
     if (snap.run_connection_errors > 0) {
-        statsd->gauge("connection_errors", (long) snap.run_connection_errors);
+        statsd->gauge("connection_errors", (long long) snap.run_connection_errors);
     }
 
     // Send percentile metrics derived from the aggregated instantaneous
@@ -3530,17 +3647,17 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     // the first 1 Hz tick). Mirrors statsd's zeroing convention.
     if (prom_enabled(cfg)) prom_publish_run_start(cfg, run_id);
 
-    unsigned long int prev_ops = 0;
-    unsigned long int prev_bytes = 0;
-    unsigned long int prev_duration = 0;
+    unsigned long long int prev_ops = 0;
+    unsigned long long int prev_bytes = 0;
+    unsigned long long int prev_duration = 0;
     double prev_latency = 0, cur_latency = 0;
-    unsigned long int cur_ops_sec = 0;
-    unsigned long int cur_bytes_sec = 0;
-    unsigned long int prev_hits = 0;
-    unsigned long int prev_misses = 0;
-    unsigned long int prev_aborts = 0;
-    unsigned long int prev_errors = 0;
-    unsigned long int prev_retry_attempts = 0;
+    unsigned long long int cur_ops_sec = 0;
+    unsigned long long int cur_bytes_sec = 0;
+    unsigned long long int prev_hits = 0;
+    unsigned long long int prev_misses = 0;
+    unsigned long long int prev_aborts = 0;
+    unsigned long long int prev_errors = 0;
+    unsigned long long int prev_retry_attempts = 0;
 
     // Detect once whether stderr is a real terminal. --realtime-latencies uses
     // this to choose between in-place cursor-up redraw and plain-append output.
@@ -3575,7 +3692,7 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         // Check for Ctrl+C interrupt
         if (g_interrupted) {
             // Calculate elapsed time before interrupting
-            unsigned long int elapsed_duration = 0;
+            unsigned long long int elapsed_duration = 0;
             unsigned int thread_counter = 0;
             for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
                 thread_counter++;
@@ -3615,18 +3732,18 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             }
         }
 
-        unsigned long int total_ops = 0;
-        unsigned long int total_bytes = 0;
-        unsigned long int duration = 0;
+        unsigned long long int total_ops = 0;
+        unsigned long long int total_bytes = 0;
+        unsigned long long int duration = 0;
         unsigned int thread_counter = 0;
         double total_latency = 0;
-        unsigned long int total_connection_errors = 0;
-        unsigned long int total_hits = 0;
-        unsigned long int total_misses = 0;
-        unsigned long int total_aborts = 0;
-        unsigned long int total_errors = 0;
-        unsigned long int total_retry_attempts = 0;
-        unsigned long int total_retried_ops = 0;
+        unsigned long long int total_connection_errors = 0;
+        unsigned long long int total_hits = 0;
+        unsigned long long int total_misses = 0;
+        unsigned long long int total_aborts = 0;
+        unsigned long long int total_errors = 0;
+        unsigned long long int total_retry_attempts = 0;
+        unsigned long long int total_retried_ops = 0;
 
         for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
             if (!(*i)->m_finished) active_threads++;
@@ -3659,26 +3776,26 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             duration = factor * duration + (float) (*i)->m_cg->get_duration_usec() / thread_counter;
         }
 
-        unsigned long int cur_ops = total_ops - prev_ops;
-        unsigned long int cur_bytes = total_bytes - prev_bytes;
-        unsigned long int cur_duration = duration - prev_duration;
+        unsigned long long int cur_ops = total_ops - prev_ops;
+        unsigned long long int cur_bytes = total_bytes - prev_bytes;
+        unsigned long long int cur_duration = duration - prev_duration;
         double cur_total_latency = total_latency - prev_latency;
         prev_ops = total_ops;
         prev_bytes = total_bytes;
         prev_latency = total_latency;
         prev_duration = duration;
 
-        unsigned long int ops_sec = 0;
-        unsigned long int bytes_sec = 0;
+        unsigned long long int ops_sec = 0;
+        unsigned long long int bytes_sec = 0;
         double avg_latency = 0;
         if (duration > 1) {
-            ops_sec = (long) ((double) total_ops / duration * 1000000);
-            bytes_sec = (long) ((double) total_bytes / duration * 1000000);
+            ops_sec = (unsigned long long) ((double) total_ops / duration * 1000000);
+            bytes_sec = (unsigned long long) ((double) total_bytes / duration * 1000000);
             avg_latency = ((double) total_latency / 1000 / total_ops);
         }
         if (cur_duration > 1 && active_threads == cfg->threads) {
-            cur_ops_sec = (long) ((double) cur_ops / cur_duration * 1000000);
-            cur_bytes_sec = (long) ((double) cur_bytes / cur_duration * 1000000);
+            cur_ops_sec = (unsigned long long) ((double) cur_ops / cur_duration * 1000000);
+            cur_bytes_sec = (unsigned long long) ((double) cur_bytes / cur_duration * 1000000);
             cur_latency = ((double) cur_total_latency / 1000 / cur_ops);
         }
 
@@ -3739,8 +3856,8 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             format_with_commas(ops_sec, avg_ops_str, sizeof(avg_ops_str));
 
             // Miss ratio: per-second (delta) and cumulative.
-            unsigned long int cur_lookups = (total_hits - prev_hits) + (total_misses - prev_misses);
-            unsigned long int tot_lookups = total_hits + total_misses;
+            unsigned long long int cur_lookups = (total_hits - prev_hits) + (total_misses - prev_misses);
+            unsigned long long int tot_lookups = total_hits + total_misses;
             char cur_miss_str[16], avg_miss_str[16];
             if (cur_lookups > 0)
                 snprintf(cur_miss_str, sizeof(cur_miss_str), "%5.2f%%",
@@ -3775,8 +3892,8 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             if (total_connection_errors > 0) {
                 line1_used = snprintf(
                     line1, sizeof(line1),
-                    "%s throughput %s (avg: %s) ops/sec   %s/sec (avg: %s/sec)   miss %s (avg: %s)   conn_err %lu", tag,
-                    cur_ops_str, avg_ops_str, cur_bytes_str, bytes_str, cur_miss_str, avg_miss_str,
+                    "%s throughput %s (avg: %s) ops/sec   %s/sec (avg: %s/sec)   miss %s (avg: %s)   conn_err %llu",
+                    tag, cur_ops_str, avg_ops_str, cur_bytes_str, bytes_str, cur_miss_str, avg_miss_str,
                     total_connection_errors);
             } else {
                 line1_used =
@@ -3794,10 +3911,10 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             // Retry/error tail: only printed when --retry-on-error is enabled
             // so existing CI / log-scraping is unaffected by default.
             if (cfg->retry_on_error && line1_used > 0 && (size_t) line1_used < sizeof(line1)) {
-                unsigned long int cur_errors = total_errors - prev_errors;
-                unsigned long int cur_retries = total_retry_attempts - prev_retry_attempts;
+                unsigned long long int cur_errors = total_errors - prev_errors;
+                unsigned long long int cur_retries = total_retry_attempts - prev_retry_attempts;
                 snprintf(line1 + line1_used, sizeof(line1) - line1_used,
-                         "   errors %lu (+%lu)   retries %lu (+%lu)   retried_ops %lu", total_errors, cur_errors,
+                         "   errors %llu (+%llu)   retries %llu (+%llu)   retried_ops %llu", total_errors, cur_errors,
                          total_retry_attempts, cur_retries, total_retried_ops);
             }
 
@@ -3866,13 +3983,13 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         } else if (total_connection_errors > 0) {
             // Only show connection errors if there are any (backwards compatible output)
             fprintf(stderr,
-                    "[RUN #%u %.0f%%, %3u secs] %2u threads %2u conns %lu conn errors: %11lu ops, %7lu (avg: %7lu) "
+                    "[RUN #%u %.0f%%, %3u secs] %2u threads %2u conns %llu conn errors: %11llu ops, %7llu (avg: %7llu) "
                     "ops/sec, %s/sec (avg: %s/sec), %5.2f (avg: %5.2f) msec latency",
                     run_id, progress, (unsigned int) (duration / 1000000), active_threads, display_clients,
                     total_connection_errors, total_ops, cur_ops_sec, ops_sec, cur_bytes_str, bytes_str, cur_latency,
                     avg_latency);
             if (cfg->retry_on_error) {
-                fprintf(stderr, "   errors %lu (+%lu)   retries %lu (+%lu)   retried_ops %lu", total_errors,
+                fprintf(stderr, "   errors %llu (+%llu)   retries %llu (+%llu)   retried_ops %llu", total_errors,
                         total_errors - prev_errors, total_retry_attempts, total_retry_attempts - prev_retry_attempts,
                         total_retried_ops);
             }
@@ -3880,16 +3997,16 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         } else if (cfg->retry_on_error && (total_errors > 0 || total_retry_attempts > 0)) {
             // Quick path when only request-level errors / retries are non-zero.
             fprintf(stderr,
-                    "[RUN #%u %.0f%%, %3u secs] %2u threads %2u conns: %11lu ops, %7lu (avg: %7lu) ops/sec, %s/sec "
-                    "(avg: %s/sec), %5.2f (avg: %5.2f) msec latency   errors %lu (+%lu)   retries %lu (+%lu)   "
-                    "retried_ops %lu\r",
+                    "[RUN #%u %.0f%%, %3u secs] %2u threads %2u conns: %11llu ops, %7llu (avg: %7llu) ops/sec, %s/sec "
+                    "(avg: %s/sec), %5.2f (avg: %5.2f) msec latency   errors %llu (+%llu)   retries %llu (+%llu)   "
+                    "retried_ops %llu\r",
                     run_id, progress, (unsigned int) (duration / 1000000), active_threads, display_clients, total_ops,
                     cur_ops_sec, ops_sec, cur_bytes_str, bytes_str, cur_latency, avg_latency, total_errors,
                     total_errors - prev_errors, total_retry_attempts, total_retry_attempts - prev_retry_attempts,
                     total_retried_ops);
         } else {
             fprintf(stderr,
-                    "[RUN #%u %.0f%%, %3u secs] %2u threads %2u conns: %11lu ops, %7lu (avg: %7lu) ops/sec, %s/sec "
+                    "[RUN #%u %.0f%%, %3u secs] %2u threads %2u conns: %11llu ops, %7llu (avg: %7llu) ops/sec, %s/sec "
                     "(avg: %s/sec), %5.2f (avg: %5.2f) msec latency\r",
                     run_id, progress, (unsigned int) (duration / 1000000), active_threads, display_clients, total_ops,
                     cur_ops_sec, ops_sec, cur_bytes_str, bytes_str, cur_latency, avg_latency);
@@ -3916,10 +4033,10 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             snap.active_threads = active_threads;
             snap.connections = display_clients * active_threads; // :3227 parity, uint32 product
             snap.progress_pct = progress;
-            snap.cur_ops_sec = (long) cur_ops_sec;
-            snap.avg_ops_sec = (long) ops_sec;
-            snap.cur_bytes_sec = (long) cur_bytes_sec;
-            snap.avg_bytes_sec = (long) bytes_sec;
+            snap.cur_ops_sec = (long long) cur_ops_sec;
+            snap.avg_ops_sec = (long long) ops_sec;
+            snap.cur_bytes_sec = (long long) cur_bytes_sec;
+            snap.avg_bytes_sec = (long long) bytes_sec;
             snap.cur_latency_ms = cur_latency;
             snap.avg_latency_ms = avg_latency;
             snap.run_connection_errors = total_connection_errors; // RAW per-run (Decisions #11)
@@ -3943,11 +4060,11 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         cfg->statsd->event("Benchmark Completed", event_data, "memtier,end");
 
         // Zero out gauges so the graph shows the run has ended
-        cfg->statsd->gauge("ops_sec", (long) 0);
-        cfg->statsd->gauge("ops_sec_avg", (long) 0);
-        cfg->statsd->gauge("bytes_sec", (long) 0);
-        cfg->statsd->gauge("bytes_sec_avg", (long) 0);
-        cfg->statsd->gauge("progress_pct", (long) 0);
+        cfg->statsd->gauge("ops_sec", (long long) 0);
+        cfg->statsd->gauge("ops_sec_avg", (long long) 0);
+        cfg->statsd->gauge("bytes_sec", (long long) 0);
+        cfg->statsd->gauge("bytes_sec_avg", (long long) 0);
+        cfg->statsd->gauge("progress_pct", (long long) 0);
     }
 
     fprintf(stderr, "\n\n");
@@ -4261,6 +4378,15 @@ static void cleanup_openssl(void)
 
 int main(int argc, char *argv[])
 {
+#ifdef _WIN32
+    WSADATA winsock_data;
+    int wsa_error = WSAStartup(MAKEWORD(2, 2), &winsock_data);
+    if (wsa_error != 0) {
+        fprintf(stderr, "error: WSAStartup failed: %d\n", wsa_error);
+        return 1;
+    }
+    // Winsock remains initialized until process exit; process teardown releases it.
+#endif
     // Enable libevent's pthreads bindings so event_base_loopbreak() /
     // event_base_loopexit() called from the main thread reliably wake a
     // worker thread that is blocked in epoll_wait() with no live events.
@@ -4269,9 +4395,15 @@ int main(int argc, char *argv[])
     // --connection-stage-timeout abort (Phase 1 of #426) or a Ctrl+C.
     // Must run before any event_base is created so the locking callbacks
     // are installed for every subsequent base.
+#ifdef _WIN32
+    if (evthread_use_windows_threads() < 0) {
+        fprintf(stderr, "warning: evthread_use_windows_threads() failed; cross-thread loop wakeups may stall.\n");
+    }
+#else
     if (evthread_use_pthreads() < 0) {
         fprintf(stderr, "warning: evthread_use_pthreads() failed; cross-thread loop wakeups may stall.\n");
     }
+#endif
 
     // Install signal handler for Ctrl+C
     signal(SIGINT, sigint_handler);
@@ -4284,12 +4416,15 @@ int main(int argc, char *argv[])
     // on plain-TCP send(), but TLS writes via OpenSSL's SSL_write() do not
     // (and ARM Linux ignores MSG_NOSIGNAL on writev in some configurations),
     // so a process-wide SIG_IGN is the robust fix. See PERF-501 / GH #382.
+#ifdef SIGPIPE
     signal(SIGPIPE, SIG_IGN);
+#endif
 
     // Install crash handlers for debugging
     setup_crash_handlers();
 
     // Enable core dumps
+#ifndef _WIN32
     struct rlimit core_limit;
     core_limit.rlim_cur = RLIM_INFINITY;
     core_limit.rlim_max = RLIM_INFINITY;
@@ -4297,6 +4432,7 @@ int main(int argc, char *argv[])
         fprintf(stderr, "warning: failed to set core dump limit: %s\n", strerror(errno));
         fprintf(stderr, "warning: core dumps may not be generated on crash\n");
     }
+#endif
 
     // Keep URI storage alive for cfg and its workers; neither string changes after parsing.
     std::string uri_authenticate;
@@ -4865,11 +5001,13 @@ int main(int argc, char *argv[])
         config_print_to_json(jsonhandler, &cfg);
     }
 
+#ifndef _WIN32
     struct rlimit rlim;
     if (getrlimit(RLIMIT_NOFILE, &rlim) != 0) {
         benchmark_error_log("error: getrlimit failed: %s\n", strerror(errno));
         exit(1);
     }
+#endif
 
     if (cfg.unix_socket != NULL && (cfg.server != NULL || cfg.port > 0)) {
         benchmark_error_log("error: UNIX domain socket and TCP cannot be used together.\n");
@@ -4885,6 +5023,7 @@ int main(int argc, char *argv[])
         }
     }
 
+#ifndef _WIN32
     unsigned int fds_needed = (cfg.threads * cfg.clients) + (cfg.threads * 10) + 10;
     if (fds_needed > rlim.rlim_cur) {
         if (fds_needed > rlim.rlim_max && getuid() != 0) {
@@ -4898,6 +5037,7 @@ int main(int argc, char *argv[])
             exit(1);
         }
     }
+#endif
 
     // create and configure object generator
     object_generator *obj_gen = NULL;
@@ -5187,7 +5327,7 @@ int main(int argc, char *argv[])
             run_stats *worst = NULL;
             run_stats *best = NULL;
             for (std::vector<run_stats>::iterator i = all_stats.begin(); i != all_stats.end(); i++) {
-                unsigned long usecs = i->get_duration_usec();
+                unsigned long long usecs = i->get_duration_usec();
                 unsigned int ops_sec = (int) (((double) i->get_total_ops() / (usecs > 0 ? usecs : 1)) * 1000000);
                 if (ops_sec < min_ops_sec || worst == NULL) {
                     min_ops_sec = ops_sec;

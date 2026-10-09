@@ -88,7 +88,7 @@ struct metrics_snapshot
     struct timespec published_at;       // CLOCK_MONOTONIC, stamped by publish() -> snapshot_age
     // statsd-only (one producer, two transports; NOT rendered in v1):
     double progress_pct;
-    long cur_ops_sec, avg_ops_sec, cur_bytes_sec, avg_bytes_sec;
+    long long cur_ops_sec, avg_ops_sec, cur_bytes_sec, avg_bytes_sec;
     double cur_latency_ms, avg_latency_ms;
     uint64_t run_connection_errors; // RAW per-run for statsd incl. its >0 send condition
 };

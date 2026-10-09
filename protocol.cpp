@@ -366,20 +366,21 @@ int redis_protocol::authenticate(const char *credentials)
                                    "*2\r\n"
                                    "$4\r\n"
                                    "AUTH\r\n"
-                                   "$%zu\r\n"
+                                   "$%llu\r\n"
                                    "%s\r\n",
-                                   strlen(password), password);
+                                   (unsigned long long) strlen(password), password);
     } else {
         size_t user_len = password - user - 1;
         size = evbuffer_add_printf(m_write_buf,
                                    "*3\r\n"
                                    "$4\r\n"
                                    "AUTH\r\n"
-                                   "$%zu\r\n"
+                                   "$%llu\r\n"
                                    "%.*s\r\n"
-                                   "$%zu\r\n"
+                                   "$%llu\r\n"
                                    "%s\r\n",
-                                   user_len, (int) user_len, user, strlen(password), password);
+                                   (unsigned long long) user_len, (int) user_len, user,
+                                   (unsigned long long) strlen(password), password);
     }
     return size;
 }
@@ -510,7 +511,7 @@ int redis_protocol::write_command_multi_get(const keylist *keylist)
                                1 + keys_count);
 
     for (unsigned int i = 0; i < keys_count; i++) {
-        unsigned int key_len;
+        unsigned int key_len = 0;
         const char *key = keylist->get_key(i, &key_len);
         assert(key != NULL);
 
@@ -1066,26 +1067,31 @@ public:
 int memcache_text_protocol::select_db(int db)
 {
     assert(0);
+    return -1;
 }
 
 int memcache_text_protocol::authenticate(const char *credentials)
 {
     assert(0);
+    return -1;
 }
 
 int memcache_text_protocol::configure_protocol(enum PROTOCOL_TYPE type)
 {
     assert(0);
+    return -1;
 }
 
 int memcache_text_protocol::write_command_cluster_slots()
 {
     assert(0);
+    return -1;
 }
 
 int memcache_text_protocol::write_command_readonly()
 {
     assert(0);
+    return -1;
 }
 
 int memcache_text_protocol::write_command_set(const char *key, int key_len, const char *value, int value_len,
@@ -1129,7 +1135,7 @@ int memcache_text_protocol::write_command_multi_get(const keylist *keylist)
 
     for (unsigned int i = 0; i < keylist->get_keys_count(); i++) {
         const char *key;
-        unsigned int key_len;
+        unsigned int key_len = 0;
 
         n = evbuffer_add(m_write_buf, " ", 1);
         assert(n != -1);
@@ -1154,6 +1160,7 @@ int memcache_text_protocol::write_command_wait(unsigned int num_slaves, unsigned
 {
     fprintf(stderr, "error: WAIT command not implemented for memcache!\n");
     assert(0);
+    return -1;
 }
 
 int memcache_text_protocol::parse_response(void)
@@ -1251,16 +1258,19 @@ int memcache_text_protocol::parse_response(void)
 bool memcache_text_protocol::format_arbitrary_command(arbitrary_command &cmd)
 {
     assert(0);
+    return false;
 }
 
 int memcache_text_protocol::write_arbitrary_command(const command_arg *arg)
 {
     assert(0);
+    return -1;
 }
 
 int memcache_text_protocol::write_arbitrary_command(const char *val, int val_len)
 {
     assert(0);
+    return -1;
 }
 
 /////////////////////////////////////////////////////////////////////////
@@ -1303,6 +1313,7 @@ public:
 int memcache_binary_protocol::select_db(int db)
 {
     assert(0);
+    return -1;
 }
 
 int memcache_binary_protocol::authenticate(const char *credentials)
@@ -1345,16 +1356,19 @@ int memcache_binary_protocol::authenticate(const char *credentials)
 int memcache_binary_protocol::configure_protocol(enum PROTOCOL_TYPE type)
 {
     assert(0);
+    return -1;
 }
 
 int memcache_binary_protocol::write_command_cluster_slots()
 {
     assert(0);
+    return -1;
 }
 
 int memcache_binary_protocol::write_command_readonly()
 {
     assert(0);
+    return -1;
 }
 
 int memcache_binary_protocol::write_command_set(const char *key, int key_len, const char *value, int value_len,
@@ -1408,6 +1422,7 @@ int memcache_binary_protocol::write_command_multi_get(const keylist *keylist)
 {
     fprintf(stderr, "error: multi get not implemented for binary memcache yet!\n");
     assert(0);
+    return -1;
 }
 
 const char *memcache_binary_protocol::status_text(void)
@@ -1445,6 +1460,7 @@ int memcache_binary_protocol::write_command_wait(unsigned int num_slaves, unsign
 {
     fprintf(stderr, "error: WAIT command not implemented for memcache!\n");
     assert(0);
+    return -1;
 }
 
 int memcache_binary_protocol::parse_response(void)
@@ -1532,16 +1548,19 @@ int memcache_binary_protocol::parse_response(void)
 bool memcache_binary_protocol::format_arbitrary_command(arbitrary_command &cmd)
 {
     assert(0);
+    return false;
 }
 
 int memcache_binary_protocol::write_arbitrary_command(const command_arg *arg)
 {
     assert(0);
+    return -1;
 }
 
 int memcache_binary_protocol::write_arbitrary_command(const char *val, int val_len)
 {
     assert(0);
+    return -1;
 }
 
 /////////////////////////////////////////////////////////////////////////
