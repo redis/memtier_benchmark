@@ -546,34 +546,13 @@ static const char *get_protocol_name(enum PROTOCOL_TYPE type)
 
 #ifdef HAVE_EVHTTP
 // Comma-joined "key=value" run labels in insertion order (PLAN.md section 5).
-// With json_escape, applies JSON string escaping (\, ", and control chars as
-// \u00XX) because json_handler::write_obj is a raw vfprintf passthrough.
-static std::string prometheus_run_labels_str(struct benchmark_config *cfg, bool json_escape)
+// Unescaped: json_handler::write_obj escapes string values itself.
+static std::string prometheus_run_labels_str(struct benchmark_config *cfg)
 {
     std::string s;
     for (size_t i = 0; i < cfg->prometheus_run_labels.size(); i++) {
         if (i > 0) s += ",";
-        const std::string &k = cfg->prometheus_run_labels[i].first;
-        const std::string &v = cfg->prometheus_run_labels[i].second;
-        std::string kv = k + "=" + v;
-        if (json_escape) {
-            for (size_t j = 0; j < kv.size(); j++) {
-                unsigned char c = (unsigned char) kv[j];
-                if (c == '\\') {
-                    s += "\\\\";
-                } else if (c == '"') {
-                    s += "\\\"";
-                } else if (c < 0x20) {
-                    char buf[8];
-                    snprintf(buf, sizeof(buf), "\\u%04x", (unsigned int) c);
-                    s += buf;
-                } else {
-                    s += (char) c;
-                }
-            }
-        } else {
-            s += kv;
-        }
+        s += cfg->prometheus_run_labels[i].first + "=" + cfg->prometheus_run_labels[i].second;
     }
     return s;
 }
@@ -696,7 +675,7 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
 #ifdef HAVE_EVHTTP
             ,
             cfg->prometheus_port, cfg->prometheus_bind_addr ? cfg->prometheus_bind_addr : "127.0.0.1",
-            prometheus_run_labels_str(cfg, false).c_str(), prometheus_buckets_str(cfg).c_str()
+            prometheus_run_labels_str(cfg).c_str(), prometheus_buckets_str(cfg).c_str()
 #endif
     );
 }
@@ -832,11 +811,11 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
 
 #ifdef HAVE_EVHTTP
     // Prometheus configuration (PLAN.md section 5). None of these are secrets.
-    // Run labels are JSON-escaped because write_obj is a raw vfprintf passthrough.
+    // Run labels are free-form; write_obj escapes quoted string values.
     jsonhandler->write_obj("prometheus-port", "%d", cfg->prometheus_port);
     jsonhandler->write_obj("prometheus-bind-addr", "\"%s\"",
                            cfg->prometheus_bind_addr ? cfg->prometheus_bind_addr : "127.0.0.1");
-    jsonhandler->write_obj("prometheus-run-labels", "\"%s\"", prometheus_run_labels_str(cfg, true).c_str());
+    jsonhandler->write_obj("prometheus-run-labels", "\"%s\"", prometheus_run_labels_str(cfg).c_str());
     jsonhandler->write_obj("prometheus-latency-buckets", "\"%s\"", prometheus_buckets_str(cfg).c_str());
 #endif
 
