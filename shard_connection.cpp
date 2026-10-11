@@ -62,6 +62,28 @@
 static const double MEMTIER_BACKOFF_CAP_SEC = 60.0;
 static const double MEMTIER_BACKOFF_CAP_MS = 60000.0;
 
+// Workload requests count toward the client's generated/processed totals and
+// per-endpoint routed ops; connection-setup requests do not. A switch, so a
+// new request_type must be classified here.
+static bool is_workload_request(request_type type)
+{
+    switch (type) {
+    case rt_get:
+    case rt_set:
+    case rt_wait:
+    case rt_arbitrary:
+        return true;
+    case rt_unknown:
+    case rt_auth:
+    case rt_select_db:
+    case rt_cluster_slots:
+    case rt_hello:
+    case rt_readonly:
+        break;
+    }
+    return false;
+}
+
 #ifdef USE_TLS
 #include <mutex>
 #include <openssl/ssl.h>
@@ -523,21 +545,25 @@ void shard_connection::disconnect()
     }
 
     // Drain pipeline. With --retry-on-error, move in-flight requests into the
-    // replay queue so they get resent after reconnect. Otherwise, discard them
-    // as before.
+    // replay queue so they get resent after reconnect. Otherwise, discard them.
+    // Discarded workload requests will never be processed, so uncount them
+    // from the client's generated total; leaving them counted holds the
+    // pipeline (--reconnect-interval, cluster in-flight budget) and stalls
+    // --requests runs once the connection comes back.
+    unsigned long long dropped = 0;
     if (m_config->retry_on_error && m_replay_queue != NULL) {
         while (m_pending_resp) {
             request *req = pop_req();
             // Only setup commands have no serialized capture (we never attempt
             // capture for those) — drop those.
-            if (req->m_type == rt_auth || req->m_type == rt_select_db || req->m_type == rt_cluster_slots ||
-                req->m_type == rt_hello || req->m_type == rt_readonly) {
+            if (!is_workload_request(req->m_type)) {
                 delete req;
                 continue;
             }
             if (req->m_serialized && req->m_serialized_len > 0) {
                 m_replay_queue->push(req);
             } else {
+                dropped++;
                 delete req;
             }
         }
@@ -562,9 +588,13 @@ void shard_connection::disconnect()
             evtimer_del(m_retry_drain_timer);
         }
     } else {
-        while (m_pending_resp)
-            delete pop_req();
+        while (m_pending_resp) {
+            request *req = pop_req();
+            if (is_workload_request(req->m_type)) dropped++;
+            delete req;
+        }
     }
+    if (dropped) m_conns_manager->dec_reqs_generated(dropped);
 
     if (m_deferred_fill_timer != NULL && evtimer_pending(m_deferred_fill_timer, NULL)) {
         evtimer_del(m_deferred_fill_timer);
@@ -718,21 +748,7 @@ void shard_connection::push_req(request *req)
     // Per-endpoint routed_ops: count anything that's not a connection-setup
     // request. This is the canonical "how many user-level requests did we
     // route here" tally used by the "Endpoints" array in mb.json.
-    switch (req->m_type) {
-    case rt_get:
-    case rt_set:
-    case rt_wait:
-    case rt_arbitrary:
-        m_routed_ops++;
-        break;
-    case rt_unknown:
-    case rt_auth:
-    case rt_select_db:
-    case rt_cluster_slots:
-    case rt_hello:
-    case rt_readonly:
-        break;
-    }
+    if (is_workload_request(req->m_type)) m_routed_ops++;
     if (m_config->request_rate) {
         // Handle race condition during reconnection - don't assert if interval is 0
         if (m_request_per_cur_interval > 0) {

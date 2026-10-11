@@ -744,3 +744,81 @@ def test_connection_kill_with_reconnect_is_not_rerun(env):
     env.assertLess(
         elapsed, test_time + 4, message="run took {:.1f}s for --test-time={}".format(elapsed, test_time)
     )
+
+
+
+def test_dropped_in_flight_requests_do_not_stall_client(env):
+    """
+    Requests in flight on a killed connection must not stall the client after
+    it reconnects.
+
+    A killed connection discards its in-flight requests, which had already
+    been counted as generated. Left counted, they kept generated ahead of
+    processed for good, so with --reconnect-interval the client held its
+    pipeline at the next reconnect point, its worker's event loop ran out of
+    events, and the run failed with "client(s) stopped before reaching their
+    stop condition".
+    """
+    import subprocess
+
+    # Cluster mode rejects --reconnect-interval, and its in-flight budget is
+    # covered by the same fix, but a separate pre-existing end-of-run hang
+    # with reconnects in flight would make a cluster variant flaky.
+    env.skipOnCluster()
+    test_time = 8
+    args = [
+        "--pipeline=1",
+        "--ratio=1:1",
+        "--key-pattern=R:R",
+        "--key-minimum=1",
+        "--key-maximum=10000",
+        "--reconnect-interval=10",
+        "--reconnect-on-error",
+        "--hide-histogram",
+    ]
+    benchmark_specs = {"name": env.testName, "args": args}
+    addTLSArgs(benchmark_specs, env)
+
+    config = get_default_memtier_config(threads=1, clients=1, requests=None, test_time=test_time)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    test_dir = tempfile.mkdtemp()
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    conn = env.getOSSMasterNodesConnectionList()[0]
+
+    stderr_path = "{0}/mb.stderr".format(config.results_dir)
+    kills = []
+    with open("{0}/mb.stdout".format(config.results_dir), "w") as stdout_f, open(stderr_path, "w") as stderr_f:
+        proc = subprocess.Popen(benchmark.args, stdout=stdout_f, stderr=stderr_f, cwd=config.results_dir)
+        try:
+            # The client is never rate limited, so most kills land with a
+            # request in flight; one discarded request is enough. A kill can
+            # still miss (e.g. a socket a planned reconnect just closed), so
+            # use several waves, spaced beyond the default 1s reconnect delay.
+            for _wave in range(4):
+                time.sleep(1.5)
+                try:
+                    kills.append(conn.execute_command("CLIENT", "KILL", "TYPE", "normal"))
+                except Exception as e:
+                    env.debugPrint("CLIENT KILL failed: {}".format(e), True)
+            rc = proc.wait(timeout=test_time + 30)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            rc = proc.wait(timeout=10)
+
+    with open(stderr_path) as f:
+        stderr_content = f.read()
+    env.debugPrint("memtier exit code: {}, CLIENT KILL counts: {}".format(rc, kills), True)
+    if rc != 0:
+        env.debugPrint("STDERR:\n{}".format(stderr_content[-2000:]), True)
+
+    env.assertGreaterEqual(sum(kills), 1, message="no CLIENT KILL wave found a memtier connection")
+    env.assertGreaterEqual(stderr_content.count("Reconnection successful"), 1,
+                           message="no connection was killed and recovered")
+    env.assertFalse("stopped before reaching their stop condition" in stderr_content,
+                    message="client stopped sending after a reconnect")
+    env.assertEqual(rc, 0, message="memtier exited {} after connection kills".format(rc))

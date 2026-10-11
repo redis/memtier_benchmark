@@ -30,6 +30,7 @@ public:
     virtual void inc_reqs_processed(void) = 0;
     virtual unsigned long long get_reqs_generated(void) = 0;
     virtual void inc_reqs_generated(void) = 0;
+    virtual void dec_reqs_generated(unsigned long long count) = 0;
     virtual bool finished(void) = 0;
     virtual bool all_connections_idle(void) = 0;
 

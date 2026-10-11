@@ -167,6 +167,14 @@ public:
     unsigned long long get_reqs_generated() { return m_reqs_generated; }
 
     void inc_reqs_generated() { m_reqs_generated++; }
+    // Uncount generated requests that will never be processed (dropped with
+    // their connection). Never go below m_reqs_processed: hold_pipeline()
+    // subtracts the two unguarded.
+    void dec_reqs_generated(unsigned long long count)
+    {
+        unsigned long long in_flight = m_reqs_generated > m_reqs_processed ? m_reqs_generated - m_reqs_processed : 0;
+        m_reqs_generated -= count < in_flight ? count : in_flight;
+    }
 
     virtual bool handle_cluster_slots(protocol_response *r)
     {
