@@ -746,7 +746,6 @@ def test_connection_kill_with_reconnect_is_not_rerun(env):
     )
 
 
-
 def test_dropped_in_flight_requests_do_not_stall_client(env):
     """
     Requests in flight on a killed connection must not stall the client after
