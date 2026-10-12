@@ -74,7 +74,8 @@ protected:
     object_generator *m_obj_gen;
     run_stats m_stats;
 
-    unsigned long long m_reqs_processed;          // requests processed (responses received)
+    unsigned long long m_reqs_processed;          // requests processed (final responses received)
+    unsigned long long m_reqs_answered;           // responses received, including ones retried
     unsigned long long m_reqs_generated;          // requests generated (wait for responses)
     unsigned int m_set_ratio_count;               // number of sets counter (overlaps on ratio)
     unsigned int m_get_ratio_count;               // number of gets counter (overlaps on ratio)
@@ -163,6 +164,10 @@ public:
     unsigned long long get_reqs_processed() { return m_reqs_processed; }
 
     void inc_reqs_processed() { m_reqs_processed++; }
+
+    unsigned long long get_reqs_answered() { return m_reqs_answered; }
+
+    void inc_reqs_answered() { m_reqs_answered++; }
 
     unsigned long long get_reqs_generated() { return m_reqs_generated; }
 

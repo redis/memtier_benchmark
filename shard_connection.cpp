@@ -580,6 +580,8 @@ void shard_connection::disconnect()
                 if (req->m_serialized && req->m_serialized_len > 0) {
                     m_replay_queue->push(req);
                 } else {
+                    // Not expected: enqueue_retry() only accepts requests
+                    // with captured bytes. Uncount it like any other drop.
                     dropped++;
                     delete req;
                 }
@@ -1263,6 +1265,7 @@ void shard_connection::process_response(void)
                                 r->get_status(), r->get_hits(), req->m_keys - r->get_hits());
 
             m_conns_manager->handle_response(m_id, now, req, r);
+            m_conns_manager->inc_reqs_answered();
             // A request claimed for retry is still outstanding: it is counted
             // as processed once, when its final attempt completes. Only counted
             // responses move processed, so only they can reach a
@@ -1491,7 +1494,9 @@ void shard_connection::handle_event(short events)
             drain_replay_queue_after_reconnect();
         }
 
-        if (!m_conns_manager->get_reqs_processed()) {
+        // Any response, even one being retried, means the run has started:
+        // a reconnect after it must not restart the clock.
+        if (!m_conns_manager->get_reqs_answered()) {
             process_first_request();
         } else {
             benchmark_debug_log("reconnection complete, proceeding with test\n");
