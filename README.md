@@ -366,6 +366,11 @@ To output different percentiles you should use the --print-percentiles option fo
 #### Saving the full latency spectrum
 To save the full latencies you should use the --hdr-file-prefix option followed by the prefix name you wish the filenames to have. 
 Each distinct command will be saved into two different files - one in .txt (textual format) and another in .hgrm (HistogramLogProcessor format).
+The JSON output also includes a `Compressed Histogram` string under
+`Percentile Latencies` / `Histogram log format`, encoded as standard V2 compressed
+HDR data in base64. If encoding fails, memtier reports the HDR error on stderr and
+writes JSON `null` for that field. Consumers should check for `null` before
+decoding; the other latency statistics remain available.
 The textual format can be hard to analyze solely, but you can use an [online formatter](http://hdrhistogram.github.io/HdrHistogram/plotFiles.html) to generate visual histograms from it. The .hgrm format will be later added as input to Redislabs [mbdirector](https://github.com/redislabs/mbdirector) to enable visualization of time-domain results.
 
 Sample Visual Feel of the full latency spectrum using an [online formatter](http://hdrhistogram.github.io/HdrHistogram/plotFiles.html):

@@ -110,6 +110,21 @@ hdr_histogram_test_CPPFLAGS = -I$(srcdir)
 hdr_histogram_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 TESTS = $(check_PROGRAMS)
 
+# Keep the release amalgamation byte-identical to the recorded upstream asset.
+# This runs in CI and the local gate through make check, including VPATH builds.
+.PHONY: check-hdr-vendor
+check-local: check-hdr-vendor
+check-hdr-vendor:
+	@cd "$(srcdir)/deps/hdr_histogram" && \
+	if command -v sha256sum >/dev/null 2>&1; then \
+		sha256sum -c SHA256SUMS; \
+	elif command -v shasum >/dev/null 2>&1; then \
+		shasum -a 256 -c SHA256SUMS; \
+	else \
+		echo "HDR vendor verification requires sha256sum or shasum" >&2; \
+		exit 1; \
+	fi
+
 @CODE_COVERAGE_RULES@
 memtier_benchmark_LDFLAGS = $(CODE_COVERAGE_LDFLAGS)
 

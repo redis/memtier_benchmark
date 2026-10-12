@@ -43,12 +43,12 @@ race:run_stats::inc_error
 race:run_stats::inc_retry_attempt
 race:run_stats::inc_retried_op
 
-# Inst-totals HDR histogram: workers record via hdr_record_value_capped_atomic with
-# NO mutex (run_stats.cpp:44-52); the main thread copies under m_inst_histogram_mutex
-# using plain reads (hdr_add / hdr_total_count inside run_stats::copy_inst_histogram and
-# the gated copy_inst_histogram_if_changed, run_stats.cpp:197-202 + the Prometheus
-# producer tick) — the mutex serializes copy-vs-reset only, so TSan reports
-# atomic-write vs plain-read.
+# Inst-totals HDR histogram: workers record via memtier_record_latency_atomic in
+# latency_histogram.h with NO mutex; the main thread copies under
+# m_inst_histogram_mutex in run_stats::copy_inst_histogram and the gated
+# copy_inst_histogram_if_changed. hdr_add reads counts without atomic loads;
+# hdr_total_count now uses an atomic load. The mutex serializes copy-vs-reset
+# only, so TSan reports atomic-write vs plain-read during histogram iteration.
 # Benign: live data is approximate; authoritative histograms merge race-free post-join.
 race:run_stats::copy_inst_histogram
 race:run_stats::copy_inst_histogram_if_changed

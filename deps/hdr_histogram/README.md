@@ -9,6 +9,8 @@ https://github.com/HdrHistogram/HdrHistogram_c/releases/tag/0.12.0
 - `SHA256SUMS` contains the upstream hashes of the eight vendored C/header files.
   Verify them from this directory with `sha256sum -c SHA256SUMS` (Linux) or
   `shasum -a 256 -c SHA256SUMS` (macOS).
+  `make check` verifies these hashes automatically; `make check-hdr-vendor`
+  runs the same verification on its own.
 
 These files are unmodified upstream output. To regenerate them from the pinned
 source checkout, run `python3 script/amalgamate.py --output <directory> --with-log`.
