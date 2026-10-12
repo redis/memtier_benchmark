@@ -549,7 +549,9 @@ void shard_connection::disconnect()
     // Discarded workload requests will never be processed, so uncount them
     // from the client's generated total; leaving them counted holds the
     // pipeline (--reconnect-interval, cluster in-flight budget) and stalls
-    // --requests runs once the connection comes back.
+    // --requests runs once the connection comes back. Requests held for retry
+    // are not counted as processed until their final outcome, so every
+    // workload request dropped here is uncounted the same way.
     unsigned long long dropped = 0;
     if (m_config->retry_on_error && m_replay_queue != NULL) {
         while (m_pending_resp) {
@@ -578,6 +580,7 @@ void shard_connection::disconnect()
                 if (req->m_serialized && req->m_serialized_len > 0) {
                     m_replay_queue->push(req);
                 } else {
+                    dropped++;
                     delete req;
                 }
             }
@@ -908,6 +911,9 @@ void shard_connection::handle_retry_drain_event()
 void shard_connection::drain_replay_queue_after_reconnect()
 {
     if (!m_replay_queue) return;
+    // Replayed requests are not yet counted as processed; uncount the ones
+    // dropped here so they don't hold the pipeline or a --requests run.
+    unsigned long long dropped = 0;
     while (!m_replay_queue->empty()) {
         request *req = m_replay_queue->front();
         m_replay_queue->pop();
@@ -917,6 +923,7 @@ void shard_connection::drain_replay_queue_after_reconnect()
             gettimeofday(&now, NULL);
             global_failed_keys_logger().log_failure(now, "REPLAY", req->m_key, req->m_key_len, "connection-dropped",
                                                     req->m_retries);
+            dropped++;
             delete req;
             continue;
         }
@@ -926,11 +933,13 @@ void shard_connection::drain_replay_queue_after_reconnect()
             gettimeofday(&now, NULL);
             global_failed_keys_logger().log_failure(now, "REPLAY", req->m_key, req->m_key_len,
                                                     "no-captured-bytes-for-replay", req->m_retries);
+            dropped++;
             delete req;
             continue;
         }
         replay_request(req);
     }
+    if (dropped) m_conns_manager->dec_reqs_generated(dropped);
 }
 
 bool shard_connection::is_conn_setup_done()
@@ -1254,7 +1263,14 @@ void shard_connection::process_response(void)
                                 r->get_status(), r->get_hits(), req->m_keys - r->get_hits());
 
             m_conns_manager->handle_response(m_id, now, req, r);
-            m_conns_manager->inc_reqs_processed();
+            // A request claimed for retry is still outstanding: it is counted
+            // as processed once, when its final attempt completes. Only counted
+            // responses move processed, so only they can reach a
+            // --reconnect-interval boundary below.
+            if (!req->m_claimed_by_retry) {
+                m_conns_manager->inc_reqs_processed();
+                responses_handled = true;
+            }
             // First *successful* post-setup response observed: tell the
             // supervisor we reached steady state. Idempotent.
             //
@@ -1284,7 +1300,6 @@ void shard_connection::process_response(void)
                 snprintf(buf, sizeof(buf), "server error: %s", r->get_status() ? r->get_status() : "");
                 report_connection_stage_failure(buf);
             }
-            responses_handled = true;
             break;
         }
         // The retry path may have claimed ownership of req for resend; in that
