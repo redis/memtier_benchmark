@@ -2668,6 +2668,8 @@ void usage()
         "      --retry-on-error           Resend a request when the server returns a transient error or the\n"
         "                                 connection drops mid-flight. Excludes permanent errors (WRONGTYPE,\n"
         "                                 NOAUTH, NOPERM, syntax/argcount/unknown-command). Default: disabled.\n"
+        "                                 A retried request counts once toward --requests, when it succeeds\n"
+        "                                 or runs out of retries.\n"
         "      --max-retries=N            Maximum retries per request when --retry-on-error is set.\n"
         "                                 -1 = unlimited (default), 0 = disable retries even with the master\n"
         "                                 switch on, N>0 = bounded. MOVED/ASK redirects count toward this.\n"

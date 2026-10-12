@@ -886,6 +886,12 @@ bool shard_connection::enqueue_retry(request *req)
 void shard_connection::replay_request(request *req)
 {
     if (!req || !req->m_serialized || !m_bev) return;
+    // fill_pipeline pauses an idle connection, e.g. once the last request of
+    // a --requests run is out and only this retry is left to answer.
+    if (m_bev_paused) {
+        bufferevent_enable(m_bev, EV_READ | EV_WRITE);
+        m_bev_paused = false;
+    }
     struct evbuffer *out = bufferevent_get_output(m_bev);
     evbuffer_add(out, req->m_serialized, req->m_serialized_len);
     gettimeofday(&req->m_sent_time, NULL);

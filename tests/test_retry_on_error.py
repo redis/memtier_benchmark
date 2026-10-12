@@ -258,7 +258,8 @@ def test_retried_requests_are_counted_once(env):
     conn = env.getOSSMasterNodesConnectionList()[0]
     conn.execute_command("FLUSHALL")
     saved = conn.execute_command("CONFIG", "GET", "maxmemory*")
-    saved = dict(zip(saved[0::2], saved[1::2]))
+    # Keys come back as bytes without decoded responses.
+    saved = {k.decode() if isinstance(k, bytes) else k: v for k, v in zip(saved[0::2], saved[1::2])}
     conn.execute_command("CONFIG", "SET", "maxmemory-policy", "noeviction")
     conn.execute_command("CONFIG", "RESETSTAT")
 
@@ -284,6 +285,66 @@ def test_retried_requests_are_counted_once(env):
     with open("{0}/mb.json".format(config.results_dir)) as f:
         results = json.load(f)
     env.assertEqual(results["ALL STATS"]["Sets"]["Count"], requests)
+
+
+def test_retry_after_last_request_is_sent(env):
+    """
+    A request retried after every request of a --requests run has been sent
+    still goes out.
+
+    Once nothing was left to send, the client paused its connection while it
+    waited for the retry, and the replay was written to the paused
+    connection, never sent: the run failed with "client(s) stopped before
+    reaching their stop condition".
+    """
+    # Toggles maxmemory on one server; the key layout assumes a single shard.
+    env.skipOnCluster()
+    requests = 5
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--pipeline=1",
+            "--ratio=1:0",
+            "--key-pattern=P:P",
+            "--key-minimum=1",
+            "--key-maximum={}".format(requests),
+            "--retry-on-error",
+            "--hide-histogram",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=1, clients=1, requests=requests)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+    test_dir = tempfile.mkdtemp()
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+
+    conn = env.getOSSMasterNodesConnectionList()[0]
+    conn.execute_command("FLUSHALL")
+    saved = conn.execute_command("CONFIG", "GET", "maxmemory*")
+    # Keys come back as bytes without decoded responses.
+    saved = {k.decode() if isinstance(k, bytes) else k: v for k, v in zip(saved[0::2], saved[1::2])}
+    conn.execute_command("CONFIG", "SET", "maxmemory-policy", "noeviction")
+    # Every SET fails with a retryable -OOM until the window below ends, so
+    # the last request is retried after all of them were sent.
+    conn.execute_command("CONFIG", "SET", "maxmemory", "1")
+
+    def oom_window(_proc):
+        time.sleep(1)
+        conn.execute_command("CONFIG", "SET", "maxmemory", "0")
+
+    try:
+        rc, _ = _run_with_background(env, benchmark, config, oom_window, timeout=60)
+    finally:
+        for k in ("maxmemory", "maxmemory-policy"):
+            if k in saved:
+                conn.execute_command("CONFIG", "SET", k, saved[k])
+
+    env.assertEqual(rc, 0)
+    env.assertEqual(conn.execute_command("DBSIZE"), requests,
+                    message="a retried SET was never sent")
 
 
 def test_dropped_replays_do_not_stall_client(env):
