@@ -76,9 +76,11 @@ void one_sec_cmd_stats::merge(const one_sec_cmd_stats &other)
     m_min_latency = other.m_min_latency < m_min_latency ? other.m_min_latency : m_min_latency;
 }
 
-void one_sec_cmd_stats::summarize_quantiles(safe_hdr_histogram histogram, std::vector<double> sorted_quantiles)
+void one_sec_cmd_stats::summarize_quantiles(const hdr_histogram *histogram, const std::vector<double> &sorted_quantiles,
+                                            std::vector<int64_t> &values)
 {
-    std::vector<int64_t> values(sorted_quantiles.size());
+    if (sorted_quantiles.empty()) return;
+    values.resize(sorted_quantiles.size());
     int result = hdr_value_at_percentiles(histogram, sorted_quantiles.data(), values.data(), sorted_quantiles.size());
     if (result != 0) {
         return;

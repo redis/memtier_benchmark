@@ -98,8 +98,11 @@ public:
      * @param histogram The histogram from which quantile values are extracted.
      * @param sorted_quantiles A sorted (ascending order) vector of quantiles for which values will be computed.
      *                         The caller must ensure the vector is sorted from smallest to largest.
+     * @param values Reusable scratch, shared across a client's sequential command summaries.
+     *               Batch p0/empty semantics are retained for existing per-second history.
      */
-    void summarize_quantiles(safe_hdr_histogram histogram, std::vector<double> sorted_quantiles);
+    void summarize_quantiles(const hdr_histogram *histogram, const std::vector<double> &sorted_quantiles,
+                             std::vector<int64_t> &values);
     void update_op(unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency);
     void update_op(unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency, unsigned int hits,
                    unsigned int misses);

@@ -24,6 +24,8 @@
 #include <vector>
 
 #include "latency_histogram.h"
+#include "latency_percentiles.h"
+#include "run_stats_types.h"
 #include "deps/hdr_histogram/hdr_histogram_log.h"
 
 static int failures = 0;
@@ -139,11 +141,73 @@ static void test_codec_and_percentiles()
     hdr_close(expected);
 }
 
+static void test_batched_scalar_compatibility()
+{
+    hdr_histogram *h = new_histogram();
+    const std::vector<double> quantiles = {100, 0, 99.999999, 50, 99, 50, 0, 0.001, 99.9};
+    latency_percentiles query(quantiles);
+    const int64_t *storage = query.values().data();
+    for (int population = 0; population < 4; ++population) {
+        hdr_reset(h);
+        if (population == 1) CHECK(memtier_record_latency(h, 10));
+        if (population == 2) {
+            CHECK(hdr_record_values(h, 10, 999));
+            CHECK(hdr_record_values(h, 600000000, 1));
+        }
+        if (population == 3) {
+            for (int i = 0; i < h->counts_len; ++i) {
+                const int64_t value = hdr_value_at_index(h, i);
+                if (value <= h->highest_trackable_value) CHECK(hdr_record_values(h, value, 1 + (i * 17) % 101));
+            }
+        }
+        const int64_t count = hdr_total_count(h);
+        for (int repeat = 0; repeat < 3; ++repeat) {
+            const std::vector<int64_t> &values = query.calculate(h);
+            CHECK(values.data() == storage);
+            CHECK(values.size() == quantiles.size());
+            for (size_t i = 0; i < quantiles.size(); ++i)
+                CHECK(values[i] == hdr_value_at_percentile(h, quantiles[i]));
+            CHECK(hdr_total_count(h) == count);
+        }
+    }
+    latency_percentiles none(std::vector<double>{});
+    CHECK(none.calculate(h).empty());
+    hdr_close(h);
+}
+
+static void test_summary_scratch_reuse()
+{
+    safe_hdr_histogram h;
+    one_sec_cmd_stats stats;
+    const std::vector<double> quantiles = {0, 50, 99.9, 100};
+    std::vector<int64_t> scratch;
+    for (int tick = 0; tick < 3; ++tick) {
+        hdr_reset(h);
+        stats.reset();
+        if (tick != 1) CHECK(memtier_record_latency(h, 10 + tick * 10000));
+        int64_t expected[4];
+        CHECK(hdr_value_at_percentiles(h, quantiles.data(), expected, 4) == 0);
+        stats.summarize_quantiles(h, quantiles, scratch);
+        CHECK(stats.summarized_quantile_values.size() == 4);
+        for (size_t i = 0; i < 4; ++i)
+            CHECK(stats.summarized_quantile_values[i] == expected[i] / 1000.0);
+        const int64_t *storage = scratch.data();
+        stats.reset();
+        stats.summarize_quantiles(h, quantiles, scratch);
+        CHECK(scratch.data() == storage);
+    }
+    stats.reset();
+    stats.summarize_quantiles(h, std::vector<double>{}, scratch);
+    CHECK(stats.summarized_quantile_values.empty());
+}
+
 int main()
 {
     test_clamping();
     test_atomic_recording();
     test_codec_and_percentiles();
+    test_batched_scalar_compatibility();
+    test_summary_scratch_reuse();
     if (failures) fprintf(stderr, "%d HDR compatibility checks failed\n", failures);
     return failures ? 1 : 0;
 }

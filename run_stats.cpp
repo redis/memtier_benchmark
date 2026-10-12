@@ -34,6 +34,7 @@
 #endif
 
 #include "run_stats.h"
+#include "latency_percentiles.h"
 #include "latency_histogram.h"
 #include "prometheus_metrics.h" // prom::hdr_add_positive_delta (pure layer, always linked)
 
@@ -178,12 +179,13 @@ void run_stats::set_end_time(struct timeval *end_time)
 
 void run_stats::summarize_current_second()
 {
-    m_cur_stats.m_get_cmd.summarize_quantiles(inst_m_get_latency_histogram, quantiles_list);
-    m_cur_stats.m_set_cmd.summarize_quantiles(inst_m_set_latency_histogram, quantiles_list);
-    m_cur_stats.m_wait_cmd.summarize_quantiles(inst_m_wait_latency_histogram, quantiles_list);
-    m_cur_stats.m_total_cmd.summarize_quantiles(inst_m_totals_latency_histogram, quantiles_list);
+    m_cur_stats.m_get_cmd.summarize_quantiles(inst_m_get_latency_histogram, quantiles_list, m_quantile_values);
+    m_cur_stats.m_set_cmd.summarize_quantiles(inst_m_set_latency_histogram, quantiles_list, m_quantile_values);
+    m_cur_stats.m_wait_cmd.summarize_quantiles(inst_m_wait_latency_histogram, quantiles_list, m_quantile_values);
+    m_cur_stats.m_total_cmd.summarize_quantiles(inst_m_totals_latency_histogram, quantiles_list, m_quantile_values);
     for (unsigned int i = 0; i < m_cur_stats.m_ar_commands.size(); i++) {
-        m_cur_stats.m_ar_commands[i].summarize_quantiles(inst_m_ar_commands_latency_histograms[i], quantiles_list);
+        m_cur_stats.m_ar_commands[i].summarize_quantiles(inst_m_ar_commands_latency_histograms[i], quantiles_list,
+                                                         m_quantile_values);
         hdr_reset(inst_m_ar_commands_latency_histograms[i]);
     }
     hdr_reset(inst_m_get_latency_histogram);
@@ -1261,9 +1263,9 @@ static void format_percentile_key(char *buf, size_t bufsize, double quantile, co
 void result_print_to_json(json_handler *jsonhandler, const char *type, double ops_sec, double hits, double miss,
                           double moved, double ask, double kbs, double kbs_rx, double kbs_tx, double latency,
                           long long m_total_latency, long long ops, double connection_errors_sec,
-                          long long connection_errors, std::vector<double> quantile_list,
-                          struct hdr_histogram *latency_histogram, std::vector<unsigned int> timestamps,
-                          std::vector<one_sec_cmd_stats> timeserie_stats, double aborts = -1.0)
+                          long long connection_errors, const std::vector<double> &quantile_list,
+                          struct hdr_histogram *latency_histogram, const std::vector<unsigned int> &timestamps,
+                          const std::vector<one_sec_cmd_stats> &timeserie_stats, double aborts = -1.0)
 {
     if (jsonhandler != NULL) { // Added for double verification in case someone accidently send NULL.
         jsonhandler->open_nesting(type);
@@ -1330,12 +1332,13 @@ void result_print_to_json(json_handler *jsonhandler, const char *type, double op
         }
         jsonhandler->close_nesting();
         jsonhandler->open_nesting("Percentile Latencies");
+        latency_percentiles query(quantile_list);
+        const std::vector<int64_t> &values = query.calculate(latency_histogram);
         for (std::size_t i = 0; i < quantile_list.size(); i++) {
             const double quantile = quantile_list[i];
             char quantile_header[32];
             format_percentile_key(quantile_header, sizeof(quantile_header), quantile, "p%.3f");
-            const double value =
-                hdr_value_at_percentile(latency_histogram, quantile) / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
+            const double value = values[i] / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
             jsonhandler->write_obj((char *) quantile_header, "%.3f", value);
         }
         jsonhandler->open_nesting("Histogram log format");
@@ -1780,81 +1783,70 @@ void run_stats::print_avg_latency_column(output_table &table,
     table.add_column(column);
 }
 
-void run_stats::print_quantile_latency_column(output_table &table, double quantile, char *label,
-                                              const std::vector<aggregated_command_type_stats> *aggregated)
+void run_stats::print_quantile_latency_columns(output_table &table, const std::vector<double> &quantiles,
+                                               const std::vector<aggregated_command_type_stats> *aggregated)
 {
-    table_el el;
+    if (quantiles.empty()) return;
+    safe_hdr_histogram total;
+    hdr_add(total, m_set_latency_histogram);
+    hdr_add(total, m_get_latency_histogram);
+    hdr_add(total, m_wait_latency_histogram);
 
-    // Auto-size the column to fit the label (e.g. "p99.999999 Latency" is 18
-    // chars). Floor at 15 preserves alignment for the common p50/p99/p99.9
-    // case, which is exactly 15 wide. Without this, long deep-tail percentile
-    // headers spill into adjacent columns and break the table separators.
-    size_t label_len = (label != NULL) ? strlen(label) : 0;
-    unsigned int col_w = (unsigned int) (label_len > 15 ? label_len : 15);
-    table_column column(col_w);
-
-    char str_fmt[16], dbl_fmt[16], dashes[64];
-    snprintf(str_fmt, sizeof(str_fmt), "%%%us ", col_w);
-    snprintf(dbl_fmt, sizeof(dbl_fmt), "%%%u.05f ", col_w);
-    size_t dash_len = (size_t) col_w + 1;
-    if (dash_len >= sizeof(dashes)) dash_len = sizeof(dashes) - 1;
-    memset(dashes, '-', dash_len);
-    dashes[dash_len] = '\0';
-
-    safe_hdr_histogram m_totals_latency_histogram;
-    hdr_add(m_totals_latency_histogram, m_set_latency_histogram);
-    hdr_add(m_totals_latency_histogram, m_get_latency_histogram);
-    hdr_add(m_totals_latency_histogram, m_wait_latency_histogram);
-
-    column.elements.push_back(*el.init_str(str_fmt, label));
-    column.elements.push_back(*el.init_str("%s", dashes));
-
-    if (print_arbitrary_commands_results()) {
+    std::vector<const hdr_histogram *> histograms;
+    const bool arbitrary = print_arbitrary_commands_results();
+    if (arbitrary) {
         if (aggregated != nullptr) {
             for (const auto &agg : *aggregated) {
-                column.elements.push_back(*el.init_double(dbl_fmt, hdr_value_at_percentile(agg.latency_hist, quantile) /
-                                                                       (double) LATENCY_HDR_RESULTS_MULTIPLIER));
-                hdr_add(m_totals_latency_histogram, agg.latency_hist);
+                histograms.push_back(agg.latency_hist);
+                hdr_add(total, agg.latency_hist);
             }
         } else {
-            for (unsigned int i = 0; i < m_totals.m_ar_commands.size(); i++) {
-                column.elements.push_back(
-                    *el.init_double(dbl_fmt, hdr_value_at_percentile(m_ar_commands_latency_histograms[i], quantile) /
-                                                 (double) LATENCY_HDR_RESULTS_MULTIPLIER));
-                hdr_add(m_totals_latency_histogram, m_ar_commands_latency_histograms[i]);
+            for (unsigned int i = 0; i < m_totals.m_ar_commands.size(); ++i) {
+                histograms.push_back(m_ar_commands_latency_histograms[i]);
+                hdr_add(total, m_ar_commands_latency_histograms[i]);
             }
         }
     } else {
-        const bool has_set_ops = hdr_total_count(m_set_latency_histogram) > 0;
-        const bool has_get_ops = hdr_total_count(m_get_latency_histogram) > 0;
-        const bool has_wait_ops = hdr_total_count(m_wait_latency_histogram) > 0;
-        if (has_set_ops) {
-            column.elements.push_back(
-                *el.init_double(dbl_fmt, hdr_value_at_percentile(m_set_latency_histogram, quantile) /
-                                             (double) LATENCY_HDR_RESULTS_MULTIPLIER));
-        } else {
-            column.elements.push_back(*el.init_str(str_fmt, "---"));
-        }
-        if (has_get_ops) {
-            column.elements.push_back(
-                *el.init_double(dbl_fmt, hdr_value_at_percentile(m_get_latency_histogram, quantile) /
-                                             (double) LATENCY_HDR_RESULTS_MULTIPLIER));
-        } else {
-            column.elements.push_back(*el.init_str(str_fmt, "---"));
-        }
-        if (has_wait_ops) {
-            column.elements.push_back(
-                *el.init_double(dbl_fmt, hdr_value_at_percentile(m_wait_latency_histogram, quantile) /
-                                             (double) LATENCY_HDR_RESULTS_MULTIPLIER));
-        } else {
-            column.elements.push_back(*el.init_str(str_fmt, "---"));
-        }
+        histograms.push_back(m_set_latency_histogram);
+        histograms.push_back(m_get_latency_histogram);
+        histograms.push_back(m_wait_latency_histogram);
     }
+    histograms.push_back(total);
 
-    column.elements.push_back(*el.init_double(dbl_fmt, hdr_value_at_percentile(m_totals_latency_histogram, quantile) /
-                                                           (double) LATENCY_HDR_RESULTS_MULTIPLIER));
-
-    table.add_column(column);
+    // One scan per row and one totals merge for the entire percentile table.
+    latency_percentiles query(quantiles);
+    std::vector<std::vector<int64_t> > values;
+    for (size_t row = 0; row < histograms.size(); ++row) {
+        if (!arbitrary && row + 1 < histograms.size() && hdr_total_count(histograms[row]) == 0)
+            values.emplace_back(); // These rows display dashes, with no percentile lookup.
+        else
+            values.push_back(query.calculate(histograms[row]));
+    }
+    for (size_t i = 0; i < quantiles.size(); ++i) {
+        char label[50];
+        // Preserve deep-tail names and configured column ordering.
+        snprintf(label, sizeof(label) - 1, "p%.10g Latency", quantiles[i]);
+        unsigned int col_w = (unsigned int) std::max<size_t>(strlen(label), 15);
+        table_column column(col_w);
+        table_el el;
+        char str_fmt[16], dbl_fmt[16], dashes[64];
+        snprintf(str_fmt, sizeof(str_fmt), "%%%us ", col_w);
+        snprintf(dbl_fmt, sizeof(dbl_fmt), "%%%u.05f ", col_w);
+        size_t dash_len = std::min<size_t>(col_w + 1, sizeof(dashes) - 1);
+        memset(dashes, '-', dash_len);
+        dashes[dash_len] = '\0';
+        column.elements.push_back(*el.init_str(str_fmt, label));
+        column.elements.push_back(*el.init_str("%s", dashes));
+        for (size_t row = 0; row < histograms.size(); ++row) {
+            if (!arbitrary && row + 1 < histograms.size() && hdr_total_count(histograms[row]) == 0) {
+                column.elements.push_back(*el.init_str(str_fmt, "---"));
+            } else {
+                column.elements.push_back(
+                    *el.init_double(dbl_fmt, values[row][i] / (double) LATENCY_HDR_RESULTS_MULTIPLIER));
+            }
+        }
+        table.add_column(column);
+    }
 }
 
 void run_stats::print_kb_sec_column(output_table &table, const std::vector<aggregated_command_type_stats> *aggregated)
@@ -2377,16 +2369,7 @@ void run_stats::print(FILE *out, benchmark_config *config, const char *header /*
     // Latency column
     print_avg_latency_column(table, aggregated_ptr);
 
-    for (std::size_t i = 0; i < config->print_percentiles.quantile_list.size(); i++) {
-        double quantile = config->print_percentiles.quantile_list[i];
-        char average_header[50];
-        // %.10g preserves the user's quantile precision up to 10 significant
-        // digits without rounding tail values (e.g. 99.99999) up to 100. The
-        // previous %.*f formatter capped at 3 fractional digits and silently
-        // rounded any deeper percentile, producing duplicate "p100" columns.
-        snprintf(average_header, sizeof(average_header) - 1, "p%.10g Latency", quantile);
-        print_quantile_latency_column(table, quantile, (char *) average_header, aggregated_ptr);
-    }
+    print_quantile_latency_columns(table, config->print_percentiles.quantile_list, aggregated_ptr);
 
     // KB/sec column
     print_kb_sec_column(table, aggregated_ptr);

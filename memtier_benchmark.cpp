@@ -103,6 +103,7 @@ static bool bitmask_is_contiguous(unsigned int mask);
 #include "obj_gen.h"
 #include "memtier_benchmark.h"
 #include "run_stats_types.h"
+#include "latency_percentiles.h"
 #include "retry_policy.h"
 #include "statsd.h"
 #include "prometheus_metrics.h"
@@ -3299,8 +3300,8 @@ static void print_staircase_pattern(int run_id, benchmark_config *cfg)
 // route through gauge(long long) ("%lld"|g) exactly as before, while progress_pct is
 // `double` (gauge(double), "%.6f"|g) and the latencies go through timing(double)
 // ("%.3f"|ms). The >0 send condition for connection_errors is unchanged.
-static void statsd_publish_tick(statsd_client *statsd, const metrics_snapshot &snap, hdr_histogram *inst_hist_agg,
-                                const std::vector<double> &quantiles)
+static void statsd_publish_tick(statsd_client *statsd, const metrics_snapshot &snap, bool has_samples,
+                                const std::vector<double> &quantiles, const std::vector<int64_t> &values)
 {
     statsd->gauge("ops_sec", snap.cur_ops_sec);
     statsd->gauge("ops_sec_avg", snap.avg_ops_sec);
@@ -3316,10 +3317,10 @@ static void statsd_publish_tick(statsd_client *statsd, const metrics_snapshot &s
 
     // Send percentile metrics derived from the aggregated instantaneous
     // histogram (allocated by the caller; shared with the TUI renderer when enabled).
-    if (inst_hist_agg != NULL && hdr_total_count(inst_hist_agg) > 0) {
+    if (has_samples) {
         for (std::size_t i = 0; i < quantiles.size(); i++) {
             double percentile = quantiles[i];
-            int64_t value = hdr_value_at_percentile(inst_hist_agg, percentile);
+            int64_t value = values[i];
             double value_ms = value / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
 
             // Format the metric name (e.g., "latency_p50", "latency_p99", "latency_p99_9",
@@ -3534,6 +3535,14 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         hdr_init(LATENCY_HDR_MIN_VALUE, LATENCY_HDR_SEC_MAX_VALUE, LATENCY_HDR_SEC_SIGDIGTS, &rtl_totals_hist);
     }
 
+    // Keep query scratch across ticks and share instantaneous values with StatsD.
+    const std::vector<double> no_quantiles;
+    const bool live_percentiles_enabled = cfg->realtime_latencies || (cfg->statsd != NULL && cfg->statsd->is_enabled());
+    const std::vector<double> &live_quantiles =
+        live_percentiles_enabled ? cfg->print_percentiles.quantile_list : no_quantiles;
+    latency_percentiles inst_percentiles(live_quantiles);
+    latency_percentiles overall_percentiles(cfg->realtime_latencies ? live_quantiles : no_quantiles);
+
     // Live (advisory) per-second CPU sampler. The main thread reads each worker's
     // CPU clock without perturbing it, so this adds no overhead to the workers.
     // Feeds the per-second JSON detail, the de-duped live high-CPU warning, and
@@ -3704,6 +3713,10 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             }
         }
 
+        bool inst_samples = inst_hist_agg != NULL && hdr_total_count(inst_hist_agg) > 0;
+        if (inst_samples) inst_percentiles.calculate(inst_hist_agg);
+        const std::vector<int64_t> &inst_values = inst_percentiles.values();
+
         if (cfg->realtime_latencies) {
             // Two-line, time-series-friendly block. On a TTY we move the cursor
             // back up 2 lines so the block redraws in place; on a non-TTY (file
@@ -3797,19 +3810,19 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             size_t num_latency_lines = quantiles.empty() ? 1 : ((quantiles.size() + kPctPerLine - 1) / kPctPerLine);
             std::vector<std::string> lat_chunks(num_latency_lines);
             bool any_samples = (rtl_totals_hist != NULL && hdr_total_count(rtl_totals_hist) > 0);
-            bool cur_samples = (inst_hist_agg != NULL && hdr_total_count(inst_hist_agg) > 0);
+            bool cur_samples = inst_samples;
+            const std::vector<int64_t> *overall_values =
+                any_samples ? &overall_percentiles.calculate(rtl_totals_hist) : NULL;
             for (std::size_t i = 0; i < quantiles.size(); i++) {
                 char cur_p[16], avg_p[16];
                 if (cur_samples) {
-                    double ms =
-                        hdr_value_at_percentile(inst_hist_agg, quantiles[i]) / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
+                    double ms = inst_values[i] / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
                     snprintf(cur_p, sizeof(cur_p), "%6.3f", ms);
                 } else {
                     snprintf(cur_p, sizeof(cur_p), "   -  ");
                 }
                 if (any_samples) {
-                    double ms = hdr_value_at_percentile(rtl_totals_hist, quantiles[i]) /
-                                (double) LATENCY_HDR_RESULTS_MULTIPLIER;
+                    double ms = (*overall_values)[i] / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
                     snprintf(avg_p, sizeof(avg_p), "%6.3f", ms);
                 } else {
                     snprintf(avg_p, sizeof(avg_p), "   -  ");
@@ -3903,7 +3916,7 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             snap.avg_latency_ms = avg_latency;
             snap.run_connection_errors = total_connection_errors; // RAW per-run (Decisions #11)
             if (prom_enabled(cfg)) prom_observe_and_fill(cfg, threads, snap);
-            if (statsd_on) statsd_publish_tick(cfg->statsd, snap, inst_hist_agg, cfg->print_percentiles.quantile_list);
+            if (statsd_on) statsd_publish_tick(cfg->statsd, snap, inst_samples, live_quantiles, inst_values);
             if (prom_enabled(cfg)) prom_publish_tick(cfg, snap, threads); // gated walk + publish (PLAN 3.7)
         }
 

@@ -173,6 +173,8 @@ protected:
 
     std::list<one_second_stats> m_stats;
     std::vector<double> quantiles_list;
+    // Scratch shared by this client's sequential per-command summaries. Never stored in history.
+    std::vector<int64_t> m_quantile_values;
 
     // current second stats ( appended to m_stats and reset every second )
     one_second_stats m_cur_stats;
@@ -394,8 +396,8 @@ public:
                               const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
     void print_avg_latency_column(output_table &table,
                                   const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
-    void print_quantile_latency_column(output_table &table, double quantile, char *label,
-                                       const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
+    void print_quantile_latency_columns(output_table &table, const std::vector<double> &quantiles,
+                                        const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
     void print_kb_sec_column(output_table &table,
                              const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
     void print_json(json_handler *jsonhandler, arbitrary_command_list &command_list, bool cluster_mode,

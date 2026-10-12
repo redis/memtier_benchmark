@@ -48,7 +48,7 @@ memtier_benchmark_SOURCES = \
 	client.cpp client.h \
 	cluster_client.cpp cluster_client.h \
 	shard_connection.cpp shard_connection.h connections_manager.h \
-	run_stats_types.cpp run_stats_types.h \
+	run_stats_types.cpp run_stats_types.h latency_percentiles.h \
 	run_stats.cpp run_stats.h latency_histogram.h \
 	JSON_handler.cpp JSON_handler.h \
 	protocol.cpp protocol.h libmemcached_protocol/binary.h libmemcached_protocol/vbucket.h \
@@ -101,7 +101,8 @@ socket_options_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g $(SOCKET_TEST_EXT
 # Reuse the real client RTTI for UBSan; the test supplies main and shard_connection.
 socket_options_test_LDADD = $(filter-out memtier_benchmark-memtier_benchmark.$(OBJEXT) \
     memtier_benchmark-shard_connection.$(OBJEXT),$(memtier_benchmark_OBJECTS)) $(memtier_benchmark_LDADD)
-hdr_histogram_test_SOURCES = tests/unit/hdr_histogram_test.cpp latency_histogram.h \
+hdr_histogram_test_SOURCES = tests/unit/hdr_histogram_test.cpp latency_histogram.h latency_percentiles.h \
+    run_stats_types.cpp run_stats_types.h \
     deps/hdr_histogram/hdr_histogram.c deps/hdr_histogram/hdr_histogram.h \
     deps/hdr_histogram/hdr_histogram_log.c deps/hdr_histogram/hdr_histogram_log.h \
     deps/hdr_histogram/hdr_encoding.c deps/hdr_histogram/hdr_time.c \
