@@ -1825,7 +1825,7 @@ void run_stats::print_quantile_latency_columns(output_table &table, const std::v
     for (size_t i = 0; i < quantiles.size(); ++i) {
         char label[50];
         // Preserve deep-tail names and configured column ordering.
-        snprintf(label, sizeof(label) - 1, "p%.10g Latency", quantiles[i]);
+        snprintf(label, sizeof(label), "p%.10g Latency", quantiles[i]);
         unsigned int col_w = (unsigned int) std::max<size_t>(strlen(label), 15);
         table_column column(col_w);
         table_el el;
@@ -1838,7 +1838,7 @@ void run_stats::print_quantile_latency_columns(output_table &table, const std::v
         column.elements.push_back(*el.init_str(str_fmt, label));
         column.elements.push_back(*el.init_str("%s", dashes));
         for (size_t row = 0; row < histograms.size(); ++row) {
-            if (!arbitrary && row + 1 < histograms.size() && hdr_total_count(histograms[row]) == 0) {
+            if (values[row].empty()) {
                 column.elements.push_back(*el.init_str(str_fmt, "---"));
             } else {
                 column.elements.push_back(

@@ -107,7 +107,8 @@ hdr_histogram_test_SOURCES = tests/unit/hdr_histogram_test.cpp latency_histogram
     deps/hdr_histogram/hdr_histogram_log.c deps/hdr_histogram/hdr_histogram_log.h \
     deps/hdr_histogram/hdr_encoding.c deps/hdr_histogram/hdr_time.c \
     deps/hdr_histogram/hdr_time.h deps/hdr_histogram/hdr_malloc.h
-hdr_histogram_test_CPPFLAGS = -I$(srcdir)
+# run_stats_types includes the TLS-aware benchmark config; honor non-system OpenSSL paths.
+hdr_histogram_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
 hdr_histogram_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 TESTS = $(check_PROGRAMS)
 

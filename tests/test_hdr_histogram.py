@@ -74,9 +74,16 @@ def test_hdr_json_and_log_exports_agree(env):
 
 
 def _percentile_from_v2(raw, percentile):
-    """Independent rank lookup in the unrotated, two-digit V2 histogram."""
+    """Independent rank lookup using the geometry recorded in the V2 header."""
+    header_format = ">IIiiqqd"
+    header_size = struct.calcsize(header_format)
+    _, _, offset, digits, lowest, _, _ = struct.unpack(header_format, raw[:header_size])
+    assert offset == 0 and lowest > 0
+    unit_magnitude = lowest.bit_length() - 1
+    half_magnitude = (2 * 10 ** digits - 1).bit_length() - 1
+    half_count = 1 << half_magnitude
     counts, index, word, shift = [], 0, 0, 0
-    for byte in raw[40:]:
+    for byte in raw[header_size:]:
         word |= (byte & 0x7f) << shift
         if byte & 0x80:
             shift += 7
@@ -95,13 +102,13 @@ def _percentile_from_v2(raw, percentile):
         cumulative += count
         if cumulative < rank:
             continue
-        # hdr_init(10, 600000000, 2): unit magnitude 3, half-bucket count 128.
-        bucket, sub_bucket = (index >> 7) - 1, (index & 127) + 128
+        bucket = (index >> half_magnitude) - 1
+        sub_bucket = (index & (half_count - 1)) + half_count
         if bucket < 0:
-            bucket, sub_bucket = 0, sub_bucket - 128
-        low = sub_bucket << (bucket + 3)
-        return low if percentile == 0 else low + (1 << (bucket + 3)) - 1
-    return 0 if percentile == 0 else 7
+            bucket, sub_bucket = 0, sub_bucket - half_count
+        low = sub_bucket << (bucket + unit_magnitude)
+        return low if percentile == 0 else low + (1 << (bucket + unit_magnitude)) - 1
+    return 0 if percentile == 0 else (1 << unit_magnitude) - 1
 
 
 def test_percentile_values_match_encoded_distribution_and_table(env):
