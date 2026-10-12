@@ -20,6 +20,8 @@
 #define HDR_TRAILING_ZEROS_INVALID -29992
 #define HDR_VALUE_TRUNCATED -29991
 #define HDR_ENCODED_INPUT_TOO_LONG -29990
+#define HDR_INVALID_WORD_SIZE -29989
+#define HDR_NEGATIVE_COUNT_INVALID -29988
 
 #define HDR_LOG_TAG_MAX_BUFFER_LEN (1024)
 
@@ -140,23 +142,6 @@ int hdr_log_write_entry(
     struct hdr_log_entry* entry,
     struct hdr_histogram* histogram);
 
-/**
- * Write an hdr_histogram entry to the string.  It will be encoded in a similar
- * fashion to the approach used by the Java version of the HdrHistogram.
- * where <histogram> is the binary histogram gzip compressed and base64 encoded.
- *
- * @param writer 'This' pointer
- * @param encoded_histogram The string to write the entry to.
- * @param histogram The histogram to encode and log.
- * @return Will return 0 if it successfully completed or an error number if there
- * was a failure.  Errors include HDR_DEFLATE_INIT_FAIL, HDR_DEFLATE_FAIL if
- * something when wrong during gzip compression.  ENOMEM if we failed to allocate
- * or reallocate the buffer used for encoding (out of memory problem). 
- */
-int hdr_string_write(
-        char** encoded_histogram,
-        struct hdr_histogram *histogram);
-        
 struct hdr_log_reader
 {
     int major_version;
@@ -178,7 +163,8 @@ int hdr_log_reader_init(struct hdr_log_reader* reader);
  *
  * @param hdr_log_reader 'This' pointer
  * @param file The data stream to read from.
- * @return 0 on success.  An error number on failure.
+ * @return 0 on success.  An error number on failure, including -EINVAL or
+ * -ERANGE when the StartTime is not finite or does not fit the timestamp type.
  */
 int hdr_log_read_header(struct hdr_log_reader* reader, FILE* file);
 

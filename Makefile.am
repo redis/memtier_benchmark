@@ -21,7 +21,8 @@ CODE_COVERAGE_IGNORE_PATTERN='*/deps/hdr_histogram/*'
 EXTRA_DIST = README.md COPYING version.sh \
 	scripts/fetch_commands_meta.sh \
 	scripts/gen_command_meta.py \
-	deps/commands_json/REDIS_TAG.txt
+	deps/commands_json/REDIS_TAG.txt \
+	deps/hdr_histogram/README.md deps/hdr_histogram/SHA256SUMS
 
 # Generate version.h before building
 BUILT_SOURCES = version.h
@@ -32,7 +33,7 @@ version.h:
 
 bin_PROGRAMS = memtier_benchmark
 completionsdir=$(BASH_COMPLETION_DIR)
-completions_DATA=bash-completion/memtier_benchmark
+dist_completions_DATA=bash-completion/memtier_benchmark
 
 memtier_benchmark_CPPFLAGS = \
 	$(CODE_COVERAGE_CFLAGS) \
@@ -48,9 +49,9 @@ memtier_benchmark_SOURCES = \
 	cluster_client.cpp cluster_client.h \
 	shard_connection.cpp shard_connection.h connections_manager.h \
 	run_stats_types.cpp run_stats_types.h \
-	run_stats.cpp run_stats.h \
+	run_stats.cpp run_stats.h latency_histogram.h \
 	JSON_handler.cpp JSON_handler.h \
-	protocol.cpp protocol.h \
+	protocol.cpp protocol.h libmemcached_protocol/binary.h libmemcached_protocol/vbucket.h \
 	obj_gen.cpp obj_gen.h \
 	item.cpp item.h \
 	file_io.cpp file_io.h \
@@ -60,9 +61,9 @@ memtier_benchmark_SOURCES = \
 	prometheus_metrics.cpp prometheus_metrics.h \
 	prometheus_exporter.cpp prometheus_exporter.h \
 	retry_policy.cpp retry_policy.h \
-	deps/hdr_histogram/hdr_histogram_log.c deps/hdr_histogram/hdr_histogram_log.h deps/hdr_histogram/byteorder.h \
+	deps/hdr_histogram/hdr_histogram_log.c deps/hdr_histogram/hdr_histogram_log.h \
 	deps/hdr_histogram/hdr_histogram.c deps/hdr_histogram/hdr_histogram.h \
-	deps/hdr_histogram/hdr_time.c deps/hdr_histogram/hdr_time.h deps/hdr_histogram/hdr_encoding.c deps/hdr_histogram/hdr_encoding.h
+	deps/hdr_histogram/hdr_time.c deps/hdr_histogram/hdr_time.h deps/hdr_histogram/hdr_encoding.c deps/hdr_histogram/hdr_malloc.h
 
 memtier_benchmark_LDADD = \
 	$(CODE_COVERAGE_LIBS) \
@@ -74,7 +75,7 @@ memtier_benchmark_LDADD = \
 	$(LIBSSL_LIBS)
 
 
-check_PROGRAMS = prometheus_metrics_test rate_limiter_test socket_options_test
+check_PROGRAMS = prometheus_metrics_test rate_limiter_test socket_options_test hdr_histogram_test
 
 # The metrics test links only the pure layer (prometheus_metrics.{h,cpp}).
 # First `make check` program in the repo. The metrics layer is config-free and
@@ -83,7 +84,7 @@ check_PROGRAMS = prometheus_metrics_test rate_limiter_test socket_options_test
 # only; purity is enforced by the S10 grep audit). -I$(srcdir) is required for
 # VPATH builds.
 prometheus_metrics_test_SOURCES = tests/unit/prometheus_metrics_test.cpp \
-    prometheus_metrics.cpp prometheus_metrics.h \
+    prometheus_metrics.cpp prometheus_metrics.h latency_histogram.h \
     deps/hdr_histogram/hdr_histogram.c deps/hdr_histogram/hdr_histogram.h
 prometheus_metrics_test_CPPFLAGS = -I$(srcdir)
 prometheus_metrics_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
@@ -100,6 +101,13 @@ socket_options_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g $(SOCKET_TEST_EXT
 # Reuse the real client RTTI for UBSan; the test supplies main and shard_connection.
 socket_options_test_LDADD = $(filter-out memtier_benchmark-memtier_benchmark.$(OBJEXT) \
     memtier_benchmark-shard_connection.$(OBJEXT),$(memtier_benchmark_OBJECTS)) $(memtier_benchmark_LDADD)
+hdr_histogram_test_SOURCES = tests/unit/hdr_histogram_test.cpp latency_histogram.h \
+    deps/hdr_histogram/hdr_histogram.c deps/hdr_histogram/hdr_histogram.h \
+    deps/hdr_histogram/hdr_histogram_log.c deps/hdr_histogram/hdr_histogram_log.h \
+    deps/hdr_histogram/hdr_encoding.c deps/hdr_histogram/hdr_time.c \
+    deps/hdr_histogram/hdr_time.h deps/hdr_histogram/hdr_malloc.h
+hdr_histogram_test_CPPFLAGS = -I$(srcdir)
+hdr_histogram_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 TESTS = $(check_PROGRAMS)
 
 @CODE_COVERAGE_RULES@

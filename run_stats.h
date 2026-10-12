@@ -191,7 +191,7 @@ protected:
     safe_hdr_histogram inst_m_totals_latency_histogram;
 
     // Protects inst_m_totals_latency_histogram against concurrent reset/aggregation reads.
-    // Worker threads use hdr_record_value_capped_atomic() for lock-free writes;
+    // Worker threads use memtier_record_latency_atomic() for lock-free writes;
     // this mutex serializes hdr_reset and hdr_add from the main thread.
     reinit_mutex_t m_inst_histogram_mutex;
 

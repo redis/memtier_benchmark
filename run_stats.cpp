@@ -34,20 +34,11 @@
 #endif
 
 #include "run_stats.h"
+#include "latency_histogram.h"
 #include "prometheus_metrics.h" // prom::hdr_add_positive_delta (pure layer, always linked)
 
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
-
-// Atomic variant of hdr_record_value_capped: clamps the value to
-// [lowest_trackable_value, highest_trackable_value] and records it
-// using atomic counts.  Safe to call concurrently with hdr_add/hdr_reset.
-static inline bool hdr_record_value_capped_atomic(struct hdr_histogram *h, int64_t value)
-{
-    int64_t capped = (value > h->highest_trackable_value) ? h->highest_trackable_value : value;
-    capped = (capped < h->lowest_trackable_value) ? h->lowest_trackable_value : capped;
-    return hdr_record_value_atomic(h, capped);
-}
 
 void output_table::add_column(table_column &col)
 {
@@ -211,7 +202,7 @@ void run_stats::copy_inst_histogram(hdr_histogram *target) const
 }
 
 void run_stats::copy_inst_histogram_if_changed(hdr_histogram *target)
-{ // Main thread, 1 Hz. Workers bump counts with hdr_record_value_capped_atomic
+{ // Main thread, 1 Hz. Workers bump counts with memtier_record_latency_atomic
     // (lock-free); this read under the copy/reset mutex is the same benign-race
     // class as copy_inst_histogram (suppressions, tsan_suppressions.txt).
     //
@@ -268,10 +259,10 @@ void run_stats::update_get_op(struct timeval *ts, unsigned int bytes_rx, unsigne
     m_cur_stats.m_get_cmd.update_op(bytes_rx, bytes_tx, latency, hits, misses);
     m_cur_stats.m_total_cmd.update_op(bytes_rx, bytes_tx, latency, hits, misses);
     m_totals.update_op(bytes_rx, bytes_tx, latency, hits, misses);
-    hdr_record_value_capped(m_get_latency_histogram, latency);
-    hdr_record_value_capped(inst_m_get_latency_histogram, latency);
-    hdr_record_value_capped(m_totals_latency_histogram, latency);
-    hdr_record_value_capped_atomic(inst_m_totals_latency_histogram, latency);
+    memtier_record_latency(m_get_latency_histogram, latency);
+    memtier_record_latency(inst_m_get_latency_histogram, latency);
+    memtier_record_latency(m_totals_latency_histogram, latency);
+    memtier_record_latency_atomic(inst_m_totals_latency_histogram, latency);
 }
 
 void run_stats::update_set_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency)
@@ -281,10 +272,10 @@ void run_stats::update_set_op(struct timeval *ts, unsigned int bytes_rx, unsigne
     m_cur_stats.m_set_cmd.update_op(bytes_rx, bytes_tx, latency);
     m_cur_stats.m_total_cmd.update_op(bytes_rx, bytes_tx, latency);
     m_totals.update_op(bytes_rx, bytes_tx, latency);
-    hdr_record_value_capped(m_set_latency_histogram, latency);
-    hdr_record_value_capped(inst_m_set_latency_histogram, latency);
-    hdr_record_value_capped(m_totals_latency_histogram, latency);
-    hdr_record_value_capped_atomic(inst_m_totals_latency_histogram, latency);
+    memtier_record_latency(m_set_latency_histogram, latency);
+    memtier_record_latency(inst_m_set_latency_histogram, latency);
+    memtier_record_latency(m_totals_latency_histogram, latency);
+    memtier_record_latency_atomic(inst_m_totals_latency_histogram, latency);
 }
 
 void run_stats::update_connection_error(struct timeval *ts)
@@ -302,10 +293,10 @@ void run_stats::update_moved_get_op(struct timeval *ts, unsigned int bytes_rx, u
     m_cur_stats.m_get_cmd.update_moved_op(bytes_rx, bytes_tx, latency);
     m_cur_stats.m_total_cmd.update_op(bytes_rx, bytes_tx, latency);
     m_totals.update_op(bytes_rx, bytes_tx, latency);
-    hdr_record_value_capped(m_get_latency_histogram, latency);
-    hdr_record_value_capped(inst_m_get_latency_histogram, latency);
-    hdr_record_value_capped(m_totals_latency_histogram, latency);
-    hdr_record_value_capped_atomic(inst_m_totals_latency_histogram, latency);
+    memtier_record_latency(m_get_latency_histogram, latency);
+    memtier_record_latency(inst_m_get_latency_histogram, latency);
+    memtier_record_latency(m_totals_latency_histogram, latency);
+    memtier_record_latency_atomic(inst_m_totals_latency_histogram, latency);
 }
 
 void run_stats::update_moved_set_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx,
@@ -316,10 +307,10 @@ void run_stats::update_moved_set_op(struct timeval *ts, unsigned int bytes_rx, u
     m_cur_stats.m_set_cmd.update_moved_op(bytes_rx, bytes_tx, latency);
     m_cur_stats.m_total_cmd.update_moved_op(bytes_rx, bytes_tx, latency);
     m_totals.update_op(bytes_rx, bytes_tx, latency);
-    hdr_record_value_capped(m_set_latency_histogram, latency);
-    hdr_record_value_capped(inst_m_set_latency_histogram, latency);
-    hdr_record_value_capped(m_totals_latency_histogram, latency);
-    hdr_record_value_capped_atomic(inst_m_totals_latency_histogram, latency);
+    memtier_record_latency(m_set_latency_histogram, latency);
+    memtier_record_latency(inst_m_set_latency_histogram, latency);
+    memtier_record_latency(m_totals_latency_histogram, latency);
+    memtier_record_latency_atomic(inst_m_totals_latency_histogram, latency);
 }
 
 void run_stats::update_moved_arbitrary_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx,
@@ -332,9 +323,9 @@ void run_stats::update_moved_arbitrary_op(struct timeval *ts, unsigned int bytes
     m_totals.update_op(bytes_rx, bytes_tx, latency);
 
     struct hdr_histogram *hist = m_ar_commands_latency_histograms.at(request_index);
-    hdr_record_value_capped(hist, latency);
-    hdr_record_value_capped(m_totals_latency_histogram, latency);
-    hdr_record_value_capped_atomic(inst_m_totals_latency_histogram, latency);
+    memtier_record_latency(hist, latency);
+    memtier_record_latency(m_totals_latency_histogram, latency);
+    memtier_record_latency_atomic(inst_m_totals_latency_histogram, latency);
 }
 
 void run_stats::update_ask_get_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx,
@@ -345,10 +336,10 @@ void run_stats::update_ask_get_op(struct timeval *ts, unsigned int bytes_rx, uns
     m_cur_stats.m_get_cmd.update_ask_op(bytes_rx, bytes_tx, latency);
     m_cur_stats.m_total_cmd.update_ask_op(bytes_rx, bytes_tx, latency);
     m_totals.update_op(bytes_rx, bytes_tx, latency);
-    hdr_record_value_capped(m_get_latency_histogram, latency);
-    hdr_record_value_capped(inst_m_get_latency_histogram, latency);
-    hdr_record_value_capped(m_totals_latency_histogram, latency);
-    hdr_record_value_capped_atomic(inst_m_totals_latency_histogram, latency);
+    memtier_record_latency(m_get_latency_histogram, latency);
+    memtier_record_latency(inst_m_get_latency_histogram, latency);
+    memtier_record_latency(m_totals_latency_histogram, latency);
+    memtier_record_latency_atomic(inst_m_totals_latency_histogram, latency);
 }
 
 void run_stats::update_ask_set_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx,
@@ -359,10 +350,10 @@ void run_stats::update_ask_set_op(struct timeval *ts, unsigned int bytes_rx, uns
     m_cur_stats.m_set_cmd.update_ask_op(bytes_rx, bytes_tx, latency);
     m_cur_stats.m_total_cmd.update_ask_op(bytes_rx, bytes_tx, latency);
     m_totals.update_op(bytes_rx, bytes_tx, latency);
-    hdr_record_value_capped(m_set_latency_histogram, latency);
-    hdr_record_value_capped(inst_m_set_latency_histogram, latency);
-    hdr_record_value_capped(m_totals_latency_histogram, latency);
-    hdr_record_value_capped_atomic(inst_m_totals_latency_histogram, latency);
+    memtier_record_latency(m_set_latency_histogram, latency);
+    memtier_record_latency(inst_m_set_latency_histogram, latency);
+    memtier_record_latency(m_totals_latency_histogram, latency);
+    memtier_record_latency_atomic(inst_m_totals_latency_histogram, latency);
 }
 
 void run_stats::update_ask_arbitrary_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx,
@@ -375,9 +366,9 @@ void run_stats::update_ask_arbitrary_op(struct timeval *ts, unsigned int bytes_r
     m_totals.update_op(bytes_rx, bytes_tx, latency);
 
     struct hdr_histogram *hist = m_ar_commands_latency_histograms.at(request_index);
-    hdr_record_value_capped(hist, latency);
-    hdr_record_value_capped(m_totals_latency_histogram, latency);
-    hdr_record_value_capped_atomic(inst_m_totals_latency_histogram, latency);
+    memtier_record_latency(hist, latency);
+    memtier_record_latency(m_totals_latency_histogram, latency);
+    memtier_record_latency_atomic(inst_m_totals_latency_histogram, latency);
 }
 
 void run_stats::update_wait_op(struct timeval *ts, unsigned int latency)
@@ -387,10 +378,10 @@ void run_stats::update_wait_op(struct timeval *ts, unsigned int latency)
     m_cur_stats.m_wait_cmd.update_op(0, 0, latency);
     m_cur_stats.m_total_cmd.update_op(0, 0, latency);
     m_totals.update_op(0, 0, latency);
-    hdr_record_value_capped(m_wait_latency_histogram, latency);
-    hdr_record_value_capped(inst_m_wait_latency_histogram, latency);
-    hdr_record_value_capped(m_totals_latency_histogram, latency);
-    hdr_record_value_capped_atomic(inst_m_totals_latency_histogram, latency);
+    memtier_record_latency(m_wait_latency_histogram, latency);
+    memtier_record_latency(inst_m_wait_latency_histogram, latency);
+    memtier_record_latency(m_totals_latency_histogram, latency);
+    memtier_record_latency_atomic(inst_m_totals_latency_histogram, latency);
 }
 
 void run_stats::update_arbitrary_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx,
@@ -404,10 +395,10 @@ void run_stats::update_arbitrary_op(struct timeval *ts, unsigned int bytes_rx, u
 
     struct hdr_histogram *hist = m_ar_commands_latency_histograms.at(request_index);
     struct hdr_histogram *inst_hist = inst_m_ar_commands_latency_histograms.at(request_index);
-    hdr_record_value_capped(hist, latency);
-    hdr_record_value_capped(inst_hist, latency);
-    hdr_record_value_capped(m_totals_latency_histogram, latency);
-    hdr_record_value_capped_atomic(inst_m_totals_latency_histogram, latency);
+    memtier_record_latency(hist, latency);
+    memtier_record_latency(inst_hist, latency);
+    memtier_record_latency(m_totals_latency_histogram, latency);
+    memtier_record_latency_atomic(inst_m_totals_latency_histogram, latency);
 }
 
 void run_stats::update_arbitrary_op_misses(size_t arbitrary_index, unsigned int hits, unsigned int misses,
@@ -1348,9 +1339,14 @@ void result_print_to_json(json_handler *jsonhandler, const char *type, double op
             jsonhandler->write_obj((char *) quantile_header, "%.3f", value);
         }
         jsonhandler->open_nesting("Histogram log format");
-        char *encoded_histogram;
-        hdr_string_write(&encoded_histogram, latency_histogram);
-        jsonhandler->write_obj("Compressed Histogram", "\"%s\"", encoded_histogram);
+        char *encoded_histogram = NULL;
+        const int encode_status = hdr_log_encode(latency_histogram, &encoded_histogram);
+        if (encode_status == 0) {
+            jsonhandler->write_obj("Compressed Histogram", "\"%s\"", encoded_histogram);
+        } else {
+            fprintf(stderr, "Failed to encode latency histogram (HDR error %d)\n", encode_status);
+            jsonhandler->write_obj("Compressed Histogram", "null");
+        }
         free(encoded_histogram);
         jsonhandler->close_nesting();
         jsonhandler->close_nesting();

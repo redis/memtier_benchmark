@@ -23,6 +23,7 @@
 #include <stdio.h>
 
 #include "run_stats_types.h"
+#include "latency_histogram.h"
 #include <limits>
 
 
@@ -371,7 +372,7 @@ void totals::update_op(unsigned long long int bytes_rx, unsigned long long int b
     m_ops++;
     m_latency += latency;
     m_total_latency += latency;
-    hdr_record_value_capped(latency_histogram, latency);
+    memtier_record_latency(latency_histogram, latency);
 }
 
 void totals::update_op(unsigned long long int bytes_rx, unsigned long long int bytes_tx, unsigned int latency,

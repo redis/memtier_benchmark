@@ -19,8 +19,8 @@
 /*
  * Unit tests U1-U10 for the pure metrics layer (PLAN.md section 10).
  * Assert-style main, no gtest. PURITY: no config.h / version.h / libevent.
- * Links prometheus_metrics.cpp + hdr_histogram (a leaf dep). U2 ships a clamp
- * replica pinned to run_stats.cpp:46-47 instead of linking run_stats.cpp.
+ * Links prometheus_metrics.cpp + hdr_histogram (a leaf dep). U2 uses the same latency
+ * recording policy as run_stats.cpp without linking run_stats.cpp.
  */
 
 #include <stdio.h>
@@ -33,7 +33,7 @@
 #include <map>
 
 #include "prometheus_metrics.h"
-#include "deps/hdr_histogram/hdr_histogram.h"
+#include "latency_histogram.h"
 
 static int g_failures = 0;
 static int g_checks = 0;
@@ -50,16 +50,6 @@ static int g_checks = 0;
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
-
-// U2 ground-truth replica of the file-static hdr_record_value_capped_atomic
-// clamp (run_stats.cpp:46-47). The clamp (never skip) IS the ground truth.
-// The S10 drift grep byte-pins those two upstream lines.
-static bool test_record_capped(struct hdr_histogram *h, int64_t value)
-{
-    int64_t capped = (value > h->highest_trackable_value) ? h->highest_trackable_value : value;
-    capped = (capped < h->lowest_trackable_value) ? h->lowest_trackable_value : capped;
-    return hdr_record_value(h, capped);
-}
 
 static struct hdr_histogram *new_hist()
 {
@@ -122,7 +112,7 @@ static void U1()
 {
     prom::text_renderer r = make_default_renderer();
     struct hdr_histogram *h = new_hist();
-    test_record_capped(h, 1000000); // 1 000 000 µs = 1 s
+    memtier_record_latency(h, 1000000); // 1 000 000 µs = 1 s
 
     metrics_snapshot s;
     zero_snapshot(s);
@@ -153,7 +143,7 @@ static void U1b()
 {
     prom::text_renderer r = make_default_renderer();
     struct hdr_histogram *h = new_hist();
-    test_record_capped(h, 100); // 100 µs = 0.0001 s
+    memtier_record_latency(h, 100); // 100 µs = 0.0001 s
 
     metrics_snapshot s;
     zero_snapshot(s);
@@ -167,7 +157,7 @@ static void U1b()
 }
 
 // ---------------------------------------------------------------------------
-// U2 — brute-force walk equivalence vs ground truth (clamp replica)
+// U2 — brute-force walk equivalence vs ground truth (application clamp)
 // ---------------------------------------------------------------------------
 static void U2()
 {
@@ -175,7 +165,7 @@ static void U2()
     const std::vector<int64_t> &edge = r.edge_us();
     struct hdr_histogram *h = new_hist();
 
-    // 100k log-uniform samples in [10 µs, 700e6 µs] via the replica.
+    // 100k log-uniform samples in [10 µs, 700e6 µs] via the production wrapper.
     const int N = 100000;
     std::vector<int64_t> samples(N);
     double lo = log((double) 10);
@@ -185,17 +175,17 @@ static void U2()
         double u = (double) rand_r(&seed) / (double) RAND_MAX;
         int64_t val = (int64_t) exp(lo + u * (hi - lo));
         samples[i] = val;
-        test_record_capped(h, val);
+        memtier_record_latency(h, val);
     }
 
     // Ground truth per bound j = count of samples whose slot edge <= edge_us[j].
     struct hdr_histogram *q = new_hist();
     std::vector<uint64_t> truth(edge.size(), 0);
     for (int i = 0; i < N; i++) {
-        // clamp into recordable range exactly as the replica did.
+        // clamp into recordable range exactly as the production wrapper did.
         int64_t cval = samples[i];
         if (cval > q->highest_trackable_value) cval = q->highest_trackable_value;
-        if (cval < q->lowest_trackable_value) cval = q->lowest_trackable_value;
+        if (cval < q->lowest_discernible_value) cval = q->lowest_discernible_value;
         int64_t se = hdr_next_non_equivalent_value(q, cval) - 1;
         for (size_t j = 0; j < edge.size(); j++)
             if (se <= edge[j]) truth[j]++;
@@ -228,7 +218,7 @@ static void U2()
 
     // capped 700 s -> le="60"=0, +Inf == _count
     struct hdr_histogram *h2 = new_hist();
-    test_record_capped(h2, 700000000LL); // 700 s in µs -> clamped to 600 s
+    memtier_record_latency(h2, 700000000LL); // 700 s in µs -> clamped to 600 s
     metrics_snapshot s2;
     zero_snapshot(s2);
     std::string body2;
@@ -468,7 +458,7 @@ static void U6()
     prom::text_renderer r("1.4.0", "deadbeef", labels, ok);
     struct hdr_histogram *h = new_hist();
     for (int i = 0; i < 200; i++)
-        test_record_capped(h, 1000 + i * 37);
+        memtier_record_latency(h, 1000 + i * 37);
 
     std::string body;
     body.reserve(16384);
@@ -500,7 +490,7 @@ static void U7()
 {
     prom::text_renderer r = make_default_renderer();
     struct hdr_histogram *h = new_hist();
-    test_record_capped(h, 1500);
+    memtier_record_latency(h, 1500);
     metrics_snapshot s;
     zero_snapshot(s);
     s.counters[MT_OPS] = 123;
@@ -558,7 +548,7 @@ static void U7()
     std::string v_before;
     CHECK(find_line_value(body, "memtier_latency_seconds_count", v_before), "U7: count line");
     for (int i = 0; i < 50; i++)
-        test_record_capped(h, 2000 + i);
+        memtier_record_latency(h, 2000 + i);
     std::string body2;
     r.render(body2, s, h, 1700000000.0, 0.25, 6);
     std::string v_after;

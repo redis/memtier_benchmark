@@ -230,9 +230,8 @@ n=$(grep -c '1e6' prometheus_metrics.cpp prometheus_metrics.h | awk -F: '{s+=$2}
 [ "$(grep -c 'USECS_PER_SEC' prometheus_metrics.cpp)" -ge 3 ] || fail "conversion sites < 3"
 grep -q 'LATENCY_HDR_RESULTS_MULTIPLIER' prometheus_metrics.cpp prometheus_metrics.h \
   && fail "ms constant leaked into exporter" || true
-grep -qF 'int64_t capped = (value > h->highest_trackable_value) ? h->highest_trackable_value : value;' run_stats.cpp \
-  && grep -qF 'capped = (capped < h->lowest_trackable_value) ? h->lowest_trackable_value : capped;' run_stats.cpp \
-  || fail "capped-record clamp drifted from the U2 test replica"
+# The unit tests now exercise latency_histogram.h's actual recording policy,
+# including lower/upper clamping, instead of a source-pinned replica.
 tr -s '[:space:]' ' ' < prometheus_exporter.cpp \
   | grep -q 'hdr_init(LATENCY_HDR_MIN_VALUE, LATENCY_HDR_SEC_MAX_VALUE, LATENCY_HDR_SEC_SIGDIGTS, ' \
   || fail "exporter hdr_init drifted from :3058 triplet"
