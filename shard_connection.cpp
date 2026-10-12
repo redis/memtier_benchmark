@@ -506,6 +506,17 @@ int shard_connection::connect(struct connect_info *addr)
         return -1;
     }
 
+    // A pending reconnect is moot once something else (e.g. a shard's
+    // reconnect() reconnecting the main connection) connects this
+    // connection; left armed, it would keep m_reconnecting set and ignore
+    // errors on the live connection. Cancel it only now, so a socket setup
+    // failure above still leaves it to retry.
+    if (m_reconnect_timer != NULL) {
+        event_free(m_reconnect_timer);
+        m_reconnect_timer = NULL;
+    }
+    m_reconnecting = false;
+
     // Start connection timeout timer (only if enabled)
     if (m_config->connection_timeout > 0) {
         struct timeval timeout;
@@ -1685,8 +1696,8 @@ void shard_connection::handle_reconnect_timer_event()
     m_reconnecting = false;
 
     // Attempt to reconnect
-    int ret = m_conns_manager->connect();
-    if (ret != 0) {
+    int ret = m_conns_manager->reconnect(m_id);
+    if (ret < 0) {
         // Reconnection failed, try again if we haven't exceeded max attempts
         if (m_config->max_reconnect_attempts == 0 || m_reconnect_attempts < m_config->max_reconnect_attempts) {
             const double prev_backoff_delay = m_current_backoff_delay;
@@ -1743,6 +1754,9 @@ void shard_connection::handle_reconnect_timer_event()
             // before any field could be read again.
             event_base_loopbreak(m_event_base);
         }
+    } else if (ret > 0) {
+        benchmark_error_log("Reconnection attempt %u: requested a cluster slot map refresh to reconnect.\n",
+                            m_reconnect_attempts);
     } else {
         benchmark_error_log("Reconnection successful after %u attempts.\n", m_reconnect_attempts);
         // State reset (m_reconnect_attempts, m_current_backoff_delay) is now

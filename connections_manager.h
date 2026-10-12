@@ -60,6 +60,10 @@ public:
     virtual void handle_connection_disconnect(unsigned int) {}
 
     virtual int connect(void) = 0;
+    // Reconnect one dropped connection: returns 0 once a connect is issued,
+    // 1 if the reconnect was left to a later step, -1 on failure. Only the
+    // main connection exists outside cluster mode, so the default reconnects it.
+    virtual int reconnect(unsigned int) { return connect(); }
     virtual void disconnect(void) = 0;
     virtual void disconnect_all(void) = 0;
 

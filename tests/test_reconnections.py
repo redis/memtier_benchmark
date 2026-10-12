@@ -821,3 +821,78 @@ def test_dropped_in_flight_requests_do_not_stall_client(env):
     env.assertFalse("stopped before reaching their stop condition" in stderr_content,
                     message="client stopped sending after a reconnect")
     env.assertEqual(rc, 0, message="memtier exited {} after connection kills".format(rc))
+
+
+def test_cluster_run_exits_with_reconnects_pending(env):
+    """
+    A cluster run must exit when connections are killed near --test-time.
+
+    A dropped shard connection's reconnect reconnected the main connection
+    instead of itself, and a CLUSTER SLOTS refresh could reconnect a shard
+    connection whose own reconnect was still pending. Either way a live
+    connection was connected again: its in-flight requests stayed counted as
+    pending on a fresh socket that never sent them, so it never became idle
+    and memtier never exited (#558).
+    """
+    import subprocess
+
+    if not env.isCluster():
+        env.skip()
+        return
+    # Over TLS a separate, rarer stall can still hang this scenario (#562).
+    if env.useTLS:
+        env.skip()
+        return
+    test_time = 3
+    rounds = 10
+    masters = env.getOSSMasterNodesConnectionList()
+    for i in range(rounds):
+        args = [
+            "--pipeline=4",
+            "--ratio=1:1",
+            "--key-pattern=R:R",
+            "--key-minimum=1",
+            "--key-maximum=10000",
+            "--reconnect-on-error",
+            "--hide-histogram",
+        ]
+        benchmark_specs = {"name": "{}_{}".format(env.testName, i), "args": args}
+        addTLSArgs(benchmark_specs, env)
+        config = get_default_memtier_config(threads=2, clients=2, requests=None, test_time=test_time)
+        add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+        test_dir = tempfile.mkdtemp()
+        config = RunConfig(test_dir, benchmark_specs["name"], config, {})
+        ensure_clean_benchmark_folder(config.results_dir)
+        benchmark = Benchmark.from_json(config, benchmark_specs)
+
+        stderr_path = "{0}/mb.stderr".format(config.results_dir)
+        hung = False
+        with open("{0}/mb.stdout".format(config.results_dir), "w") as stdout_f, open(stderr_path, "w") as stderr_f:
+            proc = subprocess.Popen(benchmark.args, stdout=stdout_f, stderr=stderr_f, cwd=config.results_dir)
+            try:
+                # Kill around the deadline, varying the offset per round, so
+                # connections drop and reconnect (1s delay) while others still
+                # have requests in flight.
+                start = time.time()
+                for offset in (-0.9, -0.5, -0.2, 0.1):
+                    delay = start + test_time + offset + 0.1 * (i % 3) - time.time()
+                    if delay > 0:
+                        time.sleep(delay)
+                    for m in masters:
+                        try:
+                            m.execute_command("CLIENT", "KILL", "TYPE", "normal")
+                        except Exception:
+                            pass
+                try:
+                    proc.wait(timeout=test_time + 20)
+                except subprocess.TimeoutExpired:
+                    hung = True
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait(timeout=10)
+        if hung:
+            with open(stderr_path) as f:
+                env.debugPrint("round {} STDERR tail:\n{}".format(i, f.read()[-3000:]), True)
+            env.assertFalse(hung, message="memtier did not exit after --test-time (round {})".format(i))
+            break

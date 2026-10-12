@@ -268,6 +268,32 @@ shard_connection *cluster_client::create_shard_connection(abstract_protocol *abs
     return sc;
 }
 
+int cluster_client::reconnect(unsigned int conn_id)
+{
+    shard_connection *sc = m_connections[conn_id];
+    // Already reconnected, e.g. by a CLUSTER SLOTS refresh while this
+    // connection's reconnect timer was pending: connecting again would
+    // discard its in-flight requests.
+    if (sc->get_connection_state() != conn_disconnected) return 0;
+    if (sc == MAIN_CONNECTION) return connect();
+    // Reconnecting the main connection refreshes the slot map, which then
+    // reconnects this one.
+    if (MAIN_CONNECTION->get_connection_state() == conn_disconnected) return connect() < 0 ? -1 : 1;
+
+    // Leave reconnecting this shard connection to a CLUSTER SLOTS refresh
+    // over the main connection, which reconnects it with its current role,
+    // or not at all if the node left the cluster. Don't reconnect the main
+    // connection for that, as connect() would: that discards its in-flight
+    // requests, which stay counted as pending, so the run never ends. Wake
+    // it too: an idle main connection is paused and would not send CLUSTER
+    // SLOTS until something else resumed it. A refresh already queued or in
+    // flight reconnects it too; requesting another would send a second
+    // CLUSTER SLOTS before the first reply is handled.
+    if (MAIN_CONNECTION->get_cluster_slots_state() == setup_done) MAIN_CONNECTION->set_cluster_slots();
+    MAIN_CONNECTION->schedule_fill();
+    return 1;
+}
+
 bool cluster_client::connect_shard_connection(shard_connection *sc, char *address, char *port)
 {
     // empty key index queue and staged monitor commands
@@ -1037,8 +1063,12 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
                 // mark not to close this connection
                 if (j < prev_connections_size) close_sc[j] = false;
 
-                // if connection disconnected, try to reconnect
-                if (sc->get_connection_state() == conn_disconnected) {
+                // if connection disconnected, try to reconnect, unless its own
+                // reconnect timer is pending: that honors the backoff and
+                // --max-reconnect-attempts, and its reconnect() refreshes the
+                // slot map again. Redialing here instead would let every
+                // refresh during a failover redial a dead node at once.
+                if (sc->get_connection_state() == conn_disconnected && !sc->is_reconnect_pending()) {
                     // Role must be set BEFORE connect() so the setup ladder is
                     // armed against the *new* role (primary). A reused endpoint
                     // that was previously labeled role_replica would otherwise
@@ -1228,9 +1258,12 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
                         // Role must be set BEFORE connect() so the READONLY
                         // ladder is armed during the AUTH/HELLO/READONLY/
                         // CLUSTER SLOTS sequence. set_role is a no-op for
-                        // already-known replicas (idempotent).
-                        rsc->set_role(role_replica);
-                        connect_shard_connection(rsc, r_addr, r_port);
+                        // already-known replicas (idempotent). A pending
+                        // reconnect timer redials it instead, as for primaries.
+                        if (!rsc->is_reconnect_pending()) {
+                            rsc->set_role(role_replica);
+                            connect_shard_connection(rsc, r_addr, r_port);
+                        }
                     } else if (rsc->get_role() != role_replica) {
                         // Live role flip: this conn was previously treated as
                         // a primary (m_readonly_state == setup_done with
@@ -1741,9 +1774,11 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
      * get_key_for_conn bumps the counter on every no-route (reads AND writes),
      * so by the time it crosses STRICT_NO_ROUTE_HOLD_THRESHOLD here we know
      * routing has been wedged for at least that many attempts. If the topology
-     * is empty OR every shard group's primary is unroutable, yield to the
-     * event loop so the timer can fire and so any in-progress CLUSTER SLOTS
-     * refresh can land. Reset the counter on yield to preserve the
+     * is empty OR no shard group's primary is ready to serve requests, yield
+     * to the event loop so the timer can fire and so any in-progress CLUSTER
+     * SLOTS refresh can land. Readiness is the routing predicate, not just a
+     * connected socket: during a failover the live primaries can all be
+     * waiting for a CLUSTER SLOTS reply, which only the event loop reads. Reset the counter on yield to preserve the
      * self-clearing semantics of the gate above (bounded spin instead of
      * deadlock; see the long comment block on the previous gate for the
      * rationale). */
@@ -1751,7 +1786,7 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         bool any_live_primary = false;
         for (size_t i = 0; i < m_shard_groups.size() && !any_live_primary; i++) {
             shard_connection *p = m_shard_groups[i].primary;
-            if (p != NULL && p->get_connection_state() == conn_connected) {
+            if (p != NULL && p->is_ready_for_reads()) {
                 any_live_primary = true;
             }
         }

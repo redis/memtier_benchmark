@@ -181,6 +181,7 @@ public:
     const char *get_port() { return m_port; }
 
     enum connection_state get_connection_state() { return m_connection_state; }
+    bool is_reconnect_pending() const { return m_reconnecting; }
 
     // Topology role accessors. Defaults to role_primary; cluster_client flips
     // replicas to role_replica after CLUSTER SLOTS reveals them.

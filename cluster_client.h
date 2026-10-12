@@ -158,6 +158,7 @@ protected:
     read_routing_counters m_get_routing_counters;
 
     virtual int connect(void);
+    virtual int reconnect(unsigned int conn_id);
     virtual void disconnect(void);
 
     // Primaries-only slot lookup. Resolves a hash slot through the
