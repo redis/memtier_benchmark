@@ -73,7 +73,8 @@ enum request_type
     rt_select_db,
     rt_cluster_slots,
     rt_hello,
-    rt_readonly
+    rt_readonly,
+    rt_discard
 };
 struct request
 {
@@ -188,6 +189,8 @@ public:
     enum shard_role get_role() const { return m_role; }
     void set_role(enum shard_role role) { m_role = role; }
     bool is_replica() const { return m_role == role_replica; }
+    // --transaction: a MULTI was written and its EXEC/DISCARD not yet.
+    bool is_multi_open() const { return m_multi_open; }
 
     // READONLY ladder state accessor. setup_done means the server has
     // acknowledged the READONLY command for this connection. Primary
@@ -302,6 +305,12 @@ private:
     void set_readable_id();
 
     bool is_conn_setup_done();
+    // True when the only setup step left is a CLUSTER SLOTS refresh not yet sent.
+    bool cluster_slots_refresh_pending() const
+    {
+        return m_cluster_slots == setup_none && m_authentication == setup_done && m_db_selection == setup_done &&
+               m_hello == setup_done && m_readonly_state == setup_done;
+    }
     void send_conn_setup_commands(struct timeval timestamp);
 
     // True iff any peer connection on this client is still climbing the
@@ -374,6 +383,10 @@ private:
     // role_replica; primaries skip the stage entirely. Re-armed on every
     // reconnect because READONLY is connection-scoped on the server side.
     enum setup_state m_readonly_state;
+    // True between writing a MULTI and writing the EXEC/DISCARD that closes
+    // it (--transaction). Anything else written meanwhile is queued by the
+    // server (+QUEUED) instead of run, so setup commands must wait for it.
+    bool m_multi_open;
 
     // Reconnection state tracking
     unsigned int m_reconnect_attempts;

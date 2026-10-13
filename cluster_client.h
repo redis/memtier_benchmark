@@ -271,6 +271,10 @@ public:
     virtual bool hold_pipeline(unsigned int conn_id);
     virtual void handle_rate_limit_refill(unsigned int conn_id);
     virtual void handle_connection_disconnect(unsigned int conn_id);
+    virtual bool is_transaction_pinned(unsigned int conn_id)
+    {
+        return m_config->transaction && m_txn_pinned_conn_id == (int) conn_id;
+    }
     virtual void handle_response(unsigned int conn_id, struct timeval timestamp, request *request,
                                  protocol_response *response);
 };

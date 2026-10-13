@@ -64,6 +64,9 @@ public:
     // 1 if the reconnect was left to a later step, -1 on failure. Only the
     // main connection exists outside cluster mode, so the default reconnects it.
     virtual int reconnect(unsigned int) { return connect(); }
+    // --transaction: true while the given connection holds the pin of the
+    // in-flight command rotation, i.e. it will send the rotation's EXEC.
+    virtual bool is_transaction_pinned(unsigned int) { return false; }
     virtual void disconnect(void) = 0;
     virtual void disconnect_all(void) = 0;
 

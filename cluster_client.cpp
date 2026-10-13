@@ -629,6 +629,7 @@ bool cluster_client::classify_read(const request *req) const
     case rt_cluster_slots:
     case rt_hello:
     case rt_readonly:
+    case rt_discard:
         return false;
     case rt_arbitrary: {
         const arbitrary_request *ar = static_cast<const arbitrary_request *>(req);
@@ -3001,10 +3002,18 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
                                             "interrupted rotation will be inaccurate.\n",
                                             conn_id);
                     }
-                    txn_release_pin();
-                    for (size_t i = 0; i < m_connections.size(); i++) {
-                        if (i != conn_id && m_connections[i]->get_connection_state() != conn_disconnected)
-                            m_connections[i]->schedule_fill();
+                    // Inside an open MULTI the server rejected the command
+                    // without queuing it and will answer the rotation's EXEC
+                    // with EXECABORT. Keep the pin then, so that EXEC still
+                    // goes to the connection holding the MULTI: moving it
+                    // would send EXEC elsewhere ("EXEC without MULTI") and
+                    // leave this MULTI open (#569).
+                    if (!m_connections[conn_id]->is_multi_open()) {
+                        txn_release_pin();
+                        for (size_t i = 0; i < m_connections.size(); i++) {
+                            if (i != conn_id && m_connections[i]->get_connection_state() != conn_disconnected)
+                                m_connections[i]->schedule_fill();
+                        }
                     }
                 } else {
                     benchmark_debug_log("--transaction: MOVED on stale (non-pin) connection %u dropped; "
@@ -3035,10 +3044,18 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
                                             "interrupted rotation will be inaccurate.\n",
                                             conn_id);
                     }
-                    txn_release_pin();
-                    for (size_t i = 0; i < m_connections.size(); i++) {
-                        if (i != conn_id && m_connections[i]->get_connection_state() != conn_disconnected)
-                            m_connections[i]->schedule_fill();
+                    // Inside an open MULTI the server rejected the command
+                    // without queuing it and will answer the rotation's EXEC
+                    // with EXECABORT. Keep the pin then, so that EXEC still
+                    // goes to the connection holding the MULTI: moving it
+                    // would send EXEC elsewhere ("EXEC without MULTI") and
+                    // leave this MULTI open (#569).
+                    if (!m_connections[conn_id]->is_multi_open()) {
+                        txn_release_pin();
+                        for (size_t i = 0; i < m_connections.size(); i++) {
+                            if (i != conn_id && m_connections[i]->get_connection_state() != conn_disconnected)
+                                m_connections[i]->schedule_fill();
+                        }
                     }
                 } else {
                     benchmark_debug_log("--transaction: ASK on stale (non-pin) connection %u dropped; "

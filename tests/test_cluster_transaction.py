@@ -18,7 +18,9 @@ broken-transaction error (`unwatch inside MULTI`, `EXEC without MULTI`,
 
 import json
 import os
+import subprocess
 import tempfile
+import time
 
 from include import (
     add_required_env_arguments,
@@ -826,6 +828,87 @@ def test_transaction_keyless_only_rotation(env):
     try:
         env.assertTrue(ok, message="memtier_benchmark exited non-zero (possible hang or crash)")
         _assert_no_transaction_breakage(env, stderr)
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_connection_kills_do_not_hang(env):
+    """Regression for #569: a CLUSTER SLOTS refresh must never be written on
+    a connection with an open MULTI. The server queues it (+QUEUED), the
+    reply handler treats that as a failed refresh, the connection never
+    finishes setup and the run hangs past --test-time.
+
+    Repeatedly killing one non-main shard's connections hits both ways in:
+    a MOVED on the pinned connection mid-rotation (the key's owner is down,
+    so the rotation falls back to another shard), and the slot map refresh
+    cluster_client::reconnect() requests on the main connection while it
+    may be pinned inside a MULTI."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    test_time = 8
+    benchmark_specs = {"name": env.testName, "args": ["--transaction"]}
+    addTLSArgs(benchmark_specs, env)
+    benchmark_specs["args"].extend([
+        '--command=MULTI',
+        '--command=SET __key__ __data__',
+        '--command=EXEC',
+        '--pipeline=1',
+        '--reconnect-on-error',
+    ])
+    config = get_default_memtier_config(threads=1, clients=1, requests=None,
+                                        test_time=test_time)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    test_dir = tempfile.mkdtemp()
+    run_config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(run_config.results_dir)
+    benchmark = Benchmark.from_json(run_config, benchmark_specs)
+
+    # Any shard but the first: memtier's main connection goes to the first
+    # node, and its refreshes are what must not land inside a MULTI.
+    victim = env.getOSSMasterNodesConnectionList()[1]
+
+    stdout_path = os.path.join(run_config.results_dir, "mb.stdout")
+    stderr_path = os.path.join(run_config.results_dir, "mb.stderr")
+    kills = 0
+    with open(stdout_path, "w") as stdout_f, open(stderr_path, "w") as stderr_f:
+        proc = subprocess.Popen(benchmark.args, stdout=stdout_f,
+                                stderr=stderr_f, cwd=run_config.results_dir)
+        try:
+            time.sleep(1)
+            deadline = time.time() + test_time - 2
+            while time.time() < deadline and proc.poll() is None:
+                try:
+                    kills += victim.execute_command("CLIENT", "KILL", "TYPE", "normal")
+                except Exception as e:
+                    env.debugPrint("CLIENT KILL failed: {}".format(e), True)
+                time.sleep(0.5)
+            try:
+                rc = proc.wait(timeout=test_time + 30)
+            except subprocess.TimeoutExpired:
+                rc = None
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+    stderr = _read_stderr(run_config)
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(kills > 0, message="no connection was killed")
+        env.assertTrue(rc is not None,
+                       message="memtier_benchmark hung past --test-time")
+        env.assertEqual(rc, 0)
+        env.assertTrue("cluster slot failed" not in stderr,
+                       message="CLUSTER SLOTS was sent inside an open MULTI")
+        # The kills must have driven the pinned connection into a MOVED
+        # mid-rotation, otherwise this run proved nothing.
+        env.assertTrue("received MOVED mid-rotation" in stderr,
+                       message="no MOVED mid-rotation was provoked")
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)

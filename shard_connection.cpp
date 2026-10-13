@@ -79,6 +79,7 @@ static bool is_workload_request(request_type type)
     case rt_cluster_slots:
     case rt_hello:
     case rt_readonly:
+    case rt_discard:
         break;
     }
     return false;
@@ -254,6 +255,7 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_db_selection(setup_done),
         m_cluster_slots(setup_done),
         m_readonly_state(setup_done),
+        m_multi_open(false),
         m_reconnect_attempts(0),
         m_current_backoff_delay(1.0),
         m_reconnect_timer(NULL),
@@ -481,6 +483,7 @@ int shard_connection::connect(struct connect_info *addr)
     m_readonly_state = (m_role == role_replica && m_config->cluster_mode && is_redis_protocol(m_config->protocol))
                            ? setup_none
                            : setup_done;
+    m_multi_open = false;
 
     // setup socket
     int sockfd = setup_socket(addr);
@@ -632,6 +635,7 @@ void shard_connection::disconnect()
     m_cluster_slots = setup_done;
     m_hello = setup_done;
     m_readonly_state = setup_done;
+    m_multi_open = false;
 
     // Drop any partial RESP parser state. A TCP RST received mid-bulk
     // (especially while draining a RESP3 push frame) would otherwise leave
@@ -733,6 +737,8 @@ const char *shard_connection::get_last_request_type()
         return "HELLO";
     case rt_readonly:
         return "READONLY";
+    case rt_discard:
+        return "DISCARD";
     default:
         return "none";
     }
@@ -1044,6 +1050,22 @@ void shard_connection::send_conn_setup_commands(struct timeval timestamp)
     }
 
     if (m_cluster_slots == setup_none) {
+        // Inside an open MULTI the server would queue CLUSTER SLOTS and
+        // answer +QUEUED, which the reply handler can only treat as a failed
+        // refresh (#569). fill_pipeline() defers the refresh while this
+        // connection still drives the pinned --transaction rotation, and a
+        // MOVED/ASK inside the MULTI keeps the pin, so a MULTI still open
+        // here belongs to a rotation whose pin moved elsewhere and will never
+        // send its EXEC on this connection (e.g. a --command rotation with
+        // no EXEC/DISCARD): discard it first.
+        if (m_multi_open) {
+            benchmark_debug_log("sending DISCARD to close an abandoned MULTI before CLUSTER SLOTS.\n");
+            static const char DISCARD_CMD[] = "*1\r\n$7\r\nDISCARD\r\n";
+            bufferevent_write(m_bev, DISCARD_CMD, sizeof(DISCARD_CMD) - 1);
+            push_req(new request(rt_discard, 0, &timestamp, 0));
+            m_multi_open = false;
+        }
+
         benchmark_debug_log("sending cluster slots command.\n");
 
         // in case we send CLUSTER SLOTS command, we need to keep the response to parse it
@@ -1192,6 +1214,12 @@ void shard_connection::process_response(void)
                     report_connection_stage_failure("CLUSTER SLOTS reply rejected (every shard malformed)");
                 }
             }
+            break;
+        case rt_discard:
+            // Closes a MULTI abandoned by its rotation; the reply carries no
+            // workload outcome. An error only means there was nothing left
+            // to discard, which is harmless.
+            benchmark_debug_log("DISCARD reply: %s\n", r->get_status() ? r->get_status() : "");
             break;
         case rt_hello:
             if (r->is_error()) {
@@ -1392,7 +1420,11 @@ void shard_connection::fill_pipeline(void)
     }
 
     while (!m_conns_manager->finished() && m_pipeline->size() < m_config->pipeline) {
-        if (!is_conn_setup_done()) {
+        // A CLUSTER SLOTS refresh requested while this connection drives
+        // the pinned --transaction rotation inside an open MULTI waits for
+        // the rotation's EXEC/DISCARD: sent now it would only be queued.
+        if (!is_conn_setup_done() &&
+            !(m_multi_open && cluster_slots_refresh_pending() && m_conns_manager->is_transaction_pinned(m_id))) {
             send_conn_setup_commands(now);
             return;
         }
@@ -1909,6 +1941,14 @@ void shard_connection::send_arbitrary_command_end(size_t command_index, struct t
     const arbitrary_command *meta = NULL;
     if (m_config && m_config->arbitrary_commands && command_index < m_config->arbitrary_commands->size()) {
         meta = &m_config->arbitrary_commands->at(command_index);
+    }
+    // Only --transaction keeps a MULTI block on one connection.
+    if (m_config->transaction && meta != NULL) {
+        if (meta->command_type == "MULTI") {
+            m_multi_open = true;
+        } else if (meta->command_type == "EXEC" || meta->command_type == "DISCARD") {
+            m_multi_open = false;
+        }
     }
     arbitrary_request *req = new arbitrary_request(command_index, rt_arbitrary, cmd_size, sent_time, meta);
     if (m_config->retry_on_error && m_bev && cmd_size > 0) {
