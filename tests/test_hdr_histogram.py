@@ -235,3 +235,47 @@ def test_aggregated_average_totals_histogram(env):
         start = max(i for i, line in enumerate(lines) if average in line)
         row = next(line.split() for line in lines[start:] if line.startswith("Totals "))
         env.assertEqual(list(map(float, row[-len(requested)-1:-1])), expected)
+
+
+def _hgrm_count(filename):
+    with open(filename) as source:
+        records = [line.strip() for line in source
+                   if line.strip() and not line.startswith(("#", '"'))]
+    assert len(records) == 1
+    return _decode_v2(records[0].split(",")[-1])[0]
+
+
+def test_hdr_files_for_duplicate_command_names(env):
+    """Two --command lines with the same name must get distinct HDR files.
+
+    Regression for #587: both GET lines wrote <prefix>_GET_command_run_1.*,
+    so the second overwrote the first and one line's histogram was lost.
+    Repeated names use the same " #N" scheme as the JSON keys; unique names
+    keep their usual file name.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        prefix = os.path.join(directory, "histogram")
+        specs = {"name": env.testName, "args": [
+            # Different ratios give the two GET lines different sample counts,
+            # so an overwritten file cannot pass for the right one.
+            "--command=GET __key__", "--command-ratio=3",
+            "--command=GET __key__",
+            "--command=SET __key__ __data__",
+            "--hide-histogram", "--hdr-file-prefix=" + prefix,
+        ]}
+        addTLSArgs(specs, env)
+        config = get_default_memtier_config(threads=1, clients=1, requests=100)
+        add_required_env_arguments(specs, config, env, env.getMasterNodesList())
+        config = RunConfig(directory, env.testName, config, {})
+        ensure_clean_benchmark_folder(config.results_dir)
+        env.assertTrue(Benchmark.from_json(config, specs).run())
+
+        # 100 requests in rounds of 3 + 1 + 1.
+        expected = {"GET #1": 60, "GET #2": 20, "SET": 20}
+        for name, count in expected.items():
+            base = "{}_{}_command_run_1".format(prefix, name)
+            env.assertTrue(os.path.exists(base + ".txt"))
+            env.assertTrue(os.path.exists(base + ".hgrm"))
+            if os.path.exists(base + ".hgrm"):
+                env.assertEqual(_hgrm_count(base + ".hgrm"), count)
+        env.assertFalse(os.path.exists(prefix + "_GET_command_run_1.hgrm"))

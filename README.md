@@ -193,7 +193,7 @@ $ memtier_benchmark --command="SET foo __data__" --command="SET bar __data__" --
 
 With the default `command` breakdown, you'll see aggregated stats for "Sets" and "Gets". With `--command-stats-breakdown=line`, you'll see separate rows for each command line.
 
-JSON object keys must be unique, so when several command lines share a name their per-line JSON entries are numbered in `--command` order (e.g. `"Sets #1"`, `"Sets #2"`, and `"SET #1"`, `"SET #2"` for the latency histograms and `Per-Key Misses`). Names that appear only once keep their plain key (`"Gets"`).
+JSON object keys must be unique, so when several command lines share a name their per-line JSON entries are numbered in `--command` order (e.g. `"Sets #1"`, `"Sets #2"`, and `"SET #1"`, `"SET #2"` for the latency histograms and `Per-Key Misses`). The same numbering is used for the per-command `--hdr-file-prefix` files (e.g. `<prefix>_GET #1_command_run_1.hgrm`), so they do not overwrite each other. Names that appear only once keep their plain key (`"Gets"`) and file name.
 
 > **Note:** When using `--command-stats-breakdown=command`, the JSON output's Time-Serie percentiles (p50, p99, etc.) for aggregated command types are approximate. They reflect only one of the underlying commands rather than a true merge of all commands of that type. Totals, counts, bytes, and average latency are correctly aggregated.
 

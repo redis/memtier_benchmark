@@ -875,13 +875,48 @@ bool run_stats::save_hdr_get_command(benchmark_config *config, int run_number)
     return true;
 }
 
+// Two --command lines can share a display name (e.g. --command="GET a"
+// --command="GET b" both print as "Gets"). Where the name is used as an
+// identifier -- JSON object keys (parsers keep only the last duplicate key,
+// silently dropping rows) and HDR output file names (the second file would
+// overwrite the first) -- it must be unique. Names that occur once are
+// returned unchanged; each occurrence of a repeated name gets a " #N" suffix
+// (1-based, in --command order, matching the order of the rows in the text
+// table).
+static std::vector<std::string> make_unique_labels(const std::vector<std::string> &names)
+{
+    std::map<std::string, unsigned int> total;
+    for (const auto &name : names)
+        total[name]++;
+
+    std::map<std::string, unsigned int> seen;
+    std::vector<std::string> keys;
+    keys.reserve(names.size());
+    for (const auto &name : names) {
+        if (total[name] > 1)
+            keys.push_back(name + " #" + std::to_string(++seen[name]));
+        else
+            keys.push_back(name);
+    }
+    return keys;
+}
+
+static std::vector<std::string> unique_command_labels(const arbitrary_command_list &command_list)
+{
+    std::vector<std::string> names;
+    for (size_t i = 0; i < command_list.size(); i++)
+        names.push_back(command_list[i].command_name);
+    return make_unique_labels(names);
+}
+
 bool run_stats::save_hdr_arbitrary_commands(benchmark_config *config, int run_number)
 {
     // save latency datacommand_list
     if (strcmp(config->hdr_prefix, "")) {
         arbitrary_command_list &command_list = *config->arbitrary_commands;
+        const std::vector<std::string> labels = unique_command_labels(command_list);
         for (unsigned int i = 0; i < command_list.size(); i++) {
-            std::string command_name = command_list[i].command_name;
+            const std::string &command_name = labels[i];
 
             // Prepare output file
             char fmtbuf[1024];
@@ -1398,38 +1433,6 @@ void histogram_print(FILE *out, json_handler *jsonhandler, const char *type, flo
         jsonhandler->write_obj("percent", "%.3f", percent);
         jsonhandler->close_nesting();
     }
-}
-
-// JSON object keys must be unique, but two --command lines can share a
-// display name (e.g. --command="GET a" --command="GET b" both print as
-// "Gets"), and parsers keep only the last duplicate key, silently dropping
-// rows. Names that occur once are returned unchanged; each occurrence of a
-// repeated name gets a " #N" suffix (1-based, in --command order, matching
-// the order of the rows in the text table).
-static std::vector<std::string> make_unique_json_keys(const std::vector<std::string> &names)
-{
-    std::map<std::string, unsigned int> total;
-    for (const auto &name : names)
-        total[name]++;
-
-    std::map<std::string, unsigned int> seen;
-    std::vector<std::string> keys;
-    keys.reserve(names.size());
-    for (const auto &name : names) {
-        if (total[name] > 1)
-            keys.push_back(name + " #" + std::to_string(++seen[name]));
-        else
-            keys.push_back(name);
-    }
-    return keys;
-}
-
-static std::vector<std::string> command_name_json_keys(const arbitrary_command_list &command_list)
-{
-    std::vector<std::string> names;
-    for (size_t i = 0; i < command_list.size(); i++)
-        names.push_back(command_list[i].command_name);
-    return make_unique_json_keys(names);
 }
 
 bool run_stats::print_arbitrary_commands_results()
@@ -2038,7 +2041,7 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
                 command_name.append("s");
                 row_names.push_back(command_name);
             }
-            const std::vector<std::string> row_keys = make_unique_json_keys(row_names);
+            const std::vector<std::string> row_keys = make_unique_labels(row_names);
             for (unsigned int i = 0; i < m_totals.m_ar_commands.size(); i++) {
                 const std::string &command_name = row_keys[i];
                 struct hdr_histogram *arbitrary_command_latency_histogram = m_ar_commands_latency_histograms.at(i);
@@ -2077,7 +2080,7 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
             }
         }
         if (any_per_key && jsonhandler != NULL) {
-            const std::vector<std::string> keys = command_name_json_keys(command_list);
+            const std::vector<std::string> keys = unique_command_labels(command_list);
             jsonhandler->open_nesting("Per-Key Misses");
             for (size_t i = 0; i < m_arbitrary_misses.size(); ++i) {
                 const arbitrary_misses_total &t = m_arbitrary_misses[i];
@@ -2187,7 +2190,7 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
 
         // Per-arbitrary-command routing breakdown.
         if (!m_arbitrary_read_routing.empty()) {
-            const std::vector<std::string> keys = command_name_json_keys(command_list);
+            const std::vector<std::string> keys = unique_command_labels(command_list);
             jsonhandler->open_nesting("Arbitrary Read Routing");
             for (size_t i = 0; i < m_arbitrary_read_routing.size(); ++i) {
                 if (i >= command_list.size()) break;
@@ -2325,7 +2328,7 @@ void run_stats::print_histogram(FILE *out, json_handler *jsonhandler, arbitrary_
             }
         } else {
             // Original per-command behavior
-            const std::vector<std::string> keys = command_name_json_keys(command_list);
+            const std::vector<std::string> keys = unique_command_labels(command_list);
             for (unsigned int i = 0; i < command_list.size(); i++) {
                 std::string command_name = command_list[i].command_name;
 
