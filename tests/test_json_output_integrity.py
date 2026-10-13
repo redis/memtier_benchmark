@@ -20,6 +20,7 @@ Run:
 import json
 import os
 import tempfile
+import threading
 
 from include import (
     get_default_memtier_config,
@@ -521,6 +522,54 @@ def _assert_totals_bandwidth_is_sum_of_commands(env, section_name, section):
                     f"{commands} ({expected})")
 
 
+def _aggregated_key(env, results):
+    agg_keys = [k for k in results
+                if k.startswith("AGGREGATED AVERAGE RESULTS")]
+    env.assertEqual(len(agg_keys), 1,
+                    message="Expected exactly one AGGREGATED section")
+    return agg_keys[0]
+
+
+def _assert_aggregated_totals_are_run_mean(env, results, run_count, fields):
+    """Issue #577: each AGGREGATED Totals rate in `fields` must be the mean of
+    the per-run values (needs --print-all-runs). Each value is printed with
+    %.2f, so allow a small rounding slack."""
+    agg_key = _aggregated_key(env, results)
+    runs = [results.get(f"RUN #{i} RESULTS") for i in range(1, run_count + 1)]
+    env.assertTrue(all(runs),
+                   message=f"Expected RUN #1..#{run_count} RESULTS sections")
+    if not all(runs):
+        return
+    totals = results[agg_key]["Totals"]
+    for field in fields:
+        values = [float(run["Totals"][field]) for run in runs]
+        expected = sum(values) / run_count
+        actual = float(totals[field])
+        env.assertAlmostEqual(
+            actual, expected, 0.02,
+            message=f"{agg_key}: Totals '{field}' ({actual}) != mean of the "
+                    f"per-run values {values} ({expected:.4f})")
+
+
+def _assert_aggregated_totals_rx_tx(env, results, run_count):
+    """Issue #577: the AGGREGATED Totals RX/TX split must be non-zero, match
+    the per-command rows, add up to the combined KB/sec and be the mean of
+    the per-run values."""
+    agg_key = _aggregated_key(env, results)
+    _assert_totals_bandwidth_is_sum_of_commands(env, agg_key, results[agg_key])
+    totals = results[agg_key]["Totals"]
+    kbs = float(totals["KB/sec"])
+    rx = float(totals["KB/sec RX"])
+    tx = float(totals["KB/sec TX"])
+    env.assertGreater(rx, 0.0, message=f"{agg_key}: Totals 'KB/sec RX' is 0")
+    env.assertGreater(tx, 0.0, message=f"{agg_key}: Totals 'KB/sec TX' is 0")
+    env.assertAlmostEqual(
+        rx + tx, kbs, 0.03,
+        message=f"{agg_key}: Totals RX ({rx}) + TX ({tx}) != KB/sec ({kbs})")
+    _assert_aggregated_totals_are_run_mean(
+        env, results, run_count, ("KB/sec", "KB/sec RX", "KB/sec TX"))
+
+
 def test_json_arbitrary_commands_totals_bandwidth(env):
     """Issue #566: in --command mode the arbitrary-command bytes were added
     to both the Totals RX and TX counters, so Totals KB/sec was about twice
@@ -528,8 +577,8 @@ def test_json_arbitrary_commands_totals_bandwidth(env):
     test_dir = tempfile.mkdtemp()
     benchmark, run_config = _build_benchmark(
         env, test_dir,
-        extra_args=["--run-count=2", "--command=SET __key__ __data__",
-                    "--command=GET __key__"],
+        extra_args=["--run-count=2", "--print-all-runs",
+                    "--command=SET __key__ __data__", "--command=GET __key__"],
         threads=2, clients=4, requests=1000)
     ok = benchmark.run()
     failed_asserts = env.getNumberOfFailedAssertion()
@@ -541,65 +590,85 @@ def test_json_arbitrary_commands_totals_bandwidth(env):
                            message=f"Expected '{label}' in JSON output")
             _assert_totals_bandwidth_is_sum_of_commands(env, label,
                                                         results[label])
-        agg_keys = [k for k in results
-                    if k.startswith("AGGREGATED AVERAGE RESULTS")]
-        env.assertEqual(len(agg_keys), 1,
-                        message="Expected exactly one AGGREGATED section")
-        _assert_totals_bandwidth_is_sum_of_commands(env, agg_keys[0],
-                                                    results[agg_keys[0]])
-        _assert_aggregated_totals_rx_tx(env, results, agg_keys[0])
+        _assert_aggregated_totals_rx_tx(env, results, 2)
     finally:
         if env.getNumberOfFailedAssertion() > failed_asserts:
             debugPrintMemtierOnError(run_config, env)
 
 
-def _assert_aggregated_totals_rx_tx(env, results, agg_key):
-    """Issue #577: the AGGREGATED Totals RX/TX split must add up to the
-    combined KB/sec, and with --run-count=2 (BEST and WORST are the two runs)
-    each of them must be the mean of the per-run values."""
-    totals = results[agg_key]["Totals"]
-    kbs = float(totals["KB/sec"])
-    rx = float(totals["KB/sec RX"])
-    tx = float(totals["KB/sec TX"])
-    env.assertGreater(rx, 0.0, message=f"{agg_key}: Totals 'KB/sec RX' is 0")
-    env.assertGreater(tx, 0.0, message=f"{agg_key}: Totals 'KB/sec TX' is 0")
-    env.assertAlmostEqual(
-        rx + tx, kbs, 0.03,
-        message=f"{agg_key}: Totals RX ({rx}) + TX ({tx}) != KB/sec ({kbs})")
-    best = results["BEST RUN RESULTS"]["Totals"]
-    worst = results["WORST RUN RESULTS"]["Totals"]
-    # BEST and WORST are the same run only if both runs had identical ops/sec.
-    if best["Ops/sec"] == worst["Ops/sec"]:
-        return
-    for field in ("KB/sec", "KB/sec RX", "KB/sec TX"):
-        expected = (float(best[field]) + float(worst[field])) / 2
-        actual = float(totals[field])
-        env.assertAlmostEqual(
-            actual, expected, 0.02,
-            message=f"{agg_key}: Totals '{field}' ({actual}) != mean of the "
-                    f"two runs ({expected})")
-
-
 def test_json_aggregated_totals_rx_tx(env):
     """Issue #577: with --run-count the AGGREGATED Totals 'KB/sec RX' and
     'KB/sec TX' were never accumulated or averaged across runs, so they were
-    always reported as 0.0."""
+    always reported as 0.0. Three runs on two threads, so that a divisor of
+    a literal 2 or of the thread count is not mistaken for the run count."""
+    run_count = 3
     test_dir = tempfile.mkdtemp()
     benchmark, run_config = _build_benchmark(
-        env, test_dir, extra_args=["--run-count=2", "--ratio=1:1"],
+        env, test_dir,
+        extra_args=[f"--run-count={run_count}", "--print-all-runs",
+                    "--ratio=1:1"],
         threads=2, clients=4, requests=1000)
     ok = benchmark.run()
     failed_asserts = env.getNumberOfFailedAssertion()
     try:
         env.assertTrue(ok, message="memtier_benchmark exited non-zero")
         results = _read_json(run_config, env)
-        agg_keys = [k for k in results
-                    if k.startswith("AGGREGATED AVERAGE RESULTS")]
-        env.assertEqual(len(agg_keys), 1,
-                        message="Expected exactly one AGGREGATED section")
-        _assert_totals_bandwidth_is_sum_of_commands(env, agg_keys[0],
-                                                    results[agg_keys[0]])
-        _assert_aggregated_totals_rx_tx(env, results, agg_keys[0])
+        _assert_aggregated_totals_rx_tx(env, results, run_count)
+        # No connection is broken here, so the averaged rate must stay 0.
+        agg_key = _aggregated_key(env, results)
+        env.assertEqual(
+            float(results[agg_key]["Totals"]["Connection Errors/sec"]), 0.0,
+            message=f"{agg_key}: Totals 'Connection Errors/sec' is not 0 "
+                    f"without connection errors")
+    finally:
+        if env.getNumberOfFailedAssertion() > failed_asserts:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_json_aggregated_connection_errors_sec(env):
+    """Issue #577: the AGGREGATED Totals 'Connection Errors/sec' was the sum
+    of the per-run rates instead of their mean. Kill memtier's connections
+    throughout every run so each run records connection errors."""
+    run_count = 3
+    test_dir = tempfile.mkdtemp()
+    benchmark, run_config = _build_benchmark(
+        env, test_dir,
+        extra_args=[f"--run-count={run_count}", "--print-all-runs",
+                    "--ratio=1:1", "--reconnect-on-error",
+                    "--max-reconnect-attempts=0"],
+        threads=2, clients=2, test_time=2)
+    connections = env.getOSSMasterNodesConnectionList()
+    stop = threading.Event()
+
+    def killer():
+        while not stop.wait(0.25):
+            for conn in connections:
+                try:
+                    conn.execute_command("CLIENT", "KILL", "TYPE", "normal",
+                                         "SKIPME", "yes")
+                except Exception:
+                    pass
+
+    killer_thread = threading.Thread(target=killer, daemon=True)
+    killer_thread.start()
+    try:
+        ok = benchmark.run()
+    finally:
+        stop.set()
+        killer_thread.join(timeout=5)
+    failed_asserts = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier_benchmark exited non-zero")
+        results = _read_json(run_config, env)
+        errors = sum(int(results[f"RUN #{i} RESULTS"]["Totals"]
+                         ["Connection Errors"])
+                     for i in range(1, run_count + 1)
+                     if f"RUN #{i} RESULTS" in results)
+        env.assertGreater(errors, 0,
+                          message="Expected connection errors from the "
+                                  "CLIENT KILL loop")
+        _assert_aggregated_totals_are_run_mean(
+            env, results, run_count, ("Connection Errors/sec",))
     finally:
         if env.getNumberOfFailedAssertion() > failed_asserts:
             debugPrintMemtierOnError(run_config, env)
