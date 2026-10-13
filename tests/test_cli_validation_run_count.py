@@ -177,3 +177,50 @@ def test_run_count_valid_runs_normally(env):
             "top-level keys: {}".format(sorted(results.keys()))
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# 5. BEST/WORST pick the fastest/slowest run  (issue #565)
+# ---------------------------------------------------------------------------
+
+def test_run_count_best_worst_selection(env):
+    """BEST/WORST RUN RESULTS must be the runs with the highest/lowest Ops/sec.
+
+    Merged per-run stats never had m_started set, so get_duration_usec()
+    returned 0 for every run, all runs compared equal and run #1 was
+    reported as both BEST and WORST.
+    """
+    env.skipOnCluster()
+
+    run_count = 3
+    test_dir = tempfile.mkdtemp()
+    config = get_default_memtier_config(threads=1, clients=2, requests=2000)
+    benchmark_specs = {
+        "name": env.testName,
+        "args": ["--run-count={}".format(run_count), "--print-all-runs"],
+    }
+    addTLSArgs(benchmark_specs, env)
+    add_required_env_arguments(
+        benchmark_specs, config, env, env.getMasterNodesList()
+    )
+
+    run_config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(run_config.results_dir)
+    benchmark = Benchmark.from_json(run_config, benchmark_specs)
+
+    memtier_ok = benchmark.run()
+    debugPrintMemtierOnError(run_config, env)
+    env.assertTrue(memtier_ok)
+
+    with open(os.path.join(run_config.results_dir, "mb.json")) as f:
+        results = json.load(f)
+
+    runs = [
+        results["RUN #{} RESULTS".format(i)]["Totals"]["Ops/sec"]
+        for i in range(1, run_count + 1)
+    ]
+    best = results["BEST RUN RESULTS"]["Totals"]["Ops/sec"]
+    worst = results["WORST RUN RESULTS"]["Totals"]["Ops/sec"]
+
+    env.assertEqual(best, max(runs), message="per-run Ops/sec: {}".format(runs))
+    env.assertEqual(worst, min(runs), message="per-run Ops/sec: {}".format(runs))

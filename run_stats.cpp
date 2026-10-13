@@ -1048,6 +1048,10 @@ void run_stats::merge(const run_stats &other, int iteration)
     m_start_time = timeval_factorial_average(m_start_time, other.m_start_time, iteration);
     m_end_time = timeval_factorial_average(m_end_time, other.m_end_time, iteration);
 
+    // The merged times are valid once any started run is merged in;
+    // get_duration_usec() returns 0 until m_started is set.
+    if (other.has_started()) m_started.flag.store(true, std::memory_order_release);
+
     // If any run was interrupted, mark the merged result as interrupted
     if (other.m_interrupted) {
         m_interrupted = true;

@@ -5176,13 +5176,13 @@ int main(int argc, char *argv[])
                 }
             }
             // User wants the best and worst
-            unsigned int min_ops_sec = (unsigned int) -1;
-            unsigned int max_ops_sec = 0;
+            double min_ops_sec = 0;
+            double max_ops_sec = 0;
             run_stats *worst = NULL;
             run_stats *best = NULL;
             for (std::vector<run_stats>::iterator i = all_stats.begin(); i != all_stats.end(); i++) {
                 unsigned long long usecs = i->get_duration_usec();
-                unsigned int ops_sec = (int) (((double) i->get_total_ops() / (usecs > 0 ? usecs : 1)) * 1000000);
+                double ops_sec = usecs > 0 ? (double) i->get_total_ops() / usecs * 1000000 : 0.0;
                 if (ops_sec < min_ops_sec || worst == NULL) {
                     min_ops_sec = ops_sec;
                     worst = &(*i);
