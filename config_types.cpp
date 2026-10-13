@@ -309,7 +309,8 @@ arbitrary_command::arbitrary_command(const char *cmd) :
         stats_only(false),
         spec(NULL),
         miss_tracking_enabled(false),
-        is_read_override(-1)
+        is_read_override(-1),
+        multi_effect(multi_effect_none)
 {
     // command name is the first word in the command
     size_t pos = command.find(" ");
@@ -436,9 +437,16 @@ void arbitrary_command::resolve_command_meta()
     spec = NULL;
     spec_key_positions.clear();
     miss_tracking_enabled = false;
+    multi_effect = multi_effect_none;
 
     if (command_args.empty()) {
         return;
+    }
+    const char *verb = command_args[0].data.c_str();
+    if (strcasecmp(verb, "MULTI") == 0) {
+        multi_effect = multi_effect_opens;
+    } else if (strcasecmp(verb, "EXEC") == 0 || strcasecmp(verb, "DISCARD") == 0) {
+        multi_effect = multi_effect_closes;
     }
     // The canonical name for subcommand containers (XGROUP CREATE, OBJECT FREQ,
     // etc.) is the first two argv tokens uppercased and space-joined. Try both

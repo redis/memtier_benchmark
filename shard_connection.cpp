@@ -1944,9 +1944,9 @@ void shard_connection::send_arbitrary_command_end(size_t command_index, struct t
     }
     // Only --transaction keeps a MULTI block on one connection.
     if (m_config->transaction && meta != NULL) {
-        if (meta->command_type == "MULTI") {
+        if (meta->multi_effect == multi_effect_opens) {
             m_multi_open = true;
-        } else if (meta->command_type == "EXEC" || meta->command_type == "DISCARD") {
+        } else if (meta->multi_effect == multi_effect_closes) {
             m_multi_open = false;
         }
     }

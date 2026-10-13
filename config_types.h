@@ -153,6 +153,16 @@ struct command_arg
     bool has_key_affixes;
 };
 
+// What a --command does to the connection's MULTI block. Resolved once from
+// argv[0] by resolve_command_meta() so the per-request path needs no string
+// compare (--transaction tracks open MULTI blocks per connection, #569).
+enum multi_effect
+{
+    multi_effect_none,
+    multi_effect_opens, // MULTI
+    multi_effect_closes // EXEC, DISCARD
+};
+
 struct arbitrary_command
 {
     arbitrary_command(const char *cmd);
@@ -198,6 +208,8 @@ struct arbitrary_command
     //  1 = force treat as a read.
     // C++11-compatible replacement for std::optional<bool>.
     int is_read_override; // -1 / 0 / 1
+
+    enum multi_effect multi_effect;
 };
 
 struct arbitrary_command_list
