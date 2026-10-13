@@ -958,6 +958,12 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
         i->summarize(i_totals);
         m_totals.add(i_totals);
 
+        // summarize() leaves i_totals.m_hits/m_misses at zero too; carry the
+        // run's GET hit/miss counts over so the default-workload miss-rate
+        // warning sees them. Summed across runs, like m_arbitrary_misses below.
+        m_totals.m_hits += i->m_totals.m_hits;
+        m_totals.m_misses += i->m_totals.m_misses;
+
         // aggregate latency data; summarize() leaves i_totals.latency_histogram
         // empty, so the per-run totals histogram must be merged explicitly.
         hdr_add(m_totals.latency_histogram, i->m_totals.latency_histogram);

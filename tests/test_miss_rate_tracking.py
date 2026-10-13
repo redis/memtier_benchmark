@@ -411,6 +411,41 @@ def test_miss_rate_threshold_suppressed_below_threshold(env):
 
 
 # ---------------------------------------------------------------------------
+# 8b. Default-workload GET warning also fires for the --run-count AVERAGE
+# ---------------------------------------------------------------------------
+
+def test_run_count_average_default_get_miss_warning(env):
+    """Without --command, every results section (BEST, WORST and AVERAGE) must
+    carry the GET miss-rate warning. The AVERAGE one reads the totals built by
+    aggregate_average(), which used to leave the GET hit/miss counts at zero."""
+    env.skipOnCluster()
+    env.flush()  # empty DB: every GET misses
+
+    clients = 2
+    requests = 300
+    ok, stdout, stderr, _js = _run_benchmark(
+        env,
+        ["--ratio=0:1", "--key-prefix={}".format(_KEY_PREFIX)],
+        clients=clients,
+        requests=requests,
+        run_count=2,
+    )
+    env.assertTrue(ok)
+
+    sections = stdout.count(" RESULTS")
+    warnings = [l for l in stderr.splitlines() if l.startswith("warning: GET miss rate")]
+    env.assertEqual(sections, 3, message="stdout sections: {}".format(sections))
+    env.assertEqual(
+        len(warnings),
+        sections,
+        message="Expected one GET miss-rate warning per results section; stderr: {}".format(stderr[:600]),
+    )
+    # The AVERAGE warning reports counts summed over both runs.
+    total = 2 * clients * requests
+    env.assertContains("({} misses / {} ops)".format(total, total), stderr)
+
+
+# ---------------------------------------------------------------------------
 # 9. --monitor-input without --command emits startup warning
 # ---------------------------------------------------------------------------
 
