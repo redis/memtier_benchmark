@@ -6,10 +6,12 @@ and makes the terminal response bytes and histogram sample counts exact.
 """
 import json
 import os
+import select
 import socketserver
 import subprocess
 import tempfile
 import threading
+import time
 
 from include import MEMTIER_BINARY
 from test_hdr_histogram import _decode_v2
@@ -222,3 +224,167 @@ def test_run_count_average_redirect_stats(env):
     for redirect in ("MOVED", "ASK"):
         for command in ("set", "get", "arbitrary-set", "arbitrary-get"):
             _check_redirect_stats(env, redirect, "success", command, run_count=2)
+
+
+def _read_commands(buf):
+    """Split the complete RESP commands off the front of buf."""
+    commands = []
+    while buf.startswith(b"*"):
+        end = buf.find(b"\r\n")
+        if end < 0:
+            break
+        pos = end + 2
+        args = []
+        for _ in range(int(buf[1:end])):
+            end = buf.find(b"\r\n", pos)
+            if end < 0:
+                return commands, buf
+            size = int(buf[pos + 1:end])
+            if len(buf) < end + 2 + size + 2:
+                return commands, buf
+            args.append(buf[end + 2:end + 2 + size])
+            pos = end + 2 + size + 2
+        commands.append(args)
+        buf = buf[pos:]
+    return commands, buf
+
+
+class _SlotMoveNode(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, cluster, keeps_slots):
+        super().__init__(("127.0.0.1", 0), _SlotMoveHandler)
+        self.cluster = cluster
+        self.keeps_slots = keeps_slots
+
+
+class _SlotMoveCluster:
+    """Two scripted nodes. One of them gives up its slots to the other while
+    memtier has more requests in flight on it than --pipeline allows.
+
+    That node first answers whole batches with -TRYAGAIN. While those
+    requests wait for their retry memtier refills the pipeline, up to the
+    in-flight budget of all its connections, so the connection ends up
+    deeper than --pipeline. Then the node answers MOVED, one reply at a
+    time, and only CLUSTER SLOTS shows the slots on the other node.
+    """
+
+    def __init__(self, tryagain_batches):
+        self.tryagain_batches = tryagain_batches
+        self.batches = 0
+        self.moved = 0
+        self.max_depth = 0
+        self.errors = []
+        self.owner = _SlotMoveNode(self, True)
+        self.leaver = _SlotMoveNode(self, False)
+
+    def moving(self):
+        return self.batches >= self.tryagain_batches
+
+    def slots_reply(self):
+        def shard(first, last, node):
+            return (b"*3\r\n:%d\r\n:%d\r\n*2\r\n$9\r\n127.0.0.1\r\n:%d\r\n"
+                    % (first, last, node.server_address[1]))
+        if self.moving():
+            return b"*1\r\n" + shard(0, 16383, self.owner)
+        return b"*2\r\n" + shard(0, 8191, self.leaver) + shard(8192, 16383, self.owner)
+
+    def __enter__(self):
+        for node in (self.owner, self.leaver):
+            threading.Thread(target=node.serve_forever, daemon=True).start()
+        return self
+
+    def __exit__(self, *exc):
+        for node in (self.owner, self.leaver):
+            node.shutdown()
+            node.server_close()
+
+
+class _SlotMoveHandler(socketserver.BaseRequestHandler):
+    def reply(self, args):
+        cluster = self.server.cluster
+        verb = args[0].upper()
+        if verb == b"CLUSTER":
+            return cluster.slots_reply()
+        if verb == b"SET":
+            reply = b"+OK\r\n"
+        elif verb == b"GET":
+            reply = b"$-1\r\n"
+        else:
+            return b"+OK\r\n"
+        if self.server.keeps_slots:
+            return reply
+        if not cluster.moving():
+            return b"-TRYAGAIN batch\r\n"
+        cluster.moved += 1
+        return b"-MOVED 0 127.0.0.1:%d\r\n" % cluster.owner.server_address[1]
+
+    def handle(self):
+        cluster = self.server.cluster
+        leaving = not self.server.keeps_slots
+        buf = b""
+        queued = []
+        # After a MOVED, wait for memtier to resend it before the next one,
+        # so it reads one reply at a time and the connection stays as deep.
+        sent_at = None
+        try:
+            while True:
+                trickle = leaving and cluster.moving()
+                # The owner answers at once. The leaving node answers a whole
+                # batch of -TRYAGAIN once memtier stops sending.
+                timeout = (0.01 if trickle else 0.05) if leaving else None
+                if select.select([self.request], [], [], timeout)[0]:
+                    data = self.request.recv(65536)
+                    if not data:
+                        return
+                    commands, buf = _read_commands(buf + data)
+                    queued += commands
+                    if leaving:
+                        depth = sum(1 for args in queued if args[0].upper() in (b"SET", b"GET"))
+                        cluster.max_depth = max(cluster.max_depth, depth)
+                        sent_at = None
+                        if not trickle:
+                            continue
+                if not queued:
+                    continue
+                if trickle:
+                    if sent_at is not None and time.monotonic() - sent_at < 0.1:
+                        continue
+                    self.request.sendall(self.reply(queued.pop(0)))
+                    sent_at = time.monotonic()
+                else:
+                    batch = any(args[0].upper() in (b"SET", b"GET") for args in queued)
+                    self.request.sendall(b"".join(self.reply(args) for args in queued))
+                    queued = []
+                    if leaving and batch:
+                        cluster.batches += 1
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            pass  # memtier may disconnect with replies still queued.
+        except Exception as error:
+            cluster.errors.append(repr(error))
+
+
+def test_moved_refreshes_slots_on_overfull_connection(env):
+    """A MOVED must refresh the slot map even on a connection with
+    --pipeline or more requests in flight. Otherwise every retry goes back
+    to the node that gave up the slot, which answers MOVED again, forever."""
+    pipeline = 4
+    with _SlotMoveCluster(tryagain_batches=8) as cluster:
+        args = [MEMTIER_BINARY, "--server=127.0.0.1",
+                "--port={}".format(cluster.leaver.server_address[1]), "--cluster-mode",
+                "--threads=1", "--clients=1", "--pipeline={}".format(pipeline),
+                "--requests=2000", "--ratio=1:1", "--key-minimum=1", "--key-maximum=1000",
+                "--retry-on-error", "--hide-histogram"]
+        try:
+            result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    timeout=30, text=True)
+        except subprocess.TimeoutExpired:
+            result = None
+        label = "depth {} MOVED {}".format(cluster.max_depth, cluster.moved)
+        env.assertTrue(result is not None, message="memtier did not finish, " + label)
+        # The bug needs a connection deeper than --pipeline when MOVED starts.
+        env.assertGreater(cluster.max_depth, pipeline, message=label)
+        env.assertEqual(cluster.errors, [], message=label)
+        if result is not None:
+            env.assertEqual(result.returncode, 0, message=label + "\n" + result.stderr)

@@ -1470,14 +1470,23 @@ void shard_connection::fill_pipeline(void)
         drain_replay_queue_after_reconnect();
     }
 
-    while (!m_conns_manager->finished() && m_pipeline->size() < m_config->pipeline) {
+    while (!m_conns_manager->finished()) {
         // A CLUSTER SLOTS refresh requested while this connection drives
         // the pinned --transaction rotation inside an open MULTI waits for
         // the rotation's EXEC/DISCARD: sent now it would only be queued.
+        //
+        // Otherwise send setup commands even when the pipeline is full.
+        // Retries are resent beyond --pipeline, so after a MOVED the
+        // pipeline can stay full while the retries keep going to the node
+        // the stale slot map names, and the refresh would never be sent.
         if (!is_conn_setup_done() &&
             !(m_multi_open && cluster_slots_refresh_pending() && m_conns_manager->is_transaction_pinned(m_id))) {
             send_conn_setup_commands(now);
             return;
+        }
+
+        if (m_pipeline->size() >= m_config->pipeline) {
+            break;
         }
 
         // don't exceed requests
