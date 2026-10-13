@@ -16,6 +16,7 @@
  * along with memtier_benchmark.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -189,8 +190,9 @@ static void test_summary_scratch_reuse()
         CHECK(hdr_value_at_percentiles(h, quantiles.data(), expected, 4) == 0);
         stats.summarize_quantiles(h, quantiles, scratch);
         CHECK(stats.summarized_quantile_values.size() == 4);
+        // Compare in microseconds: x87 builds may keep expected[i] / 1000.0 at extended precision.
         for (size_t i = 0; i < 4; ++i)
-            CHECK(stats.summarized_quantile_values[i] == expected[i] / 1000.0);
+            CHECK(llround(stats.summarized_quantile_values[i] * 1000.0) == expected[i]);
         const int64_t *storage = scratch.data();
         stats.reset();
         stats.summarize_quantiles(h, quantiles, scratch);

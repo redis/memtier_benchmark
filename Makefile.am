@@ -110,6 +110,8 @@ hdr_histogram_test_SOURCES = tests/unit/hdr_histogram_test.cpp latency_histogram
 # run_stats_types includes the TLS-aware benchmark config; honor non-system OpenSSL paths.
 hdr_histogram_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
 hdr_histogram_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+# memtier_benchmark_CPPFLAGS carries coverage flags; link their runtime too.
+hdr_histogram_test_LDADD = $(CODE_COVERAGE_LIBS)
 TESTS = $(check_PROGRAMS)
 
 # Keep the release amalgamation byte-identical to the recorded upstream asset.
