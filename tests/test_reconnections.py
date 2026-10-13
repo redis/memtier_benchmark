@@ -1,4 +1,5 @@
 import json
+import re
 import tempfile
 import time
 import threading
@@ -965,15 +966,27 @@ def test_cluster_shard_dial_failure_honors_max_reconnect_attempts(env):
             stderr_content = f.read()
     finally:
         victim.execute_command("CONFIG", "SET", "cluster-announce-ip", "")
-        wait_announced(False)
+        # Fail here, not in a later cluster test, if the topology stays poisoned.
+        env.assertTrue(wait_announced(False), message="announced address {} was not reverted".format(unreachable))
 
+    # Every synchronous dial failure goes through
+    # attempt_reconnect("Connection failed"), whichever step failed
+    # (getaddrinfo, setup_socket() or bufferevent_socket_connect()), so count
+    # those lines rather than only the "connect failed" ones.
+    sync_failures = len(re.findall(r"^Connection failed, attempting reconnection", stderr_content, re.M))
+    exhausted = "Maximum reconnection attempts ({}) exceeded for Connection failed".format(max_attempts)
+    if exhausted in stderr_content:
+        sync_failures += 1
     failed_dials = stderr_content.count("connect failed")
-    if failed_dials > max_attempts + 1 or "Maximum reconnection attempts" not in stderr_content:
+    if (sync_failures > max_attempts + 1 or failed_dials > max_attempts + 1 or exhausted not in stderr_content):
         env.debugPrint("STDERR tail:\n{}".format(stderr_content[-3000:]), True)
     # One initial dial plus one per reconnect attempt.
+    env.assertTrue(sync_failures <= max_attempts + 1,
+                   message="unreachable shard failed to dial {} times with --max-reconnect-attempts={}".format(
+                       sync_failures, max_attempts))
     env.assertTrue(failed_dials <= max_attempts + 1,
                    message="unreachable shard dialed {} times with --max-reconnect-attempts={}".format(
                        failed_dials, max_attempts))
-    env.assertTrue("Maximum reconnection attempts ({}) exceeded".format(max_attempts) in stderr_content,
+    env.assertTrue(exhausted in stderr_content,
                    message="--max-reconnect-attempts was not enforced for the unreachable shard")
     env.assertNotEqual(proc.returncode, 0)
