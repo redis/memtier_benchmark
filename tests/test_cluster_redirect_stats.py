@@ -3,6 +3,9 @@
 A scripted RESP peer keeps the topology fixed while returning two redirects
 before each successful command. This avoids timing a real cluster failover
 and makes the terminal response bytes and histogram sample counts exact.
+Every terminal reply, whether a success or the redirect that ends the
+request, is delayed by a fixed amount, so recorded latencies can be checked
+against a known lower bound.
 
 The slot-move tests at the end use a second scripted peer: two nodes, one of
 which hands its slots to the other (#590). It paces its replies on timing
@@ -12,6 +15,7 @@ depend on that timing.
 """
 import json
 import os
+import re
 import select
 import socketserver
 import subprocess
@@ -23,6 +27,11 @@ from include import MEMTIER_BINARY
 from test_hdr_histogram import _decode_v2
 
 
+# Delay before each terminal reply. Large enough to dominate loopback round
+# trips and the 1 ms retry backoff, small enough to keep each case short.
+TERMINAL_DELAY_MS = 20
+
+
 class _RedirectPeer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
@@ -31,6 +40,7 @@ class _RedirectPeer(socketserver.ThreadingTCPServer):
         super().__init__(("127.0.0.1", 0), _RedirectHandler)
         self.redirect = redirect
         self.mode = mode
+        self.terminal_delay = TERMINAL_DELAY_MS / 1000.0
         self.attempts = 0
         self.redirects = 0
         self.terminal_rx = 0
@@ -64,6 +74,8 @@ class _RedirectHandler(socketserver.StreamRequestHandler):
                     self.server.attempts += 1
                     period = {"success": 3, "refused": 2, "disabled": 1, "transaction": 1}[self.server.mode]
                     terminal = self.server.attempts % period == 0
+                    if terminal:
+                        time.sleep(self.server.terminal_delay)
                     if self.server.mode == "success" and terminal:
                         reply = b"+OK\r\n" if verb == b"SET" else b"$3\r\nfoo\r\n"
                     else:
@@ -140,18 +152,40 @@ def _check_redirect_stats(env, redirect, mode, command, backoff_ms=1, run_count=
         env.assertEqual(peer.redirects, expected_redirects, message=label)
         env.assertEqual(peer.attempts, requests * (3 if mode == "success" else
                                                 2 if mode == "refused" else 1), message=label)
+        if mode != "disabled":
+            # The JSON output has no error or retry counters; the progress
+            # line on stderr is the only text output that carries errors,
+            # retries and retried_ops. This regex has to change if that
+            # line's format changes.
+            # The last progress line carries the final counters. A refused
+            # retry is an error for every request and a successful one for
+            # none. A transaction is never retried after a redirect, so
+            # every request is an error without a retry.
+            counters = re.findall(r"errors (\d+) \(\+\d+\)\s+retries (\d+) \(\+\d+\)\s+"
+                                  r"retried_ops (\d+)", result.stderr)
+            env.assertTrue(len(counters) > 0, message=label + " progress counters")
+            if counters:
+                expected = {"success": (0, 2 * requests, requests),
+                            "refused": (requests, requests, requests),
+                            "transaction": (requests, 0, 0)}[mode]
+                actual = tuple(int(value) for value in counters[-1])
+                env.assertEqual(actual, expected, message=label + " errors/retries/retried_ops")
+        # Lower bound on every recorded latency: the delayed terminal reply,
+        # or the backoffs before it when those are longer (two retries before
+        # a successful reply, one before a refused retry's final redirect).
+        minimum_ms = max(TERMINAL_DELAY_MS, backoff_ms * {"success": 2, "refused": 1}.get(mode, 0)) * 0.9
         for entry in (stats[name], stats["Totals"]):
             env.assertEqual(entry["Count"], requests, message=label)
             histogram = entry["Percentile Latencies"]["Histogram log format"]["Compressed Histogram"]
             env.assertEqual(_decode_v2(histogram)[0], requests, message=label + " histogram")
-            if backoff_ms > 1:
-                # Refused retries still represent the whole logical request.
-                # Include its backoff in the one final sample; leave a margin
-                # for histogram quantization and timer resolution.
-                minimum_ms = backoff_ms * 0.9
-                env.assertGreaterEqual(entry["Min Latency"], minimum_ms, message=label)
-                env.assertGreaterEqual(entry["Percentile Latencies"]["p50.00"], minimum_ms,
-                                       message=label)
+            # The terminal sample represents the whole logical request: it
+            # includes the delayed terminal reply, whether that completes the
+            # command or ends it with a redirect, and the backoff of a refused
+            # retry. Leave a margin for histogram quantization and timer
+            # resolution.
+            env.assertGreaterEqual(entry["Min Latency"], minimum_ms, message=label)
+            env.assertGreaterEqual(entry["Average Latency"], minimum_ms, message=label)
+            env.assertGreaterEqual(entry["Percentile Latencies"]["p50.00"], minimum_ms, message=label)
             # Both rates use the same duration. Their ratio recovers the
             # redirect count without depending on rounded run timestamps.
             # A zero rate is reported as a failure rather than raised, so the
@@ -160,10 +194,18 @@ def _check_redirect_stats(env, redirect, mode, command, backoff_ms=1, run_count=
             if entry["Ops/sec"] > 0:
                 actual_redirects = entry[redirect + "/sec"] / entry["Ops/sec"] * requests
                 env.assertAlmostEqual(actual_redirects, expected_redirects, delta=0.05, message=label)
-        series = stats[name]["Time-Serie"].values()
-        env.assertEqual(sum(second["Count"] for second in series), requests, message=label)
-        env.assertEqual(sum(second["Bytes RX"] for second in series), peer.terminal_rx, message=label)
-        env.assertEqual(sum(second["Bytes TX"] for second in series), peer.terminal_tx, message=label)
+            # The per-second series must agree with the run totals, for the
+            # command and for Totals alike.
+            series = list(entry["Time-Serie"].values())
+            series_label = "{} {} Time-Serie".format(label, "Totals" if entry is stats["Totals"] else name)
+            env.assertEqual(sum(second["Count"] for second in series), requests, message=series_label)
+            env.assertEqual(sum(second["Bytes RX"] for second in series), peer.terminal_rx,
+                            message=series_label)
+            env.assertEqual(sum(second["Bytes TX"] for second in series), peer.terminal_tx,
+                            message=series_label)
+            for second in series:
+                if second["Count"]:
+                    env.assertGreaterEqual(second["Min Latency"], minimum_ms, message=series_label)
 
 
 def _check_redirect_rates(env, stats, redirect, name, expected_ratio, label):
@@ -224,6 +266,14 @@ def test_exhausted_redirect_latency_includes_backoff(env):
     for redirect in ("MOVED", "ASK"):
         for command in ("set", "get", "arbitrary-set", "arbitrary-get"):
             _check_redirect_stats(env, redirect, "refused", command, backoff_ms=50)
+
+
+def test_retried_success_latency_includes_backoff(env):
+    # A request that succeeds after two redirects spans both backoffs, so its
+    # one latency sample must start at the first send, not the last.
+    for redirect in ("MOVED", "ASK"):
+        for command in ("set", "get", "arbitrary-set", "arbitrary-get"):
+            _check_redirect_stats(env, redirect, "success", command, backoff_ms=50)
 
 
 def test_run_count_average_redirect_stats(env):
