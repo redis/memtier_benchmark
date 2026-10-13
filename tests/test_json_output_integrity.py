@@ -503,8 +503,7 @@ def test_json_configuration_escapes_string_values(env):
             debugPrintMemtierOnError(run_config, env)
 
 
-def _assert_totals_bandwidth_is_sum_of_commands(env, section_name, section,
-                                                check_rx_tx=True):
+def _assert_totals_bandwidth_is_sum_of_commands(env, section_name, section):
     """Totals KB/sec (and its RX/TX split) must equal the sum of the
     per-command rows. Each value is printed with %.2f, so allow a small
     rounding slack per row."""
@@ -513,10 +512,7 @@ def _assert_totals_bandwidth_is_sum_of_commands(env, section_name, section,
                 and "KB/sec" in stats]
     env.assertGreater(len(commands), 0,
                       message=f"{section_name}: no per-command rows")
-    fields = ["KB/sec"]
-    if check_rx_tx:
-        fields += ["KB/sec RX", "KB/sec TX"]
-    for field in fields:
+    for field in ("KB/sec", "KB/sec RX", "KB/sec TX"):
         expected = sum(float(section[name][field]) for name in commands)
         actual = float(section["Totals"][field])
         env.assertAlmostEqual(
@@ -549,10 +545,61 @@ def test_json_arbitrary_commands_totals_bandwidth(env):
                     if k.startswith("AGGREGATED AVERAGE RESULTS")]
         env.assertEqual(len(agg_keys), 1,
                         message="Expected exactly one AGGREGATED section")
-        # The aggregated Totals RX/TX split is not averaged across runs
-        # yet, so only the combined KB/sec is checked there.
-        _assert_totals_bandwidth_is_sum_of_commands(
-            env, agg_keys[0], results[agg_keys[0]], check_rx_tx=False)
+        _assert_totals_bandwidth_is_sum_of_commands(env, agg_keys[0],
+                                                    results[agg_keys[0]])
+        _assert_aggregated_totals_rx_tx(env, results, agg_keys[0])
+    finally:
+        if env.getNumberOfFailedAssertion() > failed_asserts:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def _assert_aggregated_totals_rx_tx(env, results, agg_key):
+    """Issue #577: the AGGREGATED Totals RX/TX split must add up to the
+    combined KB/sec, and with --run-count=2 (BEST and WORST are the two runs)
+    each of them must be the mean of the per-run values."""
+    totals = results[agg_key]["Totals"]
+    kbs = float(totals["KB/sec"])
+    rx = float(totals["KB/sec RX"])
+    tx = float(totals["KB/sec TX"])
+    env.assertGreater(rx, 0.0, message=f"{agg_key}: Totals 'KB/sec RX' is 0")
+    env.assertGreater(tx, 0.0, message=f"{agg_key}: Totals 'KB/sec TX' is 0")
+    env.assertAlmostEqual(
+        rx + tx, kbs, 0.03,
+        message=f"{agg_key}: Totals RX ({rx}) + TX ({tx}) != KB/sec ({kbs})")
+    best = results["BEST RUN RESULTS"]["Totals"]
+    worst = results["WORST RUN RESULTS"]["Totals"]
+    # BEST and WORST are the same run only if both runs had identical ops/sec.
+    if best["Ops/sec"] == worst["Ops/sec"]:
+        return
+    for field in ("KB/sec", "KB/sec RX", "KB/sec TX"):
+        expected = (float(best[field]) + float(worst[field])) / 2
+        actual = float(totals[field])
+        env.assertAlmostEqual(
+            actual, expected, 0.02,
+            message=f"{agg_key}: Totals '{field}' ({actual}) != mean of the "
+                    f"two runs ({expected})")
+
+
+def test_json_aggregated_totals_rx_tx(env):
+    """Issue #577: with --run-count the AGGREGATED Totals 'KB/sec RX' and
+    'KB/sec TX' were never accumulated or averaged across runs, so they were
+    always reported as 0.0."""
+    test_dir = tempfile.mkdtemp()
+    benchmark, run_config = _build_benchmark(
+        env, test_dir, extra_args=["--run-count=2", "--ratio=1:1"],
+        threads=2, clients=4, requests=1000)
+    ok = benchmark.run()
+    failed_asserts = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier_benchmark exited non-zero")
+        results = _read_json(run_config, env)
+        agg_keys = [k for k in results
+                    if k.startswith("AGGREGATED AVERAGE RESULTS")]
+        env.assertEqual(len(agg_keys), 1,
+                        message="Expected exactly one AGGREGATED section")
+        _assert_totals_bandwidth_is_sum_of_commands(env, agg_keys[0],
+                                                    results[agg_keys[0]])
+        _assert_aggregated_totals_rx_tx(env, results, agg_keys[0])
     finally:
         if env.getNumberOfFailedAssertion() > failed_asserts:
             debugPrintMemtierOnError(run_config, env)

@@ -321,6 +321,8 @@ totals::totals() :
         m_ar_commands(),
         m_ops_sec(0),
         m_bytes_sec(0),
+        m_bytes_sec_rx(0),
+        m_bytes_sec_tx(0),
         m_hits_sec(0),
         m_misses_sec(0),
         m_moved_sec(0),
@@ -359,6 +361,8 @@ void totals::add(const totals &other)
     m_moved_sec += other.m_moved_sec;
     m_ask_sec += other.m_ask_sec;
     m_bytes_sec += other.m_bytes_sec;
+    m_bytes_sec_rx += other.m_bytes_sec_rx;
+    m_bytes_sec_tx += other.m_bytes_sec_tx;
     m_bytes_rx += other.m_bytes_rx;
     m_bytes_tx += other.m_bytes_tx;
     m_latency += other.m_latency;

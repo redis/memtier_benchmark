@@ -990,6 +990,8 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
     m_totals.m_moved_sec /= all_stats.size();
     m_totals.m_ask_sec /= all_stats.size();
     m_totals.m_bytes_sec /= all_stats.size();
+    m_totals.m_bytes_sec_rx /= all_stats.size();
+    m_totals.m_bytes_sec_tx /= all_stats.size();
     m_totals.m_latency /= all_stats.size();
 
     // m_arbitrary_misses now holds the SUMMED hit/miss counts across all runs,
