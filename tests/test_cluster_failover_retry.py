@@ -171,5 +171,5 @@ def test_requests_complete_after_primary_failover(env):
     if os.path.isfile(json_path):
         with open(json_path) as f:
             totals = json.load(f)["ALL STATS"]["Totals"]["Count"]
-        env.assertTrue(totals >= threads * clients * requests,
-                       message="{} ops, expected {}".format(totals, threads * clients * requests))
+        env.assertEqual(totals, threads * clients * requests,
+                        message="{} ops, expected {}".format(totals, threads * clients * requests))

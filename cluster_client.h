@@ -211,8 +211,9 @@ protected:
 
     shard_connection *create_shard_connection(abstract_protocol *abs_protocol);
     bool connect_shard_connection(shard_connection *sc, char *address, char *port);
-    void handle_moved(unsigned int conn_id, struct timeval timestamp, request *request, protocol_response *response);
-    void handle_ask(unsigned int conn_id, struct timeval timestamp, request *request, protocol_response *response);
+    void handle_moved(unsigned int conn_id);
+    void update_redirect_stats(struct timeval timestamp, request *req, protocol_response *response, bool moved,
+                               bool completed);
     bool create_monitor_request_cluster(unsigned int command_index, struct timeval &timestamp, unsigned int conn_id);
     void process_staged_monitor_command(struct timeval timestamp, unsigned int conn_id);
     // Resend the request on the slot-owning connection (or same connection if

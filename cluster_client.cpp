@@ -2669,24 +2669,8 @@ bool cluster_client::create_monitor_request_cluster(unsigned int command_index, 
 }
 
 // In case of -MOVED response, we sends CLUSTER SLOTS command to get the new topology
-void cluster_client::handle_moved(unsigned int conn_id, struct timeval timestamp, request *request,
-                                  protocol_response *response)
+void cluster_client::handle_moved(unsigned int conn_id)
 {
-    // update stats
-    if (request->m_type == rt_get) {
-        m_stats.update_moved_get_op(&timestamp, response->get_total_len(), request->m_size,
-                                    ts_diff(request->m_sent_time, timestamp));
-    } else if (request->m_type == rt_set) {
-        m_stats.update_moved_set_op(&timestamp, response->get_total_len(), request->m_size,
-                                    ts_diff(request->m_sent_time, timestamp));
-    } else if (request->m_type == rt_arbitrary) {
-        arbitrary_request *ar = static_cast<arbitrary_request *>(request);
-        m_stats.update_moved_arbitrary_op(&timestamp, response->get_total_len(), request->m_size,
-                                          ts_diff(request->m_sent_time, timestamp), ar->index);
-    } else {
-        assert(0);
-    }
-
     // connection already issued 'cluster slots' command, wait for slots mapping to be updated
     if (m_connections[conn_id]->get_cluster_slots_state() != setup_done) return;
 
@@ -2726,23 +2710,38 @@ void cluster_client::handle_moved(unsigned int conn_id, struct timeval timestamp
     m_connections[conn_id]->set_cluster_slots();
 }
 
-// In case of -ASK response, we ignore the response and we will update to the new topology when we get -MOVED response
-void cluster_client::handle_ask(unsigned int conn_id, struct timeval timestamp, request *request,
-                                protocol_response *response)
+// Record every redirect, but count an operation only if it will not be retried.
+void cluster_client::update_redirect_stats(struct timeval timestamp, request *request, protocol_response *response,
+                                           bool moved, bool completed)
 {
-    // update stats
-    if (request->m_type == rt_get) {
-        m_stats.update_ask_get_op(&timestamp, response->get_total_len(), request->m_size,
-                                  ts_diff(request->m_sent_time, timestamp));
-    } else if (request->m_type == rt_set) {
-        m_stats.update_ask_set_op(&timestamp, response->get_total_len(), request->m_size,
-                                  ts_diff(request->m_sent_time, timestamp));
-    } else if (request->m_type == rt_arbitrary) {
-        arbitrary_request *ar = static_cast<arbitrary_request *>(request);
-        m_stats.update_ask_arbitrary_op(&timestamp, response->get_total_len(), request->m_size,
-                                        ts_diff(request->m_sent_time, timestamp), ar->index);
+    if (moved) {
+        if (request->m_type == rt_get) {
+            m_stats.update_moved_get_op(&timestamp, response->get_total_len(), request->m_size,
+                                        ts_diff(request->m_sent_time, timestamp), completed);
+        } else if (request->m_type == rt_set) {
+            m_stats.update_moved_set_op(&timestamp, response->get_total_len(), request->m_size,
+                                        ts_diff(request->m_sent_time, timestamp), completed);
+        } else if (request->m_type == rt_arbitrary) {
+            arbitrary_request *ar = static_cast<arbitrary_request *>(request);
+            m_stats.update_moved_arbitrary_op(&timestamp, response->get_total_len(), request->m_size,
+                                              ts_diff(request->m_sent_time, timestamp), ar->index, completed);
+        } else {
+            assert(0);
+        }
     } else {
-        assert(0);
+        if (request->m_type == rt_get) {
+            m_stats.update_ask_get_op(&timestamp, response->get_total_len(), request->m_size,
+                                      ts_diff(request->m_sent_time, timestamp), completed);
+        } else if (request->m_type == rt_set) {
+            m_stats.update_ask_set_op(&timestamp, response->get_total_len(), request->m_size,
+                                      ts_diff(request->m_sent_time, timestamp), completed);
+        } else if (request->m_type == rt_arbitrary) {
+            arbitrary_request *ar = static_cast<arbitrary_request *>(request);
+            m_stats.update_ask_arbitrary_op(&timestamp, response->get_total_len(), request->m_size,
+                                            ts_diff(request->m_sent_time, timestamp), ar->index, completed);
+        } else {
+            assert(0);
+        }
     }
 }
 
@@ -3044,7 +3043,8 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
         }
         // handle "-MOVED"
         if (strncmp(response->get_status(), MOVED_MSG_PREFIX, MOVED_MSG_PREFIX_LEN) == 0) {
-            handle_moved(conn_id, timestamp, request, response);
+            handle_moved(conn_id);
+            bool retried = false;
             // With --transaction, retrying a mid-rotation command on the new
             // slot owner would split the MULTI/EXEC block across two shard
             // connections. Drop the command instead. Reset the pin only when the
@@ -3080,7 +3080,7 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
                                         conn_id, m_txn_pinned_conn_id);
                 }
                 finalize_dropped_redirect(timestamp, request, response);
-            } else if (m_config->retry_on_error && !retry_after_redirect(conn_id, request)) {
+            } else if (m_config->retry_on_error && !(retried = retry_after_redirect(conn_id, request))) {
                 // With --retry-on-error, the captured command bytes are resent
                 // on the slot-owning connection. MOVED/ASK count toward
                 // max_retries. If the retry is refused (budget exhausted /
@@ -3088,12 +3088,13 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
                 // error so the request doesn't silently disappear from stats.
                 finalize_dropped_redirect(timestamp, request, response);
             }
+            update_redirect_stats(timestamp, request, response, true, !retried);
             return;
         }
 
         // handle "-ASK"
         if (strncmp(response->get_status(), ASK_MSG_PREFIX, ASK_MSG_PREFIX_LEN) == 0) {
-            handle_ask(conn_id, timestamp, request, response);
+            bool retried = false;
             if (m_config->transaction) {
                 if ((int) conn_id == m_txn_pinned_conn_id) {
                     if (!m_txn_pin_lost_warned) {
@@ -3122,9 +3123,10 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
                                         conn_id, m_txn_pinned_conn_id);
                 }
                 finalize_dropped_redirect(timestamp, request, response);
-            } else if (m_config->retry_on_error && !retry_after_redirect(conn_id, request)) {
+            } else if (m_config->retry_on_error && !(retried = retry_after_redirect(conn_id, request))) {
                 finalize_dropped_redirect(timestamp, request, response);
             }
+            update_redirect_stats(timestamp, request, response, false, !retried);
             return;
         }
     }

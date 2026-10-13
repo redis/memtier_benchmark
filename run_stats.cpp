@@ -288,11 +288,14 @@ void run_stats::update_connection_error(struct timeval *ts)
 }
 
 void run_stats::update_moved_get_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx,
-                                    unsigned int latency)
+                                    unsigned int latency, bool completed)
 {
     roll_cur_stats(ts);
+    m_cur_stats.m_get_cmd.m_moved++;
+    m_cur_stats.m_total_cmd.m_moved++;
+    if (!completed) return;
 
-    m_cur_stats.m_get_cmd.update_moved_op(bytes_rx, bytes_tx, latency);
+    m_cur_stats.m_get_cmd.update_op(bytes_rx, bytes_tx, latency);
     m_cur_stats.m_total_cmd.update_op(bytes_rx, bytes_tx, latency);
     m_totals.update_op(bytes_rx, bytes_tx, latency);
     memtier_record_latency(m_get_latency_histogram, latency);
@@ -302,12 +305,15 @@ void run_stats::update_moved_get_op(struct timeval *ts, unsigned int bytes_rx, u
 }
 
 void run_stats::update_moved_set_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx,
-                                    unsigned int latency)
+                                    unsigned int latency, bool completed)
 {
     roll_cur_stats(ts);
+    m_cur_stats.m_set_cmd.m_moved++;
+    m_cur_stats.m_total_cmd.m_moved++;
+    if (!completed) return;
 
-    m_cur_stats.m_set_cmd.update_moved_op(bytes_rx, bytes_tx, latency);
-    m_cur_stats.m_total_cmd.update_moved_op(bytes_rx, bytes_tx, latency);
+    m_cur_stats.m_set_cmd.update_op(bytes_rx, bytes_tx, latency);
+    m_cur_stats.m_total_cmd.update_op(bytes_rx, bytes_tx, latency);
     m_totals.update_op(bytes_rx, bytes_tx, latency);
     memtier_record_latency(m_set_latency_histogram, latency);
     memtier_record_latency(inst_m_set_latency_histogram, latency);
@@ -316,11 +322,14 @@ void run_stats::update_moved_set_op(struct timeval *ts, unsigned int bytes_rx, u
 }
 
 void run_stats::update_moved_arbitrary_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx,
-                                          unsigned int latency, size_t request_index)
+                                          unsigned int latency, size_t request_index, bool completed)
 {
     roll_cur_stats(ts);
+    m_cur_stats.m_ar_commands.at(request_index).m_moved++;
+    m_cur_stats.m_total_cmd.m_moved++;
+    if (!completed) return;
 
-    m_cur_stats.m_ar_commands.at(request_index).update_moved_op(bytes_rx, bytes_tx, latency);
+    m_cur_stats.m_ar_commands.at(request_index).update_op(bytes_rx, bytes_tx, latency);
     m_cur_stats.m_total_cmd.update_op(bytes_rx, bytes_tx, latency);
     m_totals.update_op(bytes_rx, bytes_tx, latency);
 
@@ -331,12 +340,15 @@ void run_stats::update_moved_arbitrary_op(struct timeval *ts, unsigned int bytes
 }
 
 void run_stats::update_ask_get_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx,
-                                  unsigned int latency)
+                                  unsigned int latency, bool completed)
 {
     roll_cur_stats(ts);
+    m_cur_stats.m_get_cmd.m_ask++;
+    m_cur_stats.m_total_cmd.m_ask++;
+    if (!completed) return;
 
-    m_cur_stats.m_get_cmd.update_ask_op(bytes_rx, bytes_tx, latency);
-    m_cur_stats.m_total_cmd.update_ask_op(bytes_rx, bytes_tx, latency);
+    m_cur_stats.m_get_cmd.update_op(bytes_rx, bytes_tx, latency);
+    m_cur_stats.m_total_cmd.update_op(bytes_rx, bytes_tx, latency);
     m_totals.update_op(bytes_rx, bytes_tx, latency);
     memtier_record_latency(m_get_latency_histogram, latency);
     memtier_record_latency(inst_m_get_latency_histogram, latency);
@@ -345,12 +357,15 @@ void run_stats::update_ask_get_op(struct timeval *ts, unsigned int bytes_rx, uns
 }
 
 void run_stats::update_ask_set_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx,
-                                  unsigned int latency)
+                                  unsigned int latency, bool completed)
 {
     roll_cur_stats(ts);
+    m_cur_stats.m_set_cmd.m_ask++;
+    m_cur_stats.m_total_cmd.m_ask++;
+    if (!completed) return;
 
-    m_cur_stats.m_set_cmd.update_ask_op(bytes_rx, bytes_tx, latency);
-    m_cur_stats.m_total_cmd.update_ask_op(bytes_rx, bytes_tx, latency);
+    m_cur_stats.m_set_cmd.update_op(bytes_rx, bytes_tx, latency);
+    m_cur_stats.m_total_cmd.update_op(bytes_rx, bytes_tx, latency);
     m_totals.update_op(bytes_rx, bytes_tx, latency);
     memtier_record_latency(m_set_latency_histogram, latency);
     memtier_record_latency(inst_m_set_latency_histogram, latency);
@@ -359,12 +374,15 @@ void run_stats::update_ask_set_op(struct timeval *ts, unsigned int bytes_rx, uns
 }
 
 void run_stats::update_ask_arbitrary_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx,
-                                        unsigned int latency, size_t request_index)
+                                        unsigned int latency, size_t request_index, bool completed)
 {
     roll_cur_stats(ts);
+    m_cur_stats.m_ar_commands.at(request_index).m_ask++;
+    m_cur_stats.m_total_cmd.m_ask++;
+    if (!completed) return;
 
-    m_cur_stats.m_ar_commands.at(request_index).update_ask_op(bytes_rx, bytes_tx, latency);
-    m_cur_stats.m_total_cmd.update_ask_op(bytes_rx, bytes_tx, latency);
+    m_cur_stats.m_ar_commands.at(request_index).update_op(bytes_rx, bytes_tx, latency);
+    m_cur_stats.m_total_cmd.update_op(bytes_rx, bytes_tx, latency);
     m_totals.update_op(bytes_rx, bytes_tx, latency);
 
     struct hdr_histogram *hist = m_ar_commands_latency_histograms.at(request_index);

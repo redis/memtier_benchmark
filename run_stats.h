@@ -249,15 +249,21 @@ public:
     unsigned long long int get_total_retried_ops() const { return m_totals.m_retried_ops; }
     unsigned long long int get_total_errors() const { return m_totals.m_errors; }
 
-    void update_moved_get_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency);
-    void update_moved_set_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency);
+    // A retried redirect is an event, not a completed operation. Only terminal
+    // responses contribute bytes, latency samples and operation counts.
+    void update_moved_get_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency,
+                             bool completed);
+    void update_moved_set_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency,
+                             bool completed);
     void update_moved_arbitrary_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx,
-                                   unsigned int latency, size_t arbitrary_index);
+                                   unsigned int latency, size_t arbitrary_index, bool completed);
 
-    void update_ask_get_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency);
-    void update_ask_set_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency);
+    void update_ask_get_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency,
+                           bool completed);
+    void update_ask_set_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency,
+                           bool completed);
     void update_ask_arbitrary_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency,
-                                 size_t arbitrary_index);
+                                 size_t arbitrary_index, bool completed);
 
     void update_wait_op(struct timeval *ts, unsigned int latency);
     void update_arbitrary_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency,
