@@ -350,23 +350,30 @@ bool cluster_client::connect_shard_connection(shard_connection *sc, char *addres
     int res = getaddrinfo(address, port, &hints, &addr_info);
     if (res != 0) {
         benchmark_error_log("connect: resolve error: %s\n", gai_strerror(res));
-        return false;
+    } else {
+        ci.ci_family = addr_info->ai_family;
+        ci.ci_socktype = addr_info->ai_socktype;
+        ci.ci_protocol = addr_info->ai_protocol;
+        assert(addr_info->ai_addrlen <= sizeof(ci.addr_buf));
+        memcpy(ci.addr_buf, addr_info->ai_addr, addr_info->ai_addrlen);
+        ci.ci_addr = (struct sockaddr *) ci.addr_buf;
+        ci.ci_addrlen = addr_info->ai_addrlen;
+
+        freeaddrinfo(addr_info);
+
+        // call connect
+        res = sc->connect(&ci);
     }
+    if (res == 0) return true;
 
-    ci.ci_family = addr_info->ai_family;
-    ci.ci_socktype = addr_info->ai_socktype;
-    ci.ci_protocol = addr_info->ai_protocol;
-    assert(addr_info->ai_addrlen <= sizeof(ci.addr_buf));
-    memcpy(ci.addr_buf, addr_info->ai_addr, addr_info->ai_addrlen);
-    ci.ci_addr = (struct sockaddr *) ci.addr_buf;
-    ci.ci_addrlen = addr_info->ai_addrlen;
-
-    freeaddrinfo(addr_info);
-
-    // call connect
-    res = sc->connect(&ci);
-
-    return res == 0;
+    // The connection failed before reaching the event loop (resolve error,
+    // EMFILE, ENETUNREACH, ...), so no connection event will report it, and
+    // no reconnect timer is pending: callers only dial connections without
+    // one. Handle it like a connection error, so it is retried with backoff
+    // and counts against --max-reconnect-attempts, instead of leaving the
+    // connection dead or redialing it on every slot map refresh.
+    sc->attempt_reconnect("Connection failed");
+    return false;
 }
 
 void cluster_client::build_mget_slot_cache()

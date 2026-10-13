@@ -510,7 +510,9 @@ int shard_connection::connect(struct connect_info *addr)
     // reconnect() reconnecting the main connection) connects this
     // connection; left armed, it would keep m_reconnecting set and ignore
     // errors on the live connection. Cancel it only now, so a socket setup
-    // failure above still leaves it to retry.
+    // failure above still leaves it to retry. A failed
+    // bufferevent_socket_connect() already cancelled it in disconnect(); its
+    // caller has to schedule the retry.
     if (m_reconnect_timer != NULL) {
         event_free(m_reconnect_timer);
         m_reconnect_timer = NULL;

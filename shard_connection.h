@@ -154,6 +154,10 @@ public:
 
     int connect(struct connect_info *addr);
     void disconnect();
+    // Count a connection error and disconnect. If --reconnect-on-error
+    // allows another attempt, schedule a reconnect with backoff; otherwise
+    // end this thread.
+    void attempt_reconnect(const char *error_context);
 
     void send_wait_command(struct timeval *sent_time, unsigned int num_slaves, unsigned int timeout);
     void send_set_command(struct timeval *sent_time, const char *key, int key_len, const char *value, int value_len,
@@ -323,7 +327,6 @@ private:
 
     void handle_event(short evtype);
     void handle_timer_event(void);
-    void attempt_reconnect(const char *error_context);
 
     unsigned int m_id;
     connections_manager *m_conns_manager;

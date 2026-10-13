@@ -896,3 +896,84 @@ def test_cluster_run_exits_with_reconnects_pending(env):
                 env.debugPrint("round {} STDERR tail:\n{}".format(i, f.read()[-3000:]), True)
             env.assertFalse(hung, message="memtier did not exit after --test-time (round {})".format(i))
             break
+
+
+def test_cluster_shard_dial_failure_honors_max_reconnect_attempts(env):
+    """
+    A shard connection whose dial fails before reaching the event loop must
+    still be retried with backoff and count against --max-reconnect-attempts.
+
+    One primary announces 224.0.0.1, so connecting to it fails synchronously
+    (ENETUNREACH) inside the CLUSTER SLOTS handling. No connection event ever
+    reported that failure and no reconnect timer was armed, so every slot map
+    refresh redialed the node at once, ignoring the backoff and
+    --max-reconnect-attempts (#570).
+    """
+    import subprocess
+
+    if not env.isCluster():
+        env.skip()
+        return
+    masters = env.getOSSMasterNodesConnectionList()
+    master_nodes = env.getMasterNodesList()
+    seed_port = int(master_nodes[0]['port'])
+    victim = None
+    for m in masters:
+        if int(m.connection_pool.connection_kwargs['port']) != seed_port:
+            victim = m
+            break
+    env.assertTrue(victim is not None, message="need a primary other than the seed")
+    seed = [m for m in masters if m is not victim][0]
+    unreachable = "224.0.0.1"
+    max_attempts = 2
+
+    def wait_announced(present):
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if (unreachable in str(seed.execute_command("CLUSTER", "SLOTS"))) == present:
+                return True
+            time.sleep(0.2)
+        return False
+
+    victim.execute_command("CONFIG", "SET", "cluster-announce-ip", unreachable)
+    try:
+        env.assertTrue(wait_announced(True), message="announced address did not propagate")
+        benchmark_specs = {
+            "name": env.testName,
+            "args": [
+                "--ratio=1:0",
+                "--key-pattern=R:R",
+                "--key-minimum=1",
+                "--key-maximum=10000",
+                "--reconnect-on-error",
+                "--max-reconnect-attempts={}".format(max_attempts),
+                "--hide-histogram",
+            ],
+        }
+        addTLSArgs(benchmark_specs, env)
+        config = get_default_memtier_config(threads=1, clients=1, requests=None, test_time=10)
+        add_required_env_arguments(benchmark_specs, config, env, master_nodes)
+        test_dir = tempfile.mkdtemp()
+        config = RunConfig(test_dir, env.testName, config, {})
+        ensure_clean_benchmark_folder(config.results_dir)
+        benchmark = Benchmark.from_json(config, benchmark_specs)
+        stderr_path = "{0}/mb.stderr".format(config.results_dir)
+        with open("{0}/mb.stdout".format(config.results_dir), "w") as stdout_f, open(stderr_path, "w") as stderr_f:
+            proc = subprocess.run(benchmark.args, stdout=stdout_f, stderr=stderr_f, cwd=config.results_dir,
+                                  timeout=60)
+        with open(stderr_path) as f:
+            stderr_content = f.read()
+    finally:
+        victim.execute_command("CONFIG", "SET", "cluster-announce-ip", "")
+        wait_announced(False)
+
+    failed_dials = stderr_content.count("connect failed")
+    if failed_dials > max_attempts + 1 or "Maximum reconnection attempts" not in stderr_content:
+        env.debugPrint("STDERR tail:\n{}".format(stderr_content[-3000:]), True)
+    # One initial dial plus one per reconnect attempt.
+    env.assertTrue(failed_dials <= max_attempts + 1,
+                   message="unreachable shard dialed {} times with --max-reconnect-attempts={}".format(
+                       failed_dials, max_attempts))
+    env.assertTrue("Maximum reconnection attempts ({}) exceeded".format(max_attempts) in stderr_content,
+                   message="--max-reconnect-attempts was not enforced for the unreachable shard")
+    env.assertNotEqual(proc.returncode, 0)
