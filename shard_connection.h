@@ -298,8 +298,9 @@ public:
     // Hand-off of requests held for resend when a cluster topology change
     // retires this connection: pop_replay_request() returns them one at a
     // time (NULL when none are left), and the connection that now owns the
-    // slot takes each one with adopt_replay_request(), which resends it now
-    // if connected, or once it connects otherwise.
+    // slot takes each one with adopt_replay_request(). It is resent from
+    // fill_pipeline() once that connection is connected and set up, never
+    // from inside the refresh.
     request *pop_replay_request();
     void adopt_replay_request(request *req);
     // Capture bytes added between `before_pos` and the current evbuffer length

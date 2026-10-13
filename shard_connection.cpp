@@ -986,16 +986,15 @@ request *shard_connection::pop_replay_request()
 
 void shard_connection::adopt_replay_request(request *req)
 {
-    if (!m_replay_queue) {
-        // Not expected: every connection has a replay queue with
-        // --retry-on-error, the only way to hold requests for resend.
-        delete req;
-        m_conns_manager->dec_reqs_generated(1);
-        return;
-    }
+    // Requests are only held for resend with --retry-on-error, which gives
+    // every connection a replay queue.
+    assert(m_replay_queue != NULL);
     m_replay_queue->push(req);
-    // A connection that isn't connected yet replays it once it connects.
-    if (m_connection_state == conn_connected && m_bev != NULL) drain_replay_queue_after_reconnect();
+    // Don't resend from here: this runs inside a CLUSTER SLOTS reply handler,
+    // possibly this connection's own. fill_pipeline() resends it once the
+    // connection is connected and set up. One that isn't connected yet
+    // resends it when it connects, as after any reconnect.
+    schedule_fill();
 }
 
 bool shard_connection::is_conn_setup_done()
@@ -1452,6 +1451,13 @@ void shard_connection::fill_pipeline(void)
     if (m_bev != NULL && m_bev_paused && get_connection_state() == conn_connected) {
         bufferevent_enable(m_bev, EV_READ | EV_WRITE);
         m_bev_paused = false;
+    }
+
+    // Resend requests handed over from a connection retired by a slot map
+    // refresh (adopt_replay_request). A reconnect drains the queue itself.
+    if (m_replay_queue != NULL && !m_replay_queue->empty() && get_connection_state() == conn_connected &&
+        is_conn_setup_done()) {
+        drain_replay_queue_after_reconnect();
     }
 
     while (!m_conns_manager->finished() && m_pipeline->size() < m_config->pipeline) {

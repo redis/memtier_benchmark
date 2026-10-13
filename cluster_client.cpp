@@ -2830,16 +2830,37 @@ void cluster_client::hand_off_replay_requests(unsigned int conn_id)
     unsigned long long dropped = 0;
     request *req;
     while ((req = m_connections[conn_id]->pop_replay_request()) != NULL) {
-        // Writes need the primary, and it serves reads too.
+        const char *drop_reason = NULL;
         unsigned int target = UINT_MAX;
-        if (req->m_key && req->m_key_len > 0) {
-            target = slot_primary_conn_id(calc_hslot_crc16_with_hash_tag(req->m_key, req->m_key_len));
+        if (m_config->transaction) {
+            // As for MOVED/ASK under --transaction: resending part of a
+            // MULTI/EXEC block on another connection would split it, or land
+            // it inside a block that connection has open.
+            drop_reason = "transaction-not-replayed";
+        } else {
+            // Writes need the primary, and it serves reads too.
+            if (req->m_key && req->m_key_len > 0) {
+                target = slot_primary_conn_id(calc_hslot_crc16_with_hash_tag(req->m_key, req->m_key_len));
+            }
+            if (target >= m_connections.size() || target == conn_id) {
+                drop_reason = "no-slot-owner-for-replay";
+            } else if (m_connections[target]->get_connection_state() == conn_disconnected &&
+                       !m_connections[target]->is_reconnect_pending()) {
+                // Every primary of the topology just committed is connected,
+                // connecting, or waiting on a reconnect timer: the refresh
+                // dials the ones without a timer, and a dial that fails
+                // schedules one. A primary left disconnected with no timer
+                // is one attempt_reconnect() gave up on (no
+                // --reconnect-on-error, or --max-reconnect-attempts reached),
+                // so nothing would replay the request.
+                drop_reason = "slot-owner-down-for-replay";
+            }
         }
-        if (target >= m_connections.size() || target == conn_id) {
+        if (drop_reason != NULL) {
             struct timeval now;
             gettimeofday(&now, NULL);
-            global_failed_keys_logger().log_failure(now, "REPLAY", req->m_key, req->m_key_len,
-                                                    "no-slot-owner-for-replay", req->m_retries);
+            global_failed_keys_logger().log_failure(now, "REPLAY", req->m_key, req->m_key_len, drop_reason,
+                                                    req->m_retries);
             dropped++;
             delete req;
             continue;
