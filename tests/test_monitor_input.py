@@ -722,6 +722,101 @@ def test_command_stats_breakdown_by_line(env):
         env.assertEqual(gets_count, 2)
 
 
+def _run_duplicate_command_lines(env, breakdown):
+    """
+    Run two identical GET lines plus a unique SET line with the given
+    --command-stats-breakdown and return (json pairs-preserving dict, list of
+    duplicate JSON object keys found anywhere in the document).
+    """
+    test_dir = tempfile.mkdtemp()
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--command=GET __key__",
+            "--command=GET __key__",
+            "--command=SET __key__ __data__",
+            "--command-stats-breakdown={}".format(breakdown),
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+
+    config = get_default_memtier_config(threads=1, clients=1, requests=300)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    memtier_ok = benchmark.run()
+    debugPrintMemtierOnError(config, env)
+    env.assertTrue(memtier_ok == True)
+
+    duplicates = []
+
+    def no_duplicates(pairs):
+        keys = [k for k, _ in pairs]
+        duplicates.extend(sorted(set(k for k in keys if keys.count(k) > 1)))
+        return dict(pairs)
+
+    with open("{0}/mb.json".format(config.results_dir)) as results_json:
+        results_dict = json.load(results_json, object_pairs_hook=no_duplicates)
+    return results_dict, duplicates
+
+
+def test_command_stats_breakdown_line_duplicate_json_keys(env):
+    """
+    Two --command lines with the same name used to produce duplicate "Gets"
+    (and "GET") keys in the JSON output with --command-stats-breakdown=line;
+    JSON parsers keep only the last one, so the per-command rows no longer
+    added up to Totals. Repeated names must be disambiguated with " #N" while
+    unique names keep their usual key.
+    """
+    results_dict, duplicates = _run_duplicate_command_lines(env, "line")
+    env.assertEqual(duplicates, [])
+
+    all_stats = results_dict["ALL STATS"]
+    env.assertTrue("Gets #1" in all_stats)
+    env.assertTrue("Gets #2" in all_stats)
+    env.assertFalse("Gets" in all_stats)
+    env.assertTrue("Sets" in all_stats)
+    env.assertTrue("GET #1" in all_stats)
+    env.assertTrue("GET #2" in all_stats)
+    env.assertTrue("SET" in all_stats)
+
+    # No row is lost: the per-command rows add up to Totals.
+    rows = [all_stats[k] for k in ("Gets #1", "Gets #2", "Sets")]
+    env.assertEqual(sum(r["Count"] for r in rows), all_stats["Totals"]["Count"])
+    env.assertTrue(all(r["Count"] > 0 for r in rows))
+
+    per_key = all_stats["Per-Key Misses"]
+    env.assertEqual(sorted(per_key.keys()), ["GET #1", "GET #2"])
+    total_gets = all_stats["Gets #1"]["Count"] + all_stats["Gets #2"]["Count"]
+    env.assertEqual(
+        sum(v["Total Hits"] + v["Total Misses"] for v in per_key.values()),
+        total_gets,
+    )
+
+
+def test_command_stats_breakdown_command_duplicate_json_keys(env):
+    """
+    With the default --command-stats-breakdown=command the rows are aggregated
+    by type ("Gets"), but the per-line "Per-Key Misses" section must still
+    keep one entry per --command line.
+    """
+    results_dict, duplicates = _run_duplicate_command_lines(env, "command")
+    env.assertEqual(duplicates, [])
+
+    all_stats = results_dict["ALL STATS"]
+    env.assertTrue("Gets" in all_stats)
+    env.assertTrue("Sets" in all_stats)
+    per_key = all_stats["Per-Key Misses"]
+    env.assertEqual(sorted(per_key.keys()), ["GET #1", "GET #2"])
+    env.assertEqual(
+        sum(v["Total Hits"] + v["Total Misses"] for v in per_key.values()),
+        all_stats["Gets"]["Count"],
+    )
+
+
 def test_monitor_input_malformed_command_skipped(env):
     """
     Test that malformed monitor commands are skipped with a warning instead of

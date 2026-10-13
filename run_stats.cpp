@@ -1400,6 +1400,38 @@ void histogram_print(FILE *out, json_handler *jsonhandler, const char *type, flo
     }
 }
 
+// JSON object keys must be unique, but two --command lines can share a
+// display name (e.g. --command="GET a" --command="GET b" both print as
+// "Gets"), and parsers keep only the last duplicate key, silently dropping
+// rows. Names that occur once are returned unchanged; each occurrence of a
+// repeated name gets a " #N" suffix (1-based, in --command order, matching
+// the order of the rows in the text table).
+static std::vector<std::string> make_unique_json_keys(const std::vector<std::string> &names)
+{
+    std::map<std::string, unsigned int> total;
+    for (const auto &name : names)
+        total[name]++;
+
+    std::map<std::string, unsigned int> seen;
+    std::vector<std::string> keys;
+    keys.reserve(names.size());
+    for (const auto &name : names) {
+        if (total[name] > 1)
+            keys.push_back(name + " #" + std::to_string(++seen[name]));
+        else
+            keys.push_back(name);
+    }
+    return keys;
+}
+
+static std::vector<std::string> command_name_json_keys(const arbitrary_command_list &command_list)
+{
+    std::vector<std::string> names;
+    for (size_t i = 0; i < command_list.size(); i++)
+        names.push_back(command_list[i].command_name);
+    return make_unique_json_keys(names);
+}
+
 bool run_stats::print_arbitrary_commands_results()
 {
     return m_totals.m_ar_commands.size() > 0;
@@ -1998,11 +2030,17 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
             }
         } else {
             // Original per-command behavior
+            std::vector<std::string> row_names;
             for (unsigned int i = 0; i < m_totals.m_ar_commands.size(); i++) {
                 std::string command_name = command_list[i].command_name;
                 std::transform(command_name.begin(), command_name.end(), command_name.begin(), ::tolower);
                 command_name[0] = static_cast<char>(toupper(command_name[0]));
                 command_name.append("s");
+                row_names.push_back(command_name);
+            }
+            const std::vector<std::string> row_keys = make_unique_json_keys(row_names);
+            for (unsigned int i = 0; i < m_totals.m_ar_commands.size(); i++) {
+                const std::string &command_name = row_keys[i];
                 struct hdr_histogram *arbitrary_command_latency_histogram = m_ar_commands_latency_histograms.at(i);
                 std::vector<one_sec_cmd_stats> arbitrary_command_stats = get_one_sec_cmd_stats_arbitrary_command(i);
 
@@ -2039,12 +2077,13 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
             }
         }
         if (any_per_key && jsonhandler != NULL) {
+            const std::vector<std::string> keys = command_name_json_keys(command_list);
             jsonhandler->open_nesting("Per-Key Misses");
             for (size_t i = 0; i < m_arbitrary_misses.size(); ++i) {
                 const arbitrary_misses_total &t = m_arbitrary_misses[i];
                 if (t.per_key_hits.empty()) continue;
                 if (i >= command_list.size()) continue;
-                jsonhandler->open_nesting(command_list[i].command_name.c_str());
+                jsonhandler->open_nesting(keys[i].c_str());
                 jsonhandler->write_obj("Total Hits", "%llu", t.total_hits);
                 jsonhandler->write_obj("Total Misses", "%llu", t.total_misses);
                 for (size_t k = 0; k < t.per_key_hits.size(); ++k) {
@@ -2148,12 +2187,13 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
 
         // Per-arbitrary-command routing breakdown.
         if (!m_arbitrary_read_routing.empty()) {
+            const std::vector<std::string> keys = command_name_json_keys(command_list);
             jsonhandler->open_nesting("Arbitrary Read Routing");
             for (size_t i = 0; i < m_arbitrary_read_routing.size(); ++i) {
                 if (i >= command_list.size()) break;
                 const read_routing_summary &rr = m_arbitrary_read_routing[i];
                 if (rr.ops_from_primary + rr.ops_from_replica == 0) continue;
-                jsonhandler->open_nesting(command_list[i].command_name.c_str());
+                jsonhandler->open_nesting(keys[i].c_str());
                 jsonhandler->write_obj("Ops from Primary", "%llu", rr.ops_from_primary);
                 jsonhandler->write_obj("Ops from Replica", "%llu", rr.ops_from_replica);
                 const unsigned long long total = rr.ops_from_primary + rr.ops_from_replica;
@@ -2285,11 +2325,12 @@ void run_stats::print_histogram(FILE *out, json_handler *jsonhandler, arbitrary_
             }
         } else {
             // Original per-command behavior
+            const std::vector<std::string> keys = command_name_json_keys(command_list);
             for (unsigned int i = 0; i < command_list.size(); i++) {
                 std::string command_name = command_list[i].command_name;
 
                 if (jsonhandler != NULL) {
-                    jsonhandler->open_nesting(command_name.c_str(), NESTED_ARRAY);
+                    jsonhandler->open_nesting(keys[i].c_str(), NESTED_ARRAY);
                 }
 
                 struct hdr_histogram *arbitrary_command_latency_histogram = m_ar_commands_latency_histograms.at(i);
