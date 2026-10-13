@@ -130,6 +130,7 @@ cluster_client::cluster_client(client_group *group) :
         m_txn_round_key_index(0),
         m_txn_round_key_valid(false),
         m_txn_pin_lost_warned(false),
+        m_txn_wait_slot(-1),
         m_strict_no_route_attempts(0),
         m_last_no_replica_warning_ts(0)
 {
@@ -204,6 +205,7 @@ void cluster_client::disconnect(void)
     m_txn_has_staged_key = false;
     m_txn_round_key_valid = false;
     m_txn_pin_lost_warned = false;
+    m_txn_wait_slot = -1;
 
     unsigned int conn_size = m_connections.size();
     unsigned int i;
@@ -1457,7 +1459,10 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
     // requeued or uncounted), but none of its replies are left to make a
     // producer that hold_pipeline() parked run fill_pipeline() again. With
     // every connection parked, the event loop has nothing left and exits.
-    if (m_config->multi_key_get > 0 || retired_any) {
+    // A rotation waiting for its key's owner (m_txn_wait_slot) parks every
+    // connection the same way; if the new map moves that slot to a live
+    // connection, one of them must run hold_pipeline() again to resume it.
+    if (m_config->multi_key_get > 0 || retired_any || m_txn_wait_slot != -1) {
         for (size_t i = 0; i < m_connections.size(); i++) {
             if (m_connections[i]->get_connection_state() != conn_disconnected) m_connections[i]->schedule_fill();
         }
@@ -1807,6 +1812,15 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         }
     }
 
+    /* The next rotation waits for its key's owner to reconnect. */
+    if (m_config->transaction && m_txn_pinned_conn_id == -1 && m_txn_wait_slot != -1) {
+        unsigned int owner = slot_primary_conn_id((unsigned int) m_txn_wait_slot);
+        if (owner < m_connections.size() && m_connections[owner]->get_connection_state() == conn_disconnected) {
+            return true;
+        }
+        m_txn_wait_slot = -1;
+    }
+
     /* In transaction mode the pin connection drives the entire rotation.
      * Non-pin connections must not spin in fill_pipeline; they will be
      * rescheduled via schedule_fill() when the pin is cleared. If the pin
@@ -2090,6 +2104,7 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
             m_txn_has_staged_key = false;
             m_txn_round_key_valid = false;
             m_txn_pin_lost_warned = false;
+            m_txn_wait_slot = -1;
             /* Wake up connections that were held back by hold_pipeline so
              * they can participate in the new rotation's lookahead. */
             for (size_t i = 0; i < m_connections.size(); i++) {
@@ -2118,6 +2133,7 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
              * and the actual send for that command_index pushes it onto
              * the pool just before calling client::create_arbitrary_request. */
             int target_conn = -1;
+            unsigned int hslot = 0;
             unsigned long long staged_key_index = 0;
             bool have_staged_key = false;
             unsigned int total = m_config->arbitrary_commands->size();
@@ -2151,7 +2167,6 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
                 }
                 const char *gen_key = m_obj_gen->get_key();
                 unsigned int gen_key_len = m_obj_gen->get_key_len();
-                unsigned int hslot;
                 if (key_arg != NULL && key_arg->has_key_affixes) {
                     std::string full;
                     full.reserve(key_arg->data_prefix.size() + gen_key_len + key_arg->data_suffix.size());
@@ -2173,14 +2188,23 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
                 }
                 break;
             }
-            /* If we couldn't find a keyed cmd, or the slot mapping isn't
-             * populated yet (target_conn out of range), or the elected shard
-             * is currently disconnected (e.g. pin just dropped and hasn't
-             * reconnected yet), fall back to the current conn so the rotation
-             * can proceed rather than re-pinning to a dead connection and
-             * permanently stalling all other conns via hold_pipeline. */
-            if (target_conn < 0 || target_conn >= (int) m_connections.size() ||
+            /* If the shard that owns the key is reconnecting, wait for it.
+             * Any other shard answers the keyed command with -MOVED and the
+             * transaction with EXECABORT. Keep the staged key for the owner;
+             * hold_pipeline() parks every connection until the owner is back
+             * (or a slot map refresh moves the slot to a live one), and the
+             * owner resumes the rotation from its own fill_pipeline(). */
+            if (target_conn >= 0 && target_conn < (int) m_connections.size() &&
                 m_connections[target_conn]->get_connection_state() == conn_disconnected) {
+                m_txn_staged_key_index = staged_key_index;
+                m_txn_has_staged_key = true;
+                m_txn_wait_slot = (int) hslot;
+                return false;
+            }
+            /* If we couldn't find a keyed cmd, or the slot mapping isn't
+             * populated yet (target_conn out of range), fall back to the
+             * current conn so the rotation can proceed. */
+            if (target_conn < 0 || target_conn >= (int) m_connections.size()) {
                 target_conn = (int) conn_id;
                 // keep have_staged_key: the key was already generated and the
                 // sequential counter advanced, so we must reuse it here (on

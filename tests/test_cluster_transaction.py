@@ -834,16 +834,20 @@ def test_transaction_keyless_only_rotation(env):
 
 
 def _run_with_shard_kills(env, commands, test_time=8, pipeline=1,
-                          threads=1, clients=1):
+                          threads=1, clients=1, extra_args=()):
     """Run a --transaction rotation with --reconnect-on-error while
     repeatedly killing one non-main shard's
     client connections. Returns (rc, kills, stderr, run_config); rc is None
     when memtier hung past --test-time + 30s."""
     benchmark_specs = {"name": env.testName, "args": ["--transaction"]}
     addTLSArgs(benchmark_specs, env)
-    benchmark_specs["args"].extend(['--command=' + c for c in commands])
+    # Entries starting with "--" are passed as is, so a per-command option
+    # such as --command-key-pattern can follow the command it applies to.
+    benchmark_specs["args"].extend([c if c.startswith('--') else '--command=' + c
+                                    for c in commands])
     benchmark_specs["args"].extend(['--pipeline={}'.format(pipeline),
                                     '--reconnect-on-error'])
+    benchmark_specs["args"].extend(extra_args)
     config = get_default_memtier_config(threads=threads, clients=clients, requests=None,
                                         test_time=test_time)
     master_nodes_list = env.getMasterNodesList()
@@ -854,9 +858,11 @@ def _run_with_shard_kills(env, commands, test_time=8, pipeline=1,
     ensure_clean_benchmark_folder(run_config.results_dir)
     benchmark = Benchmark.from_json(run_config, benchmark_specs)
 
-    # Any shard but the first: memtier's main connection goes to the first
-    # node, and its refreshes are what must not land inside a MULTI.
-    victim = env.getOSSMasterNodesConnectionList()[1]
+    # Any shard but the main one: memtier's main connection goes to the
+    # first node, and its refreshes are what must not land inside a MULTI.
+    main_port = int(master_nodes_list[0]['port'])
+    victim = next(conn for port, conn in sorted(_master_conns_by_port(env).items())
+                  if port != main_port)
 
     stdout_path = os.path.join(run_config.results_dir, "mb.stdout")
     stderr_path = os.path.join(run_config.results_dir, "mb.stderr")
@@ -898,24 +904,53 @@ def _discard_calls(env):
     return total
 
 
+def _main_shard_hash_tag(env):
+    """A hash tag whose slot the main node (memtier's -p) owns."""
+    main_port = int(env.getMasterNodesList()[0]['port'])
+    for tag in ['b', 'c', 'a', 'f', 'g', 'd', 'j', 'k', 'h']:
+        if _owning_port(env, tag) == main_port:
+            return tag
+    raise AssertionError("no candidate hash tag lives on the main node")
+
+
+def _sequential_key_holes(env):
+    """Number of key indexes missing between the lowest and highest
+    memtier-<n> key in the cluster."""
+    indexes = sorted(int(key.decode().split('-', 1)[1])
+                     for conn in env.getOSSMasterNodesConnectionList()
+                     for key in conn.scan_iter(match='memtier-*', count=1000))
+    if not indexes:
+        return 0
+    return indexes[-1] - indexes[0] + 1 - len(indexes)
+
+
+def _error_count(env, error):
+    total = 0
+    for conn in env.getOSSMasterNodesConnectionList():
+        stats = conn.info("errorstats")
+        total += int(stats.get("errorstat_" + error, {}).get("count", 0))
+    return total
+
+
 def test_transaction_connection_kills_do_not_hang(env):
     """Regression for #569: a CLUSTER SLOTS refresh must never be written on
     a connection with an open MULTI. The server queues it (+QUEUED), the
     reply handler treats that as a failed refresh, the connection never
     finishes setup and the run hangs past --test-time.
 
-    Repeatedly killing one non-main shard's connections hits both ways in:
-    a MOVED on the pinned connection mid-rotation (the key's owner is down,
-    so the rotation falls back to another shard), and the slot map refresh
-    cluster_client::reconnect() requests on the main connection while it
-    may be pinned inside a MULTI."""
+    Every key lives on the main node, so the main connection drives every
+    rotation and is inside a MULTI most of the time. Each kill of another
+    shard's connections makes cluster_client::reconnect() request a slot map
+    refresh on that main connection, which must wait for the rotation's
+    EXEC."""
     if not env.isCluster():
         env.skip()
         return
 
     _reset_discard_calls(env)
+    tag = _main_shard_hash_tag(env)
     rc, kills, stderr, run_config = _run_with_shard_kills(
-        env, ['MULTI', 'SET __key__ __data__', 'EXEC'])
+        env, ['MULTI', 'SET {' + tag + '}__key__ __data__', 'EXEC'])
     failed = env.getNumberOfFailedAssertion()
     try:
         env.assertTrue(kills > 0, message="no connection was killed")
@@ -924,13 +959,16 @@ def test_transaction_connection_kills_do_not_hang(env):
         env.assertEqual(rc, 0)
         env.assertTrue("cluster slot failed" not in stderr,
                        message="CLUSTER SLOTS was sent inside an open MULTI")
-        # The kills must have driven the pinned connection into a MOVED
-        # mid-rotation, otherwise this run proved nothing.
-        env.assertTrue("received MOVED mid-rotation" in stderr,
-                       message="no MOVED mid-rotation was provoked")
+        # The kills must have made the main connection refresh the slot map
+        # mid-run, otherwise this run proved nothing.
+        env.assertTrue("requested a cluster slot map refresh" in stderr,
+                       message="no reconnect slot map refresh was provoked")
         # A rotation that closes its MULTI never needs the abandoned-MULTI
-        # DISCARD: the refresh waits for the rotation's EXEC instead.
+        # DISCARD: the refresh waits for the rotation's EXEC instead. Sent
+        # inside the MULTI, the refresh would DISCARD it, and the rotation's
+        # EXEC would then fail with "EXEC without MULTI".
         env.assertEqual(_discard_calls(env), 0)
+        env.assertEqual(_error_count(env, "ERR"), 0)
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)
@@ -990,6 +1028,45 @@ def test_transaction_pipelined_connection_kills_preserve_key_pool(env):
         for command in ('Multis', 'Sets', 'Execs'):
             env.assertTrue(stats[command]['Count'] > 0,
                            message="no {} completed".format(command))
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_waits_for_reconnecting_key_owner(env):
+    """A rotation whose key belongs to a shard that is reconnecting must wait
+    for that shard. Pinned to any other shard, the keyed command gets -MOVED
+    and the server answers the rotation's EXEC with EXECABORT."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    _reset_discard_calls(env)
+    _flush_cluster(env)
+    pipeline = 1
+    rc, kills, stderr, run_config = _run_with_shard_kills(
+        env, ['MULTI', 'SET __key__ __data__', '--command-key-pattern=S', 'EXEC'],
+        pipeline=pipeline, extra_args=['--key-minimum=1', '--key-maximum=100000000'])
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(kills > 0, message="no connection was killed")
+        env.assertTrue(rc is not None,
+                       message="memtier_benchmark hung past --test-time")
+        env.assertEqual(rc, 0)
+        env.assertTrue("requested a cluster slot map refresh" in stderr,
+                       message="the killed shard was never reconnected")
+        # Holding the rotation keeps its key: only transactions in flight on
+        # a killed connection may leave a hole in the sequential range.
+        holes = _sequential_key_holes(env)
+        env.assertTrue(holes <= kills * pipeline,
+                       message="{} holes in the sequential key range for {} "
+                               "killed connections".format(holes, kills))
+        # The topology never changes, so the right shard never answers MOVED.
+        env.assertEqual(_error_count(env, "MOVED"), 0)
+        env.assertEqual(_error_count(env, "EXECABORT"), 0)
+        with open(os.path.join(run_config.results_dir, "mb.json")) as f:
+            stats = json.load(f)['ALL STATS']
+        env.assertTrue(stats['Execs']['Count'] > 0, message="no EXEC completed")
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)

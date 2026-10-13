@@ -124,6 +124,11 @@ protected:
     // Set when we emit the "pin connection lost mid-rotation" warning so we
     // don't spam it on every hold_pipeline() call during the outage.
     bool m_txn_pin_lost_warned;
+    // Slot of the staged rotation key while its owning shard connection is
+    // reconnecting, -1 otherwise. The rotation waits for that connection:
+    // sent anywhere else, the keyed command gets -MOVED and the transaction
+    // ends in EXECABORT.
+    int m_txn_wait_slot;
     // Consecutive read-routing failures under strict rp_secondary with no live
     // replica. Incremented in get_key_for_conn each time select_target_conn
     // returns UINT_MAX for a read; reset on any successful routing. When the
