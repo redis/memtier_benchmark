@@ -70,6 +70,7 @@ tests/.env/
 # Unit-test harness (tests/unit/) build + automake check-driver artifacts
 /prometheus_metrics_test
 /hdr_histogram_test
+/cluster_transaction_test
 tests/unit/prometheus_metrics_test
 *.log
 *.trs

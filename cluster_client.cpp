@@ -191,18 +191,12 @@ int cluster_client::connect(void)
 
 void cluster_client::txn_release_pin()
 {
-    if (m_txn_has_staged_key) {
-        // Return the staged key to the pin connection's pool so the next
-        // rotation can reuse it. Without this, every mid-rotation pin reset
-        // (MOVED, disconnect) silently burns one key from the sequential
-        // iterator, permanently skipping that index under --key-pattern=S.
-        m_key_index_pools[m_txn_pinned_conn_id]->push(m_txn_staged_key_index);
-        m_txn_has_staged_key = false;
-    }
-    // Forget the rotation's shared key: a dropped pin restarts the rotation on
-    // a fresh pin/lookahead, which will adopt a new key. Leaving this set would
-    // make the re-pinned rotation reuse the old key while the fresh lookahead
-    // key goes unconsumed -- burning a sequential index at the next wrap.
+    // Keep an unconsumed lookahead key in transaction state. The routed pool
+    // holds (command_index, key_index) pairs, so returning a bare key there
+    // makes create_request() interpret it as a command index. Re-pinning will
+    // resolve this same key against the current topology without advancing
+    // its iterator again.
+    // A consumed rotation key is no longer reusable after the pin is lost.
     m_txn_round_key_valid = false;
     m_txn_pinned_conn_id = -1;
 }
@@ -306,12 +300,8 @@ bool cluster_client::connect_shard_connection(shard_connection *sc, char *addres
         // the pool here without compensating leaves m_reqs_processed < m_reqs_generated
         // permanently, so a --requests run hangs and a --test-time run
         // mis-accounts pending in-flight. Compensate by n/2 (pairs).
-        // Defensive clamp guards against underflow from any future single-entry
-        // push pattern (txn_release_pin pushes a lone key, but the pin path
-        // does not increment m_reqs_generated for that staged key -- it is
-        // consumed by the next rotation -- so n/2 is the right accounting
-        // for cross-shard residue and a no-op for the txn-staged singleton
-        // beyond the clamp.) Matches the pattern at hold_pipeline.
+        // Defensive clamp guards against accounting underflow. Transaction
+        // lookahead stays in transaction state and never enters this queue.
         key_index_pool empty_queue;
         std::swap(*m_key_index_pools[sc->get_id()], empty_queue);
         {
@@ -2122,7 +2112,6 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
             int target_conn = -1;
             unsigned long long staged_key_index = 0;
             bool have_staged_key = false;
-            m_txn_has_staged_key = false;
             unsigned int total = m_config->arbitrary_commands->size();
             for (unsigned int off = 0; off < total; off++) {
                 unsigned int look_idx = (m_executed_command_index + off) % total;
@@ -2130,7 +2119,12 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
                 if (look.stats_only) continue;
                 if (look.keys_count == 0) continue;
 
-                client::get_key_for_conn(look_idx, conn_id, &staged_key_index);
+                if (m_txn_has_staged_key) {
+                    staged_key_index = m_txn_staged_key_index;
+                    m_obj_gen->generate_key(staged_key_index);
+                } else {
+                    client::get_key_for_conn(look_idx, conn_id, &staged_key_index);
+                }
                 have_staged_key = true;
 
                 /* Reconstruct the actual key string that would be sent on

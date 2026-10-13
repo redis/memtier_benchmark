@@ -833,16 +833,18 @@ def test_transaction_keyless_only_rotation(env):
             debugPrintMemtierOnError(run_config, env)
 
 
-def _run_with_shard_kills(env, commands, test_time=8):
-    """Run a --transaction rotation of `commands` (-t1 -c1, --pipeline=1,
-    --reconnect-on-error) while repeatedly killing one non-main shard's
+def _run_with_shard_kills(env, commands, test_time=8, pipeline=1,
+                          threads=1, clients=1):
+    """Run a --transaction rotation with --reconnect-on-error while
+    repeatedly killing one non-main shard's
     client connections. Returns (rc, kills, stderr, run_config); rc is None
     when memtier hung past --test-time + 30s."""
     benchmark_specs = {"name": env.testName, "args": ["--transaction"]}
     addTLSArgs(benchmark_specs, env)
     benchmark_specs["args"].extend(['--command=' + c for c in commands])
-    benchmark_specs["args"].extend(['--pipeline=1', '--reconnect-on-error'])
-    config = get_default_memtier_config(threads=1, clients=1, requests=None,
+    benchmark_specs["args"].extend(['--pipeline={}'.format(pipeline),
+                                    '--reconnect-on-error'])
+    config = get_default_memtier_config(threads=threads, clients=clients, requests=None,
                                         test_time=test_time)
     master_nodes_list = env.getMasterNodesList()
     add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
@@ -958,6 +960,36 @@ def test_transaction_abandoned_multi_is_discarded_before_refresh(env):
         # fallback ran rather than the refresh path never being reached.
         env.assertTrue(_discard_calls(env) > 0,
                        message="no abandoned MULTI was discarded")
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_pipelined_connection_kills_preserve_key_pool(env):
+    """#580: an unsent lookahead key must not enter the routed command queue
+    when a pipelined transaction loses its pin."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    rc, kills, stderr, run_config = _run_with_shard_kills(
+        env, ['MULTI', 'SET __key__ __data__', 'EXEC'],
+        pipeline=16, clients=2)
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(kills > 0, message="no connection was killed")
+        env.assertTrue(rc is not None,
+                       message="memtier_benchmark hung past --test-time")
+        env.assertEqual(rc, 0)
+        env.assertTrue("caught exception" not in stderr,
+                       message="worker threw after transaction pin release")
+        env.assertTrue("vector::_M_range_check" not in stderr,
+                       message="staged key was interpreted as a command index")
+        with open(os.path.join(run_config.results_dir, "mb.json")) as f:
+            stats = json.load(f)['ALL STATS']
+        for command in ('Multis', 'Sets', 'Execs'):
+            env.assertTrue(stats[command]['Count'] > 0,
+                           message="no {} completed".format(command))
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)

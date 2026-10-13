@@ -227,9 +227,8 @@ protected:
     // Hand the requests a retired connection holds for resend to the
     // connections that now own their slots, so they still complete.
     void hand_off_replay_requests(unsigned int conn_id);
-    // Release the transaction pin and return any staged key to the pool so the
-    // key index is not silently burned when a mid-rotation MOVED or disconnect
-    // forces the rotation to restart.
+    // Release the transaction pin, retaining any unconsumed lookahead key so
+    // re-pinning can resolve its owner again without burning a key index.
     void txn_release_pin();
 
 public:
