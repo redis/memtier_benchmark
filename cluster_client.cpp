@@ -1393,8 +1393,13 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
     print_topology_summary();
 
     // check if some connections left with no slots, and need to be closed
+    bool retired_any = false;
     for (unsigned int i = 0; i < prev_connections_size; i++) {
         if (close_sc[i] == true) {
+            // Whatever is dropped below (staged commands, key pool, the
+            // pipeline, replays hand_off_replay_requests() can't place) frees
+            // --requests and in-flight budget, so wake the producers below.
+            retired_any = true;
             // Flush staged monitor commands unconditionally for any retired shard,
             // regardless of its connection state. A shard can be already disconnected
             // (TCP dropped mid-run) while still holding staged commands that were
@@ -1428,6 +1433,9 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
                 }
             }
             if (m_connections[i]->get_connection_state() != conn_disconnected) {
+                // This can be the connection whose CLUSTER SLOTS reply is
+                // being handled: its process_response() stops parsing once
+                // it sees the disconnect.
                 m_connections[i]->disconnect();
             }
             // With --retry-on-error, disconnect() kept the in-flight and
@@ -1449,7 +1457,11 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
     // with the freshly-built m_mget_conn_slots.  Without this, a connection that
     // was bufferevent_disable()'d before the cache existed would never re-run
     // fill_pipeline() and would stay permanently idle.
-    if (m_config->multi_key_get > 0) {
+    // Retiring a connection frees in-flight budget too (its pipeline was
+    // requeued or uncounted), but none of its replies are left to make a
+    // producer that hold_pipeline() parked run fill_pipeline() again. With
+    // every connection parked, the event loop has nothing left and exits.
+    if (m_config->multi_key_get > 0 || retired_any) {
         for (size_t i = 0; i < m_connections.size(); i++) {
             if (m_connections[i]->get_connection_state() != conn_disconnected) m_connections[i]->schedule_fill();
         }

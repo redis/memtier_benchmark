@@ -435,6 +435,14 @@ private:
     // the EV_READ|EV_WRITE-disabled state.
     bool m_bev_paused;
 
+    // Bumped by every disconnect(). process_response() compares it against
+    // the value it started with and stops parsing once the connection was
+    // torn down by a handler it called (e.g. a CLUSTER SLOTS reply retiring
+    // this very connection): the pipeline those replies answer is gone. A
+    // counter rather than a state check, so that a disconnect followed by a
+    // reconnect inside the same handler is caught too.
+    unsigned long m_disconnect_count = 0;
+
     // EWMA of per-response latency in microseconds; see public accessors above
     // (LATENCY_EWMA_ALPHA / LATENCY_EWMA_MIN_SAMPLES). Driven by
     // update_latency_ewma() from the response handler. Read by the

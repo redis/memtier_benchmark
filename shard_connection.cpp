@@ -622,6 +622,7 @@ void shard_connection::disconnect()
     }
 
     m_connection_state = conn_disconnected;
+    m_disconnect_count++;
 
     // Reset rate limiting state during disconnection
     m_request_per_cur_interval = 0;
@@ -1164,6 +1165,8 @@ void shard_connection::process_response(void)
     struct timeval now;
     gettimeofday(&now, NULL);
 
+    const unsigned long disconnect_count = m_disconnect_count;
+
     while ((ret = m_protocol->parse_response()) > 0) {
         bool error = false;
         protocol_response *r = m_protocol->get_response();
@@ -1391,6 +1394,13 @@ void shard_connection::process_response(void)
         }
         if (error) {
             return;
+        }
+        // A handler tore this connection down, e.g. a CLUSTER SLOTS reply
+        // that left it with no slots retired it. disconnect() already
+        // emptied the pipeline (requeueing or uncounting the requests), so
+        // the replies still buffered have no request to match: stop here.
+        if (m_disconnect_count != disconnect_count) {
+            break;
         }
     }
 
