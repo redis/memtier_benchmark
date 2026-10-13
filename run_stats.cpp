@@ -940,7 +940,9 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
         i->summarize(i_totals);
         m_totals.add(i_totals);
 
-        // aggregate latency data
+        // aggregate latency data; summarize() leaves i_totals.latency_histogram
+        // empty, so the per-run totals histogram must be merged explicitly.
+        hdr_add(m_totals.latency_histogram, i->m_totals.latency_histogram);
         hdr_add(m_get_latency_histogram, i->m_get_latency_histogram);
         hdr_add(m_set_latency_histogram, i->m_set_latency_histogram);
         hdr_add(m_wait_latency_histogram, i->m_wait_latency_histogram);

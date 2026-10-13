@@ -184,3 +184,54 @@ def test_percentile_values_match_encoded_distribution_and_table(env):
                     env.assertEqual(table_values, ["---"] * len(requested))
                 else:
                     env.assertEqual(list(map(float, table_values)), expected)
+
+
+def test_aggregated_average_totals_histogram(env):
+    """--run-count AVERAGE Totals must carry the merged totals histogram.
+
+    Regression for #567: aggregate_average() merged the per-type histograms but
+    not the totals histogram the JSON Totals block prints from, so the AVERAGE
+    Totals percentiles came from an empty histogram while Count was right.
+    """
+    requested = [0, 50, 99, 100]
+    with tempfile.TemporaryDirectory() as directory:
+        specs = {"name": env.testName, "args": [
+            "--ratio=1:3", "--pipeline=1", "--key-maximum=1000", "--run-count=2", "--print-all-runs",
+            "--hide-histogram", "--print-percentiles=" + ",".join(map(str, requested)),
+        ]}
+        addTLSArgs(specs, env)
+        config = get_default_memtier_config(threads=2, clients=2, requests=1000)
+        add_required_env_arguments(specs, config, env, env.getMasterNodesList())
+        config = RunConfig(directory, env.testName, config, {})
+        ensure_clean_benchmark_folder(config.results_dir)
+        env.assertTrue(Benchmark.from_json(config, specs).run())
+        with open(os.path.join(config.results_dir, "mb.json")) as source:
+            results = json.load(source)
+        with open(os.path.join(config.results_dir, "mb.stdout")) as source:
+            lines = source.read().splitlines()
+
+        def decode(section, name):
+            stats = results[section][name]
+            encoded = stats["Percentile Latencies"]["Histogram log format"]["Compressed Histogram"]
+            count, raw = _decode_v2(encoded)
+            env.assertEqual(count, stats["Count"])
+            return _v2_counts(raw)
+
+        average = "AGGREGATED AVERAGE RESULTS (2 runs)"
+        totals = results[average]["Totals"]
+        env.assertEqual(totals["Count"], 2 * 4000)
+        decoded = decode(average, "Totals")
+        env.assertEqual(decoded, _merge_counts(decode(average, "Sets"), decode(average, "Gets")))
+        env.assertEqual(decoded, _merge_counts(decode("RUN #1 RESULTS", "Totals"),
+                                               decode("RUN #2 RESULTS", "Totals")))
+
+        expected = [_percentile(decoded, p) / 1000 for p in requested]
+        actual = {float(key[1:]): value for key, value in totals["Percentile Latencies"].items()
+                  if key.startswith("p")}
+        env.assertEqual([actual[p] for p in requested], expected)
+        env.assertEqual(totals["Min Latency"], expected[0])
+        env.assertEqual(totals["Max Latency"], expected[-1])
+        # The AVERAGE table's Totals row is printed after its section header.
+        start = max(i for i, line in enumerate(lines) if average in line)
+        row = next(line.split() for line in lines[start:] if line.startswith("Totals "))
+        env.assertEqual(list(map(float, row[-len(requested)-1:-1])), expected)
