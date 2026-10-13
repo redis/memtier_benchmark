@@ -225,6 +225,9 @@ protected:
     // to --failed-keys-file if configured and increments the error counter,
     // so the request doesn't silently disappear from the stats.
     void finalize_dropped_redirect(struct timeval timestamp, request *req, protocol_response *response);
+    // Same for a request rejected with -READONLY and not retried; also counts
+    // it as an op, since no redirect stats record it.
+    void finalize_dropped_readonly(struct timeval timestamp, request *req, protocol_response *response);
     // Hand the requests a retired connection holds for resend to the
     // connections that now own their slots, so they still complete.
     void hand_off_replay_requests(unsigned int conn_id);

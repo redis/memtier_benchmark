@@ -2905,6 +2905,35 @@ void cluster_client::finalize_dropped_redirect(struct timeval timestamp, request
     m_stats.inc_error();
 }
 
+// Terminal accounting for a request rejected with -READONLY and not retried.
+// Unlike MOVED/ASK there are no redirect stats to record it, so count the op
+// here, as client::handle_response does for any other error reply.
+void cluster_client::finalize_dropped_readonly(struct timeval timestamp, request *req, protocol_response *response)
+{
+    finalize_dropped_redirect(timestamp, req, response);
+
+    const unsigned int latency = ts_diff(req->m_first_sent_time, timestamp);
+    switch (req->m_type) {
+    case rt_get:
+        m_stats.update_get_op(&timestamp, response->get_total_len(), req->m_size, latency, response->get_hits(),
+                              req->m_keys - response->get_hits());
+        break;
+    case rt_set:
+        m_stats.update_set_op(&timestamp, response->get_total_len(), req->m_size, latency);
+        break;
+    case rt_wait:
+        m_stats.update_wait_op(&timestamp, latency);
+        break;
+    case rt_arbitrary:
+        m_stats.update_arbitrary_op(&timestamp, response->get_total_len(), req->m_size, latency,
+                                    static_cast<arbitrary_request *>(req)->index);
+        break;
+    default:
+        assert(0);
+        break;
+    }
+}
+
 void cluster_client::wake_mget_producers(unsigned int conn_id)
 {
     if (conn_id >= m_mget_waiting_producers.size()) return;
@@ -3033,7 +3062,7 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
                 // refresh on the rejecting connection and drop the request
                 // instead of looping it back onto the same replica.
                 m_connections[conn_id]->set_cluster_slots();
-                finalize_dropped_redirect(timestamp, request, response);
+                finalize_dropped_readonly(timestamp, request, response);
                 return;
             }
             if (m_config->retry_on_error && request && request->m_serialized && request->m_serialized_len > 0 &&
@@ -3046,7 +3075,7 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
             // through and finalize as a terminal error to keep accounting
             // honest (the original send did happen on the wire and the
             // server explicitly rejected it).
-            finalize_dropped_redirect(timestamp, request, response);
+            finalize_dropped_readonly(timestamp, request, response);
             return;
         }
         // handle "-MOVED"

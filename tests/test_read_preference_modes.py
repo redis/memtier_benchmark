@@ -528,6 +528,87 @@ def test_arbitrary_read_routing_duplicate_command_names(env):
             debugPrintMemtierOnError(run_config, env)
 
 
+def _sum_readonly_errors(conns):
+    """Sum errorstat_READONLY counts across a list of Redis connections."""
+    total = 0
+    for conn in conns:
+        try:
+            stats = conn.execute_command("INFO", "ERRORSTATS")
+        except Exception:
+            continue
+        if isinstance(stats, dict):
+            total += int(stats.get("errorstat_READONLY", {}).get("count", 0))
+        else:
+            for line in stats.split("\n"):
+                line = line.strip()
+                if line.startswith("errorstat_READONLY:count="):
+                    total += int(line.split("=", 1)[1])
+    return total
+
+
+def test_read_preference_readonly_reply_counted(env):
+    """A read-routed request a replica rejects with -READONLY, and that is
+    not retried, is counted as an op. A write script without a shebang has
+    no write flag, so a replica runs it and the write inside fails with
+    -READONLY. Totals Count must equal the requested total."""
+    if not env.isCluster():
+        env.skip()
+        return
+    replica_conns = get_cluster_replica_connections(env)
+    if not replica_conns:
+        env.skip()
+        return
+
+    for conn in replica_conns:
+        conn.execute_command("CONFIG", "RESETSTAT")
+
+    threads, clients, requests = 1, 2, 100
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--command=EVAL \"return redis.call('set',KEYS[1],'x')\" 1 __key__",
+            "--command-is-read",
+            "--read-preference=secondary",
+            # Fall back to the primary so that the per-error CLUSTER SLOTS
+            # refresh on a replica does not hold the run.
+            "--read-preference-fallback=primary",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+
+    config = get_default_memtier_config(threads=threads, clients=clients, requests=requests)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    test_dir = tempfile.mkdtemp()
+    run_config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(run_config.results_dir)
+
+    benchmark = Benchmark.from_json(run_config, benchmark_specs)
+    ok = benchmark.run()
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier exited non-zero")
+        readonly_errors = _sum_readonly_errors(replica_conns)
+        env.assertGreater(
+            readonly_errors,
+            0,
+            message="no replica answered -READONLY; the test did not exercise the drop path",
+        )
+        totals = _load_mb_json(run_config)["ALL STATS"]["Totals"]
+        env.assertEqual(
+            int(totals["Count"]),
+            threads * clients * requests,
+            message="Totals Count {} != requested {} ({} -READONLY replies on replicas)".format(
+                totals["Count"], threads * clients * requests, readonly_errors
+            ),
+        )
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
 # ---------------------------------------------------------------------------
 # Test 6 - Endpoints / Read Routing JSON schema validation
 #
