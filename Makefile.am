@@ -65,8 +65,11 @@ memtier_benchmark_SOURCES = \
 	deps/hdr_histogram/hdr_histogram.c deps/hdr_histogram/hdr_histogram.h \
 	deps/hdr_histogram/hdr_time.c deps/hdr_histogram/hdr_time.h deps/hdr_histogram/hdr_encoding.c deps/hdr_histogram/hdr_malloc.h
 
+# The vendored AX_CODE_COVERAGE (serial 15) puts -lgcov in CODE_COVERAGE_LDFLAGS
+# and has no CODE_COVERAGE_LIBS. Link it as a library, after the objects, so
+# the unit tests that reuse memtier_benchmark_LDADD get the gcov runtime too.
 memtier_benchmark_LDADD = \
-	$(CODE_COVERAGE_LIBS) \
+	$(CODE_COVERAGE_LDFLAGS) \
 	$(LIBEVENT_EXTRA_LIBS) \
 	$(LIBEVENT_LIBS) \
 	$(LIBEVENT_PTHREADS_LIBS) \
@@ -111,7 +114,7 @@ hdr_histogram_test_SOURCES = tests/unit/hdr_histogram_test.cpp latency_histogram
 hdr_histogram_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
 hdr_histogram_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 # memtier_benchmark_CPPFLAGS carries coverage flags; link their runtime too.
-hdr_histogram_test_LDADD = $(CODE_COVERAGE_LIBS)
+hdr_histogram_test_LDADD = $(CODE_COVERAGE_LDFLAGS)
 # Exercise transaction pin release and lookahead through the real cluster client.
 cluster_transaction_test_SOURCES = tests/unit/cluster_transaction_test.cpp
 cluster_transaction_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
@@ -135,7 +138,6 @@ check-hdr-vendor:
 	fi
 
 @CODE_COVERAGE_RULES@
-memtier_benchmark_LDFLAGS = $(CODE_COVERAGE_LDFLAGS)
 
 dist_man1_MANS = memtier_benchmark.1
 

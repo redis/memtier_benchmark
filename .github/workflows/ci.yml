@@ -416,6 +416,10 @@ jobs:
       # (given Ubuntu 24.04 uses lcov >= 2.0 which is not supported on autoconf still)
       run: autoreconf -ivf && ./configure --enable-code-coverage && make -j
 
+    - name: Run unit tests
+      # Unit tests reuse the instrumented objects and must link the gcov runtime.
+      run: make check
+
     - name: Setup Python
       uses: actions/setup-python@v6
       with:
