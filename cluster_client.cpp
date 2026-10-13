@@ -131,6 +131,7 @@ cluster_client::cluster_client(client_group *group) :
         m_txn_round_key_valid(false),
         m_txn_pin_lost_warned(false),
         m_txn_wait_slot(-1),
+        m_txn_multi_conn_id(-1),
         m_strict_no_route_attempts(0),
         m_last_no_replica_warning_ts(0)
 {
@@ -206,6 +207,7 @@ void cluster_client::disconnect(void)
     m_txn_round_key_valid = false;
     m_txn_pin_lost_warned = false;
     m_txn_wait_slot = -1;
+    m_txn_multi_conn_id = -1;
 
     unsigned int conn_size = m_connections.size();
     unsigned int i;
@@ -2101,10 +2103,12 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
         if (m_arbitrary_command_rotation_seq != m_txn_observed_rotation_seq) {
             m_txn_observed_rotation_seq = m_arbitrary_command_rotation_seq;
             m_txn_pinned_conn_id = -1;
-            m_txn_has_staged_key = false;
+            // An unsent staged key (its rotation was cut short below) is
+            // kept for this rotation, so the sequential range has no gap.
             m_txn_round_key_valid = false;
             m_txn_pin_lost_warned = false;
             m_txn_wait_slot = -1;
+            m_txn_multi_conn_id = -1;
             /* Wake up connections that were held back by hold_pipeline so
              * they can participate in the new rotation's lookahead. */
             for (size_t i = 0; i < m_connections.size(); i++) {
@@ -2236,6 +2240,21 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
             return false;
         }
 
+        /* This rotation's MULTI was sent on a connection that no longer holds
+         * it: the pinned connection dropped, and either reconnected or the
+         * pin moved to another connection. Sent now, the rest of the block
+         * would run outside any transaction and its EXEC would fail with
+         * "EXEC without MULTI". Skip it up to and including the EXEC/DISCARD;
+         * the server already discarded the commands queued before. */
+        if (m_txn_multi_conn_id != -1 && cmd.multi_effect != multi_effect_opens &&
+            (m_txn_multi_conn_id != (int) conn_id || !m_connections[conn_id]->is_multi_open())) {
+            benchmark_debug_log("--transaction: MULTI lost on connection %d; skipping command %u\n",
+                                m_txn_multi_conn_id, command_index);
+            if (cmd.multi_effect == multi_effect_closes) m_txn_multi_conn_id = -1;
+            advance_arbitrary_command_index();
+            return false;
+        }
+
         /* Every keyed --command in one rotation must resolve to the SAME key so
          * the whole WATCH/MULTI/EXEC unit hits a single slot -- otherwise the
          * cluster rejects it with CROSSSLOT. The first keyed command adopts the
@@ -2260,6 +2279,11 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
             }
         }
         client::create_arbitrary_request(command_index, timestamp, conn_id);
+        if (cmd.multi_effect == multi_effect_opens) {
+            m_txn_multi_conn_id = (int) conn_id;
+        } else if (cmd.multi_effect == multi_effect_closes) {
+            m_txn_multi_conn_id = -1;
+        }
         return true;
     }
 

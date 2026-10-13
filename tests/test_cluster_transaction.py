@@ -892,6 +892,7 @@ def _run_with_shard_kills(env, commands, test_time=8, pipeline=1,
 
 
 def _reset_discard_calls(env):
+    # CONFIG RESETSTAT also clears the errorstats that _error_count() reads.
     for conn in env.getOSSMasterNodesConnectionList():
         conn.execute_command("CONFIG", "RESETSTAT")
 
@@ -1064,6 +1065,37 @@ def test_transaction_waits_for_reconnecting_key_owner(env):
         # The topology never changes, so the right shard never answers MOVED.
         env.assertEqual(_error_count(env, "MOVED"), 0)
         env.assertEqual(_error_count(env, "EXECABORT"), 0)
+        with open(os.path.join(run_config.results_dir, "mb.json")) as f:
+            stats = json.load(f)['ALL STATS']
+        env.assertTrue(stats['Execs']['Count'] > 0, message="no EXEC completed")
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_lost_multi_is_not_continued(env):
+    """Once the connection holding a rotation's MULTI drops it (the
+    connection is killed and reconnects, or the pin moves to another shard),
+    the rest of that block must not be sent: outside the MULTI its SET runs
+    untransacted and its EXEC fails with "EXEC without MULTI"."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    _reset_discard_calls(env)
+    rc, kills, stderr, run_config = _run_with_shard_kills(
+        env, ['MULTI', 'SET __key__ __data__', 'EXEC'],
+        pipeline=8, threads=2, clients=4)
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(kills > 0, message="no connection was killed")
+        env.assertTrue(rc is not None,
+                       message="memtier_benchmark hung past --test-time")
+        env.assertEqual(rc, 0)
+        env.assertTrue("EXEC without MULTI" not in stderr,
+                       message="an EXEC was sent without its MULTI")
+        # memtier is the only client, so any -ERR reply is one of its own.
+        env.assertEqual(_error_count(env, "ERR"), 0)
         with open(os.path.join(run_config.results_dir, "mb.json")) as f:
             stats = json.load(f)['ALL STATS']
         env.assertTrue(stats['Execs']['Count'] > 0, message="no EXEC completed")

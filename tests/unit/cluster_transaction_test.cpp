@@ -104,6 +104,11 @@ public:
         m_slot_to_shard_group[slot] = 1;
     }
     bool pool_empty(unsigned int conn_id) const { return m_key_index_pools[conn_id]->empty(); }
+    void skip(unsigned int command_index)
+    {
+        check(!send_from(0, command_index), "command of a lost MULTI was not sent");
+        check(m_executed_command_index != command_index, "skipped command advanced the rotation");
+    }
 };
 
 // Redis cluster key slot (CRC16/XMODEM of the whole key; no hash tags here).
@@ -124,6 +129,7 @@ static void make_transaction_commands(arbitrary_command_list &commands, abstract
     for (const char *text : texts) {
         arbitrary_command command(text);
         check(command.split_command_to_args(), "parse command");
+        command.resolve_command_meta();
         command.key_pattern = 'S';
         check(protocol->format_arbitrary_command(command), "format command");
         commands.add_command(command);
@@ -196,6 +202,20 @@ static void check_pin_release(unsigned long long first_key)
         client.txn_release_pin(); // Already consumed: no key should be returned.
         check(client.pool().empty() && !client.staged(), "release after consumption leaves no orphan key");
         check(!client.round_key_valid() && client.pin() == -1, "release after consumption drops pin and round key");
+        client.next_rotation();
+        client.send(0); // MULTI stages first_key + 2.
+        evbuffer_drain(output, evbuffer_get_length(output));
+        client.get_connections()[0]->disconnect(); // The open MULTI is lost with its socket.
+        client.skip(1);
+        client.skip(2);
+        client.skip(3);
+        check(evbuffer_get_length(output) == 0, "nothing of the lost MULTI block was sent");
+        check(client.staged() && client.staged_key() == first_key + 2, "lost block keeps its unsent key");
+        client.send(0);
+        client.send(1);
+        check(client.round_key() == first_key + 2, "next rotation sends the kept key");
+        client.send(2);
+        client.send(3);
         client.next_rotation();
         client.send(0);
         check(client.staged(), "lookahead present before full disconnect");

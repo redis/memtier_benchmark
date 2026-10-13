@@ -129,6 +129,10 @@ protected:
     // sent anywhere else, the keyed command gets -MOVED and the transaction
     // ends in EXECABORT.
     int m_txn_wait_slot;
+    // Connection that carries this rotation's open MULTI, -1 when none is
+    // open. If the pin moves off it, or it reconnects, that MULTI is gone and
+    // the rest of the block must not be sent on another socket.
+    int m_txn_multi_conn_id;
     // Consecutive read-routing failures under strict rp_secondary with no live
     // replica. Incremented in get_key_for_conn each time select_target_conn
     // returns UINT_MAX for a read; reset on any successful routing. When the
