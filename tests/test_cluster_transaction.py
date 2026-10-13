@@ -833,31 +833,15 @@ def test_transaction_keyless_only_rotation(env):
             debugPrintMemtierOnError(run_config, env)
 
 
-def test_transaction_connection_kills_do_not_hang(env):
-    """Regression for #569: a CLUSTER SLOTS refresh must never be written on
-    a connection with an open MULTI. The server queues it (+QUEUED), the
-    reply handler treats that as a failed refresh, the connection never
-    finishes setup and the run hangs past --test-time.
-
-    Repeatedly killing one non-main shard's connections hits both ways in:
-    a MOVED on the pinned connection mid-rotation (the key's owner is down,
-    so the rotation falls back to another shard), and the slot map refresh
-    cluster_client::reconnect() requests on the main connection while it
-    may be pinned inside a MULTI."""
-    if not env.isCluster():
-        env.skip()
-        return
-
-    test_time = 8
+def _run_with_shard_kills(env, commands, test_time=8):
+    """Run a --transaction rotation of `commands` (-t1 -c1, --pipeline=1,
+    --reconnect-on-error) while repeatedly killing one non-main shard's
+    client connections. Returns (rc, kills, stderr, run_config); rc is None
+    when memtier hung past --test-time + 30s."""
     benchmark_specs = {"name": env.testName, "args": ["--transaction"]}
     addTLSArgs(benchmark_specs, env)
-    benchmark_specs["args"].extend([
-        '--command=MULTI',
-        '--command=SET __key__ __data__',
-        '--command=EXEC',
-        '--pipeline=1',
-        '--reconnect-on-error',
-    ])
+    benchmark_specs["args"].extend(['--command=' + c for c in commands])
+    benchmark_specs["args"].extend(['--pipeline=1', '--reconnect-on-error'])
     config = get_default_memtier_config(threads=1, clients=1, requests=None,
                                         test_time=test_time)
     master_nodes_list = env.getMasterNodesList()
@@ -896,7 +880,40 @@ def test_transaction_connection_kills_do_not_hang(env):
                 proc.kill()
                 proc.wait()
 
-    stderr = _read_stderr(run_config)
+    return rc, kills, _read_stderr(run_config), run_config
+
+
+def _reset_discard_calls(env):
+    for conn in env.getOSSMasterNodesConnectionList():
+        conn.execute_command("CONFIG", "RESETSTAT")
+
+
+def _discard_calls(env):
+    total = 0
+    for conn in env.getOSSMasterNodesConnectionList():
+        stats = conn.info("commandstats")
+        total += int(stats.get("cmdstat_discard", {}).get("calls", 0))
+    return total
+
+
+def test_transaction_connection_kills_do_not_hang(env):
+    """Regression for #569: a CLUSTER SLOTS refresh must never be written on
+    a connection with an open MULTI. The server queues it (+QUEUED), the
+    reply handler treats that as a failed refresh, the connection never
+    finishes setup and the run hangs past --test-time.
+
+    Repeatedly killing one non-main shard's connections hits both ways in:
+    a MOVED on the pinned connection mid-rotation (the key's owner is down,
+    so the rotation falls back to another shard), and the slot map refresh
+    cluster_client::reconnect() requests on the main connection while it
+    may be pinned inside a MULTI."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    _reset_discard_calls(env)
+    rc, kills, stderr, run_config = _run_with_shard_kills(
+        env, ['MULTI', 'SET __key__ __data__', 'EXEC'])
     failed = env.getNumberOfFailedAssertion()
     try:
         env.assertTrue(kills > 0, message="no connection was killed")
@@ -909,6 +926,38 @@ def test_transaction_connection_kills_do_not_hang(env):
         # mid-rotation, otherwise this run proved nothing.
         env.assertTrue("received MOVED mid-rotation" in stderr,
                        message="no MOVED mid-rotation was provoked")
+        # A rotation that closes its MULTI never needs the abandoned-MULTI
+        # DISCARD: the refresh waits for the rotation's EXEC instead.
+        env.assertEqual(_discard_calls(env), 0)
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_abandoned_multi_is_discarded_before_refresh(env):
+    """#569: a rotation that opens a MULTI and never closes it leaves that
+    MULTI open once the rotation wraps and pins another shard. A slot map
+    refresh later due on that connection must DISCARD it first: written
+    inside the MULTI, CLUSTER SLOTS is only queued and the run hangs."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    _reset_discard_calls(env)
+    rc, kills, stderr, run_config = _run_with_shard_kills(
+        env, ['MULTI', 'SET __key__ __data__'])
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(kills > 0, message="no connection was killed")
+        env.assertTrue(rc is not None,
+                       message="memtier_benchmark hung past --test-time")
+        env.assertEqual(rc, 0)
+        env.assertTrue("cluster slot failed" not in stderr,
+                       message="CLUSTER SLOTS was sent inside an open MULTI")
+        # memtier is the only client sending DISCARD, so this proves the
+        # fallback ran rather than the refresh path never being reached.
+        env.assertTrue(_discard_calls(env) > 0,
+                       message="no abandoned MULTI was discarded")
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)

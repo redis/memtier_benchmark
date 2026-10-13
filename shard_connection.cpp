@@ -1054,10 +1054,14 @@ void shard_connection::send_conn_setup_commands(struct timeval timestamp)
         // answer +QUEUED, which the reply handler can only treat as a failed
         // refresh (#569). fill_pipeline() defers the refresh while this
         // connection still drives the pinned --transaction rotation, and a
-        // MOVED/ASK inside the MULTI keeps the pin, so a MULTI still open
-        // here belongs to a rotation whose pin moved elsewhere and will never
-        // send its EXEC on this connection (e.g. a --command rotation with
-        // no EXEC/DISCARD): discard it first.
+        // MOVED/ASK inside the MULTI keeps the pin, so a well-formed rotation
+        // (MULTI ... EXEC/DISCARD) never gets here with a MULTI open. A
+        // rotation that opens a MULTI and never closes it does, for example
+        // --command=MULTI --command="SET __key__ __data__" with no EXEC: the
+        // MULTI stays open after the rotation wraps and pins another shard,
+        // and the next refresh on this connection (a MOVED, or a shard
+        // reconnect re-arming the main connection) would wedge on +QUEUED.
+        // Discard that abandoned MULTI first.
         if (m_multi_open) {
             benchmark_debug_log("sending DISCARD to close an abandoned MULTI before CLUSTER SLOTS.\n");
             static const char DISCARD_CMD[] = "*1\r\n$7\r\nDISCARD\r\n";
