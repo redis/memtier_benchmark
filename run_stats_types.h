@@ -120,7 +120,8 @@ public:
     void reset();
     void merge(const ar_one_sec_cmd_stats &other);
     unsigned long long int ops();
-    unsigned long long int bytes();
+    unsigned long long int bytes_rx();
+    unsigned long long int bytes_tx();
     unsigned long long int total_latency();
     size_t size() const;
     one_sec_cmd_stats &at(std::size_t idx) { return m_commands.at(idx); }

@@ -153,11 +153,20 @@ unsigned long long int ar_one_sec_cmd_stats::ops()
 }
 
 
-unsigned long long int ar_one_sec_cmd_stats::bytes()
+unsigned long long int ar_one_sec_cmd_stats::bytes_rx()
 {
     unsigned long long int total_bytes = 0;
     for (size_t i = 0; i < m_commands.size(); i++) {
         total_bytes += m_commands[i].m_bytes_rx;
+    }
+
+    return total_bytes;
+}
+
+unsigned long long int ar_one_sec_cmd_stats::bytes_tx()
+{
+    unsigned long long int total_bytes = 0;
+    for (size_t i = 0; i < m_commands.size(); i++) {
         total_bytes += m_commands[i].m_bytes_tx;
     }
 

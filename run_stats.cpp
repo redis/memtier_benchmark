@@ -1171,8 +1171,8 @@ void run_stats::summarize(totals &result) const
     // total ops, bytes
     result.m_ops =
         totals.m_set_cmd.m_ops + totals.m_get_cmd.m_ops + totals.m_wait_cmd.m_ops + totals.m_ar_commands.ops();
-    result.m_bytes_rx = totals.m_set_cmd.m_bytes_rx + totals.m_get_cmd.m_bytes_rx + totals.m_ar_commands.bytes();
-    result.m_bytes_tx = totals.m_set_cmd.m_bytes_tx + totals.m_get_cmd.m_bytes_tx + totals.m_ar_commands.bytes();
+    result.m_bytes_rx = totals.m_set_cmd.m_bytes_rx + totals.m_get_cmd.m_bytes_rx + totals.m_ar_commands.bytes_rx();
+    result.m_bytes_tx = totals.m_set_cmd.m_bytes_tx + totals.m_get_cmd.m_bytes_tx + totals.m_ar_commands.bytes_tx();
 
     // cmd/sec
     result.m_set_cmd.summarize(totals.m_set_cmd, test_duration_usec);

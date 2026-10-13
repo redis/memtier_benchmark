@@ -501,3 +501,58 @@ def test_json_configuration_escapes_string_values(env):
     finally:
         if env.getNumberOfFailedAssertion() > failed_asserts:
             debugPrintMemtierOnError(run_config, env)
+
+
+def _assert_totals_bandwidth_is_sum_of_commands(env, section_name, section,
+                                                check_rx_tx=True):
+    """Totals KB/sec (and its RX/TX split) must equal the sum of the
+    per-command rows. Each value is printed with %.2f, so allow a small
+    rounding slack per row."""
+    commands = [name for name, stats in section.items()
+                if name != "Totals" and isinstance(stats, dict)
+                and "KB/sec" in stats]
+    env.assertGreater(len(commands), 0,
+                      message=f"{section_name}: no per-command rows")
+    fields = ["KB/sec"]
+    if check_rx_tx:
+        fields += ["KB/sec RX", "KB/sec TX"]
+    for field in fields:
+        expected = sum(float(section[name][field]) for name in commands)
+        actual = float(section["Totals"][field])
+        env.assertAlmostEqual(
+            actual, expected, 0.01 * (len(commands) + 1),
+            message=f"{section_name}: Totals '{field}' ({actual}) != sum of "
+                    f"{commands} ({expected})")
+
+
+def test_json_arbitrary_commands_totals_bandwidth(env):
+    """Issue #566: in --command mode the arbitrary-command bytes were added
+    to both the Totals RX and TX counters, so Totals KB/sec was about twice
+    the sum of the per-command rows."""
+    test_dir = tempfile.mkdtemp()
+    benchmark, run_config = _build_benchmark(
+        env, test_dir,
+        extra_args=["--run-count=2", "--command=SET __key__ __data__",
+                    "--command=GET __key__"],
+        threads=2, clients=4, requests=1000)
+    ok = benchmark.run()
+    failed_asserts = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier_benchmark exited non-zero")
+        results = _read_json(run_config, env)
+        for label in ("BEST RUN RESULTS", "WORST RUN RESULTS"):
+            env.assertTrue(label in results,
+                           message=f"Expected '{label}' in JSON output")
+            _assert_totals_bandwidth_is_sum_of_commands(env, label,
+                                                        results[label])
+        agg_keys = [k for k in results
+                    if k.startswith("AGGREGATED AVERAGE RESULTS")]
+        env.assertEqual(len(agg_keys), 1,
+                        message="Expected exactly one AGGREGATED section")
+        # The aggregated Totals RX/TX split is not averaged across runs
+        # yet, so only the combined KB/sec is checked there.
+        _assert_totals_bandwidth_is_sum_of_commands(
+            env, agg_keys[0], results[agg_keys[0]], check_rx_tx=False)
+    finally:
+        if env.getNumberOfFailedAssertion() > failed_asserts:
+            debugPrintMemtierOnError(run_config, env)
