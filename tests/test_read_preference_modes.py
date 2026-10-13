@@ -845,3 +845,50 @@ def test_endpoints_json_emitted(env):
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config_pri, env)
+
+
+def test_read_preference_replica_refresh_wakes_peers(env):
+    """Connections held while a replica refreshes its slot map must resume
+    once the refresh completes. A write script without a shebang, marked
+    --command-is-read, is rejected by replicas with -READONLY; with no key
+    to reroute by, each rejection makes the replica connection send CLUSTER
+    SLOTS. While that refresh runs, hold_pipeline() holds the other
+    connections (strict secondary with GETs in the ratio). If nothing wakes
+    them afterwards, requests already queued on them are never sent and the
+    run stops short of --requests."""
+    if not env.isCluster():
+        env.skip()
+        return
+    replica_conns = get_cluster_replica_connections(env)
+    if not replica_conns:
+        env.skip()
+        return
+
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--command=EVAL \"return redis.call('set',KEYS[1],'x')\" 1 __key__",
+            "--command-is-read",
+            "--read-preference=secondary",
+            "--pipeline=4",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+
+    config = get_default_memtier_config(threads=2, clients=4, requests=500)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    test_dir = tempfile.mkdtemp()
+    run_config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(run_config.results_dir)
+
+    benchmark = Benchmark.from_json(run_config, benchmark_specs)
+    ok = benchmark.run()
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier exited non-zero; a client stopped before reaching --requests")
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)

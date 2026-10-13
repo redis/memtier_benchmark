@@ -1251,6 +1251,10 @@ void shard_connection::process_response(void)
                 if (committed) {
                     m_cluster_slots = setup_done;
                     benchmark_debug_log("cluster slot command successful\n");
+                    // A replica refreshing its slot map is not ready for
+                    // reads, so hold_pipeline() holds peers while it runs.
+                    // It is ready again now: wake them, as READONLY does.
+                    if (m_role == role_replica) wake_peers();
                 } else {
                     benchmark_debug_log("cluster slot reply rejected; leaving m_cluster_slots unchanged\n");
                     // Surface the rejection to the connection-stage supervisor
@@ -1333,14 +1337,7 @@ void shard_connection::process_response(void)
                 // the failed replica gets re-evaluated — a peer's next
                 // CLUSTER SLOTS refresh will rebuild topology and may
                 // re-bring this replica online.
-                if (m_role == role_replica) {
-                    for (size_t i = 0; i < m_conns_manager->get_connections().size(); i++) {
-                        shard_connection *peer = m_conns_manager->get_connections()[i];
-                        if (peer != this && peer->get_connection_state() == conn_connected) {
-                            peer->schedule_fill();
-                        }
-                    }
-                }
+                if (m_role == role_replica) wake_peers();
                 error = true;
             } else {
                 m_readonly_state = setup_done;
@@ -1348,14 +1345,7 @@ void shard_connection::process_response(void)
                 // Wake any peer connection that may have been holding for
                 // a live replica. The bootstrap primary conn will be sitting
                 // in hold_pipeline's "no live replica yet" gate; nudge it.
-                if (m_role == role_replica) {
-                    for (size_t i = 0; i < m_conns_manager->get_connections().size(); i++) {
-                        shard_connection *peer = m_conns_manager->get_connections()[i];
-                        if (peer != this && peer->get_connection_state() == conn_connected) {
-                            peer->schedule_fill();
-                        }
-                    }
-                }
+                if (m_role == role_replica) wake_peers();
             }
             break;
         default:
@@ -1682,6 +1672,16 @@ void shard_connection::handle_timer_event(void)
 bool shard_connection::has_request_rate_budget() const
 {
     return !m_config->request_rate || m_request_per_cur_interval > 0;
+}
+
+void shard_connection::wake_peers(void)
+{
+    for (size_t i = 0; i < m_conns_manager->get_connections().size(); i++) {
+        shard_connection *peer = m_conns_manager->get_connections()[i];
+        if (peer != this && peer->get_connection_state() == conn_connected) {
+            peer->schedule_fill();
+        }
+    }
 }
 
 void shard_connection::schedule_fill(void)
