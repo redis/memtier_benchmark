@@ -1238,12 +1238,11 @@ void run_stats::summarize(totals &result) const
         (test_duration_usec > 0) ? (result.m_bytes_rx / 1024.0) / test_duration_usec * 1000000 : 0.0;
     result.m_bytes_sec_tx =
         (test_duration_usec > 0) ? (result.m_bytes_tx / 1024.0) / test_duration_usec * 1000000 : 0.0;
-    result.m_moved_sec = (test_duration_usec > 0) ? (double) (totals.m_set_cmd.m_moved + totals.m_get_cmd.m_moved) /
-                                                        test_duration_usec * 1000000
-                                                  : 0.0;
-    result.m_ask_sec = (test_duration_usec > 0)
-                           ? (double) (totals.m_set_cmd.m_ask + totals.m_get_cmd.m_ask) / test_duration_usec * 1000000
-                           : 0.0;
+    // m_total_cmd counts the redirects of every command, arbitrary ones included.
+    result.m_moved_sec =
+        (test_duration_usec > 0) ? (double) totals.m_total_cmd.m_moved / test_duration_usec * 1000000 : 0.0;
+    result.m_ask_sec =
+        (test_duration_usec > 0) ? (double) totals.m_total_cmd.m_ask / test_duration_usec * 1000000 : 0.0;
 
     // connection errors/sec
     result.m_connection_errors = totals.m_connection_errors;

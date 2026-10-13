@@ -136,11 +136,8 @@ def _check_redirect_stats(env, redirect, mode, command, backoff_ms=1):
                                        message=label)
             # Both rates use the same duration. Their ratio recovers the
             # redirect count without depending on rounded run timestamps.
-            # Totals currently omits arbitrary-command redirect rates; check
-            # the command itself in that case, as well as both Count fields.
-            if entry is stats[name] or not command.startswith("arbitrary-"):
-                actual_redirects = entry[redirect + "/sec"] / entry["Ops/sec"] * requests
-                env.assertAlmostEqual(actual_redirects, expected_redirects, delta=0.05, message=label)
+            actual_redirects = entry[redirect + "/sec"] / entry["Ops/sec"] * requests
+            env.assertAlmostEqual(actual_redirects, expected_redirects, delta=0.05, message=label)
         series = stats[name]["Time-Serie"].values()
         env.assertEqual(sum(second["Count"] for second in series), requests, message=label)
         env.assertEqual(sum(second["Bytes RX"] for second in series), peer.terminal_rx, message=label)
