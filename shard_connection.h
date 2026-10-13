@@ -74,7 +74,8 @@ enum request_type
     rt_cluster_slots,
     rt_hello,
     rt_readonly,
-    rt_discard
+    rt_discard,
+    rt_asking
 };
 struct request
 {
@@ -92,6 +93,9 @@ struct request
     // queue. process_response checks this flag and skips its delete, leaving
     // the request to be freed when the retry queue drains.
     bool m_claimed_by_retry;
+    // Set by an -ASK redirect: the resend must be preceded by ASKING, or the
+    // node importing the slot answers -MOVED back to the migrating node.
+    bool m_asking;
 
     // Captured serialized command bytes for resend. Owned; freed in dtor.
     // NULL/0 when retry is disabled or capture failed. Stored as opaque protocol

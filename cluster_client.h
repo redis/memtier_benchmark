@@ -220,6 +220,9 @@ protected:
     // routing info isn't available yet). Returns true if ownership of `req`
     // transferred to a retry queue.
     bool retry_after_redirect(unsigned int conn_id, request *req);
+    // Resend the request after ASKING on the connection named by the -ASK
+    // reply, falling back to retry_after_redirect if there is none.
+    bool retry_after_ask(unsigned int conn_id, request *req, protocol_response *response);
     // Terminal accounting for a MOVED/ASK request whose retry was refused
     // (e.g. max_retries exhausted, retry queue full, no captured bytes). Logs
     // to --failed-keys-file if configured and increments the error counter,

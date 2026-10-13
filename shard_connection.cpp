@@ -80,6 +80,7 @@ static bool is_workload_request(request_type type)
     case rt_hello:
     case rt_readonly:
     case rt_discard:
+    case rt_asking:
         break;
     }
     return false;
@@ -145,6 +146,7 @@ request::request(request_type type, unsigned int size, struct timeval *sent_time
         m_keys(keys),
         m_retries(0),
         m_claimed_by_retry(false),
+        m_asking(false),
         m_serialized(NULL),
         m_serialized_len(0),
         m_key(NULL),
@@ -754,6 +756,8 @@ const char *shard_connection::get_last_request_type()
         return "READONLY";
     case rt_discard:
         return "DISCARD";
+    case rt_asking:
+        return "ASKING";
     default:
         return "none";
     }
@@ -929,6 +933,14 @@ void shard_connection::replay_request(request *req)
         m_bev_paused = false;
     }
     struct evbuffer *out = bufferevent_get_output(m_bev);
+    if (req->m_asking) {
+        // ASKING applies to the next command only, so write it right before
+        // the resent bytes. Its reply is consumed like other setup replies.
+        static const char ASKING_CMD[] = "*1\r\n$6\r\nASKING\r\n";
+        evbuffer_add(out, ASKING_CMD, sizeof(ASKING_CMD) - 1);
+        push_req(new request(rt_asking, 0, NULL, 0));
+        req->m_asking = false;
+    }
     evbuffer_add(out, req->m_serialized, req->m_serialized_len);
     gettimeofday(&req->m_sent_time, NULL);
     req->m_retries++;
@@ -1281,6 +1293,11 @@ void shard_connection::process_response(void)
             // workload outcome. An error only means there was nothing left
             // to discard, which is harmless.
             benchmark_debug_log("DISCARD reply: %s\n", r->get_status() ? r->get_status() : "");
+            break;
+        case rt_asking:
+            // Precedes a request resent after -ASK; the reply carries no
+            // workload outcome, and that request's own reply is accounted.
+            benchmark_debug_log("ASKING reply: %s\n", r->get_status() ? r->get_status() : "");
             break;
         case rt_hello:
             if (r->is_error()) {

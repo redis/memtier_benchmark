@@ -631,6 +631,7 @@ bool cluster_client::classify_read(const request *req) const
     case rt_hello:
     case rt_readonly:
     case rt_discard:
+    case rt_asking:
         return false;
     case rt_arbitrary: {
         const arbitrary_request *ar = static_cast<const arbitrary_request *>(req);
@@ -2836,6 +2837,39 @@ bool cluster_client::retry_after_redirect(unsigned int conn_id, request *req)
     return false;
 }
 
+// Resend the request to the node named by "-ASK <slot> <host>:<port>",
+// preceded by ASKING: during a slot migration only that node serves the key,
+// and only for a command sent right after ASKING. Without a ready connection
+// to that node, fall back to routing by the slot map.
+bool cluster_client::retry_after_ask(unsigned int conn_id, request *req, protocol_response *response)
+{
+    const char *status = response->get_status();
+    const char *addr = status ? strrchr(status, ' ') : NULL;
+    const char *port = addr ? strrchr(addr, ':') : NULL;
+    unsigned int target = UINT_MAX;
+    if (port != NULL) {
+        addr++;
+        const size_t addr_len = port - addr;
+        port++;
+        for (unsigned int i = 0; i < m_connections.size(); i++) {
+            shard_connection *sc = m_connections[i];
+            if (sc->get_role() == role_primary && sc->get_connection_state() == conn_connected &&
+                strncmp(sc->get_address(), addr, addr_len) == 0 && sc->get_address()[addr_len] == '\0' &&
+                strcmp(sc->get_port(), port) == 0) {
+                target = i;
+                break;
+            }
+        }
+    }
+    if (target == UINT_MAX) return retry_after_redirect(conn_id, req);
+
+    if (!m_connections[target]->enqueue_retry(req)) return false;
+    req->m_asking = true;
+    m_stats.inc_retry_attempt();
+    if (req->m_retries == 0) m_stats.inc_retried_op();
+    return true;
+}
+
 void cluster_client::hand_off_replay_requests(unsigned int conn_id)
 {
     unsigned long long dropped = 0;
@@ -3177,7 +3211,7 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
                                         conn_id, m_txn_pinned_conn_id);
                 }
                 finalize_dropped_redirect(timestamp, request, response);
-            } else if (m_config->retry_on_error && !(retried = retry_after_redirect(conn_id, request))) {
+            } else if (m_config->retry_on_error && !(retried = retry_after_ask(conn_id, request, response))) {
                 finalize_dropped_redirect(timestamp, request, response);
             }
             update_redirect_stats(timestamp, request, response, false, !retried);
