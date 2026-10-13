@@ -171,6 +171,13 @@ static void test_batched_scalar_compatibility()
             CHECK(hdr_total_count(h) == count);
         }
     }
+    // Non-finite inputs keep the scalar path; they must not reach the sort.
+    const std::vector<double> non_finite = {50, NAN, 0, INFINITY, 99, -INFINITY};
+    latency_percentiles odd(non_finite);
+    const std::vector<int64_t> &odd_values = odd.calculate(h);
+    CHECK(odd_values.size() == non_finite.size());
+    for (size_t i = 0; i < non_finite.size(); ++i)
+        CHECK(odd_values[i] == hdr_value_at_percentile(h, non_finite[i]));
     latency_percentiles none(std::vector<double>{});
     CHECK(none.calculate(h).empty());
     hdr_close(h);
