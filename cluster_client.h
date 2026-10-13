@@ -224,6 +224,9 @@ protected:
     // to --failed-keys-file if configured and increments the error counter,
     // so the request doesn't silently disappear from the stats.
     void finalize_dropped_redirect(struct timeval timestamp, request *req, protocol_response *response);
+    // Hand the requests a retired connection holds for resend to the
+    // connections that now own their slots, so they still complete.
+    void hand_off_replay_requests(unsigned int conn_id);
     // Release the transaction pin and return any staged key to the pool so the
     // key index is not silently burned when a mid-rotation MOVED or disconnect
     // forces the rotation to restart.

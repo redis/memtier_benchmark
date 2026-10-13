@@ -1440,6 +1440,11 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
             if (m_connections[i]->get_connection_state() != conn_disconnected) {
                 m_connections[i]->disconnect();
             }
+            // With --retry-on-error, disconnect() kept the in-flight and
+            // retry-queued requests for resend after a reconnect, still
+            // counted as generated. A retired connection doesn't reconnect,
+            // so without this a --requests run ends short of its count.
+            hand_off_replay_requests(i);
         }
     }
 
@@ -2818,6 +2823,32 @@ bool cluster_client::retry_after_redirect(unsigned int conn_id, request *req)
         return true;
     }
     return false;
+}
+
+void cluster_client::hand_off_replay_requests(unsigned int conn_id)
+{
+    unsigned long long dropped = 0;
+    request *req;
+    while ((req = m_connections[conn_id]->pop_replay_request()) != NULL) {
+        // Writes need the primary, and it serves reads too.
+        unsigned int target = UINT_MAX;
+        if (req->m_key && req->m_key_len > 0) {
+            target = slot_primary_conn_id(calc_hslot_crc16_with_hash_tag(req->m_key, req->m_key_len));
+        }
+        if (target >= m_connections.size() || target == conn_id) {
+            struct timeval now;
+            gettimeofday(&now, NULL);
+            global_failed_keys_logger().log_failure(now, "REPLAY", req->m_key, req->m_key_len,
+                                                    "no-slot-owner-for-replay", req->m_retries);
+            dropped++;
+            delete req;
+            continue;
+        }
+        m_connections[target]->adopt_replay_request(req);
+    }
+    // Dropped requests are never processed; uncount them as
+    // drain_replay_queue_after_reconnect does.
+    if (dropped) dec_reqs_generated(dropped);
 }
 
 // Terminal accounting for a MOVED/ASK request whose retry was refused (e.g.

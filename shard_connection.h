@@ -295,6 +295,13 @@ public:
     void replay_request(request *req);
     // Drain any pending replay-on-reconnect requests back into the pipeline.
     void drain_replay_queue_after_reconnect();
+    // Hand-off of requests held for resend when a cluster topology change
+    // retires this connection: pop_replay_request() returns them one at a
+    // time (NULL when none are left), and the connection that now owns the
+    // slot takes each one with adopt_replay_request(), which resends it now
+    // if connected, or once it connects otherwise.
+    request *pop_replay_request();
+    void adopt_replay_request(request *req);
     // Capture bytes added between `before_pos` and the current evbuffer length
     // into req->m_serialized. No-op when retry is globally disabled.
     void capture_serialized_bytes(size_t before_pos, request *req);

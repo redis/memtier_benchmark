@@ -969,6 +969,35 @@ void shard_connection::drain_replay_queue_after_reconnect()
     if (dropped) m_conns_manager->dec_reqs_generated(dropped);
 }
 
+request *shard_connection::pop_replay_request()
+{
+    // disconnect() moves the retry queue into the replay queue, but take
+    // from both so nothing is left behind whatever the connection state.
+    std::queue<request *> *queues[] = {m_replay_queue, m_retry_queue};
+    for (size_t i = 0; i < sizeof(queues) / sizeof(queues[0]); i++) {
+        if (queues[i] != NULL && !queues[i]->empty()) {
+            request *req = queues[i]->front();
+            queues[i]->pop();
+            return req;
+        }
+    }
+    return NULL;
+}
+
+void shard_connection::adopt_replay_request(request *req)
+{
+    if (!m_replay_queue) {
+        // Not expected: every connection has a replay queue with
+        // --retry-on-error, the only way to hold requests for resend.
+        delete req;
+        m_conns_manager->dec_reqs_generated(1);
+        return;
+    }
+    m_replay_queue->push(req);
+    // A connection that isn't connected yet replays it once it connects.
+    if (m_connection_state == conn_connected && m_bev != NULL) drain_replay_queue_after_reconnect();
+}
+
 bool shard_connection::is_conn_setup_done()
 {
     return m_authentication == setup_done && m_db_selection == setup_done && m_cluster_slots == setup_done &&
