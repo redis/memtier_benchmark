@@ -106,8 +106,6 @@ public:
     void update_op(unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency);
     void update_op(unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency, unsigned int hits,
                    unsigned int misses);
-    void update_moved_op(unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency);
-    void update_ask_op(unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency);
 };
 
 class one_second_stats; // forward declaration

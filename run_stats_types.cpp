@@ -110,18 +110,6 @@ void one_sec_cmd_stats::update_op(unsigned int bytes_rx, unsigned int bytes_tx, 
     m_misses += misses;
 }
 
-void one_sec_cmd_stats::update_moved_op(unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency)
-{
-    update_op(bytes_rx, bytes_tx, latency);
-    m_moved++;
-}
-
-void one_sec_cmd_stats::update_ask_op(unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency)
-{
-    update_op(bytes_rx, bytes_tx, latency);
-    m_ask++;
-}
-
 void ar_one_sec_cmd_stats::setup(size_t n_arbitrary_commands)
 {
     m_commands.resize(n_arbitrary_commands);

@@ -2714,31 +2714,33 @@ void cluster_client::handle_moved(unsigned int conn_id)
 void cluster_client::update_redirect_stats(struct timeval timestamp, request *request, protocol_response *response,
                                            bool moved, bool completed)
 {
+    // enqueue_retry() defers replay to the event loop, so the request remains
+    // valid here. Terminal latency spans all attempts, as in client::handle_response.
     if (moved) {
         if (request->m_type == rt_get) {
             m_stats.update_moved_get_op(&timestamp, response->get_total_len(), request->m_size,
-                                        ts_diff(request->m_sent_time, timestamp), completed);
+                                        ts_diff(request->m_first_sent_time, timestamp), completed);
         } else if (request->m_type == rt_set) {
             m_stats.update_moved_set_op(&timestamp, response->get_total_len(), request->m_size,
-                                        ts_diff(request->m_sent_time, timestamp), completed);
+                                        ts_diff(request->m_first_sent_time, timestamp), completed);
         } else if (request->m_type == rt_arbitrary) {
             arbitrary_request *ar = static_cast<arbitrary_request *>(request);
             m_stats.update_moved_arbitrary_op(&timestamp, response->get_total_len(), request->m_size,
-                                              ts_diff(request->m_sent_time, timestamp), ar->index, completed);
+                                              ts_diff(request->m_first_sent_time, timestamp), ar->index, completed);
         } else {
             assert(0);
         }
     } else {
         if (request->m_type == rt_get) {
             m_stats.update_ask_get_op(&timestamp, response->get_total_len(), request->m_size,
-                                      ts_diff(request->m_sent_time, timestamp), completed);
+                                      ts_diff(request->m_first_sent_time, timestamp), completed);
         } else if (request->m_type == rt_set) {
             m_stats.update_ask_set_op(&timestamp, response->get_total_len(), request->m_size,
-                                      ts_diff(request->m_sent_time, timestamp), completed);
+                                      ts_diff(request->m_first_sent_time, timestamp), completed);
         } else if (request->m_type == rt_arbitrary) {
             arbitrary_request *ar = static_cast<arbitrary_request *>(request);
             m_stats.update_ask_arbitrary_op(&timestamp, response->get_total_len(), request->m_size,
-                                            ts_diff(request->m_sent_time, timestamp), ar->index, completed);
+                                            ts_diff(request->m_first_sent_time, timestamp), ar->index, completed);
         } else {
             assert(0);
         }

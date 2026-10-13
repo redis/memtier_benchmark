@@ -79,7 +79,7 @@ class _RedirectHandler(socketserver.StreamRequestHandler):
             self.server.errors.append(repr(error))
 
 
-def _check_redirect_stats(env, redirect, mode, command):
+def _check_redirect_stats(env, redirect, mode, command, backoff_ms=1):
     requests = 12
     with _RedirectPeer(redirect, mode) as peer, tempfile.TemporaryDirectory() as directory:
         thread = threading.Thread(target=peer.serve_forever, daemon=True)
@@ -101,7 +101,7 @@ def _check_redirect_stats(env, redirect, mode, command):
             args.append("--command={} __key__{}".format(verb, " value" if verb == "SET" else ""))
             name = verb.capitalize() + "s"
         if mode != "disabled":
-            args += ["--retry-on-error", "--retry-backoff-ms=1",
+            args += ["--retry-on-error", "--retry-backoff-ms={}".format(backoff_ms),
                      "--max-retries={}".format(3 if mode == "success" else 1)]
         if mode == "transaction":
             args.append("--transaction")
@@ -126,6 +126,14 @@ def _check_redirect_stats(env, redirect, mode, command):
             env.assertEqual(entry["Count"], requests, message=label)
             histogram = entry["Percentile Latencies"]["Histogram log format"]["Compressed Histogram"]
             env.assertEqual(_decode_v2(histogram)[0], requests, message=label + " histogram")
+            if backoff_ms > 1:
+                # Refused retries still represent the whole logical request.
+                # Include its backoff in the one final sample; leave a margin
+                # for histogram quantization and timer resolution.
+                minimum_ms = backoff_ms * 0.9
+                env.assertGreaterEqual(entry["Min Latency"], minimum_ms, message=label)
+                env.assertGreaterEqual(entry["Percentile Latencies"]["p50.00"], minimum_ms,
+                                       message=label)
             # Both rates use the same duration. Their ratio recovers the
             # redirect count without depending on rounded run timestamps.
             # Totals currently omits arbitrary-command redirect rates; check
@@ -155,3 +163,9 @@ def test_transaction_redirect_stats(env):
     for redirect in ("MOVED", "ASK"):
         for command in ("arbitrary-set", "arbitrary-get"):
             _check_redirect_stats(env, redirect, "transaction", command)
+
+
+def test_exhausted_redirect_latency_includes_backoff(env):
+    for redirect in ("MOVED", "ASK"):
+        for command in ("set", "get", "arbitrary-set", "arbitrary-get"):
+            _check_redirect_stats(env, redirect, "refused", command, backoff_ms=50)
