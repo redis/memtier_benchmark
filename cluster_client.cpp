@@ -1864,6 +1864,28 @@ bool cluster_client::is_read_command_index(unsigned int command_index) const
     return command_index == GET_CMD_IDX;
 }
 
+// Slot of the key that cmd sends for the key m_obj_gen generated last. A key
+// argument such as "{tag}-__key__" puts literal text around the generated
+// key, so hash data_prefix + key + data_suffix the way Redis does, honouring
+// {tag}. Cluster mode allows one key argument per command.
+unsigned int cluster_client::calc_arbitrary_key_hslot(const arbitrary_command &cmd)
+{
+    const char *key = m_obj_gen->get_key();
+    unsigned int key_len = m_obj_gen->get_key_len();
+    for (size_t i = 0; i < cmd.command_args.size(); i++) {
+        const command_arg &arg = cmd.command_args[i];
+        if (arg.type != key_type) continue;
+        if (!arg.has_key_affixes) break;
+        std::string full;
+        full.reserve(arg.data_prefix.size() + key_len + arg.data_suffix.size());
+        full.append(arg.data_prefix);
+        full.append(key, key_len);
+        full.append(arg.data_suffix);
+        return calc_hslot_crc16_cluster(full.data(), full.size());
+    }
+    return calc_hslot_crc16_cluster(key, key_len);
+}
+
 get_key_response cluster_client::get_key_for_conn(unsigned int command_index, unsigned int conn_id,
                                                   unsigned long long *key_index)
 {
@@ -1879,7 +1901,13 @@ get_key_response cluster_client::get_key_for_conn(unsigned int command_index, un
     // generate key
     client::get_key_for_conn(command_index, conn_id, key_index);
 
-    unsigned int hslot = calc_hslot_crc16_cluster(m_obj_gen->get_key(), m_obj_gen->get_key_len());
+    unsigned int hslot;
+    if (m_config->arbitrary_commands != NULL && m_config->arbitrary_commands->is_defined() &&
+        command_index < m_config->arbitrary_commands->size()) {
+        hslot = calc_arbitrary_key_hslot(get_arbitrary_command(command_index));
+    } else {
+        hslot = calc_hslot_crc16_cluster(m_obj_gen->get_key(), m_obj_gen->get_key_len());
+    }
 
     // Read-preference-aware target selection. For writes this collapses to
     // the slot's primary owner (identical to the pre-read-pref world). For
@@ -2155,32 +2183,7 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
                 }
                 have_staged_key = true;
 
-                /* Reconstruct the actual key string that would be sent on
-                 * the wire — data_prefix + obj_gen.get_key() + data_suffix
-                 * — and hash it the way Redis does (honoring {tag}
-                 * substrings). The default memtier slot computation only
-                 * sees the generated portion of the key, so it would
-                 * route to a random shard when the keyed argument carries
-                 * hash-tag affixes. */
-                const command_arg *key_arg = NULL;
-                for (size_t a = 0; a < look.command_args.size(); a++) {
-                    if (look.command_args[a].type == key_type) {
-                        key_arg = &look.command_args[a];
-                        break;
-                    }
-                }
-                const char *gen_key = m_obj_gen->get_key();
-                unsigned int gen_key_len = m_obj_gen->get_key_len();
-                if (key_arg != NULL && key_arg->has_key_affixes) {
-                    std::string full;
-                    full.reserve(key_arg->data_prefix.size() + gen_key_len + key_arg->data_suffix.size());
-                    full.append(key_arg->data_prefix);
-                    full.append(gen_key, gen_key_len);
-                    full.append(key_arg->data_suffix);
-                    hslot = calc_hslot_crc16_cluster(full.data(), full.size());
-                } else {
-                    hslot = calc_hslot_crc16_cluster(gen_key, gen_key_len);
-                }
+                hslot = calc_arbitrary_key_hslot(look);
                 {
                     // Resolve slot via the shard_group indirection. If the
                     // map isn't populated yet (slot_primary_conn_id returns

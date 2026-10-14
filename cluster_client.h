@@ -257,6 +257,9 @@ protected:
     // Release the transaction pin, retaining any unconsumed lookahead key so
     // re-pinning can resolve its owner again without burning a key index.
     void txn_release_pin();
+    // Slot of the generated key as cmd sends it, including any text around
+    // __key__ in its key argument.
+    unsigned int calc_arbitrary_key_hslot(const arbitrary_command &cmd);
 
 public:
     cluster_client(client_group *group);
