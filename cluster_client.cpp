@@ -100,21 +100,12 @@ static inline uint16_t crc16(const char *buf, size_t len)
     return crc;
 }
 
-static uint32_t calc_hslot_crc16_cluster(const char *str, size_t length)
-{
-    uint32_t rv = (uint32_t) crc16(str, length) & MAX_CLUSTER_HSLOT;
-    return rv;
-}
-
-// Hash-tag-aware variant of calc_hslot_crc16_cluster. Mirrors Redis' rule
+// Hash slot of a key, following Redis' hash tag rule
 // (https://redis.io/docs/reference/cluster-spec/#hash-tags): if the key
 // contains a {tag} substring with at least one byte between the braces, only
 // the bytes inside the first such {tag} are hashed; otherwise the whole key
-// is hashed. memtier's default slot computation skips this rule because the
-// generic routing path only sees obj_gen->get_key() — never the literal
-// affixes like "{mx}-" that the user wrote in --command. This helper is used
-// by --transaction to pin to the actual slot owner.
-static uint32_t calc_hslot_crc16_with_hash_tag(const char *str, size_t length)
+// is hashed.
+uint32_t calc_hslot_crc16_cluster(const char *str, size_t length)
 {
     const char *open = (const char *) memchr(str, '{', length);
     if (open != NULL) {
@@ -396,7 +387,7 @@ void cluster_client::build_mget_slot_cache()
         unsigned int filled_slots = 0;
         for (unsigned long long idx = key_min; idx <= key_max && filled_slots < MAX_CLUSTER_HSLOT + 1; idx++) {
             m_obj_gen->generate_key(idx);
-            unsigned int slot = calc_hslot_crc16_with_hash_tag(m_obj_gen->get_key(), m_obj_gen->get_key_len());
+            unsigned int slot = calc_hslot_crc16_cluster(m_obj_gen->get_key(), m_obj_gen->get_key_len());
             if (cache->slot_keys[slot].size() < cap) {
                 cache->slot_keys[slot].push_back(idx);
                 if (cache->slot_keys[slot].size() == cap) filled_slots++;
@@ -2166,9 +2157,9 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
                     full.append(key_arg->data_prefix);
                     full.append(gen_key, gen_key_len);
                     full.append(key_arg->data_suffix);
-                    hslot = calc_hslot_crc16_with_hash_tag(full.data(), full.size());
+                    hslot = calc_hslot_crc16_cluster(full.data(), full.size());
                 } else {
-                    hslot = calc_hslot_crc16_with_hash_tag(gen_key, gen_key_len);
+                    hslot = calc_hslot_crc16_cluster(gen_key, gen_key_len);
                 }
                 {
                     // Resolve slot via the shard_group indirection. If the
@@ -2624,7 +2615,7 @@ bool cluster_client::create_monitor_request_cluster(unsigned int command_index, 
     if (temp_cmd.command_args.size() >= 2) {
         const std::string &key = temp_cmd.command_args[1].data;
         if (!key.empty()) {
-            uint32_t slot = calc_hslot_crc16_with_hash_tag(key.c_str(), key.size());
+            uint32_t slot = calc_hslot_crc16_cluster(key.c_str(), key.size());
             // Same primaries-only resolution as the prior m_slot_to_shard
             // read; the shard_group indirection is invisible at this site.
             unsigned int shard = slot_primary_conn_id(slot);
@@ -2776,11 +2767,7 @@ bool cluster_client::retry_after_redirect(unsigned int conn_id, request *req)
 
     unsigned int target = conn_id;
     if (req->m_key && req->m_key_len > 0) {
-        // Use the hash-tag-aware variant so a retry of an arbitrary command
-        // whose key carries a {tag} prefix (e.g. "{foo}-key-5") routes to
-        // the correct shard. calc_hslot_crc16_cluster hashes the full string
-        // and would map to a different slot, causing an infinite MOVED loop.
-        unsigned int hslot = calc_hslot_crc16_with_hash_tag(req->m_key, req->m_key_len);
+        unsigned int hslot = calc_hslot_crc16_cluster(req->m_key, req->m_key_len);
         const bool is_read = classify_read(req);
         unsigned int mapped = select_target_conn(hslot, is_read);
         // select_target_conn returns UINT_MAX when strict rp_secondary finds no
@@ -2852,7 +2839,7 @@ void cluster_client::hand_off_replay_requests(unsigned int conn_id)
         } else {
             // Writes need the primary, and it serves reads too.
             if (req->m_key && req->m_key_len > 0) {
-                target = slot_primary_conn_id(calc_hslot_crc16_with_hash_tag(req->m_key, req->m_key_len));
+                target = slot_primary_conn_id(calc_hslot_crc16_cluster(req->m_key, req->m_key_len));
             }
             if (target >= m_connections.size() || target == conn_id) {
                 drop_reason = "no-slot-owner-for-replay";
@@ -3067,7 +3054,7 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
             assert(request != NULL);
             unsigned int primary_target = UINT_MAX;
             if (m_config->retry_on_error && !m_config->transaction && request->m_key && request->m_key_len > 0) {
-                unsigned int hslot = calc_hslot_crc16_with_hash_tag(request->m_key, request->m_key_len);
+                unsigned int hslot = calc_hslot_crc16_cluster(request->m_key, request->m_key_len);
                 unsigned int p = slot_primary_conn_id(hslot);
                 if (p != UINT_MAX && p != conn_id && p < m_connections.size() &&
                     m_connections[p]->get_connection_state() == conn_connected) {

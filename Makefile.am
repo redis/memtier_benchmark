@@ -78,7 +78,8 @@ memtier_benchmark_LDADD = \
 	$(LIBSSL_LIBS)
 
 
-check_PROGRAMS = prometheus_metrics_test rate_limiter_test socket_options_test hdr_histogram_test cluster_transaction_test
+check_PROGRAMS = prometheus_metrics_test rate_limiter_test socket_options_test hdr_histogram_test cluster_transaction_test \
+    cluster_hslot_test
 
 # The metrics test links only the pure layer (prometheus_metrics.{h,cpp}).
 # First `make check` program in the repo. The metrics layer is config-free and
@@ -120,6 +121,11 @@ cluster_transaction_test_SOURCES = tests/unit/cluster_transaction_test.cpp
 cluster_transaction_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
 cluster_transaction_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 cluster_transaction_test_LDADD = $(filter-out memtier_benchmark-memtier_benchmark.$(OBJEXT),$(memtier_benchmark_OBJECTS)) $(memtier_benchmark_LDADD)
+# Check hash slots, including hash tags, against CLUSTER KEYSLOT.
+cluster_hslot_test_SOURCES = tests/unit/cluster_hslot_test.cpp
+cluster_hslot_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
+cluster_hslot_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+cluster_hslot_test_LDADD = $(filter-out memtier_benchmark-memtier_benchmark.$(OBJEXT),$(memtier_benchmark_OBJECTS)) $(memtier_benchmark_LDADD)
 TESTS = $(check_PROGRAMS)
 
 # Keep the release amalgamation byte-identical to the recorded upstream asset.

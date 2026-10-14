@@ -38,6 +38,9 @@ struct staged_monitor_cmd
 // forward decleration
 class shard_connection;
 
+// Hash slot of a key, honouring Redis Cluster hash tags.
+uint32_t calc_hslot_crc16_cluster(const char *str, size_t length);
+
 // Topology grouping: one shard_group per primary, plus the list of replicas
 // (zero-length when the primary has no replicas, or when CLUSTER SLOTS only
 // returned the primary tuple). Per-thread state (replica_rr_cursor) — no
