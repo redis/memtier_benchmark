@@ -1479,11 +1479,19 @@ void shard_connection::fill_pipeline(void)
         m_bev_paused = false;
     }
 
-    // Resend requests handed over from a connection retired by a slot map
-    // refresh (adopt_replay_request). A reconnect drains the queue itself.
-    if (m_replay_queue != NULL && !m_replay_queue->empty() && get_connection_state() == conn_connected &&
-        is_conn_setup_done()) {
-        drain_replay_queue_after_reconnect();
+    // Resend requests that survived a disconnect, or were handed over from a
+    // connection retired by a slot map refresh (adopt_replay_request), ahead
+    // of fresh work. A new connection has no AUTH/SELECT/HELLO/READONLY
+    // state yet, and the server runs commands in order, so send the setup
+    // ladder first and resend once its replies are in. This is done even if
+    // the run is finished, as the resends are still owed a reply.
+    if (m_replay_queue != NULL && !m_replay_queue->empty() && get_connection_state() == conn_connected) {
+        if (is_conn_setup_done()) {
+            drain_replay_queue_after_reconnect();
+        } else if (!(m_multi_open && cluster_slots_refresh_pending() && m_conns_manager->is_transaction_pinned(m_id))) {
+            send_conn_setup_commands(now);
+            return;
+        }
     }
 
     // Setup commands go out even when the pipeline is full, and after the
@@ -1611,13 +1619,8 @@ void shard_connection::handle_event(short events)
             event_add(m_event_timer, &interval);
         }
 
-        // After (re)connect: replay any in-flight requests that survived the
-        // disconnect. This must happen *before* fill_pipeline() so the old
-        // requests get back on the wire first; otherwise pipeline ordering
-        // would shuffle replayed work behind fresh work.
-        if (m_config->retry_on_error && m_replay_queue && !m_replay_queue->empty()) {
-            drain_replay_queue_after_reconnect();
-        }
+        // In-flight requests that survived the disconnect are resent by
+        // fill_pipeline(), after the setup ladder and before fresh work.
 
         // Any response, even one being retried, means the run has started:
         // a reconnect after it must not restart the clock.

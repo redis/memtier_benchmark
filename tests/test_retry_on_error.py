@@ -602,3 +602,100 @@ def test_transaction_drops_not_logged_without_retry(env):
     env.assertEqual(rc, 0, message="memtier exited {} after connection kills".format(rc))
     replay = [r for r in rows if r.split(",")[1] == "REPLAY"]
     env.assertEqual(replay, [], message="REPLAY rows without --retry-on-error: {}".format(replay[:5]))
+
+
+def _db_conn(env, db):
+    import redis
+
+    pool = env.getOSSMasterNodesConnectionList()[0].connection_pool
+    kwargs = dict(pool.connection_kwargs, db=db)
+    return redis.Redis(connection_pool=redis.ConnectionPool(connection_class=pool.connection_class, **kwargs))
+
+
+def _replay_churn_run(env, extra_args, password=None):
+    """Kill memtier's connections while deep pipelines are in flight, so
+    --retry-on-error has requests to resend after each reconnect.
+
+    Returns (exit code, stderr). With password, the server requires it for
+    the duration of the run.
+    """
+    test_time = 6
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--pipeline=32",
+            "--ratio=1:0",
+            "--key-pattern=R:R",
+            "--key-minimum=1",
+            "--key-maximum=10000",
+            "--reconnect-on-error",
+            "--max-reconnect-attempts=100",
+            "--retry-on-error",
+            "--hide-histogram",
+        ]
+        + list(extra_args),
+    }
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=1, clients=2, requests=None, test_time=test_time)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+    test_dir = tempfile.mkdtemp()
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+
+    # A connection of its own, never killed (CLIENT KILL skips the caller), so
+    # it can still undo requirepass once the run is over.
+    admin = _db_conn(env, 0)
+    admin.execute_command("FLUSHALL")
+    kills = []
+
+    def kill_waves(_proc):
+        # Waves spaced beyond the default 1s reconnect delay.
+        for _wave in range(4):
+            time.sleep(1.2)
+            kills.append(admin.execute_command("CLIENT", "KILL", "TYPE", "normal"))
+
+    if password is not None:
+        admin.execute_command("CONFIG", "SET", "requirepass", password)
+    try:
+        rc, stderr_content = _run_with_background(env, benchmark, config, kill_waves, timeout=test_time + 30)
+    finally:
+        if password is not None:
+            admin.execute_command("CONFIG", "SET", "requirepass", "")
+
+    env.assertGreaterEqual(sum(kills), 1, message="no CLIENT KILL wave found a memtier connection")
+    env.assertGreaterEqual(stderr_content.count("Reconnection successful"), 1,
+                           message="no connection was killed and recovered")
+    env.assertEqual(rc, 0, message="memtier exited {} after connection kills".format(rc))
+    return rc, stderr_content
+
+
+def test_replays_wait_for_auth_after_reconnect(env):
+    """
+    Requests resent after a reconnect must follow AUTH on the new connection.
+
+    They used to be written as soon as the connection came up, ahead of the
+    setup commands, so on a password-protected server every resend was
+    answered -NOAUTH and counted as an error (#527).
+    """
+    # One server to set requirepass on and kill clients from.
+    env.skipOnCluster()
+    password = "memtier-527"
+    _rc, stderr_content = _replay_churn_run(env, ["--authenticate={}".format(password)], password)
+    env.assertEqual(stderr_content.count("NOAUTH"), 0,
+                    message="a request was resent before AUTH after a reconnect")
+
+
+def test_replays_wait_for_select_after_reconnect(env):
+    """
+    Requests resent after a reconnect must follow SELECT on the new connection,
+    or they run against database 0 (#527).
+    """
+    # Cluster mode rejects --select-db.
+    env.skipOnCluster()
+    _replay_churn_run(env, ["--select-db=3"])
+    env.assertGreater(_db_conn(env, 3).execute_command("DBSIZE"), 0,
+                      message="no key was written to the selected database")
+    env.assertEqual(_db_conn(env, 0).execute_command("DBSIZE"), 0,
+                    message="a request was resent before SELECT after a reconnect and wrote to database 0")
