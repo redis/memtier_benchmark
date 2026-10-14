@@ -872,6 +872,67 @@ def test_command_stats_breakdown_line_duplicate_monitor_lines(env):
         env.assertTrue(key in all_stats)
 
 
+# TOTAL prints as "Totals", the fixed aggregate row, ENDPOINT prints as
+# "Endpoints" (the cluster read-routing array, absent here, but reserved in
+# every mode), and CPU's histogram key is "CPU", the CPU summary object.
+# 300 requests in rounds of 3 + 1 + 1 + 1 give 150 / 50 / 50 / 50.
+_RESERVED_NAME_COMMANDS = [
+    "--command=TOTAL __key__",
+    "--command-ratio=3",
+    "--command=CPU __key__",
+    "--command=GET __key__",
+    "--command=ENDPOINT __key__",
+]
+
+
+def test_command_stats_breakdown_line_reserved_json_keys(env):
+    """
+    A --command whose row or histogram key equals a fixed key of the stats
+    object (--command=TOTAL -> "Totals", --command=CPU -> "CPU") used to
+    produce duplicate JSON keys; parsers kept the fixed one and dropped the
+    command's row. Such names must get a " #N" suffix like repeated names.
+    --command=ENDPOINT -> "Endpoints" is reserved even where the fixed
+    "Endpoints" array is not emitted, so a row keeps one label in all modes.
+    """
+    results_dict, duplicates = _run_duplicate_command_lines(env, "line", _RESERVED_NAME_COMMANDS)
+    env.assertEqual(duplicates, [])
+
+    all_stats = results_dict["ALL STATS"]
+    expected = {"Totals #1": 150, "Cpus": 50, "Gets": 50, "Endpoints #1": 50}
+    for key, count in expected.items():
+        env.assertTrue(key in all_stats)
+        if key in all_stats:
+            env.assertEqual(all_stats[key]["Count"], count)
+            env.assertEqual(_hist_count(all_stats[key]), count)
+    env.assertEqual(all_stats["Totals"]["Count"], 300)
+    # The fixed CPU summary object is still the CPU summary.
+    env.assertTrue("cpu_total_seconds" in all_stats["CPU"])
+
+    # Per-line latency histogram arrays: "TOTAL" is free, "CPU" is not.
+    for key in ("TOTAL", "CPU #1", "GET", "ENDPOINT"):
+        env.assertTrue(key in all_stats)
+        if key in all_stats:
+            env.assertTrue(isinstance(all_stats[key], list))
+
+
+def test_command_stats_breakdown_command_reserved_json_keys(env):
+    """
+    Same as above with the default aggregated --command-stats-breakdown.
+    """
+    results_dict, duplicates = _run_duplicate_command_lines(env, "command", _RESERVED_NAME_COMMANDS)
+    env.assertEqual(duplicates, [])
+
+    all_stats = results_dict["ALL STATS"]
+    expected = {"Totals #1": 150, "Cpus": 50, "Gets": 50, "Endpoints #1": 50}
+    for key, count in expected.items():
+        env.assertTrue(key in all_stats)
+        if key in all_stats:
+            env.assertEqual(all_stats[key]["Count"], count)
+    env.assertEqual(all_stats["Totals"]["Count"], 300)
+    env.assertTrue("cpu_total_seconds" in all_stats["CPU"])
+    env.assertTrue(isinstance(all_stats.get("CPU #1"), list))
+
+
 def test_monitor_input_malformed_command_skipped(env):
     """
     Test that malformed monitor commands are skipped with a warning instead of

@@ -884,10 +884,17 @@ bool run_stats::save_hdr_get_command(benchmark_config *config, int run_number)
 // returned unchanged; each occurrence of a repeated name gets the separator
 // plus a 1-based ordinal in output-row order (--command order for user
 // lines). JSON keys use " #N"; file names use the shell-safe "_N".
+//
+// A name can also collide with a fixed sibling key rather than with another
+// command: --command=TOTAL prints as "Totals", the fixed aggregate row, and
+// the latency histogram key of --command=CPU is "CPU", the CPU summary
+// object. Names listed in `reserved` are therefore always numbered, as if
+// they were repeated, so the fixed key keeps its meaning.
 #define UNIQUE_JSON_KEY_SEP " #"
 #define UNIQUE_FILE_NAME_SEP "_"
 
-static std::vector<std::string> make_unique_labels(const std::vector<std::string> &names, const char *sep)
+static std::vector<std::string> make_unique_labels(const std::vector<std::string> &names, const char *sep,
+                                                   const std::set<std::string> &reserved = std::set<std::string>())
 {
     std::map<std::string, unsigned int> total;
     for (const auto &name : names)
@@ -896,11 +903,12 @@ static std::vector<std::string> make_unique_labels(const std::vector<std::string
     // A suffixed label can equal another name (e.g. "GET", "GET" and a
     // literal "GET_1"), so skip ordinals already taken by any name or label.
     std::set<std::string> used(names.begin(), names.end());
+    used.insert(reserved.begin(), reserved.end());
     std::map<std::string, unsigned int> seen;
     std::vector<std::string> keys;
     keys.reserve(names.size());
     for (const auto &name : names) {
-        if (total[name] > 1) {
+        if (total[name] > 1 || reserved.count(name) > 0) {
             std::string key;
             do {
                 key = name + sep + std::to_string(++seen[name]);
@@ -910,6 +918,17 @@ static std::vector<std::string> make_unique_labels(const std::vector<std::string
             keys.push_back(name);
         }
     }
+    return keys;
+}
+
+// Fixed members of a stats object (JSON "ALL STATS" / "RUN #N RESULTS") in
+// arbitrary-command mode, plus "Totals", the fixed last row of the text stats
+// table. Per-command row names and latency histogram keys share that object.
+static const std::set<std::string> &reserved_stats_keys()
+{
+    static const std::set<std::string> keys = {
+        "Runtime",        "CPU",      "Totals", "Per-Key Misses", "Read Routing", "Arbitrary Read Routing", "Endpoints",
+        "Active Clients", "CPU Stats"};
     return keys;
 }
 
@@ -930,14 +949,41 @@ static std::string sanitize_file_name_component(const std::string &name)
 }
 
 static std::vector<std::string> unique_command_labels(const arbitrary_command_list &command_list, const char *sep,
-                                                      bool for_file_name = false)
+                                                      bool for_file_name = false,
+                                                      const std::set<std::string> &reserved = std::set<std::string>())
 {
     std::vector<std::string> names;
     for (size_t i = 0; i < command_list.size(); i++) {
         const std::string &name = command_list[i].command_name;
         names.push_back(for_file_name ? sanitize_file_name_component(name) : name);
     }
-    return make_unique_labels(names, sep);
+    return make_unique_labels(names, sep, reserved);
+}
+
+// Stats row name of a command: lower case, first letter capitalized, plus "s"
+// (GET -> "Gets").
+static std::string command_row_name(std::string name)
+{
+    std::transform(name.begin(), name.end(), name.begin(), ::tolower);
+    if (!name.empty()) name[0] = static_cast<char>(toupper(name[0]));
+    name.append("s");
+    return name;
+}
+
+// Names of the per-command rows of the stats table, shared by the text table
+// and the JSON output so both label a row the same way.
+static std::vector<std::string> command_row_labels(const arbitrary_command_list &command_list,
+                                                   const std::vector<aggregated_command_type_stats> *aggregated)
+{
+    std::vector<std::string> names;
+    if (aggregated != nullptr) {
+        for (const auto &agg : *aggregated)
+            names.push_back(command_row_name(agg.command_type));
+    } else {
+        for (size_t i = 0; i < command_list.size(); i++)
+            names.push_back(command_row_name(command_list[i].command_name));
+    }
+    return make_unique_labels(names, UNIQUE_JSON_KEY_SEP, reserved_stats_keys());
 }
 
 bool run_stats::save_hdr_arbitrary_commands(benchmark_config *config, int run_number)
@@ -947,7 +993,8 @@ bool run_stats::save_hdr_arbitrary_commands(benchmark_config *config, int run_nu
         arbitrary_command_list &command_list = *config->arbitrary_commands;
         // Display names match the JSON keys; file labels are sanitized and
         // deduplicated separately, so they may number duplicates differently.
-        const std::vector<std::string> names = unique_command_labels(command_list, UNIQUE_JSON_KEY_SEP);
+        const std::vector<std::string> names =
+            unique_command_labels(command_list, UNIQUE_JSON_KEY_SEP, false, reserved_stats_keys());
         const std::vector<std::string> labels = unique_command_labels(command_list, UNIQUE_FILE_NAME_SEP, true);
         for (unsigned int i = 0; i < command_list.size(); i++) {
             const std::string &command_name = names[i];
@@ -1561,6 +1608,13 @@ void run_stats::print_type_column(output_table &table, arbitrary_command_list &c
     // to the column width by the snprintf in output_table::print.
     static const unsigned int MAX_TYPE_COLUMN_SIZE = 64;
     column.column_size = MAX(6, command_list.get_max_command_name_length()) + 1;
+    std::vector<std::string> row_labels;
+    if (print_arbitrary_commands_results()) {
+        row_labels = command_row_labels(command_list, aggregated);
+        // A " #N" suffix can make a label longer than its command name.
+        for (const auto &label : row_labels)
+            column.column_size = MAX(column.column_size, (unsigned int) label.size());
+    }
     if (column.column_size > MAX_TYPE_COLUMN_SIZE) {
         column.column_size = MAX_TYPE_COLUMN_SIZE;
     }
@@ -1576,25 +1630,8 @@ void run_stats::print_type_column(output_table &table, arbitrary_command_list &c
     column.elements.push_back(*el.init_str("%s", buf));
 
     if (print_arbitrary_commands_results()) {
-        if (aggregated != nullptr) {
-            // Use aggregated stats by command type
-            for (const auto &agg : *aggregated) {
-                std::string command_name = agg.command_type;
-                std::transform(command_name.begin(), command_name.end(), command_name.begin(), ::tolower);
-                command_name[0] = static_cast<char>(toupper(command_name[0]));
-                command_name.append("s");
-                column.elements.push_back(*el.init_str(type_col_format, command_name));
-            }
-        } else {
-            // Original per-command behavior
-            for (unsigned int i = 0; i < command_list.size(); i++) {
-                std::string command_name = command_list[i].command_name;
-                std::transform(command_name.begin(), command_name.end(), command_name.begin(), ::tolower);
-                command_name[0] = static_cast<char>(toupper(command_name[0]));
-                command_name.append("s");
-                column.elements.push_back(*el.init_str(type_col_format, command_name));
-            }
-        }
+        for (const auto &label : row_labels)
+            column.elements.push_back(*el.init_str(type_col_format, label));
     } else {
         column.elements.push_back(*el.init_str(type_col_format, "Sets"));
         column.elements.push_back(*el.init_str(type_col_format, "Gets"));
@@ -2035,11 +2072,10 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
             // Use aggregated stats by command type. Sum hits/misses across the
             // member command indices so the displayed Hits/sec for "Gets"
             // reflects all GET-shaped --command lines combined.
-            for (const auto &agg : *aggregated) {
-                std::string command_name = agg.command_type;
-                std::transform(command_name.begin(), command_name.end(), command_name.begin(), ::tolower);
-                command_name[0] = static_cast<char>(toupper(command_name[0]));
-                command_name.append("s");
+            const std::vector<std::string> row_keys = command_row_labels(command_list, aggregated);
+            for (size_t a = 0; a < aggregated->size(); a++) {
+                const aggregated_command_type_stats &agg = (*aggregated)[a];
+                const std::string &command_name = row_keys[a];
 
                 double avg_latency = hdr_mean(agg.latency_hist) / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
 
@@ -2068,15 +2104,7 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
             }
         } else {
             // Original per-command behavior
-            std::vector<std::string> row_names;
-            for (unsigned int i = 0; i < m_totals.m_ar_commands.size(); i++) {
-                std::string command_name = command_list[i].command_name;
-                std::transform(command_name.begin(), command_name.end(), command_name.begin(), ::tolower);
-                command_name[0] = static_cast<char>(toupper(command_name[0]));
-                command_name.append("s");
-                row_names.push_back(command_name);
-            }
-            const std::vector<std::string> row_keys = make_unique_labels(row_names, UNIQUE_JSON_KEY_SEP);
+            const std::vector<std::string> row_keys = command_row_labels(command_list, nullptr);
             for (unsigned int i = 0; i < m_totals.m_ar_commands.size(); i++) {
                 const std::string &command_name = row_keys[i];
                 struct hdr_histogram *arbitrary_command_latency_histogram = m_ar_commands_latency_histograms.at(i);
@@ -2115,7 +2143,8 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
             }
         }
         if (any_per_key && jsonhandler != NULL) {
-            const std::vector<std::string> keys = unique_command_labels(command_list, UNIQUE_JSON_KEY_SEP);
+            const std::vector<std::string> keys =
+                unique_command_labels(command_list, UNIQUE_JSON_KEY_SEP, false, reserved_stats_keys());
             jsonhandler->open_nesting("Per-Key Misses");
             for (size_t i = 0; i < m_arbitrary_misses.size(); ++i) {
                 const arbitrary_misses_total &t = m_arbitrary_misses[i];
@@ -2225,7 +2254,8 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
 
         // Per-arbitrary-command routing breakdown.
         if (!m_arbitrary_read_routing.empty()) {
-            const std::vector<std::string> keys = unique_command_labels(command_list, UNIQUE_JSON_KEY_SEP);
+            const std::vector<std::string> keys =
+                unique_command_labels(command_list, UNIQUE_JSON_KEY_SEP, false, reserved_stats_keys());
             jsonhandler->open_nesting("Arbitrary Read Routing");
             for (size_t i = 0; i < m_arbitrary_read_routing.size(); ++i) {
                 if (i >= command_list.size()) break;
@@ -2342,11 +2372,17 @@ void run_stats::print_histogram(FILE *out, json_handler *jsonhandler, arbitrary_
     if (print_arbitrary_commands_results()) {
         if (aggregated != nullptr) {
             // Use aggregated stats by command type
-            for (const auto &agg : *aggregated) {
+            std::vector<std::string> type_names;
+            for (const auto &agg : *aggregated)
+                type_names.push_back(agg.command_type);
+            const std::vector<std::string> keys =
+                make_unique_labels(type_names, UNIQUE_JSON_KEY_SEP, reserved_stats_keys());
+            for (size_t a = 0; a < aggregated->size(); a++) {
+                const aggregated_command_type_stats &agg = (*aggregated)[a];
                 std::string command_name = agg.command_type;
 
                 if (jsonhandler != NULL) {
-                    jsonhandler->open_nesting(command_name.c_str(), NESTED_ARRAY);
+                    jsonhandler->open_nesting(keys[a].c_str(), NESTED_ARRAY);
                 }
 
                 hdr_iter_percentile_init(&iter, agg.latency_hist, LATENCY_HDR_GRANULARITY);
@@ -2363,7 +2399,8 @@ void run_stats::print_histogram(FILE *out, json_handler *jsonhandler, arbitrary_
             }
         } else {
             // Original per-command behavior
-            const std::vector<std::string> keys = unique_command_labels(command_list, UNIQUE_JSON_KEY_SEP);
+            const std::vector<std::string> keys =
+                unique_command_labels(command_list, UNIQUE_JSON_KEY_SEP, false, reserved_stats_keys());
             for (unsigned int i = 0; i < command_list.size(); i++) {
                 std::string command_name = command_list[i].command_name;
 
