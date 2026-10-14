@@ -312,6 +312,11 @@ public:
     bool retry_queue_full() const;
 
 private:
+    // request::m_key is read by --failed-keys-file and, under --retry-on-error,
+    // by cluster MOVED/ASK retry, replay and -READONLY routing; skip the copy
+    // when neither is on.
+    bool wants_request_key() const { return m_config->retry_on_error || m_config->failed_keys_file; }
+
     void setup_event(int sockfd);
     int setup_socket(struct connect_info *addr);
     void set_readable_id();
@@ -398,6 +403,10 @@ private:
     // it (--transaction). Anything else written meanwhile is queued by the
     // server (+QUEUED) instead of run, so setup commands must wait for it.
     bool m_multi_open;
+    // First __key__ argument of the arbitrary command being written, attached
+    // to the request in send_arbitrary_command_end(). Empty when the command
+    // has no key or wants_request_key() is false.
+    std::string m_arbitrary_log_key;
 
     // Reconnection state tracking
     unsigned int m_reconnect_attempts;

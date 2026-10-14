@@ -5,6 +5,7 @@ Run subset:
   TEST=test_retry_on_error.py ./tests/run_tests.sh
 """
 
+import csv
 import json
 import os
 import subprocess
@@ -175,6 +176,95 @@ def test_retry_on_filter_restricts_set(env):
     env.assertGreater(len(lines), 1)
     for line in lines[1:]:
         env.assertContains("WRONGTYPE", line)
+
+
+def _failed_keys_rows(env, extra_args, requests):
+    """Run memtier with --failed-keys-file and return the logged key column."""
+    test_dir = tempfile.mkdtemp()
+    failed_log = os.path.join(test_dir, "failed-keys.csv")
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--pipeline=1",
+            "--key-prefix=fk:",
+            "--key-minimum=1",
+            "--key-maximum=3",
+            "--failed-keys-file={}".format(failed_log),
+            "--hide-histogram",
+        ]
+        + list(extra_args),
+    }
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=1, clients=1, requests=requests)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+
+    memtier_ok = benchmark.run()
+    debugPrintMemtierOnError(config, env)
+    env.assertTrue(memtier_ok)
+
+    env.assertTrue(os.path.isfile(failed_log))
+    with open(failed_log, "r") as f:
+        rows = list(csv.reader(f))
+    env.assertEqual(rows[0], ["timestamp", "command", "key", "status", "retries"])
+    return rows[1:]
+
+
+def test_failed_keys_file_records_key(env):
+    """Failed requests log the key that was sent, not an empty string.
+
+    Arbitrary commands used to log "" for every row because their __key__
+    argument was never attached to the request, and SET/GET/MGET only attached
+    the key with --retry-on-error. Multi-key requests log their first key.
+    """
+    if env.isCluster():
+        env.skip()
+        return
+
+    seeded = ["fk:1", "fk:2", "fk:3"]
+    for master_connection in env.getOSSMasterNodesConnectionList():
+        master_connection.execute_command("FLUSHALL")
+        for key in seeded:
+            master_connection.execute_command("SET", key, "hello")
+            master_connection.execute_command("SET", "{t}:" + key, "hello")
+            master_connection.execute_command("RPUSH", "list-" + key, "a")
+        # MGET never fails on its own; a user without it gets -NOPERM.
+        master_connection.execute_command("ACL", "SETUSER", "fk-no-mget", "on", ">fk-pass", "~*", "&*",
+                                          "+@all", "-mget")
+
+    # (command, args, expected keys or None for "first keys only", status)
+    cases = [
+        ("ARBITRARY", ["--command=LPUSH __key__ v", "--command-key-pattern=S"], seeded, "WRONGTYPE"),
+        ("ARBITRARY", ["--command=LPUSH __key__ v", "--command-key-pattern=S", "--retry-on-error"], seeded,
+         "WRONGTYPE"),
+        ("ARBITRARY", ["--command=LPUSH {t}:__key__ v", "--command-key-pattern=S"], ["{t}:" + k for k in seeded],
+         "WRONGTYPE"),
+        # Two keys: the row carries the first (fk:N), never the list-fk:N one.
+        ("ARBITRARY", ["--command=SINTER __key__ list-__key__", "--command-key-pattern=S"], None, "WRONGTYPE"),
+        ("GET", ["--key-prefix=list-fk:", "--ratio=0:1", "--key-pattern=S:S"], ["list-" + k for k in seeded],
+         "WRONGTYPE"),
+        # MGET without --retry-on-error, logged by its first key.
+        ("GET", ["--authenticate=fk-no-mget:fk-pass", "--ratio=0:1", "--multi-key-get=3", "--key-pattern=S:S"],
+         None, "NOPERM"),
+    ]
+    try:
+        for command, args, expected, status in cases:
+            label = "{} {}".format(command, args)
+            rows = _failed_keys_rows(env, args, requests=3)
+            env.assertEqual(len(rows), 3, message=label)
+            for row in rows:
+                env.assertEqual(row[1], command, message=label)
+                env.assertContains(status, row[3], message=label)
+                if expected is None:
+                    env.assertContains(row[2], seeded, message=label)
+            if expected is not None:
+                env.assertEqual(sorted(row[2] for row in rows), sorted(expected), message=label)
+    finally:
+        for master_connection in env.getOSSMasterNodesConnectionList():
+            master_connection.execute_command("ACL", "DELUSER", "fk-no-mget")
 
 
 def test_invalid_max_retries_rejected(env):

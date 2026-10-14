@@ -1896,10 +1896,8 @@ void shard_connection::send_set_command(struct timeval *sent_time, const char *k
     cmd_size = m_protocol->write_command_set(key, key_len, value, value_len, expiry, offset);
 
     request *req = new request(rt_set, cmd_size, sent_time, 1);
-    if (m_config->retry_on_error) {
-        capture_serialized_bytes(before, req);
-        if (key_len > 0) req->set_key_for_log(key, (unsigned int) key_len);
-    }
+    if (m_config->retry_on_error) capture_serialized_bytes(before, req);
+    if (wants_request_key() && key_len > 0) req->set_key_for_log(key, (unsigned int) key_len);
     push_req(req);
 }
 
@@ -1913,10 +1911,8 @@ void shard_connection::send_get_command(struct timeval *sent_time, const char *k
     cmd_size = m_protocol->write_command_get(key, key_len, offset);
 
     request *req = new request(rt_get, cmd_size, sent_time, 1);
-    if (m_config->retry_on_error) {
-        capture_serialized_bytes(before, req);
-        if (key_len > 0) req->set_key_for_log(key, (unsigned int) key_len);
-    }
+    if (m_config->retry_on_error) capture_serialized_bytes(before, req);
+    if (wants_request_key() && key_len > 0) req->set_key_for_log(key, (unsigned int) key_len);
     push_req(req);
 }
 
@@ -1935,11 +1931,9 @@ void shard_connection::send_mget_command(struct timeval *sent_time, const keylis
     size_t before = (m_bev && m_config->retry_on_error) ? evbuffer_get_length(bufferevent_get_output(m_bev)) : 0;
     cmd_size = m_protocol->write_command_multi_get(key_list);
     request *req = new request(rt_get, cmd_size, sent_time, key_list->get_keys_count());
-    if (m_config->retry_on_error) {
-        capture_serialized_bytes(before, req);
-        // Log the first key only — MGET keys are listed in the same record.
-        if (first_key_len > 0) req->set_key_for_log(first_key, first_key_len);
-    }
+    if (m_config->retry_on_error) capture_serialized_bytes(before, req);
+    // Log the first key only — MGET keys are listed in the same record.
+    if (wants_request_key() && first_key_len > 0) req->set_key_for_log(first_key, first_key_len);
     push_req(req);
 }
 
@@ -1983,6 +1977,8 @@ int shard_connection::send_arbitrary_command(const command_arg *arg, const char 
 
     if (arg->type == key_type) {
         benchmark_debug_log("key=[%.*s]\n", val_len, val);
+        // Like MGET, keep only the first key of a multi-key command.
+        if (wants_request_key() && m_arbitrary_log_key.empty()) m_arbitrary_log_key.assign(val, val_len);
     } else if (arg->type == scan_cursor_type) {
         benchmark_debug_log("scan_cursor=[%.*s]\n", val_len, val);
     } else {
@@ -2011,6 +2007,10 @@ void shard_connection::send_arbitrary_command_end(size_t command_index, struct t
         }
     }
     arbitrary_request *req = new arbitrary_request(command_index, rt_arbitrary, cmd_size, sent_time, meta);
+    if (!m_arbitrary_log_key.empty()) {
+        req->set_key_for_log(m_arbitrary_log_key.data(), (unsigned int) m_arbitrary_log_key.size());
+        m_arbitrary_log_key.clear();
+    }
     if (m_config->retry_on_error && m_bev && cmd_size > 0) {
         // Bytes were written across N calls to send_arbitrary_command; use
         // cmd_size to recover the start offset.

@@ -2758,9 +2758,9 @@ void cluster_client::update_redirect_stats(struct timeval timestamp, request *re
 }
 
 // Try to resend the request to the connection that now owns the key's slot.
-// Falls back to retrying on the same connection if the key is not captured
-// (e.g. arbitrary command without --retry-on-error key plumbing). Returns true
-// if ownership of `req` was transferred to a retry queue.
+// Falls back to retrying on the same connection if the request has no key
+// (keyless commands, or --monitor-input lines, whose keys are literal args).
+// Returns true if ownership of `req` was transferred to a retry queue.
 //
 // Read-preference-aware: for read-class requests, select_target_conn honors
 // --read-preference on retry, so a read that hit MOVED on a replica that no
@@ -3052,13 +3052,23 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
             // CLUSTER SLOTS refresh (cluster_slots_state transiently !=
             // setup_done). Requiring setup_done here would drop valid
             // retries to a primary mid-refresh as terminal errors.
+            //
+            // Only --retry-on-error routes by m_key: --failed-keys-file also
+            // fills it, and recording a failure must not change recovery.
+            // A slot map that still names the rejecting connection as the
+            // primary is stale (e.g. it was just demoted), so treat that as
+            // "no live primary" too and refresh instead of re-queuing there.
+            // With --transaction, resending one command of a MULTI/EXEC block
+            // on another connection would split the block, so drop it like
+            // MOVED/ASK do.
+            //
             // shard_connection pops a request for every reply it hands us.
             assert(request != NULL);
             unsigned int primary_target = UINT_MAX;
-            if (request->m_key && request->m_key_len > 0) {
+            if (m_config->retry_on_error && !m_config->transaction && request->m_key && request->m_key_len > 0) {
                 unsigned int hslot = calc_hslot_crc16_with_hash_tag(request->m_key, request->m_key_len);
                 unsigned int p = slot_primary_conn_id(hslot);
-                if (p != UINT_MAX && p < m_connections.size() &&
+                if (p != UINT_MAX && p != conn_id && p < m_connections.size() &&
                     m_connections[p]->get_connection_state() == conn_connected) {
                     primary_target = p;
                 }
