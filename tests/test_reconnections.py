@@ -1016,7 +1016,7 @@ def _clear_requirepass(conn, passwords):
     raise AssertionError("could not clear requirepass")
 
 
-def _run_with_mid_run_password_change(env, extra_args, test_time):
+def _run_with_mid_run_password_change(env, extra_args, test_time, rate_limit=True):
     """Run with AUTH, then change the password and drop the connections, so
     every reconnect gets -WRONGPASS. Return (rc, elapsed, stderr); rc is None
     if memtier had to be killed."""
@@ -1025,7 +1025,8 @@ def _run_with_mid_run_password_change(env, extra_args, test_time):
     conn = env.getOSSMasterNodesConnectionList()[0]  # Callers skip cluster mode.
     benchmark_specs = {
         "name": env.testName,
-        "args": ["--authenticate=pw-625", "--reconnect-on-error", "--rate-limiting=200", "--hide-histogram"]
+        "args": ["--authenticate=pw-625", "--reconnect-on-error", "--hide-histogram"]
+        + (["--rate-limiting=200"] if rate_limit else [])
         + extra_args,
     }
     addTLSArgs(benchmark_specs, env)
@@ -1103,4 +1104,23 @@ def test_auth_failure_on_reconnect_honors_test_time(env):
     rc, elapsed, _ = _run_with_mid_run_password_change(env, [], test_time)
     env.assertIsNotNone(rc, message="memtier hung after AUTH failed on reconnect")
     env.assertNotEqual(rc, 0, message="a run that cannot re-authenticate must fail")
+    env.assertLess(elapsed, test_time + 5, message="run took {:.1f}s for --test-time={}".format(elapsed, test_time))
+
+
+def test_auth_failure_on_reconnect_with_retry_on_error_honors_test_time(env):
+    """
+    Same as above with --retry-on-error: the requests in flight at the kill
+    are held for replay until setup succeeds, which it never does. They must
+    not keep the run reconnecting past --test-time (#625). No rate limit, so
+    the full pipeline is in flight at the kill.
+    """
+    env.skipOnCluster()
+    test_time = 8
+    rc, elapsed, stderr_content = _run_with_mid_run_password_change(
+        env, ["--retry-on-error", "--pipeline=16"], test_time, rate_limit=False
+    )
+    env.assertIsNotNone(rc, message="memtier hung after AUTH failed on reconnect")
+    env.assertNotEqual(rc, 0, message="a run that cannot re-authenticate must fail")
+    env.assertTrue("run is over, not reconnecting" in stderr_content,
+                   message="the run did not stop reconnecting at --test-time")
     env.assertLess(elapsed, test_time + 5, message="run took {:.1f}s for --test-time={}".format(elapsed, test_time))

@@ -1880,14 +1880,17 @@ void shard_connection::handle_reconnect_timer_event()
     // The server rejected a setup step on the last connection and the run's
     // time is up: stop retrying. With unlimited attempts the setup would keep
     // failing and the thread would never end. The client is left unended, so
-    // the run fails as incomplete. Requests held for replay are still owed a
-    // reply, so keep reconnecting for those. finished() is only meaningful
+    // the run fails as incomplete. This applies even with requests held for
+    // replay: they are only resent after a setup that keeps failing.
+    // disconnect_all() counts them as errors. finished() is only meaningful
     // once the run has started (a response was answered).
     const bool setup_rejected = m_setup_rejected;
     m_setup_rejected = false;
-    if (setup_rejected && m_conns_manager->get_reqs_answered() && m_conns_manager->finished() &&
-        (m_replay_queue == NULL || m_replay_queue->empty())) {
+    if (setup_rejected && m_conns_manager->get_reqs_answered() && m_conns_manager->finished()) {
         benchmark_error_log("Connection setup failed and the run is over, not reconnecting.\n");
+        if (m_conns_manager->all_connections_idle()) {
+            m_conns_manager->disconnect_all();
+        }
         return;
     }
 
