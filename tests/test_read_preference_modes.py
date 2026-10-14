@@ -546,11 +546,30 @@ def _sum_readonly_errors(conns):
     return total
 
 
+def _redis_version(conn):
+    """Return the server's (major, minor) from INFO server, or (0, 0)."""
+    info = conn.execute_command("INFO", "server")
+    if isinstance(info, dict):
+        version = str(info.get("redis_version", ""))
+    else:
+        if isinstance(info, bytes):
+            info = info.decode("utf-8", errors="replace")
+        version = ""
+        for line in info.splitlines():
+            if line.startswith("redis_version:"):
+                version = line.split(":", 1)[1].strip()
+    try:
+        return tuple(int(part) for part in version.split(".")[:2])
+    except ValueError:
+        return (0, 0)
+
+
 def test_read_preference_readonly_reply_counted(env):
     """A read-routed request a replica rejects with -READONLY, and that is
     not retried, is counted as an op. A write script without a shebang has
     no write flag, so a replica runs it and the write inside fails with
-    -READONLY. Totals Count must equal the requested total."""
+    -READONLY. Totals Count must equal the requested total, with the bytes
+    and latency of every op, and each -READONLY must be logged as a failure."""
     if not env.isCluster():
         env.skip()
         return
@@ -558,15 +577,23 @@ def test_read_preference_readonly_reply_counted(env):
     if not replica_conns:
         env.skip()
         return
+    # INFO ERRORSTATS, which counts the -READONLY replies, needs Redis 6.2.
+    if _redis_version(replica_conns[0]) < (6, 2):
+        env.skip()
+        return
 
     for conn in replica_conns:
         conn.execute_command("CONFIG", "RESETSTAT")
 
     threads, clients, requests = 1, 2, 100
+    script = "return redis.call('set',KEYS[1],'x')"
+    test_dir = tempfile.mkdtemp()
+    failed_keys = os.path.join(test_dir, "failed-keys.csv")
     benchmark_specs = {
         "name": env.testName,
         "args": [
-            "--command=EVAL \"return redis.call('set',KEYS[1],'x')\" 1 __key__",
+            "--command=EVAL \"{}\" 1 __key__".format(script),
+            "--failed-keys-file=" + failed_keys,
             "--command-is-read",
             "--read-preference=secondary",
             # Fall back to the primary so that the per-error CLUSTER SLOTS
@@ -580,12 +607,14 @@ def test_read_preference_readonly_reply_counted(env):
     master_nodes_list = env.getMasterNodesList()
     add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
 
-    test_dir = tempfile.mkdtemp()
     run_config = RunConfig(test_dir, env.testName, config, {})
     ensure_clean_benchmark_folder(run_config.results_dir)
 
     benchmark = Benchmark.from_json(run_config, benchmark_specs)
     ok = benchmark.run()
+
+    # The smallest request memtier can send for this command: a one-byte key.
+    min_request = len("*4\r\n$4\r\nEVAL\r\n${}\r\n{}\r\n$1\r\n1\r\n$1\r\nk\r\n".format(len(script), script))
 
     failed = env.getNumberOfFailedAssertion()
     try:
@@ -596,7 +625,8 @@ def test_read_preference_readonly_reply_counted(env):
             0,
             message="no replica answered -READONLY; the test did not exercise the drop path",
         )
-        totals = _load_mb_json(run_config)["ALL STATS"]["Totals"]
+        stats = _load_mb_json(run_config)["ALL STATS"]
+        totals = stats["Totals"]
         env.assertEqual(
             int(totals["Count"]),
             threads * clients * requests,
@@ -604,6 +634,26 @@ def test_read_preference_readonly_reply_counted(env):
                 totals["Count"], threads * clients * requests, readonly_errors
             ),
         )
+        # The ops are recorded under the command, not under Gets or Sets.
+        env.assertEqual(int(stats["Evals"]["Count"]), int(totals["Count"]), message="Evals Count != Totals Count")
+        bytes_tx = sum(second["Bytes TX"] for second in totals["Time-Serie"].values())
+        env.assertGreaterEqual(
+            bytes_tx,
+            int(totals["Count"]) * min_request,
+            message="Totals Bytes TX {} < {} ops x {} bytes".format(bytes_tx, totals["Count"], min_request),
+        )
+        # Every -READONLY memtier reads is a dropped request, logged once. A
+        # replica can count more: a slot map refresh may retire its connection
+        # before memtier reads the reply, and the request is then replayed on
+        # the primary instead.
+        with open(failed_keys) as fh:
+            rows = fh.readlines()[1:]
+        env.assertGreater(len(rows), 0, message="no dropped request in --failed-keys-file")
+        env.assertLessEqual(
+            len(rows), readonly_errors, message="failed-keys rows > {} -READONLY replies".format(readonly_errors)
+        )
+        for row in rows:
+            env.assertContains("READONLY", row)
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)

@@ -3048,8 +3048,10 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
             // CLUSTER SLOTS refresh (cluster_slots_state transiently !=
             // setup_done). Requiring setup_done here would drop valid
             // retries to a primary mid-refresh as terminal errors.
+            // shard_connection pops a request for every reply it hands us.
+            assert(request != NULL);
             unsigned int primary_target = UINT_MAX;
-            if (request && request->m_key && request->m_key_len > 0) {
+            if (request->m_key && request->m_key_len > 0) {
                 unsigned int hslot = calc_hslot_crc16_with_hash_tag(request->m_key, request->m_key_len);
                 unsigned int p = slot_primary_conn_id(hslot);
                 if (p != UINT_MAX && p < m_connections.size() &&
@@ -3065,7 +3067,7 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
                 finalize_dropped_readonly(timestamp, request, response);
                 return;
             }
-            if (m_config->retry_on_error && request && request->m_serialized && request->m_serialized_len > 0 &&
+            if (m_config->retry_on_error && request->m_serialized && request->m_serialized_len > 0 &&
                 m_connections[primary_target]->enqueue_retry(request)) {
                 m_stats.inc_retry_attempt();
                 if (request->m_retries == 0) m_stats.inc_retried_op();
