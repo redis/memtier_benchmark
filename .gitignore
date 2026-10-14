@@ -58,6 +58,7 @@ __pycache__
 *.gcov
 *.gcda
 *.info
+/memtier_benchmark-*-coverage/
 
 # redis related
 *.rdb
@@ -72,6 +73,8 @@ tests/.env/
 /hdr_histogram_test
 /cluster_transaction_test
 /cluster_hslot_test
+/rate_limiter_test
+/socket_options_test
 tests/unit/prometheus_metrics_test
 *.log
 *.trs
