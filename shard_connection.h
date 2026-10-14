@@ -93,7 +93,7 @@ struct request
     // queue. process_response checks this flag and skips its delete, leaving
     // the request to be freed when the retry queue drains.
     bool m_claimed_by_retry;
-    // Set by an -ASK redirect: the resend must be preceded by ASKING, or the
+    // Set by an -ASK redirect: every resend is preceded by ASKING, or the
     // node importing the slot answers -MOVED back to the migrating node.
     bool m_asking;
 

@@ -223,6 +223,8 @@ protected:
     // Resend the request after ASKING on the connection named by the -ASK
     // reply, falling back to retry_after_redirect if there is none.
     bool retry_after_ask(unsigned int conn_id, request *req, protocol_response *response);
+    // Queue the resend on connection `target` and count the retry.
+    bool enqueue_redirect_retry(unsigned int target, request *req);
     // Terminal accounting for a MOVED/ASK request whose retry was refused
     // (e.g. max_retries exhausted, retry queue full, no captured bytes). Logs
     // to --failed-keys-file if configured and increments the error counter,

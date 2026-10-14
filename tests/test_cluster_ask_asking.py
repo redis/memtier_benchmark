@@ -110,8 +110,7 @@ def _run(env, label, extra_args, pipeline, transaction=False):
     env.assertEqual(totals["Count"], threads * clients * requests, message=label)
     # The migration was really in progress: the source answered -ASK.
     name = "Gets" if stats["Gets"]["Count"] else "Sets"
-    if not extra_args[0].startswith("--command"):
-        env.assertGreater(stats[name]["ASK/sec"], 0, message=label)
+    env.assertGreater(stats[name]["ASK/sec"], 0, message=label)
     failures = []
     if os.path.isfile(failed_keys):
         with open(failed_keys, newline="") as f:

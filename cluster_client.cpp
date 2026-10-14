@@ -2829,18 +2829,25 @@ bool cluster_client::retry_after_redirect(unsigned int conn_id, request *req)
         }
     }
 
-    if (m_connections[target]->enqueue_retry(req)) {
-        m_stats.inc_retry_attempt();
-        if (req->m_retries == 0) m_stats.inc_retried_op();
-        return true;
-    }
-    return false;
+    return enqueue_redirect_retry(target, req);
+}
+
+bool cluster_client::enqueue_redirect_retry(unsigned int target, request *req)
+{
+    if (!m_connections[target]->enqueue_retry(req)) return false;
+    m_stats.inc_retry_attempt();
+    if (req->m_retries == 0) m_stats.inc_retried_op();
+    return true;
 }
 
 // Resend the request to the node named by "-ASK <slot> <host>:<port>",
 // preceded by ASKING: during a slot migration only that node serves the key,
-// and only for a command sent right after ASKING. Without a ready connection
-// to that node, fall back to routing by the slot map.
+// and only for a command sent right after ASKING. That node is the importing
+// primary, so this retry goes to a primary whatever --read-preference says:
+// no replica serves the key, and the slot map would send it back to the
+// migrating node. A connection still being established (e.g. a TLS
+// handshake at startup) holds the retry until it is set up. Without a
+// connection to that node, fall back to routing by the slot map.
 bool cluster_client::retry_after_ask(unsigned int conn_id, request *req, protocol_response *response)
 {
     const char *status = response->get_status();
@@ -2853,7 +2860,7 @@ bool cluster_client::retry_after_ask(unsigned int conn_id, request *req, protoco
         port++;
         for (unsigned int i = 0; i < m_connections.size(); i++) {
             shard_connection *sc = m_connections[i];
-            if (sc->get_role() == role_primary && sc->get_connection_state() == conn_connected &&
+            if (sc->get_role() == role_primary && sc->get_connection_state() != conn_disconnected &&
                 strncmp(sc->get_address(), addr, addr_len) == 0 && sc->get_address()[addr_len] == '\0' &&
                 strcmp(sc->get_port(), port) == 0) {
                 target = i;
@@ -2861,12 +2868,13 @@ bool cluster_client::retry_after_ask(unsigned int conn_id, request *req, protoco
             }
         }
     }
-    if (target == UINT_MAX) return retry_after_redirect(conn_id, req);
+    if (target == UINT_MAX) {
+        benchmark_debug_log("no live primary connection for %s; retrying by slot map\n", status ? status : "-ASK");
+        return retry_after_redirect(conn_id, req);
+    }
 
-    if (!m_connections[target]->enqueue_retry(req)) return false;
+    if (!enqueue_redirect_retry(target, req)) return false;
     req->m_asking = true;
-    m_stats.inc_retry_attempt();
-    if (req->m_retries == 0) m_stats.inc_retried_op();
     return true;
 }
 

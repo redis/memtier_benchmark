@@ -936,10 +936,11 @@ void shard_connection::replay_request(request *req)
     if (req->m_asking) {
         // ASKING applies to the next command only, so write it right before
         // the resent bytes. Its reply is consumed like other setup replies.
+        // The flag stays set: a resend after a reconnect needs ASKING again,
+        // and on a node that is not importing the slot it changes nothing.
         static const char ASKING_CMD[] = "*1\r\n$6\r\nASKING\r\n";
         evbuffer_add(out, ASKING_CMD, sizeof(ASKING_CMD) - 1);
         push_req(new request(rt_asking, 0, NULL, 0));
-        req->m_asking = false;
     }
     evbuffer_add(out, req->m_serialized, req->m_serialized_len);
     gettimeofday(&req->m_sent_time, NULL);
@@ -1529,6 +1530,12 @@ void shard_connection::fill_pipeline(void)
             send_conn_setup_commands(now);
             return;
         }
+    }
+    // Likewise for retries queued while the connection was being
+    // established: their drain timer fired before it was connected.
+    if (m_retry_queue != NULL && !m_retry_queue->empty() && get_connection_state() == conn_connected &&
+        is_conn_setup_done() && (m_retry_drain_timer == NULL || !evtimer_pending(m_retry_drain_timer, NULL))) {
+        handle_retry_drain_event();
     }
 
     // Setup commands go out even when the pipeline is full, and after the
