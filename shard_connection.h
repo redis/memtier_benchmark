@@ -328,6 +328,9 @@ private:
         return m_cluster_slots == setup_none && m_authentication == setup_done && m_db_selection == setup_done &&
                m_hello == setup_done && m_readonly_state == setup_done;
     }
+    // True while a CLUSTER SLOTS refresh must wait for the pinned
+    // --transaction rotation this connection drives to close its MULTI.
+    bool setup_held_for_transaction();
     void send_conn_setup_commands(struct timeval timestamp);
 
     // True iff any peer connection on this client is still climbing the

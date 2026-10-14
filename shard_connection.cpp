@@ -1020,6 +1020,12 @@ bool shard_connection::is_conn_setup_done()
            m_hello == setup_done && m_readonly_state == setup_done;
 }
 
+bool shard_connection::setup_held_for_transaction()
+{
+    // Sent inside the MULTI, CLUSTER SLOTS would only be queued (#569).
+    return m_multi_open && cluster_slots_refresh_pending() && m_conns_manager->is_transaction_pinned(m_id);
+}
+
 bool shard_connection::peer_client_has_any_setup_in_progress() const
 {
     // Walk every shard_connection on the same client. A peer "is mid-setup"
@@ -1489,11 +1495,18 @@ void shard_connection::fill_pipeline(void)
     // of fresh work. A new connection has no AUTH/SELECT/HELLO/READONLY
     // state yet, and the server runs commands in order, so send the setup
     // ladder first and resend once its replies are in. This is done even if
-    // the run is finished, as the resends are still owed a reply.
+    // the run is finished: a connection's own resends get their replies.
+    // (Requests still held on a peer that is not connected when the run
+    // ends are not resent.)
+    //
+    // While the --transaction hold keeps CLUSTER SLOTS back, fall through:
+    // the rotation must reach its EXEC/DISCARD first. Only requests handed
+    // over to a live connection can meet it, since a reconnect clears
+    // m_multi_open.
     if (m_replay_queue != NULL && !m_replay_queue->empty() && get_connection_state() == conn_connected) {
         if (is_conn_setup_done()) {
             drain_replay_queue_after_reconnect();
-        } else if (!(m_multi_open && cluster_slots_refresh_pending() && m_conns_manager->is_transaction_pinned(m_id))) {
+        } else if (!setup_held_for_transaction()) {
             send_conn_setup_commands(now);
             return;
         }
@@ -1508,8 +1521,7 @@ void shard_connection::fill_pipeline(void)
         // A CLUSTER SLOTS refresh requested while this connection drives
         // the pinned --transaction rotation inside an open MULTI waits for
         // the rotation's EXEC/DISCARD: sent now it would only be queued.
-        if (!is_conn_setup_done() &&
-            !(m_multi_open && cluster_slots_refresh_pending() && m_conns_manager->is_transaction_pinned(m_id))) {
+        if (!is_conn_setup_done() && !setup_held_for_transaction()) {
             send_conn_setup_commands(now);
             return;
         }
@@ -1623,9 +1635,6 @@ void shard_connection::handle_event(short events)
             m_event_timer = event_new(m_event_base, -1, EV_PERSIST, cluster_client_timer_handler, (void *) this);
             event_add(m_event_timer, &interval);
         }
-
-        // In-flight requests that survived the disconnect are resent by
-        // fill_pipeline(), after the setup ladder and before fresh work.
 
         // Any response, even one being retried, means the run has started:
         // a reconnect after it must not restart the clock.

@@ -707,7 +707,7 @@ def test_replays_wait_for_select_after_reconnect(env):
 class _StallingProxy(threading.Thread):
     """TCP proxy to the server. Connections opened in the first `stall`
     seconds stop getting replies at `stall` and are closed at `close`;
-    later connections are proxied as is."""
+    later connections are proxied as is, and the SETs sent on them counted."""
 
     def __init__(self, port, stall, close):
         super().__init__(daemon=True)
@@ -720,6 +720,8 @@ class _StallingProxy(threading.Thread):
         self.port = self.listener.getsockname()[1]
         self.t0 = None
         self.done = False
+        self.late_sets = 0
+        self.lock = threading.Lock()
 
     def run(self):
         while not self.done:
@@ -745,6 +747,9 @@ class _StallingProxy(threading.Thread):
                         return
                     if sock is client:
                         server.sendall(data)
+                        if not early:
+                            with self.lock:
+                                self.late_sets += data.count(b"$3\r\nSET\r\n")
                     elif not (early and elapsed >= self.stall):
                         client.sendall(data)
         except OSError:
@@ -760,8 +765,9 @@ class _StallingProxy(threading.Thread):
 
 def test_replays_after_deadline_are_counted(env):
     """
-    Requests resent after a reconnect that lands past the --test-time deadline
-    are counted once, and the reconnect's connection errors too.
+    Requests in flight on connections dropped near the --test-time deadline
+    are resent after the reconnect, past the deadline, and counted once, and
+    the reconnect's connection errors too.
 
     The run's stats used to end at the first reply read once the run was
     finished: here the SELECT reply, before the resent requests were even
@@ -799,3 +805,5 @@ def test_replays_after_deadline_are_counted(env):
     env.assertEqual(totals["Count"], progress[-1] if progress else None,
                     message="Count differs from the last progress line")
     env.assertEqual(totals["Connection Errors"], clients)
+    # Every request in flight at the stall is resent, after the deadline.
+    env.assertEqual(proxy.late_sets, clients * pipeline, message="requests in flight were not resent")
