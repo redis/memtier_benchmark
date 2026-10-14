@@ -262,6 +262,7 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_current_backoff_delay(1.0),
         m_reconnect_timer(NULL),
         m_reconnecting(false),
+        m_setup_rejected(false),
         m_connection_timeout_timer(NULL),
         m_retry_queue(NULL),
         m_replay_queue(NULL),
@@ -523,6 +524,7 @@ int shard_connection::connect(struct connect_info *addr)
         m_reconnect_timer = NULL;
     }
     m_reconnecting = false;
+    m_setup_rejected = false;
 
     // Start connection timeout timer (only if enabled)
     if (m_config->connection_timeout > 0) {
@@ -645,6 +647,7 @@ void shard_connection::disconnect()
     // reconnect timer (the timer was freed above), leaving m_reconnecting
     // true would make every future attempt_reconnect call no-op silently.
     m_reconnecting = false;
+    m_setup_rejected = false;
 
     // by default no need to send any setup request
     m_authentication = setup_done;
@@ -1860,6 +1863,7 @@ void shard_connection::reconnect_after_setup_error(const char *error_context)
 {
     if (m_config->reconnect_on_error) {
         attempt_reconnect(error_context);
+        m_setup_rejected = m_reconnecting;
     }
 }
 
@@ -1873,15 +1877,17 @@ void shard_connection::handle_reconnect_timer_event()
 
     m_reconnecting = false;
 
-    // The run ended while this connection was waiting to reconnect: stay
-    // disconnected so the thread can finish. Reconnecting would only re-run
-    // the setup ladder for a run that sends no more requests. Requests held
-    // for replay are still owed a reply, so reconnect for those. A run that
-    // has had no response yet has not started, and finished() is not
-    // meaningful before that.
-    if (m_conns_manager->get_reqs_answered() && m_conns_manager->finished() &&
+    // The server rejected a setup step on the last connection and the run's
+    // time is up: stop retrying. With unlimited attempts the setup would keep
+    // failing and the thread would never end. The client is left unended, so
+    // the run fails as incomplete. Requests held for replay are still owed a
+    // reply, so keep reconnecting for those. finished() is only meaningful
+    // once the run has started (a response was answered).
+    const bool setup_rejected = m_setup_rejected;
+    m_setup_rejected = false;
+    if (setup_rejected && m_conns_manager->get_reqs_answered() && m_conns_manager->finished() &&
         (m_replay_queue == NULL || m_replay_queue->empty())) {
-        benchmark_debug_log("run finished, not reconnecting conn %u.\n", m_id);
+        benchmark_error_log("Connection setup failed and the run is over, not reconnecting.\n");
         return;
     }
 

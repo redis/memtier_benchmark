@@ -433,6 +433,8 @@ private:
     double m_current_backoff_delay;
     struct event *m_reconnect_timer;
     bool m_reconnecting;
+    // The pending reconnect follows a rejected setup step (AUTH/SELECT/HELLO).
+    bool m_setup_rejected;
 
     // Connection timeout tracking
     struct event *m_connection_timeout_timer;
