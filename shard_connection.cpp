@@ -663,6 +663,9 @@ void shard_connection::disconnect()
     }
     // Notify only after routing can observe this connection as disconnected.
     m_conns_manager->handle_connection_disconnect(m_id);
+    // A replica that was not ready for reads held peers in hold_pipeline();
+    // disconnected, it no longer does.
+    if (m_role == role_replica) wake_peers();
 }
 
 void shard_connection::set_address_port(const char *address, const char *port)
@@ -1245,6 +1248,10 @@ void shard_connection::process_response(void)
                 // commit still prevents fill_pipeline from busy-spinning if
                 // the worker somehow reaches steady-state with an empty
                 // topology via a different code path.
+
+                // handle_cluster_slots() can change this connection's role
+                // (a promoted replica becomes a primary).
+                const bool was_replica = m_role == role_replica;
                 bool committed = m_conns_manager->handle_cluster_slots(r);
                 m_protocol->set_keep_value(false);
 
@@ -1254,7 +1261,7 @@ void shard_connection::process_response(void)
                     // A replica refreshing its slot map is not ready for
                     // reads, so hold_pipeline() holds peers while it runs.
                     // It is ready again now: wake them, as READONLY does.
-                    if (m_role == role_replica) wake_peers();
+                    if (was_replica) wake_peers();
                 } else {
                     benchmark_debug_log("cluster slot reply rejected; leaving m_cluster_slots unchanged\n");
                     // Surface the rejection to the connection-stage supervisor
@@ -1337,6 +1344,8 @@ void shard_connection::process_response(void)
                 // the failed replica gets re-evaluated — a peer's next
                 // CLUSTER SLOTS refresh will rebuild topology and may
                 // re-bring this replica online.
+                // disconnect() wakes them too, but attempt_reconnect() returns
+                // without disconnecting when m_reconnecting is already set.
                 if (m_role == role_replica) wake_peers();
                 error = true;
             } else {
