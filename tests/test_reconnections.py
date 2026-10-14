@@ -992,6 +992,30 @@ def test_cluster_shard_dial_failure_honors_max_reconnect_attempts(env):
     env.assertNotEqual(proc.returncode, 0)
 
 
+def _clear_requirepass(conn, passwords):
+    """Remove requirepass so later tests on this server can connect. The pool
+    may open a new connection, which then has to authenticate first."""
+    import redis
+
+    try:
+        conn.execute_command("CONFIG", "SET", "requirepass", "")
+        return
+    except redis.exceptions.AuthenticationError:
+        pass
+    kwargs = dict(conn.connection_pool.connection_kwargs)
+    for password in passwords:
+        kwargs["password"] = password
+        client = redis.Redis(connection_class=conn.connection_pool.connection_class, **kwargs)
+        try:
+            client.execute_command("CONFIG", "SET", "requirepass", "")
+            return
+        except redis.exceptions.AuthenticationError:
+            continue
+        finally:
+            client.close()
+    raise AssertionError("could not clear requirepass")
+
+
 def _run_with_mid_run_password_change(env, extra_args, test_time):
     """Run with AUTH, then change the password and drop the connections, so
     every reconnect gets -WRONGPASS. Return (rc, elapsed, stderr); rc is None
@@ -999,7 +1023,6 @@ def _run_with_mid_run_password_change(env, extra_args, test_time):
     import subprocess
 
     conn = env.getOSSMasterNodesConnectionList()[0]  # Callers skip cluster mode.
-    conn.execute_command("CONFIG", "SET", "requirepass", "pw-625")
     benchmark_specs = {
         "name": env.testName,
         "args": ["--authenticate=pw-625", "--reconnect-on-error", "--rate-limiting=200", "--hide-histogram"]
@@ -1015,6 +1038,9 @@ def _run_with_mid_run_password_change(env, extra_args, test_time):
 
     stderr_path = "{0}/mb.stderr".format(config.results_dir)
     rc = None
+    # Set the password only now: add_required_env_arguments() opens new
+    # connections under TLS, which would fail to authenticate.
+    conn.execute_command("CONFIG", "SET", "requirepass", "pw-625")
     started = time.monotonic()
     try:
         with open("{0}/mb.stdout".format(config.results_dir), "w") as stdout_f, open(stderr_path, "w") as stderr_f:
@@ -1033,7 +1059,7 @@ def _run_with_mid_run_password_change(env, extra_args, test_time):
                     proc.kill()
                 proc.wait(timeout=10)
     finally:
-        conn.execute_command("CONFIG", "SET", "requirepass", "")
+        _clear_requirepass(conn, ("other-625", "pw-625"))
     elapsed = time.monotonic() - started
     with open(stderr_path) as f:
         stderr_content = f.read()
