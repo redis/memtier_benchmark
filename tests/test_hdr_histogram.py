@@ -250,8 +250,9 @@ def test_hdr_files_for_duplicate_command_names(env):
 
     Regression for #587: both GET lines wrote <prefix>_GET_command_run_1.*,
     so the second overwrote the first and one line's histogram was lost.
-    Repeated names use the same " #N" scheme as the JSON keys; unique names
-    keep their usual file name.
+    Repeated names get a shell-safe "_N" suffix (the JSON keys use " #N",
+    but an unquoted "#" starts a shell comment); unique names keep their
+    usual file name.
     """
     with tempfile.TemporaryDirectory() as directory:
         prefix = os.path.join(directory, "histogram")
@@ -271,7 +272,7 @@ def test_hdr_files_for_duplicate_command_names(env):
         env.assertTrue(Benchmark.from_json(config, specs).run())
 
         # 100 requests in rounds of 3 + 1 + 1.
-        expected = {"GET #1": 60, "GET #2": 20, "SET": 20}
+        expected = {"GET_1": 60, "GET_2": 20, "SET": 20}
         for name, count in expected.items():
             base = "{}_{}_command_run_1".format(prefix, name)
             env.assertTrue(os.path.exists(base + ".txt"))
@@ -279,3 +280,5 @@ def test_hdr_files_for_duplicate_command_names(env):
             if os.path.exists(base + ".hgrm"):
                 env.assertEqual(_hgrm_count(base + ".hgrm"), count)
         env.assertFalse(os.path.exists(prefix + "_GET_command_run_1.hgrm"))
+        names = os.listdir(directory)
+        env.assertEqual([n for n in names if "#" in n or " " in n], [])

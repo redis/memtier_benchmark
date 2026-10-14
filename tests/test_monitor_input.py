@@ -1,6 +1,8 @@
+import base64
 import tempfile
 import os
 import json
+import zlib
 from include import *
 from mb import Benchmark, RunConfig
 
@@ -722,21 +724,36 @@ def test_command_stats_breakdown_by_line(env):
         env.assertEqual(gets_count, 2)
 
 
-def _run_duplicate_command_lines(env, breakdown):
+def _hist_count(stats):
+    """Sample count of a JSON row's encoded HDR histogram (V2 wire format)."""
+    encoded = stats["Percentile Latencies"]["Histogram log format"]["Compressed Histogram"]
+    compressed = base64.b64decode(encoded, validate=True)
+    raw = zlib.decompress(compressed[8:])
+    count, word, shift = 0, 0, 0
+    for byte in raw[40:]:
+        word |= (byte & 0x7F) << shift
+        if byte & 0x80:
+            shift += 7
+            continue
+        value = (word >> 1) ^ -(word & 1)
+        if value > 0:
+            count += value
+        word, shift = 0, 0
+    return count
+
+
+def _run_duplicate_command_lines(env, breakdown, commands, extra_args=()):
     """
-    Run two identical GET lines plus a unique SET line with the given
-    --command-stats-breakdown and return (json pairs-preserving dict, list of
-    duplicate JSON object keys found anywhere in the document).
+    Run the given --command args with --command-stats-breakdown=<breakdown>
+    (1 client, 300 requests) and return (results dict, list of duplicate JSON
+    object keys found anywhere in the document).
     """
     test_dir = tempfile.mkdtemp()
     benchmark_specs = {
         "name": env.testName,
-        "args": [
-            "--command=GET __key__",
-            "--command=GET __key__",
-            "--command=SET __key__ __data__",
-            "--command-stats-breakdown={}".format(breakdown),
-        ],
+        "args": list(commands)
+        + list(extra_args)
+        + ["--command-stats-breakdown={}".format(breakdown)],
     }
     addTLSArgs(benchmark_specs, env)
 
@@ -763,38 +780,47 @@ def _run_duplicate_command_lines(env, breakdown):
     return results_dict, duplicates
 
 
+# The first GET line runs 3x as often as the second, so the two lines have
+# different counts (180 / 60 / 60 for 300 requests in rounds of 3 + 1 + 1)
+# and a swapped or reversed numbering cannot pass.
+_DUPLICATE_GET_COMMANDS = [
+    "--command=GET __key__",
+    "--command-ratio=3",
+    "--command=GET __key__",
+    "--command=SET __key__ __data__",
+]
+
+
 def test_command_stats_breakdown_line_duplicate_json_keys(env):
     """
     Two --command lines with the same name used to produce duplicate "Gets"
     (and "GET") keys in the JSON output with --command-stats-breakdown=line;
     JSON parsers keep only the last one, so the per-command rows no longer
-    added up to Totals. Repeated names must be disambiguated with " #N" while
-    unique names keep their usual key.
+    added up to Totals. Repeated names must be disambiguated with " #N" in
+    --command order while unique names keep their usual key.
     """
-    results_dict, duplicates = _run_duplicate_command_lines(env, "line")
+    results_dict, duplicates = _run_duplicate_command_lines(env, "line", _DUPLICATE_GET_COMMANDS)
     env.assertEqual(duplicates, [])
 
     all_stats = results_dict["ALL STATS"]
-    env.assertTrue("Gets #1" in all_stats)
-    env.assertTrue("Gets #2" in all_stats)
     env.assertFalse("Gets" in all_stats)
-    env.assertTrue("Sets" in all_stats)
-    env.assertTrue("GET #1" in all_stats)
-    env.assertTrue("GET #2" in all_stats)
-    env.assertTrue("SET" in all_stats)
+    env.assertFalse("GET" in all_stats)
+    expected = {"Gets #1": 180, "Gets #2": 60, "Sets": 60}
+    for key, count in expected.items():
+        env.assertTrue(key in all_stats)
+        if key in all_stats:
+            env.assertEqual(all_stats[key]["Count"], count)
+            env.assertEqual(_hist_count(all_stats[key]), count)
+    env.assertEqual(all_stats["Totals"]["Count"], 300)
 
-    # No row is lost: the per-command rows add up to Totals.
-    rows = [all_stats[k] for k in ("Gets #1", "Gets #2", "Sets")]
-    env.assertEqual(sum(r["Count"] for r in rows), all_stats["Totals"]["Count"])
-    env.assertTrue(all(r["Count"] > 0 for r in rows))
+    # Per-line latency histogram arrays: one per line, no plain "GET".
+    for key in ("GET #1", "GET #2", "SET"):
+        env.assertTrue(key in all_stats)
 
     per_key = all_stats["Per-Key Misses"]
     env.assertEqual(sorted(per_key.keys()), ["GET #1", "GET #2"])
-    total_gets = all_stats["Gets #1"]["Count"] + all_stats["Gets #2"]["Count"]
-    env.assertEqual(
-        sum(v["Total Hits"] + v["Total Misses"] for v in per_key.values()),
-        total_gets,
-    )
+    env.assertEqual(per_key["GET #1"]["Total Hits"] + per_key["GET #1"]["Total Misses"], 180)
+    env.assertEqual(per_key["GET #2"]["Total Hits"] + per_key["GET #2"]["Total Misses"], 60)
 
 
 def test_command_stats_breakdown_command_duplicate_json_keys(env):
@@ -803,18 +829,47 @@ def test_command_stats_breakdown_command_duplicate_json_keys(env):
     by type ("Gets"), but the per-line "Per-Key Misses" section must still
     keep one entry per --command line.
     """
-    results_dict, duplicates = _run_duplicate_command_lines(env, "command")
+    results_dict, duplicates = _run_duplicate_command_lines(env, "command", _DUPLICATE_GET_COMMANDS)
     env.assertEqual(duplicates, [])
 
     all_stats = results_dict["ALL STATS"]
-    env.assertTrue("Gets" in all_stats)
-    env.assertTrue("Sets" in all_stats)
+    env.assertEqual(all_stats["Gets"]["Count"], 240)
+    env.assertEqual(all_stats["Sets"]["Count"], 60)
     per_key = all_stats["Per-Key Misses"]
     env.assertEqual(sorted(per_key.keys()), ["GET #1", "GET #2"])
-    env.assertEqual(
-        sum(v["Total Hits"] + v["Total Misses"] for v in per_key.values()),
-        all_stats["Gets"]["Count"],
+    env.assertEqual(per_key["GET #1"]["Total Hits"] + per_key["GET #1"]["Total Misses"], 180)
+    env.assertEqual(per_key["GET #2"]["Total Hits"] + per_key["GET #2"]["Total Misses"], 60)
+
+
+def test_command_stats_breakdown_line_duplicate_monitor_lines(env):
+    """
+    Repeating the same __monitor_lineN__ gives two lines with the same display
+    name ("GET (Line 1)"); they must get distinct JSON keys too.
+    """
+    # cluster mode does not support monitor-input option
+    env.skipOnCluster()
+    monitor_file = os.path.join(tempfile.mkdtemp(), "monitor.txt")
+    with open(monitor_file, "w") as f:
+        f.write('1764031576.604009 [0 127.0.0.1:51682] "GET" "key1"\n')
+        f.write('1764031576.605000 [0 127.0.0.1:51682] "SET" "key1" "value1"\n')
+
+    results_dict, duplicates = _run_duplicate_command_lines(
+        env,
+        "line",
+        ["--command=__monitor_line1__", "--command-ratio=3", "--command=__monitor_line1__"],
+        ["--monitor-input={}".format(monitor_file)],
     )
+    env.assertEqual(duplicates, [])
+
+    all_stats = results_dict["ALL STATS"]
+    expected = {"Get (line 1)s #1": 225, "Get (line 1)s #2": 75}
+    for key, count in expected.items():
+        env.assertTrue(key in all_stats)
+        if key in all_stats:
+            env.assertEqual(all_stats[key]["Count"], count)
+            env.assertEqual(_hist_count(all_stats[key]), count)
+    for key in ("GET (Line 1) #1", "GET (Line 1) #2"):
+        env.assertTrue(key in all_stats)
 
 
 def test_monitor_input_malformed_command_skipped(env):

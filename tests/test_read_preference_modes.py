@@ -461,6 +461,73 @@ def test_read_preference_keyless_arbitrary_secondary(env):
             debugPrintMemtierOnError(run_config, env)
 
 
+def test_arbitrary_read_routing_duplicate_command_names(env):
+    """Two arbitrary GET lines with the same name must get distinct keys in
+    the "Arbitrary Read Routing" JSON block (#587). Previously both were
+    written as "GET" and JSON parsers kept only the last one. The first line
+    runs 3x as often, so a swapped numbering cannot pass."""
+    if not env.isCluster():
+        env.skip()
+        return
+    replica_conns = get_cluster_replica_connections(env)
+    if not replica_conns:
+        env.skip()
+        return
+
+    _pre_populate(env, key_count=100)
+
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--command=GET __key__",
+            "--command-ratio=3",
+            "--command=GET __key__",
+            "--key-prefix=rp-key-",
+            "--key-minimum=1",
+            "--key-maximum=99",
+            "--read-preference=secondary",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+
+    # 2 clients x 100 requests in rounds of 3 + 1.
+    config = get_default_memtier_config(threads=1, clients=2, requests=100)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    test_dir = tempfile.mkdtemp()
+    run_config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(run_config.results_dir)
+
+    ok = Benchmark.from_json(run_config, benchmark_specs).run()
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier exited non-zero")
+
+        duplicates = []
+
+        def no_duplicates(pairs):
+            keys = [k for k, _ in pairs]
+            duplicates.extend(sorted(set(k for k in keys if keys.count(k) > 1)))
+            return dict(pairs)
+
+        json_path = os.path.join(run_config.results_dir, "mb.json")
+        with open(json_path) as fh:
+            result = json.load(fh, object_pairs_hook=no_duplicates)
+        env.assertEqual(duplicates, [])
+
+        routing = result["ALL STATS"].get("Arbitrary Read Routing", {})
+        env.assertEqual(sorted(routing.keys()), ["GET #1", "GET #2"])
+        for key, count in (("GET #1", 150), ("GET #2", 50)):
+            if key in routing:
+                ops = int(routing[key]["Ops from Primary"]) + int(routing[key]["Ops from Replica"])
+                env.assertEqual(ops, count, message="{} routed ops".format(key))
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
 # ---------------------------------------------------------------------------
 # Test 6 - Endpoints / Read Routing JSON schema validation
 #
