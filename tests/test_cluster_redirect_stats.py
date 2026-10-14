@@ -79,7 +79,7 @@ class _RedirectHandler(socketserver.StreamRequestHandler):
             self.server.errors.append(repr(error))
 
 
-def _check_redirect_stats(env, redirect, mode, command, backoff_ms=1):
+def _check_redirect_stats(env, redirect, mode, command, backoff_ms=1, run_count=1):
     requests = 12
     with _RedirectPeer(redirect, mode) as peer, tempfile.TemporaryDirectory() as directory:
         thread = threading.Thread(target=peer.serve_forever, daemon=True)
@@ -105,6 +105,8 @@ def _check_redirect_stats(env, redirect, mode, command, backoff_ms=1):
                      "--max-retries={}".format(3 if mode == "success" else 1)]
         if mode == "transaction":
             args.append("--transaction")
+        if run_count > 1:
+            args.append("--run-count={}".format(run_count))
         try:
             result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                     timeout=30, text=True)
@@ -115,6 +117,14 @@ def _check_redirect_stats(env, redirect, mode, command, backoff_ms=1):
         env.assertEqual(result.returncode, 0, message=label + "\n" + result.stderr)
         env.assertEqual(peer.errors, [], message=label)
         if result.returncode:
+            return
+        expected_ratio = 1 if mode in ("disabled", "transaction") else 2
+        _check_text_totals(env, result.stdout, redirect, name, label)
+        if run_count > 1:
+            with open(path) as source:
+                average = json.load(source)["AGGREGATED AVERAGE RESULTS ({} runs)".format(run_count)]
+            env.assertEqual(peer.redirects, requests * expected_ratio * run_count, message=label)
+            _check_redirect_rates(env, average, redirect, name, expected_ratio, label + " AVERAGE")
             return
         with open(path) as source:
             stats = json.load(source)["ALL STATS"]
@@ -136,12 +146,52 @@ def _check_redirect_stats(env, redirect, mode, command, backoff_ms=1):
                                        message=label)
             # Both rates use the same duration. Their ratio recovers the
             # redirect count without depending on rounded run timestamps.
-            actual_redirects = entry[redirect + "/sec"] / entry["Ops/sec"] * requests
-            env.assertAlmostEqual(actual_redirects, expected_redirects, delta=0.05, message=label)
+            # A zero rate is reported as a failure rather than raised, so the
+            # remaining cases still run.
+            env.assertGreater(entry["Ops/sec"], 0, message=label + " Ops/sec")
+            if entry["Ops/sec"] > 0:
+                actual_redirects = entry[redirect + "/sec"] / entry["Ops/sec"] * requests
+                env.assertAlmostEqual(actual_redirects, expected_redirects, delta=0.05, message=label)
         series = stats[name]["Time-Serie"].values()
         env.assertEqual(sum(second["Count"] for second in series), requests, message=label)
         env.assertEqual(sum(second["Bytes RX"] for second in series), peer.terminal_rx, message=label)
         env.assertEqual(sum(second["Bytes TX"] for second in series), peer.terminal_tx, message=label)
+
+
+def _check_redirect_rates(env, stats, redirect, name, expected_ratio, label):
+    """Every request is redirected expected_ratio times, in every run, so the
+    redirect rate over the ops rate must equal it for the command and Totals,
+    and Totals must equal the command (the only one with traffic)."""
+    for entry in (stats[name], stats["Totals"]):
+        env.assertGreater(entry["Ops/sec"], 0, message=label + " Ops/sec")
+        if entry["Ops/sec"] > 0:
+            env.assertAlmostEqual(entry[redirect + "/sec"] / entry["Ops/sec"], expected_ratio, delta=0.01,
+                                  message=label)
+    for rate in ("MOVED/sec", "ASK/sec"):
+        env.assertAlmostEqual(stats["Totals"][rate], stats[name][rate], delta=0.011, message=label + " " + rate)
+
+
+def _check_text_totals(env, stdout, redirect, name, label):
+    """The last text table (ALL STATS, or the AVERAGE with --run-count) must
+    show the same non-zero redirect rate in the Totals row as in the command row."""
+    lines = stdout.splitlines()
+    headers = [i for i, line in enumerate(lines) if line.startswith("Type ") and "MOVED/sec" in line]
+    env.assertTrue(headers, message=label + " no text table:\n" + stdout)
+    if not headers:
+        return
+    columns = lines[headers[-1]].split()
+    rows = {}
+    for line in lines[headers[-1] + 1:]:
+        fields = line.split()
+        if fields and fields[0] in (name, "Totals"):
+            rows.setdefault(fields[0], fields)
+    env.assertEqual(sorted(rows), sorted([name, "Totals"]), message=label + " text rows:\n" + stdout)
+    if len(rows) != 2:
+        return
+    for rate in ("MOVED/sec", "ASK/sec"):
+        index = columns.index(rate)
+        env.assertEqual(rows["Totals"][index], rows[name][index], message=label + " text " + rate)
+    env.assertGreater(float(rows["Totals"][columns.index(redirect + "/sec")]), 0, message=label + " text")
 
 
 def test_moved_redirect_stats(env):
@@ -166,3 +216,9 @@ def test_exhausted_redirect_latency_includes_backoff(env):
     for redirect in ("MOVED", "ASK"):
         for command in ("set", "get", "arbitrary-set", "arbitrary-get"):
             _check_redirect_stats(env, redirect, "refused", command, backoff_ms=50)
+
+
+def test_run_count_average_redirect_stats(env):
+    for redirect in ("MOVED", "ASK"):
+        for command in ("set", "get", "arbitrary-set", "arbitrary-get"):
+            _check_redirect_stats(env, redirect, "success", command, run_count=2)
