@@ -12,6 +12,7 @@ from redis.cluster import key_slot
 
 from include import (
     add_required_env_arguments,
+    get_cluster_replica_connections,
     addTLSArgs,
     debugPrintMemtierOnError,
     ensure_clean_benchmark_folder,
@@ -51,16 +52,21 @@ def _moved_errors(conn):
     return int(entry.get("count", 0)) if isinstance(entry, dict) else 0
 
 
-def _check(env, command, row, owner=None):
-    """Run --command and assert no server replied -MOVED. With owner set,
-    also assert every key landed on that shard."""
+def _check(env, command, row, owner=None, extra_args=(), replicas=()):
+    """Run --command and assert no server replied -MOVED. command and row may
+    be lists, for several --command lines in one run. With owner set, also
+    assert every key landed on that shard."""
+    commands = [command] if isinstance(command, str) else list(command)
+    rows = [row] if isinstance(row, str) else list(row)
     for conn in env.getOSSMasterNodesConnectionList():
         conn.execute_command("FLUSHALL")
+    for conn in list(env.getOSSMasterNodesConnectionList()) + list(replicas):
         conn.execute_command("CONFIG", "RESETSTAT")
 
+    # extra_args follow the last --command, so --command-is-read applies to it.
+    args = ["--command=" + c for c in commands] + list(extra_args)
     benchmark_specs = {"name": env.testName,
-                       "args": ["--command=" + command, "--key-minimum=1",
-                                "--key-maximum=1000"]}
+                       "args": args + ["--key-minimum=1", "--key-maximum=1000"]}
     addTLSArgs(benchmark_specs, env)
     config = get_default_memtier_config(threads=1, clients=2, requests=200)
     add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
@@ -68,7 +74,7 @@ def _check(env, command, row, owner=None):
     ensure_clean_benchmark_folder(run_config.results_dir)
     ok = Benchmark.from_json(run_config, benchmark_specs).run()
 
-    label = repr(command)
+    label = repr(args)
     failed = env.getNumberOfFailedAssertion()
     try:
         env.assertTrue(ok, message=label)
@@ -78,9 +84,16 @@ def _check(env, command, row, owner=None):
             if owner is not None and port != owner:
                 env.assertEqual(int(conn.execute_command("DBSIZE")), 0,
                                 message="{}: keys on port {}".format(label, port))
+        replica_gets = 0
+        for conn in replicas:
+            env.assertEqual(_moved_errors(conn), 0, message="{}: a replica replied -MOVED".format(label))
+            replica_gets += int(conn.execute_command("INFO", "COMMANDSTATS").get("cmdstat_get", {}).get("calls", 0))
+        if replicas:
+            env.assertGreater(replica_gets, 0, message="{}: no GETs reached a replica".format(label))
         with open("{}/mb.json".format(run_config.results_dir)) as source:
             stats = json.load(source)["ALL STATS"]
-        env.assertEqual(stats[row]["MOVED/sec"], 0, message=label)
+        for r in rows:
+            env.assertEqual(stats[r]["MOVED/sec"], 0, message="{} {}".format(label, r))
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)
@@ -103,3 +116,33 @@ def test_cluster_command_key_prefix_no_moved(env):
         return
     _check(env, "SET user:__key__ __data__", "Sets")
     _check(env, "GET user:__key__", "Gets")
+
+
+def test_cluster_command_key_affixes_per_command(env):
+    """Each --command routes by its own key text."""
+    if not env.isCluster():
+        env.skip()
+        return
+    _check(env, ["SET user:__key__ __data__", "GET session:__key__"], ["Sets", "Gets"])
+
+
+def test_cluster_command_key_not_first_argument(env):
+    """The key argument need not follow the command name directly."""
+    if not env.isCluster():
+        env.skip()
+        return
+    _check(env, "OBJECT ENCODING p:__key__", "Objects")
+    _check(env, "EVAL return 1 p:__key__", "Evals")
+
+
+def test_cluster_command_key_prefix_read_preference_secondary(env):
+    """Reads routed to replicas use the same slot."""
+    if not env.isCluster():
+        env.skip()
+        return
+    replicas = get_cluster_replica_connections(env)
+    if not replicas:
+        env.skip()
+        return
+    _check(env, "GET user:__key__", "Gets",
+           extra_args=("--command-is-read", "--read-preference=secondary"), replicas=replicas)
