@@ -368,6 +368,7 @@ To output different percentiles you should use the --print-percentiles option fo
 #### Saving the full latency spectrum
 To save the full latencies you should use the --hdr-file-prefix option followed by the prefix name you wish the filenames to have. 
 Each distinct command will be saved into two different files - one in .txt (textual format) and another in .hgrm (HistogramLogProcessor format).
+The per-command files are named `<prefix>_<command>_command_run_<run>.txt` and `.hgrm`. In `<command>`, spaces, control characters and `< > : " / \ | ? *` are replaced with `_`, so names stay valid on Windows and in CI artifact uploads (e.g. `SCAN <cursor>` from `--scan-incremental-iteration` is written as `<prefix>_SCAN__cursor__command_run_1.hgrm`, and `GET (Line 1)` from `--command-stats-breakdown=line` as `<prefix>_GET_(Line_1)_command_run_1.hgrm`). Names that become identical after this replacement get the same `_N` suffix as duplicate names.
 The JSON output also includes a `Compressed Histogram` string under
 `Percentile Latencies` / `Histogram log format`, encoded as standard V2 compressed
 HDR data in base64. If encoding fails, memtier reports the HDR error on stderr and

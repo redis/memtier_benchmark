@@ -27,6 +27,7 @@
 #include <sys/time.h>
 #include <math.h>
 #include <algorithm>
+#include <set>
 
 #ifdef HAVE_ASSERT_H
 #include <assert.h>
@@ -892,23 +893,50 @@ static std::vector<std::string> make_unique_labels(const std::vector<std::string
     for (const auto &name : names)
         total[name]++;
 
+    // A suffixed label can equal another name (e.g. "GET", "GET" and a
+    // literal "GET_1"), so skip ordinals already taken by any name or label.
+    std::set<std::string> used(names.begin(), names.end());
     std::map<std::string, unsigned int> seen;
     std::vector<std::string> keys;
     keys.reserve(names.size());
     for (const auto &name : names) {
-        if (total[name] > 1)
-            keys.push_back(name + sep + std::to_string(++seen[name]));
-        else
+        if (total[name] > 1) {
+            std::string key;
+            do {
+                key = name + sep + std::to_string(++seen[name]);
+            } while (!used.insert(key).second);
+            keys.push_back(key);
+        } else {
             keys.push_back(name);
+        }
     }
     return keys;
 }
 
-static std::vector<std::string> unique_command_labels(const arbitrary_command_list &command_list, const char *sep)
+// Command names are free-form ("SCAN <cursor>", "GET (Line 1)", or whatever
+// the first --command token is), but HDR output file names must be valid on
+// every platform: Windows reserves < > : " / \ | ? * and control characters,
+// and actions/upload-artifact rejects most of them. Map those, and spaces, to
+// '_'. Done before deduplication so names that sanitize to the same string
+// still get distinct "_N" suffixes.
+static std::string sanitize_file_name_component(const std::string &name)
+{
+    std::string out = name;
+    for (auto &c : out) {
+        unsigned char uc = static_cast<unsigned char>(c);
+        if (uc < 0x20 || uc == 0x7f || c == ' ' || strchr("<>:\"/\\|?*", c) != NULL) c = '_';
+    }
+    return out;
+}
+
+static std::vector<std::string> unique_command_labels(const arbitrary_command_list &command_list, const char *sep,
+                                                      bool for_file_name = false)
 {
     std::vector<std::string> names;
-    for (size_t i = 0; i < command_list.size(); i++)
-        names.push_back(command_list[i].command_name);
+    for (size_t i = 0; i < command_list.size(); i++) {
+        const std::string &name = command_list[i].command_name;
+        names.push_back(for_file_name ? sanitize_file_name_component(name) : name);
+    }
     return make_unique_labels(names, sep);
 }
 
@@ -917,21 +945,25 @@ bool run_stats::save_hdr_arbitrary_commands(benchmark_config *config, int run_nu
     // save latency datacommand_list
     if (strcmp(config->hdr_prefix, "")) {
         arbitrary_command_list &command_list = *config->arbitrary_commands;
-        const std::vector<std::string> labels = unique_command_labels(command_list, UNIQUE_FILE_NAME_SEP);
+        // Display names match the JSON keys; file labels are sanitized and
+        // deduplicated separately, so they may number duplicates differently.
+        const std::vector<std::string> names = unique_command_labels(command_list, UNIQUE_JSON_KEY_SEP);
+        const std::vector<std::string> labels = unique_command_labels(command_list, UNIQUE_FILE_NAME_SEP, true);
         for (unsigned int i = 0; i < command_list.size(); i++) {
-            const std::string &command_name = labels[i];
+            const std::string &command_name = names[i];
+            const std::string &file_label = labels[i];
 
             // Prepare output file
             char fmtbuf[1024];
             struct hdr_histogram *hist = m_ar_commands_latency_histograms.at(i);
 
-            snprintf(fmtbuf, sizeof(fmtbuf) - 1, "%s_%s_command_run_%d.txt", config->hdr_prefix, command_name.c_str(),
+            snprintf(fmtbuf, sizeof(fmtbuf) - 1, "%s_%s_command_run_%d.txt", config->hdr_prefix, file_label.c_str(),
                      run_number);
             fprintf(stderr, "Writing %s command HDR latency histogram results to %s...\n", command_name.c_str(),
                     fmtbuf);
             save_hdr_percentiles_print_format(hist, fmtbuf);
 
-            snprintf(fmtbuf, sizeof(fmtbuf) - 1, "%s_%s_command_run_%d.hgrm", config->hdr_prefix, command_name.c_str(),
+            snprintf(fmtbuf, sizeof(fmtbuf) - 1, "%s_%s_command_run_%d.hgrm", config->hdr_prefix, file_label.c_str(),
                      run_number);
             fprintf(stderr,
                     "Writing %s command HDR latency histogram results in HistogramLogProcessor format to %s...\n",

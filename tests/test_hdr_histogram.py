@@ -282,3 +282,87 @@ def test_hdr_files_for_duplicate_command_names(env):
         env.assertFalse(os.path.exists(prefix + "_GET_command_run_1.hgrm"))
         names = os.listdir(directory)
         env.assertEqual([n for n in names if "#" in n or " " in n], [])
+
+
+# Characters that are reserved in Windows file names or rejected by
+# actions/upload-artifact, plus space and ASCII control characters.
+_UNSAFE_FILE_NAME_CHARS = set('<>:"/\\|?* ') | {chr(c) for c in range(0x20)} | {"\x7f"}
+
+
+def _unsafe_hdr_file_names(prefix):
+    # Only the HDR outputs; the RLTest results dir is named after the test.
+    directory, base = os.path.split(prefix)
+    return sorted(name for name in os.listdir(directory)
+                  if name.startswith(base + "_") and _UNSAFE_FILE_NAME_CHARS & set(name))
+
+
+def _run_hdr_benchmark(env, directory, args, requests):
+    prefix = os.path.join(directory, "histogram")
+    specs = {"name": env.testName,
+             "args": args + ["--hide-histogram", "--hdr-file-prefix=" + prefix]}
+    addTLSArgs(specs, env)
+    config = get_default_memtier_config(threads=1, clients=1, requests=requests)
+    add_required_env_arguments(specs, config, env, env.getMasterNodesList())
+    config = RunConfig(directory, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+    env.assertTrue(Benchmark.from_json(config, specs).run())
+    return prefix
+
+
+def test_hdr_file_names_are_sanitized_for_scan_cursor(env):
+    """HDR file names must not contain characters unsafe in file names.
+
+    Regression for #627: --scan-incremental-iteration names its rows
+    "SCAN 0" and "SCAN <cursor>", which produced
+    <prefix>_SCAN <cursor>_command_run_1.hgrm. '<' and '>' are reserved
+    on Windows and rejected by actions/upload-artifact.
+    """
+    env.skipOnCluster()
+    # More keys than one SCAN page, so continuation SCANs are sent and the
+    # "SCAN <cursor>" histogram is non-empty (empty ones are not written).
+    conn = env.getConnection()
+    keys = ["hdrname:{}".format(i) for i in range(200)]
+    conn.mset({key: "v" for key in keys})
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = _run_hdr_benchmark(env, directory, [
+                "--command=SCAN 0 COUNT 10", "--scan-incremental-iteration",
+            ], requests=50)
+            env.assertEqual(_unsafe_hdr_file_names(prefix), [])
+            for name in ("SCAN_0", "SCAN__cursor_"):
+                base = "{}_{}_command_run_1".format(prefix, name)
+                env.assertTrue(os.path.exists(base + ".txt"))
+                env.assertTrue(os.path.exists(base + ".hgrm"))
+    finally:
+        conn.delete(*keys)
+
+
+def test_hdr_file_names_stay_unique_after_sanitizing(env):
+    """Names that sanitize to the same string must still get distinct files.
+
+    "A:" and "A?" both sanitize to "A_", so they get the duplicate "_N"
+    suffix (#587). The literal name "A__1" already uses the first suffix,
+    so the sanitized duplicates must skip it instead of overwriting its file.
+    'A/\\|*"x"' covers the remaining reserved characters: it must sanitize
+    to "A_____X_" and keep its own histogram.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        prefix = _run_hdr_benchmark(env, directory, [
+            # Different ratios give each line a different sample count, so an
+            # overwritten file cannot pass for the right one.
+            "--command=A: __key__", "--command-ratio=3",
+            "--command=A? __key__",
+            "--command=A__1 __key__",
+            # The quotes only wrap "x" for the argument parser; the display
+            # name keeps them, so it contains / \ | * and ".
+            '--command=A/\\|*"x" __key__',
+        ], requests=120)
+        env.assertEqual(_unsafe_hdr_file_names(prefix), [])
+        # 120 requests in rounds of 3 + 1 + 1 + 1.
+        expected = {"A__2": 60, "A__3": 20, "A__1": 20, "A_____X_": 20}
+        for name, count in expected.items():
+            base = "{}_{}_command_run_1".format(prefix, name)
+            env.assertTrue(os.path.exists(base + ".txt"))
+            env.assertTrue(os.path.exists(base + ".hgrm"))
+            if os.path.exists(base + ".hgrm"):
+                env.assertEqual(_hgrm_count(base + ".hgrm"), count)
