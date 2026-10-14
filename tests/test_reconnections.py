@@ -990,3 +990,91 @@ def test_cluster_shard_dial_failure_honors_max_reconnect_attempts(env):
     env.assertTrue(exhausted in stderr_content,
                    message="--max-reconnect-attempts was not enforced for the unreachable shard")
     env.assertNotEqual(proc.returncode, 0)
+
+
+def _run_with_mid_run_password_change(env, extra_args, test_time):
+    """Run with AUTH, then change the password and drop the connections, so
+    every reconnect gets -WRONGPASS. Return (rc, elapsed, stderr); rc is None
+    if memtier had to be killed."""
+    import subprocess
+
+    conn = env.getOSSMasterNodesConnectionList()[0]  # Callers skip cluster mode.
+    conn.execute_command("CONFIG", "SET", "requirepass", "pw-625")
+    benchmark_specs = {
+        "name": env.testName,
+        "args": ["--authenticate=pw-625", "--reconnect-on-error", "--rate-limiting=200", "--hide-histogram"]
+        + extra_args,
+    }
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=1, clients=2, requests=None, test_time=test_time)
+    add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+    test_dir = tempfile.mkdtemp()
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+
+    stderr_path = "{0}/mb.stderr".format(config.results_dir)
+    rc = None
+    started = time.monotonic()
+    try:
+        with open("{0}/mb.stdout".format(config.results_dir), "w") as stdout_f, open(stderr_path, "w") as stderr_f:
+            proc = subprocess.Popen(benchmark.args, stdout=stdout_f, stderr=stderr_f, cwd=config.results_dir)
+            try:
+                time.sleep(2)
+                conn.execute_command("CONFIG", "SET", "requirepass", "other-625")
+                # SKIPME defaults to yes, so this connection survives.
+                killed = conn.execute_command("CLIENT", "KILL", "TYPE", "normal")
+                env.assertGreaterEqual(killed, 2, message="the kill must reach both workload clients")
+                rc = proc.wait(timeout=test_time + 15)
+            except subprocess.TimeoutExpired:
+                pass
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait(timeout=10)
+    finally:
+        conn.execute_command("CONFIG", "SET", "requirepass", "")
+    elapsed = time.monotonic() - started
+    with open(stderr_path) as f:
+        stderr_content = f.read()
+    env.debugPrint("memtier exit code: {}, elapsed {:.1f}s".format(rc, elapsed), True)
+    env.debugPrint("STDERR:\n{}".format(stderr_content[-2000:]), True)
+    env.assertContains("authentication failed", stderr_content)
+    # The reconnects connect at TCP level but never complete setup.
+    env.assertFalse("Reconnection successful" in stderr_content,
+                    message="reconnects whose AUTH failed were reported as successful")
+    return rc, elapsed, stderr_content
+
+
+def test_auth_failure_on_reconnect_honors_max_reconnect_attempts(env):
+    """
+    An AUTH error on a reconnect (the password changed mid-run) must count as
+    a failed reconnect attempt. It used to leave the connection open with
+    setup unfinished: no request was sent again, so neither
+    --max-reconnect-attempts nor --test-time ended the run, and memtier hung
+    after logging "Reconnection successful" (#625).
+    """
+    env.skipOnCluster()
+    test_time = 30
+    rc, elapsed, stderr_content = _run_with_mid_run_password_change(
+        env, ["--max-reconnect-attempts=3"], test_time
+    )
+    env.assertIsNotNone(rc, message="memtier hung after AUTH failed on reconnect")
+    env.assertNotEqual(rc, 0, message="a run that cannot re-authenticate must fail")
+    env.assertTrue("Maximum reconnection attempts (3) exceeded" in stderr_content,
+                   message="--max-reconnect-attempts was not enforced for AUTH errors")
+    # 2 s before the kill, then 3 attempts at the default 1 s backoff.
+    env.assertLess(elapsed, test_time / 2, message="run took {:.1f}s".format(elapsed))
+
+
+def test_auth_failure_on_reconnect_honors_test_time(env):
+    """
+    With unlimited reconnect attempts, AUTH errors on every reconnect must not
+    keep the run going past --test-time (#625).
+    """
+    env.skipOnCluster()
+    test_time = 8
+    rc, elapsed, _ = _run_with_mid_run_password_change(env, [], test_time)
+    env.assertIsNotNone(rc, message="memtier hung after AUTH failed on reconnect")
+    env.assertNotEqual(rc, 0, message="a run that cannot re-authenticate must fail")
+    env.assertLess(elapsed, test_time + 5, message="run took {:.1f}s for --test-time={}".format(elapsed, test_time))
