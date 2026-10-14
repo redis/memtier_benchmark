@@ -790,7 +790,8 @@ void shard_connection::push_req(request *req)
     // request. This is the canonical "how many user-level requests did we
     // route here" tally used by the "Endpoints" array in mb.json.
     if (is_workload_request(req->m_type)) m_routed_ops++;
-    if (m_config->request_rate) {
+    // ASKING only prefixes a resend, which takes its own token.
+    if (m_config->request_rate && req->m_type != rt_asking) {
         // Handle race condition during reconnection - don't assert if interval is 0
         if (m_request_per_cur_interval > 0) {
             m_request_per_cur_interval--;
@@ -936,8 +937,8 @@ void shard_connection::replay_request(request *req)
     if (req->m_asking) {
         // ASKING applies to the next command only, so write it right before
         // the resent bytes. Its reply is consumed like other setup replies.
-        // The flag stays set: a resend after a reconnect needs ASKING again,
-        // and on a node that is not importing the slot it changes nothing.
+        // The flag stays set: a resend after a reconnect needs ASKING again.
+        // Routing the request by the slot map clears it.
         static const char ASKING_CMD[] = "*1\r\n$6\r\nASKING\r\n";
         evbuffer_add(out, ASKING_CMD, sizeof(ASKING_CMD) - 1);
         push_req(new request(rt_asking, 0, NULL, 0));

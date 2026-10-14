@@ -2774,6 +2774,8 @@ bool cluster_client::retry_after_redirect(unsigned int conn_id, request *req)
 {
     if (!m_config->retry_on_error) return false;
     if (!req || !req->m_serialized || req->m_serialized_len == 0) return false;
+    // Routed by the slot map now, not to the node an earlier -ASK named.
+    req->m_asking = false;
 
     unsigned int target = conn_id;
     if (req->m_key && req->m_key_len > 0) {
@@ -2846,8 +2848,9 @@ bool cluster_client::enqueue_redirect_retry(unsigned int target, request *req)
 // primary, so this retry goes to a primary whatever --read-preference says:
 // no replica serves the key, and the slot map would send it back to the
 // migrating node. A connection still being established (e.g. a TLS
-// handshake at startup) holds the retry until it is set up. Without a
-// connection to that node, fall back to routing by the slot map.
+// handshake at startup) or waiting on its reconnect timer holds the retry
+// until it is set up again, as in hand_off_replay_requests(). Without a
+// usable connection to that node, fall back to routing by the slot map.
 bool cluster_client::retry_after_ask(unsigned int conn_id, request *req, protocol_response *response)
 {
     const char *status = response->get_status();
@@ -2860,7 +2863,8 @@ bool cluster_client::retry_after_ask(unsigned int conn_id, request *req, protoco
         port++;
         for (unsigned int i = 0; i < m_connections.size(); i++) {
             shard_connection *sc = m_connections[i];
-            if (sc->get_role() == role_primary && sc->get_connection_state() != conn_disconnected &&
+            if (sc->get_role() == role_primary &&
+                (sc->get_connection_state() != conn_disconnected || sc->is_reconnect_pending()) &&
                 strncmp(sc->get_address(), addr, addr_len) == 0 && sc->get_address()[addr_len] == '\0' &&
                 strcmp(sc->get_port(), port) == 0) {
                 target = i;
@@ -2919,6 +2923,7 @@ void cluster_client::hand_off_replay_requests(unsigned int conn_id)
             delete req;
             continue;
         }
+        req->m_asking = false;
         m_connections[target]->adopt_replay_request(req);
     }
     // Dropped requests are never processed; uncount them as
