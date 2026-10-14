@@ -568,8 +568,12 @@ void shard_connection::disconnect()
     // --requests runs once the connection comes back. Requests held for retry
     // are not counted as processed until their final outcome, so every
     // workload request dropped here is uncounted the same way.
+    //
+    // --transaction requests are dropped too: the server discards the MULTI
+    // with the socket, so replaying the rest of a block would run its
+    // commands outside any transaction and its EXEC would fail.
     unsigned long long dropped = 0;
-    if (m_config->retry_on_error && m_replay_queue != NULL) {
+    if (m_config->retry_on_error && m_replay_queue != NULL && !m_config->transaction) {
         while (m_pending_resp) {
             request *req = pop_req();
             // Only setup commands have no serialized capture (we never attempt
@@ -611,7 +615,15 @@ void shard_connection::disconnect()
     } else {
         while (m_pending_resp) {
             request *req = pop_req();
-            if (is_workload_request(req->m_type)) dropped++;
+            if (is_workload_request(req->m_type)) {
+                dropped++;
+                if (m_config->retry_on_error && m_config->transaction) {
+                    struct timeval now;
+                    gettimeofday(&now, NULL);
+                    global_failed_keys_logger().log_failure(now, "REPLAY", req->m_key, req->m_key_len,
+                                                            "transaction-not-replayed", req->m_retries);
+                }
+            }
             delete req;
         }
     }
@@ -787,7 +799,8 @@ void shard_connection::push_req(request *req)
 
 void shard_connection::capture_serialized_bytes(size_t before_pos, request *req)
 {
-    if (!m_config->retry_on_error || !m_bev || !req) return;
+    // --transaction requests are never resent (see enqueue_retry), so skip the copy.
+    if (!m_config->retry_on_error || m_config->transaction || !m_bev || !req) return;
 
     struct evbuffer *out = bufferevent_get_output(m_bev);
     size_t after_pos = evbuffer_get_length(out);
@@ -861,7 +874,10 @@ bool shard_connection::retry_queue_full() const
 
 bool shard_connection::enqueue_retry(request *req)
 {
-    if (!m_config->retry_on_error || !m_retry_queue) return false;
+    // --transaction requests are never retried: a command resent on its own
+    // lands outside its MULTI block or in a later one, and an EXEC resent
+    // after its MULTI is gone fails with "EXEC without MULTI" forever.
+    if (!m_config->retry_on_error || m_config->transaction || !m_retry_queue) return false;
     if (!req || !req->m_serialized || req->m_serialized_len == 0) return false;
 
     // Honor max_retries (always counts; MOVED/ASK count too).

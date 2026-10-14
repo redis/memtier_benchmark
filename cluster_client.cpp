@@ -2846,7 +2846,8 @@ void cluster_client::hand_off_replay_requests(unsigned int conn_id)
         if (m_config->transaction) {
             // As for MOVED/ASK under --transaction: resending part of a
             // MULTI/EXEC block on another connection would split it, or land
-            // it inside a block that connection has open.
+            // it inside a block that connection has open. disconnect() no
+            // longer queues --transaction requests (#611), so this is a guard.
             drop_reason = "transaction-not-replayed";
         } else {
             // Writes need the primary, and it serves reads too.

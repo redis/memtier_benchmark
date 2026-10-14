@@ -8,6 +8,7 @@ Run subset:
 import csv
 import json
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -494,3 +495,110 @@ def test_dropped_replays_do_not_stall_client(env):
     env.assertFalse("stopped before reaching their stop condition" in stderr_content,
                     message="client stopped sending after a reconnect")
     env.assertEqual(rc, 0, message="memtier exited {} after connection kills".format(rc))
+
+
+
+def _run_transaction_with_kills(env, extra_args, requests=None, test_time=None, kill_interval=0.5, pipeline=1):
+    """Run a MULTI/SET/EXEC --transaction rotation while every primary's
+    clients are killed every kill_interval seconds.
+
+    Returns (rc, stderr, connections killed, server -ERR replies, failed-keys rows).
+    """
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--pipeline={}".format(pipeline),
+            "--transaction",
+            "--command=MULTI",
+            "--command=SET __key__ __data__",
+            "--command=EXEC",
+            "--reconnect-on-error",
+            "--hide-histogram",
+        ]
+        + list(extra_args),
+    }
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=2, clients=4, requests=requests, test_time=test_time)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+    test_dir = tempfile.mkdtemp()
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+    failed_keys = os.path.join(config.results_dir, "failed_keys.csv")
+    benchmark_specs["args"].append("--failed-keys-file={}".format(failed_keys))
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    conns = env.getOSSMasterNodesConnectionList()
+    for conn in conns:
+        conn.execute_command("CONFIG", "RESETSTAT")
+
+    kills = []
+
+    def kill_loop(proc):
+        end = time.time() + (test_time - 1 if test_time else 60)
+        while time.time() < end and proc.poll() is None:
+            time.sleep(kill_interval)
+            for conn in conns:
+                try:
+                    kills.append(conn.execute_command("CLIENT", "KILL", "TYPE", "normal"))
+                except Exception as e:
+                    env.debugPrint("CLIENT KILL failed: {}".format(e), True)
+
+    rc, stderr_content = _run_with_background(env, benchmark, config, kill_loop, timeout=(test_time or 60) + 30)
+
+    killed = sum(kills)
+    errors = sum(conn.execute_command("INFO", "errorstats").get("errorstat_ERR", {}).get("count", 0)
+                 for conn in conns)
+    rows = []
+    if os.path.exists(failed_keys):
+        with open(failed_keys) as f:
+            rows = f.read().splitlines()[1:]
+    env.debugPrint("killed {} connections, {} -ERR replies, {} failed-keys rows".format(killed, errors, len(rows)),
+                   True)
+    env.assertGreaterEqual(killed, 1, message="no CLIENT KILL found a memtier connection")
+    return rc, stderr_content, killed, errors, rows
+
+
+def test_transaction_requests_are_not_retried(env):
+    """
+    --transaction requests are not retried or replayed after a reconnect.
+
+    A killed connection's in-flight requests were replayed after the
+    reconnect, without their MULTI. The replayed EXEC failed with "EXEC
+    without MULTI", which was retried, failed again, and so on until the end
+    of the run: millions of errors, and in cluster mode the run never ended.
+    """
+    rc, stderr_content, killed, errors, rows = _run_transaction_with_kills(env, ["--retry-on-error"], test_time=6)
+    retries = re.findall(r"retries (\d+)", stderr_content)
+    env.assertEqual(rc, 0, message="memtier exited {} after connection kills".format(rc))
+    env.assertTrue(retries and retries[-1] == "0", message="transaction requests were retried")
+    # A killed connection may still send the rest of its current block, whose
+    # EXEC fails once; nothing is resent after that.
+    env.assertLessEqual(errors, killed, message="{} -ERR replies for {} killed connections".format(errors, killed))
+    # The requests in flight on a killed connection are dropped, not replayed.
+    dropped = [r for r in rows if r.split(",")[1] == "REPLAY"]
+    env.assertGreaterEqual(len(dropped), 1, message="no in-flight request was dropped on a kill")
+    env.assertTrue(all(r.endswith(',"transaction-not-replayed",0') for r in dropped),
+                   message="unexpected REPLAY rows: {}".format(dropped[:5]))
+
+
+def test_dropped_transaction_requests_do_not_stall_requests_run(env):
+    """
+    Transaction requests dropped on a kill are uncounted, so a --requests run
+    still sends every request and ends.
+    """
+    rc, stderr_content, _, _, _ = _run_transaction_with_kills(env, ["--retry-on-error"], requests=30000,
+                                                              kill_interval=0.3, pipeline=4)
+    env.assertFalse("stopped before reaching" in stderr_content,
+                    message="client stopped sending after dropping transaction requests")
+    env.assertEqual(rc, 0, message="memtier exited {} after connection kills".format(rc))
+
+
+def test_transaction_drops_not_logged_without_retry(env):
+    """
+    Without --retry-on-error, requests dropped on a kill were never going to
+    be resent: they are not logged as transaction-not-replayed.
+    """
+    rc, _, _, _, rows = _run_transaction_with_kills(env, [], test_time=4)
+    env.assertEqual(rc, 0, message="memtier exited {} after connection kills".format(rc))
+    replay = [r for r in rows if r.split(",")[1] == "REPLAY"]
+    env.assertEqual(replay, [], message="REPLAY rows without --retry-on-error: {}".format(replay[:5]))
