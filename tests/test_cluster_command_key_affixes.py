@@ -51,7 +51,7 @@ def _moved_errors(conn):
     return int(entry.get("count", 0)) if isinstance(entry, dict) else 0
 
 
-def _check(env, command, row, seed=None, owner=None):
+def _check(env, command, row, owner=None):
     """Run --command and assert no server replied -MOVED. With owner set,
     also assert every key landed on that shard."""
     for conn in env.getOSSMasterNodesConnectionList():
@@ -64,17 +64,11 @@ def _check(env, command, row, seed=None, owner=None):
     addTLSArgs(benchmark_specs, env)
     config = get_default_memtier_config(threads=1, clients=2, requests=200)
     add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
-    if seed is not None:
-        # Seed on the slot owner. With another seed, the seed connection has
-        # no keys of its own to send, and reads for a peer that is still
-        # connecting spin without returning to the event loop (a separate
-        # problem).
-        config['redis_process_port'] = seed
     run_config = RunConfig(tempfile.mkdtemp(), env.testName, config, {})
     ensure_clean_benchmark_folder(run_config.results_dir)
     ok = Benchmark.from_json(run_config, benchmark_specs).run()
 
-    label = "{!r} seed {}".format(command, seed)
+    label = repr(command)
     failed = env.getNumberOfFailedAssertion()
     try:
         env.assertTrue(ok, message=label)
@@ -97,9 +91,9 @@ def test_cluster_command_key_hash_tag_no_moved(env):
         env.skip()
         return
     for owner, tag in _tags_one_per_shard(env):
-        _check(env, "SET {" + tag + "}-__key__ __data__", "Sets", seed=owner, owner=owner)
-        _check(env, "SET __key__:{" + tag + "} __data__", "Sets", seed=owner, owner=owner)
-        _check(env, "GET {" + tag + "}-__key__", "Gets", seed=owner)
+        _check(env, "SET {" + tag + "}-__key__ __data__", "Sets", owner=owner)
+        _check(env, "SET __key__:{" + tag + "} __data__", "Sets", owner=owner)
+        _check(env, "GET {" + tag + "}-__key__", "Gets")
 
 
 def test_cluster_command_key_prefix_no_moved(env):
