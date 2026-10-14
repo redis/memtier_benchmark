@@ -1452,7 +1452,12 @@ void shard_connection::process_response(void)
 
     fill_pipeline();
 
-    if (m_conns_manager->finished()) {
+    // End the run's stats only once no reply is pending: run_stats files
+    // replies that come after set_end_time() in a bucket that is never
+    // reported, and reports the end bucket again if they start a new second.
+    // This happens when the deadline passes during a reconnect: the requests
+    // resent after the setup ladder are answered after its replies.
+    if (m_conns_manager->finished() && m_conns_manager->all_connections_idle()) {
         m_conns_manager->set_end_time();
     }
 }

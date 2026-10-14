@@ -25,8 +25,9 @@ send a SHUTDOWN NOSAVE, then waits briefly.  The re-run assertion is the
 authoritative check.
 """
 
-import time
+import subprocess
 import tempfile
+import time
 
 from include import (
     add_required_env_arguments,
@@ -361,3 +362,79 @@ def test_readonly_retry_resp2_resp3(env):
     """
     env.skip()
     return
+
+
+def _moved_errors(conns):
+    total = 0
+    for conn in conns:
+        stats = conn.execute_command("INFO", "ERRORSTATS")
+        if isinstance(stats, bytes):
+            stats = stats.decode()
+        if isinstance(stats, dict):
+            total += int(stats.get("errorstat_MOVED", {}).get("count", 0))
+        else:
+            for line in stats.split("\n"):
+                if line.startswith("errorstat_MOVED:count="):
+                    total += int(line.strip().split("=", 1)[1])
+    return total
+
+
+def test_replica_replays_wait_for_readonly(env):
+    """Reads resent after a replica connection reconnects must follow
+    READONLY on the new connection. They used to be sent ahead of it, so the
+    replica answered each one -MOVED to its primary (#527)."""
+    replica_conns = get_cluster_replica_connections(env)
+    if not replica_conns:
+        env.skip()
+        return
+    for conn in replica_conns:
+        conn.execute_command("CONFIG", "RESETSTAT")
+
+    test_time = 6
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--ratio=0:1",
+            "--pipeline=32",
+            "--read-preference=secondary",
+            "--retry-on-error",
+            "--reconnect-on-error",
+            "--max-reconnect-attempts=100",
+            "--hide-histogram",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=1, clients=2, requests=None, test_time=test_time)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+    test_dir = tempfile.mkdtemp()
+    run_config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(run_config.results_dir)
+    benchmark = Benchmark.from_json(run_config, benchmark_specs)
+
+    kills = 0
+    with open("{0}/mb.stdout".format(run_config.results_dir), "w") as stdout_f, \
+            open("{0}/mb.stderr".format(run_config.results_dir), "w") as stderr_f:
+        proc = subprocess.Popen(benchmark.args, stdout=stdout_f, stderr=stderr_f, cwd=run_config.results_dir)
+        try:
+            # Waves spaced beyond the default 1s reconnect delay. TYPE normal
+            # leaves the replication links alone.
+            for _wave in range(4):
+                time.sleep(1.2)
+                for conn in replica_conns:
+                    kills += conn.execute_command("CLIENT", "KILL", "TYPE", "normal")
+            rc = proc.wait(timeout=test_time + 30)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertGreaterEqual(kills, 1, message="no CLIENT KILL wave found a memtier replica connection")
+        env.assertEqual(rc, 0, message="memtier exited {} after replica connection kills".format(rc))
+        env.assertEqual(_moved_errors(replica_conns), 0,
+                        message="a read was resent to a replica before READONLY after a reconnect")
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)

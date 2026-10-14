@@ -9,8 +9,11 @@ import csv
 import json
 import os
 import re
+import select
+import socket
 import subprocess
 import tempfile
+import threading
 import time
 from include import *
 from mb import Benchmark, RunConfig
@@ -699,3 +702,100 @@ def test_replays_wait_for_select_after_reconnect(env):
                       message="no key was written to the selected database")
     env.assertEqual(_db_conn(env, 0).execute_command("DBSIZE"), 0,
                     message="a request was resent before SELECT after a reconnect and wrote to database 0")
+
+
+class _StallingProxy(threading.Thread):
+    """TCP proxy to the server. Connections opened in the first `stall`
+    seconds stop getting replies at `stall` and are closed at `close`;
+    later connections are proxied as is."""
+
+    def __init__(self, port, stall, close):
+        super().__init__(daemon=True)
+        self.target = port
+        self.stall = stall
+        self.close = close
+        self.listener = socket.socket()
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(16)
+        self.port = self.listener.getsockname()[1]
+        self.t0 = None
+        self.done = False
+
+    def run(self):
+        while not self.done:
+            try:
+                client, _ = self.listener.accept()
+            except OSError:
+                return
+            if self.t0 is None:
+                self.t0 = time.monotonic()
+            early = time.monotonic() - self.t0 < self.stall
+            server = socket.create_connection(("127.0.0.1", self.target))
+            threading.Thread(target=self._pump, args=(client, server, early), daemon=True).start()
+
+    def _pump(self, client, server, early):
+        try:
+            while not self.done:
+                elapsed = time.monotonic() - self.t0
+                if early and elapsed >= self.close:
+                    return
+                for sock in select.select([client, server], [], [], 0.01)[0]:
+                    data = sock.recv(65536)
+                    if not data:
+                        return
+                    if sock is client:
+                        server.sendall(data)
+                    elif not (early and elapsed >= self.stall):
+                        client.sendall(data)
+        except OSError:
+            pass
+        finally:
+            client.close()
+            server.close()
+
+    def stop(self):
+        self.done = True
+        self.listener.close()
+
+
+def test_replays_after_deadline_are_counted(env):
+    """
+    Requests resent after a reconnect that lands past the --test-time deadline
+    are counted once, and the reconnect's connection errors too.
+
+    The run's stats used to end at the first reply read once the run was
+    finished: here the SELECT reply, before the resent requests were even
+    sent. Their replies then went into a bucket that was never reported, and
+    the bucket ending the run was reported twice: Count fell short of the
+    last progress line and Connection Errors doubled.
+    """
+    # A plain TCP proxy in front of a single server.
+    env.skipOnCluster()
+    if env.isUnixSocket() or env.useTLS:
+        env.skip()
+        return
+    clients = 2
+    pipeline = 32
+    port = env.getMasterNodesList()[0]["port"]
+    proxy = _StallingProxy(port, stall=1.8, close=2.1)
+    proxy.start()
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            stats = os.path.join(directory, "stats.json")
+            args = [MEMTIER_BINARY, "--server=127.0.0.1", "--port={}".format(proxy.port), "--threads=1",
+                    "--clients={}".format(clients), "--pipeline={}".format(pipeline), "--test-time=2",
+                    "--ratio=1:0", "--select-db=3", "--retry-on-error", "--reconnect-on-error",
+                    "--hide-histogram", "--json-out-file=" + stats]
+            result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, text=True)
+            with open(stats) as f:
+                totals = json.load(f)["ALL STATS"]["Totals"]
+    finally:
+        proxy.stop()
+
+    env.assertEqual(result.returncode, 0, message=result.stderr[-2000:])
+    env.assertEqual(result.stderr.count("Reconnection successful"), clients, message=result.stderr[-2000:])
+    progress = [int(n) for n in re.findall(r"(\d+) ops,", result.stderr)]
+    env.assertTrue(progress, message="no progress line")
+    env.assertEqual(totals["Count"], progress[-1] if progress else None,
+                    message="Count differs from the last progress line")
+    env.assertEqual(totals["Connection Errors"], clients)
