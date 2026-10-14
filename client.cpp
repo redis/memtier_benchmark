@@ -269,11 +269,37 @@ void client::disconnect(void)
 
 void client::disconnect_all(void)
 {
+    // This ends the run, once it is finished and no replies are pending. A
+    // request still held for resend (waiting in a retry queue for its
+    // backoff, or in a replay queue for a reconnect) is not pending, so it
+    // is never resent: e.g. a --test-time run whose last replies all
+    // arrive, after the deadline, as retryable errors. disconnect() moves
+    // the retry queue into the replay queue; account every request left
+    // there instead of dropping it silently with the connection. It counts
+    // as an error but, unlike a refused retry, not as an op: it never got a
+    // final reply.
+    unsigned long long abandoned = 0;
     for (unsigned int i = 0; i < m_connections.size(); i++) {
         shard_connection *sc = m_connections[i];
         if (sc != NULL) {
             sc->disconnect();
+            request *req;
+            while ((req = sc->pop_replay_request()) != NULL) {
+                struct timeval now;
+                gettimeofday(&now, NULL);
+                global_failed_keys_logger().log_failure(now, "REPLAY", req->m_key, req->m_key_len,
+                                                        "run-ended-before-resend", req->m_retries);
+                m_stats.inc_error();
+                abandoned++;
+                delete req;
+            }
         }
+    }
+    if (abandoned) {
+        benchmark_error_log("warning: %llu request(s) held for retry when the run ended were not resent; "
+                            "counted as errors.\n",
+                            abandoned);
+        dec_reqs_generated(abandoned);
     }
 }
 

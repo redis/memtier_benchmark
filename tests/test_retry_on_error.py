@@ -11,6 +11,7 @@ import os
 import re
 import select
 import socket
+import socketserver
 import subprocess
 import tempfile
 import threading
@@ -807,3 +808,124 @@ def test_replays_after_deadline_are_counted(env):
     env.assertEqual(totals["Connection Errors"], clients)
     # Every request in flight at the stall is resent, after the deadline.
     env.assertEqual(proxy.late_sets, clients * pipeline, message="requests in flight were not resent")
+
+
+class _LateErrorPeer(socketserver.ThreadingTCPServer):
+    """A standalone peer that answers +OK, then holds every reply until after
+    the --test-time deadline and answers the held requests with one write:
+    +OK, then retryable errors. Requests that arrive after that are retries.
+    """
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, hold, release):
+        super().__init__(("127.0.0.1", 0), _LateErrorHandler)
+        self.hold = hold
+        self.release = release
+        self.t0 = None
+        self.failed = 0
+        self.retried = 0
+        self.errors = []
+
+
+class _LateErrorHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        peer = self.server
+        buf = b""
+        held = 0
+        try:
+            while True:
+                if select.select([self.request], [], [], 0.005)[0]:
+                    data = self.request.recv(65536)
+                    if not data:
+                        return
+                    buf += data
+                out = []
+                while buf.startswith(b"*"):
+                    end = buf.find(b"\r\n")
+                    if end < 0:
+                        break
+                    pos, args = end + 2, []
+                    for _ in range(int(buf[1:end])):
+                        end = buf.find(b"\r\n", pos)
+                        if end < 0:
+                            break
+                        size = int(buf[pos + 1:end])
+                        if len(buf) < end + 4 + size:
+                            end = -1
+                            break
+                        args.append(buf[end + 2:end + 2 + size])
+                        pos = end + 4 + size
+                    if end < 0:
+                        break
+                    buf = buf[pos:]
+                    verb = args[0].upper()
+                    if verb not in (b"SET", b"GET"):
+                        out.append(b"*0\r\n" if verb == b"COMMAND" else b"+OK\r\n")
+                        continue
+                    if peer.t0 is None:
+                        peer.t0 = time.monotonic()
+                    elapsed = time.monotonic() - peer.t0
+                    if elapsed < peer.hold:
+                        out.append(b"+OK\r\n")
+                    elif held >= 0 and elapsed < peer.release:
+                        held += 1
+                    else:
+                        peer.retried += 1
+                        out.append(b"+OK\r\n")
+                if held > 0 and time.monotonic() - peer.t0 >= peer.release:
+                    # All the held replies in one write, so memtier reads
+                    # them together and has nothing pending afterwards. The
+                    # first succeeds: a completed request is what moves
+                    # memtier's run clock past --test-time.
+                    out.insert(0, b"+OK\r\n" + b"-BUSY held past the deadline\r\n" * (held - 1))
+                    peer.failed += held - 1
+                    held = -1
+                if out:
+                    self.request.sendall(b"".join(out))
+        except (ConnectionResetError, BrokenPipeError):
+            pass
+        except Exception as error:
+            peer.errors.append(repr(error))
+
+
+def test_retries_left_at_end_of_test_time_are_counted(env):
+    """
+    Retries still waiting for their backoff when a --test-time run ends are
+    accounted as errors and in --failed-keys-file.
+
+    After the deadline, the last replies on a connection can all arrive as
+    retryable errors in one read. Nothing is pending then, so the run ended
+    and the connection dropped its retry queue: the requests vanished, with
+    "errors 0" and nothing logged.
+    """
+    pipeline = 8
+    with _LateErrorPeer(hold=0.3, release=1.5) as peer, tempfile.TemporaryDirectory() as directory:
+        thread = threading.Thread(target=peer.serve_forever, daemon=True)
+        thread.start()
+        failed_keys = os.path.join(directory, "failed.csv")
+        args = [MEMTIER_BINARY, "--server=127.0.0.1", "--port={}".format(peer.server_address[1]),
+                "--threads=1", "--clients=1", "--pipeline={}".format(pipeline), "--test-time=1",
+                "--ratio=1:1", "--key-minimum=1", "--key-maximum=1000", "--hide-histogram",
+                "--retry-on-error", "--retry-backoff-ms=200", "--failed-keys-file=" + failed_keys]
+        try:
+            result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    timeout=30, text=True)
+        finally:
+            peer.shutdown()
+            thread.join(timeout=5)
+        with open(failed_keys) as source:
+            logged = sum(1 for line in source if "run-ended-before-resend" in line)
+
+    env.assertEqual(result.returncode, 0, message=result.stderr)
+    env.assertEqual(peer.errors, [])
+    # Premise: the whole pipeline was held past the deadline, and all but
+    # the first request failed.
+    env.assertEqual(peer.failed, pipeline - 1, message=result.stderr)
+    abandoned = peer.failed - peer.retried
+    env.assertGreater(abandoned, 0, message="every retry was resent; the scenario was not hit")
+    env.assertEqual(logged, abandoned, message=result.stderr)
+    totals = re.findall(r"errors (\d+) \(", result.stderr)
+    env.assertTrue(totals, message=result.stderr)
+    if totals:
+        env.assertEqual(int(totals[-1]), abandoned, message=result.stderr)
