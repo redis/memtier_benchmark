@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <string>
 
 // Built-in permanent-error prefixes. Matched after stripping a leading '-'.
 // Anything not in this list is considered retryable by default.
@@ -159,49 +160,34 @@ void failed_keys_logger::close()
     pthread_mutex_unlock(&m_mtx);
 }
 
-// Escape `in` for CSV: wrap in quotes, double inner quotes, hex-escape any
-// non-printable byte. Writes into `out` (size out_sz) and returns the number
-// of bytes written (excluding trailing NUL). Always NUL-terminates if out_sz > 0.
+// Escape `in` for CSV: wrap in quotes, double inner quotes, write a
+// backslash as \\ and any non-printable byte as \xHH, so the escape is
+// reversible ("\x01" text and a 0x01 byte log differently). The result is
+// sized from the input, so a field is never truncated.
 //
 // Plain control-flow only (no C++11 lambdas) so older macOS Apple Clang
 // images on CI compile cleanly.
-static size_t csv_escape(const char *in, unsigned int in_len, char *out, size_t out_sz)
+static std::string csv_escape(const char *in, unsigned int in_len)
 {
-    if (out_sz == 0) return 0;
-    if (out_sz < 3) {
-        // Not enough room even for an empty quoted string: write what we can
-        // and bail. out[0] = '\0' guarantees a valid C string.
-        out[0] = '\0';
-        return 0;
-    }
-    size_t o = 0;
-    out[o++] = '"';
+    std::string out;
+    out.reserve(in_len + 2);
+    out.push_back('"');
     for (unsigned int i = 0; i < in_len; i++) {
         unsigned char c = (unsigned char) in[i];
         if (c == '"') {
-            // Need 2 bytes for "" + 1 for trailing quote + 1 for NUL.
-            if (o + 3 >= out_sz) break;
-            out[o++] = '"';
-            out[o++] = '"';
+            out.append("\"\"");
+        } else if (c == '\\') {
+            out.append("\\\\");
         } else if (c >= 0x20 && c <= 0x7e) {
-            if (o + 2 >= out_sz) break;
-            out[o++] = (char) c;
+            out.push_back((char) c);
         } else {
-            // hex-escape: \xHH (4 bytes) + 1 trailing quote + 1 NUL = need 6 free.
-            if (o + 5 >= out_sz) break;
-            int n = snprintf(out + o, out_sz - o, "\\x%02x", c);
-            if (n < 0 || (size_t) n >= out_sz - o) break;
-            o += (size_t) n;
+            char hex[5];
+            snprintf(hex, sizeof(hex), "\\x%02x", c);
+            out.append(hex);
         }
     }
-    if (o + 1 >= out_sz) {
-        // Should not happen given the per-iteration checks, but defensively
-        // bail to keep room for the trailing quote and NUL.
-        o = out_sz - 2;
-    }
-    out[o++] = '"';
-    out[o] = '\0';
-    return o;
+    out.push_back('"');
+    return out;
 }
 
 void failed_keys_logger::log_failure(const struct timeval &ts, const char *command, const char *key,
@@ -225,13 +211,11 @@ void failed_keys_logger::log_failure(const struct timeval &ts, const char *comma
     snprintf(tsbuf, sizeof(tsbuf), "%04d-%02d-%02dT%02d:%02d:%02d.%06luZ", tmbuf.tm_year + 1900, tmbuf.tm_mon + 1,
              tmbuf.tm_mday, tmbuf.tm_hour, tmbuf.tm_min, tmbuf.tm_sec, usec);
 
-    char keybuf[1024];
-    csv_escape(key ? key : "", key_len, keybuf, sizeof(keybuf));
+    const std::string keyfield = csv_escape(key ? key : "", key ? key_len : 0);
+    const std::string statusfield = csv_escape(status ? status : "", status ? (unsigned int) strlen(status) : 0);
 
-    char statusbuf[512];
-    csv_escape(status ? status : "", status ? (unsigned int) strlen(status) : 0, statusbuf, sizeof(statusbuf));
-
-    int rc = fprintf(m_fp, "%s,%s,%s,%s,%u\n", tsbuf, command ? command : "UNKNOWN", keybuf, statusbuf, retries);
+    int rc = fprintf(m_fp, "%s,%s,%s,%s,%u\n", tsbuf, command ? command : "UNKNOWN", keyfield.c_str(),
+                     statusfield.c_str(), retries);
     if (rc < 0) {
         fprintf(stderr, "warning: failed-keys-file '%s' write failed (%s); logging disabled.\n", m_path ? m_path : "?",
                 strerror(errno));

@@ -272,6 +272,48 @@ def test_failed_keys_file_records_key(env):
             master_connection.execute_command("ACL", "DELUSER", "fk-no-mget")
 
 
+def test_failed_keys_file_escapes_backslash_and_long_keys(env):
+    """The key field escape is reversible and never truncated.
+
+    A backslash used to be written as is, so the 6-byte key p\\x011 (literal
+    backslash) and the 3-byte key p<0x01>1 both logged as "p\\x011". The
+    escaped key also went through a 1024-byte buffer, so longer keys were
+    cut off without any marker.
+    """
+    if env.isCluster():
+        env.skip()
+        return
+
+    backslash_prefix = "bs\\x0"  # literal backslash, not an escape
+    control_prefix = "bs\x01"
+    long_prefix = "L" * 1100
+    for master_connection in env.getOSSMasterNodesConnectionList():
+        master_connection.execute_command("FLUSHALL")
+        # Lists, so GET fails with WRONGTYPE.
+        master_connection.execute_command("RPUSH", backslash_prefix + "11", "a")
+        master_connection.execute_command("RPUSH", control_prefix + "1", "a")
+        master_connection.execute_command("RPUSH", long_prefix + "1", "a")
+
+    cases = [
+        (backslash_prefix, "11", "bs\\\\x011"),
+        (control_prefix, "1", "bs\\x011"),
+        (long_prefix, "1", long_prefix + "1"),
+    ]
+    for prefix, index, expected in cases:
+        args = [
+            "--command=GET __key__",
+            "--command-key-pattern=S",
+            "--key-prefix=" + prefix,
+            "--key-minimum=" + index,
+            "--key-maximum=" + index,
+        ]
+        rows = _failed_keys_rows(env, args, requests=1)
+        env.assertEqual(len(rows), 1, message=repr(prefix[:16]))
+        if rows:
+            env.assertContains("WRONGTYPE", rows[0][3])
+            env.assertEqual(rows[0][2], expected, message=repr(prefix[:16]))
+
+
 def test_invalid_max_retries_rejected(env):
     """--max-retries below -1 must be rejected by getopt parsing."""
     test_dir = tempfile.mkdtemp()
