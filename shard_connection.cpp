@@ -1239,8 +1239,10 @@ void shard_connection::process_response(void)
                 // enter steady-state routing with an empty topology
                 // (m_shard_groups empty on bootstrap), and every slot lookup
                 // would return UINT_MAX. Leave m_cluster_slots at its prior
-                // value (setup_sent during the bootstrap ladder) so subsequent
-                // protocol-error / reconnect / retry paths can re-arm. The
+                // value (setup_sent during the bootstrap ladder). While it is
+                // setup_sent, set_cluster_slots() does not request another
+                // refresh, so only disconnect() re-arms it (a reconnect, or
+                // the peer closing the socket after the bad reply). The
                 // write-side hold_pipeline spin guard added in the previous
                 // commit still prevents fill_pipeline from busy-spinning if
                 // the worker somehow reaches steady-state with an empty
