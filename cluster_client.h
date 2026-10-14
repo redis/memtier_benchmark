@@ -220,9 +220,15 @@ protected:
     // routing info isn't available yet). Returns true if ownership of `req`
     // transferred to a retry queue.
     bool retry_after_redirect(unsigned int conn_id, request *req);
+    // Resend the request to the primary named by the -MOVED reply, falling
+    // back to retry_after_redirect if there is no usable connection to it.
+    bool retry_after_moved(unsigned int conn_id, request *req, protocol_response *response);
     // Resend the request after ASKING on the connection named by the -ASK
     // reply, falling back to retry_after_redirect if there is none.
     bool retry_after_ask(unsigned int conn_id, request *req, protocol_response *response);
+    // The primary connection to the node a -MOVED/-ASK reply names, or
+    // UINT_MAX if there is none.
+    unsigned int redirect_target_conn(protocol_response *response);
     // Queue the resend on connection `target` and count the retry.
     bool enqueue_redirect_retry(unsigned int target, request *req);
     // Terminal accounting for a MOVED/ASK request whose retry was refused

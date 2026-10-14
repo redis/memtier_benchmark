@@ -11,6 +11,13 @@ are exact. Modes:
   for the first key's slot, B accepts them. A stays in the map, so a retry
   that is not routed by the request's key goes back to A and is redirected
   again.
+- "moved-slow": A owns 0-8191 and B owns 8192-16383. A answers every write
+  with -MOVED to B for the first key's slot, B accepts them. After A's first
+  -MOVED every map says B owns 0-8191 and A owns 8192-16383, but A takes
+  0.3 s to send it, so a retry routed by the slot map goes back to A.
+- "ask-moved": the same stable split. A answers the first write with -ASK
+  to B, and B answers it (sent after ASKING) with -MOVED back to A, which
+  accepts every later write. A counts writes sent right after ASKING.
 - "replica": a stable topology, A primary and B its replica. B answers writes
   with -READONLY (a write sent to a replica), A accepts them.
 - "txn": A and B first split the slots. B's first SET answers -MOVED, which
@@ -61,11 +68,12 @@ class _Peer(socketserver.ThreadingTCPServer):
 
 class _Cluster(object):
     def __init__(self, mode):
-        self.mode = mode  # "readonly", "moved", "replica" or "txn"
+        self.mode = mode  # "readonly", "moved", "moved-slow", "ask-moved", "replica" or "txn"
         self.lock = threading.Lock()
         self.slots_calls = 0
         self.slots_by = {"A": 0, "B": 0}
         self.writes = {"A": 0, "B": 0}
+        self.asking_on_a = 0  # "ask-moved": writes A got right after ASKING
         self.naked_b_writes = 0  # "txn": SETs that reached B outside MULTI
         self.late_readonly = 0  # "txn": -READONLY A sent after serving the new map
         self.moved_sent = False
@@ -83,6 +91,14 @@ class _Cluster(object):
         a_port, b_port = self.a.server_address[1], self.b.server_address[1]
         if self.mode == "replica":
             return b"*1\r\n*4\r\n:0\r\n:16383\r\n" + _node(a_port, b"a") + _node(b_port, b"b")
+        if self.mode == "ask-moved":
+            return (b"*2\r\n*3\r\n:0\r\n:8191\r\n" + _node(a_port, b"a") +
+                    b"*3\r\n:8192\r\n:16383\r\n" + _node(b_port, b"b"))
+        if self.mode == "moved-slow":
+            low, high = _node(a_port, b"a"), _node(b_port, b"b")
+            if moved:
+                low, high = high, low
+            return b"*2\r\n*3\r\n:0\r\n:8191\r\n" + low + b"*3\r\n:8192\r\n:16383\r\n" + high
         if self.mode == "txn":
             if not moved:
                 return (b"*2\r\n*3\r\n:0\r\n:8191\r\n" + _node(a_port, b"a") +
@@ -95,15 +111,24 @@ class _Cluster(object):
         return (b"*2\r\n*3\r\n:0\r\n:8191\r\n" + _node(b_port, b"b") +
                 b"*3\r\n:8192\r\n:16383\r\n" + _node(a_port, b"a"))
 
-    def write_reply(self, name, in_multi, key):
+    def write_reply(self, name, in_multi, key, asking=False):
         readonly = b"-READONLY You can't write against a read only replica.\r\n"
         with self.lock:
             self.writes[name] += 1
+            first_a = name == "A" and self.writes["A"] == 1
+            if self.mode == "ask-moved" and name == "A" and asking:
+                self.asking_on_a += 1
             if self.mode == "txn" and name == "B":
                 first = not self.moved_sent
                 self.moved_sent = True
                 if not first and not in_multi:
                     self.naked_b_writes += 1
+        if self.mode == "ask-moved":
+            if name == "B":
+                return b"-MOVED %d 127.0.0.1:%d\r\n" % (_slot(key), self.a.server_address[1])
+            if first_a:
+                return b"-ASK %d 127.0.0.1:%d\r\n" % (_slot(key), self.b.server_address[1])
+            return b"+OK\r\n"
         if self.mode == "replica":
             return readonly if name == "B" else b"+OK\r\n"
         if self.mode == "txn":
@@ -117,6 +142,9 @@ class _Cluster(object):
             return b"+QUEUED\r\n" if in_multi else b"+OK\r\n"
         if name == "B":
             return b"+OK\r\n"
+        if self.mode == "moved-slow":
+            with self.lock:
+                self.moved_sent = True
         if self.mode == "readonly":
             return b"-READONLY You can't write against a read only replica.\r\n"
         return b"-MOVED %d 127.0.0.1:%d\r\n" % (_slot(key), self.b.server_address[1])
@@ -140,6 +168,7 @@ class _Handler(socketserver.StreamRequestHandler):
         cluster = self.server.cluster
         name = self.server.name
         in_multi = False
+        asking = False
         try:
             while True:
                 line = self.rfile.readline()
@@ -157,10 +186,17 @@ class _Handler(socketserver.StreamRequestHandler):
                     # ready, so most writes go to B, not to A through the
                     # primary fallback.
                     time.sleep(0.01)
+                elif cluster.mode == "ask-moved" and name == "A" and verb == b"SET" and cluster.writes["A"] == 0:
+                    time.sleep(0.1)  # B's connection is ready by the -ASK
+                elif cluster.mode == "moved-slow" and name == "A":
+                    if verb == b"SET" and cluster.writes["A"] == 0:
+                        time.sleep(0.1)  # B's connection is ready by the first -MOVED
+                    elif verb == b"CLUSTER" and cluster.moved_sent:
+                        time.sleep(0.3)  # the refresh lands after the first retry is routed
                 if verb == b"CLUSTER":
                     reply = cluster.slots_reply(name)
                 elif verb == b"SET":
-                    reply = cluster.write_reply(name, in_multi, args[1])
+                    reply = cluster.write_reply(name, in_multi, args[1], asking)
                 elif verb == b"MULTI":
                     in_multi = True
                     reply = b"+OK\r\n"
@@ -178,6 +214,7 @@ class _Handler(socketserver.StreamRequestHandler):
                     reply = b"*0\r\n"
                 else:
                     raise AssertionError("unexpected command: {!r}".format(args))
+                asking = verb == b"ASKING"
                 self.wfile.write(reply)
                 self.wfile.flush()
         except (ConnectionResetError, BrokenPipeError, ValueError):
@@ -281,6 +318,51 @@ def test_moved_retry_goes_to_key_owner(env):
             redirects = entry["MOVED/sec"] / entry["Ops/sec"] * requests
             env.assertGreaterEqual(redirects, 0.95, message=label)
             env.assertLessEqual(redirects, 2.05, message=label + " {}".format(cluster.writes))
+
+
+def test_moved_retry_goes_to_redirect_target(env):
+    """A request retried after -MOVED is resent to the node the reply names.
+
+    The CLUSTER SLOTS refresh that -MOVED triggers is still in flight when the
+    retry is routed, so the slot map still says A owns the key. With
+    --max-retries=1 a retry sent back to A is redirected again and dropped;
+    sent to B, every request completes with a single redirect.
+    """
+    env.assertLess(_slot(b"memtier-1"), 8192)
+    requests = 20
+    for command in ("set", "arbitrary"):
+        cluster, rows, label = _run(env, "moved-slow", command,
+                                    ["--retry-on-error", "--max-retries=1", "--retry-backoff-ms=20",
+                                     "--failed-keys-file"], requests=requests)
+        env.assertEqual(rows, [], message=label)
+        env.assertEqual(cluster.writes["B"], requests, message=label + " {}".format(cluster.writes))
+        stats = cluster.stats
+        env.assertTrue(stats is not None, message=label)
+        if stats is None:
+            continue
+        env.assertEqual(stats["Totals"]["Count"], requests, message=label)
+        # Every SET sent to A is redirected once, and none is sent to A twice.
+        redirects = stats["Sets"]["MOVED/sec"] / stats["Sets"]["Ops/sec"] * requests
+        env.assertAlmostEqual(redirects, cluster.writes["A"], 0.05, message=label + " {}".format(cluster.writes))
+
+
+def test_moved_after_ask_is_resent_without_asking(env):
+    """A request redirected by -ASK and then by -MOVED is resent plainly.
+
+    The -ASK retry goes to B after ASKING; B answers -MOVED back to A. The
+    resend to A must not be preceded by ASKING: a node importing the slot
+    would then serve a key it does not own.
+    """
+    requests = 20
+    for command in ("set", "arbitrary"):
+        cluster, rows, label = _run(env, "ask-moved", command,
+                                    ["--retry-on-error", "--max-retries=3", "--failed-keys-file"], requests=requests)
+        env.assertEqual(rows, [], message=label)
+        env.assertEqual(cluster.writes["B"], 1, message=label + " {}".format(cluster.writes))
+        env.assertEqual(cluster.asking_on_a, 0, message=label + " {}".format(cluster.writes))
+        env.assertTrue(cluster.stats is not None, message=label)
+        if cluster.stats is not None:
+            env.assertEqual(cluster.stats["Totals"]["Count"], requests, message=label)
 
 
 def test_readonly_from_replica_refreshes_without_retry_on_error(env):

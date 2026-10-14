@@ -2842,37 +2842,44 @@ bool cluster_client::enqueue_redirect_retry(unsigned int target, request *req)
     return true;
 }
 
+// The primary connection to the node named by "-MOVED/-ASK <slot>
+// <host>:<port>", or UINT_MAX if there is none. A connection still being
+// established (e.g. a TLS handshake at startup) or waiting on its reconnect
+// timer qualifies: its retry queue holds the request until it is set up
+// again, as in hand_off_replay_requests().
+unsigned int cluster_client::redirect_target_conn(protocol_response *response)
+{
+    const char *status = response->get_status();
+    const char *addr = status ? strrchr(status, ' ') : NULL;
+    const char *port = addr ? strrchr(addr, ':') : NULL;
+    if (port == NULL) return UINT_MAX;
+    addr++;
+    const size_t addr_len = port - addr;
+    port++;
+    for (unsigned int i = 0; i < m_connections.size(); i++) {
+        shard_connection *sc = m_connections[i];
+        if (sc->get_role() == role_primary &&
+            (sc->get_connection_state() != conn_disconnected || sc->is_reconnect_pending()) &&
+            strncmp(sc->get_address(), addr, addr_len) == 0 && sc->get_address()[addr_len] == '\0' &&
+            strcmp(sc->get_port(), port) == 0) {
+            return i;
+        }
+    }
+    return UINT_MAX;
+}
+
 // Resend the request to the node named by "-ASK <slot> <host>:<port>",
 // preceded by ASKING: during a slot migration only that node serves the key,
 // and only for a command sent right after ASKING. That node is the importing
 // primary, so this retry goes to a primary whatever --read-preference says:
 // no replica serves the key, and the slot map would send it back to the
-// migrating node. A connection still being established (e.g. a TLS
-// handshake at startup) or waiting on its reconnect timer holds the retry
-// until it is set up again, as in hand_off_replay_requests(). Without a
-// usable connection to that node, fall back to routing by the slot map.
+// migrating node. Without a usable connection to that node, fall back to
+// routing by the slot map.
 bool cluster_client::retry_after_ask(unsigned int conn_id, request *req, protocol_response *response)
 {
-    const char *status = response->get_status();
-    const char *addr = status ? strrchr(status, ' ') : NULL;
-    const char *port = addr ? strrchr(addr, ':') : NULL;
-    unsigned int target = UINT_MAX;
-    if (port != NULL) {
-        addr++;
-        const size_t addr_len = port - addr;
-        port++;
-        for (unsigned int i = 0; i < m_connections.size(); i++) {
-            shard_connection *sc = m_connections[i];
-            if (sc->get_role() == role_primary &&
-                (sc->get_connection_state() != conn_disconnected || sc->is_reconnect_pending()) &&
-                strncmp(sc->get_address(), addr, addr_len) == 0 && sc->get_address()[addr_len] == '\0' &&
-                strcmp(sc->get_port(), port) == 0) {
-                target = i;
-                break;
-            }
-        }
-    }
+    unsigned int target = redirect_target_conn(response);
     if (target == UINT_MAX) {
+        const char *status = response->get_status();
         benchmark_debug_log("no live primary connection for %s; retrying by slot map\n", status ? status : "-ASK");
         return retry_after_redirect(conn_id, req);
     }
@@ -2880,6 +2887,35 @@ bool cluster_client::retry_after_ask(unsigned int conn_id, request *req, protoco
     if (!enqueue_redirect_retry(target, req)) return false;
     req->m_asking = true;
     return true;
+}
+
+// Resend the request to the node named by "-MOVED <slot> <host>:<port>".
+// handle_moved() only asks for a CLUSTER SLOTS refresh; until its reply lands
+// the slot map still names this connection, so a retry routed by the map
+// comes straight back here and is redirected again. With unlimited
+// --max-retries that repeats for as long as the refresh takes.
+//
+// The -MOVED address is authoritative, so a read under rp_primary goes there
+// like a write, without waiting for the target's CLUSTER SLOTS ladder (as
+// select_target_conn() does since #612). A read under another
+// --read-preference may belong on a replica, so it keeps routing by the slot
+// map, as does a request whose target has no primary connection (e.g. a node
+// not in the map yet, or one memtier still has as a replica after a
+// failover: its connection may have sent READONLY).
+bool cluster_client::retry_after_moved(unsigned int conn_id, request *req, protocol_response *response)
+{
+    if (!m_config->retry_on_error) return false;
+    if (!req || !req->m_serialized || req->m_serialized_len == 0) return false;
+
+    unsigned int target = UINT_MAX;
+    if (!classify_read(req) || m_config->read_preference == rp_primary) target = redirect_target_conn(response);
+    if (target == UINT_MAX || target == conn_id) return retry_after_redirect(conn_id, req);
+
+    // The node that owns the slot gets a plain resend: ASKING from an
+    // earlier -ASK would let a node importing the slot serve a key it does
+    // not own.
+    req->m_asking = false;
+    return enqueue_redirect_retry(target, req);
 }
 
 void cluster_client::hand_off_replay_requests(unsigned int conn_id)
@@ -3181,7 +3217,7 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
                                         conn_id, m_txn_pinned_conn_id);
                 }
                 finalize_dropped_redirect(timestamp, request, response);
-            } else if (m_config->retry_on_error && !(retried = retry_after_redirect(conn_id, request))) {
+            } else if (m_config->retry_on_error && !(retried = retry_after_moved(conn_id, request, response))) {
                 // With --retry-on-error, the captured command bytes are resent
                 // on the slot-owning connection. MOVED/ASK count toward
                 // max_retries. If the retry is refused (budget exhausted /
