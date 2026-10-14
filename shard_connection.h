@@ -171,7 +171,15 @@ public:
     int send_arbitrary_command(const command_arg *arg, const char *val, int val_len);
     void send_arbitrary_command_end(size_t command_index, struct timeval *sent_time, int cmd_size);
 
-    void set_cluster_slots() { m_cluster_slots = setup_none; }
+    // Request a CLUSTER SLOTS refresh. A refresh already in flight (setup_sent)
+    // will update the slot map anyway: sending a second one would leave two
+    // replies pending, and the first one turns off keeping the reply value the
+    // second needs. disconnect() resets the state, so a reconnect still sends
+    // a new one.
+    void set_cluster_slots()
+    {
+        if (m_cluster_slots != setup_sent) m_cluster_slots = setup_none;
+    }
     void schedule_fill(void);
     bool has_request_rate_budget() const;
 
