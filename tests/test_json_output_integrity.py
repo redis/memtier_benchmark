@@ -39,6 +39,9 @@ from mb import Benchmark, RunConfig
 # a 2% relative gap.
 ABS_TOLERANCE_MS = 0.01
 REL_TOLERANCE = 0.02
+# "Average Latency" is printed with %.3f, so it is rounded by up to 0.0005 ms.
+AVG_PRINT_ROUNDING_MS = 0.0005
+FLOAT_EPSILON_MS = 1e-9
 
 
 def _assert_latency_consistent(env, section_name, section):
@@ -114,7 +117,13 @@ def _assert_time_series_consistent(env, section_name, section):
         # second of a short --test-time run with --reconnect-interval=1 — that
         # term dominates and the static 2% relative + 0.01 ms absolute floor
         # would false-positive (RED-197205 regression-test CI surfaced this).
-        tolerance = max(ABS_TOLERANCE_MS, REL_TOLERANCE * derived, 1.0 / count)
+        # Both fields come from the same whole-microsecond sum, so the gap is at
+        # most 0.999/count + 0.0005 ms: the truncation above plus the %.3f
+        # rounding of "Average Latency" itself. We allow 1/count + 0.0005, and
+        # add a small epsilon because the gap can land exactly on 1/count
+        # (e.g. true avg 6.9998 printed as 7.000 with acc=41, count=6).
+        tolerance = max(ABS_TOLERANCE_MS, REL_TOLERANCE * derived,
+                        1.0 / count + AVG_PRINT_ROUNDING_MS + FLOAT_EPSILON_MS)
         if acc > 0:
             env.assertGreater(
                 avg, 0.0,
@@ -672,3 +681,20 @@ def test_json_aggregated_connection_errors_sec(env):
     finally:
         if env.getNumberOfFailedAssertion() > failed_asserts:
             debugPrintMemtierOnError(run_config, env)
+
+
+def test_time_series_tolerance_covers_truncation_and_rounding(env):
+    # Values from a TSAN CI failure: 6 ops whose true sum is just under 42 ms.
+    # "Accumulated Latency" truncates to 41 and "Average Latency" (%.3f) rounds
+    # to 7.000, so the gap sits exactly on 1/count. memtier's output is
+    # consistent here; the checker must accept it.
+    # Bucket "6": 7 ops summing to 7.999 ms -> avg 1.142714 prints as 1.143,
+    # acc truncates to 7. The gap 0.143 exceeds 1/7 (0.142857), so it is only
+    # accepted thanks to the %.3f rounding term, not the float epsilon.
+    section = {"Time-Serie": {"5": {"Count": 6,
+                                    "Average Latency": "7.000",
+                                    "Accumulated Latency": 41},
+                              "6": {"Count": 7,
+                                    "Average Latency": "1.143",
+                                    "Accumulated Latency": 7}}}
+    _assert_time_series_consistent(env, "synthetic.Sets", section)
