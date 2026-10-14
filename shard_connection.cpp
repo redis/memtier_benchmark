@@ -1532,8 +1532,10 @@ void shard_connection::fill_pipeline(void)
             return;
         }
     }
-    // Likewise for retries queued while the connection was being
-    // established: their drain timer fired before it was connected.
+    // Retries queued on this connection while it was connecting or waiting
+    // to reconnect (an -ASK retry to the importing node, retry_after_ask)
+    // found it unusable when their drain timer fired, and nothing re-arms
+    // it. Send them once the setup ladder is done.
     if (m_retry_queue != NULL && !m_retry_queue->empty() && get_connection_state() == conn_connected &&
         is_conn_setup_done() && (m_retry_drain_timer == NULL || !evtimer_pending(m_retry_drain_timer, NULL))) {
         handle_retry_drain_event();
