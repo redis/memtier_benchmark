@@ -8,12 +8,15 @@ Covers:
 - --run-count > 1 AVERAGE report shows non-zero Hits/sec (aggregate_average fix)
 - --miss-rate-threshold warning fires in stderr when miss rate exceeds threshold
 - --miss-rate-threshold=0 fires for any miss
+- --run-count > 1 AVERAGE also carries the default-workload GET miss-rate
+  warning, with the exact summed hit/miss counts (all-miss and partial-hit)
 - --monitor-input without --command produces a startup warning
 - --miss-rate-threshold invalid values (empty, NaN) are rejected at startup
 """
 
 import json
 import os
+import re
 import subprocess
 import tempfile
 
@@ -411,41 +414,6 @@ def test_miss_rate_threshold_suppressed_below_threshold(env):
 
 
 # ---------------------------------------------------------------------------
-# 8b. Default-workload GET warning also fires for the --run-count AVERAGE
-# ---------------------------------------------------------------------------
-
-def test_run_count_average_default_get_miss_warning(env):
-    """Without --command, every results section (BEST, WORST and AVERAGE) must
-    carry the GET miss-rate warning. The AVERAGE one reads the totals built by
-    aggregate_average(), which used to leave the GET hit/miss counts at zero."""
-    env.skipOnCluster()
-    env.flush()  # empty DB: every GET misses
-
-    clients = 2
-    requests = 300
-    ok, stdout, stderr, _js = _run_benchmark(
-        env,
-        ["--ratio=0:1", "--key-prefix={}".format(_KEY_PREFIX)],
-        clients=clients,
-        requests=requests,
-        run_count=2,
-    )
-    env.assertTrue(ok)
-
-    sections = stdout.count(" RESULTS")
-    warnings = [l for l in stderr.splitlines() if l.startswith("warning: GET miss rate")]
-    env.assertEqual(sections, 3, message="stdout sections: {}".format(sections))
-    env.assertEqual(
-        len(warnings),
-        sections,
-        message="Expected one GET miss-rate warning per results section; stderr: {}".format(stderr[:600]),
-    )
-    # The AVERAGE warning reports counts summed over both runs.
-    total = 2 * clients * requests
-    env.assertContains("({} misses / {} ops)".format(total, total), stderr)
-
-
-# ---------------------------------------------------------------------------
 # 9. --monitor-input without --command emits startup warning
 # ---------------------------------------------------------------------------
 
@@ -548,3 +516,112 @@ def test_miss_rate_threshold_rejects_out_of_range(env):
         0,
         message="Expected non-zero exit for --miss-rate-threshold=101",
     )
+
+
+# ---------------------------------------------------------------------------
+# 11. Default-workload GET warning also covers the --run-count AVERAGE
+# ---------------------------------------------------------------------------
+
+_GET_WARNING_RE = re.compile(r"^warning: GET miss rate ([0-9.]+)% above target [0-9.]+% \((\d+) misses / (\d+) ops\)$")
+
+
+def _get_miss_warnings(stderr):
+    """Return (rate, misses, ops) for every default-workload GET warning, in print order."""
+    found = []
+    for line in stderr.splitlines():
+        m = _GET_WARNING_RE.match(line)
+        if m:
+            found.append((float(m.group(1)), int(m.group(2)), int(m.group(3))))
+    return found
+
+
+def _average_get_warning(env, warnings, run_ops, runs):
+    """BEST/WORST warnings cover one run (run_ops ops); the AVERAGE one sums all
+    runs, so its ops total identifies it. It is also printed last."""
+    average = [w for w in warnings if w[2] == run_ops * runs]
+    env.assertEqual(len(average), 1, message="AVERAGE GET warning not found: {}".format(warnings))
+    if len(average) != 1:
+        return None
+    env.assertEqual(warnings[-1], average[0], message="AVERAGE warning must come last: {}".format(warnings))
+    env.assertEqual(
+        [w[2] for w in warnings[:-1]], [run_ops] * (len(warnings) - 1),
+        message="BEST/WORST warnings must each cover one run: {}".format(warnings),
+    )
+    return average[0]
+
+
+def _run_default_get(env, clients, requests, extra_args):
+    return _run_benchmark(
+        env,
+        ["--ratio=0:1", "--key-prefix={}".format(_KEY_PREFIX)] + extra_args,
+        clients=clients,
+        requests=requests,
+        run_count=2,
+    )
+
+
+def test_run_count_average_default_get_miss_warning(env):
+    """Without --command, every results section (BEST, WORST and AVERAGE) must
+    carry the GET miss-rate warning. The AVERAGE one reads the totals built by
+    aggregate_average(), which used to leave the GET hit/miss counts at zero."""
+    env.flush()  # empty DB: every GET misses
+
+    clients, requests = 2, 300
+    ok, stdout, stderr, _js = _run_default_get(env, clients, requests, [])
+    env.assertTrue(ok)
+
+    sections = stdout.count(" RESULTS")
+    warnings = _get_miss_warnings(stderr)
+    env.assertEqual(sections, 3, message="stdout sections: {}".format(sections))
+    env.assertEqual(
+        len(warnings),
+        sections,
+        message="Expected one GET miss-rate warning per results section; stderr: {}".format(stderr[:600]),
+    )
+    run_ops = clients * requests
+    average = _average_get_warning(env, warnings, run_ops, 2)
+    env.assertEqual(average, (100.0, 2 * run_ops, 2 * run_ops))
+
+
+def test_run_count_average_default_get_partial_miss_rate(env):
+    """Partial hit rate: the AVERAGE warning must report the exact summed hit and
+    miss counts (so hits are neither dropped nor counted as misses), and must
+    stay silent when the threshold is above the real miss rate."""
+    clients, requests = 2, 300
+    run_ops = clients * requests
+
+    def preload_and_reset():
+        env.flush()
+        conn = env.getClusterConnectionIfNeeded()
+        for i in range(1, _PRELOADED_KEYS + 1):
+            conn.set("{}{}".format(_KEY_PREFIX, i), "v{}".format(i))
+        for node in env.getOSSMasterNodesConnectionList():
+            node.execute_command("CONFIG", "RESETSTAT")
+
+    key_range = ["--key-minimum=1", "--key-maximum={}".format(_KEY_RANGE_MAX)]
+
+    # ~70% misses (3 of 10 keys exist): above the default 1% threshold.
+    preload_and_reset()
+    ok, _stdout, stderr, _js = _run_default_get(env, clients, requests, key_range)
+    env.assertTrue(ok)
+    server_hits = server_misses = 0
+    for node in env.getOSSMasterNodesConnectionList():
+        stats = node.info("stats")
+        server_hits += int(stats["keyspace_hits"])
+        server_misses += int(stats["keyspace_misses"])
+    env.assertEqual(server_hits + server_misses, 2 * run_ops)
+    env.assertGreater(server_hits, 0)
+    env.assertGreater(server_misses, 0)
+
+    warnings = _get_miss_warnings(stderr)
+    env.assertEqual(len(warnings), 3, message="stderr: {}".format(stderr[:600]))
+    average = _average_get_warning(env, warnings, run_ops, 2)
+    if average is not None:
+        env.assertEqual(average[1:], (server_misses, server_hits + server_misses))
+        env.assertLess(average[0], 100.0)
+
+    # Threshold above the real miss rate: no section may warn, AVERAGE included.
+    preload_and_reset()
+    ok, _stdout, stderr, _js = _run_default_get(env, clients, requests, key_range + ["--miss-rate-threshold=95"])
+    env.assertTrue(ok)
+    env.assertEqual(_get_miss_warnings(stderr), [], message="stderr: {}".format(stderr[:600]))
