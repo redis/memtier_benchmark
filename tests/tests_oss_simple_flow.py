@@ -1280,3 +1280,53 @@ def test_interrupt_signal_handling(env):
         env.assertTrue("Count" in totals_metrics)
         total_count = totals_metrics["Count"]
         env.assertTrue(total_count > 0)
+
+
+def test_cluster_seed_owns_no_keys(env):
+    """Reads must reach their shard when the -p seed owns none of the keys (#610).
+
+    The seed connects first. Its GETs used to find the owning shard still
+    connecting, get no route, and retry inside fill_pipeline without ever
+    returning to the event loop, so the other shards never finished
+    connecting: 0 ops at 100% CPU.
+    """
+    if not env.isCluster() or env.isUnixSocket():
+        env.skip()
+        return
+
+    master_nodes_list = env.getMasterNodesList()
+    any_master = env.getOSSMasterNodesConnectionList()[0]
+    key = 'memtier-4'
+    slot = int(any_master.execute_command('CLUSTER', 'KEYSLOT', key))
+    owner_port = None
+    for entry in any_master.execute_command('CLUSTER', 'SLOTS'):
+        if int(entry[0]) <= slot <= int(entry[1]):
+            owner_port = int(entry[2][1])
+    env.assertNotEqual(owner_port, None)
+    seed_port = next(node['port'] for node in master_nodes_list if node['port'] != owner_port)
+
+    requests = 200
+    for ratio in ['0:1', '1:1']:
+        benchmark_specs = {'name': env.testName + '-' + ratio.replace(':', '_'),
+                           'args': ['--ratio=' + ratio, '--key-minimum=4', '--key-maximum=4',
+                                    '--hide-histogram']}
+        addTLSArgs(benchmark_specs, env)
+        config = get_default_memtier_config(threads=1, clients=1, requests=requests)
+        add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+        config['redis_process_port'] = seed_port
+
+        test_dir = tempfile.mkdtemp()
+        config = RunConfig(test_dir, benchmark_specs['name'], config, {})
+        ensure_clean_benchmark_folder(config.results_dir)
+        benchmark = Benchmark.from_json(config, benchmark_specs)
+
+        ok = benchmark.run(timeout=20)
+        if not ok:
+            debugPrintMemtierOnError(config, env)
+        env.assertTrue(ok, message=ratio)
+        env.assertFalse(os.path.exists(os.path.join(config.results_dir, 'mb.timeout')), message=ratio)
+        if not ok:
+            continue
+        with open(os.path.join(config.results_dir, 'mb.json')) as results_json:
+            stats = json.load(results_json)['ALL STATS']
+        env.assertEqual(stats['Totals']['Count'], requests, message=ratio)

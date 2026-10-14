@@ -522,11 +522,13 @@ unsigned int cluster_client::select_target_conn(unsigned int slot, bool is_read)
     // declaration instead of shadowing each other.
     const size_t nreplicas = group.replicas.size();
 
-    // rp_primary: legacy behavior (read from primary). Falling all the way
-    // through to the slot's primary owner gives parity with the
-    // pre-read-preference world.
+    // rp_primary: legacy behavior (read from primary). Like a write, route to
+    // the slot's primary even while it is still connecting: the read waits in
+    // its key index pool until its setup ladder is done. Returning UINT_MAX
+    // would leave a seed that owns none of the keys spinning in fill_pipeline
+    // before the other connections can connect (#610).
     if (mode == rp_primary) {
-        return conn_is_live_for_routing(group.primary) ? group.primary->get_id() : UINT_MAX;
+        return group.primary->get_id();
     }
 
     // rp_nearest: scan warm replicas (and the primary if it has already
