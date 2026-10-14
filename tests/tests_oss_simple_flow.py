@@ -1303,17 +1303,30 @@ def test_cluster_seed_owns_no_keys(env):
         if int(entry[0]) <= slot <= int(entry[1]):
             owner_port = int(entry[2][1])
     env.assertNotEqual(owner_port, None)
-    seed_port = next(node['port'] for node in master_nodes_list if node['port'] != owner_port)
+    seed_ports = [node['port'] for node in master_nodes_list if node['port'] != owner_port]
+    if not seed_ports:
+        env.skip()
+        return
 
     requests = 200
-    for ratio in ['0:1', '1:1']:
-        benchmark_specs = {'name': env.testName + '-' + ratio.replace(':', '_'),
-                           'args': ['--ratio=' + ratio, '--key-minimum=4', '--key-maximum=4',
-                                    '--hide-histogram']}
+    cases = [
+        ('get', ['--ratio=0:1'], requests),
+        ('set_get', ['--ratio=1:1'], requests),
+        ('command_get', ['--command=GET __key__'], requests),
+        # Without --requests only the in-flight budget in hold_pipeline()
+        # bounds what the seed queues for the owner while it connects.
+        ('get_test_time', ['--ratio=0:1'], None),
+    ]
+    for name, args, case_requests in cases:
+        benchmark_specs = {'name': env.testName + '-' + name,
+                           'args': args + ['--key-minimum=4', '--key-maximum=4', '--hide-histogram']}
         addTLSArgs(benchmark_specs, env)
-        config = get_default_memtier_config(threads=1, clients=1, requests=requests)
+        if case_requests is None:
+            config = get_default_memtier_config(threads=None, clients=None, requests=None, test_time=3)
+        else:
+            config = get_default_memtier_config(threads=1, clients=1, requests=case_requests)
         add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
-        config['redis_process_port'] = seed_port
+        config['redis_process_port'] = seed_ports[0]
 
         test_dir = tempfile.mkdtemp()
         config = RunConfig(test_dir, benchmark_specs['name'], config, {})
@@ -1323,10 +1336,14 @@ def test_cluster_seed_owns_no_keys(env):
         ok = benchmark.run(timeout=20)
         if not ok:
             debugPrintMemtierOnError(config, env)
-        env.assertTrue(ok, message=ratio)
-        env.assertFalse(os.path.exists(os.path.join(config.results_dir, 'mb.timeout')), message=ratio)
+        env.assertTrue(ok, message=name)
+        env.assertFalse(os.path.exists(os.path.join(config.results_dir, 'mb.timeout')), message=name)
         if not ok:
             continue
         with open(os.path.join(config.results_dir, 'mb.json')) as results_json:
             stats = json.load(results_json)['ALL STATS']
-        env.assertEqual(stats['Totals']['Count'], requests, message=ratio)
+        if case_requests is None:
+            env.assertGreater(stats['Totals']['Count'], 0, message=name)
+        else:
+            env.assertEqual(stats['Totals']['Count'], case_requests, message=name)
+        env.assertEqual(stats['Totals']['MOVED/sec'], 0, message=name)

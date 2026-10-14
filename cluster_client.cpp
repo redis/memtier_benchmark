@@ -498,8 +498,10 @@ unsigned int cluster_client::select_target_conn(unsigned int slot, bool is_read)
     //
     // The cluster_slots gate is meaningful only for reads, which need a
     // valid slot map to ROUTE; writes to the producer's primary do not
-    // re-look-up routing. Reads continue to use the full
-    // conn_is_live_for_routing() / is_ready_for_reads() predicate below.
+    // re-look-up routing. Under the non-primary read preferences, reads
+    // continue to use the full conn_is_live_for_routing() /
+    // is_ready_for_reads() predicate below; rp_primary reads route like
+    // writes (#610).
     //
     // Round-13: even the conn_connected gate has been removed for writes.
     // The producer's own slot is conn_connected by definition (fill_pipeline
@@ -1941,9 +1943,10 @@ get_key_response cluster_client::get_key_for_conn(unsigned int command_index, un
     // handle key for other connection
     unsigned int other_conn_id = target_conn_id;
 
-    // The target connection picked by select_target_conn was live at selection
-    // time (conn_is_live_for_routing already filters disconnected nodes), but a
-    // TOCTOU window exists between that check and the dispatch here -- the
+    // For non-primary read preferences select_target_conn only returns a live
+    // connection, but a write or an rp_primary read goes to the slot's primary
+    // even when it is connecting or disconnected, and a TOCTOU window exists
+    // between selection and the dispatch here too -- the
     // bufferevent can fire BEV_EVENT_EOF in between. If the target is no longer
     // connected at dispatch time, route the recovery based on its role:
     //
@@ -1978,9 +1981,8 @@ get_key_response cluster_client::get_key_for_conn(unsigned int command_index, un
     // disconnect only) but fall through to the cross-shard queue push
     // below. Queueing onto the target's pool is safe: the target's
     // fill_pipeline waits for setup_done before draining, and on
-    // reconnect the pool drains normally. The read-side setup_done
-    // gate at line ~1352 still protects reads that need a populated
-    // slot map to route.
+    // reconnect the pool drains normally. A slot map refresh that
+    // retires the connection uncounts what is left in its pool.
     if (m_connections[other_conn_id]->get_connection_state() == conn_disconnected &&
         !m_connections[other_conn_id]->is_replica()) {
         m_connections[conn_id]->set_cluster_slots();
