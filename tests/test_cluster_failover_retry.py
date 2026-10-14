@@ -309,9 +309,12 @@ def _run_slots_move_off_primary(env, retry_on_error):
                 # slot any more, so memtier retires its connections.
                 _move_slots(env, nodes, victim_ranges, victim, target)
                 moves += 1
-                if cycle + 1 < SLOT_MOVE_CYCLES:
-                    time.sleep(1)
-                    _move_slots(env, nodes, victim_ranges, target, victim)
+                # Give memtier time to retire them, then hand the slots
+                # back, also after the last cycle: leaving them off the
+                # victim can trip an unrelated redirect livelock (tracked
+                # separately) that would hang the run.
+                time.sleep(1)
+                _move_slots(env, nodes, victim_ranges, target, victim)
             env.assertTrue(moves > 0, message="memtier finished before the slots were moved; raise --requests")
             try:
                 rc = proc.wait(timeout=180)
