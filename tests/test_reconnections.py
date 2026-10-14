@@ -1123,4 +1123,7 @@ def test_auth_failure_on_reconnect_with_retry_on_error_honors_test_time(env):
     env.assertNotEqual(rc, 0, message="a run that cannot re-authenticate must fail")
     env.assertTrue("run is over, not reconnecting" in stderr_content,
                    message="the run did not stop reconnecting at --test-time")
+    # The requests held for replay are accounted, not dropped silently.
+    env.assertTrue("held for retry when the run ended were not resent" in stderr_content,
+                   message="requests held for replay were not counted when the run ended")
     env.assertLess(elapsed, test_time + 5, message="run took {:.1f}s for --test-time={}".format(elapsed, test_time))
