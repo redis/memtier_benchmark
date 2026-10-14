@@ -179,6 +179,7 @@ client::client(client_group *group) :
         m_txn_rotation_key_index(0),
         m_txn_rotation_key_valid(false),
         m_txn_rotation_key_seq(0),
+        m_txn_multi_sent(false),
         m_tot_set_ops(0),
         m_tot_wait_ops(0),
         m_scan_cursor("0"),
@@ -216,6 +217,7 @@ client::client(struct event_base *event_base, benchmark_config *config, abstract
         m_txn_rotation_key_index(0),
         m_txn_rotation_key_valid(false),
         m_txn_rotation_key_seq(0),
+        m_txn_multi_sent(false),
         m_tot_set_ops(0),
         m_tot_wait_ops(0),
         m_scan_cursor("0"),
@@ -715,7 +717,28 @@ void client::create_request(struct timeval timestamp, unsigned int conn_id)
             return;
         }
 
+        const arbitrary_command &cmd = get_arbitrary_command(m_executed_command_index);
+        if (m_config->transaction) {
+            /* The connection lost this rotation's MULTI when it reconnected.
+             * Sent now, the rest of the block would run outside any
+             * transaction and its EXEC would fail with "EXEC without MULTI".
+             * Skip it up to and including the EXEC/DISCARD; the server already
+             * discarded the commands queued before. */
+            if (m_txn_multi_sent && cmd.multi_effect != multi_effect_opens &&
+                !m_connections[conn_id]->is_multi_open()) {
+                benchmark_debug_log("--transaction: MULTI lost on reconnect; skipping command %u\n",
+                                    m_executed_command_index);
+                if (cmd.multi_effect == multi_effect_closes) m_txn_multi_sent = false;
+                advance_arbitrary_command_index();
+                return;
+            }
+        }
         if (create_arbitrary_request(m_executed_command_index, timestamp, conn_id)) {
+            if (cmd.multi_effect == multi_effect_opens) {
+                m_txn_multi_sent = true;
+            } else if (cmd.multi_effect == multi_effect_closes) {
+                m_txn_multi_sent = false;
+            }
             advance_arbitrary_command_index();
             m_reqs_generated++;
         }

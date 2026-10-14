@@ -650,6 +650,24 @@ def test_transaction_drops_not_logged_without_retry(env):
     env.assertEqual(replay, [], message="REPLAY rows without --retry-on-error: {}".format(replay[:5]))
 
 
+def test_transaction_lost_multi_is_not_continued(env):
+    """
+    Once a reconnect drops the connection's open MULTI, the rest of that
+    block is not sent: outside the MULTI its SET runs untransacted and its
+    EXEC fails with "EXEC without MULTI". (Cluster mode is covered in
+    test_cluster_transaction.py.)
+    """
+    if env.isCluster():
+        env.skip()
+        return
+    rc, stderr_content, killed, errors, _ = _run_transaction_with_kills(env, [], test_time=6, kill_interval=0.3,
+                                                                       pipeline=8)
+    env.assertEqual(rc, 0, message="memtier exited {} after connection kills".format(rc))
+    env.assertFalse("EXEC without MULTI" in stderr_content, message="an EXEC was sent without its MULTI")
+    # memtier is the only client, so any -ERR reply is one of its own.
+    env.assertEqual(errors, 0, message="{} -ERR replies for {} killed connections".format(errors, killed))
+
+
 def _db_conn(env, db):
     import redis
 

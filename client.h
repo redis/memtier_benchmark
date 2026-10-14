@@ -97,6 +97,10 @@ protected:
     unsigned long long m_txn_rotation_key_index;
     bool m_txn_rotation_key_valid;
     unsigned long long m_txn_rotation_key_seq;
+    // --transaction (non-cluster path): this rotation's MULTI was sent and its
+    // EXEC/DISCARD was not yet. If the connection no longer has the MULTI open
+    // (it reconnected), the rest of the block is skipped.
+    bool m_txn_multi_sent;
 
     unsigned long long m_tot_set_ops;  // Total number of SET ops
     unsigned long long m_tot_wait_ops; // Total number of WAIT ops
