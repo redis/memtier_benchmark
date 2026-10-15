@@ -3000,9 +3000,9 @@ void cluster_client::hand_off_replay_requests(unsigned int conn_id)
         req->m_asking = false;
         m_connections[target]->adopt_replay_request(req);
     }
-    // Dropped requests are never processed; uncount them as
-    // drain_replay_queue_after_reconnect does.
-    if (dropped) dec_reqs_generated(dropped);
+    // Dropped requests are never resent: uncount them and count them as
+    // errors, as drain_replay_queue_after_reconnect does.
+    if (dropped) abandon_requests(dropped);
 }
 
 // Terminal accounting for a MOVED/ASK request whose retry was refused (e.g.

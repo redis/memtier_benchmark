@@ -33,6 +33,9 @@ public:
     virtual unsigned long long get_reqs_generated(void) = 0;
     virtual void inc_reqs_generated(void) = 0;
     virtual void dec_reqs_generated(unsigned long long count) = 0;
+    // Requests sent and then given up for good under --retry-on-error (never
+    // resent, never answered): uncount them and count each as an error.
+    virtual void abandon_requests(unsigned long long count) = 0;
     virtual bool finished(void) = 0;
     virtual bool all_connections_idle(void) = 0;
 

@@ -576,7 +576,13 @@ void shard_connection::disconnect()
     // --transaction requests are dropped too: the server discards the MULTI
     // with the socket, so replaying the rest of a block would run its
     // commands outside any transaction and its EXEC would fail.
+    //
+    // Under --retry-on-error a dropped request is one memtier gave up on, so
+    // it also counts as an error, like every other request that is never
+    // resent (abandoned); without it, dropping in-flight requests on a
+    // disconnect is the expected behaviour.
     unsigned long long dropped = 0;
+    unsigned long long abandoned = 0;
     if (m_config->retry_on_error && m_replay_queue != NULL && !m_config->transaction) {
         while (m_pending_resp) {
             request *req = pop_req();
@@ -589,7 +595,7 @@ void shard_connection::disconnect()
             if (req->m_serialized && req->m_serialized_len > 0) {
                 m_replay_queue->push(req);
             } else {
-                dropped++;
+                abandoned++;
                 delete req;
             }
         }
@@ -605,8 +611,8 @@ void shard_connection::disconnect()
                     m_replay_queue->push(req);
                 } else {
                     // Not expected: enqueue_retry() only accepts requests
-                    // with captured bytes. Uncount it like any other drop.
-                    dropped++;
+                    // with captured bytes. Account it like any other drop.
+                    abandoned++;
                     delete req;
                 }
             }
@@ -620,18 +626,21 @@ void shard_connection::disconnect()
         while (m_pending_resp) {
             request *req = pop_req();
             if (is_workload_request(req->m_type)) {
-                dropped++;
                 if (m_config->retry_on_error && m_config->transaction) {
+                    abandoned++;
                     struct timeval now;
                     gettimeofday(&now, NULL);
                     global_failed_keys_logger().log_failure(now, "REPLAY", req->m_key, req->m_key_len,
                                                             "transaction-not-replayed", req->m_retries);
+                } else {
+                    dropped++;
                 }
             }
             delete req;
         }
     }
     if (dropped) m_conns_manager->dec_reqs_generated(dropped);
+    if (abandoned) m_conns_manager->abandon_requests(abandoned);
 
     if (m_deferred_fill_timer != NULL && evtimer_pending(m_deferred_fill_timer, NULL)) {
         evtimer_del(m_deferred_fill_timer);
@@ -976,7 +985,8 @@ void shard_connection::drain_replay_queue_after_reconnect()
 {
     if (!m_replay_queue) return;
     // Replayed requests are not yet counted as processed; uncount the ones
-    // dropped here so they don't hold the pipeline or a --requests run.
+    // dropped here so they don't hold the pipeline or a --requests run, and
+    // count them as errors: they never get a reply.
     unsigned long long dropped = 0;
     while (!m_replay_queue->empty()) {
         request *req = m_replay_queue->front();
@@ -1003,7 +1013,7 @@ void shard_connection::drain_replay_queue_after_reconnect()
         }
         replay_request(req);
     }
-    if (dropped) m_conns_manager->dec_reqs_generated(dropped);
+    if (dropped) m_conns_manager->abandon_requests(dropped);
 }
 
 request *shard_connection::pop_replay_request()

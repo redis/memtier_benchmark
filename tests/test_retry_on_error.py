@@ -543,6 +543,55 @@ def test_dropped_replays_do_not_stall_client(env):
     env.assertEqual(rc, 0, message="memtier exited {} after connection kills".format(rc))
 
 
+def test_dropped_replays_are_counted_as_errors(env):
+    """
+    Requests --retry-on-error gives up on after a reconnect count as errors.
+
+    The requests in flight on a killed connection are logged to
+    --failed-keys-file as "connection-dropped" once --max-retries is reached,
+    but were not counted in the error total ("errors 0"), unlike the requests
+    abandoned when the run ends. Every logged row is a request that never got
+    a reply, so the error total must match the rows.
+    """
+    # The CLIENT KILL below is not routed to every node in cluster mode.
+    env.skipOnCluster()
+    test_dir = tempfile.mkdtemp()
+    failed_log = os.path.join(test_dir, "failed-keys.csv")
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--pipeline=16",
+            "--command=SET __key__ v",
+            "--command-ratio=200",
+            # memtier kills its own sibling connections, with requests in flight.
+            "--command=CLIENT KILL TYPE normal SKIPME yes",
+            "--command-ratio=1",
+            "--reconnect-on-error",
+            "--retry-on-error",
+            "--max-retries=0",
+            "--failed-keys-file={}".format(failed_log),
+            "--hide-histogram",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=1, clients=4, requests=None, test_time=3)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+
+    rc, stderr_content = _run_with_background(env, benchmark, config, lambda _proc: None, timeout=40)
+    env.assertEqual(rc, 0, message="memtier exited {}".format(rc))
+    with open(failed_log) as f:
+        rows = list(csv.reader(f))[1:]
+    env.assertGreater(len(rows), 0, message="no request was dropped; the scenario was not hit")
+    env.assertEqual([row for row in rows if row[3] != "connection-dropped"], [])
+    totals = re.findall(r"errors (\d+) \(", stderr_content)
+    env.assertTrue(totals, message=stderr_content[-2000:])
+    if totals:
+        env.assertEqual(int(totals[-1]), len(rows), message=stderr_content[-2000:])
+
 
 _TXN_KILL_THREADS, _TXN_KILL_CLIENTS = 2, 4
 

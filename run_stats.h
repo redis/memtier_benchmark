@@ -238,7 +238,7 @@ public:
     // run_stats are merged across threads.
     void inc_retry_attempt() { m_totals.m_retry_attempts++; }
     void inc_retried_op() { m_totals.m_retried_ops++; }
-    void inc_error() { m_totals.m_errors++; }
+    void inc_error(unsigned long long int count = 1) { m_totals.m_errors += count; }
 
     unsigned long long int get_total_retry_attempts() const { return m_totals.m_retry_attempts; }
     unsigned long long int get_total_retried_ops() const { return m_totals.m_retried_ops; }

@@ -184,6 +184,11 @@ public:
         unsigned long long in_flight = m_reqs_generated > m_reqs_processed ? m_reqs_generated - m_reqs_processed : 0;
         m_reqs_generated -= count < in_flight ? count : in_flight;
     }
+    void abandon_requests(unsigned long long count)
+    {
+        dec_reqs_generated(count);
+        m_stats.inc_error(count);
+    }
 
     virtual bool handle_cluster_slots(protocol_response *r)
     {

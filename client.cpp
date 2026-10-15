@@ -291,7 +291,6 @@ void client::disconnect_all(void)
                 gettimeofday(&now, NULL);
                 global_failed_keys_logger().log_failure(now, "REPLAY", req->m_key, req->m_key_len,
                                                         "run-ended-before-resend", req->m_retries);
-                m_stats.inc_error();
                 abandoned++;
                 delete req;
             }
@@ -301,7 +300,7 @@ void client::disconnect_all(void)
         benchmark_error_log("warning: %llu request(s) held for retry when the run ended were not resent; "
                             "counted as errors.\n",
                             abandoned);
-        dec_reqs_generated(abandoned);
+        abandon_requests(abandoned);
     }
 }
 
