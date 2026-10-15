@@ -1312,6 +1312,8 @@ void shard_connection::process_response(void)
                 benchmark_error_log("cluster slot failed.\n");
                 report_connection_stage_failure("CLUSTER SLOTS failed (server returned empty or non-cluster reply; "
                                                 "is the server actually cluster-enabled?)");
+                m_protocol->set_keep_value(false);
+                retry_cluster_slots_after_error();
                 error = true;
             } else {
                 // Parse the reply. handle_cluster_slots returns true only when
@@ -1930,6 +1932,37 @@ void shard_connection::reconnect_after_setup_error(const char *error_context)
         attempt_reconnect(error_context);
         m_setup_rejected = m_reconnecting;
     }
+}
+
+// A CLUSTER SLOTS reply was empty or an error, e.g. from a node that owns no
+// slots yet. No workload request is sent on this connection until a refresh
+// succeeds, so ask again instead of leaving it stuck. With
+// --reconnect-on-error, reconnect, so --max-reconnect-attempts bounds the
+// retries and they stop once the run is over. Otherwise resend CLUSTER SLOTS
+// after a second. Counting the error as a connection error (as a reconnect
+// does) also advances the run's clock, which otherwise moves only on replies,
+// so the run still ends at --test-time. At startup --connection-stage-timeout
+// still applies.
+void shard_connection::retry_cluster_slots_after_error()
+{
+    if (m_config->reconnect_on_error) {
+        reconnect_after_setup_error("CLUSTER SLOTS error");
+        return;
+    }
+
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    static_cast<client *>(m_conns_manager)->get_stats()->update_connection_error(&now);
+
+    m_cluster_slots = setup_none;
+    if (m_deferred_fill_timer == NULL) {
+        m_deferred_fill_timer = event_new(m_event_base, -1, 0, deferred_fill_pipeline_cb, this);
+        if (m_deferred_fill_timer == NULL) {
+            return;
+        }
+    }
+    struct timeval delay = {1, 0};
+    event_add(m_deferred_fill_timer, &delay);
 }
 
 void shard_connection::handle_reconnect_timer_event()
