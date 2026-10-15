@@ -3164,10 +3164,9 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
             // to `conn_id` (the rejecting replica) -- doing so re-queues the
             // request onto the same connection that just returned -READONLY,
             // guaranteeing another rejection until --retry-max-attempts is
-            // hit. Instead, schedule a topology refresh on this connection
-            // (the next CLUSTER SLOTS reply re-binds slot -> primary) and
-            // finalize the in-flight request as a terminal error -- the next
-            // pipeline tick reroutes future traffic correctly.
+            // hit. Instead, finalize the in-flight request as a terminal
+            // error, and refresh the topology only when the slot map may be
+            // stale (see below).
             // Match the readiness predicate used by MOVED/ASK write retries
             // and select_target_conn's write path: a TCP-connected primary
             // is sufficient for a write-class retry, even during a
@@ -3196,10 +3195,14 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
                 }
             }
             if (primary_target == UINT_MAX) {
-                // No live primary known for this slot. Trigger a topology
-                // refresh on the rejecting connection and drop the request
-                // instead of looping it back onto the same replica.
-                m_connections[conn_id]->set_cluster_slots();
+                // No live primary to retry on: drop the request instead of
+                // looping it back onto the same replica. Refresh the topology
+                // only if the slot map still calls the rejecting connection a
+                // primary (e.g. it was just demoted). On a known replica,
+                // -READONLY is the expected answer to a write and a refresh
+                // cannot change that, so refreshing would cost one CLUSTER
+                // SLOTS per reply (#651).
+                if (m_connections[conn_id]->get_role() == role_primary) m_connections[conn_id]->set_cluster_slots();
                 finalize_dropped_readonly(timestamp, request, response);
                 return;
             }

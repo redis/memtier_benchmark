@@ -13,6 +13,9 @@ and each test drives one:
   memtier re-routes it to B, a different live connection, but
   --max-retries=0 refuses the retry. A few writes can reach B through
   --read-preference-fallback=primary before A is ready; B accepts those.
+
+A third test checks that a drop on a known replica does not refresh the
+topology (#651), while the "stale" drop above still does.
 """
 import json
 import os
@@ -49,6 +52,7 @@ class _Pair(object):
         self.accepted = 0  # SETs B accepted
         self.rx = 0
         self.tx = 0
+        self.cluster_slots = {"A": 0, "B": 0}  # CLUSTER SLOTS each peer received
         self.errors = []
         self.a = _Peer(self, "A")
         self.b = _Peer(self, "B")
@@ -111,6 +115,8 @@ class _Handler(socketserver.StreamRequestHandler):
                     args.append(value[:-2])
                 verb = args[0].upper()
                 if verb == b"CLUSTER":
+                    with pair.lock:
+                        pair.cluster_slots[self.server.name] += 1
                     reply = pair.slots_reply()
                 elif verb == b"SET":
                     time.sleep(_REPLY_DELAY_MS / 1000.0)
@@ -178,6 +184,9 @@ def _check_dropped_readonly_counted(env, mode):
             env.assertGreater(entry["Ops/sec"], 0, message=mode + " " + name + " Ops/sec")
         if mode == "stale":
             env.assertEqual(stats["Gets"]["Count"], 0)
+            # The map still names A the primary, so its -READONLY is evidence
+            # the map is stale and must keep triggering refreshes.
+            env.assertGreater(pair.cluster_slots["A"], 1, message="stale refreshes")
         series = stats["Sets"]["Time-Serie"].values()
         env.assertEqual(sum(second["Count"] for second in series), requests)
         env.assertEqual(sum(second["Bytes RX"] for second in series), pair.rx)
@@ -192,3 +201,28 @@ def test_readonly_stale_primary_drop_counted(env):
 def test_readonly_refused_retry_counted(env):
     """Drop site 2: the retry to the slot primary is refused."""
     _check_dropped_readonly_counted(env, "replica")
+
+
+def test_readonly_on_replica_does_not_refresh(env):
+    """A -READONLY from a connection the map already calls a replica is the
+    expected answer to a write; it must not trigger a CLUSTER SLOTS refresh
+    per reply (#651). Without --retry-on-error every rejected request is
+    dropped on the no-retry-target path."""
+    requests = 200
+    with _Pair("replica") as pair:
+        args = [MEMTIER_BINARY, "--server=127.0.0.1",
+                "--port={}".format(pair.a.server_address[1]), "--cluster-mode",
+                "--threads=1", "--clients=1", "--pipeline=1",
+                "--requests={}".format(requests), "--hide-histogram",
+                "--command=SET k value", "--command-is-read",
+                "--read-preference=secondary", "--read-preference-fallback=primary"]
+        result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                timeout=60, text=True)
+        env.assertEqual(result.returncode, 0, message=result.stderr)
+        env.assertEqual(pair.errors, [])
+        env.assertEqual(pair.readonly + pair.accepted, requests)
+        env.assertGreaterEqual(pair.readonly, requests // 2)
+        # Setup sends one CLUSTER SLOTS (to the seed, A). Allow a little slack
+        # for setup; one refresh per -READONLY would be ~requests.
+        env.assertLessEqual(pair.cluster_slots["A"] + pair.cluster_slots["B"], 3,
+                            message=str(pair.cluster_slots))
