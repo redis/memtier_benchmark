@@ -4,6 +4,7 @@ set -euo pipefail
 
 ssl_prefix="${1:?usage: build-macos-libevent.sh OPENSSL_PREFIX}"
 build_root="${RUNNER_TEMP:?RUNNER_TEMP must name a private build directory}"
+mkdir -p "$build_root"
 archive="$build_root/libevent-2.1.13-stable.tar.gz"
 curl -fsSL --retry 3 -o "$archive" \
   https://github.com/libevent/libevent/releases/download/release-2.1.13-stable/libevent-2.1.13-stable.tar.gz

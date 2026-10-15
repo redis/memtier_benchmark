@@ -545,8 +545,6 @@ jobs:
     - name: Verify version, libevent, openssl
       run: |
         ./memtier_benchmark --version
-        otool -L ./memtier_benchmark | grep libevent
-        otool -L ./memtier_benchmark | grep ssl
         bash scripts/check-macos-tls-links.sh "$(brew --prefix openssl@1.1)"
     - name: Unit tests
       run: |

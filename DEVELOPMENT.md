@@ -57,11 +57,13 @@ openssl@4
 $ PKG_CONFIG_PATH=`brew --prefix openssl@4`/lib/pkgconfig ./configure
 ```
 
-To use a different OpenSSL, build libevent from source against it and put both
+To use a different OpenSSL, install it (for example `brew install openssl@3`),
+build libevent from source against it, and put both
 prefixes in `PKG_CONFIG_PATH`. `scripts/build-macos-libevent.sh` does this and
 installs it under `$RUNNER_TEMP/libevent-memtier`:
 
 ```
+$ brew install openssl@3
 $ RUNNER_TEMP=$HOME/build bash scripts/build-macos-libevent.sh `brew --prefix openssl@3`
 $ PKG_CONFIG_PATH=$HOME/build/libevent-memtier/lib/pkgconfig:`brew --prefix openssl@3`/lib/pkgconfig ./configure
 ```
