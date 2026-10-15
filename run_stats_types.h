@@ -80,10 +80,10 @@ public:
     unsigned long long int m_bytes_rx;
     unsigned long long int m_bytes_tx;
     unsigned long long int m_ops;
-    unsigned int m_hits;
-    unsigned int m_misses;
-    unsigned int m_moved;
-    unsigned int m_ask;
+    unsigned long long int m_hits;
+    unsigned long long int m_misses;
+    unsigned long long int m_moved;
+    unsigned long long int m_ask;
     unsigned long long int m_total_latency;
     std::vector<double> summarized_quantile_values;
     double m_avg_latency;

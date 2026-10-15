@@ -79,7 +79,7 @@ memtier_benchmark_LDADD = \
 
 
 check_PROGRAMS = prometheus_metrics_test rate_limiter_test socket_options_test hdr_histogram_test cluster_transaction_test \
-    cluster_hslot_test
+    cluster_hslot_test run_stats_counters_test
 
 # The metrics test links only the pure layer (prometheus_metrics.{h,cpp}).
 # First `make check` program in the repo. The metrics layer is config-free and
@@ -126,6 +126,14 @@ cluster_hslot_test_SOURCES = tests/unit/cluster_hslot_test.cpp
 cluster_hslot_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
 cluster_hslot_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 cluster_hslot_test_LDADD = $(filter-out memtier_benchmark-memtier_benchmark.$(OBJEXT),$(memtier_benchmark_OBJECTS)) $(memtier_benchmark_LDADD)
+# Sum per-second hit/miss/MOVED/ASK counters past 2^32, as run_stats::summarize() does.
+run_stats_counters_test_SOURCES = tests/unit/run_stats_counters_test.cpp run_stats_types.cpp run_stats_types.h \
+    latency_histogram.h latency_percentiles.h \
+    deps/hdr_histogram/hdr_histogram.c deps/hdr_histogram/hdr_histogram.h \
+    deps/hdr_histogram/hdr_time.c deps/hdr_histogram/hdr_time.h deps/hdr_histogram/hdr_malloc.h
+run_stats_counters_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
+run_stats_counters_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+run_stats_counters_test_LDADD = $(CODE_COVERAGE_LDFLAGS)
 TESTS = $(check_PROGRAMS)
 
 # Keep the release amalgamation byte-identical to the recorded upstream asset.

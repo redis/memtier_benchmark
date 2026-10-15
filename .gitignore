@@ -75,6 +75,7 @@ tests/.env/
 /cluster_hslot_test
 /rate_limiter_test
 /socket_options_test
+/run_stats_counters_test
 tests/unit/prometheus_metrics_test
 *.log
 *.trs

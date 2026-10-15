@@ -571,7 +571,7 @@ void run_stats::save_csv_one_sec(FILE *f, unsigned long long int &total_get_ops,
     total_set_ops = 0;
     total_wait_ops = 0;
     for (std::list<one_second_stats>::iterator i = m_stats.begin(); i != m_stats.end(); i++) {
-        fprintf(f, "%u,%llu,%u.%06u,%llu,%llu,%llu,%llu,%u.%06u,%llu,%llu,%llu,%u,%u,%llu,%u.%06u\n", i->m_second,
+        fprintf(f, "%u,%llu,%u.%06u,%llu,%llu,%llu,%llu,%u.%06u,%llu,%llu,%llu,%llu,%llu,%llu,%u.%06u\n", i->m_second,
                 i->m_set_cmd.m_ops, USEC_FORMAT(AVERAGE(i->m_set_cmd.m_total_latency, i->m_set_cmd.m_ops)),
                 i->m_set_cmd.m_bytes_rx + i->m_set_cmd.m_bytes_tx, i->m_set_cmd.m_bytes_tx, i->m_set_cmd.m_bytes_rx,
                 i->m_get_cmd.m_ops, USEC_FORMAT(AVERAGE(i->m_get_cmd.m_total_latency, i->m_get_cmd.m_ops)),
@@ -654,8 +654,8 @@ void run_stats::save_csv_one_sec_cluster(FILE *f)
     fprintf(f, "Second,SET Moved,SET Ask,GET Moved,GET Ask\n");
 
     for (std::list<one_second_stats>::iterator i = m_stats.begin(); i != m_stats.end(); i++) {
-        fprintf(f, "%u,%u,%u,%u,%u\n", i->m_second, i->m_set_cmd.m_moved, i->m_set_cmd.m_ask, i->m_get_cmd.m_moved,
-                i->m_get_cmd.m_ask);
+        fprintf(f, "%u,%llu,%llu,%llu,%llu\n", i->m_second, i->m_set_cmd.m_moved, i->m_set_cmd.m_ask,
+                i->m_get_cmd.m_moved, i->m_get_cmd.m_ask);
     }
 }
 
@@ -1050,7 +1050,7 @@ void run_stats::debug_dump(void)
     for (std::list<one_second_stats>::iterator i = m_stats.begin(); i != m_stats.end(); i++) {
         benchmark_debug_log(
             "  %u: get latency=%u.%ums, set latency=%u.%ums, wait latency=%u.%ums"
-            "m_ops_set/get/wait=%llu/%llu/%llu, m_bytes_set/get=%llu/%llu, m_get_hit/miss=%u/%u\n",
+            "m_ops_set/get/wait=%llu/%llu/%llu, m_bytes_set/get=%llu/%llu, m_get_hit/miss=%llu/%llu\n",
             i->m_second, USEC_FORMAT(AVERAGE(i->m_get_cmd.m_total_latency, i->m_get_cmd.m_ops)),
             USEC_FORMAT(AVERAGE(i->m_set_cmd.m_total_latency, i->m_set_cmd.m_ops)),
             USEC_FORMAT(AVERAGE(i->m_wait_cmd.m_total_latency, i->m_wait_cmd.m_ops)), i->m_set_cmd.m_ops,
