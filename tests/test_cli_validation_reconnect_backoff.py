@@ -10,6 +10,8 @@ Run with:
 
 import json
 import os
+import re
+import socket
 import subprocess
 import tempfile
 
@@ -102,8 +104,40 @@ def test_reconnect_backoff_invalid_values_rejected(env):
             timeout=10,
         )
         label = "--reconnect-backoff-factor={!r}".format(value)
+        # --help also exits 2, so only the diagnostic below proves rejection.
         env.assertEqual(result.returncode, 2, message=label + ": " + result.stderr)
         env.assertTrue(
             "error: reconnect-backoff-factor" in result.stderr,
             message=label + ": expected a parser diagnostic, got " + repr(result.stderr),
         )
+
+
+def test_reconnect_backoff_zero_keeps_one_second_delay(env):
+    """Factor 0 must not scale the delay: every reconnect waits 1.00 s."""
+    env.skipOnCluster()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    closed_port = sock.getsockname()[1]
+    sock.close()
+
+    result = subprocess.run(
+        [
+            MEMTIER_BINARY,
+            "--server=127.0.0.1",
+            "--port={}".format(closed_port),
+            "--threads=1",
+            "--clients=1",
+            "--reconnect-on-error",
+            "--reconnect-backoff-factor=0",
+            "--max-reconnect-attempts=3",
+            "--connection-timeout=1",
+            "--test-time=30",
+            "--hide-histogram",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    delays = re.findall(r"attempting reconnection \d+/\d+ in ([0-9.]+) seconds", result.stderr)
+    env.assertGreaterEqual(len(delays), 2, message=result.stderr[-2000:])
+    env.assertEqual(set(delays), {"1.00"}, message=repr(delays))
