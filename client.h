@@ -159,7 +159,8 @@ public:
     // (finished()) or was finalized by client_group::finalize_all_clients().
     bool end_time_set(void) const { return m_end_set; }
     // Ends a client whose --test-time deadline passed TEST_TIME_DRAIN_GRACE_SECS
-    // ago with replies still pending; returns the number of requests abandoned.
+    // ago with replies still pending; returns the number of workload requests
+    // abandoned (setup commands are dropped but not counted).
     unsigned int abandon_unanswered_requests(void);
 
     virtual get_key_response get_key_for_conn(unsigned int command_index, unsigned int conn_id,

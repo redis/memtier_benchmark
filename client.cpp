@@ -399,22 +399,30 @@ unsigned int client::abandon_unanswered_requests(void)
 
     // Only a client that is waiting for replies: one with nothing in flight
     // ends by itself, or is waiting for a reconnect.
-    unsigned int pending = 0;
+    bool waiting = false;
     for (unsigned int i = 0; i < m_connections.size(); i++) {
-        if (m_connections[i] != NULL) pending += m_connections[i]->get_pending_resp();
+        if (m_connections[i] != NULL && m_connections[i]->get_pending_resp() > 0) waiting = true;
     }
-    if (pending == 0) return 0;
+    if (!waiting) return 0;
 
-    // They never got a reply: errors, not ops. disconnect() drops them. The
-    // run measured --test-time, not the grace period spent waiting for them.
-    for (unsigned int i = 0; i < pending; i++)
+    // Drop them before disconnecting, so --retry-on-error does not hold them
+    // for a resend that will never come (disconnect_all() would then count
+    // them a second time). Workload requests that never got a reply are
+    // errors, not ops; setup commands are not counted.
+    unsigned int abandoned = 0;
+    for (unsigned int i = 0; i < m_connections.size(); i++) {
+        if (m_connections[i] != NULL) abandoned += m_connections[i]->drop_pending_requests();
+    }
+    for (unsigned int i = 0; i < abandoned; i++)
         m_stats.inc_error();
+
+    // The run measured --test-time, not the grace period spent waiting.
     struct timeval end_time = m_stats.get_start_time();
     end_time.tv_sec += m_config->test_time;
     m_stats.set_end_time(&end_time);
     m_end_set = true;
     disconnect_all();
-    return pending;
+    return abandoned;
 }
 
 bool client::hold_pipeline(unsigned int conn_id)
@@ -1513,13 +1521,18 @@ void client_group::handle_end_stalled_clients(void)
     unsigned int stalled = 0;
     unsigned int count = active_client_count();
     for (unsigned int i = 0; i < count && i < m_clients.size(); i++) {
-        unsigned int n = m_clients[i]->abandon_unanswered_requests();
-        if (n > 0) {
-            abandoned += n;
-            stalled++;
-        }
+        if (m_clients[i]->end_time_set()) continue;
+        abandoned += m_clients[i]->abandon_unanswered_requests();
+        if (m_clients[i]->end_time_set()) stalled++;
     }
     if (stalled > 0) {
+        // The deadline has passed, so the ramp is over. Do not let its
+        // persistent timer keep the loop alive until the next step.
+        if (m_staircase_timer != NULL) {
+            event_del(m_staircase_timer);
+            event_free(m_staircase_timer);
+            m_staircase_timer = NULL;
+        }
         benchmark_error_log("warning: %u client(s) got no reply to %llu request(s) %u seconds after the test time "
                             "ended; counted as errors.\n",
                             stalled, abandoned, TEST_TIME_DRAIN_GRACE_SECS);

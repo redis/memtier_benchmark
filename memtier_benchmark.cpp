@@ -3721,7 +3721,9 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
 
         // Replies still pending well after --test-time (the server stopped
         // replying) would otherwise keep the run waiting forever. Each client
-        // checks its own deadline; this only says when to start asking.
+        // checks its own deadline (its own start, or the staircase start), so
+        // one that connected late is ended a tick or two later; this only says
+        // when to start asking.
         bool end_stalled = false;
         if (cfg->test_time > 0) {
             struct timeval now;
