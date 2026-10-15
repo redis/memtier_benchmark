@@ -496,43 +496,44 @@ jobs:
   build-macos:
     strategy:
       matrix:
-        openssl: ["3.0", "3"]
+        # 3.0 and 3 build libevent from source against the same OpenSSL as
+        # memtier. 4 uses Homebrew's libevent, which links openssl@4 (the pair
+        # DEVELOPMENT.md recommends). Mixing OpenSSL majors in one process
+        # crashes TLS (#674).
+        openssl: ["3.0", "3", "4"]
     runs-on: macos-latest
     steps:
     - uses: actions/checkout@v6
     - name: Install dependencies
       run: brew install autoconf automake libtool pkg-config openssl@${{ matrix.openssl }}
-    - name: Install Homebrew libevent for the default OpenSSL
-      if: matrix.openssl == '3'
+    - name: Install Homebrew libevent
+      if: matrix.openssl == '4'
       run: brew install libevent
     - name: Build libevent against the selected OpenSSL
-      if: matrix.openssl != '3'
+      if: matrix.openssl != '4'
       run: bash scripts/build-macos-libevent.sh "$(brew --prefix openssl@${{ matrix.openssl }})"
     - name: Build
       run: |
         autoreconf -ivf
-        if [ '${{ matrix.openssl }}' = '3' ]; then
+        if [ '${{ matrix.openssl }}' = '4' ]; then
           event_prefix="$(brew --prefix libevent)"
         else
           event_prefix="$RUNNER_TEMP/libevent-memtier"
         fi
+        echo "EVENT_PREFIX=$event_prefix" >> "$GITHUB_ENV"
         PKG_CONFIG_PATH="$event_prefix/lib/pkgconfig:$(brew --prefix openssl@${{ matrix.openssl }})/lib/pkgconfig" ./configure
         make
+    # Run before the tests: a libevent linked against another OpenSSL
+    # crashes the TLS unit tests instead of failing with a clear message.
+    - name: Verify version, libevent, openssl
+      run: |
+        ./memtier_benchmark --version
+        bash scripts/check-macos-tls-links.sh "$(brew --prefix openssl@${{ matrix.openssl }})" "$EVENT_PREFIX"
     - name: Unit tests
       run: |
         if ! make check; then
           cat test-suite.log
           exit 1
-        fi
-    - name: Verify version, libevent, openssl
-      run: |
-        ./memtier_benchmark --version
-        otool -L ./memtier_benchmark | grep libevent
-        otool -L ./memtier_benchmark | grep ssl
-        if [ '${{ matrix.openssl }}' = '3' ]; then
-          bash scripts/check-macos-tls-links.sh "$(brew --prefix openssl@3)" "$(brew --prefix libevent)"
-        else
-          bash scripts/check-macos-tls-links.sh "$(brew --prefix openssl@${{ matrix.openssl }})"
         fi
 
   # macos-13 has been retired as of December 2025, so use macos-14
@@ -550,19 +551,18 @@ jobs:
         autoreconf -ivf
         PKG_CONFIG_PATH="$RUNNER_TEMP/libevent-memtier/lib/pkgconfig:$(brew --prefix openssl@1.1)/lib/pkgconfig" ./configure
         make
-    - name: Unit tests
-      run: |
-        if ! make check; then
-          cat test-suite.log
-          exit 1
-        fi
     - name: Verify version, libevent, openssl
       run: |
         ./memtier_benchmark --version
         otool -L ./memtier_benchmark | grep libevent
         otool -L ./memtier_benchmark | grep ssl
         bash scripts/check-macos-tls-links.sh "$(brew --prefix openssl@1.1)"
-
+    - name: Unit tests
+      run: |
+        if ! make check; then
+          cat test-suite.log
+          exit 1
+        fi
 
   build-macos-openssl-1-0-2:
     runs-on: macos-14
@@ -593,12 +593,6 @@ jobs:
         autoreconf -ivf
         PKG_CONFIG_PATH="$RUNNER_TEMP/libevent-openssl-1.0/lib/pkgconfig:$(brew --prefix openssl@1.0)/lib/pkgconfig" ./configure
         make
-    - name: Unit tests
-      run: |
-        if ! make check; then
-          cat test-suite.log
-          exit 1
-        fi
     - name: Verify version, libevent, openssl
       run: |
         set -euo pipefail
@@ -607,6 +601,12 @@ jobs:
         printf '%s\n' "$binary_links" | grep '/libssl\.1\.0\.0\.dylib '
         bash scripts/check-macos-tls-links.sh "$(brew --prefix openssl@1.0)" "$RUNNER_TEMP/libevent-openssl-1.0"
         otool -L "$RUNNER_TEMP/libevent-openssl-1.0/lib/libevent_openssl.dylib" | grep 'libssl.1.0.0'
+    - name: Unit tests
+      run: |
+        if ! make check; then
+          cat test-suite.log
+          exit 1
+        fi
 
   promtool-lint:
     runs-on: ubuntu-latest
