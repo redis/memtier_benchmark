@@ -365,14 +365,15 @@ def test_moved_after_ask_is_resent_without_asking(env):
             env.assertEqual(cluster.stats["Totals"]["Count"], requests, message=label)
 
 
-def test_readonly_from_replica_refreshes_without_retry_on_error(env):
+def test_readonly_from_replica_drops_without_retry_on_error(env):
     """A write sent to a replica gets -READONLY in a stable topology.
 
     The write is a --command marked --command-is-read, so
-    --read-preference=secondary sends it to B, B's replica. Without
-    --retry-on-error the handler must refresh and drop, as it does on master,
-    whether or not --failed-keys-file filled the request's key. Only
-    --retry-on-error resends the write to the slot primary A.
+    --read-preference=secondary sends it to B, A's replica. Without
+    --retry-on-error the handler must drop it without a refresh (the map
+    already calls B a replica, #651), whether or not --failed-keys-file filled
+    the request's key. Only --retry-on-error resends the write to the slot
+    primary A.
 
     Writes sent before B's connection is ready go to A through
     --read-preference-fallback=primary, and how many depends on timing, so
@@ -381,13 +382,9 @@ def test_readonly_from_replica_refreshes_without_retry_on_error(env):
     read_pref = ["--command-is-read", "--read-preference=secondary", "--read-preference-fallback=primary"]
     for extra in ([], ["--failed-keys-file"]):
         cluster, rows, label = _run(env, "replica", "arbitrary", read_pref + extra)
-        refreshes = cluster.slots_by["B"]
-        # Every -READONLY from B schedules a refresh on B; a few land while
-        # one is already pending (47 of 48 measured, also under ASAN), so
-        # require half. Routing by key instead gives no refresh at all.
         env.assertGreaterEqual(cluster.writes["B"], 1, message=label + " {}".format(cluster.writes))
-        env.assertGreaterEqual(2 * refreshes, cluster.writes["B"],
-                               message=label + " {} {}".format(cluster.slots_by, cluster.writes))
+        env.assertEqual(cluster.slots_by["B"], 0,
+                        message=label + " {} {}".format(cluster.slots_by, cluster.writes))
         if "--failed-keys-file" in extra:
             env.assertEqual(len(rows), cluster.writes["B"], message=label)
     cluster, rows, label = _run(env, "replica", "arbitrary",

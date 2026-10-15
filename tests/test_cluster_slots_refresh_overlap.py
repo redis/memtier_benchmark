@@ -1,15 +1,17 @@
 """A redirect that arrives while a CLUSTER SLOTS refresh is in flight.
 
 Two scripted RESP peers form a one-shard cluster: a primary (the seed) and a
-replica. With --read-preference=secondary the GETs go to the replica, which
-answers the first two with -READONLY, pausing after each so memtier handles
-them one at a time. Without --retry-on-error a request carries no key to
-reroute by, so each -READONLY asks the replica connection for a CLUSTER
-SLOTS refresh. The second one arrives while the first refresh is still
-unanswered, and memtier must not send another then. If it does, the first
+replica. The GETs go to the primary, which answers the first two with
+-READONLY (as a just-demoted primary would), pausing after each so memtier
+handles them one at a time. The slot map still names that connection the
+primary, so without --retry-on-error each -READONLY asks it for a CLUSTER
+SLOTS refresh (a -READONLY from a known replica does not, see #651). The
+second one arrives while the first refresh is still unanswered, and memtier
+must not send another then. If it does, the first
 reply stops keeping the reply value the second needs, the second is
 reported as "cluster slot failed", and the connection stops reading, so the
-run never ends.
+run never ends. With the #617 fix reverted, this test hangs, reports
+"cluster slot failed" and counts 3 CLUSTER SLOTS instead of 2.
 """
 import socketserver
 import subprocess
@@ -37,7 +39,7 @@ class _Cluster(object):
         self.primary = _Peer(self, False)
         self.replica = _Peer(self, True)
         self.readonly = 0
-        self.replica_slots_requests = 0
+        self.primary_slots_requests = 0
         self.errors = []
 
     def slots_reply(self):
@@ -65,13 +67,13 @@ class _Handler(socketserver.StreamRequestHandler):
                 verb = args[0].upper()
                 pause = False
                 if verb == b"CLUSTER":
-                    if self.server.replica:
+                    if not self.server.replica:
                         with cluster.lock:
-                            cluster.replica_slots_requests += 1
+                            cluster.primary_slots_requests += 1
                     reply = cluster.slots_reply()
                 elif verb in (b"SET", b"GET"):
                     readonly = False
-                    if self.server.replica:
+                    if not self.server.replica:
                         with cluster.lock:
                             readonly = cluster.readonly < READONLY_REPLIES
                             if readonly:
@@ -108,7 +110,7 @@ def test_readonly_during_cluster_slots_refresh(env):
         threads.append(thread)
     args = [MEMTIER_BINARY, "--server=127.0.0.1",
             "--port={}".format(cluster.primary.server_address[1]), "--cluster-mode",
-            "--read-preference=secondary", "--threads=1", "--clients=1", "--pipeline=4",
+            "--threads=1", "--clients=1", "--pipeline=4",
             "--ratio=0:1", "--requests=20", "--key-minimum=1", "--key-maximum=1",
             "--hide-histogram"]
     try:
@@ -128,6 +130,6 @@ def test_readonly_during_cluster_slots_refresh(env):
     env.assertEqual(cluster.readonly, READONLY_REPLIES)
     env.assertEqual(returncode, 0, message=stderr[-2000:])
     env.assertNotContains("cluster slot failed", stderr)
-    # Only the first -READONLY sends a refresh: the second arrived while
-    # that refresh was in flight.
-    env.assertEqual(cluster.replica_slots_requests, 1)
+    # The setup CLUSTER SLOTS, then only the first -READONLY sends a refresh:
+    # the second arrived while that refresh was in flight.
+    env.assertEqual(cluster.primary_slots_requests, 2)
