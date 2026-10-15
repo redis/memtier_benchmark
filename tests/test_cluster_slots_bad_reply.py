@@ -2,10 +2,11 @@
 
 A scripted RESP peer acts as a one-node cluster that owns every slot. It
 answers some CLUSTER SLOTS requests with an empty array or an error, as a
-node that has no slots yet does, or with shards that all fail validation. memtier used to log "cluster slot failed"
-and never ask again: the connection sent no more requests, so the run hung
-past --test-time and --requests. It must ask again, and finish once the node
-answers.
+node that has no slots yet does, or with shards that all fail validation.
+memtier used to log "cluster slot failed" and never ask again: the connection
+sent no more requests, so the run hung past --test-time and --requests. At
+startup it must ask again, without charging the wait to the run; mid-run it
+must reconnect with --reconnect-on-error, or else fail the run.
 """
 import socketserver
 import subprocess
@@ -102,7 +103,7 @@ def _run(node, extra_args, timeout=20):
 def test_cluster_slots_empty_reply_mid_run_is_retried(env):
     # The refresh after -MOVED gets two empty replies, then a good one.
     node = _Node(bad_slots_replies=2, moved_after=50)
-    returncode, stderr, _ = _run(node, ["--requests=200"])
+    returncode, stderr, _ = _run(node, ["--requests=200", "--reconnect-on-error"])
     env.assertEqual(node.errors, [])
     env.assertEqual(returncode, 0, message=stderr[-2000:])
     env.assertContains("cluster slot failed", stderr)
@@ -110,14 +111,35 @@ def test_cluster_slots_empty_reply_mid_run_is_retried(env):
     env.assertGreaterEqual(node.data_requests, 200)
 
 
-def test_cluster_slots_error_reply_at_startup_is_retried(env):
-    # A node that has no slots for a moment at startup is asked again.
-    node = _Node(bad_slots_replies=2, bad_reply=b"-ERR This instance has cluster support disabled\r\n")
-    returncode, stderr, _ = _run(node, ["--requests=200"])
+def _assert_startup_retry_not_charged(env, node, returncode, stderr, elapsed):
+    # About two seconds of retries, then the full --test-time=2 run. If the
+    # retries counted towards --test-time, the run would end right after the
+    # first good reply, with only a handful of requests.
     env.assertEqual(node.errors, [])
     env.assertEqual(returncode, 0, message=stderr[-2000:])
     env.assertEqual(node.slots_requests, 3)
-    env.assertGreaterEqual(node.data_requests, 200)
+    env.assertGreaterEqual(elapsed, 3.5)
+    env.assertGreaterEqual(node.data_requests, 1000)
+
+
+def test_cluster_slots_error_reply_at_startup_is_retried(env):
+    # A node that has no slots for a moment at startup is asked again.
+    node = _Node(bad_slots_replies=2, bad_reply=b"-ERR This instance has cluster support disabled\r\n")
+    returncode, stderr, elapsed = _run(node, ["--test-time=2", "--pipeline=4"])
+    _assert_startup_retry_not_charged(env, node, returncode, stderr, elapsed)
+
+
+def test_cluster_slots_empty_reply_mid_run_fails_without_reconnect(env):
+    # Without --reconnect-on-error a refresh that fails mid-run ends the
+    # thread, as a dropped connection does, so the run fails.
+    node = _Node(bad_slots_replies=1000, moved_after=50)
+    returncode, stderr, elapsed = _run(node, ["--test-time=3"])
+    env.assertEqual(node.errors, [])
+    env.assertNotEqual(returncode, "timeout", message=stderr[-2000:])
+    env.assertNotEqual(returncode, 0)
+    env.assertContains("exceeded for CLUSTER SLOTS error", stderr)
+    env.assertEqual(node.slots_requests, 2)
+    env.assertLess(elapsed, 3)
 
 
 def test_cluster_slots_empty_reply_mid_run_honours_test_time(env):
@@ -141,7 +163,7 @@ MALFORMED_NODE = b"*1\r\n*3\r\n:0\r\n:16383\r\n*1\r\n$9\r\n127.0.0.1\r\n"
 
 def test_cluster_slots_malformed_reply_mid_run_is_retried(env):
     node = _Node(bad_slots_replies=2, moved_after=50, bad_reply=MALFORMED_RANGE)
-    returncode, stderr, _ = _run(node, ["--requests=200"])
+    returncode, stderr, _ = _run(node, ["--requests=200", "--reconnect-on-error"])
     env.assertEqual(node.errors, [])
     env.assertEqual(returncode, 0, message=stderr[-2000:])
     env.assertContains("every shard in the reply was malformed", stderr)
@@ -151,11 +173,8 @@ def test_cluster_slots_malformed_reply_mid_run_is_retried(env):
 
 def test_cluster_slots_malformed_reply_at_startup_is_retried(env):
     node = _Node(bad_slots_replies=2, bad_reply=MALFORMED_NODE)
-    returncode, stderr, _ = _run(node, ["--requests=200"])
-    env.assertEqual(node.errors, [])
-    env.assertEqual(returncode, 0, message=stderr[-2000:])
-    env.assertEqual(node.slots_requests, 3)
-    env.assertGreaterEqual(node.data_requests, 200)
+    returncode, stderr, elapsed = _run(node, ["--test-time=2", "--pipeline=4"])
+    _assert_startup_retry_not_charged(env, node, returncode, stderr, elapsed)
 
 
 def test_cluster_slots_malformed_reply_mid_run_honours_test_time(env):

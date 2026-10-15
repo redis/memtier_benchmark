@@ -121,6 +121,11 @@ void deferred_fill_pipeline_cb(evutil_socket_t, short, void *ctx)
     static_cast<shard_connection *>(ctx)->fill_pipeline();
 }
 
+void cluster_slots_retry_cb(evutil_socket_t, short, void *ctx)
+{
+    static_cast<shard_connection *>(ctx)->handle_cluster_slots_retry_event();
+}
+
 void cluster_client_connection_timeout_handler(evutil_socket_t fd, short what, void *ctx)
 {
     shard_connection *sc = (shard_connection *) ctx;
@@ -279,6 +284,7 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_retry_drain_timer(NULL),
         m_current_retry_backoff_ms(0.0),
         m_deferred_fill_timer(NULL),
+        m_cluster_slots_retry_timer(NULL),
         m_bev_paused(false)
 {
     m_id = id;
@@ -375,6 +381,11 @@ shard_connection::~shard_connection()
     if (m_deferred_fill_timer != NULL) {
         event_free(m_deferred_fill_timer);
         m_deferred_fill_timer = NULL;
+    }
+
+    if (m_cluster_slots_retry_timer != NULL) {
+        event_free(m_cluster_slots_retry_timer);
+        m_cluster_slots_retry_timer = NULL;
     }
 
     if (m_retry_queue != NULL) {
@@ -661,6 +672,9 @@ void shard_connection::disconnect()
 
     if (m_deferred_fill_timer != NULL && evtimer_pending(m_deferred_fill_timer, NULL)) {
         evtimer_del(m_deferred_fill_timer);
+    }
+    if (m_cluster_slots_retry_timer != NULL && evtimer_pending(m_cluster_slots_retry_timer, NULL)) {
+        evtimer_del(m_cluster_slots_retry_timer);
     }
 
     m_connection_state = conn_disconnected;
@@ -1936,37 +1950,46 @@ void shard_connection::reconnect_after_setup_error(const char *error_context)
 
 // A CLUSTER SLOTS reply was empty, an error, or had no valid shard, e.g. from
 // a node that owns no slots yet. No workload request is sent on this
-// connection until a refresh succeeds, so ask again instead of leaving it
-// stuck. With --reconnect-on-error, reconnect, so --max-reconnect-attempts
-// bounds the retries and they stop once the run is over. Otherwise resend
-// CLUSTER SLOTS after a second. Once the run has started, count the error as
-// a connection error (as a reconnect does): that also advances the run's
-// clock, which otherwise moves only on replies, so the run still ends at
-// --test-time. Before the first reply, leave the clock alone, so a node that
-// never answers still ends the run at --connection-stage-timeout instead of
-// finishing an empty run at --test-time.
+// connection until a refresh succeeds, so it must not be left waiting.
+// - With --reconnect-on-error, reconnect, so --max-reconnect-attempts bounds
+//   the retries and they stop once the run is over.
+// - Otherwise, once the run has started, handle it like a dropped
+//   connection: end this thread, so the run fails.
+// - Otherwise (at startup), ask again after a second, while
+//   --connection-stage-timeout lets the node converge.
 void shard_connection::retry_cluster_slots_after_error()
 {
     if (m_config->reconnect_on_error) {
         reconnect_after_setup_error("CLUSTER SLOTS error");
         return;
     }
-
     if (m_conns_manager->get_reqs_answered()) {
-        struct timeval now;
-        gettimeofday(&now, NULL);
-        static_cast<client *>(m_conns_manager)->get_stats()->update_connection_error(&now);
+        attempt_reconnect("CLUSTER SLOTS error");
+        return;
     }
 
-    m_cluster_slots = setup_none;
-    if (m_deferred_fill_timer == NULL) {
-        m_deferred_fill_timer = event_new(m_event_base, -1, 0, deferred_fill_pipeline_cb, this);
-        if (m_deferred_fill_timer == NULL) {
+    if (m_cluster_slots_retry_timer == NULL) {
+        m_cluster_slots_retry_timer = event_new(m_event_base, -1, 0, cluster_slots_retry_cb, this);
+        if (m_cluster_slots_retry_timer == NULL) {
             return;
         }
     }
     struct timeval delay = {1, 0};
-    event_add(m_deferred_fill_timer, &delay);
+    event_add(m_cluster_slots_retry_timer, &delay);
+}
+
+void shard_connection::handle_cluster_slots_retry_event()
+{
+    // m_cluster_slots stays setup_sent while the retry waits, so nothing else
+    // sends the request early. A disconnect in the meantime cancels the timer.
+    if (m_cluster_slots != setup_sent) return;
+    m_cluster_slots = setup_none;
+    // The run has not started: don't charge the time spent waiting for the
+    // slot map to --test-time or to the throughput figures.
+    if (!m_conns_manager->get_reqs_answered()) {
+        m_conns_manager->set_start_time();
+    }
+    fill_pipeline();
 }
 
 void shard_connection::handle_reconnect_timer_event()

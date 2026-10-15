@@ -146,6 +146,7 @@ class shard_connection
 {
     friend void cluster_client_timer_handler(evutil_socket_t fd, short what, void *ctx);
     friend void deferred_fill_pipeline_cb(evutil_socket_t fd, short what, void *ctx);
+    friend void cluster_slots_retry_cb(evutil_socket_t fd, short what, void *ctx);
     friend void cluster_client_read_handler(bufferevent *bev, void *ctx);
     friend void cluster_client_event_handler(bufferevent *bev, short events, void *ctx);
 
@@ -166,6 +167,7 @@ public:
     void attempt_reconnect(const char *error_context);
     void reconnect_after_setup_error(const char *error_context);
     void retry_cluster_slots_after_error();
+    void handle_cluster_slots_retry_event();
 
     void send_wait_command(struct timeval *sent_time, unsigned int num_slaves, unsigned int timeout);
     void send_set_command(struct timeval *sent_time, const char *key, int key_len, const char *value, int value_len,
@@ -475,6 +477,9 @@ private:
     // Cancelable timer for deferred fill_pipeline (replaces event_base_once to
     // avoid UAF when the connection is freed before the callback fires).
     struct event *m_deferred_fill_timer;
+
+    // Resends CLUSTER SLOTS after an empty, error or rejected reply at startup.
+    struct event *m_cluster_slots_retry_timer;
 
     // Tracks whether the bufferevent was paused via bufferevent_disable(EV_READ|
     // EV_WRITE) by fill_pipeline's idle-disable branch. fill_pipeline used to
