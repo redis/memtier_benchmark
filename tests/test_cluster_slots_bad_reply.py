@@ -167,3 +167,14 @@ def test_cluster_slots_malformed_reply_mid_run_honours_test_time(env):
     env.assertContains("CLUSTER SLOTS error, attempting reconnection", stderr)
     env.assertLess(elapsed, 10)
 
+
+def test_cluster_slots_empty_reply_at_startup_still_aborts(env):
+    # A node that never answers: the retries must not count as the run's
+    # time, or the run would finish empty at --test-time with exit 0 instead
+    # of failing at --connection-stage-timeout.
+    node = _Node(bad_slots_replies=1000)
+    returncode, stderr, _ = _run(node, ["--test-time=1", "--connection-stage-timeout=5"])
+    env.assertEqual(node.errors, [])
+    env.assertEqual(returncode, 2, message=stderr[-2000:])
+    env.assertContains("See --connection-stage-timeout.", stderr)
+    env.assertGreater(node.slots_requests, 1)

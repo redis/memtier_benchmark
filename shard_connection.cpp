@@ -1939,10 +1939,12 @@ void shard_connection::reconnect_after_setup_error(const char *error_context)
 // connection until a refresh succeeds, so ask again instead of leaving it
 // stuck. With --reconnect-on-error, reconnect, so --max-reconnect-attempts
 // bounds the retries and they stop once the run is over. Otherwise resend
-// CLUSTER SLOTS after a second. Counting the error as a connection error (as a
-// reconnect does) also advances the run's clock, which otherwise moves only on
-// replies, so the run still ends at --test-time. At startup
-// --connection-stage-timeout still applies.
+// CLUSTER SLOTS after a second. Once the run has started, count the error as
+// a connection error (as a reconnect does): that also advances the run's
+// clock, which otherwise moves only on replies, so the run still ends at
+// --test-time. Before the first reply, leave the clock alone, so a node that
+// never answers still ends the run at --connection-stage-timeout instead of
+// finishing an empty run at --test-time.
 void shard_connection::retry_cluster_slots_after_error()
 {
     if (m_config->reconnect_on_error) {
@@ -1950,9 +1952,11 @@ void shard_connection::retry_cluster_slots_after_error()
         return;
     }
 
-    struct timeval now;
-    gettimeofday(&now, NULL);
-    static_cast<client *>(m_conns_manager)->get_stats()->update_connection_error(&now);
+    if (m_conns_manager->get_reqs_answered()) {
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        static_cast<client *>(m_conns_manager)->get_stats()->update_connection_error(&now);
+    }
 
     m_cluster_slots = setup_none;
     if (m_deferred_fill_timer == NULL) {
