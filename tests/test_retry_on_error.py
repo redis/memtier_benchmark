@@ -544,7 +544,8 @@ def test_dropped_replays_do_not_stall_client(env):
 
 
 
-def _run_transaction_with_kills(env, extra_args, requests=None, test_time=None, kill_interval=0.5, pipeline=1):
+def _run_transaction_with_kills(env, extra_args, requests=None, test_time=None, kill_interval=0.5, pipeline=1,
+                                set_ratio=1):
     """Run a MULTI/SET/EXEC --transaction rotation while every primary's
     clients are killed every kill_interval seconds.
 
@@ -557,6 +558,7 @@ def _run_transaction_with_kills(env, extra_args, requests=None, test_time=None, 
             "--transaction",
             "--command=MULTI",
             "--command=SET __key__ __data__",
+            "--command-ratio={}".format(set_ratio),
             "--command=EXEC",
             "--reconnect-on-error",
             "--hide-histogram",
@@ -655,17 +657,33 @@ def test_transaction_lost_multi_is_not_continued(env):
     Once a reconnect drops the connection's open MULTI, the rest of that
     block is not sent: outside the MULTI its SET runs untransacted and its
     EXEC fails with "EXEC without MULTI". (Cluster mode is covered in
-    test_cluster_transaction.py.)
+    test_cluster_transaction.py.) The skip ends at the EXEC: the GETs after
+    it are still sent.
     """
     if env.isCluster():
         env.skip()
         return
-    rc, stderr_content, killed, errors, _ = _run_transaction_with_kills(env, [], test_time=6, kill_interval=0.3,
-                                                                       pipeline=8)
+    # Long blocks, so most kills land inside one; a --pipeline that does not
+    # divide the rotation, so the kill does not always find it at a boundary.
+    get_ratio, pipeline = 50, 7
+    rc, stderr_content, killed, errors, _ = _run_transaction_with_kills(
+        env, ["--command=GET __key__", "--command-ratio={}".format(get_ratio)], test_time=6, kill_interval=0.3,
+        pipeline=pipeline, set_ratio=50)
     env.assertEqual(rc, 0, message="memtier exited {} after connection kills".format(rc))
     env.assertFalse("EXEC without MULTI" in stderr_content, message="an EXEC was sent without its MULTI")
     # memtier is the only client, so any -ERR reply is one of its own.
     env.assertEqual(errors, 0, message="{} -ERR replies for {} killed connections".format(errors, killed))
+    # Every rotation sends get_ratio GETs, except the GETs in flight on a
+    # killed connection and the partial rotations of the 8 connections at the end.
+    stats = env.getOSSMasterNodesConnectionList()[0].execute_command("INFO", "commandstats")
+    multi = stats.get("cmdstat_multi", {}).get("calls", 0)
+    get = stats.get("cmdstat_get", {}).get("calls", 0)
+    env.assertGreater(multi, 0, message="no MULTI was sent")
+    missing = get_ratio * multi - get
+    env.debugPrint("{} MULTIs, {} GETs, {} missing, {} connections killed".format(multi, get, missing, killed), True)
+    env.assertLessEqual(missing, get_ratio * 8 + pipeline * killed,
+                        message="{} GETs missing for {} MULTIs: GETs after a skipped EXEC were skipped too".format(
+                            missing, multi))
 
 
 def _db_conn(env, db):

@@ -718,7 +718,10 @@ void client::create_request(struct timeval timestamp, unsigned int conn_id)
         }
 
         const arbitrary_command &cmd = get_arbitrary_command(m_executed_command_index);
-        if (m_config->transaction) {
+        /* Cluster mode can fall through to here (an empty key pool), but
+         * there the MULTI may sit on another connection than conn_id; its
+         * own check is in cluster_client::create_arbitrary_request(). */
+        if (m_config->transaction && !m_config->cluster_mode) {
             /* The connection lost this rotation's MULTI when it reconnected.
              * Sent now, the rest of the block would run outside any
              * transaction and its EXEC would fail with "EXEC without MULTI".
