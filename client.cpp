@@ -391,6 +391,32 @@ void client::set_end_time_keep_live_totals(bool keep_live_totals)
     }
 }
 
+unsigned int client::abandon_unanswered_requests(void)
+{
+    if (m_end_set || m_config->test_time == 0) return 0;
+    if (m_stats.get_duration_usec() < (unsigned long long) (m_config->test_time + TEST_TIME_DRAIN_GRACE_SECS) * 1000000)
+        return 0;
+
+    // Only a client that is waiting for replies: one with nothing in flight
+    // ends by itself, or is waiting for a reconnect.
+    unsigned int pending = 0;
+    for (unsigned int i = 0; i < m_connections.size(); i++) {
+        if (m_connections[i] != NULL) pending += m_connections[i]->get_pending_resp();
+    }
+    if (pending == 0) return 0;
+
+    // They never got a reply: errors, not ops. disconnect() drops them. The
+    // run measured --test-time, not the grace period spent waiting for them.
+    for (unsigned int i = 0; i < pending; i++)
+        m_stats.inc_error();
+    struct timeval end_time = m_stats.get_start_time();
+    end_time.tv_sec += m_config->test_time;
+    m_stats.set_end_time(&end_time);
+    m_end_set = true;
+    disconnect_all();
+    return pending;
+}
+
 bool client::hold_pipeline(unsigned int conn_id)
 {
     // don't exceed requests
@@ -1461,6 +1487,42 @@ void client_group::handle_staircase_step(void)
             event_free(m_staircase_timer);
             m_staircase_timer = NULL;
         }
+    }
+}
+
+// Called from the main thread once a --test-time run is
+// TEST_TIME_DRAIN_GRACE_SECS past its deadline and this thread has not ended.
+// The clients belong to the worker thread, so hand the work to its event loop
+// (this also wakes it from a poll that has nothing left to deliver).
+void client_group::end_stalled_clients(void)
+{
+    struct timeval zero = {0, 0};
+    event_base_once(m_base, -1, EV_TIMEOUT, end_stalled_clients_cb, (void *) this, &zero);
+}
+
+void client_group::end_stalled_clients_cb(evutil_socket_t fd, short what, void *arg)
+{
+    (void) fd;
+    (void) what;
+    ((client_group *) arg)->handle_end_stalled_clients();
+}
+
+void client_group::handle_end_stalled_clients(void)
+{
+    unsigned long long abandoned = 0;
+    unsigned int stalled = 0;
+    unsigned int count = active_client_count();
+    for (unsigned int i = 0; i < count && i < m_clients.size(); i++) {
+        unsigned int n = m_clients[i]->abandon_unanswered_requests();
+        if (n > 0) {
+            abandoned += n;
+            stalled++;
+        }
+    }
+    if (stalled > 0) {
+        benchmark_error_log("warning: %u client(s) got no reply to %llu request(s) %u seconds after the test time "
+                            "ended; counted as errors.\n",
+                            stalled, abandoned, TEST_TIME_DRAIN_GRACE_SECS);
     }
 }
 

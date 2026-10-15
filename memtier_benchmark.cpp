@@ -3597,6 +3597,8 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
         (*i)->start();
     }
+    struct timeval launch_time;
+    gettimeofday(&launch_time, NULL);
 
     // Send "run started" annotation to Graphite
     if (cfg->statsd != NULL && cfg->statsd->is_enabled()) {
@@ -3717,8 +3719,22 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         unsigned long long int total_retry_attempts = 0;
         unsigned long long int total_retried_ops = 0;
 
+        // Replies still pending well after --test-time (the server stopped
+        // replying) would otherwise keep the run waiting forever. Each client
+        // checks its own deadline; this only says when to start asking.
+        bool end_stalled = false;
+        if (cfg->test_time > 0) {
+            struct timeval now;
+            gettimeofday(&now, NULL);
+            end_stalled =
+                ts_diff(launch_time, now) >= (long long) (cfg->test_time + TEST_TIME_DRAIN_GRACE_SECS) * 1000000;
+        }
+
         for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
-            if (!(*i)->m_finished) active_threads++;
+            if (!(*i)->m_finished) {
+                active_threads++;
+                if (end_stalled) (*i)->m_cg->end_stalled_clients();
+            }
 
             total_ops += (*i)->m_cg->get_total_ops();
             total_bytes += (*i)->m_cg->get_total_bytes();

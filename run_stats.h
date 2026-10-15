@@ -225,6 +225,7 @@ public:
     void setup_arbitrary_commands(size_t n_arbitrary_commands);
     void set_start_time(struct timeval *start_time);
     void set_end_time(struct timeval *end_time, bool keep_live_totals = false);
+    struct timeval get_start_time(void) const { return m_start_time; }
     void set_interrupted(bool interrupted) { m_interrupted = interrupted; }
     bool get_interrupted() const { return m_interrupted; }
 

@@ -53,6 +53,11 @@ class object_generator;
 // Stack buffer size for key operations to avoid heap allocation
 #define KEY_BUFFER_STACK_SIZE 512
 
+// How long a --test-time run waits, past its deadline, for replies to requests
+// already sent. A client still waiting after that (the server stopped
+// replying) is ended and its unanswered requests are counted as errors.
+#define TEST_TIME_DRAIN_GRACE_SECS 10
+
 enum get_key_response
 {
     not_available,
@@ -153,6 +158,9 @@ public:
     // True once set_end_time() ran: the client reached its stop condition
     // (finished()) or was finalized by client_group::finalize_all_clients().
     bool end_time_set(void) const { return m_end_set; }
+    // Ends a client whose --test-time deadline passed TEST_TIME_DRAIN_GRACE_SECS
+    // ago with replies still pending; returns the number of requests abandoned.
+    unsigned int abandon_unanswered_requests(void);
 
     virtual get_key_response get_key_for_conn(unsigned int command_index, unsigned int conn_id,
                                               unsigned long long *key_index);
@@ -318,6 +326,8 @@ protected:
     void setup_staircase_timer(void);
     void handle_staircase_step(void);
     static void staircase_timer_cb(evutil_socket_t fd, short what, void *arg);
+    static void end_stalled_clients_cb(evutil_socket_t fd, short what, void *arg);
+    void handle_end_stalled_clients(void);
     unsigned int active_client_count(void);
 
 public:
@@ -332,6 +342,7 @@ public:
     void finalize_all_clients(bool keep_live_totals = false);
     void set_all_clients_interrupted(void);
     unsigned int count_unended_clients(void);
+    void end_stalled_clients(void);
 
     void write_client_stats(const char *prefix);
 
