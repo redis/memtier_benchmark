@@ -231,16 +231,16 @@ jobs:
         platform: [ubuntu-22.04]
         test-config:
           - name: "Single Endpoint: TCP Plaintext"
-            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "0", VERBOSE: "1" }
+            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "0", VERBOSE: "1", PARALLELISM: "2" }
             tls: false
           - name: "Single Endpoint: TCP TLS"
-            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", VERBOSE: "1" }
+            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", VERBOSE: "1", PARALLELISM: "2" }
             tls: true
           - name: "OSS TCP TLS v1.2"
-            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", TLS_PROTOCOLS: "TLSv1.2", VERBOSE: "1" }
+            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", TLS_PROTOCOLS: "TLSv1.2", VERBOSE: "1", PARALLELISM: "2" }
             tls: true
           - name: "OSS TCP TLS v1.3"
-            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", TLS_PROTOCOLS: "TLSv1.3", VERBOSE: "1" }
+            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", TLS_PROTOCOLS: "TLSv1.3", VERBOSE: "1", PARALLELISM: "2" }
             tls: true
           - name: "OSS-CLUSTER API: TCP Plaintext"
             env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", VERBOSE: "1", PARALLELISM: "2" }
@@ -333,7 +333,10 @@ jobs:
           ./tests/gen-test-certs.sh
 
     - name: Run tests
-      timeout-minutes: 25
+      # The standalone cells run the whole suite (~1300-1500 s serially as of
+      # 2026-10, issue #679), so they use PARALLELISM=2 like the cluster cells;
+      # the limit keeps headroom for slow runners.
+      timeout-minutes: 40
       env: ${{ matrix.test-config.env }}
       run: |
         ./tests/run_tests.sh
@@ -446,7 +449,8 @@ jobs:
         ulimit -n 40960
 
     - name: Run tests for coverage
-      timeout-minutes: 25
+      # Kept serial; ~1250 s as of 2026-10, close to the old 25 min limit (#679).
+      timeout-minutes: 40
       env:
         OSS_STANDALONE: "1"
         OSS_CLUSTER: "0"
