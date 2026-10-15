@@ -680,6 +680,12 @@ def test_transaction_requests_are_not_retried(env):
     env.assertGreaterEqual(len(dropped), 1, message="no in-flight request was dropped on a kill")
     env.assertTrue(all(r.endswith(',"transaction-not-replayed",0') for r in dropped),
                    message="unexpected REPLAY rows: {}".format(dropped[:5]))
+    # Every logged request never got a successful reply, the dropped ones
+    # included: each one counts as an error.
+    totals = re.findall(r"errors (\d+) \(", stderr_content)
+    env.assertTrue(totals, message=stderr_content[-2000:])
+    if totals:
+        env.assertEqual(int(totals[-1]), len(rows), message="{} REPLAY rows".format(len(dropped)))
 
 
 def test_dropped_transaction_requests_do_not_stall_requests_run(env):
@@ -1061,3 +1067,54 @@ def test_retries_left_at_end_of_test_time_are_counted(env):
     env.assertTrue(totals, message=result.stderr)
     if totals:
         env.assertEqual(int(totals[-1]), abandoned, message=result.stderr)
+
+
+def test_replays_abandoned_when_reconnects_run_out_are_counted(env):
+    """
+    Requests held for resend when --max-reconnect-attempts runs out are
+    logged and counted as errors.
+
+    The peer closes the connection with writes in flight and stops listening.
+    The reconnect is refused, the thread ends, and nothing will resend the
+    requests: they vanished with "errors 0" and nothing logged.
+    """
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+
+    def serve():
+        conn, _ = listener.accept()
+        listener.close()  # refuse the reconnect
+        buf = b""
+        try:
+            while b"SET" not in buf:
+                data = conn.recv(65536)
+                if not data:
+                    break
+                buf += data
+        finally:
+            conn.close()  # with the writes in flight
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    with tempfile.TemporaryDirectory() as directory:
+        failed_keys = os.path.join(directory, "failed.csv")
+        args = [MEMTIER_BINARY, "--server=127.0.0.1", "--port={}".format(port), "--threads=1", "--clients=1",
+                "--pipeline=8", "--requests=50", "--ratio=1:0", "--key-minimum=1", "--key-maximum=1000",
+                "--hide-histogram", "--retry-on-error", "--reconnect-on-error", "--max-reconnect-attempts=1",
+                "--failed-keys-file=" + failed_keys]
+        result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, text=True)
+        thread.join(timeout=5)
+        with open(failed_keys) as source:
+            rows = list(csv.reader(source))[1:]
+
+    # The run fails: its thread ended before --requests was reached.
+    env.assertNotEqual(result.returncode, 0, message=result.stderr)
+    env.assertContains("ending this thread", result.stderr)
+    env.assertGreaterEqual(len(rows), 1, message="no abandoned request was logged")
+    env.assertEqual([row[3] for row in rows], ["max-reconnect-attempts-exceeded"] * len(rows))
+    totals = re.findall(r"errors (\d+) \(", result.stderr)
+    env.assertTrue(totals, message=result.stderr)
+    if totals:
+        env.assertEqual(int(totals[-1]), len(rows), message=result.stderr)

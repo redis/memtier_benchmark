@@ -285,22 +285,13 @@ void client::disconnect_all(void)
         shard_connection *sc = m_connections[i];
         if (sc != NULL) {
             sc->disconnect();
-            request *req;
-            while ((req = sc->pop_replay_request()) != NULL) {
-                struct timeval now;
-                gettimeofday(&now, NULL);
-                global_failed_keys_logger().log_failure(now, "REPLAY", req->m_key, req->m_key_len,
-                                                        "run-ended-before-resend", req->m_retries);
-                abandoned++;
-                delete req;
-            }
+            abandoned += sc->abandon_replay_requests("run-ended-before-resend");
         }
     }
     if (abandoned) {
         benchmark_error_log("warning: %llu request(s) held for retry when the run ended were not resent; "
                             "counted as errors.\n",
                             abandoned);
-        abandon_requests(abandoned);
     }
 }
 

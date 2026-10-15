@@ -24,11 +24,16 @@ are exact. Modes:
   makes memtier refresh; every later map says B owns every slot and A is its
   replica. A answers SET with -READONLY and is slow, so MULTI blocks are in
   flight on A when the new map lands. B counts SETs that arrive outside MULTI.
+- "handoff": B owns 0-8191 and A 8192-16383. B closes its socket when the
+  first SET arrives, with writes in flight. The next map leaves B out and
+  0-8191 unowned; every later map says A owns every slot. The first SET A
+  gets after that answers -MOVED, so memtier refreshes to the full map.
 """
 import binascii
 import csv
 import json
 import os
+import re
 import socketserver
 import subprocess
 import tempfile
@@ -77,6 +82,8 @@ class _Cluster(object):
         self.naked_b_writes = 0  # "txn": SETs that reached B outside MULTI
         self.late_readonly = 0  # "txn": -READONLY A sent after serving the new map
         self.moved_sent = False
+        self.b_closed = False  # "handoff": B dropped its connection
+        self.slots_after_close = 0  # "handoff": maps served since then
         self.errors = []
         self.stats = None
         self.a = _Peer(self, "A")
@@ -89,6 +96,17 @@ class _Cluster(object):
             first = self.slots_calls == 1
             moved = self.moved_sent
         a_port, b_port = self.a.server_address[1], self.b.server_address[1]
+        if self.mode == "handoff":
+            with self.lock:
+                after_close = self.slots_after_close
+                if self.b_closed:
+                    self.slots_after_close += 1
+            if not self.b_closed:
+                return (b"*2\r\n*3\r\n:0\r\n:8191\r\n" + _node(b_port, b"b") +
+                        b"*3\r\n:8192\r\n:16383\r\n" + _node(a_port, b"a"))
+            if after_close == 0:
+                return b"*1\r\n*3\r\n:8192\r\n:16383\r\n" + _node(a_port, b"a")
+            return b"*1\r\n*3\r\n:0\r\n:16383\r\n" + _node(a_port, b"a")
         if self.mode == "replica":
             return b"*1\r\n*4\r\n:0\r\n:16383\r\n" + _node(a_port, b"a") + _node(b_port, b"b")
         if self.mode == "ask-moved":
@@ -123,6 +141,14 @@ class _Cluster(object):
                 self.moved_sent = True
                 if not first and not in_multi:
                     self.naked_b_writes += 1
+        if self.mode == "handoff":
+            with self.lock:
+                first = self.b_closed and not self.moved_sent
+                self.moved_sent = self.moved_sent or first
+            if first:
+                # Makes memtier refresh, to a map that covers every slot.
+                return b"-MOVED %d 127.0.0.1:%d\r\n" % (_slot(key), self.a.server_address[1])
+            return b"+OK\r\n"
         if self.mode == "ask-moved":
             if name == "B":
                 return b"-MOVED %d 127.0.0.1:%d\r\n" % (_slot(key), self.a.server_address[1])
@@ -179,6 +205,10 @@ class _Handler(socketserver.StreamRequestHandler):
                     size = self.rfile.readline()
                     args.append(self.rfile.read(int(size[1:]) + 2)[:-2])
                 verb = args[0].upper()
+                if cluster.mode == "handoff" and name == "B" and verb == b"SET":
+                    with cluster.lock:
+                        cluster.b_closed = True
+                    return  # drop the connection with the writes in flight
                 if cluster.mode == "txn" and name == "A" and verb != b"CLUSTER":
                     time.sleep(0.05)  # keep MULTI blocks in flight on A
                 elif cluster.mode == "replica" and name == "A" and verb == b"SET":
@@ -230,7 +260,10 @@ def _run(env, mode, command, extra_args, requests=50, pipeline=1):
                 "--cluster-mode", "--threads=1", "--clients=1", "--pipeline={}".format(pipeline),
                 "--requests={}".format(requests), "--hide-histogram",
                 "--json-out-file=" + os.path.join(directory, "stats.json")]
-        if mode != "txn":
+        if mode == "handoff":
+            # memtier-1 is in B's half, memtier-2 and memtier-3 in A's.
+            args += ["--key-minimum=1", "--key-maximum=3"]
+        elif mode != "txn":
             args += ["--key-minimum=1", "--key-maximum=1"]
         if command == "set":
             args.append("--ratio=1:0")
@@ -250,6 +283,9 @@ def _run(env, mode, command, extra_args, requests=50, pipeline=1):
         result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, text=True)
         env.assertEqual(result.returncode, 0, message=label + "\n" + result.stderr[-2000:])
         env.assertEqual(cluster.errors, [], message=label)
+        # The error total of the last progress line.
+        totals = re.findall(r"errors (\d+) \(", result.stderr)
+        cluster.stderr_errors = int(totals[-1]) if totals else None
         stats_path = os.path.join(directory, "stats.json")
         if os.path.isfile(stats_path):
             with open(stats_path) as f:
@@ -413,3 +449,21 @@ def test_readonly_in_transaction_is_not_retried_outside_multi(env):
     # refresh, fail here instead of passing without exercising the handler.
     env.assertGreaterEqual(cluster.late_readonly, 1, message=label + " {}".format(cluster.writes))
     env.assertEqual(cluster.naked_b_writes, 0, message=label + " {}".format(cluster.writes))
+
+
+def test_requests_dropped_at_hand_off_count_as_errors(env):
+    """Requests a retired connection can't hand off count as errors.
+
+    B drops its connection with writes in flight; --retry-on-error holds them
+    for resend. The refresh retires B and leaves their slot without an owner,
+    so they are dropped as "no-slot-owner-for-replay". Each one never gets a
+    reply and must count as an error, like the rows it is logged with.
+    """
+    cluster, rows, label = _run(env, "handoff", "set",
+                                ["--retry-on-error", "--reconnect-on-error", "--failed-keys-file"],
+                                requests=50, pipeline=8)
+    env.assertTrue(cluster.b_closed, message=label)
+    env.assertGreaterEqual(len(rows), 1, message=label + " no request was dropped at hand-off")
+    env.assertEqual([row[3] for row in rows], ["no-slot-owner-for-replay"] * len(rows), message=label)
+    env.assertEqual(cluster.stats["Totals"]["Count"] if cluster.stats else None, 50, message=label)
+    env.assertEqual(cluster.stderr_errors, len(rows), message=label)

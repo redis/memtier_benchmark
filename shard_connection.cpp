@@ -1031,6 +1031,21 @@ request *shard_connection::pop_replay_request()
     return NULL;
 }
 
+unsigned long long shard_connection::abandon_replay_requests(const char *reason)
+{
+    unsigned long long abandoned = 0;
+    request *req;
+    while ((req = pop_replay_request()) != NULL) {
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        global_failed_keys_logger().log_failure(now, "REPLAY", req->m_key, req->m_key_len, reason, req->m_retries);
+        abandoned++;
+        delete req;
+    }
+    if (abandoned) m_conns_manager->abandon_requests(abandoned);
+    return abandoned;
+}
+
 void shard_connection::adopt_replay_request(request *req)
 {
     // Requests are only held for resend with --retry-on-error, which gives
@@ -1856,6 +1871,8 @@ void shard_connection::attempt_reconnect(const char *error_context)
         benchmark_error_log("Maximum reconnection attempts (%u) exceeded for %s, ending this thread.\n",
                             m_config->max_reconnect_attempts, error_context);
         disconnect();
+        // Nothing will resend the requests held for it now.
+        abandon_replay_requests("max-reconnect-attempts-exceeded");
         // Break the event loop: the thread ends and run_benchmark() fails the
         // run. It is not restarted.
         event_base_loopbreak(m_event_base);

@@ -317,6 +317,10 @@ public:
     // from inside the refresh.
     request *pop_replay_request();
     void adopt_replay_request(request *req);
+    // Give up on every request held for resend: log each one to
+    // --failed-keys-file with `reason` and count it as an error. Returns how
+    // many were dropped.
+    unsigned long long abandon_replay_requests(const char *reason);
     // Capture bytes added between `before_pos` and the current evbuffer length
     // into req->m_serialized. No-op when retry is globally disabled.
     void capture_serialized_bytes(size_t before_pos, request *req);
