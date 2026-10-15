@@ -1327,11 +1327,9 @@ void shard_connection::process_response(void)
                 // enter steady-state routing with an empty topology
                 // (m_shard_groups empty on bootstrap), and every slot lookup
                 // would return UINT_MAX. Leave m_cluster_slots at its prior
-                // value (setup_sent during the bootstrap ladder). While it is
-                // setup_sent, set_cluster_slots() does not request another
-                // refresh, so only disconnect() re-arms it (a reconnect, or
-                // the peer closing the socket after the bad reply). The
-                // write-side hold_pipeline spin guard added in the previous
+                // value (setup_sent during the bootstrap ladder), and ask
+                // again as for an empty reply (retry_cluster_slots_after_error).
+                // The write-side hold_pipeline spin guard added in the previous
                 // commit still prevents fill_pipeline from busy-spinning if
                 // the worker somehow reaches steady-state with an empty
                 // topology via a different code path.
@@ -1363,6 +1361,8 @@ void shard_connection::process_response(void)
                     // --connection-stage-timeout=0. Mirrors how AUTH / SELECT /
                     // HELLO / READONLY rejections are already surfaced above.
                     report_connection_stage_failure("CLUSTER SLOTS reply rejected (every shard malformed)");
+                    retry_cluster_slots_after_error();
+                    error = true;
                 }
             }
             break;
@@ -1934,15 +1934,15 @@ void shard_connection::reconnect_after_setup_error(const char *error_context)
     }
 }
 
-// A CLUSTER SLOTS reply was empty or an error, e.g. from a node that owns no
-// slots yet. No workload request is sent on this connection until a refresh
-// succeeds, so ask again instead of leaving it stuck. With
-// --reconnect-on-error, reconnect, so --max-reconnect-attempts bounds the
-// retries and they stop once the run is over. Otherwise resend CLUSTER SLOTS
-// after a second. Counting the error as a connection error (as a reconnect
-// does) also advances the run's clock, which otherwise moves only on replies,
-// so the run still ends at --test-time. At startup --connection-stage-timeout
-// still applies.
+// A CLUSTER SLOTS reply was empty, an error, or had no valid shard, e.g. from
+// a node that owns no slots yet. No workload request is sent on this
+// connection until a refresh succeeds, so ask again instead of leaving it
+// stuck. With --reconnect-on-error, reconnect, so --max-reconnect-attempts
+// bounds the retries and they stop once the run is over. Otherwise resend
+// CLUSTER SLOTS after a second. Counting the error as a connection error (as a
+// reconnect does) also advances the run's clock, which otherwise moves only on
+// replies, so the run still ends at --test-time. At startup
+// --connection-stage-timeout still applies.
 void shard_connection::retry_cluster_slots_after_error()
 {
     if (m_config->reconnect_on_error) {

@@ -1,8 +1,8 @@
-"""A CLUSTER SLOTS reply that is empty or an error (#648).
+"""A CLUSTER SLOTS reply that is empty, an error (#648), or malformed (#670).
 
 A scripted RESP peer acts as a one-node cluster that owns every slot. It
 answers some CLUSTER SLOTS requests with an empty array or an error, as a
-node that has no slots yet does. memtier used to log "cluster slot failed"
+node that has no slots yet does, or with shards that all fail validation. memtier used to log "cluster slot failed"
 and never ask again: the connection sent no more requests, so the run hung
 past --test-time and --requests. It must ask again, and finish once the node
 answers.
@@ -131,3 +131,39 @@ def test_cluster_slots_empty_reply_mid_run_honours_test_time(env):
     env.assertNotEqual(returncode, 0)
     env.assertContains("CLUSTER SLOTS error, attempting reconnection", stderr)
     env.assertLess(elapsed, 10)
+
+
+# Every shard fails validation: the slot range is out of bounds, or the node
+# has no port. The reply is not empty, so it takes a different path.
+MALFORMED_RANGE = b"*1\r\n*3\r\n:0\r\n:16384\r\n*2\r\n$9\r\n127.0.0.1\r\n:1\r\n"
+MALFORMED_NODE = b"*1\r\n*3\r\n:0\r\n:16383\r\n*1\r\n$9\r\n127.0.0.1\r\n"
+
+
+def test_cluster_slots_malformed_reply_mid_run_is_retried(env):
+    node = _Node(bad_slots_replies=2, moved_after=50, bad_reply=MALFORMED_RANGE)
+    returncode, stderr, _ = _run(node, ["--requests=200"])
+    env.assertEqual(node.errors, [])
+    env.assertEqual(returncode, 0, message=stderr[-2000:])
+    env.assertContains("every shard in the reply was malformed", stderr)
+    env.assertEqual(node.slots_requests, 4)
+    env.assertGreaterEqual(node.data_requests, 200)
+
+
+def test_cluster_slots_malformed_reply_at_startup_is_retried(env):
+    node = _Node(bad_slots_replies=2, bad_reply=MALFORMED_NODE)
+    returncode, stderr, _ = _run(node, ["--requests=200"])
+    env.assertEqual(node.errors, [])
+    env.assertEqual(returncode, 0, message=stderr[-2000:])
+    env.assertEqual(node.slots_requests, 3)
+    env.assertGreaterEqual(node.data_requests, 200)
+
+
+def test_cluster_slots_malformed_reply_mid_run_honours_test_time(env):
+    node = _Node(bad_slots_replies=1000, moved_after=50, bad_reply=MALFORMED_RANGE)
+    returncode, stderr, elapsed = _run(node, ["--test-time=2", "--reconnect-on-error"])
+    env.assertEqual(node.errors, [])
+    env.assertNotEqual(returncode, "timeout", message=stderr[-2000:])
+    env.assertNotEqual(returncode, 0)
+    env.assertContains("CLUSTER SLOTS error, attempting reconnection", stderr)
+    env.assertLess(elapsed, 10)
+
