@@ -1761,9 +1761,11 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             break;
         case o_reconnect_backoff_factor:
             endptr = NULL;
+            errno = 0;
             cfg->reconnect_backoff_factor = strtod(optarg, &endptr);
-            if (cfg->reconnect_backoff_factor <= 0.0 || !endptr || *endptr != '\0') {
-                fprintf(stderr, "error: reconnect-backoff-factor must be greater than zero.\n");
+            if (endptr == optarg || !endptr || *endptr != '\0' || errno == ERANGE ||
+                !std::isfinite(cfg->reconnect_backoff_factor) || cfg->reconnect_backoff_factor < 0.0) {
+                fprintf(stderr, "error: reconnect-backoff-factor must be a finite number >= 0 (0 = no backoff).\n");
                 return -1;
             }
             break;
@@ -2667,7 +2669,8 @@ void usage()
         "      --reconnect-on-error       Enable automatic reconnection on connection errors (default: disabled).\n"
         "                                 Without it, a lost connection ends its thread and the run exits 1.\n"
         "      --max-reconnect-attempts=NUM Maximum number of reconnection attempts (default: 0, unlimited)\n"
-        "      --reconnect-backoff-factor=NUM Backoff factor for reconnection delays (default: 0, no backoff)\n"
+        "      --reconnect-backoff-factor=NUM Non-negative backoff factor for reconnection delays (default: 0, no "
+        "backoff)\n"
         "      --retry-on-error           Resend a request when the server returns a transient error or the\n"
         "                                 connection drops mid-flight. Excludes permanent errors (WRONGTYPE,\n"
         "                                 NOAUTH, NOPERM, syntax/argcount/unknown-command). Default: disabled.\n"
