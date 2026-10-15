@@ -32,35 +32,40 @@ from include import (
 from mb import Benchmark, RunConfig
 
 
-# Tolerance for the (Accumulated / Count) vs Latency comparison.
-# Accumulated Latency is emitted with %lld (1 ms precision), Latency with
-# %.3f (0.001 ms precision). For low op counts the rounding of Accumulated
-# can dominate, so we accept the largest of an absolute 0.01 ms slack, a 2%
-# relative gap, and the quantization bound computed in _latency_tolerance().
+# Tolerance for comparing an average latency with Accumulated / Count.
+# "Accumulated Latency" is emitted with %lld (whole ms, truncated) and the
+# averages with %.3f. Below Accumulated/Count we allow only a static slack,
+# the larger of 0.01 ms and 2%. Above it we also allow the truncation and
+# rounding bound computed in _latency_bounds().
 ABS_TOLERANCE_MS = 0.01
 REL_TOLERANCE = 0.02
 # "Average Latency" is printed with %.3f, so it is rounded by up to 0.0005 ms.
 AVG_PRINT_ROUNDING_MS = 0.0005
-FLOAT_EPSILON_MS = 1e-9
 
 
-def _latency_tolerance(derived, count):
-    """Allowed |avg - Accumulated/Count| gap, in ms.
+def _latency_bounds(derived, count):
+    """Return (below, above): how far, in ms, a correct average may sit
+    below or above Accumulated/Count.
 
-    Both fields come from the same whole-microsecond sum. "Accumulated
-    Latency" is emitted with %lld, so it is truncated by up to 0.999 ms
-    and Accumulated/Count is low by up to 0.999/count ms. The average is
-    printed with %.3f and rounded by up to 0.0005 ms. So the gap is at most
-    0.999/count + 0.0005 ms. We allow 1/count + 0.0005, plus a tiny epsilon
-    because the gap can land exactly on 1/count (e.g. true avg 6.9998
-    printed as 7.000 with acc=41, count=6). For low-count buckets/sections
-    (e.g. the trailing second of a short --test-time run with
-    --reconnect-interval=1) this term dominates the static floors. (Section
-    totals compute the average with integer us division, which can put it
-    up to 0.0015 ms below Accumulated/Count; ABS_TOLERANCE_MS covers that.)
+    All fields come from the same whole-microsecond sum. "Accumulated
+    Latency" is that sum truncated to whole ms by %lld, so Accumulated/Count
+    is low by at most 0.999/count ms. A %.3f average is rounded by at most
+    0.0005 ms. So a correct average is at most 0.999/count + 0.0005 ms above
+    Accumulated/Count. We allow 1/count + 0.0005, which leaves at least
+    0.001/count ms of headroom for float noise. For low-count buckets and
+    sections (e.g. the trailing second of a short --test-time run, or Sets
+    under a skewed --ratio) this term dominates the static floor.
+
+    Below Accumulated/Count, a correct average can only be off by printing.
+    The Time-Serie and Totals averages use double division, so they are off
+    by up to 0.0005 ms of %.3f rounding. The Sets/Gets and arbitrary-command
+    sections use integer us division (totals_cmd::summarize), so they are
+    exact multiples of 0.001 ms and at most (count-1)/(1000*count) ms low.
+    The static floor covers both. Keeping this side tight is what catches an
+    average truncated to an integer, for low counts too.
     """
-    return max(ABS_TOLERANCE_MS, REL_TOLERANCE * derived,
-               1.0 / count + AVG_PRINT_ROUNDING_MS + FLOAT_EPSILON_MS)
+    below = max(ABS_TOLERANCE_MS, REL_TOLERANCE * derived)
+    return below, max(below, 1.0 / count + AVG_PRINT_ROUNDING_MS)
 
 
 def _assert_latency_consistent(env, section_name, section):
@@ -106,12 +111,12 @@ def _assert_latency_consistent(env, section_name, section):
 
     # Latency must match Accumulated/Count within tolerance. Catches the
     # bug where Latency was stored as an integer (e.g., 1.291 -> 1.000).
-    tolerance = _latency_tolerance(derived, count)
+    below, above = _latency_bounds(derived, count)
     env.assertTrue(
-        abs(latency - derived) <= tolerance,
+        -below <= latency - derived <= above,
         message=f"{section_name}: 'Latency' {latency:.4f} ms inconsistent "
                 f"with Accumulated/Count ({accumulated}/{count} = "
-                f"{derived:.4f} ms); tolerance {tolerance:.4f} ms")
+                f"{derived:.4f} ms); allowed -{below:.4f}/+{above:.4f} ms")
 
 
 def _assert_time_series_consistent(env, section_name, section):
@@ -129,7 +134,7 @@ def _assert_time_series_consistent(env, section_name, section):
         avg = float(bucket["Average Latency"])
         acc = float(bucket["Accumulated Latency"])
         derived = acc / count
-        tolerance = _latency_tolerance(derived, count)
+        below, above = _latency_bounds(derived, count)
         if acc > 0:
             env.assertGreater(
                 avg, 0.0,
@@ -137,11 +142,11 @@ def _assert_time_series_consistent(env, section_name, section):
                         f"Average Latency is 0 but Accumulated={acc}, "
                         f"Count={count}")
         env.assertTrue(
-            abs(avg - derived) <= tolerance,
+            -below <= avg - derived <= above,
             message=f"{section_name} Time-Serie[{bucket_key}]: "
                     f"Average Latency {avg:.4f} ms inconsistent with "
                     f"Accumulated/Count ({acc}/{count} = {derived:.4f} ms); "
-                    f"tolerance {tolerance:.4f} ms")
+                    f"allowed -{below:.4f}/+{above:.4f} ms")
 
 
 def _validate_run_section(env, run_label, run_section):
@@ -692,11 +697,12 @@ def test_json_aggregated_connection_errors_sec(env):
 def test_time_series_tolerance_covers_truncation_and_rounding(env):
     # Values from a TSAN CI failure: 6 ops whose true sum is just under 42 ms.
     # "Accumulated Latency" truncates to 41 and "Average Latency" (%.3f) rounds
-    # to 7.000, so the gap sits exactly on 1/count. memtier's output is
-    # consistent here; the checker must accept it.
+    # to 7.000, so avg - acc/count is exactly 1/count (above the old 1/count
+    # bound in floating point). memtier's output is consistent here; the
+    # checker must accept it.
     # Bucket "6": 7 ops summing to 7.999 ms -> avg 1.142714 prints as 1.143,
     # acc truncates to 7. The gap 0.143 exceeds 1/7 (0.142857), so it is only
-    # accepted thanks to the %.3f rounding term, not the float epsilon.
+    # accepted thanks to the %.3f rounding term.
     section = {"Time-Serie": {"5": {"Count": 6,
                                     "Average Latency": "7.000",
                                     "Accumulated Latency": 41},
@@ -714,3 +720,35 @@ def test_section_tolerance_covers_truncation(env):
     section = {"Count": 3, "Latency": "0.333", "Average Latency": "0.333",
                "Accumulated Latency": 0}
     _assert_latency_consistent(env, "synthetic.Sets", section)
+
+
+class _FailureCounter:
+    """Stand-in env that counts failed assertions instead of failing."""
+
+    def __init__(self):
+        self.failures = 0
+
+    def assertTrue(self, cond, message=None):
+        self.failures += not cond
+
+    def assertEqual(self, a, b, message=None):
+        self.failures += a != b
+
+    def assertGreater(self, a, b, message=None):
+        self.failures += not a > b
+
+
+def test_tolerance_rejects_truncated_average(env):
+    # 3 ops summing to 4.2 ms: true avg 1.400, Accumulated Latency 4. An
+    # average printed as an integer (1.000) is 0.333 ms below 4/3. The
+    # symmetric 1/count slack accepted that; both checks must reject it.
+    counter = _FailureCounter()
+    _assert_latency_consistent(
+        counter, "synthetic.Sets",
+        {"Count": 3, "Latency": "1.000", "Average Latency": "1.000",
+         "Accumulated Latency": 4})
+    _assert_time_series_consistent(
+        counter, "synthetic.Sets",
+        {"Time-Serie": {"0": {"Count": 3, "Average Latency": "1.000",
+                              "Accumulated Latency": 4}}})
+    env.assertEqual(counter.failures, 2)
