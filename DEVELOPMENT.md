@@ -47,29 +47,39 @@ $ brew install autoconf automake libtool libevent pkg-config clang-format
 ```
 
 memtier must use the same OpenSSL that Homebrew's `libevent` is linked against.
-Mixing two OpenSSL versions in one process crashes on `--tls`. Find which one
-`libevent` uses (currently `openssl@4`) and point `PKG_CONFIG_PATH` at it when
-running `./configure`:
+Mixing two OpenSSL versions in one process crashes on `--tls`. Which OpenSSL
+that is depends on the `libevent` revision you have, so ask Homebrew and point
+`PKG_CONFIG_PATH` at it when running `./configure`:
 
 ```
-$ brew deps libevent | grep openssl
-openssl@4
-$ PKG_CONFIG_PATH=`brew --prefix openssl@4`/lib/pkgconfig ./configure
+$ ssl=$(brew deps libevent | grep '^openssl@' | head -n 1)
+$ brew install $ssl
+$ PKG_CONFIG_PATH="$(brew --prefix $ssl)/lib/pkgconfig" ./configure
 ```
 
 To use a different OpenSSL, install it (for example `brew install openssl@3`),
-build libevent from source against it, and put both
-prefixes in `PKG_CONFIG_PATH`. `scripts/build-macos-libevent.sh` does this and
-installs it under `$RUNNER_TEMP/libevent-memtier`:
+build libevent from source against it, and put both prefixes in
+`PKG_CONFIG_PATH`. `scripts/build-macos-libevent.sh` does this and installs it
+under `$RUNNER_TEMP/libevent-memtier`:
 
 ```
 $ brew install openssl@3
-$ RUNNER_TEMP=$HOME/build bash scripts/build-macos-libevent.sh `brew --prefix openssl@3`
-$ PKG_CONFIG_PATH=$HOME/build/libevent-memtier/lib/pkgconfig:`brew --prefix openssl@3`/lib/pkgconfig ./configure
+$ RUNNER_TEMP=$HOME/build bash scripts/build-macos-libevent.sh "$(brew --prefix openssl@3)"
+$ PKG_CONFIG_PATH="$HOME/build/libevent-memtier/lib/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig" ./configure
 ```
 
-`otool -L` on `memtier_benchmark` and on the `libevent_openssl` dylib it links
-should show the same `libssl`.
+After `make`, check that `memtier_benchmark` and libevent's `libevent_openssl`
+link the same OpenSSL. For the Homebrew libevent build:
+
+```
+$ bash scripts/check-macos-tls-links.sh "$(brew --prefix $ssl)" "$(brew --prefix libevent)"
+```
+
+For the source-built libevent:
+
+```
+$ RUNNER_TEMP=$HOME/build bash scripts/check-macos-tls-links.sh "$(brew --prefix openssl@3)"
+```
 
 ### Building and Installing
 

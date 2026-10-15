@@ -18,18 +18,18 @@ printf '%s\n' ./memtier_benchmark "$event_libraries" |
     printf '%s\n' "$links"
     printf '%s\n' "$links" | awk -v library="$library" -v event_prefix="$event_prefix" -v ssl_prefix="$ssl_prefix/lib/" '
       NR > 1 && $1 ~ /\/libevent[^\/]*\.dylib$/ && index($1, event_prefix) != 1 {
-        print "Unexpected libevent dependency: " $1 > "/dev/stderr"; bad = 1
+        print library ": unexpected libevent dependency " $1 " (expected under " event_prefix ")" > "/dev/stderr"; bad = 1
       }
       NR > 1 && $1 ~ /\/lib(ssl|crypto)[^\/]*\.dylib$/ {
         if (index($1, ssl_prefix) != 1) {
-          print "Unexpected OpenSSL dependency: " $1 > "/dev/stderr"; bad = 1
+          print library ": unexpected OpenSSL dependency " $1 " (expected under " ssl_prefix ")" > "/dev/stderr"; bad = 1
         } else if ($1 ~ /\/libssl[^\/]*\.dylib$/) {
           has_ssl = 1
         }
       }
       END {
         if ((library == "./memtier_benchmark" || library ~ /\/libevent_openssl[^\/]*\.dylib$/) && !has_ssl) {
-          print library " does not link libssl from " ssl_prefix > "/dev/stderr"; bad = 1
+          print library ": does not link libssl from " ssl_prefix > "/dev/stderr"; bad = 1
         }
         exit bad
       }
