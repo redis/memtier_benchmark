@@ -544,6 +544,9 @@ def test_dropped_replays_do_not_stall_client(env):
 
 
 
+_TXN_KILL_THREADS, _TXN_KILL_CLIENTS = 2, 4
+
+
 def _run_transaction_with_kills(env, extra_args, requests=None, test_time=None, kill_interval=0.5, pipeline=1,
                                 set_ratio=1):
     """Run a MULTI/SET/EXEC --transaction rotation while every primary's
@@ -566,7 +569,8 @@ def _run_transaction_with_kills(env, extra_args, requests=None, test_time=None, 
         + list(extra_args),
     }
     addTLSArgs(benchmark_specs, env)
-    config = get_default_memtier_config(threads=2, clients=4, requests=requests, test_time=test_time)
+    config = get_default_memtier_config(threads=_TXN_KILL_THREADS, clients=_TXN_KILL_CLIENTS, requests=requests,
+                                        test_time=test_time)
     master_nodes_list = env.getMasterNodesList()
     add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
     test_dir = tempfile.mkdtemp()
@@ -674,14 +678,15 @@ def test_transaction_lost_multi_is_not_continued(env):
     # memtier is the only client, so any -ERR reply is one of its own.
     env.assertEqual(errors, 0, message="{} -ERR replies for {} killed connections".format(errors, killed))
     # Every rotation sends get_ratio GETs, except the GETs in flight on a
-    # killed connection and the partial rotations of the 8 connections at the end.
+    # killed connection and the partial rotation of each connection at the end.
     stats = env.getOSSMasterNodesConnectionList()[0].execute_command("INFO", "commandstats")
     multi = stats.get("cmdstat_multi", {}).get("calls", 0)
     get = stats.get("cmdstat_get", {}).get("calls", 0)
     env.assertGreater(multi, 0, message="no MULTI was sent")
     missing = get_ratio * multi - get
     env.debugPrint("{} MULTIs, {} GETs, {} missing, {} connections killed".format(multi, get, missing, killed), True)
-    env.assertLessEqual(missing, get_ratio * 8 + pipeline * killed,
+    connections = _TXN_KILL_THREADS * _TXN_KILL_CLIENTS
+    env.assertLessEqual(missing, get_ratio * connections + pipeline * killed,
                         message="{} GETs missing for {} MULTIs: GETs after a skipped EXEC were skipped too".format(
                             missing, multi))
 
