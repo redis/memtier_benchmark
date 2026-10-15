@@ -94,22 +94,38 @@ def test_reconnect_backoff_invalid_values_rejected(env):
         "nan", "NaN", "-nan", "inf", "+inf", "-inf", "infinity",
         "1e9999", "1e-9999", "-1e9999", "-1e-9999",
     ):
-        # --help exits immediately if the invalid value slips through. This
-        # keeps rejection tests independent of Redis and avoids reconnecting
-        # with a non-finite delay on a broken parser.
+        # --version exits 0 immediately if the invalid value slips through.
+        # This keeps rejection tests independent of Redis and avoids
+        # reconnecting with a non-finite delay on a broken parser.
         result = subprocess.run(
-            [MEMTIER_BINARY, "--reconnect-backoff-factor=" + value, "--help"],
+            [MEMTIER_BINARY, "--reconnect-backoff-factor=" + value, "--version"],
             capture_output=True,
             text=True,
             timeout=10,
         )
         label = "--reconnect-backoff-factor={!r}".format(value)
-        # --help also exits 2, so only the diagnostic below proves rejection.
         env.assertEqual(result.returncode, 2, message=label + ": " + result.stderr)
         env.assertTrue(
             "error: reconnect-backoff-factor" in result.stderr,
             message=label + ": expected a parser diagnostic, got " + repr(result.stderr),
         )
+
+
+def test_reconnect_backoff_ignores_errno_from_earlier_options(env):
+    """An earlier option's strtoul overflow must not reject a valid factor."""
+    result = subprocess.run(
+        [
+            MEMTIER_BINARY,
+            "--max-reconnect-attempts=99999999999999999999999",
+            "--reconnect-backoff-factor=1",
+            "--version",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    env.assertEqual(result.returncode, 0, message=result.stderr)
+    env.assertFalse("error: reconnect-backoff-factor" in result.stderr, message=result.stderr)
 
 
 def test_reconnect_backoff_zero_keeps_one_second_delay(env):
