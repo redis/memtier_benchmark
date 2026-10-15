@@ -43,22 +43,31 @@ $ sudo apt-get install build-essential autoconf automake \
 To build natively on macOS, use Homebrew to install the required dependencies:
 
 ```
-$ brew install autoconf automake libtool libevent pkg-config openssl@4 clang-format
+$ brew install autoconf automake libtool libevent pkg-config clang-format
 ```
 
-Homebrew's `libevent` is linked against `openssl@4`, so memtier must be built
-against the same OpenSSL. Point `PKG_CONFIG_PATH` at it when running `./configure`:
+memtier must use the same OpenSSL that Homebrew's `libevent` is linked against.
+Mixing two OpenSSL versions in one process crashes on `--tls`. Find which one
+`libevent` uses (currently `openssl@4`) and point `PKG_CONFIG_PATH` at it when
+running `./configure`:
 
 ```
-PKG_CONFIG_PATH=`brew --prefix openssl@4`/lib/pkgconfig ./configure
+$ brew deps libevent | grep openssl
+openssl@4
+$ PKG_CONFIG_PATH=`brew --prefix openssl@4`/lib/pkgconfig ./configure
 ```
 
-Do not combine Homebrew's `libevent` with another OpenSSL (for example
-`openssl@3`): the process then loads two OpenSSL libraries and crashes on
-`--tls`. To use a different OpenSSL, build libevent from source against it
-(`RUNNER_TEMP=/some/build/dir scripts/build-macos-libevent.sh $(brew --prefix openssl@3)` installs it under `$RUNNER_TEMP/libevent-memtier`) and put both prefixes in
-`PKG_CONFIG_PATH`. `otool -L` on `memtier_benchmark` and on libevent's
-`libevent_openssl` dylib should show the same `libssl`.
+To use a different OpenSSL, build libevent from source against it and put both
+prefixes in `PKG_CONFIG_PATH`. `scripts/build-macos-libevent.sh` does this and
+installs it under `$RUNNER_TEMP/libevent-memtier`:
+
+```
+$ RUNNER_TEMP=$HOME/build bash scripts/build-macos-libevent.sh `brew --prefix openssl@3`
+$ PKG_CONFIG_PATH=$HOME/build/libevent-memtier/lib/pkgconfig:`brew --prefix openssl@3`/lib/pkgconfig ./configure
+```
+
+`otool -L` on `memtier_benchmark` and on the `libevent_openssl` dylib it links
+should show the same `libssl`.
 
 ### Building and Installing
 
