@@ -1314,6 +1314,10 @@ def _run_count_interrupted(env, test_time, sigint_when, run_count=3):
         deadline = time.time() + 60
         while process.poll() is None and time.time() < deadline and not sigint_when(read_stderr()):
             time.sleep(0.01)
+        # The trigger must fire while memtier still runs; otherwise the test
+        # never interrupted anything and its other checks are meaningless.
+        env.assertTrue(process.poll() is None,
+                       message="SIGINT trigger did not fire before memtier exited: {}".format(read_stderr()))
         process.send_signal(signal.SIGINT)
         t_sigint = time.time()
         try:
@@ -1381,8 +1385,9 @@ def test_interrupt_between_runs_stops_run_count(env):
     def run_1_done(err):
         # The last progress line of run 1 reports 0 threads; main() then
         # sleeps 1 s before run 2. Wait 0.4 s more so the signal lands inside
-        # that pause, not in the check just before it.
-        if not seen and re.search(r"\[RUN #1 100%[^\r\n]*\b0 threads", err):
+        # that pause, not in the check just before it. Progress can exceed
+        # 100% on a slow (e.g. TSAN) build, so match any percentage.
+        if not seen and re.search(r"\[RUN #1 \d+%[^\r\n]*\b0 threads", err):
             seen.append(time.time())
         return bool(seen) and time.time() - seen[0] >= 0.4
 
