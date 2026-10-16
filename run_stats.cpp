@@ -228,6 +228,10 @@ void run_stats::drain_prom_latency_histogram(hdr_histogram *target, bool run_end
 
 void run_stats::roll_cur_stats(struct timeval *ts)
 {
+    // Before set_start_time() (connection errors of a client whose first
+    // connect failed) there is no start time to measure the second from:
+    // keep counting in second 0, which the run's first second then continues.
+    if (!has_started()) return;
     const unsigned int sec = ts_diff(m_start_time, *ts) / 1000000;
     if (sec > m_cur_stats.m_second) {
         summarize_current_second();
