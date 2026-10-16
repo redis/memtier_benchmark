@@ -1945,9 +1945,12 @@ bool shard_connection::run_is_over()
 {
     if (m_conns_manager->get_reqs_answered()) return m_conns_manager->finished();
     if (m_config->test_time == 0 || !connection_stage_steady_state_reached()) return false;
-    struct timeval now;
+    struct timeval now, elapsed;
     gettimeofday(&now, NULL);
-    return now.tv_sec - m_config->benchmark_start_time.tv_sec >= (time_t) m_config->test_time;
+    // Compare full timevals: whole seconds alone would end a client up to
+    // 1 s before the deadline when the run started late in a second.
+    timersub(&now, &m_config->benchmark_start_time, &elapsed);
+    return elapsed.tv_sec >= (time_t) m_config->test_time;
 }
 
 // A setup step (AUTH/SELECT/HELLO) was rejected. With --reconnect-on-error,
