@@ -72,7 +72,7 @@ def _run(args, timeout=15):
 
 # Reject vectors are parsed and rejected before any connection is attempted,
 # so a dead port is fine and fastest.
-_BASE = ["-s", "127.0.0.1", "-p", "6379"]
+_BASE = ["-s", "127.0.0.1", "-p", "1"]
 
 # Accept/warn vectors parse cleanly and would proceed to connect; bound the
 # connect loop hard so a dead port exits quickly instead of hitting the
@@ -367,9 +367,7 @@ def test_v16_compiled_out_unrecognized(env):
 def test_v17_show_config_disabled(env):
     """Flagless --show-config prints prometheus-port = -1 and
     prometheus-latency-buckets = default; no secrets in the four fields."""
-    result = _run(_BASE + ["--show-config", "--test-time=1",
-                           "--max-reconnect-attempts=1",
-                           "--connection-stage-timeout=2"], timeout=20)
+    result = _run(_BASE_ACCEPT + ["--show-config"], timeout=20)
     out = _out(result)
     env.assertTrue("prometheus-port = -1" in out,
                    message="disabled show-config must print 'prometheus-port = -1'; out={!r}".format(out))
@@ -380,8 +378,7 @@ def test_v17_show_config_disabled(env):
 def test_v17_show_config_enabled(env):
     """--show-config with all four flags echoes parsed values, buckets as
     parsed floats."""
-    result = _run(_BASE + ["--show-config", "--test-time=1",
-                           "--max-reconnect-attempts=1", "--connection-stage-timeout=2",
+    result = _run(_BASE_ACCEPT + ["--show-config",
                            "--prometheus-port=0", "--prometheus-bind-addr=127.0.0.1",
                            "--prometheus-run-label=phase=load",
                            "--prometheus-latency-buckets=0.001,0.005"], timeout=20)
@@ -417,8 +414,7 @@ def test_v18_mb_json_round_trip(env):
     fd, path = tempfile.mkstemp(suffix=".json")
     os.close(fd)
     try:
-        result = _run(_BASE + ["--show-config", "--test-time=1",
-                               "--max-reconnect-attempts=1", "--connection-stage-timeout=2",
+        result = _run(_BASE_ACCEPT + ["--show-config",
                                "--json-out-file={}".format(path),
                                "--prometheus-port=12345",
                                "--prometheus-bind-addr=127.0.0.1",
