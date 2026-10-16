@@ -208,6 +208,8 @@ protected:
     char *m_buffer;
     char *m_buffer_ptr;
     size_t m_buffer_size;
+    // A 32-bit size wrapped to 0 past 2 GiB and add_key()'s growth never ended.
+    static_assert(sizeof(m_buffer_size) >= sizeof(size_t), "keylist buffer size must be size_t");
 
     key_entry *m_keys;
     unsigned int m_keys_size;

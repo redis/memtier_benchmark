@@ -546,7 +546,6 @@ def test_remaining_options_store_the_parsed_value(env):
         env.assertTrue(expected in out, message="{}: expected {!r} in {!r}".format(args, expected, out))
 
 
-
 def test_remaining_options_store_their_maximum(env):
     """Each option stores its full maximum, so a store narrowed to a smaller
     type (or dropped) is caught: every value here is above 65535."""
@@ -578,6 +577,7 @@ def test_remaining_options_store_their_maximum(env):
     env.assertTrue("--clients-start ({}) must be less than --clients".format(UINT_MAX) in result.stderr,
                    message=repr(result.stderr))
 
+
 def _assert_no_sigfpe(env, args, label):
     """Run memtier against a closed port and assert it did not die of SIGFPE.
 
@@ -602,7 +602,10 @@ def test_rate_limiting_max_does_not_divide_by_zero(env):
 
 def test_jitter_max_range_does_not_divide_by_zero(env):
     """A jitter range of UINT_MAX made jitter_range + 1 wrap to 0, and
-    rand() % 0 raised SIGFPE after the first connection."""
+    rand() % 0 raised SIGFPE after the first connection.
+
+    The fixed binary then sleeps in the jitter (no smaller range has a 2^32
+    span), so hitting the 5 s timeout is the expected pass path."""
     _assert_no_sigfpe(env, ["-c", "2", "--thread-conn-start-min-jitter-micros=0",
                             "--thread-conn-start-max-jitter-micros=" + UINT_MAX], "jitter 0.." + UINT_MAX)
 
@@ -625,8 +628,11 @@ def test_multi_key_get_cap(env):
 def test_key_maximum_full_range_runs(env):
     """--key-maximum=ULLONG_MAX with the default --key-minimum (0) is a full
     64-bit key range: r_max - r_min + 1 wrapped to 0, so random keys hit
-    rn % 0 (SIGFPE), Gaussian keys never passed val > max + 1 == 0, and a
-    Zipf sample could be the double 2^64, which does not convert."""
+    rn % 0 (SIGFPE), and Gaussian keys never passed val > max + 1 == 0.
+
+    Z:Z only checks that the full range runs: its clamp of a 2^64 sample is
+    defensive, since reaching it needs p within ~1e-16 of 1, which no test
+    can force."""
     env.skipOnCluster()
     master = env.getMasterNodesList()[0]
     for pattern, clients in (("R:R", "1"), ("G:G", "1"), ("Z:Z", "1"), ("S:S", "1"), ("P:P", "2")):

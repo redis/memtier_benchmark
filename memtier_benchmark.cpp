@@ -868,6 +868,7 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
         jsonhandler->write_obj("clients_step", "%u", cfg->clients_step);
         jsonhandler->write_obj("step_duration", "%u", cfg->step_duration);
     }
+    jsonhandler->write_obj("scan_incremental_max_iterations", "%u", cfg->scan_incremental_max_iterations);
 
     // Read-preference configuration
     {
@@ -1298,14 +1299,14 @@ static bool verify_arbitrary_command_option(struct benchmark_config *cfg)
 //   DATA_SIZE_MAX: upper bound on --data-size (and per-entry size in
 //                  --data-size-list).  Matches Redis' default proto-max-bulk-len
 //                  (512 MiB), past which the server rejects the bulk anyway.
-//   MULTI_KEY_GET_MAX: upper bound on --multi-key-get.  Every client
-//                  preallocates a keylist of multi_key_get + 1 entries with a
-//                  256-byte key buffer per entry.  At this cap that initial
-//                  buffer is 2^32 - 256 bytes, the largest that fits the
-//                  32-bit size keylist used to have (it wrapped one entry
-//                  later); the buffer now grows in size_t, so longer keys are
-//                  safe too.  Memory is left to the user: about 272 bytes per
-//                  entry per client, so about 4.3 GiB per client at this cap.
+//   MULTI_KEY_GET_MAX: upper bound on --multi-key-get, a memory sanity
+//                  limit.  Every client preallocates a keylist of
+//                  multi_key_get + 1 entries: 16 bytes of index plus 256 bytes
+//                  of key buffer each, about 4.3 GiB per client at this cap,
+//                  where the preallocated key buffer is just under 4 GiB.  The
+//                  sizes are size_t now, so nothing wraps above it; the cap is
+//                  where keylist's old 32-bit buffer size used to wrap, so every
+//                  value that ever worked still does.
 #define MEMTIER_PIPELINE_MAX 1024u
 #define MEMTIER_DATA_SIZE_MAX (512u * 1024u * 1024u)
 #define MEMTIER_MULTI_KEY_GET_MAX 16777214u
