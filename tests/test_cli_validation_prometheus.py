@@ -459,7 +459,7 @@ def test_v19_lsan_exit1_after_creation(env):
     env.assertEqual(result.returncode, 1,
                     message="cluster multi-key command must exit 1; got {}".format(
                         result.returncode))
-    env.assertTrue("Cluster mode supports only a single key" in _out(result),
+    env.assertTrue("Cluster mode supports only single-key commands" in _out(result),
                    message="expected single-key rejection; out={!r}".format(_out(result)))
     for needle in ("LeakSanitizer", "AddressSanitizer"):
         env.assertFalse(needle in _out(result),
