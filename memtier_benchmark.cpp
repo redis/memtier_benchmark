@@ -779,6 +779,15 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             prometheus_run_labels_str(cfg).c_str(), prometheus_buckets_str(cfg).c_str()
 #endif
     );
+    fprintf(file,
+            "clients_start = %u\n"
+            "clients_step = %u\n"
+            "step_duration = %u\n"
+            "scan_incremental_max_iterations = %u\n"
+            "replica_clients = %u\n"
+            "replicas_per_shard = %u\n",
+            cfg->clients_start, cfg->clients_step, cfg->step_duration, cfg->scan_incremental_max_iterations,
+            cfg->replica_clients, cfg->replicas_per_shard);
 }
 
 static void config_print_to_json(json_handler *jsonhandler, struct benchmark_config *cfg)

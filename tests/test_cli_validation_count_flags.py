@@ -27,7 +27,7 @@ import errno
 import signal
 import subprocess
 
-from include import MEMTIER_BINARY
+from include import MEMTIER_BINARY, addTLSArgs
 
 
 # ---------------------------------------------------------------------------
@@ -546,6 +546,38 @@ def test_remaining_options_store_the_parsed_value(env):
         env.assertTrue(expected in out, message="{}: expected {!r} in {!r}".format(args, expected, out))
 
 
+
+def test_remaining_options_store_their_maximum(env):
+    """Each option stores its full maximum, so a store narrowed to a smaller
+    type (or dropped) is caught: every value here is above 65535."""
+    # One run for the options without cross-checks. min == max jitter adds
+    # no sleep, and -c 1 creates no second connection to jitter before.
+    out = _show_config([
+        "--key-minimum=18446744073709551614", "--key-maximum=" + ULLONG_MAX,
+        "--reconnect-interval=" + UINT_MAX, "--rate-limiting=" + UINT_MAX,
+        "--thread-conn-start-min-jitter-micros=" + UINT_MAX, "--thread-conn-start-max-jitter-micros=" + UINT_MAX,
+        "--scan-incremental-max-iterations=" + UINT_MAX, "--replica-clients=" + UINT_MAX,
+        "--replicas-per-shard=" + UINT_MAX,
+    ])
+    for expected in ("key_minimum = 18446744073709551614\n", "reconnect_interval = " + UINT_MAX,
+                     "rate_limit = " + UINT_MAX, "thread_conn_start_min_jitter_micros = " + UINT_MAX,
+                     "thread_conn_start_max_jitter_micros = " + UINT_MAX,
+                     "scan_incremental_max_iterations = " + UINT_MAX, "replica_clients = " + UINT_MAX,
+                     "replicas_per_shard = " + UINT_MAX):
+        env.assertTrue(expected in out, message="expected {!r} in {!r}".format(expected, out))
+    # Staircase: --requests is not allowed, and --clients-start must stay
+    # below --clients.
+    result = _run_memtier(["-s", "127.0.0.1", "-p", "1", "-t", "1", "-c", "2", "--test-time=1", "--show-config",
+                           "--clients-start=1", "--clients-step=" + UINT_MAX, "--step-duration=" + UINT_MAX])
+    for expected in ("clients_step = " + UINT_MAX, "step_duration = " + UINT_MAX):
+        env.assertTrue(expected in result.stderr, message="expected {!r} in {!r}".format(expected, result.stderr))
+    # --clients-start at its maximum is reported back by the staircase check,
+    # which exits before any client is created.
+    result = _run_memtier(["-s", "127.0.0.1", "-p", "1", "--test-time=1", "--clients-start=" + UINT_MAX,
+                           "--clients-step=1", "--step-duration=1"])
+    env.assertTrue("--clients-start ({}) must be less than --clients".format(UINT_MAX) in result.stderr,
+                   message=repr(result.stderr))
+
 def _assert_no_sigfpe(env, args, label):
     """Run memtier against a closed port and assert it did not die of SIGFPE.
 
@@ -597,11 +629,11 @@ def test_key_maximum_full_range_runs(env):
     master = env.getMasterNodesList()[0]
     for pattern, clients in (("R:R", "1"), ("G:G", "1"), ("S:S", "1"), ("P:P", "2")):
         label = "--key-pattern={}".format(pattern)
+        specs = {"args": ["-s", "127.0.0.1", "-p", str(master["port"]), "-n", "3", "-c", clients, "-t", "1",
+                          "--key-maximum=" + ULLONG_MAX, "--key-pattern=" + pattern, "--hide-histogram"]}
+        addTLSArgs(specs, env)  # the TLS CI cells run a TLS-only server
         try:
-            result = subprocess.run(
-                [MEMTIER_BINARY, "-s", "127.0.0.1", "-p", str(master["port"]), "-n", "3", "-c", clients, "-t", "1",
-                 "--key-maximum=" + ULLONG_MAX, "--key-pattern=" + pattern, "--hide-histogram"],
-                capture_output=True, text=True, timeout=30)
+            result = subprocess.run([MEMTIER_BINARY] + specs["args"], capture_output=True, text=True, timeout=30)
         except subprocess.TimeoutExpired:
             env.assertTrue(False, message=label + ": hung")
             continue
