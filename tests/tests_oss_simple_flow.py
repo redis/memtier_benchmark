@@ -1,4 +1,5 @@
 import tempfile
+import re
 import json
 import time
 import signal
@@ -1282,17 +1283,14 @@ def test_interrupt_signal_handling(env):
         env.assertTrue(total_count > 0)
 
 
-def test_interrupt_stops_run_count(env):
-    """Ctrl+C stops the whole --run-count series, not only the current run (#690).
+def _run_count_interrupted(env, test_time, sigint_when):
+    """Run --run-count=3 and SIGINT it once sigint_when(stderr_text) is true.
 
-    Before the fix every remaining run started anyway, sent about 1 s of load,
-    and was counted in BEST/WORST/AGGREGATED ("(3 runs)"). Now memtier exits
-    after the interrupted run, and the summary covers only that run.
+    Returns (returncode, stderr text, seconds from SIGINT to exit, mb.json dict).
     """
-    benchmark_specs = {"name": env.testName,
-                       "args": ['--run-count=3', '--hide-histogram']}
+    benchmark_specs = {"name": env.testName, "args": ['--run-count=3', '--hide-histogram']}
     addTLSArgs(benchmark_specs, env)
-    config = get_default_memtier_config(threads=2, clients=5, requests=None, test_time=30)
+    config = get_default_memtier_config(threads=2, clients=5, requests=None, test_time=test_time)
     master_nodes_list = env.getMasterNodesList()
     add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
 
@@ -1302,11 +1300,18 @@ def test_interrupt_stops_run_count(env):
     benchmark = Benchmark.from_json(config, benchmark_specs)
 
     stderr_path = os.path.join(config.results_dir, 'mb.stderr')
+
+    def read_stderr():
+        with open(stderr_path, 'r', errors='replace') as fh:
+            return fh.read()
+
     with open(stderr_path, 'wb') as stderr_file:
         process = subprocess.Popen(
             stdin=None, stdout=subprocess.PIPE, stderr=stderr_file,
             executable=benchmark.binary, args=benchmark.args)
-        time.sleep(1.5)
+        deadline = time.time() + 60
+        while process.poll() is None and time.time() < deadline and not sigint_when(read_stderr()):
+            time.sleep(0.01)
         process.send_signal(signal.SIGINT)
         t_sigint = time.time()
         try:
@@ -1316,25 +1321,67 @@ def test_interrupt_stops_run_count(env):
             _stdout, _ = process.communicate()
         elapsed = time.time() - t_sigint
     benchmark.write_file('mb.stdout', _stdout)
-    with open(stderr_path, 'r') as fh:
-        stderr_content = fh.read()
-
-    env.assertEqual(process.returncode, 0, message=stderr_content)
-    # Only run 1 started and was interrupted; no later run was launched.
-    env.assertEqual(stderr_content.count("Interrupted by user (Ctrl+C) after"), 1, message=stderr_content)
-    env.assertFalse("[RUN #2]" in stderr_content, message=stderr_content)
-    env.assertTrue("skipping the remaining runs (1 of 3 done)" in stderr_content, message=stderr_content)
-    # Each skipped run used to add a 1 s pause plus 1 s of load (>= 4 s here).
-    env.assertTrue(elapsed < 3.5, message="exit took {:.1f}s after SIGINT".format(elapsed))
-
     with open('{0}/mb.json'.format(config.results_dir)) as results_json:
         results_dict = json.load(results_json)
-    env.assertTrue("AGGREGATED AVERAGE RESULTS (1 runs)" in results_dict, message=list(results_dict))
-    env.assertFalse("AGGREGATED AVERAGE RESULTS (3 runs)" in results_dict, message=list(results_dict))
-    for section in ("BEST RUN RESULTS", "WORST RUN RESULTS", "AGGREGATED AVERAGE RESULTS (1 runs)"):
+    return process.returncode, read_stderr(), elapsed, results_dict
+
+
+def _assert_series_cut_after_run_1(env, rc, stderr_content, results_dict):
+    env.assertEqual(rc, 0, message=stderr_content)
+    # No later run was launched ("[RUN #2]" and the "[RUN #2 ...%" progress).
+    env.assertFalse("[RUN #2" in stderr_content, message=stderr_content)
+    env.assertTrue("skipping the remaining runs (1 of 3 done)" in stderr_content, message=stderr_content)
+    # The section keys follow --run-count; "Runs completed" says what they hold.
+    env.assertEqual(results_dict.get("run information", {}).get("Runs completed"), 1,
+                    message=results_dict.get("run information"))
+    agg = "AGGREGATED AVERAGE RESULTS (3 runs)"
+    for section in ("BEST RUN RESULTS", "WORST RUN RESULTS", agg):
         env.assertTrue(section in results_dict, message=list(results_dict))
         if section in results_dict:
             env.assertEqual(results_dict[section]["Runtime"]["Interrupted"], "true", message=section)
+    if agg in results_dict and "BEST RUN RESULTS" in results_dict:
+        # One run: the average is that run.
+        best_ops = results_dict["BEST RUN RESULTS"]["Totals"]["Ops/sec"]
+        agg_ops = results_dict[agg]["Totals"]["Ops/sec"]
+        env.assertTrue(best_ops > 0 and abs(agg_ops - best_ops) <= 0.01 * best_ops,
+                       message="AGG Ops/sec {} vs BEST {}".format(agg_ops, best_ops))
+
+
+def test_interrupt_stops_run_count(env):
+    """Ctrl+C stops the whole --run-count series, not only the current run (#690).
+
+    Before the fix every remaining run started anyway, sent about 1 s of load,
+    and was counted in BEST/WORST/AGGREGATED. Now memtier exits after the
+    interrupted run, and the summary covers only that run.
+    """
+    started = time.time()
+    rc, stderr_content, elapsed, results_dict = _run_count_interrupted(
+        env, 30, lambda _err: time.time() - started >= 1.5)
+    _assert_series_cut_after_run_1(env, rc, stderr_content, results_dict)
+    env.assertEqual(stderr_content.count("Interrupted by user (Ctrl+C) after"), 1, message=stderr_content)
+    # Sanity bound: each skipped run used to add a 1 s pause plus 1 s of load
+    # (>= 4 s here); with the fix the exit takes about 1 s at most.
+    env.assertTrue(elapsed < 3.5, message="exit took {:.1f}s after SIGINT".format(elapsed))
+
+
+def test_interrupt_between_runs_stops_run_count(env):
+    """Ctrl+C in the settle pause after run 1 starts no further run (#690).
+
+    Run 1 (--test-time=1) completes on its own, so no run sees the signal; the
+    series is still cut short and the summary sections say Interrupted.
+    """
+    seen = []
+
+    def run_1_done(err):
+        # The last progress line of run 1 reports 0 threads; main() then
+        # sleeps 1 s before run 2. Wait 0.4 s more so the signal lands inside
+        # that pause, not in the check just before it.
+        if not seen and re.search(r"\[RUN #1 100%[^\r\n]*\b0 threads", err):
+            seen.append(time.time())
+        return bool(seen) and time.time() - seen[0] >= 0.4
+
+    rc, stderr_content, _elapsed, results_dict = _run_count_interrupted(env, 1, run_1_done)
+    _assert_series_cut_after_run_1(env, rc, stderr_content, results_dict)
 
 
 def test_cluster_seed_owns_no_keys(env):

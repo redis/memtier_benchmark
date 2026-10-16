@@ -1424,9 +1424,13 @@ def test_F27_interrupt_run_end_counts_every_op(env):
     proc = None
     try:
         try:
-            fcntl.fcntl(rfd, getattr(fcntl, "F_SETPIPE_SZ", 1031), 4096)
+            pipe_size = fcntl.fcntl(rfd, getattr(fcntl, "F_SETPIPE_SZ", 1031), 4096)
         except OSError:
-            env.skip()  # cannot shrink the pipe; results would not block
+            pipe_size = None
+        if pipe_size is None or pipe_size > 4096:
+            # Cannot shrink the pipe to 4 KiB (no F_SETPIPE_SZ, or 64 KiB
+            # pages); the ~32 KB of results might then not block.
+            env.skip()
             return
         proc, out_path, err_path = _popen_memtier(
             env,

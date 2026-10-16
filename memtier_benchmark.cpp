@@ -5201,9 +5201,10 @@ int main(int argc, char *argv[])
         all_stats.reserve(cfg.run_count);
 
         // Ctrl+C ends the whole --run-count series, not only the current run:
-        // no later run starts, checked before and after the settle pause
-        // (SIGINT cuts sleep() short). The interrupted run itself is kept,
-        // marked Interrupted. Run 1 always runs, so all_stats is never empty.
+        // no later run starts. g_interrupted is checked before and after the
+        // settle pause, since the signal can arrive during it. The interrupted
+        // run itself is kept, marked Interrupted. Run 1 always runs, so
+        // all_stats is never empty.
         for (unsigned int run_id = 1; run_id <= cfg.run_count; run_id++) {
             if (run_id > 1) {
                 if (g_interrupted) break;
@@ -5218,7 +5219,8 @@ int main(int argc, char *argv[])
             stats.save_hdr_set_command(&cfg, run_id);
             stats.save_hdr_arbitrary_commands(&cfg, run_id);
         }
-        if (all_stats.size() < cfg.run_count) {
+        const bool series_cut = all_stats.size() < cfg.run_count;
+        if (series_cut) {
             fprintf(stderr, "Interrupted by user (Ctrl+C), skipping the remaining runs (%zu of %u done).\n",
                     all_stats.size(), cfg.run_count);
         }
@@ -5277,6 +5279,8 @@ int main(int argc, char *argv[])
 
         fprintf(outfile, "%-9llu %s\n", (unsigned long long) (cfg.requests > 0 ? cfg.requests : cfg.test_time),
                 cfg.requests > 0 ? "Requests per client" : "Seconds");
+        if (series_cut)
+            fprintf(outfile, "%-9zu Runs completed (of %u, interrupted)\n", all_stats.size(), cfg.run_count);
 
         if (jsonhandler != NULL) {
             jsonhandler->open_nesting("run information");
@@ -5291,6 +5295,7 @@ int main(int argc, char *argv[])
             }
             jsonhandler->write_obj(cfg.requests > 0 ? "Requests per client" : "Seconds", "%llu",
                                    cfg.requests > 0 ? cfg.requests : (unsigned long long) cfg.test_time);
+            jsonhandler->write_obj("Runs completed", "%zu", all_stats.size());
             jsonhandler->write_obj("Format version", "%d", 2);
             jsonhandler->close_nesting();
         }
@@ -5310,8 +5315,8 @@ int main(int argc, char *argv[])
 
         // If more than 1 run was used, compute best, worst and average
         // Furthermore, if print_all_runs is enabled we save separate histograms per run.
-        // The section layout follows --run-count; their contents and the run
-        // count use only the runs that happened (fewer after Ctrl+C).
+        // The section names follow --run-count, so JSON keys stay stable; their
+        // contents use only the runs that happened ("Runs completed" above).
         if (cfg.run_count > 1) {
             // User wants to see a separate histogram per run
             if (cfg.print_all_runs) {
@@ -5337,6 +5342,12 @@ int main(int argc, char *argv[])
                     best = &(*i);
                 }
             }
+            // A series cut short by Ctrl+C is interrupted as a whole, even when
+            // the signal landed between runs and no single run saw it.
+            if (series_cut) {
+                best->set_interrupted(true);
+                worst->set_interrupted(true);
+            }
             // Best results:
             best->print(outfile, &cfg, "BEST RUN RESULTS", jsonhandler);
             // worst results:
@@ -5344,8 +5355,9 @@ int main(int argc, char *argv[])
             // average results:
             run_stats average(&cfg);
             average.aggregate_average(all_stats);
+            if (series_cut) average.set_interrupted(true);
             char average_header[50];
-            snprintf(average_header, sizeof(average_header), "AGGREGATED AVERAGE RESULTS (%zu runs)", all_stats.size());
+            snprintf(average_header, sizeof(average_header), "AGGREGATED AVERAGE RESULTS (%u runs)", cfg.run_count);
             average.print(outfile, &cfg, average_header, jsonhandler);
         } else {
             all_stats.begin()->print(outfile, &cfg, "ALL STATS", jsonhandler);
