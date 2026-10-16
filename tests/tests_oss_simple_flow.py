@@ -1876,18 +1876,19 @@ def test_startup_error_keeps_output_files_data_import(env):
     _startup_error_keeps_output_files(env, ['--data-import', '/nonexistent-memtier-dir/keys.imp'], 1, expected)
 
 
-def _start_memtier(env, extra_args, stdout, drop_default_out_file=False, prefix=None, requests=10,
+def _start_memtier(env, work_dir, extra_args, stdout, drop_default_out_file=False, prefix=None, requests=10,
                    test_time=None):
     """Start a short benchmark whose output goes to extra_args/stdout; return the Popen.
 
-    prefix (e.g. ['stdbuf', '-o0']) is put in front of the memtier command.
+    The results and memtier's stderr (work_dir/memtier.stderr) go under
+    work_dir. prefix (e.g. ['stdbuf', '-o0']) is put in front of the memtier
+    command.
     """
     benchmark_specs = {"name": env.testName, "args": ['--hide-histogram'] + extra_args}
     addTLSArgs(benchmark_specs, env)
     config = get_default_memtier_config(threads=1, clients=1, requests=requests, test_time=test_time)
     add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
-    test_dir = tempfile.mkdtemp()
-    config = RunConfig(test_dir, env.testName, config, {})
+    config = RunConfig(work_dir, env.testName, config, {})
     ensure_clean_benchmark_folder(config.results_dir)
     benchmark = Benchmark.from_json(config, benchmark_specs)
     args = list(benchmark.args)
@@ -1901,22 +1902,34 @@ def _start_memtier(env, extra_args, stdout, drop_default_out_file=False, prefix=
         # stdbuf works by LD_PRELOAD; let an ASan build accept that.
         proc_env = dict(os.environ)
         proc_env['ASAN_OPTIONS'] = (proc_env.get('ASAN_OPTIONS', '') + ':verify_asan_link_order=0').lstrip(':')
-    return subprocess.Popen(args, stdout=stdout, stderr=subprocess.PIPE, env=proc_env)
+    with open(_memtier_stderr_path(work_dir), 'wb') as stderr:
+        return subprocess.Popen(args, stdout=stdout, stderr=stderr, env=proc_env)
 
 
-def _finish_memtier(process, timeout=30):
+def _memtier_stderr_path(work_dir):
+    return os.path.join(work_dir, 'memtier.stderr')
+
+
+def _read_memtier_stderr(work_dir):
+    with open(_memtier_stderr_path(work_dir), 'rb') as f:
+        return f.read().decode(errors='replace')
+
+
+def _finish_memtier(process, work_dir, timeout=30):
     """Wait for a _start_memtier() process; return (rc, stderr)."""
     try:
-        _, stderr = process.communicate(timeout=timeout)
+        process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         process.kill()
-        _, stderr = process.communicate()
-    return process.returncode, stderr.decode(errors='replace')
+        process.wait()
+    return process.returncode, _read_memtier_stderr(work_dir)
 
 
 def _run_with_unwritable_output(env, extra_args, stdout, drop_default_out_file=False, prefix=None, **kwargs):
     """Run a short benchmark whose output goes to extra_args/stdout; return (rc, stderr)."""
-    return _finish_memtier(_start_memtier(env, extra_args, stdout, drop_default_out_file, prefix, **kwargs))
+    with tempfile.TemporaryDirectory() as work_dir:
+        process = _start_memtier(env, work_dir, extra_args, stdout, drop_default_out_file, prefix, **kwargs)
+        return _finish_memtier(process, work_dir)
 
 
 def _closed_pipe_run(env, extra_args, prefix=None):
@@ -1989,17 +2002,26 @@ def test_out_file_fifo_reader_exits_is_an_error(env):
     Only stdout, or an --out-file that is the same file as stdout, gets the
     gone-reader exemption; for any other --out-file the results are lost.
     """
-    fifo = os.path.join(tempfile.mkdtemp(), 'results.fifo')
-    os.mkfifo(fifo)
-    # Open the read end first (non-blocking), so memtier's open() does not block.
-    rfd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
-    try:
-        process = _start_memtier(env, ['--out-file', fifo], subprocess.DEVNULL, requests=None, test_time=2)
-        time.sleep(0.7)
-    finally:
-        os.close(rfd)
-    rc, stderr = _finish_memtier(process)
-    os.remove(fifo)
+    with tempfile.TemporaryDirectory() as work_dir:
+        fifo = os.path.join(work_dir, 'results.fifo')
+        os.mkfifo(fifo)
+        # Open the read end first (non-blocking), so memtier's open() does not block.
+        rfd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            process = _start_memtier(env, work_dir, ['--out-file', fifo], subprocess.DEVNULL, requests=None,
+                                     test_time=2)
+            # Close the reader only once memtier has the FIFO open (it prints
+            # this line after the open). Closed earlier, memtier's open() would
+            # wait for a new reader forever.
+            opened = "Writing results to {}...".format(fifo)
+            deadline = time.time() + 30
+            while (opened not in _read_memtier_stderr(work_dir) and process.poll() is None
+                   and time.time() < deadline):
+                time.sleep(0.05)
+        finally:
+            os.close(rfd)
+        rc, stderr = _finish_memtier(process, work_dir)
+    env.assertContains(opened, stderr)
     env.assertEqual(rc, 1, message=stderr)
     env.assertContains("error: failed writing --out-file {}: Broken pipe".format(fifo), stderr)
 

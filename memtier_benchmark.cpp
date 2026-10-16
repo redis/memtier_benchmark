@@ -4456,8 +4456,11 @@ static void cleanup_openssl(void)
 // reset socket). But finish_output_file() returns a synthetic EIO when stdio
 // dropped the failed data (musl does, glibc when line-buffered or unbuffered), and
 // its real cause may also be a lost write to a live reader (EAGAIN on a full
-// non-blocking pipe). So for EIO ask the kernel: poll() reports POLLERR on a
-// pipe with no reader and POLLHUP on a closed socket.
+// non-blocking pipe). That happens in practice: O_NONBLOCK belongs to the open
+// pipe description, so a parent sharing it (e.g. Node or a CI runner that set
+// its own end non-blocking) makes memtier's stdout non-blocking too. So for
+// EIO ask the kernel: poll() reports POLLERR on a pipe with no reader and
+// POLLHUP on a closed socket.
 static bool stdout_reader_gone(FILE *fp, int err)
 {
     if (err != EPIPE && err != ECONNRESET && err != EIO) return false;
