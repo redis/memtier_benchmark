@@ -216,6 +216,32 @@ def test_cluster_slots_empty_reply_for_one_client_fails_without_reconnect(env):
     env.assertLess(elapsed, 10)
 
 
+def test_cluster_slots_empty_reply_for_one_client_fails_with_requests(env):
+    # Under --requests the run has no deadline, so the second client's
+    # failure ends the thread at once instead of being retried forever.
+    node = _Node(bad_slots_replies=1000, first_good=True)
+    returncode, stderr, elapsed = _run(node, ["--requests=200"], clients=2)
+    env.assertEqual(node.errors, [])
+    env.assertNotEqual(returncode, "timeout", message=stderr[-2000:])
+    env.assertNotEqual(returncode, 0)
+    env.assertContains("CLUSTER SLOTS error and --reconnect-on-error is not set, ending this thread", stderr)
+    env.assertLess(elapsed, 10)
+
+
+def test_cluster_slots_empty_reply_for_late_staircase_clients_fails(env):
+    # With --clients-start, clients added later never get a slot map. They
+    # never send a request, so the run must fail at the deadline rather
+    # than report one client's throughput as a full run.
+    node = _Node(bad_slots_replies=1000, first_good=True)
+    returncode, stderr, elapsed = _run(node, ["--test-time=4", "--clients-start=1", "--clients-step=1",
+                                              "--step-duration=1"], clients=3)
+    env.assertEqual(node.errors, [])
+    env.assertNotEqual(returncode, "timeout", message=stderr[-2000:])
+    env.assertNotEqual(returncode, 0)
+    env.assertContains("CLUSTER SLOTS error and --reconnect-on-error is not set, ending this thread", stderr)
+    env.assertLess(elapsed, 12)
+
+
 def test_cluster_slots_empty_reply_for_one_client_honours_test_time(env):
     node = _Node(bad_slots_replies=1000, first_good=True)
     returncode, stderr, elapsed = _run(node, ["--test-time=2", "--reconnect-on-error"], workers=2)

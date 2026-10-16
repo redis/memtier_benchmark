@@ -2006,6 +2006,13 @@ void shard_connection::handle_cluster_slots_retry_event()
     // m_cluster_slots stays setup_sent while the retry waits, so nothing else
     // sends the request early. A disconnect in the meantime cancels the timer.
     if (m_cluster_slots != setup_sent) return;
+    // The run ended while this client was still waiting for a slot map. It
+    // never sent a request: fail the run instead of letting it count as
+    // finished (under --clients-start, finished() uses the run's deadline).
+    if (!m_conns_manager->get_reqs_answered() && run_is_over()) {
+        attempt_reconnect("CLUSTER SLOTS error");
+        return;
+    }
     m_cluster_slots = setup_none;
     // The run has not started: don't charge the time spent waiting for the
     // slot map to --test-time or to the throughput figures. Once any
