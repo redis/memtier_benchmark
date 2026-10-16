@@ -1675,6 +1675,67 @@ def test_json_out_file_unwritable(env):
     env.assertContains("error: cannot open --json-out-file /nonexistent-memtier-dir/mb.json", stderr)
 
 
+def test_json_out_file_unwritable_keeps_out_file(env):
+    """An unwritable --json-out-file must not wipe an existing --out-file.
+
+    --out-file is opened without truncation and only truncated once the
+    --json-out-file has been opened as well.
+    """
+    benchmark_specs = {"name": env.testName,
+                       "args": ['--json-out-file=/nonexistent-memtier-dir/mb.json', '--hide-histogram']}
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=1, clients=1, requests=10)
+    add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+    test_dir = tempfile.mkdtemp()
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    out_path = os.path.join(config.results_dir, 'mb.stdout')
+    out_before = 'previous results\n'
+    with open(out_path, 'w') as f:
+        f.write(out_before)
+    benchmark.args += ['--out-file', out_path]
+
+    process = subprocess.Popen(benchmark.args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        _, stderr = process.communicate(timeout=20)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        _, stderr = process.communicate()
+    stderr = stderr.decode(errors='replace')
+    env.assertEqual(process.returncode, 1, message=stderr)
+    env.assertContains("error: cannot open --json-out-file /nonexistent-memtier-dir/mb.json", stderr)
+    with open(out_path) as f:
+        env.assertEqual(f.read(), out_before)
+
+
+def test_out_file_replaces_existing(env):
+    """A successful run replaces a longer existing --out-file completely."""
+    benchmark_specs = {"name": env.testName, "args": ['--hide-histogram']}
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=1, clients=1, requests=10)
+    add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+    test_dir = tempfile.mkdtemp()
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    out_path = os.path.join(config.results_dir, 'mb.stdout')
+    with open(out_path, 'w') as f:
+        f.write('stale\n' * 100000)
+    benchmark.args += ['--out-file', out_path]
+
+    process = subprocess.run(benchmark.args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=60)
+    stderr = process.stderr.decode(errors='replace')
+    env.assertEqual(process.returncode, 0, message=stderr)
+    # The JSON file is opened before the results file is truncated, but the
+    # stderr notes keep their old order.
+    env.assertLess(stderr.index("Json file "), stderr.index("Writing results to " + out_path))
+    with open(out_path) as f:
+        out = f.read()
+    env.assertNotContains('stale', out)
+    env.assertContains('ALL STATS', out)
+
+
 def test_out_file_unwritable(env):
     """An --out-file that cannot be opened is a clean startup error (#716).
 
