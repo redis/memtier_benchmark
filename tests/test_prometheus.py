@@ -1334,7 +1334,10 @@ def test_F25_latency_count_tracks_ops(env):
         for ops, count in samples:
             env.assertTrue(count <= ops, message="_count {} > ops_total {}".format(count, ops))
         # Skip the first two seconds (ramp-up), then compare the growth of
-        # both series across the rest of the run.
+        # both series across the rest of the run (about 7-8 s). _count trails
+        # ops_total by at most about one second of ops at either end, so the
+        # ratio stays near 1 and cannot drop much below 1 - 1/7 ~= 0.86; 0.7
+        # leaves room for a slow CI cell. Before #637 it was 0.0006-0.34.
         env.assertTrue(len(samples) >= 10, message="too few samples: {}".format(samples))
         first, last = samples[4], samples[-1]
         d_ops, d_count = last[0] - first[0], last[1] - first[1]
@@ -1343,5 +1346,56 @@ def test_F25_latency_count_tracks_ops(env):
             d_count >= 0.7 * d_ops,
             message="_count grew {} while ops_total grew {}: {}".format(d_count, d_ops, samples),
         )
+    finally:
+        _kill(proc)
+
+
+# ---------------------------------------------------------------------------
+# F26 -- a run's last latency samples are exported before the next run (#637).
+# Each client folds its last partial second at set_end_time(), after which its
+# thread is finished; the exporter must still drain finished threads (at the
+# loop's last tick and at the run-end publish). With --requests the run size
+# is exact, so every scrape taken during run 2 must already count all of run
+# 1's operations. The first render in run 2 lands before run 2's first 1 Hz
+# tick (renders are cached for 1 s), so a missed drain shows there.
+# ---------------------------------------------------------------------------
+def test_F26_run_end_drains_latency(env):
+    if _is_cluster(env):
+        env.skip()  # cluster run boundaries covered by F18
+        return
+    threads, clients, requests = 2, 2, 50000
+    run_ops = threads * clients * requests
+    rd = _new_results_dir()
+    proc, out_path, err_path = _popen_memtier(
+        env,
+        ["--requests={}".format(requests), "-t", str(threads), "-c", str(clients),
+         "--run-count=2", "--prometheus-port=0"],
+        rd,
+    )
+    run2 = []  # (ops_total, latency_seconds_count) scraped during run 2
+    try:
+        url = wait_for_prometheus_url(out_path, timeout=20)
+        env.assertFalse(url is None, message="no announce line")
+        deadline = time.time() + 120
+        while proc.poll() is None and time.time() < deadline:
+            r = prom_scrape(url, timeout=2)
+            if r.status == 200:
+                p = prom_parse(r.body)
+                run = prom_sample_value(p, "memtier_run")
+                ops = prom_sample_value(p, "memtier_ops_total")
+                count = prom_sample_value(p, "memtier_latency_seconds_count")
+                if run == 2 and ops is not None and count is not None:
+                    run2.append((ops, count))
+            time.sleep(0.05)
+        rc = proc.wait()
+        env.assertEqual(rc, 0, message="memtier exit {}: {}".format(rc, _drain(err_path)))
+        env.assertTrue(len(run2) > 0, message="no scrape during run 2")
+        for ops, count in run2:
+            env.assertTrue(ops >= run_ops, message="run 2 ops_total {} < run 1 ops {}".format(ops, run_ops))
+            env.assertTrue(
+                run_ops <= count <= ops,
+                message="run 2 _count {} not in [run 1 ops {}, ops_total {}]: {}".format(
+                    count, run_ops, ops, run2),
+            )
     finally:
         _kill(proc)
