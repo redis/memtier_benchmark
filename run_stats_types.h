@@ -294,8 +294,10 @@ public:
     //   m_retried_ops      number of distinct requests that needed at least
     //                      one retry (regardless of final outcome)
     //   m_errors           number of requests that ultimately failed (retries
-    //                      exhausted or permanent error). Excludes connection
-    //                      errors which already have their own counter.
+    //                      exhausted, permanent error, or given up on without
+    //                      a reply under --retry-on-error). Excludes
+    //                      connection errors which already have their own
+    //                      counter.
     unsigned long long int m_retry_attempts;
     unsigned long long int m_retried_ops;
     unsigned long long int m_errors;

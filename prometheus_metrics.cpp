@@ -72,8 +72,8 @@ static const metric_def kMetricDefs[] = {
      "Total GET operations that did not find the key. Counts GET-command misses only; misses on arbitrary "
      "(--command) miss-trackable commands are reported separately by memtier_arbitrary_misses_total."},
     {"memtier_errors_total", MT_TYPE_COUNTER,
-     "Total commands that received an error reply after retries were exhausted; connection errors are counted "
-     "separately."},
+     "Total requests that ultimately failed: an error reply after retries were exhausted, or (with "
+     "--retry-on-error) a request given up on without a reply; connection errors are counted separately."},
     {"memtier_connection_errors_total", MT_TYPE_COUNTER,
      "Total connection errors since process start, accumulated across runs (the StatsD transport reports the raw "
      "per-run value instead)."},

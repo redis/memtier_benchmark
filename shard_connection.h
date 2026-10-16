@@ -321,6 +321,9 @@ public:
     // --failed-keys-file with `reason` and count it as an error. Returns how
     // many were dropped.
     unsigned long long abandon_replay_requests(const char *reason);
+    // abandon_replay_requests() before the thread's event loop is broken,
+    // with a summary on stderr.
+    void abandon_held_requests_on_thread_end(const char *reason);
     // Capture bytes added between `before_pos` and the current evbuffer length
     // into req->m_serialized. No-op when retry is globally disabled.
     void capture_serialized_bytes(size_t before_pos, request *req);

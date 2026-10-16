@@ -283,7 +283,7 @@ differences from the StatsD names above:
 | `memtier_ops_total` | counter | `ops_sec` (rate) | Prometheus exports the cumulative total; rate is derived at query time. |
 | `memtier_sent_bytes_total` / `memtier_received_bytes_total` | counter | `bytes_sec` | Cumulative bytes since process start. |
 | `memtier_hits_total` / `memtier_misses_total` | counter | hits/misses | |
-| `memtier_errors_total` | counter | — | Errors after retries are exhausted. |
+| `memtier_errors_total` | counter | — | Requests that ultimately failed: errors after retries are exhausted, or requests given up on without a reply under `--retry-on-error`. |
 | `memtier_connection_errors_total` | counter | `connection_errors` | Accumulated across runs (StatsD reports the raw per-run value). |
 | `memtier_retry_attempts_total` / `memtier_retried_ops_total` | counter | — | Nonzero only with `--retry-on-error`. |
 | `memtier_connections` / `memtier_threads` | gauge | `connections` | |

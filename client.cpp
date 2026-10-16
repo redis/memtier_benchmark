@@ -1301,6 +1301,25 @@ void client_group::run(void)
         setup_staircase_timer();
     }
     event_base_dispatch(m_base);
+
+    // The loop can end while requests are still held for resend: a
+    // connection that ran out of reconnect attempts ends the whole thread,
+    // and the other connections on it may hold requests they moved to their
+    // replay queues on the same outage. Nothing resends them now; count
+    // them as errors instead of freeing them silently with the connections.
+    // A run that ended normally has already emptied them (disconnect_all()).
+    unsigned long long abandoned = 0;
+    for (unsigned int i = 0; i < m_clients.size(); i++) {
+        std::vector<shard_connection *> &conns = m_clients[i]->get_connections();
+        for (unsigned int j = 0; j < conns.size(); j++) {
+            if (conns[j] != NULL) abandoned += conns[j]->abandon_replay_requests("thread-ended-before-resend");
+        }
+    }
+    if (abandoned) {
+        benchmark_error_log("warning: %llu request(s) held for resend when the thread ended were not resent; "
+                            "counted as errors.\n",
+                            abandoned);
+    }
 }
 
 void client_group::staircase_timer_cb(evutil_socket_t fd, short what, void *arg)

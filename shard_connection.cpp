@@ -540,6 +540,14 @@ int shard_connection::connect(struct connect_info *addr)
     return 0;
 }
 
+// Log a request memtier gives up on, without a reply, to --failed-keys-file.
+static void log_abandoned_request(const request *req, const char *reason)
+{
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    global_failed_keys_logger().log_failure(now, "REPLAY", req->m_key, req->m_key_len, reason, req->m_retries);
+}
+
 void shard_connection::disconnect()
 {
     if (m_bev) {
@@ -595,6 +603,7 @@ void shard_connection::disconnect()
             if (req->m_serialized && req->m_serialized_len > 0) {
                 m_replay_queue->push(req);
             } else {
+                log_abandoned_request(req, "not-replayable");
                 abandoned++;
                 delete req;
             }
@@ -611,7 +620,8 @@ void shard_connection::disconnect()
                     m_replay_queue->push(req);
                 } else {
                     // Not expected: enqueue_retry() only accepts requests
-                    // with captured bytes. Account it like any other drop.
+                    // with captured bytes. It cannot be resent: abandon it.
+                    log_abandoned_request(req, "not-replayable");
                     abandoned++;
                     delete req;
                 }
@@ -628,10 +638,7 @@ void shard_connection::disconnect()
             if (is_workload_request(req->m_type)) {
                 if (m_config->retry_on_error && m_config->transaction) {
                     abandoned++;
-                    struct timeval now;
-                    gettimeofday(&now, NULL);
-                    global_failed_keys_logger().log_failure(now, "REPLAY", req->m_key, req->m_key_len,
-                                                            "transaction-not-replayed", req->m_retries);
+                    log_abandoned_request(req, "transaction-not-replayed");
                 } else {
                     dropped++;
                 }
@@ -1036,14 +1043,22 @@ unsigned long long shard_connection::abandon_replay_requests(const char *reason)
     unsigned long long abandoned = 0;
     request *req;
     while ((req = pop_replay_request()) != NULL) {
-        struct timeval now;
-        gettimeofday(&now, NULL);
-        global_failed_keys_logger().log_failure(now, "REPLAY", req->m_key, req->m_key_len, reason, req->m_retries);
+        log_abandoned_request(req, reason);
         abandoned++;
         delete req;
     }
     if (abandoned) m_conns_manager->abandon_requests(abandoned);
     return abandoned;
+}
+
+void shard_connection::abandon_held_requests_on_thread_end(const char *reason)
+{
+    unsigned long long abandoned = abandon_replay_requests(reason);
+    if (abandoned) {
+        benchmark_error_log("warning: %llu request(s) held for resend on conn %u were not resent (%s); "
+                            "counted as errors.\n",
+                            abandoned, m_id, reason);
+    }
 }
 
 void shard_connection::adopt_replay_request(request *req)
@@ -1871,8 +1886,11 @@ void shard_connection::attempt_reconnect(const char *error_context)
         benchmark_error_log("Maximum reconnection attempts (%u) exceeded for %s, ending this thread.\n",
                             m_config->max_reconnect_attempts, error_context);
         disconnect();
-        // Nothing will resend the requests held for it now.
-        abandon_replay_requests("max-reconnect-attempts-exceeded");
+        // Nothing will resend the requests held for it now. The requests
+        // held by the other connections on this thread are abandoned by
+        // client_group::run() once the loop returns.
+        abandon_held_requests_on_thread_end(m_config->reconnect_on_error ? "max-reconnect-attempts-exceeded"
+                                                                         : "connection-lost-no-reconnect");
         // Break the event loop: the thread ends and run_benchmark() fails the
         // run. It is not restarted.
         event_base_loopbreak(m_event_base);
@@ -1974,6 +1992,7 @@ void shard_connection::handle_reconnect_timer_event()
             }
             benchmark_error_log("Maximum reconnection attempts (%u) exceeded, ending this thread.\n",
                                 m_config->max_reconnect_attempts);
+            abandon_held_requests_on_thread_end("max-reconnect-attempts-exceeded");
             // Break the event loop: the thread ends and run_benchmark() fails
             // the run. It is not restarted. No state reset needed here: the
             // thread is finished and the shard_connection object destroyed
