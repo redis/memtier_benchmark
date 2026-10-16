@@ -1759,13 +1759,16 @@ void client_group::merge_run_stats(run_stats *target)
     assert(target != NULL);
     // Iterate ALL clients (not just active_client_count) to avoid dropping
     // stats from clients that were prepare()-d but not yet counted in the
-    // atomic when the benchmark ended. Skip clients that never started
-    // (set_start_time never called) — merging their zeroed m_start_time
-    // would corrupt the factorial-averaged timestamps.
+    // atomic when the benchmark ended. Clients that never started
+    // (set_start_time never called) are merged too, for the connection errors
+    // and interrupted flag they recorded; run_stats::merge() leaves their
+    // zeroed m_start_time out of the factorial-averaged timestamps, so they
+    // do not advance the iteration counter.
     unsigned int iteration_counter = 1;
     for (unsigned int i = 0; i < m_clients.size(); i++) {
-        if (!m_clients[i]->get_stats()->has_started()) continue;
-        target->merge(*m_clients[i]->get_stats(), iteration_counter++);
+        run_stats *stats = m_clients[i]->get_stats();
+        target->merge(*stats, iteration_counter);
+        if (stats->has_started()) iteration_counter++;
     }
 }
 

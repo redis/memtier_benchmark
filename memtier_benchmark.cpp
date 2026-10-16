@@ -3718,16 +3718,12 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
 
         // Check for Ctrl+C interrupt
         if (g_interrupted) {
-            // Calculate elapsed time before interrupting
-            unsigned long long int elapsed_duration = 0;
-            unsigned int thread_counter = 0;
-            for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
-                thread_counter++;
-                float factor = ((float) (thread_counter - 1) / thread_counter);
-                elapsed_duration = factor * elapsed_duration + (float) (*i)->m_cg->get_duration_usec() / thread_counter;
-            }
+            // Wall time since the run started: the client durations stay 0
+            // for clients that have not connected yet.
+            struct timeval now;
+            gettimeofday(&now, NULL);
             fprintf(stderr, "\n[RUN #%u] Interrupted by %s after %.1f secs, stopping threads...\n", run_id,
-                    interrupt_source(), (float) elapsed_duration / 1000000);
+                    interrupt_source(), (float) ts_diff(cfg->benchmark_start_time, now) / 1000000);
             // Interrupt all threads (marks clients as interrupted, breaks event loops, and finalizes stats)
             for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
                 (*i)->m_cg->interrupt();

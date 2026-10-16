@@ -1,5 +1,9 @@
 import json
+import os
 import re
+import signal
+import socket
+import subprocess
 import tempfile
 import time
 import threading
@@ -487,6 +491,90 @@ def test_reconnect_disabled_by_default(env):
     if not killed:
         env.debugPrint("WARNING: No connections were killed", True)
     env.assertTrue(killed)
+
+
+def _closed_port():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
+
+
+def _dead_server_args(json_path, extra_args):
+    return [
+        MEMTIER_BINARY,
+        "--server=127.0.0.1",
+        "--port={}".format(_closed_port()),
+        "--threads=1",
+        "--clients=2",
+        "--reconnect-on-error",
+        "--connection-stage-timeout=0",
+        "--connection-timeout=1",
+        "--hide-histogram",
+        "--json-out-file={}".format(json_path),
+    ] + extra_args
+
+
+def test_connection_errors_reported_when_server_never_reachable(env):
+    """Clients that never connect keep their connection errors (issue #702).
+
+    No connection ever succeeds, so no client sets a start time. The final
+    report used to skip those clients and print Connection Errors 0, although
+    the live line counted every failed connect.
+    """
+    env.skipOnCluster()
+    test_dir = tempfile.mkdtemp()
+    json_path = os.path.join(test_dir, "mb.json")
+    result = subprocess.run(
+        _dead_server_args(json_path, ["--max-reconnect-attempts=2", "--test-time=30"]),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    # One failed connect and two failed reconnects at least; the thread ends
+    # when its first client runs out of attempts.
+    logged = len(re.findall(r"Connection error: ", result.stderr))
+    env.assertGreaterEqual(logged, 3, message=result.stderr[-2000:])
+    with open(json_path) as f:
+        totals = json.load(f)["ALL STATS"]["Totals"]
+    env.assertEqual(totals["Connection Errors"], logged, message=repr(totals))
+
+
+def test_ctrl_c_reported_when_server_never_reachable(env):
+    """A Ctrl+C before any client connects is reported (issue #702).
+
+    The "after N secs" message used the client durations, which stay 0 until
+    a client connects, and the JSON lost the interrupted flag together with
+    the clients that never started.
+    """
+    env.skipOnCluster()
+    test_dir = tempfile.mkdtemp()
+    json_path = os.path.join(test_dir, "mb.json")
+    proc = subprocess.Popen(
+        _dead_server_args(json_path, ["--test-time=30"]),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    time.sleep(3)
+    proc.send_signal(signal.SIGINT)
+    try:
+        _, stderr = proc.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        _, stderr = proc.communicate()
+        env.assertTrue(False, message="memtier did not exit after SIGINT")
+        return
+    match = re.search(r"Interrupted by user \(Ctrl\+C\) after ([0-9.]+) secs", stderr)
+    env.assertTrue(match is not None, message=stderr[-2000:])
+    if match is None:
+        return
+    env.assertGreaterEqual(float(match.group(1)), 2.0, message=match.group(0))
+    with open(json_path) as f:
+        stats = json.load(f)["ALL STATS"]
+    env.assertEqual(stats["Runtime"]["Interrupted"], "true", message=repr(stats["Runtime"]))
+    env.assertGreater(stats["Totals"]["Connection Errors"], 0, message=repr(stats["Totals"]))
 
 
 def test_reconnect_backoff_cap_60s(env):

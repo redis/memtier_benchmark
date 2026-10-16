@@ -1176,6 +1176,19 @@ void run_stats::merge(const run_stats &other, int iteration)
 {
     bool new_stats = false;
 
+    // A run that never started (no connection was ever set up) has no start
+    // time: its timestamps are zero and its per-second buckets are keyed from
+    // the epoch, so neither can be merged. Keep what it did record, so a
+    // server that was never reachable does not report 0 connection errors
+    // and a Ctrl+C is not lost: add its connection errors to the current
+    // second, which summarize() includes, and take its interrupted flag.
+    if (!other.has_started()) {
+        m_cur_stats.m_connection_errors += other.m_totals.m_connection_errors;
+        if (other.m_interrupted) m_interrupted = true;
+        m_unanswered_requests += other.m_unanswered_requests;
+        return;
+    }
+
     m_start_time = timeval_factorial_average(m_start_time, other.m_start_time, iteration);
     m_end_time = timeval_factorial_average(m_end_time, other.m_end_time, iteration);
 
