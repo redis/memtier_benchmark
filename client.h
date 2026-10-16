@@ -193,6 +193,8 @@ public:
     virtual bool all_connections_idle(void);
     virtual void set_start_time();
     virtual void set_end_time();
+    // set_end_time() for client_group::interrupt(), on the main thread.
+    void set_end_time_keep_live_totals(bool keep_live_totals);
     virtual void create_request(struct timeval timestamp, unsigned int conn_id);
     virtual bool hold_pipeline(unsigned int conn_id);
     virtual int connect(void);
@@ -316,7 +318,7 @@ public:
     int prepare_count(unsigned int count);
     void run(void);
     void interrupt(void);
-    void finalize_all_clients(void);
+    void finalize_all_clients(bool keep_live_totals = false);
     void set_all_clients_interrupted(void);
     unsigned int count_unended_clients(void);
 

@@ -385,11 +385,16 @@ void client::set_start_time()
 
 void client::set_end_time()
 {
+    set_end_time_keep_live_totals(false);
+}
+
+void client::set_end_time_keep_live_totals(bool keep_live_totals)
+{
     // update only once
     if (!m_end_set) {
         benchmark_debug_log("nothing else to do, test is finished.\n");
 
-        m_stats.set_end_time(NULL);
+        m_stats.set_end_time(NULL, keep_live_totals);
         m_end_set = true;
     }
 }
@@ -1374,11 +1379,13 @@ void client_group::interrupt(void)
     event_base_loopbreak(m_base);
     struct timeval zero = {0, 0};
     event_base_loopexit(m_base, &zero);
-    // Set end time for all clients as close as possible to the loop break
-    finalize_all_clients();
+    // Set end time for all clients as close as possible to the loop break.
+    // This runs on the main thread while workers may still record, so keep
+    // their live latency totals for the exporter's post-join drain.
+    finalize_all_clients(true);
 }
 
-void client_group::finalize_all_clients(void)
+void client_group::finalize_all_clients(bool keep_live_totals)
 {
     // Iterate ALL clients, not just active ones. During staircase mode,
     // a client may have been prepare()-d but not yet counted in the atomic
@@ -1386,7 +1393,7 @@ void client_group::finalize_all_clients(void)
     // no client is missed. Calling set_end_time() on never-started clients
     // is harmless — they won't be included in merge (which uses active_client_count).
     for (unsigned int i = 0; i < m_clients.size(); i++) {
-        m_clients[i]->set_end_time();
+        m_clients[i]->set_end_time_keep_live_totals(keep_live_totals);
     }
 }
 

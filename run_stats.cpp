@@ -164,7 +164,7 @@ void run_stats::set_start_time(struct timeval *start_time)
     m_started.flag.store(true, std::memory_order_release);
 }
 
-void run_stats::set_end_time(struct timeval *end_time)
+void run_stats::set_end_time(struct timeval *end_time, bool keep_live_totals)
 {
     struct timeval tv;
     if (!end_time) {
@@ -172,17 +172,12 @@ void run_stats::set_end_time(struct timeval *end_time)
         end_time = &tv;
     }
     m_end_time = *end_time;
-    // After interrupt() (Ctrl+C, connection-stage abort) this runs on the main
-    // thread while the worker may still record ops lock-free; folding and
-    // resetting the live totals here would drop the samples recorded between
-    // the add and the reset. Leave them for the exporter's post-join drain.
-    // m_interrupted stands in for "called from the main thread": interrupt()
-    // sets it before finalize_all_clients(), and the worker's own paths
-    // (stop condition, worker-failure finalize) leave it false. A worker that
-    // races interrupt() may read either value; both are safe (false folds on
-    // the only writer, true leaves the samples for the post-join drain). A
-    // new main-thread caller of set_end_time() must set it first.
-    summarize_current_second(m_interrupted && m_config->prometheus != NULL);
+    // keep_live_totals is set only by interrupt() (Ctrl+C, connection-stage
+    // abort), which runs this on the main thread while the worker may still
+    // record ops lock-free; folding and resetting the live totals here would
+    // drop the samples recorded between the add and the reset. Leave them for
+    // the exporter's post-join drain.
+    summarize_current_second(keep_live_totals && m_config->prometheus != NULL);
     m_stats.push_back(m_cur_stats);
 }
 
