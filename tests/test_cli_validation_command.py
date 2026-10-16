@@ -188,3 +188,91 @@ def test_command_ratio_one_succeeds(env):
         memtier_ok,
         message="Benchmark must complete cleanly with --command-ratio 1",
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #515 - commands whose reply arity is not 1:1 with the request
+# ---------------------------------------------------------------------------
+
+def test_command_multi_reply_family_rejected(env):
+    """The pub/sub and streaming families must be rejected at parse time.
+
+    Issue #515: Redis answers SUBSCRIBE/PSUBSCRIBE/UNSUBSCRIBE once per
+    channel, so `--command="SUBSCRIBE a b"` produced two replies for one
+    queued request. The surplus reply popped a request that was never queued
+    and drove m_pending_resp negative, tripping the assert in
+    shard_connection::pop_req() -- SIGABRT, in release builds too (the default
+    CXXFLAGS carry no -DNDEBUG).
+
+    Single-channel SUBSCRIBE is rejected as well: it is equally fatal the
+    moment anyone publishes to that channel, because the message arrives with
+    no request outstanding. MONITOR / PSYNC stream indefinitely and wedge the
+    run past --test-time instead.
+    """
+    master = env.getMasterNodesList()[0]
+
+    for command in (
+        "SUBSCRIBE chan1 chan2",
+        "SUBSCRIBE chan1",
+        "PSUBSCRIBE ch1* ch2*",
+        "UNSUBSCRIBE chan1 chan2",
+        "PUNSUBSCRIBE ch1*",
+        "SSUBSCRIBE schan",
+        "SUNSUBSCRIBE schan",
+        "MONITOR",
+        "SYNC",
+        "PSYNC",
+        # case-insensitive: the predicate uppercases before comparing
+        "subscribe chan1 chan2",
+    ):
+        result = _run_memtier([
+            "-s", "127.0.0.1",
+            "-p", str(master["port"]),
+            "--command", command,
+            "--test-time=1",
+        ])
+
+        env.assertNotEqual(
+            result.returncode, 0,
+            message="--command {!r} must exit non-zero".format(command),
+        )
+        # -6/-11 would mean we reached the crash instead of the rejection.
+        env.assertTrue(
+            result.returncode > 0,
+            message="--command {!r} must be rejected, not crash "
+                    "(returncode {})".format(command, result.returncode),
+        )
+        env.assertTrue(
+            "is not supported" in result.stderr,
+            message="Expected multi-reply rejection for {!r} in stderr; "
+                    "got: {!r}".format(command, result.stderr),
+        )
+        env.assertTrue(
+            "Assertion" not in result.stderr,
+            message="--command {!r} must not trip an assert; "
+                    "got: {!r}".format(command, result.stderr),
+        )
+
+
+def test_command_publish_still_allowed(env):
+    """PUBLISH is 1:1 (integer reply) and must keep working.
+
+    Guards against over-broad denylisting of the pub/sub family: only the
+    subscribe side is multi-reply.
+    """
+    test_dir = tempfile.mkdtemp()
+
+    benchmark, run_config = _build_benchmark(
+        env, test_dir,
+        extra_args=["--command", "PUBLISH chan1 __data__"],
+        threads=1,
+        clients=1,
+        requests=50,
+    )
+
+    memtier_ok = benchmark.run()
+    debugPrintMemtierOnError(run_config, env)
+    env.assertTrue(
+        memtier_ok,
+        message="PUBLISH must remain benchmarkable",
+    )
