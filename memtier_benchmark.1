@@ -75,21 +75,32 @@ Print debug output
 Run client in cluster mode
 .TP
 \fB\-\-transaction\fR
-In \fB\-\-cluster\-mode\fR, pin one full rotation of \fB\-\-command\fR entries to
-a single shard connection so that keyless commands (MULTI/EXEC/
-UNWATCH) stay on the same connection as the keyed ones. Hash\-tag
-your keys so they map to the same slot, otherwise the cross\-slot
-keyed commands of the same rotation will get MOVED back. In every
-mode, each \fB__key__\fR in a rotation resolves to the same key; in
-standalone mode no pinning is needed (each client already runs
-through a single connection). Requires at least one \fB\-\-command\fR.
-\fB\-\-pipeline\fR > 1 is supported: each rotation is sent contiguously
-on its pinned connection, so multiple whole transactions can be
-in flight without interleaving MULTI/EXEC blocks.
-Note: a reconnect (e.g. \fB\-\-reconnect\-on\-error\fR) loses the server\-side
-WATCH/MULTI state. If it happens inside a MULTI block, the rest of that
-block, through its EXEC/DISCARD, is skipped and not counted, so the
-per\-command counts no longer follow the command ratio.
+Treat one full rotation of \fB\-\-command\fR entries as a transactional
+unit (e.g. WATCH/GET/MULTI/SETEX/EXEC/UNWATCH). Every __key__ in
+a rotation resolves to the same key (taken from the first keyed
+command's \fB\-\-command\-key\-pattern\fR), so all keyed commands hit one
+key and one slot: the WATCH guards the key the SETEX writes and
+the unit runs without CROSSSLOT errors \fB\-\-\fR no hash\-tag needed.
+This same\-key behavior applies in every mode, so it also works
+against a single endpoint fronting a sharded backend (e.g. a
+Redis Enterprise proxy) where keyed commands must share a slot.
+In \fB\-\-cluster\-mode\fR it additionally pins the whole rotation to the
+owning shard connection so the keyless commands (MULTI/EXEC/
+UNWATCH) stay with the keyed ones. Caveat: keep the literal text
+around __key__ (including any {tag}) identical across keyed
+commands; differing affixes still hash to different slots.
+Requires at least one \fB\-\-command\fR.
+\fB\-\-pipeline\fR > 1 is supported: in \fB\-\-cluster\-mode\fR each rotation is
+sent contiguously on its pinned connection, so multiple whole
+transactions can be in flight without interleaving MULTI/EXEC.
+Note: a reconnect (e.g. \fB\-\-reconnect\-on\-error\fR) loses the
+server\-side WATCH/MULTI state. If it happens inside a MULTI
+block, the rest of that block, through its EXEC/DISCARD, is
+skipped and not counted, so the per\-command counts no longer
+follow the command ratio. Replies already received for that
+block stay counted.
+\fB\-\-retry\-on\-error\fR does not retry or replay \fB\-\-transaction\fR
+commands.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Display this help
