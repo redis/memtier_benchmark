@@ -2011,8 +2011,10 @@ void shard_connection::handle_cluster_slots_retry_event()
     if (m_cluster_slots != setup_sent) return;
     // The run ended while this client was still waiting for a slot map. It
     // never sent a request: fail the run instead of letting it count as
-    // finished (under --clients-start, finished() uses the run's deadline).
-    if (!m_conns_manager->get_reqs_answered() && run_is_over()) {
+    // finished. Under --clients-start, finished() uses the run's deadline in
+    // whole seconds, so it can be true up to 1 s before run_is_over().
+    if (!m_conns_manager->get_reqs_answered() &&
+        (run_is_over() || (connection_stage_steady_state_reached() && m_conns_manager->finished()))) {
         attempt_reconnect("CLUSTER SLOTS error");
         return;
     }

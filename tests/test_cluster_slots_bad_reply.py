@@ -99,7 +99,7 @@ class _Handler(socketserver.StreamRequestHandler):
             node.errors.append(repr(error))
 
 
-def _run(node, extra_args, timeout=20, workers=1, clients=1, cluster=True):
+def _run(node, extra_args, timeout=20, workers=1, clients=1, cluster=True, start_fraction=None):
     others = [node.replica] if node.replica else []
     threads = [threading.Thread(target=n.serve_forever, daemon=True) for n in [node] + others]
     for thread in threads:
@@ -107,6 +107,9 @@ def _run(node, extra_args, timeout=20, workers=1, clients=1, cluster=True):
     args = [MEMTIER_BINARY, "--server=127.0.0.1", "--port={}".format(node.server_address[1]),
             "--threads={}".format(workers), "--clients={}".format(clients),
             "--hide-histogram"] + (["--cluster-mode"] if cluster else []) + extra_args
+    if start_fraction is not None:
+        # Start the run this far into a wall-clock second.
+        time.sleep((start_fraction - time.time() % 1) % 1)
     start = time.time()
     try:
         result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -238,6 +241,22 @@ def test_cluster_slots_empty_reply_for_late_staircase_clients_fails(env):
     env.assertEqual(node.errors, [])
     env.assertNotEqual(returncode, "timeout", message=stderr[-2000:])
     env.assertNotEqual(returncode, 0)
+    env.assertContains("CLUSTER SLOTS error and --reconnect-on-error is not set, ending this thread", stderr)
+    env.assertLess(elapsed, 12)
+
+
+def test_cluster_slots_empty_reply_for_late_staircase_clients_fails_late_in_second(env):
+    # As above, with the run started 0.9 s into a second, and each bad reply
+    # delayed 0.3 s, so the late clients' retries fire 3.3 s and 3.6 s into
+    # the run. finished() compares whole seconds under --clients-start and
+    # is already true then, 0.6 s before the deadline: the retry must not
+    # let these clients count as done.
+    node = _Node(bad_slots_replies=1000, first_good=True, bad_delay=0.3)
+    returncode, stderr, elapsed = _run(node, ["--test-time=4", "--clients-start=1", "--clients-step=1",
+                                              "--step-duration=1"], clients=3, start_fraction=0.9)
+    env.assertEqual(node.errors, [])
+    env.assertNotEqual(returncode, "timeout", message=stderr[-2000:])
+    env.assertNotEqual(returncode, 0, message=stderr[-2000:])
     env.assertContains("CLUSTER SLOTS error and --reconnect-on-error is not set, ending this thread", stderr)
     env.assertLess(elapsed, 12)
 
