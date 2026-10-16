@@ -1258,7 +1258,9 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
                         // CLUSTER SLOTS sequence. set_role is a no-op for
                         // already-known replicas (idempotent). A pending
                         // reconnect timer redials it instead, as for primaries.
-                        if (!rsc->is_reconnect_pending()) {
+                        // Nor is a replica closed because it rejected its
+                        // setup under --read-preference primary (#737).
+                        if (!rsc->is_reconnect_pending() && !rsc->is_setup_rejected_replica()) {
                             rsc->set_role(role_replica);
                             connect_shard_connection(rsc, r_addr, r_port);
                         }

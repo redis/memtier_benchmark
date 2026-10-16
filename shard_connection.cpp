@@ -128,6 +128,11 @@ void cluster_slots_retry_cb(evutil_socket_t, short, void *ctx)
     static_cast<shard_connection *>(ctx)->handle_cluster_slots_retry_event();
 }
 
+void setup_rejected_check_cb(evutil_socket_t, short, void *ctx)
+{
+    static_cast<shard_connection *>(ctx)->handle_setup_rejected_check_event();
+}
+
 void cluster_client_connection_timeout_handler(evutil_socket_t fd, short what, void *ctx)
 {
     shard_connection *sc = (shard_connection *) ctx;
@@ -293,6 +298,8 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_reconnect_timer(NULL),
         m_reconnecting(false),
         m_setup_rejected(false),
+        m_setup_rejected_replica(false),
+        m_setup_rejected_context(NULL),
         m_thread_end_reason(NULL),
         m_connection_timeout_timer(NULL),
         m_retry_queue(NULL),
@@ -300,6 +307,7 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_retry_drain_timer(NULL),
         m_deferred_fill_timer(NULL),
         m_cluster_slots_retry_timer(NULL),
+        m_setup_rejected_timer(NULL),
         m_bev_paused(false)
 {
     m_id = id;
@@ -401,6 +409,11 @@ shard_connection::~shard_connection()
     if (m_cluster_slots_retry_timer != NULL) {
         event_free(m_cluster_slots_retry_timer);
         m_cluster_slots_retry_timer = NULL;
+    }
+
+    if (m_setup_rejected_timer != NULL) {
+        event_free(m_setup_rejected_timer);
+        m_setup_rejected_timer = NULL;
     }
 
     if (m_retry_queue != NULL) {
@@ -691,6 +704,10 @@ void shard_connection::disconnect()
     if (m_cluster_slots_retry_timer != NULL && evtimer_pending(m_cluster_slots_retry_timer, NULL)) {
         evtimer_del(m_cluster_slots_retry_timer);
     }
+    if (m_setup_rejected_timer != NULL && evtimer_pending(m_setup_rejected_timer, NULL)) {
+        evtimer_del(m_setup_rejected_timer);
+    }
+    m_setup_rejected_context = NULL;
 
     m_connection_state = conn_disconnected;
     m_disconnect_count++;
@@ -2019,33 +2036,58 @@ bool shard_connection::run_is_over()
     return elapsed.tv_sec >= (time_t) m_config->test_time;
 }
 
-// A setup step (AUTH/SELECT/HELLO) was rejected. With --reconnect-on-error,
-// handle it like a dropped connection, so --max-reconnect-attempts bounds it.
-// Leaving the connection open would stall it for good: no workload request is
-// sent before setup completes, so --test-time / --requests are never checked
-// again, and --connection-stage-timeout is disarmed once the run has reached
-// steady state. Without --reconnect-on-error, a failure at startup is ended by
-// --connection-stage-timeout.
-//
-// A replica connection under --read-preference primary is the exception: it
-// never carries a request, so the primaries reach steady state and disarm
-// --connection-stage-timeout, and the replica's unfinished setup then keeps
-// the client from ending (#737). Close it instead, as for a READONLY error;
-// the run goes on without it.
+// A setup step (AUTH/SELECT/HELLO) was rejected. No workload request is sent
+// before setup completes, so a connection left open with a rejected setup
+// would stall for good, and keep its client from ending (#737).
+// - With --reconnect-on-error, handle it like a dropped connection, so
+//   --max-reconnect-attempts bounds it.
+// - A replica connection under --read-preference primary is not needed: keyed
+//   requests go to the primaries, and so do the keyless ones the replica
+//   connection would have sent. Close it, as for a READONLY error, and leave
+//   it closed: a slot map refresh does not redial it while it is a replica.
+// - Otherwise, once the run has reached steady state, end this thread, as
+//   for a dropped connection, so the run fails. Before that, the rejection
+//   is a startup failure that --connection-stage-timeout ends; check again
+//   every second, since another connection reaching steady state disarms it.
 void shard_connection::reconnect_after_setup_error(const char *error_context)
 {
     if (m_config->reconnect_on_error) {
         attempt_reconnect(error_context);
         m_setup_rejected = m_reconnecting;
-    } else if (m_role == role_replica && m_config->read_preference == rp_primary) {
-        benchmark_error_log("warning: %s on replica connection %s, which carries no requests under "
-                            "--read-preference primary; closing it.\n",
+        return;
+    }
+    if (m_role == role_replica && m_config->read_preference == rp_primary) {
+        benchmark_error_log("warning: %s on replica connection %s; it is not needed under --read-preference "
+                            "primary, closing it.\n",
                             error_context, get_readable_id());
         struct timeval now;
         gettimeofday(&now, NULL);
         static_cast<client *>(m_conns_manager)->get_stats()->update_connection_error(&now);
         disconnect();
+        m_setup_rejected_replica = true;
+        return;
     }
+    m_setup_rejected_context = error_context;
+    handle_setup_rejected_check_event();
+}
+
+void shard_connection::handle_setup_rejected_check_event()
+{
+    if (m_setup_rejected_context == NULL || get_connection_state() != conn_connected) return;
+    if (connection_stage_steady_state_reached() || m_conns_manager->get_reqs_answered()) {
+        attempt_reconnect(m_setup_rejected_context);
+        return;
+    }
+    if (m_setup_rejected_timer == NULL) {
+        m_setup_rejected_timer = event_new(m_event_base, -1, 0, setup_rejected_check_cb, this);
+        if (m_setup_rejected_timer == NULL) {
+            benchmark_error_log("error: event_new failed in reconnect_after_setup_error\n");
+            event_base_loopbreak(m_event_base);
+            return;
+        }
+    }
+    struct timeval delay = {1, 0};
+    event_add(m_setup_rejected_timer, &delay);
 }
 
 // A CLUSTER SLOTS reply was empty, an error, or had no valid shard, e.g. from
