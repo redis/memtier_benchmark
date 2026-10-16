@@ -12,7 +12,6 @@ Run with:
 
 import json
 import os
-import re
 import shutil
 import socket
 import subprocess
@@ -114,12 +113,11 @@ def _check_common(env, result):
     returncode, stderr, stats, calls = result
     env.assertEqual(returncode, 0, message=stderr[-2000:])
     totals = stats["Totals"]
-    # Every failed connect before the server came up is counted, including
-    # those recorded before the client started: each client fails its first
-    # connect and at least one reconnect.
-    logged = len(re.findall(r"(?:TLS c|C)onnection error: ", stderr))
-    env.assertGreaterEqual(logged, 2 * CLIENTS, message=stderr[-2000:])
-    env.assertEqual(totals["Connection Errors"], logged, message=repr(totals))
+    # Every client fails at least twice before redis is up, and each of those
+    # errors must survive the late start (#708). Don't tie the count to the
+    # "Connection error:" log line: it is only printed when errno is set, so an
+    # error can be counted without one.
+    env.assertGreaterEqual(totals["Connection Errors"], 2 * CLIENTS, message=repr(totals) + stderr[-2000:])
     env.assertGreater(totals["Count"], 0, message=stderr[-2000:])
     env.assertEqual(totals["Count"], calls, message="server saw {} GET/SET calls".format(calls))
     return totals
