@@ -191,8 +191,10 @@ static bool check_cluster_monitor_lines(const struct monitor_command_list *monit
 #define MAX_RUN_COUNT 1024
 
 // Global flag for signal handling: 0, or the number of the signal
-// (SIGINT / SIGTERM) that interrupted the run
-static volatile sig_atomic_t g_interrupted = 0;
+// (SIGINT / SIGTERM) that interrupted the run. Atomic, not a volatile
+// sig_atomic_t: the kernel may run the handler on a worker thread while the
+// main thread reads the flag.
+static std::atomic<int> g_interrupted(0);
 
 // Set when run_benchmark() aborts because --connection-stage-timeout
 // elapsed without any thread reaching steady state. main() reads it after
@@ -385,6 +387,11 @@ static void install_alt_signal_stack(void)
 // CLOCK_MONOTONIC time (ns) of the first SIGINT/SIGTERM, 0 before it.
 static std::atomic<long long> g_first_interrupt_ns(0);
 
+// The handler touches both atomics; that is async-signal-safe only when they
+// are lock-free (not the case for 64-bit atomics on e.g. armv5te).
+static_assert(ATOMIC_INT_LOCK_FREE == 2, "sigint_handler needs lock-free std::atomic<int>");
+static_assert(ATOMIC_LLONG_LOCK_FREE == 2, "sigint_handler needs lock-free std::atomic<long long>");
+
 // Signal handler for Ctrl+C (SIGINT) and SIGTERM. The first signal stops
 // the run gracefully. A signal at least 1 s later terminates at once, as a
 // way out of a stuck shutdown. Signals within that second are duplicates of
@@ -392,18 +399,19 @@ static std::atomic<long long> g_first_interrupt_ns(0);
 // twice (terminal and timeout), and a process-group kill does the same.
 static void sigint_handler(int signum)
 {
+    int saved_errno = errno;
     struct timespec ts;
+    // clock_gettime() is async-signal-safe (POSIX.1-2008).
     clock_gettime(CLOCK_MONOTONIC, &ts);
     long long now = (long long) ts.tv_sec * 1000000000LL + ts.tv_nsec;
     long long first = 0;
     if (g_first_interrupt_ns.compare_exchange_strong(first, now)) {
         g_interrupted = signum;
-        return;
-    }
-    if (now - first >= 1000000000LL) {
+    } else if (now - first >= 1000000000LL) {
         signal(signum, SIG_DFL);
         raise(signum);
     }
+    errno = saved_errno;
 }
 
 static const char *interrupt_source(void)

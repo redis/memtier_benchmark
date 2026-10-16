@@ -20,6 +20,7 @@
 #include "config.h"
 #endif
 
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <cmath> // For std::isfinite
@@ -30,14 +31,19 @@
  * C'tor
  * -----
  * Opens the file named jsonfilename and sets the first nesting as NESTED_GENERAL
- * In case of failure to create the file, will state the error perror
+ * In case of failure to create the file, prints the error and exits
  */
 json_handler::json_handler(const char *jsonfilename) : m_json_file(NULL)
 {
-    // Try to open a file and add the first level
-    m_json_file = fopen(jsonfilename, "w");
+    // Try to open a file and add the first level. Retry on EINTR: a Ctrl+C or
+    // SIGTERM can arrive while fopen() blocks (e.g. on a FIFO), and not every
+    // libc interceptor (TSAN) restarts it.
+    do {
+        m_json_file = fopen(jsonfilename, "w");
+    } while (!m_json_file && errno == EINTR);
     if (!m_json_file) {
-        perror(jsonfilename);
+        fprintf(stderr, "error: cannot open --json-out-file %s: %s\n", jsonfilename, strerror(errno));
+        exit(1);
     }
     // opening the JSON
     fprintf(stderr, "Json file %s created...\n", jsonfilename);

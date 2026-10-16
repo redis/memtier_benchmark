@@ -1645,3 +1645,31 @@ def test_duplicate_signal_counts_once(env):
         except ValueError as e:
             interrupted = "invalid JSON: {}".format(e)
         env.assertEqual(interrupted, "true", message=name)
+
+
+def test_json_out_file_unwritable(env):
+    """An --json-out-file that cannot be opened is a clean startup error.
+
+    json_handler used to print the fopen() error and go on writing to a NULL
+    FILE *, so memtier crashed with SIGSEGV. Under TSAN a signal during a
+    blocked fopen() (EINTR) took the same path.
+    """
+    benchmark_specs = {"name": env.testName,
+                       "args": ['--json-out-file=/nonexistent-memtier-dir/mb.json', '--hide-histogram']}
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=1, clients=1, requests=10)
+    add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+    test_dir = tempfile.mkdtemp()
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+
+    process = subprocess.Popen(benchmark.args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        _, stderr = process.communicate(timeout=20)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        _, stderr = process.communicate()
+    stderr = stderr.decode(errors='replace')
+    env.assertEqual(process.returncode, 1, message=stderr)
+    env.assertContains("error: cannot open --json-out-file /nonexistent-memtier-dir/mb.json", stderr)
