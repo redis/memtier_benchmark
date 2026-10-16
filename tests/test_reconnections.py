@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import re
 import signal
@@ -493,19 +494,22 @@ def test_reconnect_disabled_by_default(env):
     env.assertTrue(killed)
 
 
-def _closed_port():
+def _refusing_socket():
+    """A bound socket that does not listen: connects to its port are refused.
+
+    Holding it for the whole run keeps the port from being reused by another
+    process, which closing a probe socket before the run would not.
+    """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
+    return sock
 
 
-def _dead_server_args(json_path, extra_args):
+def _dead_server_args(port, json_path, extra_args):
     return [
         MEMTIER_BINARY,
         "--server=127.0.0.1",
-        "--port={}".format(_closed_port()),
+        "--port={}".format(port),
         "--threads=1",
         "--clients=2",
         "--reconnect-on-error",
@@ -516,29 +520,66 @@ def _dead_server_args(json_path, extra_args):
     ] + extra_args
 
 
+def _assert_no_null_stats(env, results):
+    """No NaN (written as null) or infinite value outside "configuration"."""
+    bad = []
+
+    def walk(value, path):
+        if isinstance(value, dict):
+            for k, v in value.items():
+                walk(v, path + "/" + k)
+        elif isinstance(value, list):
+            for i, v in enumerate(value):
+                walk(v, "{}/{}".format(path, i))
+        elif value is None or (isinstance(value, float) and not math.isfinite(value)):
+            bad.append(path)
+
+    for section, value in results.items():
+        if section != "configuration":
+            walk(value, "/" + section)
+    env.assertEqual(bad, [])
+
+
+def _assert_zero_rates(env, stats):
+    for cmd in ("Sets", "Gets", "Waits", "Totals"):
+        for field in ("Ops/sec", "KB/sec", "KB/sec RX", "KB/sec TX"):
+            env.assertEqual(stats[cmd][field], 0.0, message="{} {}".format(cmd, field))
+
+
 def test_connection_errors_reported_when_server_never_reachable(env):
     """Clients that never connect keep their connection errors (issue #702).
 
     No connection ever succeeds, so no client sets a start time. The final
     report used to skip those clients and print Connection Errors 0, although
-    the live line counted every failed connect.
+    the live line counted every failed connect. The run has no duration, so
+    every rate must be 0, not NaN (JSON null).
     """
     env.skipOnCluster()
     test_dir = tempfile.mkdtemp()
     json_path = os.path.join(test_dir, "mb.json")
-    result = subprocess.run(
-        _dead_server_args(json_path, ["--max-reconnect-attempts=2", "--test-time=30"]),
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
+    refusing = _refusing_socket()
+    try:
+        result = subprocess.run(
+            _dead_server_args(
+                refusing.getsockname()[1], json_path, ["--max-reconnect-attempts=2", "--test-time=30"]
+            ),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    finally:
+        refusing.close()
     # One failed connect and two failed reconnects at least; the thread ends
-    # when its first client runs out of attempts.
+    # when its first client runs out of attempts. Every logged error is
+    # counted; a connect failure with errno 0 is counted but not logged.
     logged = len(re.findall(r"Connection error: ", result.stderr))
     env.assertGreaterEqual(logged, 3, message=result.stderr[-2000:])
     with open(json_path) as f:
-        totals = json.load(f)["ALL STATS"]["Totals"]
-    env.assertEqual(totals["Connection Errors"], logged, message=repr(totals))
+        results = json.load(f)
+    stats = results["ALL STATS"]
+    env.assertGreaterEqual(stats["Totals"]["Connection Errors"], logged, message=repr(stats["Totals"]))
+    _assert_zero_rates(env, stats)
+    _assert_no_null_stats(env, results)
 
 
 def test_ctrl_c_reported_when_server_never_reachable(env):
@@ -551,30 +592,141 @@ def test_ctrl_c_reported_when_server_never_reachable(env):
     env.skipOnCluster()
     test_dir = tempfile.mkdtemp()
     json_path = os.path.join(test_dir, "mb.json")
+    refusing = _refusing_socket()
     proc = subprocess.Popen(
-        _dead_server_args(json_path, ["--test-time=30"]),
+        _dead_server_args(refusing.getsockname()[1], json_path, ["--test-time=30"]),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
     )
-    time.sleep(3)
-    proc.send_signal(signal.SIGINT)
     try:
-        _, stderr = proc.communicate(timeout=30)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        _, stderr = proc.communicate()
-        env.assertTrue(False, message="memtier did not exit after SIGINT")
-        return
+        time.sleep(3)
+        proc.send_signal(signal.SIGINT)
+        try:
+            _, stderr = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            env.assertTrue(False, message="memtier did not exit after SIGINT")
+            return
+    finally:
+        refusing.close()
     match = re.search(r"Interrupted by user \(Ctrl\+C\) after ([0-9.]+) secs", stderr)
     env.assertTrue(match is not None, message=stderr[-2000:])
     if match is None:
         return
     env.assertGreaterEqual(float(match.group(1)), 2.0, message=match.group(0))
     with open(json_path) as f:
-        stats = json.load(f)["ALL STATS"]
+        results = json.load(f)
+    stats = results["ALL STATS"]
     env.assertEqual(stats["Runtime"]["Interrupted"], "true", message=repr(stats["Runtime"]))
     env.assertGreater(stats["Totals"]["Connection Errors"], 0, message=repr(stats["Totals"]))
+    _assert_zero_rates(env, stats)
+    _assert_no_null_stats(env, results)
+
+
+def test_connection_errors_reported_when_only_a_later_client_connects(env):
+    """A client that never connects, merged before one that did (issue #702).
+
+    Client 0 is refused on every attempt; client 1, added by the staircase
+    ramp after 3 s, connects through a proxy that accepts one connection.
+    The final report must count client 0's connection errors, and its zero
+    timestamps must not enter the merged run time: client 1 uses the run's
+    start time and connects 3 s into it, so the run lasts at least 3 s.
+    """
+    env.skipOnCluster()
+    upstream = env.getMasterNodesList()[0]
+    if upstream.get("unix_socket_path"):
+        env.skip()
+    test_dir = tempfile.mkdtemp()
+    json_path = os.path.join(test_dir, "mb.json")
+
+    # Bound but not listening (connects are refused) until client 0's second
+    # attempt has failed; it then accepts the next connection, client 1's,
+    # forwards it to Redis and stops listening, so client 0 stays refused.
+    proxy = _refusing_socket()
+    port = proxy.getsockname()[1]
+    args = _dead_server_args(
+        port,
+        json_path,
+        [
+            "--clients-start=1",
+            "--clients-step=1",
+            "--step-duration=3",
+            "--reconnect-backoff-factor=2",
+            "--max-reconnect-attempts=2",
+            "--test-time=5",
+        ],
+    )
+    tls_specs = {"args": []}
+    addTLSArgs(tls_specs, env)
+    args += tls_specs["args"]
+    # Delays are 2 s and 4 s: client 0 dials at 0 s, 2 s and 6 s, client 1 at 3 s.
+    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    stderr = bytearray()
+    second_failure = threading.Event()
+
+    def read_stderr():
+        while True:
+            chunk = proc.stderr.read1(4096)
+            if not chunk:
+                return
+            stderr.extend(chunk)
+            if b"attempting reconnection 2/2" in stderr:
+                second_failure.set()
+
+    reader = threading.Thread(target=read_stderr, daemon=True)
+    reader.start()
+    pumps = []
+    try:
+        env.assertTrue(second_failure.wait(20), message=stderr.decode(errors="replace")[-2000:])
+        proxy.listen(1)
+        proxy.settimeout(5)
+        conn, _ = proxy.accept()
+        proxy.close()
+        up = socket.create_connection(("127.0.0.1", upstream["port"]))
+
+        def pump(src, dst):
+            try:
+                while True:
+                    data = src.recv(65536)
+                    if not data:
+                        break
+                    dst.sendall(data)
+            except OSError:
+                pass
+            finally:
+                for s in (src, dst):
+                    try:
+                        s.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+
+        for src, dst in ((conn, up), (up, conn)):
+            t = threading.Thread(target=pump, args=(src, dst), daemon=True)
+            t.start()
+            pumps.append(t)
+        proc.wait(timeout=60)
+    finally:
+        proxy.close()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    reader.join(10)
+    text = stderr.decode(errors="replace")
+    logged = len(re.findall(r"Connection error: ", text))
+    env.assertGreaterEqual(logged, 3, message=text[-2000:])
+    with open(json_path) as f:
+        results = json.load(f)
+    stats = results["ALL STATS"]
+    totals = stats["Totals"]
+    env.assertGreaterEqual(totals["Connection Errors"], logged, message=repr(totals))
+    env.assertGreater(totals["Count"], 0, message=repr(totals))
+    duration_ms = stats["Runtime"]["Total duration"]
+    env.assertGreaterEqual(duration_ms, 3000, message=repr(stats["Runtime"]))
+    env.assertLessEqual(duration_ms, 10000, message=repr(stats["Runtime"]))
+    env.assertAlmostEqual(totals["Ops/sec"], totals["Count"] * 1000.0 / duration_ms, delta=totals["Ops/sec"] * 0.05)
+    _assert_no_null_stats(env, results)
 
 
 def test_reconnect_backoff_cap_60s(env):

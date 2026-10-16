@@ -1181,11 +1181,13 @@ void run_stats::merge(const run_stats &other, int iteration)
     // the epoch, so neither can be merged. Keep what it did record, so a
     // server that was never reachable does not report 0 connection errors
     // and a Ctrl+C is not lost: add its connection errors to the current
-    // second, which summarize() includes, and take its interrupted flag.
+    // second, and take its interrupted flag. Not to m_totals: print() and
+    // aggregate_average() rebuild the totals from the per-second stats and
+    // the current second with summarize(). It sent no requests, so it has
+    // none unanswered.
     if (!other.has_started()) {
         m_cur_stats.m_connection_errors += other.m_totals.m_connection_errors;
         if (other.m_interrupted) m_interrupted = true;
-        m_unanswered_requests += other.m_unanswered_requests;
         return;
     }
 

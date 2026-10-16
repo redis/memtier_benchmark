@@ -255,12 +255,19 @@ void totals_cmd::summarize(const one_sec_cmd_stats &other, unsigned long long te
     m_ops = other.m_ops;
     m_total_latency = other.m_total_latency;
 
-    m_ops_sec = (double) other.m_ops / test_duration_usec * 1000000;
     if (other.m_ops > 0) {
         m_latency = (double) (other.m_total_latency / other.m_ops) / 1000;
     } else {
         m_latency = 0;
     }
+
+    // A run where no client ever connected has a zero duration; report 0
+    // rates instead of NaN (printed as -nan, written to JSON as null).
+    if (test_duration_usec == 0) {
+        m_ops_sec = m_bytes_sec = m_bytes_sec_rx = m_bytes_sec_tx = m_moved_sec = m_ask_sec = 0;
+        return;
+    }
+    m_ops_sec = (double) other.m_ops / test_duration_usec * 1000000;
     m_bytes_sec = ((other.m_bytes_rx + other.m_bytes_tx) / 1024.0) / test_duration_usec * 1000000;
     m_bytes_sec_rx = (other.m_bytes_rx / 1024.0) / test_duration_usec * 1000000;
     m_bytes_sec_tx = (other.m_bytes_tx / 1024.0) / test_duration_usec * 1000000;
