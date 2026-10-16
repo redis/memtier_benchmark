@@ -4454,7 +4454,7 @@ static void cleanup_openssl(void)
 // (e.g. --out-file /dev/stdout), it is a pipe or socket, and the other end is
 // closed. SIGPIPE is ignored, so such writes fail with EPIPE (ECONNRESET on a
 // reset socket). But finish_output_file() returns a synthetic EIO when stdio
-// dropped the failed data (glibc does when line-buffered or unbuffered), and
+// dropped the failed data (musl does, glibc when line-buffered or unbuffered), and
 // its real cause may also be a lost write to a live reader (EAGAIN on a full
 // non-blocking pipe). So for EIO ask the kernel: poll() reports POLLERR on a
 // pipe with no reader and POLLHUP on a closed socket.

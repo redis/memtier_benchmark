@@ -30,7 +30,8 @@ int finish_output_file(FILE *fp, bool do_close)
     int err = 0;
     // fflush() reports the errno of a write that fails now. If an earlier
     // write failed and stdio dropped its data (glibc does for line-buffered
-    // and unbuffered streams), only ferror() is left, and the cause is lost.
+    // and unbuffered streams, musl for all), only ferror() is left, and the
+    // cause is lost.
     if (fflush(fp) != 0) {
         err = errno;
     } else if (ferror(fp)) {
