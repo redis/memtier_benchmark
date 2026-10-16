@@ -1283,12 +1283,14 @@ def test_interrupt_signal_handling(env):
         env.assertTrue(total_count > 0)
 
 
-def _run_count_interrupted(env, test_time, sigint_when):
-    """Run --run-count=3 and SIGINT it once sigint_when(stderr_text) is true.
+def _run_count_interrupted(env, test_time, sigint_when, run_count=3):
+    """Run --run-count=run_count with --print-all-runs and SIGINT it once
+    sigint_when(stderr_text) is true.
 
     Returns (returncode, stderr text, seconds from SIGINT to exit, mb.json dict).
     """
-    benchmark_specs = {"name": env.testName, "args": ['--run-count=3', '--hide-histogram']}
+    benchmark_specs = {"name": env.testName,
+                       "args": ['--run-count={}'.format(run_count), '--print-all-runs', '--hide-histogram']}
     addTLSArgs(benchmark_specs, env)
     config = get_default_memtier_config(threads=2, clients=5, requests=None, test_time=test_time)
     master_nodes_list = env.getMasterNodesList()
@@ -1335,7 +1337,7 @@ def _assert_series_cut_after_run_1(env, rc, stderr_content, results_dict):
     env.assertEqual(results_dict.get("run information", {}).get("Runs completed"), 1,
                     message=results_dict.get("run information"))
     agg = "AGGREGATED AVERAGE RESULTS (3 runs)"
-    for section in ("BEST RUN RESULTS", "WORST RUN RESULTS", agg):
+    for section in ("RUN #1 RESULTS", "BEST RUN RESULTS", "WORST RUN RESULTS", agg):
         env.assertTrue(section in results_dict, message=list(results_dict))
         if section in results_dict:
             env.assertEqual(results_dict[section]["Runtime"]["Interrupted"], "true", message=section)
@@ -1382,6 +1384,32 @@ def test_interrupt_between_runs_stops_run_count(env):
 
     rc, stderr_content, _elapsed, results_dict = _run_count_interrupted(env, 1, run_1_done)
     _assert_series_cut_after_run_1(env, rc, stderr_content, results_dict)
+
+
+def test_interrupt_last_run_marks_aggregate(env):
+    """Ctrl+C during the last run marks the aggregate Interrupted (#690).
+
+    Every requested run happened, so only the interrupted run's own flag can
+    carry Interrupted into the AGGREGATED section (aggregate_average()).
+    """
+    seen = []
+
+    def run_2_started(err):
+        if not seen and "[RUN #2" in err:
+            seen.append(time.time())
+        return bool(seen) and time.time() - seen[0] >= 0.5
+
+    rc, stderr_content, _elapsed, results_dict = _run_count_interrupted(env, 2, run_2_started, run_count=2)
+    env.assertEqual(rc, 0, message=stderr_content)
+    env.assertEqual(stderr_content.count("Interrupted by user (Ctrl+C) after"), 1, message=stderr_content)
+    env.assertFalse("skipping the remaining runs" in stderr_content, message=stderr_content)
+    env.assertEqual(results_dict.get("run information", {}).get("Runs completed"), 2,
+                    message=results_dict.get("run information"))
+    for section, interrupted in (("RUN #1 RESULTS", "false"), ("RUN #2 RESULTS", "true"),
+                                 ("AGGREGATED AVERAGE RESULTS (2 runs)", "true")):
+        env.assertTrue(section in results_dict, message=list(results_dict))
+        if section in results_dict:
+            env.assertEqual(results_dict[section]["Runtime"]["Interrupted"], interrupted, message=section)
 
 
 def test_cluster_seed_owns_no_keys(env):
