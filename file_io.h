@@ -66,7 +66,7 @@ public:
 
 /** Flushes fp and, if do_close is true, closes it. Returns 0 if every write
  * to fp reached the OS, otherwise an errno value describing the failure (EIO
- * when the error was seen by an earlier write and its cause is gone). */
+ * when an earlier write failed and its errno is no longer known). */
 int finish_output_file(FILE *fp, bool do_close);
 
 #endif /* _FILE_IO_H */

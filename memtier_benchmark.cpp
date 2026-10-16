@@ -4448,6 +4448,16 @@ static void cleanup_openssl(void)
 
 #endif
 
+// True if fp is stdout, or the same file as stdout, and that is a pipe or a
+// socket.
+static bool output_is_stdout_pipe(FILE *fp)
+{
+    struct stat st, out_st;
+    if (fstat(fileno(fp), &st) != 0 || !(S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode))) return false;
+    if (fp == stdout) return true;
+    return fstat(STDOUT_FILENO, &out_st) == 0 && st.st_dev == out_st.st_dev && st.st_ino == out_st.st_ino;
+}
+
 int main(int argc, char *argv[])
 {
     // Enable libevent's pthreads bindings so event_base_loopbreak() /
@@ -5484,11 +5494,17 @@ int main(int argc, char *argv[])
     }
 
     // A results file that could not be written (disk full, quota, I/O error)
-    // fails the run. On stdout, EPIPE (the reader went away, e.g. `| head`;
-    // SIGPIPE is ignored) is not an error: the reader chose not to read it.
+    // fails the run, with one exception: stdout (or an --out-file that is
+    // stdout, e.g. /dev/stdout) on a pipe or socket whose reader went away,
+    // e.g. `| head`. That is the reader's choice, not a lost result.
     bool output_failed = false;
+    bool stdout_pipe = output_is_stdout_pipe(outfile);
     int out_err = finish_output_file(outfile, outfile != stdout);
-    if (out_err != 0 && !(outfile == stdout && out_err == EPIPE)) {
+    // SIGPIPE is ignored, so such writes fail with EPIPE. stdio may drop the
+    // failed data (glibc does when line-buffered or unbuffered), and then
+    // finish_output_file() can only report EIO; a pipe or socket write never
+    // fails with EIO itself, so take both as the reader having gone away.
+    if (out_err != 0 && !(stdout_pipe && (out_err == EPIPE || out_err == EIO))) {
         if (outfile == stdout) {
             fprintf(stderr, "error: failed writing results to stdout: %s\n", strerror(out_err));
         } else {

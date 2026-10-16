@@ -1873,8 +1873,11 @@ def test_startup_error_keeps_output_files_data_import(env):
     _startup_error_keeps_output_files(env, ['--data-import', '/nonexistent-memtier-dir/keys.imp'], 1, expected)
 
 
-def _run_with_unwritable_output(env, extra_args, stdout, drop_default_out_file=False):
-    """Run a short benchmark whose output goes to extra_args/stdout; return (rc, stderr)."""
+def _run_with_unwritable_output(env, extra_args, stdout, drop_default_out_file=False, prefix=None):
+    """Run a short benchmark whose output goes to extra_args/stdout; return (rc, stderr).
+
+    prefix (e.g. ['stdbuf', '-o0']) is put in front of the memtier command.
+    """
     benchmark_specs = {"name": env.testName, "args": ['--hide-histogram'] + extra_args}
     addTLSArgs(benchmark_specs, env)
     config = get_default_memtier_config(threads=1, clients=1, requests=10)
@@ -1888,7 +1891,13 @@ def _run_with_unwritable_output(env, extra_args, stdout, drop_default_out_file=F
         # mb.py always passes --out-file; without it the results go to stdout.
         i = args.index('--out-file')
         del args[i:i + 2]
-    process = subprocess.Popen(args, stdout=stdout, stderr=subprocess.PIPE)
+    proc_env = None
+    if prefix:
+        args = prefix + args
+        # stdbuf works by LD_PRELOAD; let an ASan build accept that.
+        proc_env = dict(os.environ)
+        proc_env['ASAN_OPTIONS'] = (proc_env.get('ASAN_OPTIONS', '') + ':verify_asan_link_order=0').lstrip(':')
+    process = subprocess.Popen(args, stdout=stdout, stderr=subprocess.PIPE, env=proc_env)
     try:
         _, stderr = process.communicate(timeout=30)
     except subprocess.TimeoutExpired:
@@ -1947,3 +1956,56 @@ def test_stdout_closed_pipe_is_not_an_error(env):
         os.close(wfd)
     env.assertEqual(rc, 0, message=stderr)
     env.assertNotContains("error: failed writing", stderr)
+
+
+def _closed_pipe_run(env, extra_args, prefix=None):
+    """Run with stdout on a pipe whose read end is already closed; return (rc, stderr)."""
+    rfd, wfd = os.pipe()
+    os.close(rfd)
+    try:
+        return _run_with_unwritable_output(env, extra_args, wfd, drop_default_out_file=True, prefix=prefix)
+    finally:
+        os.close(wfd)
+
+
+def test_stdout_closed_pipe_unbuffered_is_not_an_error(env):
+    """A gone stdout reader is not an error with any stdout buffering (#719).
+
+    Line-buffered and unbuffered, glibc drops the data of a failed write, so the
+    final fflush() succeeds with only ferror() set and the EPIPE is lost. The
+    exemption must not depend on that errno.
+    """
+    if shutil.which('stdbuf') is None:
+        env.skip()
+        return
+    for mode in ['-o0', '-oL']:
+        rc, stderr = _closed_pipe_run(env, [], prefix=['stdbuf', mode])
+        env.assertEqual(rc, 0, message='stdbuf {}: {}'.format(mode, stderr))
+        env.assertNotContains("error: failed writing", stderr)
+
+
+def test_stdout_reader_exits_early(env):
+    """`memtier | head -n 1` exits 0, the reader quitting mid-output (#719)."""
+    if shutil.which('stdbuf') is None or shutil.which('head') is None:
+        env.skip()
+        return
+    head = subprocess.Popen(['head', '-n', '1'], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
+    try:
+        rc, stderr = _run_with_unwritable_output(env, [], head.stdin, drop_default_out_file=True,
+                                                 prefix=['stdbuf', '-oL'])
+    finally:
+        head.stdin.close()
+        head.wait(timeout=10)
+    env.assertEqual(rc, 0, message=stderr)
+    env.assertNotContains("error: failed writing", stderr)
+
+
+def test_out_file_dev_stdout_closed_pipe_is_not_an_error(env):
+    """--out-file /dev/stdout gets the stdout rule for a gone reader (#719)."""
+    if not os.path.exists('/dev/stdout'):
+        env.skip()
+        return
+    rc, stderr = _closed_pipe_run(env, ['--out-file', '/dev/stdout'])
+    env.assertEqual(rc, 0, message=stderr)
+    env.assertNotContains("error: failed writing", stderr)
+
