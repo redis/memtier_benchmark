@@ -1609,7 +1609,7 @@ void shard_connection::process_response(void)
             ret = m_conns_manager->connect();
             if (ret != 0) {
                 benchmark_error_log("failed to reconnect.\n");
-                exit(1);
+                exit(failure_exit_code());
             }
             return;
         }

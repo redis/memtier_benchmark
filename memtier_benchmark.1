@@ -275,7 +275,8 @@ SECS, or if connection\-setup failures (AUTH / HELLO / SELECT /
 CLUSTER SLOTS / \fB\-ERR\fR during initial probe) persist for SECS
 without a successful handshake. Bounds the *startup* phase;
 \fB\-\-test\-time\fR still bounds the steady\-state run. Default: 30,
-0 disables the supervisor.
+0 disables the supervisor. With \fB\-\-run\-count\fR, an abort in
+any run exits 2.
 .HP
 \fB\-\-thread\-conn\-start\-min\-jitter\-micros\fR=\fI\,NUM\/\fR Minimum jitter in microseconds between connection creation (default: 0)
 .HP

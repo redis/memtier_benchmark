@@ -207,8 +207,9 @@ static std::atomic<bool> g_connection_stage_aborted{false};
 
 // Set by run_benchmark() (main thread) together with
 // g_connection_stage_aborted, but never reset: with --run-count > 1, an abort
-// in any run, not only the last one, makes main() exit 2.
-static bool g_any_run_connection_stage_aborted = false;
+// in any run, not only the last one, makes memtier exit 2. Atomic because
+// worker threads read it through failure_exit_code().
+static std::atomic<bool> g_any_run_connection_stage_aborted{false};
 
 // Set by run_benchmark() (main thread, after joining the workers) when any
 // worker thread ended on connection failures it could not recover from (or an
@@ -304,6 +305,11 @@ void report_connection_stage_success(void)
     if (g_conn_stage_steady_state.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
         g_conn_stage_streak_start_sec.store(0, std::memory_order_release);
     }
+}
+
+int failure_exit_code(void)
+{
+    return g_any_run_connection_stage_aborted.load(std::memory_order_acquire) ? 2 : 1;
 }
 
 bool connection_stage_steady_state_reached(void)
@@ -2846,7 +2852,8 @@ void usage()
         "                                 without a successful handshake. Bounds the *startup* phase;\n"
         "                                 --test-time still bounds the steady-state run. Default: 30,\n"
         "                                 0 disables the supervisor (at startup, a failed CLUSTER SLOTS\n"
-        "                                 is then retried every second).\n"
+        "                                 is then retried every second). With --run-count, an abort in\n"
+        "                                 any run exits 2.\n"
         "      --thread-conn-start-min-jitter-micros=NUM Minimum jitter in microseconds between connection creation "
         "(default: 0)\n"
         "      --thread-conn-start-max-jitter-micros=NUM Maximum jitter in microseconds between connection creation "
@@ -3637,7 +3644,7 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             benchmark_error_log("error: failed to prepare thread %u for test.\n", i);
             delete cfg->mget_cache;
             cfg->mget_cache = NULL;
-            exit(1);
+            exit(failure_exit_code());
         }
         threads.push_back(t);
     }
@@ -3766,7 +3773,7 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
                         "(last error: %s). See --connection-stage-timeout.\n",
                         elapsed, last_err.c_str());
                 g_connection_stage_aborted.store(true, std::memory_order_release);
-                g_any_run_connection_stage_aborted = true;
+                g_any_run_connection_stage_aborted.store(true, std::memory_order_release);
                 for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
                     (*i)->m_cg->interrupt();
                 }
@@ -5603,7 +5610,7 @@ int main(int argc, char *argv[])
     // With --run-count > 1 an abort in any run counts, and it takes
     // precedence over a worker failure or output error (exit 1) in another
     // run or in the same one.
-    if (g_any_run_connection_stage_aborted) {
+    if (g_any_run_connection_stage_aborted.load(std::memory_order_acquire)) {
         return 2;
     }
     // A worker thread ended before the run's stop condition (see

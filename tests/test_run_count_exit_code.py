@@ -12,7 +12,10 @@ the n-th connection belongs to run n:
   "abort" rejects AUTH, so --connection-stage-timeout aborts the run;
   "drop"  closes the connection after a few data commands, so the worker
           ends early and the run fails (exit 1). Answering some first takes
-          the run past the connection stage, so this is not an abort.
+          the run past the connection stage, so this is not an abort;
+  "refuse" (--unix-socket only) removes the socket when the previous
+          connection closes, so this run cannot connect and memtier exits
+          from thread setup without finishing the series.
 """
 import json
 import os
@@ -23,17 +26,13 @@ import threading
 
 from include import MEMTIER_BINARY
 
-# Data commands a "drop" connection answers before it closes; fewer than
-# --requests, so the run cannot complete.
-_DROP_AFTER = 10
+# A "drop" connection answers this many data commands, then closes on the
+# next one; fewer than --requests, so the run cannot complete.
+_DROP_AFTER = 9
 
 
-class _Server(socketserver.ThreadingTCPServer):
-    allow_reuse_address = True
-    daemon_threads = True
-
+class _Plan:
     def __init__(self, plan):
-        super().__init__(("127.0.0.1", 0), _Handler)
         self.lock = threading.Lock()
         self.plan = plan
         self.connections = 0
@@ -44,6 +43,29 @@ class _Server(socketserver.ThreadingTCPServer):
             self.connections += 1
             n = self.connections
         return self.plan[n - 1] if n <= len(self.plan) else "ok"
+
+    def connection_closed(self):
+        with self.lock:
+            n = self.connections
+        if n < len(self.plan) and self.plan[n] == "refuse":
+            os.unlink(self.server_address)
+
+
+class _TCPServer(_Plan, socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, plan):
+        _Plan.__init__(self, plan)
+        socketserver.ThreadingTCPServer.__init__(self, ("127.0.0.1", 0), _Handler)
+
+
+class _UnixServer(_Plan, socketserver.ThreadingUnixStreamServer):
+    daemon_threads = True
+
+    def __init__(self, plan, path):
+        _Plan.__init__(self, plan)
+        socketserver.ThreadingUnixStreamServer.__init__(self, path, _Handler)
 
 
 class _Handler(socketserver.StreamRequestHandler):
@@ -64,7 +86,7 @@ class _Handler(socketserver.StreamRequestHandler):
                     data_commands += 1
                 if verb == b"AUTH" and mode == "abort":
                     reply = b"-WRONGPASS invalid username-password pair\r\n"
-                elif verb in (b"SET", b"GET") and mode == "drop" and data_commands == _DROP_AFTER:
+                elif verb in (b"SET", b"GET") and mode == "drop" and data_commands > _DROP_AFTER:
                     return
                 elif verb == b"GET":
                     reply = b"$-1\r\n"
@@ -76,30 +98,44 @@ class _Handler(socketserver.StreamRequestHandler):
             pass
         except Exception as error:
             self.server.errors.append(repr(error))
+        finally:
+            self.server.connection_closed()
 
 
-def _run(env, plan):
-    server = _Server(plan)
+def _run(env, plan, unix_socket=False):
+    if env.isCluster() or env.useTLS:
+        # Only the scripted peer is used; run once, in the plaintext standalone cell.
+        env.skip()
+    tmpdir = tempfile.mkdtemp()
+    if unix_socket:
+        server = _UnixServer(plan, os.path.join(tmpdir, "s"))
+        target = ["--unix-socket={}".format(server.server_address)]
+    else:
+        server = _TCPServer(plan)
+        target = ["--server=127.0.0.1", "--port={}".format(server.server_address[1])]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    fd, json_path = tempfile.mkstemp(suffix=".json")
-    os.close(fd)
-    args = [MEMTIER_BINARY, "--server=127.0.0.1", "--port={}".format(server.server_address[1]),
-            "--threads=1", "--clients=1", "--authenticate=pw", "--requests=100",
+    json_path = os.path.join(tmpdir, "out.json")
+    args = [MEMTIER_BINARY] + target + ["--threads=1", "--clients=1", "--authenticate=pw", "--requests=100",
             "--connection-stage-timeout=1", "--run-count={}".format(len(plan)),
             "--hide-histogram", "--json-out-file={}".format(json_path)]
     try:
         result = subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                 timeout=60, text=True)
-        with open(json_path) as f:
-            results = json.load(f)
+        # A series that ends early leaves no complete JSON.
+        results = None
+        if "refuse" not in plan:
+            with open(json_path) as f:
+                results = json.load(f)
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
-        os.unlink(json_path)
+        for name in os.listdir(tmpdir):
+            os.unlink(os.path.join(tmpdir, name))
+        os.rmdir(tmpdir)
     env.assertEqual(server.errors, [])
-    env.assertEqual(server.connections, len(plan), message=result.stderr[-2000:])
+    env.assertEqual(server.connections, len(plan) - plan.count("refuse"), message=result.stderr[-2000:])
     env.assertEqual(result.stderr.count("See --connection-stage-timeout."), plan.count("abort"),
                     message=result.stderr[-2000:])
     return result.returncode, result.stderr, results
@@ -134,6 +170,21 @@ def test_abort_wins_over_worker_failure_in_a_later_run(env):
 def test_abort_wins_over_worker_failure_in_an_earlier_run(env):
     rc, stderr, _ = _run(env, ["drop", "abort"])
     env.assertEqual(rc, 2, message=stderr[-2000:])
+    env.assertContains("the results of this run are not valid", stderr)
+
+
+def test_abort_wins_over_connect_failure_in_a_later_run(env):
+    # Run 2 cannot connect, and memtier exits while preparing its threads,
+    # before main() returns.
+    rc, stderr, _ = _run(env, ["abort", "refuse"], unix_socket=True)
+    env.assertEqual(rc, 2, message=stderr[-2000:])
+    env.assertContains("failed to prepare thread", stderr)
+
+
+def test_connect_failure_in_a_later_run_exits_1(env):
+    rc, stderr, _ = _run(env, ["ok", "refuse"], unix_socket=True)
+    env.assertEqual(rc, 1, message=stderr[-2000:])
+    env.assertContains("failed to prepare thread", stderr)
 
 
 def test_worker_failure_in_an_earlier_run_exits_1(env):

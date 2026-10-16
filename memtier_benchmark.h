@@ -315,5 +315,8 @@ void report_connection_stage_success(void);
 // supervisor is disarmed.
 bool connection_stage_steady_state_reached(void);
 bool connection_stage_should_abort(unsigned int timeout_secs, std::string *out_last_err, unsigned int *out_elapsed);
+// Exit code for a failure that ends memtier before main() returns: 2 if a
+// run of this --run-count series was aborted by the supervisor, else 1.
+int failure_exit_code(void);
 
 #endif /* _MEMTIER_BENCHMARK_H */

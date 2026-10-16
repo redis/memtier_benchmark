@@ -269,10 +269,17 @@ Exit status:
 - after a graceful interrupt (first SIGINT or SIGTERM): **0**. Check
   `"Interrupted": "true"` in the JSON to tell an interrupted run from a
   complete one. If the results cannot be written, the exit status is 1
-  instead (see below).
+  instead (see below). If an earlier `--run-count` run was aborted by
+  `--connection-stage-timeout`, it is 2.
 - after a second signal: memtier dies by that signal (128 + signal number in
   a shell: 130 for SIGINT, 143 for SIGTERM), and the JSON file is
   incomplete.
+- with `--run-count`, the exit status covers every run, not only the last
+  one: **2** if any run was aborted by `--connection-stage-timeout`,
+  otherwise **1** if any run failed or the results could not be written,
+  otherwise **0**. An aborted run still counts in `AGGREGATED AVERAGE
+  RESULTS`, which is then marked `"Interrupted": "true"` (as are `BEST RUN
+  RESULTS` or `WORST RUN RESULTS` when they are that run).
 
 ### Output write errors
 
@@ -282,10 +289,6 @@ closed stdout), memtier prints `error: failed writing --out-file PATH:
 REASON` (or `--json-out-file PATH`, or `results to stdout`) and exits with
 status **1**, also after a graceful interrupt. A connection-stage abort still
 exits with **2** when an output write fails too.
-
-With `--run-count`, the exit status covers every run, not only the last
-one: **2** if any run was aborted by `--connection-stage-timeout`, otherwise
-**1** if any run failed or the results could not be written, otherwise **0**.
 
 One exception: when stdout is a pipe or socket and its reader has gone
 away (e.g. `memtier_benchmark ... | head`), the run is not failed, since the
