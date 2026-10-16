@@ -440,6 +440,6 @@ connection errors, retries), gauges (connections, threads, current/configured
 run), and a latency histogram (`memtier_latency_seconds`), plus build info. By
 design it echoes **no** connection identity (no server address, password, URI,
 or filesystem path) into the scrape body. The end-of-run output remains the
-authoritative latency source; the histogram samples a phase-dependent fraction
-of operations. See the [Real-Time Metrics Guide](docs/REALTIME_METRICS.md) for
+authoritative latency source; the histogram counts every operation but trails
+the live counters by up to about one second. See the [Real-Time Metrics Guide](docs/REALTIME_METRICS.md) for
 the full metric mapping, threat model, and operational notes.

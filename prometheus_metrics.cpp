@@ -96,10 +96,9 @@ static const metric_def kMetricDefs[] = {
     {"memtier_config_test_time_seconds", MT_TYPE_GAUGE,
      "Configured --test-time in seconds; 0 when running by --requests."},
     {"memtier_latency_seconds", MT_TYPE_HISTOGRAM,
-     "Client-observed request latency in seconds, accumulated from 1 Hz snapshots of each connection's in-progress "
-     "second; a phase-dependent fraction of operations (about half in steady state) is sampled, so _count is not "
-     "comparable to memtier_ops_total; bucket placement carries up to 1% HDR quantization; authoritative latency is "
-     "the end-of-run output."},
+     "Client-observed request latency in seconds of every completed operation, folded in once per completed "
+     "second, so _count trails memtier_ops_total by up to about one second of operations; bucket placement carries "
+     "up to 1% HDR quantization; authoritative latency is the end-of-run output."},
     {"memtier_exporter_renders_total", MT_TYPE_COUNTER,
      "Number of times the /metrics body was rendered (scrapes that missed the 1-second render cache)."},
     {"memtier_exporter_snapshot_age_seconds", MT_TYPE_GAUGE,
@@ -224,19 +223,6 @@ label_name_result validate_prom_label_name(const std::string &name)
 static const char *const kBucketErr =
     "error: --prometheus-latency-buckets must be 1-64 comma-separated, strictly ascending bucket bounds in "
     "seconds, each within [1e-06, 86400] (e.g. 0.001,0.005,0.05); +Inf is implicit and must not be listed.";
-
-void hdr_add_positive_delta(struct hdr_histogram *target, const struct hdr_histogram *cur,
-                            const struct hdr_histogram *prev)
-{
-    // cur and prev share identical HDR params, so index i maps to the same
-    // representative value in both. Add only buckets that grew since prev.
-    for (int32_t i = 0; i < cur->counts_len; i++) {
-        const int64_t delta = hdr_count_at_index(cur, i) - hdr_count_at_index(prev, i);
-        if (delta > 0) {
-            hdr_record_values(target, hdr_value_at_index(cur, i), delta);
-        }
-    }
-}
 
 bool parse_latency_buckets(const char *s, std::vector<double> &out, std::string &err, std::string &warn)
 {

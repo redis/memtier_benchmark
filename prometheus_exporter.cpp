@@ -458,7 +458,7 @@ void prometheus_exporter::publish_run_start(uint32_t run_id, uint32_t run_count)
     publish(s, NULL);
 }
 
-void prometheus_exporter::publish_run_end(uint32_t run_id, uint32_t run_count)
+void prometheus_exporter::publish_run_end(uint32_t run_id, uint32_t run_count, const struct hdr_histogram *inst)
 {
     metrics_snapshot s;
     memset(&s, 0, sizeof(s));
@@ -470,7 +470,7 @@ void prometheus_exporter::publish_run_end(uint32_t run_id, uint32_t run_count)
     s.active_threads = 0;
     s.progress_pct = 100.0;
     m_accum.fill(s.counters);
-    publish(s, NULL);
+    publish(s, inst);
 }
 
 #endif // HAVE_EVHTTP

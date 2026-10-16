@@ -301,21 +301,17 @@ per-run reset that a naive exporter would emit.
 
 ### Latency accuracy (error model)
 
-`memtier_latency_seconds` is built from **1 Hz snapshots** of each connection's
-in-progress second of HDR-recorded latencies. Treat it as an operational signal,
-not the authoritative result:
+`memtier_latency_seconds` is built from each connection's per-second HDR
+latency histograms. Every completed operation is counted exactly once. Treat
+it as an operational signal, not the authoritative result:
 
-- **Phase-dependent capture (~50% in steady state).** Only the portion of each
-  connection's per-second histogram that is complete at snapshot time is folded
-  in, so in steady state roughly half of all operations are represented.
-  `memtier_latency_seconds_count` is therefore **not** comparable to
-  `memtier_ops_total` and must not be used to compute a hit fraction.
-- **Stall dedup + residuals.** A snapshot whose source histogram has not changed
-  since the previous tick is skipped, so a stalled server (every in-flight op
-  frozen) does **not** keep inflating `_count`; once traffic resumes the series
-  grows again. A small residual at the tail of a run can be lost this way.
-- **Run-tail loss.** The final fraction of a second at run end may not be
-  captured by the last tick.
+- **Up to ~1 s behind.** Each connection's second is folded in once that second
+  completes, and the exporter collects completed seconds at its 1 Hz tick, so
+  `memtier_latency_seconds_count` trails `memtier_ops_total` by up to about one
+  second of operations while a run is in progress. At run end the last partial
+  second is folded in, so `_count` catches up with the ops the clients
+  completed. A stalled server adds nothing to `_count` until operations
+  complete again.
 - **HDR quantization (≤1%).** Bucket placement carries up to 1% HDR
   quantization; the `le` bound rendered is the user-supplied (µs-quantized)
   bound, not the internal slot edge.

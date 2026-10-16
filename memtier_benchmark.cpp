@@ -3415,20 +3415,26 @@ static void prom_fold_thread(benchmark_config *cfg, size_t t, client_group *cg)
     cfg->prometheus->accumulator().fold_final(t, prom_read_cg_counters(cg));
 }
 
-// 1 Hz publish: reset the exporter's scratch tick histogram, run the gated
-// per-client aggregation walk over non-finished threads (mirrors the statsd
-// !m_finished gate), then publish the fully-filled snapshot + the tick
-// histogram. PLAN.md section 3.7.
-static void prom_publish_tick(benchmark_config *cfg, const metrics_snapshot &snap, std::vector<cg_thread *> &threads)
+// Drain the latency samples of every second the clients completed since the
+// previous drain into the exporter's scratch tick histogram. Threads that
+// already finished are drained by the run-end publish.
+static hdr_histogram *prom_drain_latency(benchmark_config *cfg, std::vector<cg_thread *> &threads, bool finished_too)
 {
     hdr_histogram *tick = cfg->prometheus->tick_histogram();
     hdr_reset(tick);
     for (size_t t = 0; t < threads.size(); t++) {
-        if (!threads[t]->m_finished) {
-            threads[t]->m_cg->aggregate_inst_histogram_if_changed(tick);
+        if (finished_too || !threads[t]->m_finished) {
+            threads[t]->m_cg->drain_prom_latency_histogram(tick);
         }
     }
-    cfg->prometheus->publish(snap, tick);
+    return tick;
+}
+
+// 1 Hz publish: the fully-filled snapshot + the drained tick histogram.
+// PLAN.md section 3.7.
+static void prom_publish_tick(benchmark_config *cfg, const metrics_snapshot &snap, std::vector<cg_thread *> &threads)
+{
+    cfg->prometheus->publish(snap, prom_drain_latency(cfg, threads, false));
 }
 
 static void prom_publish_run_start(benchmark_config *cfg, uint32_t run_id)
@@ -3436,9 +3442,11 @@ static void prom_publish_run_start(benchmark_config *cfg, uint32_t run_id)
     cfg->prometheus->publish_run_start(run_id, cfg->run_count);
 }
 
-static void prom_publish_run_end(benchmark_config *cfg, uint32_t run_id)
+// Post-join: drain every thread, so the run's last seconds (folded by each
+// client's set_end_time) reach memtier_latency_seconds.
+static void prom_publish_run_end(benchmark_config *cfg, uint32_t run_id, std::vector<cg_thread *> &threads)
 {
-    cfg->prometheus->publish_run_end(run_id, cfg->run_count);
+    cfg->prometheus->publish_run_end(run_id, cfg->run_count, prom_drain_latency(cfg, threads, true));
 }
 
 #else // !HAVE_EVHTTP — empty stubs keep the run loop ifdef-free.
@@ -3451,7 +3459,7 @@ static inline void prom_observe_and_fill(benchmark_config *, std::vector<cg_thre
 static inline void prom_fold_thread(benchmark_config *, size_t, client_group *) {}
 static inline void prom_publish_tick(benchmark_config *, const metrics_snapshot &, std::vector<cg_thread *> &) {}
 static inline void prom_publish_run_start(benchmark_config *, uint32_t) {}
-static inline void prom_publish_run_end(benchmark_config *, uint32_t) {}
+static inline void prom_publish_run_end(benchmark_config *, uint32_t, std::vector<cg_thread *> &) {}
 
 #endif // HAVE_EVHTTP
 
@@ -4128,7 +4136,7 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         for (size_t t = 0; t < threads.size(); t++) {
             prom_fold_thread(cfg, t, threads[t]->m_cg);
         }
-        prom_publish_run_end(cfg, run_id);
+        prom_publish_run_end(cfg, run_id, threads);
     }
 
     // Do we need to produce client stats?

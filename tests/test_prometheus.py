@@ -1299,3 +1299,49 @@ def test_F24_arbitrary_misses_accumulate_across_runs(env):
                            run1[-1], run2[-1]))
     finally:
         _kill(proc)
+
+
+# ---------------------------------------------------------------------------
+# F25 -- memtier_latency_seconds tracks memtier_ops_total (issue #637).
+# The exporter used to read each client's per-second latency histogram at its
+# 1 Hz tick, which lands just after the worker's per-second reset, so _count
+# grew by a few dozen samples per second while ops_total grew by tens of
+# thousands. Every completed second is now exported, so over a multi-second
+# window _count must grow about as fast as ops_total (it lags by at most one
+# second), and never exceed it.
+# ---------------------------------------------------------------------------
+def test_F25_latency_count_tracks_ops(env):
+    rd = _new_results_dir()
+    proc, out_path, err_path = _popen_memtier(
+        env, ["--test-time=10", "-t", "2", "-c", "2", "--prometheus-port=0"], rd
+    )
+    samples = []  # (ops_total, latency_seconds_count)
+    try:
+        url = wait_for_prometheus_url(out_path, timeout=20)
+        env.assertFalse(url is None, message="no announce line")
+        deadline = time.time() + 60
+        while proc.poll() is None and time.time() < deadline:
+            r = prom_scrape(url, timeout=2)
+            if r.status == 200:
+                p = prom_parse(r.body)
+                ops = prom_sample_value(p, "memtier_ops_total")
+                count = prom_sample_value(p, "memtier_latency_seconds_count")
+                if ops and count is not None:
+                    samples.append((ops, count))
+            time.sleep(0.5)
+        rc = proc.wait()
+        env.assertEqual(rc, 0, message="memtier exit {}: {}".format(rc, _drain(err_path)))
+        for ops, count in samples:
+            env.assertTrue(count <= ops, message="_count {} > ops_total {}".format(count, ops))
+        # Skip the first two seconds (ramp-up), then compare the growth of
+        # both series across the rest of the run.
+        env.assertTrue(len(samples) >= 10, message="too few samples: {}".format(samples))
+        first, last = samples[4], samples[-1]
+        d_ops, d_count = last[0] - first[0], last[1] - first[1]
+        env.assertTrue(d_ops > 0, message="ops_total did not grow: {}".format(samples))
+        env.assertTrue(
+            d_count >= 0.7 * d_ops,
+            message="_count grew {} while ops_total grew {}: {}".format(d_count, d_ops, samples),
+        )
+    finally:
+        _kill(proc)
