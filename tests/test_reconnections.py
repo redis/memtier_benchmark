@@ -1427,15 +1427,16 @@ def test_merged_duration_averages_all_threads(env):
     the last thread's clients (#709).
 
     Four threads with one rate-limited client each take about 3 s for
-    --requests=300. One client is disconnected once and waits the default 1 s
-    before reconnecting, so it ends about 1 s later: the rate limiter resets
-    its budget on disconnect and refills it per interval after the reconnect,
-    so it does not catch up on the missed requests. The mean over all four
-    clients is about 3.25 s. The last thread alone reports about 3 s or 4 s,
-    depending on whether it held the killed client.
+    --requests=300. One client is disconnected once and, with
+    --reconnect-backoff-factor=3, waits 3 s before reconnecting, so it ends
+    about 3 s later: the rate limiter resets its budget on disconnect and
+    refills it per interval after the reconnect, so it does not catch up on
+    the missed requests. The mean over all four clients is about 3.75 s.
+    The killed client is the first to connect, so it is not in the last
+    thread, and the last thread alone reports about 3 s.
     """
     env.skipOnCluster()
-    requests, rate = 300, 100
+    requests, rate, reconnect_delay_ms = 300, 100, 3000
     benchmark_specs = {
         "name": env.testName,
         "args": [
@@ -1447,6 +1448,7 @@ def test_merged_duration_averages_all_threads(env):
             "--key-maximum=1000",
             "--reconnect-on-error",
             "--max-reconnect-attempts=10",
+            "--reconnect-backoff-factor={}".format(reconnect_delay_ms // 1000),
             "--hide-histogram",
         ],
     }
@@ -1498,10 +1500,13 @@ def test_merged_duration_averages_all_threads(env):
                    message="the killed client did not reconnect; " + diag)
     duration = runtime["Total duration"]
     env.assertEqual(duration, runtime["Finish time"] - runtime["Start time"], message=str(runtime))
-    undelayed_ms = requests * 1000 // rate
-    # Mean of three clients at ~3 s and one at ~4 s; the last thread alone
-    # gives ~3 s or ~4 s.
-    env.assertGreater(duration, undelayed_ms + 100,
-                      message="Total duration {} ms ignores the delayed client".format(duration))
-    env.assertLess(duration, undelayed_ms + 650,
-                   message="Total duration {} ms is the delayed client alone".format(duration))
+    # Mean of three clients at ~3 s and one at ~6 s: ~3.75 s. Allow half the
+    # delayed client's share either side. The last thread alone gives ~3 s
+    # (~6 s if it held the killed client); a weight that overcounts the
+    # first client (e.g. advancing by 2 per client) gives ~4.3 s.
+    expected_ms = requests * 1000 // rate + reconnect_delay_ms // 4
+    margin_ms = reconnect_delay_ms // 8
+    env.assertGreater(duration, expected_ms - margin_ms,
+                      message="Total duration {} ms ignores the delayed client; {}".format(duration, runtime))
+    env.assertLess(duration, expected_ms + margin_ms,
+                   message="Total duration {} ms overweights the delayed client; {}".format(duration, runtime))
