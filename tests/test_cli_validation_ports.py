@@ -96,8 +96,9 @@ def test_read_server_port_rejects_out_of_range_and_malformed(env):
 
 
 def test_uri_port_rejects_out_of_range_and_malformed(env):
-    # The URI is parsed after --version would exit, so run with no server
-    # listening on the valid control port and look for the parser diagnostic.
+    # The URI is parsed after --version would exit, so this runs a real
+    # command line; it needs no server because parsing fails before any
+    # connection attempt.
     for value in ("65537", "0", "-18446744073709551615", "+80"):
         result = subprocess.run(
             [MEMTIER_BINARY, "--uri=redis://127.0.0.1:" + value, "-n", "1", "-c", "1", "-t", "1"],

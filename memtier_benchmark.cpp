@@ -882,10 +882,26 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
     jsonhandler->close_nesting();
 }
 
+// Parse a TCP/UDP port number: the whole string must be a decimal number in
+// [1,65535], starting with a digit (no sign or leading whitespace). The range
+// is checked on the unsigned long BEFORE narrowing. Shared by -p/--port,
+// --statsd-port, --graphite-port, the --uri port and --read-server HOST:PORT.
+static bool parse_port(const char *s, unsigned short *out)
+{
+    // Require a leading digit: strtoul() would otherwise skip any whitespace
+    // (including '\n', '\v', ...) and accept a sign, and wrap a negative value
+    // such as "\n-18446744073709551615" to a valid port.
+    if (s == NULL || !isdigit((unsigned char) *s)) return false;
+    char *endptr = NULL;
+    errno = 0;
+    unsigned long v = strtoul(s, &endptr, 10);
+    if (*endptr != '\0' || errno == ERANGE || v < 1 || v > 65535) return false;
+    *out = (unsigned short) v;
+    return true;
+}
+
 // Parse URI and populate config fields
 // Returns 0 on success, -1 on error
-static bool parse_port(const char *s, unsigned short *out);
-
 static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string &uri_authenticate,
                      std::string &uri_server)
 {
@@ -1170,24 +1186,6 @@ static bool parse_backoff_factor(const char *s, double *out)
     double v = strtod(s, &endptr);
     if (endptr == s || !endptr || *endptr != '\0' || errno == ERANGE || !std::isfinite(v) || v < 0.0) return false;
     *out = v;
-    return true;
-}
-
-// Parse a TCP/UDP port number: the whole string must be a decimal number in
-// [1,65535].  Range-checks the unsigned long BEFORE narrowing, rejects a
-// leading '-' (strtoul would negate it) and empty input or trailing junk.
-// Shared by -p/--port, --statsd-port and --graphite-port.
-static bool parse_port(const char *s, unsigned short *out)
-{
-    // Require a leading digit: strtoul() would otherwise skip any whitespace
-    // (including '\n', '\v', ...) and accept a sign, and wrap a negative value
-    // such as "\n-18446744073709551615" to a valid port.
-    if (s == NULL || !isdigit((unsigned char) *s)) return false;
-    char *endptr = NULL;
-    errno = 0;
-    unsigned long v = strtoul(s, &endptr, 10);
-    if (*endptr != '\0' || errno == ERANGE || v < 1 || v > 65535) return false;
-    *out = (unsigned short) v;
     return true;
 }
 
