@@ -130,9 +130,13 @@ unsigned long long gaussian_noise::gaussian_distribution_range(double stddev, do
     if (median == 0) median = len / 2.0 + min + 0.5;
     if (stddev == 0) stddev = len / 6.0;
     assert(median > min && median < max);
+    // max + 1 in double: in unsigned long long it wraps to 0 for
+    // max == ULLONG_MAX and every sample would be rejected.
     do {
         val = gaussian_distribution(stddev) + median;
-    } while (val < min || val > max + 1);
+    } while (val < min || val > (double) max + 1);
+    // Converting a double >= 2^64 to unsigned long long is undefined.
+    if (val >= (double) max) return max;
     return val;
 }
 
@@ -373,7 +377,10 @@ void object_generator::set_key_zipf_distribution(double key_exp)
 unsigned long long object_generator::random_range(unsigned long long r_min, unsigned long long r_max)
 {
     unsigned long long rn = m_random.get_random();
-    return (rn % (r_max - r_min + 1)) + r_min;
+    unsigned long long span = r_max - r_min + 1;
+    // A full 0..ULLONG_MAX range wraps span to 0; any rn is then in range.
+    if (span == 0) return rn;
+    return (rn % span) + r_min;
 }
 
 // return a random number between r_min and r_max using normal distribution according to r_stddev

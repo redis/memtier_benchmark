@@ -1290,13 +1290,17 @@ static bool verify_arbitrary_command_option(struct benchmark_config *cfg)
 //                  --data-size-list).  Matches Redis' default proto-max-bulk-len
 //                  (512 MiB), past which the server rejects the bulk anyway.
 //   MULTI_KEY_GET_MAX: upper bound on --multi-key-get.  Every client
-//                  preallocates a keylist of multi_key_get + 1 entries plus
-//                  256 bytes of key buffer per entry (about 272 MB per client
-//                  at this cap), and the unsigned 256 * entries buffer size
-//                  wraps above 16777215 entries.
+//                  preallocates a keylist of multi_key_get + 1 entries, with
+//                  256 bytes of key buffer per entry in an unsigned int
+//                  (keylist::keylist()), which wraps above 16777215 entries.
+//                  Memory is left to the user: about 272 bytes per entry per
+//                  client, so about 4.3 GiB per client at this cap.
 #define MEMTIER_PIPELINE_MAX 1024u
 #define MEMTIER_DATA_SIZE_MAX (512u * 1024u * 1024u)
-#define MEMTIER_MULTI_KEY_GET_MAX 1000000u
+#define MEMTIER_MULTI_KEY_GET_MAX 16777214u
+//   DATA_OFFSET_MAX: upper bound on --data-offset (the SETRANGE/GETRANGE
+//                  offset), 2^29 - 1, which main() used to check after parsing.
+#define MEMTIER_DATA_OFFSET_MAX ((1u << 29) - 1)
 
 // Parse a backoff factor: the whole string must be a finite, representable
 // number >= 0.  Rejects empty input, trailing junk, nan/inf and ERANGE
@@ -1779,8 +1783,8 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             break;
         case o_data_offset: {
             bool too_large;
-            if (!parse_unsigned(optarg, UINT_MAX, &val, &too_large)) {
-                non_negative_option_error("data-offset", too_large, UINT_MAX);
+            if (!parse_unsigned(optarg, MEMTIER_DATA_OFFSET_MAX, &val, &too_large)) {
+                non_negative_option_error("data-offset", too_large, MEMTIER_DATA_OFFSET_MAX);
                 return -1;
             }
             cfg->data_offset = (unsigned int) val;
@@ -2252,7 +2256,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             bool too_large;
             bool parsed = parse_unsigned(optarg, UINT_MAX, &val, &too_large);
             if (!parsed || !val) {
-                count_option_error("rate", parsed, too_large, UINT_MAX);
+                count_option_error("rate-limiting", parsed, too_large, UINT_MAX);
                 return -1;
             }
             cfg->request_rate = (unsigned int) val;
@@ -2912,7 +2916,8 @@ void usage()
         "(default: 0)\n"
         "      --thread-conn-start-max-jitter-micros=NUM Maximum jitter in microseconds between connection creation "
         "(default: 0)\n"
-        "      --multi-key-get=NUM        Enable multi-key get commands, up to NUM keys (default: 0, max: 1000000).\n"
+        "      --multi-key-get=NUM        Enable multi-key get commands, up to NUM keys (default: 0, max: 16777214).\n"
+        "                                 Each client preallocates about 272 bytes per key.\n"
         "                                 In cluster mode, keys are probed from the key space so that all\n"
         "                                 keys in one batch route to the same shard (no hash-tag prefix).\n"
         "      --select-db=DB             DB number to select, when testing a redis server\n"
@@ -5269,10 +5274,6 @@ int main(int argc, char *argv[])
         usage();
     }
     if (cfg.data_offset > 0) {
-        if (cfg.data_offset > (1 << 29) - 1) {
-            fprintf(stderr, "error: data-offset too long\n");
-            usage();
-        }
         if (cfg.expiry_range.min || cfg.expiry_range.max || !is_redis_protocol(cfg.protocol)) {
             fprintf(stderr,
                     "error: data-offset can only be used with redis protocol, and cannot be used with expiry\n");

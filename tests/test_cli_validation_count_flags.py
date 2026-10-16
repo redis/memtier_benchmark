@@ -382,9 +382,9 @@ ULLONG_MAX = "18446744073709551615"
 POSITIVE_OPTIONS = {
     "--key-minimum": ("key-minimum", ULLONG_MAX),
     "--key-maximum": ("key-maximum", ULLONG_MAX),
-    # Capped: each client preallocates ~272 bytes per key (MEMTIER_MULTI_KEY_GET_MAX).
-    "--multi-key-get": ("multi-key-get", "1000000"),
-    "--rate-limiting": ("rate", UINT_MAX),
+    # Capped where keylist's 256 * (N + 1) buffer size would wrap (MEMTIER_MULTI_KEY_GET_MAX).
+    "--multi-key-get": ("multi-key-get", "16777214"),
+    "--rate-limiting": ("rate-limiting", UINT_MAX),
     "--clients-start": ("clients-start", UINT_MAX),
     "--clients-step": ("clients-step", UINT_MAX),
     "--step-duration": ("step-duration", UINT_MAX),
@@ -395,7 +395,7 @@ POSITIVE_OPTIONS = {
 
 # Options where 0 is a valid value: option -> (message prefix, maximum).
 NON_NEGATIVE_OPTIONS = {
-    "--data-offset": ("data-offset", UINT_MAX),
+    "--data-offset": ("data-offset", "536870911"),  # (1 << 29) - 1
     "--thread-conn-start-min-jitter-micros": ("thread-conn-start-min-jitter-micros", UINT_MAX),
     "--thread-conn-start-max-jitter-micros": ("thread-conn-start-max-jitter-micros", UINT_MAX),
     "--select-db": ("select-db", INT_MAX),
@@ -532,12 +532,11 @@ def test_remaining_options_store_the_parsed_value(env):
         (["--max-retries= -1"], "max_retries = -1"),
         (["--max-retries=" + INT_MAX], "max_retries = " + INT_MAX),
         (["--max-retries=+7"], "max_retries = 7"),
-        # main() later caps --data-offset at 2^29 - 1.
         (["--data-offset=+536870911"], "data_offset = 536870911"),
         (["--key-minimum=+2", "--key-maximum=" + ULLONG_MAX], "key_minimum = 2\n"),
         (["--key-maximum=" + ULLONG_MAX], "key_maximum = " + ULLONG_MAX),
         (["--multi-key-get= +64"], "multi_key_get = 64\n"),
-        (["--multi-key-get=1000000"], "multi_key_get = 1000000\n"),
+        (["--multi-key-get=2000000"], "multi_key_get = 2000000\n"),
         (["--select-db=" + INT_MAX], "select-db = " + INT_MAX),
         (["--rate-limiting= 9"], "rate_limit = 9\n"),
         (["--thread-conn-start-max-jitter-micros=" + UINT_MAX], "thread_conn_start_max_jitter_micros = " + UINT_MAX),
@@ -577,12 +576,45 @@ def test_jitter_max_range_does_not_divide_by_zero(env):
 
 
 def test_multi_key_get_cap(env):
-    """INT_MAX used to be accepted, then keylist sizing overflowed and the
-    startup allocation exhausted memory (~31 GB RSS before being killed)."""
-    result = _run_memtier(["--multi-key-get=1000000", "--version"])
-    env.assertEqual(result.returncode, 0, message=result.stderr)
-    for value in ("1000001", "16777215", INT_MAX):
+    """INT_MAX used to be accepted; keylist's unsigned 256 * (N + 1) buffer
+    size then wrapped, and the startup allocation exhausted memory. The cap
+    is that correctness bound, so values that used to work (2000000) still do."""
+    for value in ("2000000", "16777214"):
+        result = _run_memtier(["--multi-key-get=" + value, "--version"])
+        env.assertEqual(result.returncode, 0, message="{}: {}".format(value, result.stderr))
+    for value in ("16777215", "16777216", INT_MAX):
         result = _run_memtier(["--multi-key-get=" + value, "--version"])
         env.assertEqual(result.returncode, 2, message="{}: {}".format(value, result.stderr))
-        env.assertTrue("error: multi-key-get must be <= 1000000." in result.stderr,
+        env.assertTrue("error: multi-key-get must be <= 16777214." in result.stderr,
+                       message="{}: {!r}".format(value, result.stderr))
+
+
+def test_key_maximum_full_range_runs(env):
+    """--key-maximum=ULLONG_MAX with the default --key-minimum (0) is a full
+    64-bit key range: r_max - r_min + 1 wrapped to 0, so random keys hit
+    rn % 0 (SIGFPE) and Gaussian keys never passed val > max + 1 == 0."""
+    env.skipOnCluster()
+    master = env.getMasterNodesList()[0]
+    for pattern, clients in (("R:R", "1"), ("G:G", "1"), ("S:S", "1"), ("P:P", "2")):
+        label = "--key-pattern={}".format(pattern)
+        try:
+            result = subprocess.run(
+                [MEMTIER_BINARY, "-s", "127.0.0.1", "-p", str(master["port"]), "-n", "3", "-c", clients, "-t", "1",
+                 "--key-maximum=" + ULLONG_MAX, "--key-pattern=" + pattern, "--hide-histogram"],
+                capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            env.assertTrue(False, message=label + ": hung")
+            continue
+        env.assertEqual(result.returncode, 0, message="{}: rc {}: {}".format(label, result.returncode, result.stderr))
+
+
+def test_data_offset_cap(env):
+    """The parser enforces the (1 << 29) - 1 limit main() used to check later
+    with "data-offset too long", so "must be <= N" states the real bound."""
+    result = _run_memtier(["--data-offset=536870911", "--version"])
+    env.assertEqual(result.returncode, 0, message=result.stderr)
+    for value in ("536870912", UINT_MAX):
+        result = _run_memtier(["--data-offset=" + value, "--version"])
+        env.assertEqual(result.returncode, 2, message="{}: {}".format(value, result.stderr))
+        env.assertTrue("error: data-offset must be <= 536870911." in result.stderr,
                        message="{}: {!r}".format(value, result.stderr))
