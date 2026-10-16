@@ -4883,7 +4883,10 @@ int main(int argc, char *argv[])
         // Only the cursor changes; generated arguments are retained by each client.
         cfg.scan_continuation_command = new arbitrary_command(scan_cmd);
         // The separate formatting pass below classifies this as scan_cursor_type.
+        // Only this flag makes an argument a cursor slot; the text is kept for
+        // debug output (a literal "__scan_cursor__" elsewhere is a constant).
         cfg.scan_continuation_command->command_args[cursor_index].data = SCAN_CURSOR_PLACEHOLDER;
+        cfg.scan_continuation_command->command_args[cursor_index].scan_cursor = true;
         cfg.scan_continuation_command->command_name = command_type + " <cursor>";
         cfg.scan_continuation_command->command_type = command_type + " <cursor>";
         scan_cmd.command_name = command_type + " 0";

@@ -215,6 +215,46 @@ def test_scan_incremental_with_match(env):
         pass
 
 
+def test_scan_incremental_literal_scan_cursor_in_match(env):
+    """
+    Regression test for #663: only the cursor slot of the internal
+    continuation command is a cursor. A user argument that is literally
+    "__scan_cursor__" (here the MATCH pattern) is sent as typed in both the
+    initial SCAN 0 and the continuation. Before the fix it was dropped from
+    the initial SCAN (the *N header still counted it) and the run hung.
+    """
+    env.skipOnCluster()
+    _preload_keys(env, count=200, prefix="scanlit")
+
+    test_dir = tempfile.mkdtemp()
+    extra_args = [
+        '--command', 'SCAN 0 MATCH __scan_cursor__ COUNT 10',
+        '--scan-incremental-iteration',
+        '--pipeline', '1',
+    ]
+    benchmark, run_config = _build_scan_benchmark(
+        env, test_dir, extra_args, threads=1, clients=1, requests=50)
+    ok = benchmark.run(timeout=30)
+
+    failed_asserts = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="run failed or hung (timeout)")
+        if not ok:
+            return
+        stderr = _read_stderr(run_config)
+        env.assertFalse('error response' in stderr,
+                        message="server rejected a request: {}".format(stderr[-500:]))
+        with open(os.path.join(run_config.results_dir, "mb.json")) as f:
+            all_stats = json.load(f).get("ALL STATS", {})
+        # 200 keys at COUNT 10 need many pages, so the continuation (with
+        # the real cursor in its slot) must have been sent too.
+        env.assertGreater(all_stats.get("Scan 0s", {}).get("Count", 0), 0)
+        env.assertGreater(all_stats.get("Scan <cursor>s", {}).get("Count", 0), 0)
+    finally:
+        if env.getNumberOfFailedAssertion() > failed_asserts:
+            debugPrintMemtierOnError(run_config, env)
+
+
 # ---------------------------------------------------------------------------
 # Test: bare SCAN (no MATCH, COUNT, or TYPE)
 # ---------------------------------------------------------------------------

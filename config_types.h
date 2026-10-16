@@ -138,7 +138,12 @@ enum command_arg_type
 struct command_arg
 {
     command_arg(const char *arg, unsigned int arg_len) :
-            type(undefined_type), data(arg, arg_len), monitor_index(0), has_key_affixes(false), resolved(false)
+            type(undefined_type),
+            data(arg, arg_len),
+            monitor_index(0),
+            has_key_affixes(false),
+            resolved(false),
+            scan_cursor(false)
     {
         ;
     }
@@ -155,6 +160,11 @@ struct command_arg
     // format_arbitrary_command() frames it as a constant without scanning it
     // for placeholders (a generated key can itself contain "__key__").
     bool resolved;
+    // The cursor slot of the internal --scan-incremental-iteration
+    // continuation command, filled per request by
+    // client::create_scan_continuation_request(). A user-supplied
+    // "__scan_cursor__" never sets this and is sent as a constant (#663).
+    bool scan_cursor;
 };
 
 // What a --command does to the connection's MULTI block. Resolved once from

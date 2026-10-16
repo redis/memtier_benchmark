@@ -1002,7 +1002,7 @@ bool redis_protocol::format_arbitrary_command(arbitrary_command &cmd)
             }
 
             current_arg->type = data_type;
-        } else if (current_arg->data == SCAN_CURSOR_PLACEHOLDER) {
+        } else if (current_arg->scan_cursor) {
             current_arg->type = scan_cursor_type;
         }
 

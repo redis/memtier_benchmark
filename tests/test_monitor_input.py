@@ -1484,3 +1484,67 @@ def test_monitor_input_random_line_failed_keys_file(env):
     # The default --monitor-pattern=S alternates the two lines.
     env.assertTrue("fixed" in keys, message="no row for the fixed-key line: {}".format(keys[:10]))
     env.assertTrue(any(k.startswith("user:mon-") for k in keys), message="no user:mon-* rows: {}".format(keys[:10]))
+
+
+def _scan_cursor_literal_run(env, args, requests=20):
+    """Run memtier with a hard timeout; a hang returns False instead of blocking."""
+    benchmark_specs = {"name": env.testName, "args": args + ["--hide-histogram"]}
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=1, clients=1, requests=requests)
+    add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+    config = RunConfig(tempfile.mkdtemp(), env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    memtier_ok = benchmark.run(timeout=30)
+    debugPrintMemtierOnError(config, env)
+    return memtier_ok
+
+
+def _scan_cursor_literal_values(env, pattern):
+    values = []
+    for conn in env.getOSSMasterNodesConnectionList():
+        for key in conn.execute_command("KEYS", pattern):
+            values.append(conn.execute_command("GET", key))
+    return values
+
+
+def test_command_scan_cursor_literal_is_sent(env):
+    """
+    Regression test for #663: a --command argument that is literally
+    "__scan_cursor__" is an ordinary constant. Before the fix it was typed as
+    the --scan-incremental-iteration cursor slot, counted in the *N header
+    but never written, so the server waited for the missing argument and the
+    run hung with 0 ops.
+    """
+    for conn in env.getOSSMasterNodesConnectionList():
+        conn.execute_command("FLUSHALL")
+
+    memtier_ok = _scan_cursor_literal_run(
+        env, ["--command=SET __key__ __scan_cursor__", "--key-prefix=sc663-", "--key-maximum=50"])
+    env.assertTrue(memtier_ok == True, message="--command with a literal __scan_cursor__ failed or hung")
+
+    values = _scan_cursor_literal_values(env, "sc663-*")
+    env.assertTrue(len(values) > 0, message="no sc663-* keys were written")
+    env.assertEqual(set(values), {b"__scan_cursor__"})
+
+
+def test_monitor_input_scan_cursor_literal_is_sent(env):
+    """
+    Regression test for #663 on the --monitor-input paths: a captured line
+    with a literal "__scan_cursor__" argument is replayed as-is, through both
+    __monitor_line1__ and __monitor_line@__ (standalone and cluster).
+    """
+    test_dir = tempfile.mkdtemp()
+    monitor_file = os.path.join(test_dir, "monitor_scan_cursor.txt")
+    with open(monitor_file, "w") as f:
+        f.write('[ proxy ] 1764031576.604009 [0 127.0.0.1:5000] "SET" "sc663:mon" "__scan_cursor__"\n')
+
+    for command in ("__monitor_line1__", "__monitor_line@__"):
+        for conn in env.getOSSMasterNodesConnectionList():
+            conn.execute_command("FLUSHALL")
+
+        memtier_ok = _scan_cursor_literal_run(
+            env, ["--monitor-input={}".format(monitor_file), "--command={}".format(command)])
+        env.assertTrue(memtier_ok == True, message="{} with a literal __scan_cursor__ failed or hung".format(command))
+        env.assertEqual(_scan_cursor_literal_values(env, "sc663:mon"), [b"__scan_cursor__"],
+                        message="{} did not write the literal value".format(command))
