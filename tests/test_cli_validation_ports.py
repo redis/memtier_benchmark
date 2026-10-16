@@ -24,6 +24,10 @@ INVALID_VALUES = (
     "65536", "65537", "88536", "131072", "70000",
     "99999999999999999999999",
     "-1", "-65535", "-0", " -1",
+    # Negatives that strtoul() wraps back into 1..65535, with and without
+    # leading whitespace strtoul() skips.
+    "-18446744073709551615", "-18446744073709545916", "\n-18446744073709551615",
+    "\v-18446744073709551615", "+6379", " 6379", "\t6379",
     "0", "", " ", "abc", "1x", "6379 ", "0x50",
 )
 
@@ -70,5 +74,6 @@ def test_port_options_accept_valid_values(env):
 
 def test_port_ignores_errno_from_earlier_options(env):
     """An earlier option's strtoul overflow must not reject a valid port."""
-    result = _run(["--max-reconnect-attempts=99999999999999999999999", "--port=6379", "--statsd-port=8125"])
+    result = _run(["--max-reconnect-attempts=99999999999999999999999", "--port=6379", "--statsd-port=8125",
+                   "--graphite-port=2003"])
     env.assertEqual(result.returncode, 0, message=result.stderr)

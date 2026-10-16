@@ -1178,7 +1178,10 @@ static bool parse_backoff_factor(const char *s, double *out)
 // Shared by -p/--port, --statsd-port and --graphite-port.
 static bool parse_port(const char *s, unsigned short *out)
 {
-    if (s == NULL || *s == '\0' || optarg_is_negative(s)) return false;
+    // Require a leading digit: strtoul() would otherwise skip any whitespace
+    // (including '\n', '\v', ...) and accept a sign, and wrap a negative value
+    // such as "\n-18446744073709551615" to a valid port.
+    if (s == NULL || !isdigit((unsigned char) *s)) return false;
     char *endptr = NULL;
     errno = 0;
     unsigned long v = strtoul(s, &endptr, 10);
