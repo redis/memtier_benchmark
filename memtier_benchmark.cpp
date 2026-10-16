@@ -1172,6 +1172,21 @@ static bool parse_backoff_factor(const char *s, double *out)
     return true;
 }
 
+// Parse a TCP/UDP port number: the whole string must be a decimal number in
+// [1,65535].  Range-checks the unsigned long BEFORE narrowing, rejects a
+// leading '-' (strtoul would negate it) and empty input or trailing junk.
+// Shared by -p/--port, --statsd-port and --graphite-port.
+static bool parse_port(const char *s, unsigned short *out)
+{
+    if (s == NULL || *s == '\0' || optarg_is_negative(s)) return false;
+    char *endptr = NULL;
+    errno = 0;
+    unsigned long v = strtoul(s, &endptr, 10);
+    if (endptr == s || !endptr || *endptr != '\0' || errno == ERANGE || v < 1 || v > 65535) return false;
+    *out = (unsigned short) v;
+    return true;
+}
+
 #ifdef HAVE_EVHTTP
 // True if a bracket-free numeric IPv4/IPv6 literal is a loopback address
 // (PLAN.md section 5, W1). IPv4 loopback = 127.0.0.0/8; IPv6 loopback = ::1.
@@ -1463,9 +1478,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             cfg->unix_socket = optarg;
             break;
         case 'p':
-            endptr = NULL;
-            cfg->port = (unsigned short) strtoul(optarg, &endptr, 10);
-            if (!cfg->port || cfg->port > 65535 || !endptr || *endptr != '\0') {
+            if (!parse_port(optarg, &cfg->port)) {
                 fprintf(stderr, "error: port must be a number in the range [1-65535].\n");
                 return -1;
             }
@@ -2201,9 +2214,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             cfg->statsd_host = optarg;
             break;
         case o_statsd_port:
-            endptr = NULL;
-            cfg->statsd_port = (unsigned short) strtoul(optarg, &endptr, 10);
-            if (cfg->statsd_port == 0 || !endptr || *endptr != '\0') {
+            if (!parse_port(optarg, &cfg->statsd_port)) {
                 fprintf(stderr, "error: statsd-port must be a valid port number.\n");
                 return -1;
             }
@@ -2215,9 +2226,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             cfg->statsd_run_label = optarg;
             break;
         case o_graphite_port:
-            endptr = NULL;
-            cfg->graphite_port = (unsigned short) strtoul(optarg, &endptr, 10);
-            if (cfg->graphite_port == 0 || !endptr || *endptr != '\0') {
+            if (!parse_port(optarg, &cfg->graphite_port)) {
                 fprintf(stderr, "error: graphite-port must be a valid port number.\n");
                 return -1;
             }

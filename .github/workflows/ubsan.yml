@@ -91,7 +91,7 @@ jobs:
             tls: true
           - name: "Single Endpoint: TCP TLS (cli)"
             env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", VERBOSE: "1", UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1",
-                   TEST: "test_cli_validation_command.py test_cli_validation_count_flags.py test_cli_validation_read_preference.py test_cli_validation_reconnect_backoff.py test_cli_validation_retry_backoff.py test_cli_validation_run_count.py test_cli_validation_sampler.py test_cli_validation_size.py test_cli_fuzz_phase1.py" }
+                   TEST: "test_cli_validation_command.py test_cli_validation_count_flags.py test_cli_validation_ports.py test_cli_validation_read_preference.py test_cli_validation_reconnect_backoff.py test_cli_validation_retry_backoff.py test_cli_validation_run_count.py test_cli_validation_sampler.py test_cli_validation_size.py test_cli_fuzz_phase1.py" }
             tls: true
           - name: "Single Endpoint: TCP TLS (misc)"
             env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", VERBOSE: "1", UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1",
@@ -113,7 +113,7 @@ jobs:
             tls: true
           - name: "OSS TCP TLS v1.3 (cli)"
             env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", TLS_PROTOCOLS: "TLSv1.3", VERBOSE: "1", UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1",
-                   TEST: "test_cli_validation_command.py test_cli_validation_count_flags.py test_cli_validation_read_preference.py test_cli_validation_reconnect_backoff.py test_cli_validation_retry_backoff.py test_cli_validation_run_count.py test_cli_validation_sampler.py test_cli_validation_size.py test_cli_fuzz_phase1.py" }
+                   TEST: "test_cli_validation_command.py test_cli_validation_count_flags.py test_cli_validation_ports.py test_cli_validation_read_preference.py test_cli_validation_reconnect_backoff.py test_cli_validation_retry_backoff.py test_cli_validation_run_count.py test_cli_validation_sampler.py test_cli_validation_size.py test_cli_fuzz_phase1.py" }
             tls: true
           - name: "OSS TCP TLS v1.3 (misc)"
             env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", TLS_PROTOCOLS: "TLSv1.3", VERBOSE: "1", UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1",
