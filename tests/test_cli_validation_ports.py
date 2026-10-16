@@ -76,8 +76,8 @@ def test_port_options_accept_valid_values(env):
 def test_port_ignores_errno_from_earlier_options(env):
     """An earlier option's strtoul overflow must not reject a valid port.
 
-    --key-maximum does not check ERANGE today, so it is used here to leave
-    errno set; if it starts rejecting overflow, pick another such option.
+    --key-maximum does not check ERANGE yet (#725), so it is used here to
+    leave errno set; once #725 lands, pick another errno source.
     """
     result = _run(["--key-maximum=99999999999999999999999", "--port=6379", "--statsd-port=8125",
                    "--graphite-port=2003"])

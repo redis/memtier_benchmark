@@ -955,6 +955,18 @@ static bool parse_port(const char *s, unsigned short *out)
     return true;
 }
 
+// Error for a count option (-n, -c, -t, --test-time) that parse_unsigned()
+// rejected or that was zero: say why, so "-1" and "99999..." are not both
+// reported as "must be greater than zero".
+static void count_option_error(const char *name, const char *s, bool too_large, unsigned long long max)
+{
+    if (too_large)
+        fprintf(stderr, "error: %s must be <= %llu.\n", name, max);
+    else
+        fprintf(stderr, "error: %s must be %s.\n", name,
+                isdigit((unsigned char) *s) ? "greater than zero" : "a positive integer");
+}
+
 // Parse URI and populate config fields
 // Returns 0 on success, -1 on error
 static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string &uri_authenticate,
@@ -1634,9 +1646,9 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 cfg->requests = -1;
             else {
                 // ULLONG_MAX is the "allkeys" sentinel, so it is not a valid count.
-                if (!parse_unsigned(optarg, ULLONG_MAX - 1, &cfg->requests) || !cfg->requests) {
-                    fprintf(stderr, "error: requests must be %s.\n",
-                            isdigit((unsigned char) *optarg) ? "greater than zero" : "a positive integer");
+                bool too_large;
+                if (!parse_unsigned(optarg, ULLONG_MAX - 1, &cfg->requests, &too_large) || !cfg->requests) {
+                    count_option_error("requests", optarg, too_large, ULLONG_MAX - 1);
                     return -1;
                 }
                 if (cfg->test_time) {
@@ -1645,26 +1657,28 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 }
             }
             break;
-        case 'c':
-            if (!parse_unsigned(optarg, UINT_MAX, &val) || !val) {
-                fprintf(stderr, "error: clients must be %s.\n",
-                        isdigit((unsigned char) *optarg) ? "greater than zero" : "a positive integer");
+        case 'c': {
+            bool too_large;
+            if (!parse_unsigned(optarg, UINT_MAX, &val, &too_large) || !val) {
+                count_option_error("clients", optarg, too_large, UINT_MAX);
                 return -1;
             }
             cfg->clients = (unsigned int) val;
             break;
-        case 't':
-            if (!parse_unsigned(optarg, UINT_MAX, &val) || !val) {
-                fprintf(stderr, "error: threads must be %s.\n",
-                        isdigit((unsigned char) *optarg) ? "greater than zero" : "a positive integer");
+        }
+        case 't': {
+            bool too_large;
+            if (!parse_unsigned(optarg, UINT_MAX, &val, &too_large) || !val) {
+                count_option_error("threads", optarg, too_large, UINT_MAX);
                 return -1;
             }
             cfg->threads = (unsigned int) val;
             break;
-        case o_test_time:
-            if (!parse_unsigned(optarg, UINT_MAX, &val) || !val) {
-                fprintf(stderr, "error: test time must be %s.\n",
-                        isdigit((unsigned char) *optarg) ? "greater than zero" : "a positive integer");
+        }
+        case o_test_time: {
+            bool too_large;
+            if (!parse_unsigned(optarg, UINT_MAX, &val, &too_large) || !val) {
+                count_option_error("test time", optarg, too_large, UINT_MAX);
                 return -1;
             }
             cfg->test_time = (unsigned int) val;
@@ -1673,6 +1687,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 return -1;
             }
             break;
+        }
         case o_ratio:
             cfg->ratio = config_ratio(optarg);
             if (!cfg->ratio.is_defined()) {

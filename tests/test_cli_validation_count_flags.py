@@ -298,6 +298,16 @@ def test_unsigned_options_keep_specific_messages(env):
         result = _run_memtier([option, "-1", "--version"])
         env.assertTrue("error: {} must be a positive integer.".format(prefix) in result.stderr,
                        message="{} -1: {!r}".format(option, result.stderr))
+    # Too large (above the field's range, or ERANGE) names the limit.
+    for option, prefix, values in (("-c", "clients", ("4294967296", "99999999999999999999999")),
+                                   ("-t", "threads", ("4294967296", "99999999999999999999999")),
+                                   ("--test-time", "test time", ("4294967296", "99999999999999999999999")),
+                                   ("-n", "requests", ("18446744073709551615", "99999999999999999999999"))):
+        limit = "18446744073709551614" if option == "-n" else "4294967295"
+        for value in values:
+            result = _run_memtier([option, value, "--version"])
+            env.assertTrue("error: {} must be <= {}.".format(prefix, limit) in result.stderr,
+                           message="{} {}: {!r}".format(option, value, result.stderr))
     for option, cap in (("--pipeline", "pipeline must be <= 1024"), ("-d", "data-size must be <= 536870912 bytes")):
         for value in ("1025" if option == "--pipeline" else "536870913", "99999999999999999999999"):
             result = _run_memtier([option, value, "--version"])
@@ -308,8 +318,8 @@ def test_unsigned_options_keep_specific_messages(env):
 def test_unsigned_options_ignore_errno_from_earlier_options(env):
     """parse_unsigned() must reset errno itself.
 
-    --key-maximum does not check ERANGE today, so it is used here to leave
-    errno set; if it starts rejecting overflow, pick another such option.
+    --key-maximum does not check ERANGE yet (#725), so it is used here to
+    leave errno set; once #725 lands, pick another errno source.
     """
     result = _run_memtier(["--key-maximum=99999999999999999999999", "-c", "5", "--version"])
     env.assertEqual(result.returncode, 0, message=result.stderr)

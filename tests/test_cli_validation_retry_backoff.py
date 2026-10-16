@@ -109,7 +109,11 @@ def test_retry_backoff_invalid_values_rejected(env):
 
 
 def test_retry_backoff_ignores_errno_from_earlier_options(env):
-    """An earlier option's strtoul overflow must not reject a valid factor."""
+    """An earlier option's strtoul overflow must not reject a valid factor.
+
+    --key-maximum does not check ERANGE yet (#725), so it is used here to
+    leave errno set; once #725 lands, pick another errno source.
+    """
     result = subprocess.run(
         [
             MEMTIER_BINARY,
