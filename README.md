@@ -237,6 +237,17 @@ code 0. Commands that legitimately take longer than 10 seconds to reply after
 the deadline (for example a slow `--command` Lua script) are reported the same
 way.
 
+### Interrupting a run
+
+Ctrl+C (SIGINT) and SIGTERM (sent by `kill`, `timeout`, `docker stop`,
+Kubernetes and most CI runners) stop a run gracefully: memtier stops the
+threads, prints the results for the time it ran, writes a complete
+`--json-out-file` with `"Interrupted": "true"` in the `Runtime` section, and
+exits with code 0. With `--run-count`, no further run starts; the summary
+covers the runs that happened (`"Runs completed"` in the JSON `run information`
+section). A second signal ends memtier immediately, without results, as a way
+out of a stuck shutdown.
+
 ## Crash Reporting
 
 memtier_benchmark includes built-in crash handling that automatically generates detailed bug reports when the program crashes. If you encounter a crash, the tool will print a comprehensive report including:

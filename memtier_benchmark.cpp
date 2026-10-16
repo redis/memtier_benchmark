@@ -382,10 +382,22 @@ static void install_alt_signal_stack(void)
     }
 }
 
-// Signal handler for Ctrl+C (SIGINT) and SIGTERM
+// Signal handler for Ctrl+C (SIGINT) and SIGTERM. The first signal stops
+// the run gracefully; a second one terminates at once, as a way out of a
+// stuck shutdown.
 static void sigint_handler(int signum)
 {
+    if (g_interrupted) {
+        signal(signum, SIG_DFL);
+        raise(signum);
+        return;
+    }
     g_interrupted = signum;
+}
+
+static const char *interrupt_source(void)
+{
+    return g_interrupted == SIGTERM ? "SIGTERM" : "user (Ctrl+C)";
 }
 
 // Crash handler - prints stack trace and other debugging information
@@ -2653,7 +2665,8 @@ void usage()
         "of 'TLSv1', 'TLSv1.1', 'TLSv1.2' and 'TLSv1.3'.\n"
         "      --sni=STRING               Add an SNI header\n"
 #endif
-        "  -x, --run-count=NUMBER         Number of full-test iterations to perform\n"
+        "  -x, --run-count=NUMBER         Number of full-test iterations to perform. Ctrl+C or SIGTERM\n"
+        "                                 ends the series after the current run\n"
         "  -D, --debug                    Print debug output\n"
         "      --cluster-mode             Run client in cluster mode\n"
         "      --transaction              Treat one full rotation of --command entries as a transactional\n"
@@ -3693,7 +3706,7 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
                 elapsed_duration = factor * elapsed_duration + (float) (*i)->m_cg->get_duration_usec() / thread_counter;
             }
             fprintf(stderr, "\n[RUN #%u] Interrupted by %s after %.1f secs, stopping threads...\n", run_id,
-                    g_interrupted == SIGTERM ? "SIGTERM" : "user (Ctrl+C)", (float) elapsed_duration / 1000000);
+                    interrupt_source(), (float) elapsed_duration / 1000000);
             // Interrupt all threads (marks clients as interrupted, breaks event loops, and finalizes stats)
             for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
                 (*i)->m_cg->interrupt();
@@ -5219,7 +5232,7 @@ int main(int argc, char *argv[])
         std::vector<run_stats> all_stats;
         all_stats.reserve(cfg.run_count);
 
-        // Ctrl+C ends the whole --run-count series, not only the current run:
+        // Ctrl+C (or SIGTERM) ends the whole --run-count series, not only the current run:
         // no later run starts. g_interrupted is checked before and after the
         // settle pause, since the signal can arrive during it. The interrupted
         // run itself is kept, marked Interrupted. Run 1 always runs, so
@@ -5240,7 +5253,7 @@ int main(int argc, char *argv[])
         }
         const bool series_cut = all_stats.size() < cfg.run_count;
         if (series_cut) {
-            fprintf(stderr, "Interrupted by user (Ctrl+C), skipping the remaining runs (%zu of %u done).\n",
+            fprintf(stderr, "Interrupted by %s, skipping the remaining runs (%zu of %u done).\n", interrupt_source(),
                     all_stats.size(), cfg.run_count);
         }
         //

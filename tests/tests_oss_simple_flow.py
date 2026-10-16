@@ -1283,9 +1283,9 @@ def test_interrupt_signal_handling(env):
         env.assertTrue(total_count > 0)
 
 
-def _run_count_interrupted(env, test_time, sigint_when, run_count=3):
-    """Run --run-count=run_count with --print-all-runs and SIGINT it once
-    sigint_when(stderr_text) is true.
+def _run_count_interrupted(env, test_time, sigint_when, run_count=3, sig=signal.SIGINT):
+    """Run --run-count=run_count with --print-all-runs and send it sig (SIGINT
+    by default) once sigint_when(stderr_text) is true.
 
     Returns (returncode, stderr text, seconds from SIGINT to exit, mb.json dict).
     """
@@ -1318,7 +1318,7 @@ def _run_count_interrupted(env, test_time, sigint_when, run_count=3):
         # never interrupted anything and its other checks are meaningless.
         env.assertTrue(process.poll() is None,
                        message="SIGINT trigger did not fire before memtier exited: {}".format(read_stderr()))
-        process.send_signal(signal.SIGINT)
+        process.send_signal(sig)
         t_sigint = time.time()
         try:
             _stdout, _ = process.communicate(timeout=30)
@@ -1528,3 +1528,69 @@ def test_sigterm_closes_json(env):
         runtime = json.load(results_json)["ALL STATS"]["Runtime"]
     env.assertEqual(runtime["Interrupted"], "true")
     env.assertLess(runtime["Total duration"], 10000)
+
+
+def test_sigterm_stops_run_count(env):
+    """SIGTERM during run 1 stops the --run-count series like Ctrl+C (#704)."""
+    started = time.time()
+    rc, stderr_content, _elapsed, results_dict = _run_count_interrupted(
+        env, 30, lambda _err: time.time() - started >= 1.5, sig=signal.SIGTERM)
+    _assert_series_cut_after_run_1(env, rc, stderr_content, results_dict, "true")
+    env.assertEqual(stderr_content.count("Interrupted by SIGTERM after"), 1, message=stderr_content)
+    env.assertContains("Interrupted by SIGTERM, skipping the remaining runs (1 of 3 done)", stderr_content)
+
+
+def test_sigterm_between_runs_stops_run_count(env):
+    """SIGTERM in the settle pause after run 1 starts no further run (#704)."""
+    seen = []
+
+    def run_1_done(err):
+        # Same trigger as test_interrupt_between_runs_stops_run_count.
+        if not seen and re.search(r"\[RUN #1 \d+%[^\r\n]*\b0 threads", err):
+            seen.append(time.time())
+        return bool(seen) and time.time() - seen[0] >= 0.4
+
+    rc, stderr_content, _elapsed, results_dict = _run_count_interrupted(env, 1, run_1_done, sig=signal.SIGTERM)
+    _assert_series_cut_after_run_1(env, rc, stderr_content, results_dict, "false")
+    env.assertFalse("Interrupted by SIGTERM after" in stderr_content, message=stderr_content)
+    env.assertContains("Interrupted by SIGTERM, skipping the remaining runs (1 of 3 done)", stderr_content)
+
+
+def test_second_signal_terminates(env):
+    """A second SIGTERM ends memtier at once when the graceful stop is stuck (#704).
+
+    memtier opens --json-out-file at startup, so a FIFO with no reader holds
+    it in open(). The first SIGTERM only sets the interrupt flag (open() is
+    restarted), so memtier stays up; the second one must kill it.
+    """
+    benchmark_specs = {"name": env.testName, "args": ['--hide-histogram']}
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=1, clients=1, requests=None, test_time=30)
+    add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+
+    test_dir = tempfile.mkdtemp()
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    fifo = os.path.join(config.results_dir, 'mb.json')
+    if os.path.exists(fifo):
+        os.remove(fifo)
+    os.mkfifo(fifo)
+
+    process = subprocess.Popen(stdin=None, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               executable=benchmark.binary, args=benchmark.args)
+    try:
+        time.sleep(1)
+        process.send_signal(signal.SIGTERM)
+        time.sleep(1)
+        env.assertTrue(process.poll() is None, message="first SIGTERM killed memtier (rc {})".format(process.poll()))
+        process.send_signal(signal.SIGTERM)
+        try:
+            rc = process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            rc = None
+        env.assertEqual(rc, -signal.SIGTERM)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
