@@ -3206,8 +3206,9 @@ static void *cg_thread_start(void *t)
         // both leave clients unfinished. Fail the run without restarting it.
         //
         // Ctrl+C and the connection-stage supervisor end the loop through
-        // client_group::interrupt(), which stamps end times from the main
-        // thread; neither is a worker failure (the latter exits 2 itself).
+        // client_group::interrupt(); the main thread stamps the end times
+        // after pthread_join(). Neither is a worker failure (the latter
+        // exits 2 itself).
         if (!g_interrupted && !g_connection_stage_aborted.load(std::memory_order_acquire)) {
             unsigned int unended = thread->m_cg->count_unended_clients();
             if (unended > 0) {
@@ -3731,7 +3732,8 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             gettimeofday(&now, NULL);
             fprintf(stderr, "\n[RUN #%u] Interrupted by %s after %.1f secs, stopping threads...\n", run_id,
                     interrupt_source(), (float) ts_diff(cfg->benchmark_start_time, now) / 1000000);
-            // Interrupt all threads (marks clients as interrupted, breaks event loops, and finalizes stats)
+            // Interrupt all threads (marks clients as interrupted and breaks event loops; the stats are
+            // finalized after the join)
             for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
                 (*i)->m_cg->interrupt();
             }
@@ -4132,6 +4134,10 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     unsigned int merge_iteration = 1;
     for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
         (*i)->join();
+        // After interrupt() (Ctrl+C, connection-stage abort): end the clients
+        // that were still running at the interrupt time. Done here, not in
+        // interrupt(), because the worker records into the same run_stats.
+        (*i)->m_cg->finalize_interrupted_clients();
         if ((*i)->m_failed) failed_threads++;
         (*i)->m_cg->merge_run_stats(&stats, merge_iteration);
     }

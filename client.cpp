@@ -385,18 +385,24 @@ void client::set_start_time()
 
 void client::set_end_time()
 {
-    set_end_time_keep_live_totals(false);
-}
-
-void client::set_end_time_keep_live_totals(bool keep_live_totals)
-{
     // update only once
     if (!m_end_set) {
         benchmark_debug_log("nothing else to do, test is finished.\n");
 
-        m_stats.set_end_time(NULL, keep_live_totals);
+        m_stats.set_end_time(NULL);
         m_end_set = true;
     }
+}
+
+void client::set_end_time_interrupted(struct timeval *end_time)
+{
+    if (m_end_set) return;
+    // A client whose connection completed in the loop iteration that the
+    // interrupt ended may have started after the interrupt time.
+    struct timeval start_time = m_stats.get_start_time();
+    if (m_stats.has_started() && timercmp(end_time, &start_time, <)) end_time = &start_time;
+    m_stats.set_end_time(end_time);
+    m_end_set = true;
 }
 
 bool client::abandon_unanswered_requests(unsigned long long *unanswered, unsigned long long *held)
@@ -1297,8 +1303,11 @@ client_group::client_group(benchmark_config *config, abstract_protocol *protocol
         m_obj_gen(obj_gen),
         m_staircase_timer(NULL),
         m_staircase_active_clients(0),
-        m_staircase_steps(0)
+        m_staircase_steps(0),
+        m_interrupt_requested(false)
 {
+    m_interrupt_time.tv_sec = 0;
+    m_interrupt_time.tv_usec = 0;
     m_base = event_base_new();
     assert(m_base != NULL);
 
@@ -1572,6 +1581,12 @@ void client_group::handle_end_stalled_clients(void)
 
 void client_group::interrupt(void)
 {
+    // The end time of the clients that have not ended yet. Taken first, so
+    // that it does not include the time the loop takes to stop.
+    if (!m_interrupt_requested) {
+        gettimeofday(&m_interrupt_time, NULL);
+        m_interrupt_requested = true;
+    }
     // Mark all clients as interrupted
     set_all_clients_interrupted();
     // Break the event loop to stop processing.
@@ -1588,13 +1603,19 @@ void client_group::interrupt(void)
     event_base_loopbreak(m_base);
     struct timeval zero = {0, 0};
     event_base_loopexit(m_base, &zero);
-    // Set end time for all clients as close as possible to the loop break.
-    // This runs on the main thread while workers may still record, so keep
-    // their live latency totals for the exporter's post-join drain.
-    finalize_all_clients(true);
+    // Do not finalize the clients here: the worker may still be in a callback
+    // that records into the same run_stats (roll_cur_stats() and
+    // set_end_time() both fold and append the current second).
+    // finalize_interrupted_clients() does it after pthread_join(), with the
+    // end time taken here.
 }
 
-void client_group::finalize_all_clients(bool keep_live_totals)
+void client_group::finalize_interrupted_clients(void)
+{
+    if (m_interrupt_requested) finalize_all_clients(&m_interrupt_time);
+}
+
+void client_group::finalize_all_clients(struct timeval *end_time)
 {
     // Iterate ALL clients, not just active ones. During staircase mode,
     // a client may have been prepare()-d but not yet counted in the atomic
@@ -1602,7 +1623,10 @@ void client_group::finalize_all_clients(bool keep_live_totals)
     // no client is missed. Calling set_end_time() on never-started clients
     // is harmless — they won't be included in merge (which uses active_client_count).
     for (unsigned int i = 0; i < m_clients.size(); i++) {
-        m_clients[i]->set_end_time_keep_live_totals(keep_live_totals);
+        if (end_time != NULL)
+            m_clients[i]->set_end_time_interrupted(end_time);
+        else
+            m_clients[i]->set_end_time();
     }
 }
 

@@ -9,7 +9,6 @@
 # - Progress stats are approximate and for display only
 # - Final results are collected after pthread_join (race-free)
 # - Adding synchronization would hurt performance
-race:run_stats::set_end_time
 race:run_stats::get_duration_usec
 race:run_stats::get_total_ops
 race:run_stats::get_total_bytes

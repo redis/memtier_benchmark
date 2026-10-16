@@ -1317,16 +1317,18 @@ def test_interrupt_signal_handling(env):
         env.assertTrue(total_count > 0)
 
 
-def _run_count_interrupted(env, test_time, signal_when, run_count=3, sig=signal.SIGINT):
+def _run_count_interrupted(env, test_time, signal_when, run_count=3, sig=signal.SIGINT, threads=2, clients=5,
+                           extra_args=()):
     """Run --run-count=run_count with --print-all-runs and send it sig (SIGINT
     by default) once signal_when(stderr_text) is true.
 
     Returns (returncode, stderr text, seconds from the signal to exit, mb.json dict).
     """
     benchmark_specs = {"name": env.testName,
-                       "args": ['--run-count={}'.format(run_count), '--print-all-runs', '--hide-histogram']}
+                       "args": ['--run-count={}'.format(run_count), '--print-all-runs', '--hide-histogram'] +
+                       list(extra_args)}
     addTLSArgs(benchmark_specs, env)
-    config = get_default_memtier_config(threads=2, clients=5, requests=None, test_time=test_time)
+    config = get_default_memtier_config(threads=threads, clients=clients, requests=None, test_time=test_time)
     master_nodes_list = env.getMasterNodesList()
     add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
 
@@ -1453,6 +1455,35 @@ def test_interrupt_last_run_marks_aggregate(env):
         env.assertTrue(section in results_dict, message=list(results_dict))
         if section in results_dict:
             env.assertEqual(results_dict[section]["Runtime"]["Interrupted"], interrupted, message=section)
+
+
+def test_interrupt_does_not_race_worker_stats(env):
+    """Ctrl+C does not touch the clients' stats while the workers run (#710).
+
+    client_group::interrupt() used to finalize every client's run_stats on the
+    main thread right after asking the worker loops to stop, while the
+    workers could still be recording replies into the same objects (a data
+    race; a double free under ASan). Now the end times are stamped after the
+    workers are joined. A TSAN build reports the race (and exits 66) in
+    about half the interrupts, hence several runs; any build checks the
+    interrupted results.
+    """
+    for attempt in range(3):
+        started = time.time()
+        rc, stderr_content, _elapsed, results_dict = _run_count_interrupted(
+            env, 30, lambda _err: time.time() - started >= 2, run_count=1,
+            threads=4, clients=10, extra_args=['--pipeline=16'])
+        env.assertFalse("ThreadSanitizer" in stderr_content, message=stderr_content)
+        env.assertFalse("AddressSanitizer" in stderr_content, message=stderr_content)
+        env.assertEqual(rc, 0, message=stderr_content)
+        env.assertEqual(stderr_content.count("Interrupted by user (Ctrl+C) after"), 1, message=stderr_content)
+        runtime = results_dict["ALL STATS"]["Runtime"]
+        env.assertEqual(runtime["Interrupted"], "true", message=attempt)
+        # The end time is the interrupt time, not the (later) join.
+        env.assertTrue(1000 <= runtime["Total duration"] <= 6000, message=runtime)
+        env.assertTrue(results_dict["ALL STATS"]["Totals"]["Count"] > 0, message=attempt)
+        if rc != 0:
+            break
 
 
 def test_cluster_seed_owns_no_keys(env):
