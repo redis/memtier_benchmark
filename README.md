@@ -245,8 +245,10 @@ threads, prints the results for the time it ran, writes a complete
 `--json-out-file` with `"Interrupted": "true"` in the `Runtime` section, and
 exits with code 0. With `--run-count`, no further run starts; the summary
 covers the runs that happened (`"Runs completed"` in the JSON `run information`
-section). A second signal ends memtier immediately, without results, as a way
-out of a stuck shutdown.
+section). A second signal sent more than about 1 second after the first ends
+memtier immediately, without results, as a way out of a stuck shutdown.
+Signals within that second count as one: Ctrl+C under `timeout`, or a kill
+of the whole process group, delivers the same signal twice.
 
 ## Crash Reporting
 

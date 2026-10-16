@@ -1561,7 +1561,8 @@ def test_second_signal_terminates(env):
 
     memtier opens --json-out-file at startup, so a FIFO with no reader holds
     it in open(). The first SIGTERM only sets the interrupt flag (open() is
-    restarted), so memtier stays up; the second one must kill it.
+    restarted), so memtier stays up; the second one, sent 1.5 s later (past
+    the 1 s window that coalesces duplicates), must kill it.
     """
     benchmark_specs = {"name": env.testName, "args": ['--hide-histogram']}
     addTLSArgs(benchmark_specs, env)
@@ -1582,7 +1583,7 @@ def test_second_signal_terminates(env):
     try:
         time.sleep(1)
         process.send_signal(signal.SIGTERM)
-        time.sleep(1)
+        time.sleep(1.5)
         env.assertTrue(process.poll() is None, message="first SIGTERM killed memtier (rc {})".format(process.poll()))
         process.send_signal(signal.SIGTERM)
         try:
@@ -1594,3 +1595,53 @@ def test_second_signal_terminates(env):
         if process.poll() is None:
             process.kill()
             process.wait()
+        os.remove(fifo)
+
+
+def test_duplicate_signal_counts_once(env):
+    """Signals within 1 s of the first are one interrupt, not an escalation (#704).
+
+    Ctrl+C on `timeout ... memtier` delivers SIGINT twice (terminal and
+    timeout), and a process-group kill does the same. memtier must still stop
+    gracefully: rc 0 and a valid --json-out-file marked Interrupted.
+    """
+    cases = [("direct-2x-SIGTERM", False, signal.SIGTERM)]
+    if shutil.which("timeout"):
+        cases += [("timeout-group-SIGINT", True, signal.SIGINT), ("timeout-group-SIGTERM", True, signal.SIGTERM)]
+    for name, under_timeout, sig in cases:
+        benchmark_specs = {"name": env.testName + '-' + name, "args": ['--hide-histogram']}
+        addTLSArgs(benchmark_specs, env)
+        config = get_default_memtier_config(threads=1, clients=2, requests=None, test_time=60)
+        add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+        test_dir = tempfile.mkdtemp()
+        config = RunConfig(test_dir, benchmark_specs['name'], config, {})
+        ensure_clean_benchmark_folder(config.results_dir)
+        benchmark = Benchmark.from_json(config, benchmark_specs)
+
+        args = list(benchmark.args)
+        if under_timeout:
+            args = ["timeout", "100"] + args
+        process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   start_new_session=True)
+        try:
+            time.sleep(2)
+            if under_timeout:
+                os.killpg(process.pid, sig)
+            else:
+                process.send_signal(sig)
+                process.send_signal(sig)
+            try:
+                rc = process.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                rc = None
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+        env.assertEqual(rc, 0, message=name)
+        try:
+            with open(os.path.join(config.results_dir, 'mb.json')) as results_json:
+                interrupted = json.load(results_json)["ALL STATS"]["Runtime"]["Interrupted"]
+        except ValueError as e:
+            interrupted = "invalid JSON: {}".format(e)
+        env.assertEqual(interrupted, "true", message=name)

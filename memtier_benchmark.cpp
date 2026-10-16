@@ -382,17 +382,28 @@ static void install_alt_signal_stack(void)
     }
 }
 
+// CLOCK_MONOTONIC time (ns) of the first SIGINT/SIGTERM, 0 before it.
+static std::atomic<long long> g_first_interrupt_ns(0);
+
 // Signal handler for Ctrl+C (SIGINT) and SIGTERM. The first signal stops
-// the run gracefully; a second one terminates at once, as a way out of a
-// stuck shutdown.
+// the run gracefully. A signal at least 1 s later terminates at once, as a
+// way out of a stuck shutdown. Signals within that second are duplicates of
+// the same action and are ignored: Ctrl+C under `timeout` delivers SIGINT
+// twice (terminal and timeout), and a process-group kill does the same.
 static void sigint_handler(int signum)
 {
-    if (g_interrupted) {
-        signal(signum, SIG_DFL);
-        raise(signum);
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    long long now = (long long) ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    long long first = 0;
+    if (g_first_interrupt_ns.compare_exchange_strong(first, now)) {
+        g_interrupted = signum;
         return;
     }
-    g_interrupted = signum;
+    if (now - first >= 1000000000LL) {
+        signal(signum, SIG_DFL);
+        raise(signum);
+    }
 }
 
 static const char *interrupt_source(void)
