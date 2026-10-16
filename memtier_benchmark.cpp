@@ -700,15 +700,18 @@ static std::string redact_credentials(const char *credentials)
 
 // End of the userinfo in a URI authority+path (the text after "scheme://"),
 // or NULL when there is none. The authority ends at a '/', '?' or '#'
-// (RFC 3986), so the search for '@' stops at the first of those after the
-// first '@': a stray '@' in the db path, query or fragment is not taken for
-// the end of the credentials, which would send them to another host. It is
-// the LAST '@' before that point, so a raw '@' in the password works and no
-// tail of it is taken for the host and echoed by --show-config or a
-// host/port error. A raw '/', '?' or '#' in the password works only when no
-// '@' comes before it in the password: "u:a@b/c@host" is still split as
-// host "b" and db "c@host" (as before). Such passwords need the
-// percent-encoding of #732.
+// (RFC 3986), so once credentials are present the search for '@' stops at
+// the first of those after the first '@': a later '@' in the db path, query
+// or fragment does not end the credentials, which would send them to another
+// host. It is the LAST '@' before that point, so a raw '@' in the password
+// works and no tail of it is taken for the host and echoed by --show-config
+// or a host/port error.
+// Known limits, both as before, until #732's percent-encoding:
+// - A raw '/', '?' or '#' in the password works only when no '@' comes
+//   before it in the password: "u:a@b/c@host" is split as host "b".
+// - Without credentials, an '@' in the path still ends a "userinfo":
+//   "host:6379/1@other:6379" connects to "other". Treating a '/', '?' or '#'
+//   before the first '@' as "no userinfo" would break a raw '/' in passwords.
 static const char *uri_userinfo_end(const char *s)
 {
     const char *at = strchr(s, '@');
@@ -721,7 +724,8 @@ static const char *uri_userinfo_end(const char *s)
 }
 
 // --uri with its userinfo password redacted: redis://user:pw@host:port/db ->
-// redis://user:***@host:port/db. Splits where parse_uri() does.
+// redis://user:***@host:port/db. Splits where parse_uri() does; it assumes a
+// URI parse_uri() has already validated (the no-"://" fallback is only a guard).
 static std::string redact_uri(const char *uri)
 {
     if (!uri) return "";
@@ -1151,10 +1155,10 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
         cfg->port = port;
     }
 
-    // Credentials with no host would fall back to the default server and
+    // An '@' with no host after it would fall back to the default server and
     // benchmark the wrong target.
     if (auth_end && strlen(host_start) == 0) {
-        fprintf(stderr, "error: missing host after credentials in URI.\n");
+        fprintf(stderr, "error: missing host in URI.\n");
         free(uri_copy);
         return -1;
     }

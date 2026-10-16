@@ -290,8 +290,37 @@ def test_config_uri_credentials_without_host_rejected(env):
     with tempfile.TemporaryDirectory() as workdir:
         _raw, stdout, stderr = _run(env, ["--uri", "redis://default:{}@:{}".format(_CANARY, port)], workdir,
                                     expect_ok=False)
-    env.assertContains("missing host after credentials in URI", stderr)
+    env.assertContains("missing host in URI", stderr)
     env.assertFalse(_CANARY in stdout + stderr)
+
+
+def test_config_uri_at_in_path_without_credentials_known_limit(env):
+    """Known, pre-existing limit (same as master), pinned until #732.
+
+    Without credentials, an '@' in the db path still ends a "userinfo":
+    redis://host:port/1@other:port is read as credentials "host:port/1" for
+    host "other". Treating a '/' before the first '@' as "no userinfo"
+    would break a raw '/' in passwords, which master supports. The value is
+    redacted like any credential, and with nothing after the '@' the URI is
+    rejected rather than run against the default server.
+    """
+    host, port = _target(env)
+    closed = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    closed.bind(("127.0.0.1", 0))
+    other_port = closed.getsockname()[1]
+    closed.close()  # nothing listens there: the connect is refused at once
+    uri = "redis://{}:{}/1@127.0.0.1:{}".format(host, port, other_port)
+    with tempfile.TemporaryDirectory() as workdir:
+        _raw, _stdout, stderr = _run(env, ["--uri", uri], workdir, expect_ok=False)
+    env.assertEqual(_show_config_value(stderr, "server"), "127.0.0.1")
+    env.assertEqual(_show_config_value(stderr, "port"), str(other_port))
+    env.assertEqual(_show_config_value(stderr, "authenticate"), "{}:***".format(host))
+    env.assertEqual(_show_config_value(stderr, "uri"), "redis://{}:***@127.0.0.1:{}".format(host, other_port))
+
+    with tempfile.TemporaryDirectory() as workdir:
+        _raw, _stdout, stderr = _run(env, ["--uri", "redis://{}:{}/1@".format(host, port)], workdir,
+                                     expect_ok=False)
+    env.assertContains("missing host in URI", stderr)
 
 
 def test_config_uri_without_credentials(env):
