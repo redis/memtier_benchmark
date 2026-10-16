@@ -271,6 +271,16 @@ void client::disconnect(void)
 
 void client::disconnect_all(void)
 {
+    unsigned long long abandoned = disconnect_and_abandon_held();
+    if (abandoned) {
+        benchmark_error_log("warning: %llu request(s) held for retry when the run ended were not resent; "
+                            "counted as errors.\n",
+                            abandoned);
+    }
+}
+
+unsigned long long client::disconnect_and_abandon_held(void)
+{
     // This ends the run, once it is finished and no replies are pending. A
     // request still held for resend (waiting in a retry queue for its
     // backoff, or in a replay queue for a reconnect) is not pending, so it
@@ -288,11 +298,7 @@ void client::disconnect_all(void)
             abandoned += sc->abandon_replay_requests("run-ended-before-resend");
         }
     }
-    if (abandoned) {
-        benchmark_error_log("warning: %llu request(s) held for retry when the run ended were not resent; "
-                            "counted as errors.\n",
-                            abandoned);
-    }
+    return abandoned;
 }
 
 int client::connect(void)
@@ -391,34 +397,44 @@ void client::set_end_time_keep_live_totals(bool keep_live_totals)
     }
 }
 
-unsigned int client::abandon_unanswered_requests(void)
+bool client::abandon_unanswered_requests(unsigned long long *unanswered, unsigned long long *held)
 {
-    if (m_end_set || m_config->test_time == 0) return 0;
+    if (m_end_set || m_config->test_time == 0) return false;
     if (m_stats.get_duration_usec() < (unsigned long long) (m_config->test_time + TEST_TIME_DRAIN_GRACE_SECS) * 1000000)
-        return 0;
+        return false;
 
-    // Only a client that is waiting for replies: one with nothing in flight
-    // ends by itself, or is waiting for a reconnect.
-    if (all_connections_idle()) return 0;
+    // Only a client that is waiting for replies, or that keeps resending
+    // --retry-on-error retries that never succeed (#715): one with nothing
+    // in flight ends by itself, or is waiting for a reconnect. A retry held
+    // for its backoff is not pending.
+    if (all_connections_idle()) {
+        bool holds_retries = false;
+        for (unsigned int i = 0; i < m_connections.size() && !holds_retries; i++) {
+            holds_retries = m_connections[i] != NULL && m_connections[i]->holds_retries();
+        }
+        if (!holds_retries) return false;
+    }
 
     // Drop them before disconnecting, so --retry-on-error does not hold them
-    // for a resend that will never come (disconnect_all() would then count
-    // them a second time). Workload requests that never got a reply are
-    // errors, not ops (drop_pending_requests() counts them through
+    // for a resend that will never come (they would then be counted a
+    // second time). Workload requests that never got a reply are errors,
+    // not ops (drop_pending_requests() counts them through
     // abandon_requests()); setup commands are not counted.
     unsigned int abandoned = 0;
     for (unsigned int i = 0; i < m_connections.size(); i++) {
         if (m_connections[i] != NULL) abandoned += m_connections[i]->drop_pending_requests();
     }
     m_stats.add_unanswered_requests(abandoned);
+    *unanswered += abandoned;
 
     // The run measured --test-time, not the grace period spent waiting.
     struct timeval end_time = m_stats.get_start_time();
     end_time.tv_sec += m_config->test_time;
     m_stats.set_end_time(&end_time);
     m_end_set = true;
-    disconnect_all();
-    return abandoned;
+    // The caller reports the requests held for retry with the others.
+    *held += disconnect_and_abandon_held();
+    return true;
 }
 
 bool client::hold_pipeline(unsigned int conn_id)
@@ -1498,15 +1514,27 @@ void client_group::end_stalled_clients_cb(evutil_socket_t fd, short what, void *
 
 void client_group::handle_end_stalled_clients(void)
 {
-    unsigned long long abandoned = 0;
-    unsigned int stalled = 0;
+    // A client is reported as waiting for replies if it was (even if only
+    // for setup commands, which are not counted), and as retrying if it
+    // held requests for retry; one that had both is in both lines.
+    unsigned long long unanswered = 0, held = 0;
+    unsigned int no_reply = 0, retrying = 0, ended = 0;
     unsigned int count = active_client_count();
     for (unsigned int i = 0; i < count && i < m_clients.size(); i++) {
         if (m_clients[i]->end_time_set()) continue;
-        abandoned += m_clients[i]->abandon_unanswered_requests();
-        if (m_clients[i]->end_time_set()) stalled++;
+        unsigned long long client_unanswered = 0, client_held = 0;
+        if (!m_clients[i]->abandon_unanswered_requests(&client_unanswered, &client_held)) continue;
+        ended++;
+        if (client_unanswered > 0 || client_held == 0) {
+            no_reply++;
+            unanswered += client_unanswered;
+        }
+        if (client_held > 0) {
+            retrying++;
+            held += client_held;
+        }
     }
-    if (stalled > 0) {
+    if (ended > 0) {
         // The deadline has passed, so the ramp is over. Do not let its
         // persistent timer keep the loop alive until the next step.
         if (m_staircase_timer != NULL) {
@@ -1514,10 +1542,17 @@ void client_group::handle_end_stalled_clients(void)
             event_free(m_staircase_timer);
             m_staircase_timer = NULL;
         }
-        benchmark_error_log("warning: %u client(s) got no reply to %llu request(s) %u seconds after the test time "
-                            "ended; abandoned them (counted as errors, \"Unanswered requests\" in the JSON "
-                            "Runtime).\n",
-                            stalled, abandoned, TEST_TIME_DRAIN_GRACE_SECS);
+        if (no_reply > 0) {
+            benchmark_error_log("warning: %u client(s) got no reply to %llu request(s) %u seconds after the test time "
+                                "ended; abandoned them (counted as errors, \"Unanswered requests\" in the JSON "
+                                "Runtime).\n",
+                                no_reply, unanswered, TEST_TIME_DRAIN_GRACE_SECS);
+        }
+        if (retrying > 0) {
+            benchmark_error_log("warning: %u client(s) were still retrying %llu request(s) %u seconds after the test "
+                                "time ended; ended them (counted as errors, not resent).\n",
+                                retrying, held, TEST_TIME_DRAIN_GRACE_SECS);
+        }
     }
 }
 

@@ -163,9 +163,11 @@ public:
     // (finished()) or was finalized by client_group::finalize_all_clients().
     bool end_time_set(void) const { return m_end_set; }
     // Ends a client whose --test-time deadline passed TEST_TIME_DRAIN_GRACE_SECS
-    // ago with replies still pending; returns the number of workload requests
-    // abandoned (setup commands are dropped but not counted).
-    unsigned int abandon_unanswered_requests(void);
+    // ago with replies still pending, or with --retry-on-error retries it
+    // keeps resending; returns whether it did. Adds the workload requests
+    // that got no reply to *unanswered (setup commands are dropped but not
+    // counted) and the requests held for retry to *held.
+    bool abandon_unanswered_requests(unsigned long long *unanswered, unsigned long long *held);
 
     virtual get_key_response get_key_for_conn(unsigned int command_index, unsigned int conn_id,
                                               unsigned long long *key_index);
@@ -224,6 +226,8 @@ public:
     virtual int connect(void);
     virtual void disconnect(void);
     virtual void disconnect_all(void);
+    // disconnect_all() without the warning; returns the requests held for resend it abandoned.
+    unsigned long long disconnect_and_abandon_held(void);
     //
 
     /* Get current executed arbitrary command */

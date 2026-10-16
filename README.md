@@ -237,6 +237,17 @@ code 0. Commands that legitimately take longer than 10 seconds to reply after
 the deadline (for example a slow `--command` Lua script) are reported the same
 way.
 
+With `--retry-on-error`, requests that get a retryable error after the
+deadline are still retried, so a slot migration or a failover in progress can
+complete. A client that is still retrying when the grace period is over (for
+example against a server that rejects every write with `-OOM`, with the
+default unlimited `--max-retries`) is ended the same way: its requests held
+for retry are not resent, are counted as errors and written to
+`--failed-keys-file` with status `run-ended-before-resend`, and stderr shows
+`warning: N client(s) were still retrying M request(s) 10 seconds after the
+test time ended`. They are not part of `"Unanswered requests"`, which only
+counts requests that were waiting for a reply.
+
 ### Interrupting a run
 
 Ctrl+C (SIGINT) and SIGTERM (sent by `kill`, `timeout`, `docker stop`,

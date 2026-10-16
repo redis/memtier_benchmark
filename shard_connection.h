@@ -293,6 +293,7 @@ public:
     // mutations; std::atomic with relaxed ordering gives TSAN a clean
     // happens-before edge and is signal-safe for lock-free integer atomics.
     int get_pending_resp() { return m_pending_resp.load(std::memory_order_relaxed); }
+    bool holds_retries() const { return m_retry_queue != NULL && !m_retry_queue->empty(); }
 
     // Get local port for crash reporting
     int get_local_port();

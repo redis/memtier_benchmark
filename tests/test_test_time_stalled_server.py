@@ -14,6 +14,9 @@ TEST_TIME = 3
 STALL_WARNING = re.compile(
     r"warning: (\d+) client\(s\) got no reply to (\d+) request\(s\) (\d+) seconds after the test time ended"
 )
+RETRYING_WARNING = re.compile(
+    r"warning: (\d+) client\(s\) were still retrying (\d+) request\(s\) (\d+) seconds after the test time ended"
+)
 PROGRESS_ERRORS = re.compile(r"   errors (\d+) \(\+\d+\)")
 
 
@@ -162,13 +165,7 @@ def test_test_time_stalled_server_staircase(env):
     env.assertTrue(out["wall"] < TEST_TIME + MAX_DRAIN_GRACE_SECS + 10)
 
 
-def test_test_time_reconnecting_client_left_alone(env):
-    """
-    A client with nothing in flight is not a stalled client: here it waits
-    for a reconnect scheduled past the grace period. It must be left to the
-    reconnect logic, not ended as "no reply".
-    """
-
+def check_reconnecting_client_left_alone(env, extra_args):
     def kill_clients(conns):
         for conn in conns:
             conn.execute_command("CLIENT", "KILL", "TYPE", "normal")
@@ -177,7 +174,7 @@ def test_test_time_reconnecting_client_left_alone(env):
     # period (TEST_TIME + 10 s) has passed. The run then ends on its own.
     out = run_memtier(
         env,
-        ["--reconnect-on-error", "--max-reconnect-attempts=3", "--reconnect-backoff-factor=15"],
+        ["--reconnect-on-error", "--max-reconnect-attempts=3", "--reconnect-backoff-factor=15"] + extra_args,
         kill_clients,
         clients=1,
         # In cluster mode a reconnect can need a second backoff round.
@@ -185,4 +182,23 @@ def test_test_time_reconnecting_client_left_alone(env):
     )
     env.assertFalse(out["hung"])
     env.assertEqual(STALL_WARNING.findall(out["stderr"]), [])
+    env.assertEqual(RETRYING_WARNING.findall(out["stderr"]), [])
     env.assertTrue(out["wall"] > TEST_TIME + MAX_DRAIN_GRACE_SECS)
+
+
+def test_test_time_reconnecting_client_left_alone(env):
+    """
+    A client with nothing in flight is not a stalled client: here it waits
+    for a reconnect scheduled past the grace period. It must be left to the
+    reconnect logic, not ended as "no reply" or as still retrying.
+    """
+    check_reconnecting_client_left_alone(env, [])
+
+
+def test_test_time_reconnecting_client_left_alone_retry_on_error(env):
+    """
+    Same with --retry-on-error: the requests that were in flight wait for
+    the reconnect in the replay queue, not in the retry queue, so the client
+    is not retrying either.
+    """
+    check_reconnecting_client_left_alone(env, ["--retry-on-error"])

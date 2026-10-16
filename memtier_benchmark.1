@@ -197,7 +197,8 @@ Number of threads (default: 4)
 \fB\-\-test\-time\fR=\fI\,SECS\/\fR
 Number of seconds to run the test. Replies to requests already sent
 are waited for at most 10 more seconds; requests still unanswered
-then are abandoned and counted as errors.
+then are abandoned and counted as errors, and so are
+\fB\-\-retry\-on\-error\fR retries still being resent.
 .TP
 \fB\-\-clients\-start\fR=\fI\,NUMBER\/\fR
 Starting number of clients per thread for staircase ramp\-up.

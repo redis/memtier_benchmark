@@ -577,6 +577,124 @@ def test_retry_backoff_is_per_request(env):
         env.assertEqual(int(row["retries"]), max_retries)
 
 
+_NO_REPLY_WARNING = re.compile(
+    r"warning: (\d+) client\(s\) got no reply to (\d+) request\(s\) (\d+) seconds after the test time ended")
+_STILL_RETRYING_WARNING = re.compile(
+    r"warning: (\d+) client\(s\) were still retrying (\d+) request\(s\) (\d+) seconds after the test time ended")
+
+
+def test_test_time_ends_when_every_request_is_retried(env):
+    """
+    A --test-time run whose retries never succeed ends once the drain grace
+    after the deadline is over, like one waiting for replies that never come.
+
+    finished() measures the run by the per-second stats clock, which only
+    moves on a completed op. With every SET failing and unlimited
+    --max-retries nothing completes, and the drain grace skipped a client
+    whose requests were held for retry rather than in flight, so the run
+    kept resending them until it was killed (issue #715).
+    """
+    # Toggles maxmemory on one server; the key layout assumes a single shard.
+    env.skipOnCluster()
+    test_time = 3
+    # Upper bound for TEST_TIME_DRAIN_GRACE_SECS in client.h; the value the
+    # run used is read back from its warning.
+    max_grace = 10
+    conn = env.getOSSMasterNodesConnectionList()[0]
+    conn.execute_command("FLUSHALL")
+    saved = conn.execute_command("CONFIG", "GET", "maxmemory*")
+    # Keys come back as bytes without decoded responses.
+    saved = {k.decode() if isinstance(k, bytes) else k: v for k, v in zip(saved[0::2], saved[1::2])}
+    conn.execute_command("CONFIG", "SET", "maxmemory-policy", "noeviction")
+    # Every SET fails with a retryable -OOM for the whole run.
+    conn.execute_command("CONFIG", "SET", "maxmemory", "1")
+    try:
+        # Factor 0 resends every 100 ms, 2 waits out a growing backoff, and
+        # a 20 s backoff is longer than the whole run. Without
+        # --retry-on-error the errors are final and the run ends on time.
+        for backoff_ms, factor in ((100, "0"), (100, "2"), (20000, "1"), (None, None)):
+            retry = backoff_ms is not None
+            label = "--retry-backoff-ms {} --retry-backoff-factor {}".format(backoff_ms, factor) if retry \
+                else "no --retry-on-error"
+            test_dir = tempfile.mkdtemp()
+            failed_keys = os.path.join(test_dir, "failed-keys.csv")
+            args = [
+                "--pipeline=1",
+                "--ratio=1:0",
+                # No reply ever succeeds; don't abort on that.
+                "--connection-stage-timeout=0",
+                "--failed-keys-file={}".format(failed_keys),
+                "--hide-histogram",
+            ]
+            if retry:
+                args += ["--retry-on-error", "--retry-backoff-ms={}".format(backoff_ms),
+                         "--retry-backoff-factor={}".format(factor)]
+            benchmark_specs = {"name": env.testName, "args": args}
+            addTLSArgs(benchmark_specs, env)
+            config = get_default_memtier_config(threads=1, clients=1, requests=None, test_time=test_time)
+            master_nodes_list = env.getMasterNodesList()
+            add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+            config = RunConfig(test_dir, env.testName, config, {})
+            ensure_clean_benchmark_folder(config.results_dir)
+            benchmark = Benchmark.from_json(config, benchmark_specs)
+
+            start = time.monotonic()
+            try:
+                rc, stderr = _run_with_background(env, benchmark, config, lambda _proc: None,
+                                                  timeout=test_time + max_grace + 10)
+            except subprocess.TimeoutExpired:
+                rc, stderr = None, ""
+            elapsed = time.monotonic() - start
+
+            env.assertTrue(rc is not None, message="{}: the run did not end within {} s".format(
+                label, test_time + max_grace + 10))
+            if rc is None:
+                continue
+            env.assertEqual(rc, 0, message="{}: {}".format(label, stderr[-2000:]))
+            no_reply = _NO_REPLY_WARNING.findall(stderr)
+            retrying = _STILL_RETRYING_WARNING.findall(stderr)
+            with open("{0}/mb.json".format(config.results_dir)) as f:
+                runtime = json.load(f)["ALL STATS"]["Runtime"]
+            # The report covers --test-time, not the grace spent retrying.
+            env.assertGreaterEqual(runtime["Total duration"], test_time * 1000, message=label)
+            env.assertLess(runtime["Total duration"], test_time * 1000 + 200, message=label)
+            if not retry:
+                env.assertEqual(no_reply + retrying, [], message=label)
+                env.assertGreaterEqual(elapsed, test_time, message=label)
+                env.assertLess(elapsed, test_time + 3, message="{}: did not end at --test-time".format(label))
+                continue
+
+            # The client is ended once, by the grace: as retrying, and also as
+            # waiting for replies if the tick found a resend still on the wire.
+            env.assertTrue(len(retrying) + len(no_reply) in (1, 2), message="{}: {}".format(label, stderr[-2000:]))
+            env.assertTrue(len(retrying) <= 1 and len(no_reply) <= 1, message=label)
+            graces = set(int(g) for _, _, g in retrying + no_reply)
+            env.assertEqual(len(graces), 1, message=label)
+            grace = graces.pop() if len(graces) == 1 else max_grace
+            env.assertLessEqual(grace, max_grace, message=label)
+            # The main thread checks for the end of the run once a second.
+            env.assertGreaterEqual(elapsed, test_time + grace, message="{}: ended before the drain grace".format(label))
+            env.assertLess(elapsed, test_time + grace + 3, message="{}: did not end after the drain grace".format(label))
+            held = sum(int(n) for _, n, _ in retrying)
+            unanswered = sum(int(n) for _, n, _ in no_reply)
+            env.assertGreater(held + unanswered, 0, message=label)
+            env.assertEqual(runtime.get("Unanswered requests", 0), unanswered, message=label)
+            # Each of them is counted as an error and logged, and nothing else.
+            with open(failed_keys) as f:
+                statuses = [row["status"] for row in csv.DictReader(f)]
+            env.assertEqual(statuses.count("run-ended-before-resend"), held, message=label)
+            env.assertEqual(statuses.count("no-reply-after-test-time"), unanswered, message=label)
+            env.assertEqual(len(statuses), held + unanswered, message=label)
+            totals = re.findall(r"errors (\d+) \(\+\d+\)", stderr)
+            env.assertTrue(totals, message=label)
+            if totals:
+                env.assertEqual(int(totals[-1]), held + unanswered, message=label)
+    finally:
+        for k in ("maxmemory", "maxmemory-policy"):
+            if k in saved:
+                conn.execute_command("CONFIG", "SET", k, saved[k])
+
+
 class _MixedErrorPeer(socketserver.ThreadingTCPServer):
     """A standalone peer that answers attempt n (1-based) of SET key with
     -TRYAGAIN when fails(key, n) is true and +OK otherwise, and records when
