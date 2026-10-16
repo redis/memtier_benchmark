@@ -650,26 +650,78 @@ def test_F13_latency_unit_sanity(env):
     try:
         url = wait_for_prometheus_url(out_path, timeout=20)
         env.assertFalse(url is None, message="no announce line")
-        time.sleep(3.0)
-        parsed = prom_parse(prom_scrape(url).body)
-        s = prom_sample_value(parsed, "memtier_latency_seconds_sum")
-        c = prom_sample_value(parsed, "memtier_latency_seconds_count")
-        env.assertTrue(c and c > 0, message="empty histogram")
+        if url is None:
+            return
+        # Keep the last non-empty scrape before the exporter goes away, so the
+        # scraped window covers as much of the run as possible.
+        s = c = None
+        deadline = time.time() + 60
+        while proc.poll() is None and time.time() < deadline:
+            r = prom_scrape(url)
+            if r.status == 200:
+                parsed = prom_parse(r.body)
+                cc = prom_sample_value(parsed, "memtier_latency_seconds_count")
+                if cc and cc > 0:
+                    s, c = prom_sample_value(parsed, "memtier_latency_seconds_sum"), cc
+            time.sleep(0.2)
+        try:
+            rc = proc.wait(timeout=max(1.0, deadline - time.time()))
+            env.assertEqual(rc, 0, message="exit code {}".format(rc))
+        except subprocess.TimeoutExpired:
+            _kill(proc)
+            env.assertTrue(False, message="did not exit within 60s")
+            return
+        env.assertTrue(c is not None and c > 0, message="empty histogram")
+        env.assertTrue(s is not None, message="no memtier_latency_seconds_sum sample")
+        if c is None or c <= 0 or s is None:
+            return
         mean = s / c
-        env.assertTrue(1e-6 < mean < 0.05, message="mean latency out of range: {} s".format(mean))
-        proc.wait()
+        # Coarse unit guard only (a sum exported in ms or us instead of s is
+        # >= 1000x off); the same-window JSON cross-check below is the precise
+        # one. The mean on a loaded TLS/ASAN runner can exceed 50 ms, so the
+        # upper bound is 1 s.
+        env.assertTrue(1e-6 < mean < 1.0, message="mean latency out of range: {} s".format(mean))
         with open(json_path) as fh:
             js = json.load(fh)
-        # cross-check vs JSON avg latency (ms) within 50%
-        try:
-            avg_ms = js["ALL STATS"]["Totals"]["Latency"]
-            if avg_ms:
-                ratio = (mean * 1000.0) / avg_ms
-                env.assertTrue(0.5 <= ratio <= 2.0,
-                               message="latency cross-check off: prom {} ms vs json {} ms".format(
-                                   mean * 1000.0, avg_ms))
-        except (KeyError, TypeError):
-            pass
+        # Cross-check vs the JSON latency over the SAME requests. The scrape
+        # holds only the seconds each connection has completed, not the whole
+        # run. The first seconds (connection setup, TLS handshakes) are the
+        # slowest, so on slow TLS/ASAN runners an early scrape was about 2x
+        # the whole-run "Totals" average and this check flaked (#740).
+        # Instead, walk the JSON per-second series to the second k+1 where the
+        # cumulative op count reaches the scraped _count c, and interpolate:
+        #   expected = (latency of seconds 0..k + f * latency of second k+1) / c
+        # with f the fraction of second k+1's ops needed to reach c (f == 1
+        # when c matches a prefix exactly, the usual case on a fast runner).
+        # Connections roll their seconds independently, so on a slow one the
+        # scrape often falls between two prefixes. "Accumulated Latency" is
+        # the per-second latency sum (whole ms). Over the same requests the ratio
+        # is 1.000-1.06, so a 0.8-1.25x band catches an exporter-side unit or
+        # scaling bug down to 2x (and 0.5x). A scaling error at the shared
+        # latency source, which feeds both the JSON and the exporter, cancels
+        # out here and is out of F13's scope.
+        series = js["ALL STATS"]["Totals"]["Time-Serie"]
+        cum_count = 0
+        cum_lat_ms = 0.0
+        expected_ms = None
+        for _, sec in sorted(series.items(), key=lambda kv: int(kv[0])):
+            n = sec["Count"]
+            if n <= 0:
+                continue
+            acc = sec["Accumulated Latency"]
+            if cum_count + n >= c:
+                expected_ms = (cum_lat_ms + acc * float(c - cum_count) / n) / c
+                break
+            cum_count += n
+            cum_lat_ms += acc
+        env.assertTrue(expected_ms is not None and expected_ms > 0,
+                       message="JSON Time-Serie has fewer ops ({}) than the scrape ({})".format(cum_count, c))
+        if expected_ms is not None and expected_ms > 0:
+            prom_ms = mean * 1000.0
+            ratio = prom_ms / expected_ms
+            env.assertTrue(0.8 <= ratio <= 1.25,
+                           message="latency cross-check off: prom {} ms vs json {} ms over the same {} ops "
+                                   "(ratio {})".format(prom_ms, expected_ms, c, ratio))
     finally:
         _kill(proc)
 
