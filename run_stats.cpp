@@ -172,11 +172,15 @@ void run_stats::set_end_time(struct timeval *end_time)
         end_time = &tv;
     }
     m_end_time = *end_time;
-    summarize_current_second();
+    // After interrupt() (Ctrl+C, connection-stage abort) this runs on the main
+    // thread while the worker may still record ops lock-free; folding and
+    // resetting the live totals here would drop the samples recorded between
+    // the add and the reset. Leave them for the exporter's post-join drain.
+    summarize_current_second(m_interrupted && m_config->prometheus != NULL);
     m_stats.push_back(m_cur_stats);
 }
 
-void run_stats::summarize_current_second()
+void run_stats::summarize_current_second(bool keep_live_totals)
 {
     m_cur_stats.m_get_cmd.summarize_quantiles(inst_m_get_latency_histogram, quantiles_list, m_quantile_values);
     m_cur_stats.m_set_cmd.summarize_quantiles(inst_m_set_latency_histogram, quantiles_list, m_quantile_values);
@@ -190,6 +194,7 @@ void run_stats::summarize_current_second()
     hdr_reset(inst_m_get_latency_histogram);
     hdr_reset(inst_m_set_latency_histogram);
     hdr_reset(inst_m_wait_latency_histogram);
+    if (keep_live_totals) return;
     pthread_mutex_lock(&m_inst_histogram_mutex.mtx);
     if (m_config->prometheus != NULL) hdr_add(m_prom_pending_latency_histogram, inst_m_totals_latency_histogram);
     hdr_reset(inst_m_totals_latency_histogram);
@@ -203,11 +208,19 @@ void run_stats::copy_inst_histogram(hdr_histogram *target) const
     pthread_mutex_unlock(&m_inst_histogram_mutex.mtx);
 }
 
-void run_stats::drain_prom_latency_histogram(hdr_histogram *target)
+void run_stats::drain_prom_latency_histogram(hdr_histogram *target, bool run_end)
 {
     pthread_mutex_lock(&m_inst_histogram_mutex.mtx);
     hdr_add(target, m_prom_pending_latency_histogram);
     hdr_reset(m_prom_pending_latency_histogram);
+    if (run_end) {
+        // Post-join only. After interrupt() (Ctrl+C, connection-stage abort)
+        // set_end_time() leaves the live totals in place, and a worker may
+        // still have finished a read callback after it; those ops are only
+        // here. Empty on the --test-time / --requests paths.
+        hdr_add(target, inst_m_totals_latency_histogram);
+        hdr_reset(inst_m_totals_latency_histogram);
+    }
     pthread_mutex_unlock(&m_inst_histogram_mutex.mtx);
 }
 

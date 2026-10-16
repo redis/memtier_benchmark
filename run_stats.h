@@ -335,7 +335,7 @@ public:
 
     void aggregate_average(const std::vector<run_stats> &all_stats);
     void summarize(totals &result) const;
-    void summarize_current_second();
+    void summarize_current_second(bool keep_live_totals = false);
     void merge(const run_stats &other, int iteration);
     std::vector<one_sec_cmd_stats> get_one_sec_cmd_stats_get();
     std::vector<one_sec_cmd_stats> get_one_sec_cmd_stats_set();
@@ -353,8 +353,11 @@ public:
     // Move the latency samples of every second completed since the previous
     // call into target (Prometheus exporter, main thread). Lags the live
     // second by up to one second; the final partial second is folded by
-    // set_end_time(), so after the run ends every op has been drained.
-    void drain_prom_latency_histogram(hdr_histogram *target);
+    // set_end_time(). With run_end (post-join only) it also moves what is
+    // left in the live histogram: ops a worker completed after an
+    // interrupt()-driven set_end_time(). After the run-end drain every op has
+    // been drained.
+    void drain_prom_latency_histogram(hdr_histogram *target, bool run_end);
     void save_csv_one_sec_cluster(FILE *f);
     void save_csv_set_get_commands(FILE *f, bool cluster_mode);
     void save_csv_arbitrary_commands_one_sec(FILE *f, arbitrary_command_list &command_list,

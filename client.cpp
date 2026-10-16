@@ -1595,11 +1595,11 @@ void client_group::aggregate_inst_histogram(hdr_histogram *target)
     }
 }
 
-void client_group::drain_prom_latency_histogram(hdr_histogram *target)
+void client_group::drain_prom_latency_histogram(hdr_histogram *target, bool run_end)
 {
     for (unsigned int i = 0; i < m_clients.size(); i++) {
         if (!m_clients[i]->get_stats()->has_started()) continue;
-        m_clients[i]->get_stats()->drain_prom_latency_histogram(target);
+        m_clients[i]->get_stats()->drain_prom_latency_histogram(target, run_end);
     }
 }
 

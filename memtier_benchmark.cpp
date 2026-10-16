@@ -3419,13 +3419,13 @@ static void prom_fold_thread(benchmark_config *cfg, size_t t, client_group *cg)
 // previous drain into the exporter's scratch tick histogram. Finished threads
 // are drained too (their last partial second is folded by set_end_time): the
 // drain is mutex-protected and every m_cg lives until after the run-end
-// publish.
-static hdr_histogram *prom_drain_latency(benchmark_config *cfg, std::vector<cg_thread *> &threads)
+// publish. run_end (post-join only) also drains the live histograms.
+static hdr_histogram *prom_drain_latency(benchmark_config *cfg, std::vector<cg_thread *> &threads, bool run_end)
 {
     hdr_histogram *tick = cfg->prometheus->tick_histogram();
     hdr_reset(tick);
     for (size_t t = 0; t < threads.size(); t++) {
-        threads[t]->m_cg->drain_prom_latency_histogram(tick);
+        threads[t]->m_cg->drain_prom_latency_histogram(tick, run_end);
     }
     return tick;
 }
@@ -3442,12 +3442,13 @@ static void prom_publish_run_start(benchmark_config *cfg, uint32_t run_id)
     cfg->prometheus->publish_run_start(run_id, cfg->run_count);
 }
 
-// Post-join: drain every thread once more. The loop's last tick normally has
-// drained everything already; this covers exits that skip it (Ctrl+C, the
-// connection-stage abort), so the run-end snapshot always counts every op.
+// Post-join: drain every thread once more, including its live histogram. The
+// loop's last tick normally has drained everything already; this covers exits
+// that skip it or stop a worker mid-callback (Ctrl+C, the connection-stage
+// abort), so the run-end snapshot always counts every op.
 static void prom_publish_run_end(benchmark_config *cfg, uint32_t run_id, std::vector<cg_thread *> &threads)
 {
-    cfg->prometheus->publish_run_end(run_id, cfg->run_count, prom_drain_latency(cfg, threads));
+    cfg->prometheus->publish_run_end(run_id, cfg->run_count, prom_drain_latency(cfg, threads, true));
 }
 
 #else // !HAVE_EVHTTP — empty stubs keep the run loop ifdef-free.
@@ -3458,7 +3459,7 @@ static inline bool prom_enabled(benchmark_config *)
 }
 static inline void prom_observe_and_fill(benchmark_config *, std::vector<cg_thread *> &, metrics_snapshot &) {}
 static inline void prom_fold_thread(benchmark_config *, size_t, client_group *) {}
-static inline hdr_histogram *prom_drain_latency(benchmark_config *, std::vector<cg_thread *> &)
+static inline hdr_histogram *prom_drain_latency(benchmark_config *, std::vector<cg_thread *> &, bool)
 {
     return NULL;
 }
@@ -3949,7 +3950,7 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             // were counted, so memtier_latency_seconds_count never exceeds
             // memtier_ops_total, even when a thread finishes or a connection
             // rolls its second between the two reads.
-            hdr_histogram *prom_latency = prom_enabled(cfg) ? prom_drain_latency(cfg, threads) : NULL;
+            hdr_histogram *prom_latency = prom_enabled(cfg) ? prom_drain_latency(cfg, threads, false) : NULL;
             if (prom_enabled(cfg)) prom_observe_and_fill(cfg, threads, snap);
             if (statsd_on) statsd_publish_tick(cfg->statsd, snap, inst_samples, live_quantiles, inst_values);
             if (prom_enabled(cfg)) prom_publish_tick(cfg, snap, prom_latency); // PLAN 3.7
