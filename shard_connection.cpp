@@ -1365,17 +1365,11 @@ void shard_connection::process_response(void)
                     if (was_replica) wake_peers();
                 } else {
                     benchmark_debug_log("cluster slot reply rejected; leaving m_cluster_slots unchanged\n");
-                    // Surface the rejection to the connection-stage supervisor
-                    // so the failure-streak detector arms regardless of whether
-                    // the peer half-closes after the malformed reply. The fuzz
-                    // fixture relied on BEV_EVENT_EOF to trigger reconnect, but
-                    // a real server that keeps the socket open after every
-                    // shard's mbulk fails validation would otherwise stall the
-                    // worker in fill_pipeline's setup branch until
-                    // --connection-stage-timeout fired via run-elapsed (default
-                    // 30s), or hang indefinitely with
-                    // --connection-stage-timeout=0. Mirrors how AUTH / SELECT /
-                    // HELLO / READONLY rejections are already surfaced above.
+                    // Surface the rejection to the connection-stage supervisor,
+                    // as AUTH / SELECT / HELLO / READONLY rejections are above,
+                    // so --connection-stage-timeout bounds a node that keeps
+                    // rejecting the map at startup. Then handle it like an
+                    // empty reply: ask again, reconnect, or end the thread.
                     report_connection_stage_failure("CLUSTER SLOTS reply rejected (every shard malformed)");
                     retry_cluster_slots_after_error();
                     error = true;
@@ -1924,8 +1918,8 @@ void shard_connection::attempt_reconnect(const char *error_context)
         // routing path which already gates on is_ready_for_reads() and
         // handles dead-conn cases via the bootstrap-warming hold.
         if (m_config->read_preference != rp_primary && peer_client_has_any_setup_in_progress()) {
-            benchmark_error_log("%s on conn %u; peers still mid-setup, leaving connection dead and continuing.\n",
-                                reason, m_id);
+            benchmark_error_log("%s; leaving conn %u dead and continuing while peers are still mid-setup.\n", reason,
+                                m_id);
             disconnect();
             return;
         }
@@ -1940,6 +1934,20 @@ void shard_connection::attempt_reconnect(const char *error_context)
         // run. It is not restarted.
         event_base_loopbreak(m_event_base);
     }
+}
+
+// Whether this client's run is over, for a connection whose setup keeps
+// failing. finished() is only meaningful once the client has started (a
+// response was answered). A client that never started, while others did,
+// stops at the run's --test-time deadline: --connection-stage-timeout no
+// longer bounds it, and its own clock never started.
+bool shard_connection::run_is_over()
+{
+    if (m_conns_manager->get_reqs_answered()) return m_conns_manager->finished();
+    if (m_config->test_time == 0 || !connection_stage_steady_state_reached()) return false;
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    return now.tv_sec - m_config->benchmark_start_time.tv_sec >= (time_t) m_config->test_time;
 }
 
 // A setup step (AUTH/SELECT/HELLO) was rejected. With --reconnect-on-error,
@@ -1964,15 +1972,20 @@ void shard_connection::reconnect_after_setup_error(const char *error_context)
 //   the retries and they stop once the run is over.
 // - Otherwise, once the run has started, handle it like a dropped
 //   connection: end this thread, so the run fails.
-// - Otherwise (at startup), ask again after a second, while
-//   --connection-stage-timeout lets the node converge.
+// - Otherwise (at startup, before any connection reached steady state), ask
+//   again after a second, while --connection-stage-timeout lets the node
+//   converge.
 void shard_connection::retry_cluster_slots_after_error()
 {
     if (m_config->reconnect_on_error) {
         reconnect_after_setup_error("CLUSTER SLOTS error");
         return;
     }
-    if (m_conns_manager->get_reqs_answered()) {
+    // The run has started once this client had a reply, or once any
+    // connection reached steady state: that disarms
+    // --connection-stage-timeout, so retries at startup would no longer be
+    // bounded.
+    if (m_conns_manager->get_reqs_answered() || connection_stage_steady_state_reached()) {
         attempt_reconnect("CLUSTER SLOTS error");
         return;
     }
@@ -1980,6 +1993,8 @@ void shard_connection::retry_cluster_slots_after_error()
     if (m_cluster_slots_retry_timer == NULL) {
         m_cluster_slots_retry_timer = event_new(m_event_base, -1, 0, cluster_slots_retry_cb, this);
         if (m_cluster_slots_retry_timer == NULL) {
+            benchmark_error_log("error: event_new failed in retry_cluster_slots_after_error\n");
+            event_base_loopbreak(m_event_base);
             return;
         }
     }
@@ -2018,11 +2033,10 @@ void shard_connection::handle_reconnect_timer_event()
     // failing and the thread would never end. The client is left unended, so
     // the run fails as incomplete. This applies even with requests held for
     // replay: they are only resent after a setup that keeps failing.
-    // disconnect_all() counts them as errors. finished() is only meaningful
-    // once the run has started (a response was answered).
+    // disconnect_all() counts them as errors.
     const bool setup_rejected = m_setup_rejected;
     m_setup_rejected = false;
-    if (setup_rejected && m_conns_manager->get_reqs_answered() && m_conns_manager->finished()) {
+    if (setup_rejected && run_is_over()) {
         benchmark_error_log("Connection setup failed and the run is over, not reconnecting.\n");
         if (m_conns_manager->all_connections_idle()) {
             m_conns_manager->disconnect_all();

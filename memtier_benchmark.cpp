@@ -294,6 +294,11 @@ void report_connection_stage_success(void)
     }
 }
 
+bool connection_stage_steady_state_reached(void)
+{
+    return g_conn_stage_steady_state.load(std::memory_order_acquire);
+}
+
 bool connection_stage_should_abort(unsigned int timeout_secs, std::string *out_last_err, unsigned int *out_elapsed)
 {
     if (timeout_secs == 0) return false; // operator opt-out

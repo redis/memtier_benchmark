@@ -311,6 +311,9 @@ bool is_redis_protocol(enum PROTOCOL_TYPE type);
 void connection_stage_supervisor_reset(void);
 void report_connection_stage_failure(const char *err);
 void report_connection_stage_success(void);
+// Whether any connection has reached steady state in this run, i.e. the
+// supervisor is disarmed.
+bool connection_stage_steady_state_reached(void);
 bool connection_stage_should_abort(unsigned int timeout_secs, std::string *out_last_err, unsigned int *out_elapsed);
 
 #endif /* _MEMTIER_BENCHMARK_H */

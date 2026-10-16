@@ -166,6 +166,7 @@ public:
     // end this thread.
     void attempt_reconnect(const char *error_context);
     void reconnect_after_setup_error(const char *error_context);
+    bool run_is_over();
     void retry_cluster_slots_after_error();
     void handle_cluster_slots_retry_event();
 
