@@ -1328,7 +1328,9 @@ def _run_count_interrupted(env, test_time, sigint_when, run_count=3):
     return process.returncode, read_stderr(), elapsed, results_dict
 
 
-def _assert_series_cut_after_run_1(env, rc, stderr_content, results_dict):
+def _assert_series_cut_after_run_1(env, rc, stderr_content, results_dict, run_1_interrupted):
+    """run_1_interrupted: run 1's own flag ("true" if it saw the signal). BEST
+    and WORST are run 1 and carry its flag; the cut series marks AGG "true"."""
     env.assertEqual(rc, 0, message=stderr_content)
     # No later run was launched ("[RUN #2]" and the "[RUN #2 ...%" progress).
     env.assertFalse("[RUN #2" in stderr_content, message=stderr_content)
@@ -1337,10 +1339,11 @@ def _assert_series_cut_after_run_1(env, rc, stderr_content, results_dict):
     env.assertEqual(results_dict.get("run information", {}).get("Runs completed"), 1,
                     message=results_dict.get("run information"))
     agg = "AGGREGATED AVERAGE RESULTS (3 runs)"
-    for section in ("RUN #1 RESULTS", "BEST RUN RESULTS", "WORST RUN RESULTS", agg):
+    for section, interrupted in (("RUN #1 RESULTS", run_1_interrupted), ("BEST RUN RESULTS", run_1_interrupted),
+                                 ("WORST RUN RESULTS", run_1_interrupted), (agg, "true")):
         env.assertTrue(section in results_dict, message=list(results_dict))
         if section in results_dict:
-            env.assertEqual(results_dict[section]["Runtime"]["Interrupted"], "true", message=section)
+            env.assertEqual(results_dict[section]["Runtime"]["Interrupted"], interrupted, message=section)
     if agg in results_dict and "BEST RUN RESULTS" in results_dict:
         # One run: the average is that run.
         best_ops = results_dict["BEST RUN RESULTS"]["Totals"]["Ops/sec"]
@@ -1359,7 +1362,7 @@ def test_interrupt_stops_run_count(env):
     started = time.time()
     rc, stderr_content, elapsed, results_dict = _run_count_interrupted(
         env, 30, lambda _err: time.time() - started >= 1.5)
-    _assert_series_cut_after_run_1(env, rc, stderr_content, results_dict)
+    _assert_series_cut_after_run_1(env, rc, stderr_content, results_dict, "true")
     env.assertEqual(stderr_content.count("Interrupted by user (Ctrl+C) after"), 1, message=stderr_content)
     # Sanity bound: each skipped run used to add a 1 s pause plus 1 s of load
     # (>= 4 s here); with the fix the exit takes about 1 s at most.
@@ -1369,8 +1372,9 @@ def test_interrupt_stops_run_count(env):
 def test_interrupt_between_runs_stops_run_count(env):
     """Ctrl+C in the settle pause after run 1 starts no further run (#690).
 
-    Run 1 (--test-time=1) completes on its own, so no run sees the signal; the
-    series is still cut short and the summary sections say Interrupted.
+    Run 1 (--test-time=1) completes on its own, so no run sees the signal:
+    RUN #1 (and BEST/WORST, which are run 1) stay Interrupted "false", but the
+    series is cut short, so the AGGREGATED section says Interrupted "true".
     """
     seen = []
 
@@ -1383,7 +1387,7 @@ def test_interrupt_between_runs_stops_run_count(env):
         return bool(seen) and time.time() - seen[0] >= 0.4
 
     rc, stderr_content, _elapsed, results_dict = _run_count_interrupted(env, 1, run_1_done)
-    _assert_series_cut_after_run_1(env, rc, stderr_content, results_dict)
+    _assert_series_cut_after_run_1(env, rc, stderr_content, results_dict, "false")
 
 
 def test_interrupt_last_run_marks_aggregate(env):

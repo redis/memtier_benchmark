@@ -1475,7 +1475,7 @@ def test_F27_interrupt_run_end_counts_every_op(env):
             except BlockingIOError:
                 time.sleep(0.01)
         env.assertEqual(proc.wait(timeout=10), 0, message=_drain(err_path))
-        if run_end is not None:
+        if run_end is not None:  # env.assertTrue above records a failure but does not raise
             ops, count = run_end
             env.assertTrue(ops > 0, message="run 1 completed no ops")
             env.assertEqual(count, ops, message="run-end _count {} != ops_total {}".format(count, ops))

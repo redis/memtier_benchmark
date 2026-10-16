@@ -5223,11 +5223,6 @@ int main(int argc, char *argv[])
         if (series_cut) {
             fprintf(stderr, "Interrupted by user (Ctrl+C), skipping the remaining runs (%zu of %u done).\n",
                     all_stats.size(), cfg.run_count);
-            // A series cut short by Ctrl+C is interrupted as a whole, even when
-            // the signal landed between runs and no single run saw it. Mark
-            // every run, so RUN #k, BEST, WORST and the average all agree.
-            for (auto &s : all_stats)
-                s.set_interrupted(true);
         }
         //
         // Print some run information.
@@ -5354,6 +5349,10 @@ int main(int argc, char *argv[])
             // average results:
             run_stats average(&cfg);
             average.aggregate_average(all_stats);
+            // Each run (and BEST/WORST, which are runs) keeps its own flag. The
+            // average is interrupted if any run was, or if Ctrl+C cut the
+            // series short, even between runs where no single run saw it.
+            if (series_cut) average.set_interrupted(true);
             char average_header[50];
             snprintf(average_header, sizeof(average_header), "AGGREGATED AVERAGE RESULTS (%u runs)", cfg.run_count);
             average.print(outfile, &cfg, average_header, jsonhandler);
