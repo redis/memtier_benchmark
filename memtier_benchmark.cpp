@@ -699,8 +699,8 @@ static std::string redact_credentials(const char *credentials)
 }
 
 // --uri with its userinfo password redacted: redis://user:pw@host:port/db ->
-// redis://user:***@host:port/db. The userinfo runs up to the last '@' so no
-// part of a password that itself contains '@' survives.
+// redis://user:***@host:port/db. The userinfo runs up to the last '@', where
+// parse_uri() splits it too, so a password that contains '@' is fully hidden.
 static std::string redact_uri(const char *uri)
 {
     if (!uri) return "";
@@ -1062,8 +1062,12 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
 
     ptr = scheme_end + 3; // Skip "://"
 
-    // Parse user:password@host:port/db
-    char *auth_end = strchr(ptr, '@');
+    // Parse user:password@host:port/db. The userinfo ends at the LAST '@'
+    // ('@' cannot appear in host, port or db, RFC 3986), so a password that
+    // contains a raw '@' works and no part of it is taken for the host and
+    // echoed by --show-config or a host/port error (#731). redact_uri()
+    // splits at the same place.
+    char *auth_end = strrchr(ptr, '@');
     char *host_start = ptr;
 
     if (auth_end) {

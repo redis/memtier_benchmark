@@ -105,7 +105,7 @@ jobs:
             tls: true
           - name: "Single Endpoint: TCP TLS (misc)"
             env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", VERBOSE: "1",
-                   TEST: "test_arbitrary_command_misses.py test_crash_handler_integration.py test_json_output_integrity.py test_large_key_prefix.py test_miss_rate_tracking.py test_realtime_latencies.py test_resp_response_fuzzer.py test_retry_on_error.py test_cluster_redirect_stats.py test_sigpipe_immunity.py test_sigpipe_tls_rst.py test_statsd.py test_tls_logging.py test_prometheus.py test_prometheus_redaction.py test_closed_std_fds.py" }
+                   TEST: "test_arbitrary_command_misses.py test_crash_handler_integration.py test_json_output_integrity.py test_large_key_prefix.py test_miss_rate_tracking.py test_realtime_latencies.py test_resp_response_fuzzer.py test_retry_on_error.py test_cluster_redirect_stats.py test_sigpipe_immunity.py test_sigpipe_tls_rst.py test_statsd.py test_tls_logging.py test_prometheus.py test_prometheus_redaction.py test_config_password_redaction.py test_closed_std_fds.py" }
             tls: true
           # TODO: v1.2 coverage deferred to nightly when schedule added
           # "OSS TCP TLS v1.3" was split into per-test-file cells (round-37).
@@ -127,7 +127,7 @@ jobs:
             tls: true
           - name: "OSS TCP TLS v1.3 (misc)"
             env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", TLS_PROTOCOLS: "TLSv1.3", VERBOSE: "1",
-                   TEST: "test_arbitrary_command_misses.py test_crash_handler_integration.py test_json_output_integrity.py test_large_key_prefix.py test_miss_rate_tracking.py test_realtime_latencies.py test_resp_response_fuzzer.py test_retry_on_error.py test_cluster_redirect_stats.py test_sigpipe_immunity.py test_sigpipe_tls_rst.py test_statsd.py test_tls_logging.py test_prometheus.py test_prometheus_redaction.py test_closed_std_fds.py" }
+                   TEST: "test_arbitrary_command_misses.py test_crash_handler_integration.py test_json_output_integrity.py test_large_key_prefix.py test_miss_rate_tracking.py test_realtime_latencies.py test_resp_response_fuzzer.py test_retry_on_error.py test_cluster_redirect_stats.py test_sigpipe_immunity.py test_sigpipe_tls_rst.py test_statsd.py test_tls_logging.py test_prometheus.py test_prometheus_redaction.py test_config_password_redaction.py test_closed_std_fds.py" }
             tls: true
           - name: "OSS-CLUSTER API: TCP Plaintext"
             env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", VERBOSE: "1", PARALLELISM: "2" }
