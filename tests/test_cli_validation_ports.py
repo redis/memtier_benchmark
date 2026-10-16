@@ -122,6 +122,7 @@ def test_uri_rejects_malformed_ipv6_host(env):
         "redis://[]:6379": "error: invalid IPv6 host",
         "redis://[::1]:": "error: invalid port number",
         "redis://[::1]:65537": "error: invalid port number '65537'",
+        "redis://u:s3cret@[::1": "error: invalid IPv6 host",
     }
     for uri, diagnostic in cases.items():
         result = subprocess.run(
@@ -133,3 +134,22 @@ def test_uri_rejects_malformed_ipv6_host(env):
         label = "--uri {!r}".format(uri)
         env.assertNotEqual(result.returncode, 0, message=label + ": " + result.stderr)
         env.assertTrue(diagnostic in result.stderr, message=label + ": " + result.stderr)
+        # The diagnostic must not echo URI credentials.
+        env.assertFalse("s3cret" in result.stderr, message=label + ": " + result.stderr)
+
+
+def test_uri_accepts_ipv6_host_without_port(env):
+    # Bracketed hosts without a port, with or without /DB, parse and reach the
+    # connect stage (issue #701). --version exits before the URI is parsed, so
+    # point at a port nobody listens on and check only for parse diagnostics.
+    for uri in ("redis://[::1]/0", "redis://[::1]", "redis://[::1]/"):
+        result = subprocess.run(
+            [MEMTIER_BINARY, "--uri=" + uri, "--port=14599", "-n", "1", "-c", "1", "-t", "1",
+             "--connection-stage-timeout=2"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        label = "--uri {!r}".format(uri)
+        for diagnostic in ("invalid IPv6 host", "invalid port number", "invalid database number"):
+            env.assertFalse(diagnostic in result.stderr, message=label + ": " + result.stderr)
