@@ -21,7 +21,7 @@ class _Node(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
     def __init__(self, bad_slots_replies, moved_after=0, bad_reply=b"*0\r\n", replica=None, readonly_delay=0,
-                 first_good=False, bad_delay=0, auth_error=None):
+                 first_good=False, bad_delay=0, auth_error=None, auth_error_with_next=False):
         super().__init__(("127.0.0.1", 0), _Handler)
         self.lock = threading.Lock()
         # CLUSTER SLOTS requests answered with bad_reply: the ones after the
@@ -34,8 +34,10 @@ class _Node(socketserver.ThreadingTCPServer):
         self.first_good = first_good
         # How long to wait before sending bad_reply.
         self.bad_delay = bad_delay
-        # Reply to AUTH, if not +OK.
+        # Reply to AUTH, if not +OK, and whether to send it together with
+        # the next reply, as a server answering a pipelined setup does.
         self.auth_error = auth_error
+        self.auth_error_with_next = auth_error_with_next
         # A node listed as this node's replica in a good reply, and how long
         # a node waits before answering READONLY.
         self.replica = replica
@@ -64,6 +66,7 @@ class _Node(socketserver.ThreadingTCPServer):
 class _Handler(socketserver.StreamRequestHandler):
     def handle(self):
         node = self.server
+        held = b""
         try:
             while True:
                 line = self.rfile.readline()
@@ -77,6 +80,9 @@ class _Handler(socketserver.StreamRequestHandler):
                 if verb == b"CLUSTER":
                     reply = node.slots_reply()
                 elif verb == b"AUTH" and node.auth_error:
+                    if node.auth_error_with_next:
+                        held = node.auth_error
+                        continue
                     reply = node.auth_error
                 elif verb == b"READONLY":
                     time.sleep(node.readonly_delay)
@@ -91,8 +97,9 @@ class _Handler(socketserver.StreamRequestHandler):
                         reply = b"+OK\r\n" if verb == b"SET" else b"$-1\r\n"
                 else:
                     reply = b"+OK\r\n"
-                self.wfile.write(reply)
+                self.wfile.write(held + reply)
                 self.wfile.flush()
+                held = b""
         except (ConnectionResetError, BrokenPipeError):
             pass
         except Exception as error:
@@ -341,3 +348,41 @@ def test_cluster_slots_empty_reply_at_startup_still_aborts(env):
     env.assertEqual(returncode, 2, message=stderr[-2000:])
     env.assertContains("See --connection-stage-timeout.", stderr)
     env.assertGreater(node.slots_requests, 1)
+
+
+# A replica that rejects AUTH, as one does when only the primaries have
+# requirepass (#737). Under --read-preference primary the replica connection
+# carries no requests: it is closed and the run ends on the primary. memtier
+# used to leave it open with its setup unfinished, so the client never ended:
+# a --requests run hung, and a --test-time run waited out the 10 s grace.
+_NO_PASSWORD = b"-ERR AUTH <password> called without any password configured for the default user\r\n"
+
+
+def _primary_with_replica_rejecting_auth():
+    replica = _Node(bad_slots_replies=0, auth_error=_NO_PASSWORD, auth_error_with_next=True)
+    return _Node(bad_slots_replies=0, replica=replica)
+
+
+def test_replica_rejecting_auth_does_not_hold_requests_run(env):
+    node = _primary_with_replica_rejecting_auth()
+    returncode, stderr, elapsed = _run(node, ["-a", "dummy-pw-737", "--requests=200",
+                                              "--connection-stage-timeout=5"], clients=2)
+    env.assertEqual(node.errors + node.replica.errors, [])
+    env.assertEqual(returncode, 0, message=stderr[-2000:])
+    env.assertContains("authentication failed", stderr)
+    env.assertContains("AUTH error on replica connection", stderr)
+    env.assertEqual(node.data_requests, 400)
+    env.assertEqual(node.replica.data_requests, 0)
+    env.assertLess(elapsed, 5)
+
+
+def test_replica_rejecting_auth_does_not_hold_test_time_run(env):
+    node = _primary_with_replica_rejecting_auth()
+    returncode, stderr, elapsed = _run(node, ["-a", "dummy-pw-737", "--test-time=2",
+                                              "--connection-stage-timeout=5"], clients=2)
+    env.assertEqual(node.errors + node.replica.errors, [])
+    env.assertEqual(returncode, 0, message=stderr[-2000:])
+    env.assertFalse("got no reply" in stderr, message=stderr[-2000:])
+    env.assertEqual(node.replica.data_requests, 0)
+    env.assertLess(elapsed, 5)
+

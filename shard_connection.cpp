@@ -2026,11 +2026,25 @@ bool shard_connection::run_is_over()
 // again, and --connection-stage-timeout is disarmed once the run has reached
 // steady state. Without --reconnect-on-error, a failure at startup is ended by
 // --connection-stage-timeout.
+//
+// A replica connection under --read-preference primary is the exception: it
+// never carries a request, so the primaries reach steady state and disarm
+// --connection-stage-timeout, and the replica's unfinished setup then keeps
+// the client from ending (#737). Close it instead, as for a READONLY error;
+// the run goes on without it.
 void shard_connection::reconnect_after_setup_error(const char *error_context)
 {
     if (m_config->reconnect_on_error) {
         attempt_reconnect(error_context);
         m_setup_rejected = m_reconnecting;
+    } else if (m_role == role_replica && m_config->read_preference == rp_primary) {
+        benchmark_error_log("warning: %s on replica connection %s, which carries no requests under "
+                            "--read-preference primary; closing it.\n",
+                            error_context, get_readable_id());
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        static_cast<client *>(m_conns_manager)->get_stats()->update_connection_error(&now);
+        disconnect();
     }
 }
 
