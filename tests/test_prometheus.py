@@ -1406,13 +1406,14 @@ def test_F26_run_end_drains_latency(env):
 # F27 -- the run-end snapshot counts every op after Ctrl+C (#637, PR #665).
 # On Ctrl+C, client_group::interrupt() only stops the workers' loops, and the
 # end times are stamped after pthread_join() (#710); the run-end snapshot must
-# still count the ops of the read callbacks the workers finished after it. Ctrl+C ends the whole --run-count series (#690), so
-# the run-end snapshot (run 1, 0 threads) is the last one before exit. To keep
-# the exporter up after it, results go to a FIFO shrunk to one page that the
-# test does not read: memtier blocks writing them until the test drains it.
-# Renders are cached for 1 s, so the test stops scraping for over 1 s before
-# the SIGINT; its next scrape then renders the run-end snapshot. There,
-# _count must equal memtier_ops_total.
+# still count the ops of the read callbacks the workers finished after it.
+# Ctrl+C ends the whole --run-count series (#690), so the run-end snapshot
+# (run 1, 0 threads) is the last one before exit. To keep the exporter up
+# after it, results go to a FIFO shrunk to one page that the test does not
+# read: memtier blocks writing them until the test drains it. Renders are
+# cached for 1 s, so the test stops scraping for over 1 s before the SIGINT;
+# its next scrape then renders the run-end snapshot. There, _count must equal
+# memtier_ops_total.
 # ---------------------------------------------------------------------------
 def test_F27_interrupt_run_end_counts_every_op(env):
     import fcntl

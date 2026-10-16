@@ -341,7 +341,9 @@ protected:
     struct timeval m_interrupt_time;
     // Only the worker thread that runs the loop may stamp the clients'
     // run_stats until it has been joined (#710); check_stats_owner() checks it.
-    bool m_worker_tid_set;
+    // m_worker_tid is written once by the worker before it publishes
+    // m_worker_tid_set (release); readers load the flag (acquire) first.
+    std::atomic<bool> m_worker_tid_set;
     pthread_t m_worker_tid;
     std::atomic<bool> m_joined;
     void check_stats_owner(const char *what);

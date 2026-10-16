@@ -1402,7 +1402,7 @@ unsigned int client_group::active_client_count(void)
 void client_group::run(void)
 {
     m_worker_tid = pthread_self();
-    m_worker_tid_set = true;
+    m_worker_tid_set.store(true, std::memory_order_release);
     if (m_config->clients_start > 0) {
         setup_staircase_timer();
     }
@@ -1622,7 +1622,7 @@ void client_group::finalize_interrupted_clients(void)
 void client_group::check_stats_owner(const char *what)
 {
     if (m_joined.load(std::memory_order_acquire)) return;
-    if (m_worker_tid_set && pthread_equal(pthread_self(), m_worker_tid)) return;
+    if (m_worker_tid_set.load(std::memory_order_acquire) && pthread_equal(pthread_self(), m_worker_tid)) return;
     // Another thread would race with the worker recording into the same
     // run_stats (roll_cur_stats() vs. set_end_time()). Always on: the race
     // itself only shows up under a sanitizer, and then not every time.
