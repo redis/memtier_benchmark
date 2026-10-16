@@ -868,7 +868,8 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
         jsonhandler->write_obj("clients_step", "%u", cfg->clients_step);
         jsonhandler->write_obj("step_duration", "%u", cfg->step_duration);
     }
-    jsonhandler->write_obj("scan_incremental_max_iterations", "%u", cfg->scan_incremental_max_iterations);
+    if (cfg->scan_incremental_iteration)
+        jsonhandler->write_obj("scan_incremental_max_iterations", "%u", cfg->scan_incremental_max_iterations);
 
     // Read-preference configuration
     {
@@ -935,8 +936,10 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
 
 // Parse an unsigned decimal option value in [0,max].  Like strtoull(), leading
 // whitespace and a single '+' are accepted, so existing command lines keep
-// working; but a '-' is rejected wherever it appears, since strtoull() would
-// negate it and wrap "-1" or "\n-18446744073709551000" into the valid range.
+// working.  A single '-' is accepted only when the value is zero ("-0",
+// "-00"), which strtoull() never wrapped; any other negative value is
+// rejected, since strtoull() would negate it and wrap "-1" or
+// "\n-18446744073709551000" into the valid range.
 // Empty input, trailing junk, ERANGE and values above max are rejected BEFORE
 // the caller narrows the result, so values above UINT_MAX cannot wrap modulo
 // 2^32.  If too_large is given, it is set when the value is a well-formed
@@ -947,12 +950,19 @@ static bool parse_unsigned(const char *s, unsigned long long max, unsigned long 
     if (s == NULL) return false;
     while (isspace((unsigned char) *s))
         s++;
-    if (*s == '+') s++;
+    bool negative = false;
+    if (*s == '+')
+        s++;
+    else if (*s == '-') {
+        negative = true;
+        s++;
+    }
     if (!isdigit((unsigned char) *s)) return false;
     char *endptr = NULL;
     errno = 0;
     unsigned long long v = strtoull(s, &endptr, 10);
     if (*endptr != '\0') return false;
+    if (negative && (errno == ERANGE || v != 0)) return false;
     if (errno == ERANGE || v > max) {
         if (too_large) *too_large = true;
         return false;
@@ -966,8 +976,7 @@ static bool parse_unsigned(const char *s, unsigned long long max, unsigned long 
 // accepted; empty input, trailing junk, ERANGE and values outside [min,max]
 // are rejected before the caller narrows the result.  If too_large is
 // given, it is set when the value is a well-formed number above max.
-// Unlike parse_unsigned(), "-0" is accepted here: a '-' is a legal sign for a
-// signed option, and strtoll() reads "-0" as 0 without any wrap.
+// Like parse_unsigned(), "-0" is accepted: strtoll() reads it as 0.
 static bool parse_signed(const char *s, long long min, long long max, long long *out, bool *too_large = NULL)
 {
     if (too_large) *too_large = false;
@@ -2360,7 +2369,8 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
 #ifdef HAVE_EVHTTP
         case o_prometheus_port: {
             // Unlike --statsd-port this accepts 0. parse_unsigned() accepts
-            // leading whitespace and one '+', rejects any '-', and bounds the
+            // leading whitespace and one '+', rejects negatives other than
+            // "-0", and bounds the
             // value to [0,65535] BEFORE the narrowing cast (a cast would
             // silently wrap 70000 -> 4464).
             static const char *E1 = "error: prometheus-port must be a number in the range [0-65535] (0 = ephemeral).\n";

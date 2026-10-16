@@ -243,6 +243,12 @@ WRAPPED_VALUES = (
     "5x",
     "5 ",
     "99999999999999999999999",
+    "-99999999999999999999999",
+    "-0x",
+    "- 0",
+    "-+0",
+    "+-0",
+    "--0",
 )
 
 # What strtoul() accepted harmlessly before (leading whitespace, one '+') is
@@ -658,3 +664,25 @@ def test_data_offset_cap(env):
         env.assertEqual(result.returncode, 2, message="{}: {}".format(value, result.stderr))
         env.assertTrue("error: data-offset must be <= 536870911." in result.stderr,
                        message="{}: {!r}".format(value, result.stderr))
+
+
+def test_negative_zero_is_zero(env):
+    """strtoul("-0") never wrapped, so "-0" and "-00" keep meaning 0 (#212):
+    accepted where 0 is valid, "greater than zero" where it is not."""
+    zero_ok = ["--max-reconnect-attempts", "--retry-backoff-ms", "--max-retry-queue", "--connection-timeout",
+               "--connection-stage-timeout", "--max-retries"] + list(NON_NEGATIVE_OPTIONS)
+    for option in zero_ok:
+        for value in ("-0", "-00", " -0", "\n-0"):
+            result = _run_memtier([option, value, "--version"])
+            env.assertEqual(result.returncode, 0, message="{} {!r}: {}".format(option, value, result.stderr))
+    for option, (prefix, _) in POSITIVE_OPTIONS.items():
+        result = _run_memtier([option, "-0", "--version"])
+        env.assertTrue("error: {} must be greater than zero.".format(prefix) in result.stderr,
+                       message="{} -0: {!r}".format(option, result.stderr))
+    for option, prefix in (("-n", "requests"), ("-c", "clients"), ("-t", "threads"), ("--test-time", "test time")):
+        result = _run_memtier([option, "-0", "--version"])
+        env.assertTrue("error: {} must be greater than zero.".format(prefix) in result.stderr,
+                       message="{} -0: {!r}".format(option, result.stderr))
+    out = _show_config(["--select-db=-0", "--data-offset=-00", "--replica-clients= -0"])
+    for expected in ("select-db = 0\n", "data_offset = 0\n", "replica_clients = 0\n"):
+        env.assertTrue(expected in out, message="expected {!r} in {!r}".format(expected, out))
