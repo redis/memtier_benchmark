@@ -698,18 +698,36 @@ static std::string redact_credentials(const char *credentials)
     return std::string(credentials, colon - credentials + 1) + "***";
 }
 
+// End of the userinfo in a URI authority+path (the text after "scheme://"),
+// or NULL when there is none. The authority ends at a '/' (RFC 3986), so the
+// search for '@' stops at the first '/' after the first '@': a stray '@' in
+// the db path is not taken for the end of the credentials (which would
+// retarget the run), while a raw '@' or '/' inside the password still works.
+// It is the LAST '@' before that point, so no tail of a password containing
+// '@' is taken for the host and echoed by --show-config or a host/port error.
+static const char *uri_userinfo_end(const char *s)
+{
+    const char *at = strchr(s, '@');
+    if (!at) return NULL;
+    const char *slash = strchr(at, '/');
+    const char *end = slash ? slash : at + strlen(at);
+    while (end > at && *(end - 1) != '@')
+        end--;
+    return end - 1;
+}
+
 // --uri with its userinfo password redacted: redis://user:pw@host:port/db ->
-// redis://user:***@host:port/db. The userinfo runs up to the last '@', where
-// parse_uri() splits it too, so a password that contains '@' is fully hidden.
+// redis://user:***@host:port/db. Splits where parse_uri() does.
 static std::string redact_uri(const char *uri)
 {
     if (!uri) return "";
     std::string s(uri);
     size_t start = s.find("://");
     start = (start == std::string::npos) ? 0 : start + 3;
-    size_t at = s.rfind('@');
-    if (at == std::string::npos || at < start) return s;
-    return s.substr(0, start) + redact_credentials(s.substr(start, at - start).c_str()) + s.substr(at);
+    const char *at = uri_userinfo_end(s.c_str() + start);
+    if (!at) return s;
+    size_t at_pos = at - s.c_str();
+    return s.substr(0, start) + redact_credentials(s.substr(start, at_pos - start).c_str()) + s.substr(at_pos);
 }
 
 static void config_print(FILE *file, struct benchmark_config *cfg)
@@ -1062,12 +1080,9 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
 
     ptr = scheme_end + 3; // Skip "://"
 
-    // Parse user:password@host:port/db. The userinfo ends at the LAST '@'
-    // ('@' cannot appear in host, port or db, RFC 3986), so a password that
-    // contains a raw '@' works and no part of it is taken for the host and
-    // echoed by --show-config or a host/port error (#731). redact_uri()
-    // splits at the same place.
-    char *auth_end = strrchr(ptr, '@');
+    // Parse user:password@host:port/db; see uri_userinfo_end() for where the
+    // userinfo ends (redact_uri() splits at the same place).
+    char *auth_end = (char *) uri_userinfo_end(ptr);
     char *host_start = ptr;
 
     if (auth_end) {
@@ -1130,6 +1145,14 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
             fprintf(stderr, "warning: both URI and --port specified, URI takes precedence.\n");
         }
         cfg->port = port;
+    }
+
+    // Credentials with no host would fall back to the default server and
+    // benchmark the wrong target.
+    if (auth_end && strlen(host_start) == 0) {
+        fprintf(stderr, "error: missing host after credentials in URI.\n");
+        free(uri_copy);
+        return -1;
     }
 
     // Own URI hosts separately from a borrowed --server argument or the default.

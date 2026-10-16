@@ -17,7 +17,7 @@ import subprocess
 import tempfile
 from contextlib import contextmanager
 
-from include import MEMTIER_BINARY, TLS_CACERT, TLS_CERT, TLS_KEY
+from include import MEMTIER_BINARY, TLS_CACERT, TLS_CERT, TLS_KEY, TLS_PROTOCOLS
 
 # Dummy password, distinctive enough that a substring match is no accident.
 _CANARY = "cfg-redaction-canary-731-dummy"
@@ -97,6 +97,8 @@ def _tls_args(env):
     args = ["--tls", "--tls-skip-verify", "--cert={}".format(TLS_CERT)]
     if TLS_KEY:
         args.append("--key={}".format(TLS_KEY))
+    if TLS_PROTOCOLS:
+        args.append("--tls-protocols={}".format(TLS_PROTOCOLS))
     return args
 
 
@@ -119,7 +121,7 @@ def _run(env, target_args, workdir, expect_ok=True):
         with open(json_path) as f:
             raw_json = f.read()
     else:
-        env.assertNotEqual(proc.returncode, 0)
+        env.assertEqual(proc.returncode, 1, message="expected a URI error (rc 1):\n" + stderr[-2000:])
     return raw_json, stdout, stderr
 
 
@@ -206,6 +208,42 @@ def test_config_password_with_at_bad_port_no_leak(env):
     env.assertContains("invalid port number 'notaport'", stderr)
     for secret in (_CANARY_HEAD, _CANARY_TAIL, _CANARY_TAIL2):
         env.assertFalse(secret in stdout + stderr, message="{!r} leaked: {}".format(secret, stderr[-500:]))
+
+
+def test_config_uri_stray_at_in_path_rejected(env):
+    """An '@' after the db path is not the end of the credentials.
+
+    Taking it for one left an empty host, so the run fell back to the default
+    server and benchmarked the wrong target. The authority ends at the '/'.
+    """
+    host, port = _target(env)
+    with tempfile.TemporaryDirectory() as workdir:
+        uri = "redis://default:{}@{}:{}/1@".format(_CANARY, host, port)
+        _raw, stdout, stderr = _run(env, ["--uri", uri], workdir, expect_ok=False)
+    env.assertContains("invalid database number '1@'", stderr)
+    env.assertFalse(_CANARY in stdout + stderr)
+
+
+def test_config_uri_at_in_password_and_path_keeps_host(env):
+    """redis://u:p@w@host:port/x@y must not be read as host "y"."""
+    host, port = _target(env)
+    uri = "redis://default:{}@{}@{}:{}/x@cfg731-wrong-host".format(_CANARY_HEAD, _CANARY_TAIL, host, port)
+    with tempfile.TemporaryDirectory() as workdir:
+        _raw, stdout, stderr = _run(env, ["--uri", uri], workdir, expect_ok=False)
+    env.assertContains("invalid database number 'x@cfg731-wrong-host'", stderr)
+    env.assertFalse("server = cfg731-wrong-host" in stderr)
+    for secret in (_CANARY_HEAD, _CANARY_TAIL):
+        env.assertFalse(secret in stdout + stderr, message="{!r} leaked: {}".format(secret, stderr[-500:]))
+
+
+def test_config_uri_credentials_without_host_rejected(env):
+    """Credentials with an empty host must not fall back to the default server."""
+    _host, port = _target(env)
+    with tempfile.TemporaryDirectory() as workdir:
+        _raw, stdout, stderr = _run(env, ["--uri", "redis://default:{}@:{}".format(_CANARY, port)], workdir,
+                                    expect_ok=False)
+    env.assertContains("missing host after credentials in URI", stderr)
+    env.assertFalse(_CANARY in stdout + stderr)
 
 
 def test_config_uri_without_credentials(env):
