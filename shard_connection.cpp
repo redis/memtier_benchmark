@@ -1038,7 +1038,7 @@ unsigned int shard_connection::drop_pending_requests()
         }
         delete req;
     }
-    if (dropped) m_conns_manager->dec_reqs_generated(dropped);
+    if (dropped) m_conns_manager->abandon_requests(dropped);
     return dropped;
 }
 

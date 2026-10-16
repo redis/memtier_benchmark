@@ -404,13 +404,12 @@ unsigned int client::abandon_unanswered_requests(void)
     // Drop them before disconnecting, so --retry-on-error does not hold them
     // for a resend that will never come (disconnect_all() would then count
     // them a second time). Workload requests that never got a reply are
-    // errors, not ops; setup commands are not counted.
+    // errors, not ops (drop_pending_requests() counts them through
+    // abandon_requests()); setup commands are not counted.
     unsigned int abandoned = 0;
     for (unsigned int i = 0; i < m_connections.size(); i++) {
         if (m_connections[i] != NULL) abandoned += m_connections[i]->drop_pending_requests();
     }
-    for (unsigned int i = 0; i < abandoned; i++)
-        m_stats.inc_error();
     m_stats.add_unanswered_requests(abandoned);
 
     // The run measured --test-time, not the grace period spent waiting.
