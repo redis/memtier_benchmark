@@ -285,13 +285,42 @@ def test_config_uri_at_in_query_or_fragment_not_retargeted(env):
 
 
 def test_config_uri_credentials_without_host_rejected(env):
-    """Credentials with an empty host must not fall back to the default server."""
+    """Credentials with an empty host and no --server/--unix-socket must not
+    fall back to the default server."""
     _host, port = _target(env)
     with tempfile.TemporaryDirectory() as workdir:
         _raw, stdout, stderr = _run(env, ["--uri", "redis://default:{}@:{}".format(_CANARY, port)], workdir,
                                     expect_ok=False)
     env.assertContains("missing host in URI", stderr)
     env.assertFalse(_CANARY in stdout + stderr)
+
+
+def test_config_uri_without_host_uses_explicit_server(env):
+    """-s HOST with a host-less --uri keeps working, as on master: the URI only
+    carries the credentials and port, and the run goes to HOST."""
+    host, port = _target(env)
+    _check(env, _CANARY, ["-s", host, "--uri", "redis://default:{}@:{}".format(_CANARY, port)],
+           "redis://default:***@:{}".format(port), "default:***", [_CANARY])
+
+
+def test_config_uri_without_host_uses_explicit_unix_socket(env):
+    """-S PATH with a host-less --uri passes the credentials over the unix
+    socket, as on master. Nothing listens on PATH here, so the run must fail
+    to connect to that socket (not be rejected as a URI error, and not go to
+    the default server), with the credentials redacted."""
+    with tempfile.TemporaryDirectory() as workdir:
+        sock = os.path.join(workdir, "none.sock")
+        args = [MEMTIER_BINARY, "-S", sock, "--uri", "redis://default:{}@".format(_CANARY),
+                "-n", "1", "-t", "1", "-c", "1", "--hide-histogram", "--show-config"]
+        proc = subprocess.run(args, cwd=workdir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    out = proc.stdout.decode("utf-8", "replace") + proc.stderr.decode("utf-8", "replace")
+    env.assertEqual(proc.returncode, 1, message=out[-2000:])
+    env.assertFalse("missing host in URI" in out)
+    env.assertContains("connect failed, error = No such file or directory", out)
+    env.assertEqual(_show_config_value(out, "unix socket"), sock)
+    env.assertEqual(_show_config_value(out, "uri"), "redis://default:***@")
+    env.assertEqual(_show_config_value(out, "authenticate"), "default:***")
+    env.assertFalse(_CANARY in out)
 
 
 def test_config_uri_at_in_path_without_credentials_known_limit(env):

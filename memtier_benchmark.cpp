@@ -1155,9 +1155,12 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
         cfg->port = port;
     }
 
-    // An '@' with no host after it would fall back to the default server and
-    // benchmark the wrong target.
-    if (auth_end && strlen(host_start) == 0) {
+    // An '@' with no host after it and no explicit --server/--unix-socket
+    // would fall back to the default server and benchmark the wrong target.
+    // (parse_uri() runs before config_init_defaults(), so a non-NULL server
+    // or unix_socket here was given on the command line.) With an explicit
+    // target the host-less URI only carries credentials/port/db, as before.
+    if (auth_end && strlen(host_start) == 0 && !cfg->server && !cfg->unix_socket) {
         fprintf(stderr, "error: missing host in URI.\n");
         free(uri_copy);
         return -1;
