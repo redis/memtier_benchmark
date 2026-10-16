@@ -5263,6 +5263,8 @@ int main(int argc, char *argv[])
         struct stat st;
         if (fstat(fileno(outfile), &st) == 0 && S_ISREG(st.st_mode) && ftruncate(fileno(outfile), 0) != 0) {
             fprintf(stderr, "error: cannot truncate --out-file %s: %s\n", cfg.out_file, strerror(errno));
+            // Close the JSON nesting, so the --json-out-file stays valid.
+            delete jsonhandler;
             exit(1);
         }
     } else {
