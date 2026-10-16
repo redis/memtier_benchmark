@@ -434,20 +434,22 @@ get_key_response client::get_key_for_conn(unsigned int command_index, unsigned i
     return available_for_conn;
 }
 
-// --monitor-input "__monitor_line@__": replace __key__ (keeping any text
-// around it, e.g. {tag}__key__ or user:__key__, as the --command path does)
-// and a bare __data__ with a generated key and value. Call it after
-// split_command_to_args() and before format_arbitrary_command(), so every
-// argument is a constant: the monitor send loops (here and in cluster_client)
-// only write constant arguments, and cluster mode can route by the key that
-// is actually sent.
+// --monitor-input "__monitor_line@__": replace the first __key__ in an
+// argument with a generated key, keeping the text around it (e.g.
+// {tag}__key__ or user:__key__; like the --command path, any later __key__
+// in the same argument stays literal), and a bare __data__ with a generated
+// value. Call it after split_command_to_args() and before
+// format_arbitrary_command(). Resolved arguments are marked const_type, which
+// format_arbitrary_command() frames as-is without scanning the generated text
+// for placeholders again. Every argument is then a constant: the monitor send
+// loops (here and in cluster_client) only write constant arguments, and
+// cluster mode can route by the key that is actually sent.
 void client::resolve_monitor_placeholders(arbitrary_command &cmd, unsigned int command_index, unsigned int conn_id)
 {
-    const size_t key_ph_len = strlen(KEY_PLACEHOLDER);
     // Argument 0 is the command name.
     for (size_t i = 1; i < cmd.command_args.size(); i++) {
-        std::string &data = cmd.command_args[i].data;
-        size_t pos = data.find(KEY_PLACEHOLDER);
+        command_arg &arg = cmd.command_args[i];
+        size_t pos = arg.data.find(KEY_PLACEHOLDER);
         if (pos != std::string::npos) {
             unsigned long long key_index;
             // Base-class lookup: cluster_client routes by the resolved key
@@ -455,20 +457,15 @@ void client::resolve_monitor_placeholders(arbitrary_command &cmd, unsigned int c
             get_key_response res = client::get_key_for_conn(command_index, conn_id, &key_index);
             assert(res == available_for_conn);
             (void) res;
-            const char *key = m_obj_gen->get_key();
-            unsigned int key_len = m_obj_gen->get_key_len();
-            // Replace every occurrence: one left behind would be re-parsed as
-            // a key argument by format_arbitrary_command() and never sent.
-            while (pos != std::string::npos) {
-                data.replace(pos, key_ph_len, key, key_len);
-                pos = data.find(KEY_PLACEHOLDER, pos + key_len);
-            }
-        } else if (data == DATA_PLACEHOLDER) {
+            arg.data.replace(pos, strlen(KEY_PLACEHOLDER), m_obj_gen->get_key(), m_obj_gen->get_key_len());
+            arg.type = const_type;
+        } else if (arg.data == DATA_PLACEHOLDER) {
             unsigned int value_len;
             const char *value = m_obj_gen->get_value(0, &value_len);
             assert(value != NULL);
             assert(value_len > 0);
-            data.assign(value, value_len);
+            arg.data.assign(value, value_len);
+            arg.type = const_type;
         }
     }
 }

@@ -1314,6 +1314,8 @@ def test_monitor_input_random_line_key_affixes_and_data(env):
     with open(monitor_file, "w") as f:
         f.write('[ proxy ] 1764031576.604009 [0 127.0.0.1:5000] "SET" "user:__key__" "v"\n')
         f.write('[ proxy ] 1764031576.604010 [0 127.0.0.1:5000] "SET" "{tag}__key__:x" "__data__"\n')
+        # Like --command, only the first __key__ in an argument is replaced.
+        f.write('[ proxy ] 1764031576.604011 [0 127.0.0.1:5000] "SET" "a:__key__:b:__key__" "v"\n')
 
     benchmark_specs = {
         "name": env.testName,
@@ -1351,14 +1353,64 @@ def test_monitor_input_random_line_key_affixes_and_data(env):
         keys.extend(k.decode() for k in conn.execute_command("KEYS", "*"))
     user_keys = [k for k in keys if k.startswith("user:mon-")]
     tag_keys = [k for k in keys if k.startswith("{tag}mon-") and k.endswith(":x")]
+    rep_keys = [k for k in keys if k.startswith("a:mon-") and k.endswith(":b:__key__")]
     env.assertTrue(len(user_keys) > 0, message="no user:mon-* keys; keys: {}".format(keys[:10]))
     env.assertTrue(len(tag_keys) > 0, message="no {{tag}}mon-*:x keys; keys: {}".format(keys[:10]))
-    env.assertEqual(len(keys), len(user_keys) + len(tag_keys),
+    env.assertTrue(len(rep_keys) > 0, message="no a:mon-*:b:__key__ keys; keys: {}".format(keys[:10]))
+    env.assertEqual(len(keys), len(user_keys) + len(tag_keys) + len(rep_keys),
                     message="keys without their affixes: {}".format(
-                        [k for k in keys if k not in user_keys and k not in tag_keys][:10]))
+                        [k for k in keys if k not in user_keys and k not in tag_keys and k not in rep_keys][:10]))
     conn = master_nodes_connections[0]
     if user_keys:
         env.assertEqual(conn.execute_command("GET", user_keys[0]), b"v")
     if tag_keys:
         # __data__ is replaced by a generated --data-size value.
         env.assertEqual(len(conn.execute_command("GET", tag_keys[0])), 20)
+
+
+def test_monitor_input_random_line_placeholder_in_key_prefix(env):
+    """
+    A generated key or value that itself contains placeholder text must be
+    sent as-is. With --key-prefix=__key__ (or __data__), the key filled into a
+    __monitor_line@__ line is "__key__NNN"; it must not be parsed again as a
+    key/data argument (that dropped the argument and hung the run, or
+    rejected the line). __monitor_line1__ already handles this.
+    """
+    env.skipOnCluster()
+
+    test_dir = tempfile.mkdtemp()
+    monitor_file = os.path.join(test_dir, "monitor_prefix_placeholder.txt")
+    with open(monitor_file, "w") as f:
+        f.write('[ proxy ] 1764031576.604009 [0 127.0.0.1:5000] "SET" "__key__" "v"\n')
+
+    master_nodes_connections = env.getOSSMasterNodesConnectionList()
+    conn = master_nodes_connections[0]
+    for prefix in ("__key__", "__data__"):
+        conn.execute_command("FLUSHALL")
+        benchmark_specs = {
+            "name": env.testName,
+            "args": [
+                "--monitor-input={}".format(monitor_file),
+                "--command=__monitor_line@__",
+                "--key-prefix={}".format(prefix),
+                "--key-maximum=100",
+                "--hide-histogram",
+            ],
+        }
+        addTLSArgs(benchmark_specs, env)
+
+        config = get_default_memtier_config(threads=1, clients=1, requests=20)
+        add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+
+        config = RunConfig(tempfile.mkdtemp(), env.testName, config, {})
+        ensure_clean_benchmark_folder(config.results_dir)
+
+        benchmark = Benchmark.from_json(config, benchmark_specs)
+        memtier_ok = benchmark.run(timeout=30)
+
+        debugPrintMemtierOnError(config, env)
+        env.assertTrue(memtier_ok == True, message="run failed with --key-prefix={}".format(prefix))
+        keys = [k.decode() for k in conn.execute_command("KEYS", "*")]
+        env.assertTrue(len(keys) > 0, message="no keys written with --key-prefix={}".format(prefix))
+        env.assertTrue(all(k.startswith(prefix) and k[len(prefix):].isdigit() for k in keys),
+                       message="unexpected keys with --key-prefix={}: {}".format(prefix, keys[:10]))
