@@ -3861,6 +3861,10 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             gettimeofday(&now, NULL);
             unsigned int elapsed_secs = ts_diff(cfg->benchmark_start_time, now) / 1000000;
             unsigned int steps_done = elapsed_secs / cfg->step_duration;
+            // As in the JSON "Active Clients": only steps k with
+            // k * step_duration < test_time ever run.
+            if (cfg->test_time > 0 && steps_done > (cfg->test_time - 1) / cfg->step_duration)
+                steps_done = (cfg->test_time - 1) / cfg->step_duration;
             display_clients = cfg->clients_start + steps_done * cfg->clients_step;
             if (display_clients > cfg->clients) display_clients = cfg->clients;
         }

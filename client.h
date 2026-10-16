@@ -333,6 +333,7 @@ protected:
 
     // Client staircase ramp-up
     struct event *m_staircase_timer;
+    struct event *m_staircase_deadline_timer;
     std::atomic<unsigned int> m_staircase_active_clients;
     unsigned int m_staircase_steps;
     // Set by interrupt(), read after the worker thread was joined; both on
@@ -350,6 +351,8 @@ protected:
     void setup_staircase_timer(void);
     void handle_staircase_step(void);
     static void staircase_timer_cb(evutil_socket_t fd, short what, void *arg);
+    static void staircase_deadline_cb(evutil_socket_t fd, short what, void *arg);
+    void remove_staircase_timer(void);
     static void end_stalled_clients_cb(evutil_socket_t fd, short what, void *arg);
     void handle_end_stalled_clients(void);
     unsigned int active_client_count(void);

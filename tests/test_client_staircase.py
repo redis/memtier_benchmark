@@ -7,6 +7,7 @@ the per-second active client counts follow the expected staircase pattern.
 """
 import tempfile
 import json
+import re
 import os
 import subprocess
 import time
@@ -814,3 +815,85 @@ def test_staircase_no_step_at_deadline(env):
         finally:
             if env.getNumberOfFailedAssertion() > failed_asserts:
                 debugPrintMemtierOnError(run_config, env)
+
+
+
+def test_staircase_exits_at_test_time(env):
+    """Verify a staircase run exits at --test-time, not at the next step.
+
+    The step timer is persistent, so after the clients stopped at the
+    deadline it kept the event loop running until its next tick: --test-time 2
+    --step-duration 20 took 20 s of wall time (issue #728).
+
+    Measure each worker thread's lifetime with the JSON "CPU" cpu_wall_seconds
+    (the longest event-loop thread, so process startup does not count). It
+    must end within a moment of --test-time. Without per-thread CPU accounting
+    (non-Linux), fall back to the process wall time.
+    """
+    # (test_time, step_duration): longer than the run, not dividing it, and
+    # dividing it.
+    cases = [(2, 20), (5, 2), (4, 2), (5, 3)]
+    for test_time, step_duration in cases:
+        test_dir = tempfile.mkdtemp()
+        benchmark, run_config = _build_staircase_benchmark(
+            env, test_dir, clients=4, clients_start=1, clients_step=1,
+            step_duration=step_duration, test_time=test_time, threads=2)
+
+        start = time.monotonic()
+        ok = benchmark.run()
+        process_wall = time.monotonic() - start
+        failed_asserts = env.getNumberOfFailedAssertion()
+        try:
+            env.assertTrue(ok, message="memtier_benchmark should exit successfully")
+            if not ok:
+                continue
+            cpu = _load_json(run_config)["ALL STATS"].get("CPU", {})
+            if "cpu_wall_seconds" in cpu:
+                thread_wall = float(cpu["cpu_wall_seconds"])
+                env.assertTrue(thread_wall < test_time + 0.5,
+                               message="--test-time {} --step-duration {}: worker threads ran {:.3f} s".format(
+                                   test_time, step_duration, thread_wall))
+            else:
+                env.assertTrue(process_wall < test_time + 3,
+                               message="--test-time {} --step-duration {}: run took {:.2f} s "
+                                       "of wall time".format(test_time, step_duration, process_wall))
+        finally:
+            if env.getNumberOfFailedAssertion() > failed_asserts:
+                debugPrintMemtierOnError(run_config, env)
+
+
+def test_staircase_progress_clients_match_json(env):
+    """Verify the progress line's client count stops at the last step taken.
+
+    With --test-time 3 --step-duration 1, the steps at 1 s and 2 s run and
+    the one at 3 s does not. The final progress line used to count it anyway
+    (4 conns per thread instead of 3); it must agree with the last JSON
+    "Active Clients" entry.
+    """
+    env.skipOnCluster()
+
+    test_dir = tempfile.mkdtemp()
+    benchmark, run_config = _build_staircase_benchmark(
+        env, test_dir, clients=6, clients_start=1, clients_step=1,
+        step_duration=1, test_time=3, threads=1)
+
+    ok = benchmark.run()
+    failed_asserts = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier_benchmark should exit successfully")
+        with open(os.path.join(run_config.results_dir, "mb.stderr")) as f:
+            stderr = f.read()
+        progress = re.findall(r"\[RUN #1 [^\]]*\]\s+\d+ threads\s+(\d+) conns",
+                                          stderr.replace("\r", "\n"))
+        env.assertTrue(len(progress) > 0, message="no progress lines in stderr")
+        ac = _load_json(run_config)["ALL STATS"]["Active Clients"]
+        last_ts = max(ac, key=int)
+        json_clients = ac[last_ts]["Clients per thread"]
+        env.assertEqual(json_clients, 3, message="last Active Clients entry (t={}s)".format(last_ts))
+        if progress:
+            env.assertEqual(int(progress[-1]), json_clients,
+                            message="last progress line shows {} conns, JSON Active Clients at t={}s is {}".format(
+                                progress[-1], last_ts, json_clients))
+    finally:
+        if env.getNumberOfFailedAssertion() > failed_asserts:
+            debugPrintMemtierOnError(run_config, env)

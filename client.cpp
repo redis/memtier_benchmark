@@ -1302,6 +1302,7 @@ client_group::client_group(benchmark_config *config, abstract_protocol *protocol
         m_protocol(protocol),
         m_obj_gen(obj_gen),
         m_staircase_timer(NULL),
+        m_staircase_deadline_timer(NULL),
         m_staircase_active_clients(0),
         m_staircase_steps(0),
         m_interrupt_requested(false),
@@ -1319,10 +1320,11 @@ client_group::client_group(benchmark_config *config, abstract_protocol *protocol
 
 client_group::~client_group(void)
 {
-    if (m_staircase_timer != NULL) {
-        event_del(m_staircase_timer);
-        event_free(m_staircase_timer);
-        m_staircase_timer = NULL;
+    remove_staircase_timer();
+    if (m_staircase_deadline_timer != NULL) {
+        event_del(m_staircase_deadline_timer);
+        event_free(m_staircase_deadline_timer);
+        m_staircase_deadline_timer = NULL;
     }
 
     for (std::vector<client *>::iterator i = m_clients.begin(); i != m_clients.end(); i++) {
@@ -1445,19 +1447,52 @@ void client_group::staircase_timer_cb(evutil_socket_t fd, short what, void *arg)
     cg->handle_staircase_step();
 }
 
+void client_group::staircase_deadline_cb(evutil_socket_t fd, short what, void *arg)
+{
+    (void) fd;
+    (void) what;
+    ((client_group *) arg)->remove_staircase_timer();
+}
+
+void client_group::remove_staircase_timer(void)
+{
+    if (m_staircase_timer != NULL) {
+        event_del(m_staircase_timer);
+        event_free(m_staircase_timer);
+        m_staircase_timer = NULL;
+    }
+}
+
 void client_group::setup_staircase_timer(void)
 {
     struct timeval interval = {(long) m_config->step_duration, 0};
     m_staircase_timer = event_new(m_base, -1, EV_PERSIST, staircase_timer_cb, (void *) this);
+    if (m_staircase_timer == NULL) {
+        benchmark_error_log("error: staircase: failed to create the step timer; no clients will be added.\n");
+        return;
+    }
     event_add(m_staircase_timer, &interval);
+
+    // The step timer is persistent, so once the clients stop at the deadline
+    // it alone would keep event_base_dispatch() running until its next tick
+    // (up to step_duration past --test-time). Remove it at the deadline.
+    struct timeval now, elapsed, deadline = {(time_t) m_config->test_time, 0}, remaining = {0, 0};
+    gettimeofday(&now, NULL);
+    timersub(&now, &m_config->benchmark_start_time, &elapsed);
+    if (timercmp(&elapsed, &deadline, <)) timersub(&deadline, &elapsed, &remaining);
+    m_staircase_deadline_timer = event_new(m_base, -1, 0, staircase_deadline_cb, (void *) this);
+    if (m_staircase_deadline_timer == NULL) {
+        // The step timer still stops itself at its first tick past the deadline.
+        benchmark_error_log("warning: staircase: failed to create the deadline timer; the run may end up to "
+                            "--step-duration late.\n");
+        return;
+    }
+    event_add(m_staircase_deadline_timer, &remaining);
 }
 
 void client_group::handle_staircase_step(void)
 {
-    // Check if the test deadline has passed. Without this, the EV_PERSIST
-    // timer keeps event_base_dispatch alive even after all clients' finished()
-    // returns true, extending the run far beyond test_time.
-    // Two checks, either one stops:
+    // Stop the ramp at the test deadline; two checks, either one stops:
     // - The step count: step k is due at k * step_duration. The clock alone
     //   can't decide this: the timer runs on libevent's monotonic clock and
     //   can fire a hair before the deadline by gettimeofday(), which would add
@@ -1473,11 +1508,7 @@ void client_group::handle_staircase_step(void)
         timersub(&now, &m_config->benchmark_start_time, &elapsed);
         if ((unsigned long long) m_staircase_steps * m_config->step_duration >= m_config->test_time ||
             elapsed.tv_sec >= (time_t) m_config->test_time) {
-            if (m_staircase_timer != NULL) {
-                event_del(m_staircase_timer);
-                event_free(m_staircase_timer);
-                m_staircase_timer = NULL;
-            }
+            remove_staircase_timer();
             return;
         }
     }
@@ -1488,11 +1519,7 @@ void client_group::handle_staircase_step(void)
 
     if (current >= target) {
         // Already at max, remove the timer
-        if (m_staircase_timer != NULL) {
-            event_del(m_staircase_timer);
-            event_free(m_staircase_timer);
-            m_staircase_timer = NULL;
-        }
+        remove_staircase_timer();
         return;
     }
 
@@ -1514,11 +1541,7 @@ void client_group::handle_staircase_step(void)
 
     // If we've reached max, remove the timer
     if (connected >= m_config->clients) {
-        if (m_staircase_timer != NULL) {
-            event_del(m_staircase_timer);
-            event_free(m_staircase_timer);
-            m_staircase_timer = NULL;
-        }
+        remove_staircase_timer();
     }
 }
 
@@ -1562,13 +1585,10 @@ void client_group::handle_end_stalled_clients(void)
         }
     }
     if (ended > 0) {
-        // The deadline has passed, so the ramp is over. Do not let its
-        // persistent timer keep the loop alive until the next step.
-        if (m_staircase_timer != NULL) {
-            event_del(m_staircase_timer);
-            event_free(m_staircase_timer);
-            m_staircase_timer = NULL;
-        }
+        // The deadline has passed, so the ramp is over. The deadline timer has
+        // normally removed the step timer already; this only covers the case
+        // where that timer could not be created.
+        remove_staircase_timer();
         if (no_reply > 0) {
             benchmark_error_log("warning: %u client(s) got no reply to %llu request(s) %u seconds after the test time "
                                 "ended; abandoned them (counted as errors, \"Unanswered requests\" in the JSON "
