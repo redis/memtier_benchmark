@@ -171,7 +171,7 @@ static bool check_cluster_monitor_lines(const struct monitor_command_list *monit
             keys++;
         }
         if (keys > 1 && !same_slot) {
-            benchmark_error_log("error: Cluster mode supports only a single key commands: monitor line %zu has %u "
+            benchmark_error_log("error: Cluster mode supports only single-key commands: monitor line %zu has %u "
                                 "__key__ arguments that can hash to different slots (give them one {hash tag}, "
                                 "e.g. {t}__key__): %s\n",
                                 line + 1, keys, cmd.command.c_str());
@@ -4810,9 +4810,9 @@ int main(int argc, char *argv[])
             exit(1);
         }
 
-        // Cluster mode supports only a single key commands
+        // Cluster mode supports only single-key commands
         if (cfg.cluster_mode && cmd.keys_count > 1) {
-            benchmark_error_log("error: Cluster mode supports only a single key commands\n");
+            benchmark_error_log("error: Cluster mode supports only single-key commands\n");
             exit(1);
         }
         delete tmp_protocol;

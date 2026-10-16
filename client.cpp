@@ -441,11 +441,13 @@ get_key_response client::get_key_for_conn(unsigned int command_index, unsigned i
 // and before format_arbitrary_command(). Resolved arguments are marked
 // `resolved`, so format_arbitrary_command() frames them as constants without
 // scanning the generated text for placeholders again, and cluster mode can
-// route by the key that is actually sent. The first one is kept in
-// cmd.resolved_key for the request's log key. A bare __data__ (other than as
-// the first argument) is left for format_arbitrary_command() to mark
-// data_type: write_monitor_command_args() writes the value at send time,
-// without copying it into the command.
+// route by the key that is actually sent. Argument 1 after resolution (a
+// literal or a generated key) is kept in cmd.resolved_key for the request's
+// log key: it is what cluster mode hashes to pick the shard, so
+// --failed-keys-file and --retry-on-error see the same key the router used.
+// A bare __data__ (other than as the first argument) is left for
+// format_arbitrary_command() to mark data_type: write_monitor_command_args()
+// writes the value at send time, without copying it into the command.
 void client::resolve_monitor_placeholders(arbitrary_command &cmd, unsigned int command_index, unsigned int conn_id)
 {
     // Argument 0 is the command name.
@@ -475,8 +477,8 @@ void client::resolve_monitor_placeholders(arbitrary_command &cmd, unsigned int c
         (void) res;
         arg.data.replace(pos, strlen(KEY_PLACEHOLDER), m_obj_gen->get_key(), m_obj_gen->get_key_len());
         arg.resolved = true;
-        if (cmd.resolved_key.empty()) cmd.resolved_key = arg.data;
     }
+    if (cmd.command_args.size() >= 2) cmd.resolved_key = cmd.command_args[1].data;
 }
 
 // Write a formatted __monitor_line@__ command (see

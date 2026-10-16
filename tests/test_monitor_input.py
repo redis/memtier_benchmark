@@ -1437,7 +1437,9 @@ def test_monitor_input_random_line_failed_keys_file(env):
     --failed-keys-file records the key a __monitor_line@__ request was sent
     with (affixes included), as it does for --command. A line whose every
     request fails (INCRBY by a non-integer) must log user:mon-NNN keys, not
-    an empty key.
+    an empty key. The logged key is argument 1, the one cluster mode routes
+    by, even when __key__ is only in a later argument: "INCRBY" "fixed"
+    "x:__key__" logs "fixed", not the generated x:mon-NNN.
     """
     env.skipOnCluster()
 
@@ -1445,6 +1447,7 @@ def test_monitor_input_random_line_failed_keys_file(env):
     monitor_file = os.path.join(test_dir, "monitor_failed_keys.txt")
     with open(monitor_file, "w") as f:
         f.write('[ proxy ] 1764031576.604009 [0 127.0.0.1:5000] "INCRBY" "user:__key__" "x"\n')
+        f.write('[ proxy ] 1764031576.604010 [0 127.0.0.1:5000] "INCRBY" "fixed" "x:__key__"\n')
     failed_log = os.path.join(test_dir, "failed_keys.csv")
 
     requests = 20
@@ -1476,5 +1479,8 @@ def test_monitor_input_random_line_failed_keys_file(env):
         rows = [r for r in csv.reader(fh) if r and not r[0].startswith("#") and r[0] != "timestamp"]
     env.assertEqual(len(rows), requests, message="failed-keys rows: {}".format(rows[:5]))
     keys = [r[2] for r in rows]
-    bad = [k for k in keys if not k.startswith("user:mon-")]
-    env.assertEqual(bad, [], message="logged keys without user:mon- prefix: {}".format(bad[:5]))
+    bad = [k for k in keys if not k.startswith("user:mon-") and k != "fixed"]
+    env.assertEqual(bad, [], message="logged keys other than user:mon-* / fixed: {}".format(bad[:5]))
+    # The default --monitor-pattern=S alternates the two lines.
+    env.assertTrue("fixed" in keys, message="no row for the fixed-key line: {}".format(keys[:10]))
+    env.assertTrue(any(k.startswith("user:mon-") for k in keys), message="no user:mon-* rows: {}".format(keys[:10]))

@@ -188,9 +188,10 @@ struct arbitrary_command
     unsigned int count_user_key_placeholders() const;
 
     std::vector<command_arg> command_args;
-    // __monitor_line@__ only: the first key filled in by
-    // client::resolve_monitor_placeholders() (affixes included), recorded on
-    // the request for --failed-keys-file and --retry-on-error.
+    // __monitor_line@__ only: argument 1 after
+    // client::resolve_monitor_placeholders() (the text cluster mode routes
+    // by), recorded on the request for --failed-keys-file and
+    // --retry-on-error.
     std::string resolved_key;
     std::string command;
     std::string command_name; // Display name (e.g., "SET (Line 1)" or "SET")
