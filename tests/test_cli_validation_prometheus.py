@@ -97,7 +97,7 @@ def test_v1_v4_port_rejects_e1(env):
     # The "\n-..." / "\v-1" vectors used to bypass the leading '-' check
     # (strtoul skips any whitespace) and bind port 616 / 1 (#705).
     for bad in ("abc", "70000", "-1", "9219x", "", "\n-18446744073709551000", "\n-18446744073709551615", "\v-1",
-                " 9219", "+9219", "99999999999999999999999"):
+                " 9219", "+9219", "99999999999999999999999", "65536"):
         result = _run(_BASE + ["--prometheus-port={}".format(bad)])
         env.assertEqual(result.returncode, 2,
                         message="--prometheus-port={!r} must exit 2; got {}".format(
@@ -125,6 +125,16 @@ def test_v6_port_zero_accepted(env):
     result = _run(_BASE_ACCEPT + ["--prometheus-port=0"])
     env.assertFalse(E1_PORT in result.stderr,
                     message="--prometheus-port=0 must not be rejected; stderr={!r}".format(
+                        result.stderr))
+
+
+def test_v6b_port_max_accepted(env):
+    """--prometheus-port=65535 parses (no E1); 65536 is in the V1-V4 reject list."""
+    # --version exits right after parsing, so nothing binds 65535.
+    result = _run(["--prometheus-port=65535", "--version"])
+    env.assertEqual(result.returncode, 0, message=result.stderr)
+    env.assertFalse(E1_PORT in result.stderr,
+                    message="--prometheus-port=65535 must not be rejected; stderr={!r}".format(
                         result.stderr))
 
 

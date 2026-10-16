@@ -232,6 +232,7 @@ WRAPPED_VALUES = (
     " 5",
     "+5",
     "",
+    "5x",
     "99999999999999999999999",
 )
 
@@ -265,10 +266,50 @@ def test_unsigned_options_accept_valid_values(env):
     for option in UNSIGNED_OPTIONS:
         result = _run_memtier([option, "1", "--version"])
         env.assertEqual(result.returncode, 0, message=option + " 1: " + result.stderr)
-    for option in ("--max-reconnect-attempts", "--retry-backoff-ms", "--max-retry-queue", "--connection-timeout",
-                   "--connection-stage-timeout"):
-        for value in ("0", "4294967295"):
+    for option, top in (("--max-reconnect-attempts", "4294967295"), ("--retry-backoff-ms", "4294967295"),
+                        ("--max-retry-queue", "4294967295"), ("--connection-timeout", "4294967295"),
+                        ("--connection-stage-timeout", "4294967294")):
+        for value in ("0", top):
             result = _run_memtier([option, value, "--version"])
             env.assertEqual(result.returncode, 0, message="{} {}: {}".format(option, value, result.stderr))
-    result = _run_memtier(["-n", "18446744073709551615", "--version"])
+    result = _run_memtier(["-n", "18446744073709551614", "--version"])
+    env.assertEqual(result.returncode, 0, message=result.stderr)
+
+
+def test_unsigned_options_reject_sentinel_values(env):
+    """Values equal to an internal "unset" sentinel must not be accepted.
+
+    -n ULLONG_MAX is the allkeys marker and --connection-stage-timeout
+    UINT_MAX means "not set" (replaced by the 30 s default).
+    """
+    for option, value, diagnostic in (("-n", "18446744073709551615", "requests must be"),
+                                      ("--connection-stage-timeout", "4294967295",
+                                       "connection-stage-timeout must be")):
+        result = _run_memtier([option, value, "--version"])
+        label = "{} {}".format(option, value)
+        env.assertEqual(result.returncode, 2, message=label + ": " + result.stderr)
+        env.assertTrue(diagnostic in result.stderr, message=label + ": " + repr(result.stderr))
+
+
+def test_unsigned_options_keep_specific_messages(env):
+    """Negative input keeps "must be a positive integer"; overflow on a capped
+    option keeps the cap message rather than "greater than zero"."""
+    for option, prefix in (("-n", "requests"), ("-c", "clients"), ("-t", "threads"), ("--test-time", "test time")):
+        result = _run_memtier([option, "-1", "--version"])
+        env.assertTrue("error: {} must be a positive integer.".format(prefix) in result.stderr,
+                       message="{} -1: {!r}".format(option, result.stderr))
+    for option, cap in (("--pipeline", "pipeline must be <= 1024"), ("-d", "data-size must be <= 536870912 bytes")):
+        for value in ("1025" if option == "--pipeline" else "536870913", "99999999999999999999999"):
+            result = _run_memtier([option, value, "--version"])
+            env.assertEqual(result.returncode, 2, message="{} {}: {}".format(option, value, result.stderr))
+            env.assertTrue(cap in result.stderr, message="{} {}: {!r}".format(option, value, result.stderr))
+
+
+def test_unsigned_options_ignore_errno_from_earlier_options(env):
+    """parse_unsigned() must reset errno itself.
+
+    --key-maximum does not check ERANGE today, so it is used here to leave
+    errno set; if it starts rejecting overflow, pick another such option.
+    """
+    result = _run_memtier(["--key-maximum=99999999999999999999999", "-c", "5", "--version"])
     env.assertEqual(result.returncode, 0, message=result.stderr)

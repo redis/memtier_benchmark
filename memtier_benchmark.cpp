@@ -921,20 +921,36 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
     jsonhandler->close_nesting();
 }
 
-// Parse a TCP/UDP port number: the whole string must be a decimal number in
-// [1,65535], starting with a digit (no sign or leading whitespace). The range
-// is checked on the unsigned long BEFORE narrowing. Shared by -p/--port,
-// --statsd-port, --graphite-port, the --uri port and --read-server HOST:PORT.
-static bool parse_port(const char *s, unsigned short *out)
+// Parse an unsigned decimal option value: the whole string must be a number
+// in [0,max], starting with a digit (no sign or leading whitespace).
+// strtoull() would otherwise skip any whitespace (including '\n', '\v', ...)
+// and accept a '-', wrapping "-1" or "\n-18446744073709551000" into the valid
+// range.  ERANGE and the range are checked BEFORE the caller narrows the
+// result, so values above UINT_MAX cannot wrap modulo 2^32.  If too_large is
+// given, it is set when the value is a well-formed number above max.
+static bool parse_unsigned(const char *s, unsigned long long max, unsigned long long *out, bool *too_large = NULL)
 {
-    // Require a leading digit: strtoul() would otherwise skip any whitespace
-    // (including '\n', '\v', ...) and accept a sign, and wrap a negative value
-    // such as "\n-18446744073709551615" to a valid port.
+    if (too_large) *too_large = false;
     if (s == NULL || !isdigit((unsigned char) *s)) return false;
     char *endptr = NULL;
     errno = 0;
-    unsigned long v = strtoul(s, &endptr, 10);
-    if (*endptr != '\0' || errno == ERANGE || v < 1 || v > 65535) return false;
+    unsigned long long v = strtoull(s, &endptr, 10);
+    if (*endptr != '\0') return false;
+    if (errno == ERANGE || v > max) {
+        if (too_large) *too_large = true;
+        return false;
+    }
+    *out = v;
+    return true;
+}
+
+// Parse a TCP/UDP port number: the whole string must be a decimal number in
+// [1,65535] (see parse_unsigned()). Shared by -p/--port, --statsd-port,
+// --graphite-port, the --uri port and --read-server HOST:PORT.
+static bool parse_port(const char *s, unsigned short *out)
+{
+    unsigned long long v;
+    if (!parse_unsigned(s, 65535, &v) || v < 1) return false;
     *out = (unsigned short) v;
     return true;
 }
@@ -1214,23 +1230,6 @@ static bool verify_arbitrary_command_option(struct benchmark_config *cfg)
 //                  (512 MiB), past which the server rejects the bulk anyway.
 #define MEMTIER_PIPELINE_MAX 1024u
 #define MEMTIER_DATA_SIZE_MAX (512u * 1024u * 1024u)
-
-// Parse an unsigned decimal option value: the whole string must be a number
-// in [0,max], starting with a digit (no sign or leading whitespace, as in
-// parse_port()).  strtoull() would otherwise skip any whitespace (including
-// '\n', '\v', ...) and accept a '-', wrapping "-1" or "\n-18446744073709551000"
-// into the valid range.  ERANGE and the range are checked BEFORE the caller
-// narrows the result, so values above UINT_MAX cannot wrap modulo 2^32.
-static bool parse_unsigned(const char *s, unsigned long long max, unsigned long long *out)
-{
-    if (s == NULL || !isdigit((unsigned char) *s)) return false;
-    char *endptr = NULL;
-    errno = 0;
-    unsigned long long v = strtoull(s, &endptr, 10);
-    if (*endptr != '\0' || errno == ERANGE || v > max) return false;
-    *out = v;
-    return true;
-}
 
 // Parse a backoff factor: the whole string must be a finite, representable
 // number >= 0.  Rejects empty input, trailing junk, nan/inf and ERANGE
@@ -1634,8 +1633,10 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             if (strcmp(optarg, "allkeys") == 0)
                 cfg->requests = -1;
             else {
-                if (!parse_unsigned(optarg, ULLONG_MAX, &cfg->requests) || !cfg->requests) {
-                    fprintf(stderr, "error: requests must be greater than zero.\n");
+                // ULLONG_MAX is the "allkeys" sentinel, so it is not a valid count.
+                if (!parse_unsigned(optarg, ULLONG_MAX - 1, &cfg->requests) || !cfg->requests) {
+                    fprintf(stderr, "error: requests must be %s.\n",
+                            isdigit((unsigned char) *optarg) ? "greater than zero" : "a positive integer");
                     return -1;
                 }
                 if (cfg->test_time) {
@@ -1646,21 +1647,24 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             break;
         case 'c':
             if (!parse_unsigned(optarg, UINT_MAX, &val) || !val) {
-                fprintf(stderr, "error: clients must be greater than zero.\n");
+                fprintf(stderr, "error: clients must be %s.\n",
+                        isdigit((unsigned char) *optarg) ? "greater than zero" : "a positive integer");
                 return -1;
             }
             cfg->clients = (unsigned int) val;
             break;
         case 't':
             if (!parse_unsigned(optarg, UINT_MAX, &val) || !val) {
-                fprintf(stderr, "error: threads must be greater than zero.\n");
+                fprintf(stderr, "error: threads must be %s.\n",
+                        isdigit((unsigned char) *optarg) ? "greater than zero" : "a positive integer");
                 return -1;
             }
             cfg->threads = (unsigned int) val;
             break;
         case o_test_time:
             if (!parse_unsigned(optarg, UINT_MAX, &val) || !val) {
-                fprintf(stderr, "error: test time must be greater than zero.\n");
+                fprintf(stderr, "error: test time must be %s.\n",
+                        isdigit((unsigned char) *optarg) ? "greater than zero" : "a positive integer");
                 return -1;
             }
             cfg->test_time = (unsigned int) val;
@@ -1677,24 +1681,24 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             }
             break;
         case o_pipeline: {
-            if (!parse_unsigned(optarg, ULLONG_MAX, &val) || !val) {
-                fprintf(stderr, "error: pipeline must be greater than zero.\n");
-                return -1;
-            }
-            if (val > MEMTIER_PIPELINE_MAX) {
-                fprintf(stderr, "error: pipeline must be <= %u.\n", MEMTIER_PIPELINE_MAX);
+            bool too_large;
+            if (!parse_unsigned(optarg, MEMTIER_PIPELINE_MAX, &val, &too_large) || !val) {
+                if (too_large)
+                    fprintf(stderr, "error: pipeline must be <= %u.\n", MEMTIER_PIPELINE_MAX);
+                else
+                    fprintf(stderr, "error: pipeline must be greater than zero.\n");
                 return -1;
             }
             cfg->pipeline = (unsigned int) val;
             break;
         }
         case 'd': {
-            if (!parse_unsigned(optarg, ULLONG_MAX, &val) || !val) {
-                fprintf(stderr, "error: data-size must be greater than zero.\n");
-                return -1;
-            }
-            if (val > MEMTIER_DATA_SIZE_MAX) {
-                fprintf(stderr, "error: data-size must be <= %u bytes (512 MiB).\n", MEMTIER_DATA_SIZE_MAX);
+            bool too_large;
+            if (!parse_unsigned(optarg, MEMTIER_DATA_SIZE_MAX, &val, &too_large) || !val) {
+                if (too_large)
+                    fprintf(stderr, "error: data-size must be <= %u bytes (512 MiB).\n", MEMTIER_DATA_SIZE_MAX);
+                else
+                    fprintf(stderr, "error: data-size must be greater than zero.\n");
                 return -1;
             }
             cfg->data_size = (unsigned int) val;
@@ -1928,7 +1932,8 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         case o_connection_stage_timeout:
             // 0 is allowed and disables the supervisor (opt-out for users
             // running long pre-warmed handshakes against slow servers).
-            if (!parse_unsigned(optarg, UINT_MAX, &val)) {
+            // UINT_MAX is the "not set" sentinel (defaults to 30 s).
+            if (!parse_unsigned(optarg, UINT_MAX - 1, &val)) {
                 fprintf(stderr, "error: connection-stage-timeout must be a valid number (seconds, 0 disables).\n");
                 return -1;
             }
@@ -2253,7 +2258,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             // Unlike --statsd-port this accepts 0; parse_unsigned() rejects a
             // sign or leading whitespace and bounds the value to [0,65535]
             // BEFORE the narrowing cast (a cast would silently wrap
-            // 70000 -> 4464). PLAN.md section 5 / E1.
+            // 70000 -> 4464).
             static const char *E1 = "error: prometheus-port must be a number in the range [0-65535] (0 = ephemeral).\n";
             if (!parse_unsigned(optarg, 65535, &val)) {
                 fprintf(stderr, "%s", E1);
