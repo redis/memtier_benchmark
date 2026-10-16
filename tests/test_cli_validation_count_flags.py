@@ -229,12 +229,21 @@ WRAPPED_VALUES = (
     "\n-1",
     "\v-1",
     "-1",
-    " 5",
-    "+5",
+    " -5",
+    "- 5",
+    "+-5",
+    "++5",
+    "+ 5",
     "",
+    " ",
     "5x",
+    "5 ",
     "99999999999999999999999",
 )
+
+# What strtoul() accepted harmlessly before (leading whitespace, one '+') is
+# still accepted, so existing command lines keep working.
+RELAXED_VALUES = (" 5", "\t5", "\n5", "+5", " +5")
 
 
 def test_unsigned_options_reject_wrapped_values(env):
@@ -264,8 +273,9 @@ def test_unsigned_int_options_reject_values_above_uint_max(env):
 
 def test_unsigned_options_accept_valid_values(env):
     for option in UNSIGNED_OPTIONS:
-        result = _run_memtier([option, "1", "--version"])
-        env.assertEqual(result.returncode, 0, message=option + " 1: " + result.stderr)
+        for value in ("1",) + RELAXED_VALUES:
+            result = _run_memtier([option, value, "--version"])
+            env.assertEqual(result.returncode, 0, message="{} {!r}: {}".format(option, value, result.stderr))
     for option, top in (("--max-reconnect-attempts", "4294967295"), ("--retry-backoff-ms", "4294967295"),
                         ("--max-retry-queue", "4294967295"), ("--connection-timeout", "4294967295"),
                         ("--connection-stage-timeout", "4294967294")):
@@ -292,12 +302,16 @@ def test_unsigned_options_reject_sentinel_values(env):
 
 
 def test_unsigned_options_keep_specific_messages(env):
-    """Negative input keeps "must be a positive integer"; overflow on a capped
-    option keeps the cap message rather than "greater than zero"."""
+    """Negative or malformed input keeps "must be a positive integer", zero
+    says "greater than zero", and overflow on a capped option names the cap."""
     for option, prefix in (("-n", "requests"), ("-c", "clients"), ("-t", "threads"), ("--test-time", "test time")):
-        result = _run_memtier([option, "-1", "--version"])
-        env.assertTrue("error: {} must be a positive integer.".format(prefix) in result.stderr,
-                       message="{} -1: {!r}".format(option, result.stderr))
+        for value in ("-1", "5x", "12abc", ""):
+            result = _run_memtier([option, value, "--version"])
+            env.assertTrue("error: {} must be a positive integer.".format(prefix) in result.stderr,
+                           message="{} {!r}: {!r}".format(option, value, result.stderr))
+        result = _run_memtier([option, "0", "--version"])
+        env.assertTrue("error: {} must be greater than zero.".format(prefix) in result.stderr,
+                       message="{} 0: {!r}".format(option, result.stderr))
     # Too large (above the field's range, or ERANGE) names the limit.
     for option, prefix, values in (("-c", "clients", ("4294967296", "99999999999999999999999")),
                                    ("-t", "threads", ("4294967296", "99999999999999999999999")),
@@ -321,5 +335,14 @@ def test_unsigned_options_ignore_errno_from_earlier_options(env):
     --key-maximum does not check ERANGE yet (#725), so it is used here to
     leave errno set; once #725 lands, pick another errno source.
     """
+    # Guard: if --key-maximum starts rejecting overflow, the errno-leak tests
+    # below and in test_cli_validation_{ports,reconnect_backoff,retry_backoff}.py
+    # would pass for the wrong reason (or fail confusingly). Fail loudly instead.
+    probe = _run_memtier(["--key-maximum=99999999999999999999999", "--version"])
+    env.assertEqual(
+        probe.returncode, 0,
+        message=("--key-maximum=99999999999999999999999 is now rejected (#725 fixed?). The errno-leak tests "
+                 "use it to leave errno == ERANGE behind: pick a new errno source for them. stderr: "
+                 + probe.stderr))
     result = _run_memtier(["--key-maximum=99999999999999999999999", "-c", "5", "--version"])
     env.assertEqual(result.returncode, 0, message=result.stderr)

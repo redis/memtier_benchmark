@@ -921,17 +921,22 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
     jsonhandler->close_nesting();
 }
 
-// Parse an unsigned decimal option value: the whole string must be a number
-// in [0,max], starting with a digit (no sign or leading whitespace).
-// strtoull() would otherwise skip any whitespace (including '\n', '\v', ...)
-// and accept a '-', wrapping "-1" or "\n-18446744073709551000" into the valid
-// range.  ERANGE and the range are checked BEFORE the caller narrows the
-// result, so values above UINT_MAX cannot wrap modulo 2^32.  If too_large is
-// given, it is set when the value is a well-formed number above max.
+// Parse an unsigned decimal option value in [0,max].  Like strtoull(), leading
+// whitespace and a single '+' are accepted, so existing command lines keep
+// working; but a '-' is rejected wherever it appears, since strtoull() would
+// negate it and wrap "-1" or "\n-18446744073709551000" into the valid range.
+// Empty input, trailing junk, ERANGE and values above max are rejected BEFORE
+// the caller narrows the result, so values above UINT_MAX cannot wrap modulo
+// 2^32.  If too_large is given, it is set when the value is a well-formed
+// number above max.
 static bool parse_unsigned(const char *s, unsigned long long max, unsigned long long *out, bool *too_large = NULL)
 {
     if (too_large) *too_large = false;
-    if (s == NULL || !isdigit((unsigned char) *s)) return false;
+    if (s == NULL) return false;
+    while (isspace((unsigned char) *s))
+        s++;
+    if (*s == '+') s++;
+    if (!isdigit((unsigned char) *s)) return false;
     char *endptr = NULL;
     errno = 0;
     unsigned long long v = strtoull(s, &endptr, 10);
@@ -956,15 +961,16 @@ static bool parse_port(const char *s, unsigned short *out)
 }
 
 // Error for a count option (-n, -c, -t, --test-time) that parse_unsigned()
-// rejected or that was zero: say why, so "-1" and "99999..." are not both
-// reported as "must be greater than zero".
-static void count_option_error(const char *name, const char *s, bool too_large, unsigned long long max)
+// rejected (parsed == false) or that was zero: say why, so "-1", "5x",
+// "99999..." and "0" are not all reported as "must be greater than zero".
+static void count_option_error(const char *name, bool parsed, bool too_large, unsigned long long max)
 {
     if (too_large)
         fprintf(stderr, "error: %s must be <= %llu.\n", name, max);
+    else if (parsed)
+        fprintf(stderr, "error: %s must be greater than zero.\n", name);
     else
-        fprintf(stderr, "error: %s must be %s.\n", name,
-                isdigit((unsigned char) *s) ? "greater than zero" : "a positive integer");
+        fprintf(stderr, "error: %s must be a positive integer.\n", name);
 }
 
 // Parse URI and populate config fields
@@ -1647,8 +1653,9 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             else {
                 // ULLONG_MAX is the "allkeys" sentinel, so it is not a valid count.
                 bool too_large;
-                if (!parse_unsigned(optarg, ULLONG_MAX - 1, &cfg->requests, &too_large) || !cfg->requests) {
-                    count_option_error("requests", optarg, too_large, ULLONG_MAX - 1);
+                bool parsed = parse_unsigned(optarg, ULLONG_MAX - 1, &cfg->requests, &too_large);
+                if (!parsed || !cfg->requests) {
+                    count_option_error("requests", parsed, too_large, ULLONG_MAX - 1);
                     return -1;
                 }
                 if (cfg->test_time) {
@@ -1659,8 +1666,9 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             break;
         case 'c': {
             bool too_large;
-            if (!parse_unsigned(optarg, UINT_MAX, &val, &too_large) || !val) {
-                count_option_error("clients", optarg, too_large, UINT_MAX);
+            bool parsed = parse_unsigned(optarg, UINT_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("clients", parsed, too_large, UINT_MAX);
                 return -1;
             }
             cfg->clients = (unsigned int) val;
@@ -1668,8 +1676,9 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         }
         case 't': {
             bool too_large;
-            if (!parse_unsigned(optarg, UINT_MAX, &val, &too_large) || !val) {
-                count_option_error("threads", optarg, too_large, UINT_MAX);
+            bool parsed = parse_unsigned(optarg, UINT_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("threads", parsed, too_large, UINT_MAX);
                 return -1;
             }
             cfg->threads = (unsigned int) val;
@@ -1677,8 +1686,9 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         }
         case o_test_time: {
             bool too_large;
-            if (!parse_unsigned(optarg, UINT_MAX, &val, &too_large) || !val) {
-                count_option_error("test time", optarg, too_large, UINT_MAX);
+            bool parsed = parse_unsigned(optarg, UINT_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("test time", parsed, too_large, UINT_MAX);
                 return -1;
             }
             cfg->test_time = (unsigned int) val;

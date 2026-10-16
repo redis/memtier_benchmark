@@ -145,6 +145,8 @@ $ memtier_benchmark --help
 
 for command line options.
 
+Numeric options that take a count, size, timeout or port (for example `-n`, `-c`, `-t`, `--test-time`, `--pipeline`, `-d`, `--max-reconnect-attempts`, `--prometheus-port`) reject negative, empty, out-of-range and malformed values instead of silently wrapping them. Leading whitespace and a `+` are still accepted. Note that an empty value such as `--max-reconnect-attempts=` used to mean 0 (unlimited) and is now an error.
+
 ### Using monitor input files
 
 You can replay real command streams by pointing memtier_benchmark to a monitor log file with the `--monitor-input=/path/to/file` option. Special commands such as `__monitor_line1__` pick a specific entry from the file, while `__monitor_line@__` selects commands at runtime (optionally combined with `--monitor-pattern` and `--command-ratio`). For example, the following command replays the first command from the file on each request:
