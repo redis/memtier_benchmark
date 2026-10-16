@@ -1299,11 +1299,13 @@ static bool verify_arbitrary_command_option(struct benchmark_config *cfg)
 //                  --data-size-list).  Matches Redis' default proto-max-bulk-len
 //                  (512 MiB), past which the server rejects the bulk anyway.
 //   MULTI_KEY_GET_MAX: upper bound on --multi-key-get.  Every client
-//                  preallocates a keylist of multi_key_get + 1 entries, with
-//                  256 bytes of key buffer per entry in an unsigned int
-//                  (keylist::keylist()), which wraps above 16777215 entries.
-//                  Memory is left to the user: about 272 bytes per entry per
-//                  client, so about 4.3 GiB per client at this cap.
+//                  preallocates a keylist of multi_key_get + 1 entries with a
+//                  256-byte key buffer per entry.  At this cap that initial
+//                  buffer is 2^32 - 256 bytes, the largest that fits the
+//                  32-bit size keylist used to have (it wrapped one entry
+//                  later); the buffer now grows in size_t, so longer keys are
+//                  safe too.  Memory is left to the user: about 272 bytes per
+//                  entry per client, so about 4.3 GiB per client at this cap.
 #define MEMTIER_PIPELINE_MAX 1024u
 #define MEMTIER_DATA_SIZE_MAX (512u * 1024u * 1024u)
 #define MEMTIER_MULTI_KEY_GET_MAX 16777214u

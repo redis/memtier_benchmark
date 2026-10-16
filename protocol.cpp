@@ -28,6 +28,7 @@
 #endif
 
 #include "protocol.h"
+#include "keylist_growth.h"
 #include "memtier_benchmark.h"
 #include "libmemcached_protocol/binary.h"
 
@@ -1574,7 +1575,7 @@ keylist::keylist(unsigned int max_keys) :
     memset(m_keys, 0, m_keys_size * sizeof(key_entry));
 
     /* allocate buffer for actual keys */
-    m_buffer_size = 256 * m_keys_size;
+    m_buffer_size = (size_t) 256 * m_keys_size;
     m_buffer = (char *) malloc(m_buffer_size);
     assert(m_buffer != NULL);
     memset(m_buffer, 0, m_buffer_size);
@@ -1600,11 +1601,12 @@ bool keylist::add_key(const char *key, unsigned int key_len)
     if (m_keys_count >= m_keys_size) return false;
 
     // have buffer? (+1 for the NUL terminator written after the key bytes)
-    if (m_buffer_ptr + key_len + 1 > m_buffer + m_buffer_size) {
-        ptrdiff_t offset = m_buffer_ptr - m_buffer;
-        while (m_buffer_ptr + key_len + 1 > m_buffer + m_buffer_size) {
-            m_buffer_size *= 2;
-        }
+    size_t offset = (size_t) (m_buffer_ptr - m_buffer);
+    size_t needed = offset + (size_t) key_len + 1;
+    if (needed > m_buffer_size) {
+        // size_t growth: an unsigned int size wrapped to 0 past 2 GiB and the
+        // doubling loop never ended.
+        m_buffer_size = keylist_grow_size(m_buffer_size, needed);
         m_buffer = (char *) realloc(m_buffer, m_buffer_size);
         assert(m_buffer != NULL);
         // Re-base all key_ptr entries into the new allocation. Keys are packed

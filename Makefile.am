@@ -51,7 +51,7 @@ memtier_benchmark_SOURCES = \
 	run_stats_types.cpp run_stats_types.h latency_percentiles.h \
 	run_stats.cpp run_stats.h latency_histogram.h \
 	JSON_handler.cpp JSON_handler.h \
-	protocol.cpp protocol.h libmemcached_protocol/binary.h libmemcached_protocol/vbucket.h \
+	protocol.cpp protocol.h keylist_growth.h libmemcached_protocol/binary.h libmemcached_protocol/vbucket.h \
 	obj_gen.cpp obj_gen.h \
 	item.cpp item.h \
 	file_io.cpp file_io.h \
@@ -78,7 +78,7 @@ memtier_benchmark_LDADD = \
 	$(LIBSSL_LIBS)
 
 
-check_PROGRAMS = prometheus_metrics_test rate_limiter_test retry_backoff_test retry_drain_test socket_options_test hdr_histogram_test cluster_transaction_test \
+check_PROGRAMS = prometheus_metrics_test rate_limiter_test retry_backoff_test keylist_growth_test retry_drain_test socket_options_test hdr_histogram_test cluster_transaction_test \
     cluster_hslot_test run_stats_counters_test run_stats_merge_test
 
 # The metrics test links only the pure layer (prometheus_metrics.{h,cpp}).
@@ -95,6 +95,9 @@ prometheus_metrics_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 rate_limiter_test_SOURCES = tests/unit/rate_limiter_test.cpp rate_limiter.h
 rate_limiter_test_CPPFLAGS = -I$(srcdir)
 rate_limiter_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+keylist_growth_test_SOURCES = tests/unit/keylist_growth_test.cpp keylist_growth.h
+keylist_growth_test_CPPFLAGS = -I$(srcdir)
+keylist_growth_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 retry_backoff_test_SOURCES = tests/unit/retry_backoff_test.cpp retry_backoff.h
 retry_backoff_test_CPPFLAGS = -I$(srcdir)
 retry_backoff_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g

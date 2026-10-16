@@ -382,7 +382,7 @@ ULLONG_MAX = "18446744073709551615"
 POSITIVE_OPTIONS = {
     "--key-minimum": ("key-minimum", ULLONG_MAX),
     "--key-maximum": ("key-maximum", ULLONG_MAX),
-    # Capped where keylist's 256 * (N + 1) buffer size would wrap (MEMTIER_MULTI_KEY_GET_MAX).
+    # Capped where keylist's initial 256 * (N + 1) buffer reaches 4 GiB (MEMTIER_MULTI_KEY_GET_MAX).
     "--multi-key-get": ("multi-key-get", "16777214"),
     "--rate-limiting": ("rate-limiting", UINT_MAX),
     "--clients-start": ("clients-start", UINT_MAX),
@@ -608,9 +608,10 @@ def test_jitter_max_range_does_not_divide_by_zero(env):
 
 
 def test_multi_key_get_cap(env):
-    """INT_MAX used to be accepted; keylist's unsigned 256 * (N + 1) buffer
+    """INT_MAX used to be accepted; keylist's 32-bit 256 * (N + 1) buffer
     size then wrapped, and the startup allocation exhausted memory. The cap
-    is that correctness bound, so values that used to work (2000000) still do."""
+    is where that size reaches 4 GiB, so values that used to work (2000000)
+    still do."""
     for value in ("2000000", "16777214"):
         result = _run_memtier(["--multi-key-get=" + value, "--version"])
         env.assertEqual(result.returncode, 0, message="{}: {}".format(value, result.stderr))
@@ -624,10 +625,11 @@ def test_multi_key_get_cap(env):
 def test_key_maximum_full_range_runs(env):
     """--key-maximum=ULLONG_MAX with the default --key-minimum (0) is a full
     64-bit key range: r_max - r_min + 1 wrapped to 0, so random keys hit
-    rn % 0 (SIGFPE) and Gaussian keys never passed val > max + 1 == 0."""
+    rn % 0 (SIGFPE), Gaussian keys never passed val > max + 1 == 0, and a
+    Zipf sample could be the double 2^64, which does not convert."""
     env.skipOnCluster()
     master = env.getMasterNodesList()[0]
-    for pattern, clients in (("R:R", "1"), ("G:G", "1"), ("S:S", "1"), ("P:P", "2")):
+    for pattern, clients in (("R:R", "1"), ("G:G", "1"), ("Z:Z", "1"), ("S:S", "1"), ("P:P", "2")):
         label = "--key-pattern={}".format(pattern)
         specs = {"args": ["-s", "127.0.0.1", "-p", str(master["port"]), "-n", "3", "-c", clients, "-t", "1",
                           "--key-maximum=" + ULLONG_MAX, "--key-pattern=" + pattern, "--hide-histogram"]}

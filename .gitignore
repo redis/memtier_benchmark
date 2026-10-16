@@ -74,6 +74,7 @@ tests/.env/
 /cluster_transaction_test
 /cluster_hslot_test
 /rate_limiter_test
+/keylist_growth_test
 /retry_backoff_test
 /retry_drain_test
 /socket_options_test

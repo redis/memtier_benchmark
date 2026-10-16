@@ -207,7 +207,7 @@ protected:
 
     char *m_buffer;
     char *m_buffer_ptr;
-    unsigned int m_buffer_size;
+    size_t m_buffer_size;
 
     key_entry *m_keys;
     unsigned int m_keys_size;
