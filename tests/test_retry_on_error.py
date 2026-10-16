@@ -1103,15 +1103,24 @@ def _run_transaction_with_kills(env, extra_args, requests=None, test_time=None, 
 
     kills = []
 
+    def sending():
+        return any(conn.execute_command("INFO", "commandstats").get("cmdstat_multi", {}).get("calls", 0)
+                   for conn in conns)
+
     def kill_loop(proc):
         end = time.time() + (test_time - 1 if test_time else 60)
+        # The first wave goes in as soon as memtier is sending transactions,
+        # not one kill_interval in: a fast runner can finish a --requests run
+        # within kill_interval, and nothing is killed (#682).
+        while time.time() < end and proc.poll() is None and not sending():
+            time.sleep(0.001)
         while time.time() < end and proc.poll() is None:
-            time.sleep(kill_interval)
             for conn in conns:
                 try:
                     kills.append(conn.execute_command("CLIENT", "KILL", "TYPE", "normal"))
                 except Exception as e:
                     env.debugPrint("CLIENT KILL failed: {}".format(e), True)
+            time.sleep(kill_interval)
 
     rc, stderr_content = _run_with_background(env, benchmark, config, kill_loop, timeout=(test_time or 60) + 30)
 
@@ -1162,8 +1171,11 @@ def test_dropped_transaction_requests_do_not_stall_requests_run(env):
     Transaction requests dropped on a kill are uncounted, so a --requests run
     still sends every request and ends.
     """
-    rc, stderr_content, _, _, _ = _run_transaction_with_kills(env, ["--retry-on-error"], requests=30000,
-                                                              kill_interval=0.3, pipeline=4)
+    rc, stderr_content, _, _, rows = _run_transaction_with_kills(env, ["--retry-on-error"], requests=30000,
+                                                                 kill_interval=0.3, pipeline=4)
+    # The scenario needs a kill that dropped in-flight transaction requests.
+    dropped = [r for r in rows if r.endswith(',"transaction-not-replayed",0')]
+    env.assertGreaterEqual(len(dropped), 1, message="no in-flight transaction request was dropped on a kill")
     env.assertFalse("stopped before reaching" in stderr_content,
                     message="client stopped sending after dropping transaction requests")
     env.assertEqual(rc, 0, message="memtier exited {} after connection kills".format(rc))
