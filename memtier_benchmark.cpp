@@ -3430,11 +3430,11 @@ static hdr_histogram *prom_drain_latency(benchmark_config *cfg, std::vector<cg_t
     return tick;
 }
 
-// 1 Hz publish: the fully-filled snapshot + the drained tick histogram.
-// PLAN.md section 3.7.
-static void prom_publish_tick(benchmark_config *cfg, const metrics_snapshot &snap, std::vector<cg_thread *> &threads)
+// 1 Hz publish: the fully-filled snapshot + the tick histogram drained by
+// prom_drain_latency. PLAN.md section 3.7.
+static void prom_publish_tick(benchmark_config *cfg, const metrics_snapshot &snap, const hdr_histogram *latency)
 {
-    cfg->prometheus->publish(snap, prom_drain_latency(cfg, threads));
+    cfg->prometheus->publish(snap, latency);
 }
 
 static void prom_publish_run_start(benchmark_config *cfg, uint32_t run_id)
@@ -3458,7 +3458,11 @@ static inline bool prom_enabled(benchmark_config *)
 }
 static inline void prom_observe_and_fill(benchmark_config *, std::vector<cg_thread *> &, metrics_snapshot &) {}
 static inline void prom_fold_thread(benchmark_config *, size_t, client_group *) {}
-static inline void prom_publish_tick(benchmark_config *, const metrics_snapshot &, std::vector<cg_thread *> &) {}
+static inline hdr_histogram *prom_drain_latency(benchmark_config *, std::vector<cg_thread *> &)
+{
+    return NULL;
+}
+static inline void prom_publish_tick(benchmark_config *, const metrics_snapshot &, const hdr_histogram *) {}
 static inline void prom_publish_run_start(benchmark_config *, uint32_t) {}
 static inline void prom_publish_run_end(benchmark_config *, uint32_t, std::vector<cg_thread *> &) {}
 
@@ -3940,9 +3944,15 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             snap.cur_latency_ms = cur_latency;
             snap.avg_latency_ms = avg_latency;
             snap.run_connection_errors = total_connection_errors; // RAW per-run (Decisions #11)
+            // Drain the latency histograms BEFORE reading the op counters: a
+            // second is folded (under the drain's mutex) only after its ops
+            // were counted, so memtier_latency_seconds_count never exceeds
+            // memtier_ops_total, even when a thread finishes or a connection
+            // rolls its second between the two reads.
+            hdr_histogram *prom_latency = prom_enabled(cfg) ? prom_drain_latency(cfg, threads) : NULL;
             if (prom_enabled(cfg)) prom_observe_and_fill(cfg, threads, snap);
             if (statsd_on) statsd_publish_tick(cfg->statsd, snap, inst_samples, live_quantiles, inst_values);
-            if (prom_enabled(cfg)) prom_publish_tick(cfg, snap, threads); // gated walk + publish (PLAN 3.7)
+            if (prom_enabled(cfg)) prom_publish_tick(cfg, snap, prom_latency); // PLAN 3.7
         }
 
         // Per-second CPU sampling (advisory).

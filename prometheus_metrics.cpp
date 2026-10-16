@@ -97,9 +97,9 @@ static const metric_def kMetricDefs[] = {
      "Configured --test-time in seconds; 0 when running by --requests."},
     {"memtier_latency_seconds", MT_TYPE_HISTOGRAM,
      "Client-observed request latency in seconds of every completed operation, folded in once per completed "
-     "second, so _count trails memtier_ops_total by up to about one second of operations (longer while the server "
-     "is stalled); bucket placement carries up to 1% HDR quantization above ~1 ms (8 us absolute below ~2 ms); "
-     "authoritative latency is the end-of-run output."},
+     "second, so _count trails memtier_ops_total by about one second of operations (longer while the server is "
+     "stalled or rate-limited) and never exceeds it; bucket placement carries up to 1% HDR quantization above "
+     "~1 ms (8 us absolute below ~2 ms); authoritative latency is the end-of-run output."},
     {"memtier_exporter_renders_total", MT_TYPE_COUNTER,
      "Number of times the /metrics body was rendered (scrapes that missed the 1-second render cache)."},
     {"memtier_exporter_snapshot_age_seconds", MT_TYPE_GAUGE,

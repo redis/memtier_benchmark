@@ -305,14 +305,16 @@ per-run reset that a naive exporter would emit.
 latency histograms. Every completed operation is counted exactly once. Treat
 it as an operational signal, not the authoritative result:
 
-- **Up to ~1 s behind.** Each connection's second is folded in once that second
-  completes, and the exporter collects completed seconds at its 1 Hz tick, so
-  `memtier_latency_seconds_count` trails `memtier_ops_total` by up to about one
-  second of operations while a run is in progress. At run end the last partial
-  second is folded in, so `_count` catches up with the ops the clients
-  completed. While the server is stalled, a connection's in-progress second
-  does not complete, so the gap stays open (and `_count` frozen) until
-  operations complete again.
+- **About 1 s behind, never ahead.** A connection's second is folded in when
+  that connection completes its first operation of the next second, and the
+  exporter collects folded seconds at its 1 Hz tick. So while a run is in
+  progress `memtier_latency_seconds_count` trails `memtier_ops_total` by about
+  one second of operations, and never exceeds it. The lag is longer for a
+  connection whose next operation is slow to complete: while the server is
+  stalled the gap stays open (and `_count` frozen), and with a low
+  `--rate-limiting` rate it can span several seconds. At run end the last
+  partial second is folded in, so `_count` catches up with the ops the clients
+  completed.
 - **HDR quantization.** Bucket placement carries up to 1% HDR quantization
   above ~1 ms, and 8 µs absolute below ~2 ms (e.g. up to 8% at 100 µs); the
   `le` bound rendered is the user-supplied (µs-quantized)
