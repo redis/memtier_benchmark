@@ -106,9 +106,10 @@ static void test_many_clients(benchmark_config *config)
     long long start = usec(merged.get_start_time());
     long long duration = (long long) merged.get_duration_usec();
     fprintf(stderr, "start %lld (expected %lld), duration %lld usec\n", start, expected_start, duration);
-    // Each merge floors to a whole microsecond, which drifts the mean by
-    // under 1 ms here; an overflow puts it decades away.
-    CHECK(llabs(start - expected_start) <= 1000);
+    // Each merge floors to a whole microsecond, which drifts the mean down by
+    // 935 us here (deterministic inputs). Allow 2 ms; an overflow puts it
+    // decades away.
+    CHECK(llabs(start - expected_start) <= 2000);
     CHECK(duration == 3000000);
 }
 

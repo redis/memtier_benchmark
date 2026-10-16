@@ -1428,7 +1428,9 @@ def test_merged_duration_averages_all_threads(env):
 
     Four threads with one rate-limited client each take about 3 s for
     --requests=300. One client is disconnected once and waits the default 1 s
-    before reconnecting, so it ends about 1 s later. The mean over all four
+    before reconnecting, so it ends about 1 s later: the rate limiter resets
+    its budget on disconnect and refills it per interval after the reconnect,
+    so it does not catch up on the missed requests. The mean over all four
     clients is about 3.25 s. The last thread alone reports about 3 s or 4 s,
     depending on whether it held the killed client.
     """
@@ -1490,7 +1492,10 @@ def test_merged_duration_averages_all_threads(env):
         return_code, killed, killed_alive, stderr_content[-2000:])
     env.assertEqual(killed, 1, message="CLIENT KILL ID did not kill a workload client; " + diag)
     env.assertEqual(return_code, 0, message=diag)
-    env.assertTrue("Connection dropped" in stderr_content, message="the killed client did not reconnect; " + diag)
+    # CLIENT KILL arrives as EOF ("Connection dropped") or, e.g. as ECONNRESET
+    # or under TLS, as an error ("Connection error"); both log this.
+    env.assertTrue("attempting reconnection" in stderr_content,
+                   message="the killed client did not reconnect; " + diag)
     duration = runtime["Total duration"]
     env.assertEqual(duration, runtime["Finish time"] - runtime["Start time"], message=str(runtime))
     undelayed_ms = requests * 1000 // rate
