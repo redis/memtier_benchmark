@@ -19,6 +19,7 @@ Run:
 """
 import json
 import os
+import shutil
 import tempfile
 import threading
 
@@ -58,10 +59,13 @@ def _latency_bounds(derived, count):
 
     Below Accumulated/Count, a correct average can only be off by printing.
     The Time-Serie and Totals averages use double division, so they are off
-    by up to 0.0005 ms of %.3f rounding. The Sets/Gets and arbitrary-command
-    sections use integer us division (totals_cmd::summarize), so they are
-    exact multiples of 0.001 ms and at most (count-1)/(1000*count) ms low.
-    The static floor covers both. Keeping this side tight is what catches an
+    by up to 0.0005 ms of %.3f rounding. The Sets/Gets sections (and
+    arbitrary-command sections with --command-stats-breakdown=line) use
+    integer us division (totals_cmd::summarize), so they are exact multiples
+    of 0.001 ms and at most (count-1)/(1000*count) ms low. The static floor
+    covers both. These bounds do not hold for the default per-type
+    arbitrary-command sections, whose average is an HDR histogram mean;
+    _validate_run_section does not check those. Keeping this side tight is what catches an
     average truncated to an integer, for low counts too.
 
     AGGREGATED AVERAGE RESULTS is the exception: its averages are unweighted
@@ -221,6 +225,30 @@ def test_json_totals_latency_matches_accumulated_single_run(env):
                 debugPrintMemtierOnError(run_config, env)
     finally:
         pass
+
+
+def test_json_low_count_run_consistent(env):
+    """A 3-request run exercises the low-count bound on real output: with so
+    few ops, the %lld truncation of Accumulated Latency dominates."""
+    test_dir = tempfile.mkdtemp()
+    try:
+        benchmark, run_config = _build_benchmark(
+            env, test_dir,
+            extra_args=["--ratio=1:1", "--key-pattern=R:R", "--pipeline=1"],
+            threads=1, clients=1, requests=3)
+        ok = benchmark.run()
+        failed_asserts = env.getNumberOfFailedAssertion()
+        try:
+            env.assertTrue(ok, message="memtier_benchmark exited non-zero")
+            results = _read_json(run_config, env)
+            env.assertTrue("ALL STATS" in results,
+                           message="Expected 'ALL STATS' in JSON output")
+            _validate_run_section(env, "ALL STATS", results["ALL STATS"])
+        finally:
+            if env.getNumberOfFailedAssertion() > failed_asserts:
+                debugPrintMemtierOnError(run_config, env)
+    finally:
+        shutil.rmtree(test_dir, ignore_errors=True)
 
 
 def test_json_totals_latency_matches_accumulated_set_only(env):
@@ -757,3 +785,22 @@ def test_tolerance_rejects_truncated_average(env):
         {"Time-Serie": {"0": {"Count": 3, "Average Latency": "1.000",
                               "Accumulated Latency": 4}}})
     env.assertEqual(counter.failures, 2)
+
+
+def test_tolerance_bounds_both_sides(env):
+    counter = _FailureCounter()
+    # Correct integer-us Sets output just below Accumulated/Count: 3 ops
+    # summing to 2000 us print 0.666 against 2/3. Must be accepted.
+    _assert_latency_consistent(
+        counter, "synthetic.Sets",
+        {"Count": 3, "Latency": "0.666", "Average Latency": "0.666",
+         "Accumulated Latency": 2})
+    env.assertEqual(counter.failures, 0)
+    # Just above the upper bound: 100 ops, Accumulated 10 ms, so the bound is
+    # max(0.01, 1/100 + 0.0005) = 0.0105. An average 0.0106 above 0.1 cannot
+    # come from truncation plus rounding and must be rejected.
+    _assert_latency_consistent(
+        counter, "synthetic.Sets",
+        {"Count": 100, "Latency": "0.1106", "Average Latency": "0.1106",
+         "Accumulated Latency": 10})
+    env.assertEqual(counter.failures, 1)
