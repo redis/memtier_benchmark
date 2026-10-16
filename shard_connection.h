@@ -167,6 +167,9 @@ public:
     // allows another attempt, schedule a reconnect with backoff; otherwise
     // end this thread.
     void attempt_reconnect(const char *error_context);
+    void count_connection_error();
+    void disconnect_after_error();
+    void end_thread(const char *reason, const char *thread_end_reason);
     void reconnect_after_setup_error(const char *error_context);
     bool run_is_over();
     void retry_cluster_slots_after_error();
@@ -213,18 +216,15 @@ public:
     enum connection_state get_connection_state() { return m_connection_state; }
     bool is_reconnect_pending() const { return m_reconnecting; }
     // A replica connection closed because the server rejected its setup
-    // under --read-preference primary. A slot map refresh does not redial it
-    // while it is still a replica.
+    // under --read-preference primary. The replica path of a slot map refresh
+    // does not redial it; a refresh that makes the node a primary dials it
+    // through the primary path, where reconnect_after_setup_error() applies.
     bool is_setup_rejected_replica() const { return m_setup_rejected_replica; }
 
     // Topology role accessors. Defaults to role_primary; cluster_client flips
     // replicas to role_replica after CLUSTER SLOTS reveals them.
     enum shard_role get_role() const { return m_role; }
-    void set_role(enum shard_role role)
-    {
-        m_role = role;
-        if (role != role_replica) m_setup_rejected_replica = false;
-    }
+    void set_role(enum shard_role role) { m_role = role; }
     bool is_replica() const { return m_role == role_replica; }
     // --transaction: a MULTI was written and its EXEC/DISCARD not yet.
     bool is_multi_open() const { return m_multi_open; }
