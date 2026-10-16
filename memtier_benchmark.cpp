@@ -1099,6 +1099,20 @@ static bool optarg_is_negative(const char *s)
     return *s == '-';
 }
 
+// Parse a backoff factor: the whole string must be a finite, representable
+// number >= 0.  Rejects empty input, trailing junk, nan/inf and ERANGE
+// overflow/underflow.  Shared by --reconnect-backoff-factor and
+// --retry-backoff-factor so the two flags accept the same inputs.
+static bool parse_backoff_factor(const char *s, double *out)
+{
+    char *endptr = NULL;
+    errno = 0;
+    double v = strtod(s, &endptr);
+    if (endptr == s || !endptr || *endptr != '\0' || errno == ERANGE || !std::isfinite(v) || v < 0.0) return false;
+    *out = v;
+    return true;
+}
+
 #ifdef HAVE_EVHTTP
 // True if a bracket-free numeric IPv4/IPv6 literal is a loopback address
 // (PLAN.md section 5, W1). IPv4 loopback = 127.0.0.0/8; IPv6 loopback = ::1.
@@ -1760,11 +1774,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             }
             break;
         case o_reconnect_backoff_factor:
-            endptr = NULL;
-            errno = 0;
-            cfg->reconnect_backoff_factor = strtod(optarg, &endptr);
-            if (endptr == optarg || !endptr || *endptr != '\0' || errno == ERANGE ||
-                !std::isfinite(cfg->reconnect_backoff_factor) || cfg->reconnect_backoff_factor < 0.0) {
+            if (!parse_backoff_factor(optarg, &cfg->reconnect_backoff_factor)) {
                 fprintf(
                     stderr,
                     "error: reconnect-backoff-factor must be a finite, representable number >= 0 (0 = no backoff).\n");
@@ -1793,10 +1803,9 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             }
             break;
         case o_retry_backoff_factor:
-            endptr = NULL;
-            cfg->retry_backoff_factor = strtod(optarg, &endptr);
-            if (cfg->retry_backoff_factor < 0.0 || !endptr || *endptr != '\0') {
-                fprintf(stderr, "error: retry-backoff-factor must be >= 0 (0 = no exponential, constant backoff).\n");
+            if (!parse_backoff_factor(optarg, &cfg->retry_backoff_factor)) {
+                fprintf(stderr, "error: retry-backoff-factor must be a finite, representable number >= 0 (0 = no "
+                                "exponential, constant backoff).\n");
                 return -1;
             }
             break;
