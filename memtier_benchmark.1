@@ -245,7 +245,8 @@ Delay between retries in milliseconds (default: 0, immediate).
 \fB\-\-retry\-backoff\-factor\fR=\fI\,NUM\/\fR Multiply the delay by NUM on each retry of the same request:
 with NUM > 0 the Nth resend waits retry\-backoff\-ms * NUM^(N\-1),
 at most 60 s or retry\-backoff\-ms if larger (default: 0,
-constant retry\-backoff\-ms).
+constant retry\-backoff\-ms). Values below 1 shrink it, but
+never below 100 ms or retry\-backoff\-ms if smaller.
 .TP
 \fB\-\-retry\-on\fR=\fI\,LIST\/\fR
 Restrict retries to error\-status prefixes in this comma list

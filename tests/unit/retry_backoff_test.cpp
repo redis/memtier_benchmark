@@ -49,8 +49,22 @@ int main(void)
     CHECK_MS(retry_backoff_delay_ms(10, 2.0, 4), 160.0);
     CHECK_MS(retry_backoff_delay_ms(10, 1.0, 1000), 10.0);
     CHECK_MS(retry_backoff_delay_ms(1000, 0.5, 2), 250.0);
-    // A tiny factor underflows to 0, not NaN.
-    CHECK_MS(retry_backoff_delay_ms(10, 1e-300, 10), 0.0);
+
+    // A factor below 1 shrinks the delay down to 100 ms, not to 0 (#712).
+    CHECK_MS(retry_backoff_delay_ms(1000, 0.5, 3), 125.0);
+    CHECK_MS(retry_backoff_delay_ms(1000, 0.5, 4), 100.0);
+    CHECK_MS(retry_backoff_delay_ms(1000, 0.5, 4000000000U), 100.0);
+    CHECK_MS(retry_backoff_delay_ms(100, 0.5, 1), 100.0);
+    CHECK_MS(retry_backoff_delay_ms(100, 0.5, 20), 100.0);
+    CHECK_MS(retry_backoff_delay_ms(120000, 0.5, 30), 100.0);
+    // A base below 100 ms is its own floor: the delay never drops below it.
+    CHECK_MS(retry_backoff_delay_ms(10, 0.5, 1), 10.0);
+    CHECK_MS(retry_backoff_delay_ms(1, 0.5, 50), 1.0);
+    // A tiny factor underflows, not to 0 or NaN but to the floor.
+    CHECK_MS(retry_backoff_delay_ms(10, 1e-300, 10), 10.0);
+    CHECK_MS(retry_backoff_delay_ms(1000, DBL_MIN, 4000000000U), 100.0);
+    // No base delay stays immediate with a factor below 1 too.
+    CHECK_MS(retry_backoff_delay_ms(0, 0.5, 30), 0.0);
 
     // Growth stops at 60 s, including on overflow to inf.
     CHECK_MS(retry_backoff_delay_ms(10, 2.0, 12), 40960.0);
