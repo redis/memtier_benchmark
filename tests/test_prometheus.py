@@ -1404,9 +1404,9 @@ def test_F26_run_end_drains_latency(env):
 
 # ---------------------------------------------------------------------------
 # F27 -- the run-end snapshot counts every op after Ctrl+C (#637, PR #665).
-# On Ctrl+C, client_group::interrupt() stamps end times from the main thread
-# while workers may still finish a read callback; the post-join run-end drain
-# must pick those ops up. Ctrl+C ends the whole --run-count series (#690), so
+# On Ctrl+C, client_group::interrupt() only stops the workers' loops, and the
+# end times are stamped after pthread_join() (#710); the run-end snapshot must
+# still count the ops of the read callbacks the workers finished after it. Ctrl+C ends the whole --run-count series (#690), so
 # the run-end snapshot (run 1, 0 threads) is the last one before exit. To keep
 # the exporter up after it, results go to a FIFO shrunk to one page that the
 # test does not read: memtier blocks writing them until the test drains it.

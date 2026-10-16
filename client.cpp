@@ -1304,7 +1304,9 @@ client_group::client_group(benchmark_config *config, abstract_protocol *protocol
         m_staircase_timer(NULL),
         m_staircase_active_clients(0),
         m_staircase_steps(0),
-        m_interrupt_requested(false)
+        m_interrupt_requested(false),
+        m_worker_tid_set(false),
+        m_joined(false)
 {
     m_interrupt_time.tv_sec = 0;
     m_interrupt_time.tv_usec = 0;
@@ -1399,6 +1401,8 @@ unsigned int client_group::active_client_count(void)
 
 void client_group::run(void)
 {
+    m_worker_tid = pthread_self();
+    m_worker_tid_set = true;
     if (m_config->clients_start > 0) {
         setup_staircase_timer();
     }
@@ -1615,8 +1619,20 @@ void client_group::finalize_interrupted_clients(void)
     if (m_interrupt_requested) finalize_all_clients(&m_interrupt_time);
 }
 
+void client_group::check_stats_owner(const char *what)
+{
+    if (m_joined.load(std::memory_order_acquire)) return;
+    if (m_worker_tid_set && pthread_equal(pthread_self(), m_worker_tid)) return;
+    // Another thread would race with the worker recording into the same
+    // run_stats (roll_cur_stats() vs. set_end_time()). Always on: the race
+    // itself only shows up under a sanitizer, and then not every time.
+    fprintf(stderr, "BUG: %s off the worker thread before join\n", what);
+    abort();
+}
+
 void client_group::finalize_all_clients(struct timeval *end_time)
 {
+    check_stats_owner("finalize_all_clients()");
     // Iterate ALL clients, not just active ones. During staircase mode,
     // a client may have been prepare()-d but not yet counted in the atomic
     // (race window in handle_staircase_step). Using m_clients.size() ensures

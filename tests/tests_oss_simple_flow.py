@@ -1482,6 +1482,8 @@ def test_interrupt_does_not_race_worker_stats(env):
         # The end time is the interrupt time, not the (later) join.
         env.assertTrue(1000 <= runtime["Total duration"] <= 6000, message=runtime)
         env.assertTrue(results_dict["ALL STATS"]["Totals"]["Count"] > 0, message=attempt)
+        # One failed attempt is enough; the others would only repeat the
+        # same TSAN report in the log.
         if rc != 0:
             break
 

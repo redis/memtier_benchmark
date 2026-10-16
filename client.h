@@ -27,6 +27,7 @@
 #include <vector>
 #include <queue>
 #include <atomic>
+#include <pthread.h>
 #include <iterator>
 #include <event2/event.h>
 #include <event2/buffer.h>
@@ -338,6 +339,12 @@ protected:
     // the main thread.
     bool m_interrupt_requested;
     struct timeval m_interrupt_time;
+    // Only the worker thread that runs the loop may stamp the clients'
+    // run_stats until it has been joined (#710); check_stats_owner() checks it.
+    bool m_worker_tid_set;
+    pthread_t m_worker_tid;
+    std::atomic<bool> m_joined;
+    void check_stats_owner(const char *what);
     void setup_staircase_timer(void);
     void handle_staircase_step(void);
     static void staircase_timer_cb(evutil_socket_t fd, short what, void *arg);
@@ -356,6 +363,8 @@ public:
     void interrupt(void);
     void finalize_all_clients(struct timeval *end_time = NULL);
     void finalize_interrupted_clients(void);
+    // Called after pthread_join() of the worker thread that ran run().
+    void mark_joined(void) { m_joined.store(true, std::memory_order_release); }
     void set_all_clients_interrupted(void);
     unsigned int count_unended_clients(void);
     void end_stalled_clients(void);

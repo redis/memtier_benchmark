@@ -3049,6 +3049,7 @@ struct cg_thread
 
         ret = pthread_join(m_thread, (void **) &retval);
         assert(ret == 0);
+        m_cg->mark_joined();
     }
 };
 

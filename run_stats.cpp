@@ -1104,7 +1104,7 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
         total_duration_usec += ts_diff(i->m_start_time, i->m_end_time);
 
         // Like merge(): the average is interrupted if any of its runs was.
-        if (i->m_interrupted) m_interrupted = true;
+        if (i->get_interrupted()) set_interrupted(true);
     }
 
     m_totals.m_set_cmd.aggregate_average(all_stats.size());
@@ -1189,7 +1189,7 @@ void run_stats::merge(const run_stats &other, int iteration)
     // none unanswered.
     if (!other.has_started()) {
         m_cur_stats.m_connection_errors += other.m_totals.m_connection_errors;
-        if (other.m_interrupted) m_interrupted = true;
+        if (other.get_interrupted()) set_interrupted(true);
         return;
     }
 
@@ -1201,8 +1201,8 @@ void run_stats::merge(const run_stats &other, int iteration)
     if (other.has_started()) m_started.flag.store(true, std::memory_order_release);
 
     // If any run was interrupted, mark the merged result as interrupted
-    if (other.m_interrupted) {
-        m_interrupted = true;
+    if (other.get_interrupted()) {
+        set_interrupted(true);
     }
     m_unanswered_requests += other.m_unanswered_requests;
 
@@ -2030,7 +2030,7 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
         jsonhandler->write_obj("Finish time", "%lld", end_time_ms);
         jsonhandler->write_obj("Total duration", "%lld", end_time_ms - start_time_ms);
         jsonhandler->write_obj("Time unit", "\"%s\"", "MILLISECONDS");
-        jsonhandler->write_obj("Interrupted", "\"%s\"", m_interrupted ? "true" : "false");
+        jsonhandler->write_obj("Interrupted", "\"%s\"", get_interrupted() ? "true" : "false");
         jsonhandler->write_obj("Unanswered requests", "%llu", m_unanswered_requests);
         jsonhandler->close_nesting();
     }

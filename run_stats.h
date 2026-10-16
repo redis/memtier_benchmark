@@ -167,7 +167,9 @@ protected:
             return *this;
         }
     } m_started;
-    bool m_interrupted;
+    // Set by client_group::interrupt() on the main thread, possibly while the
+    // worker reads it (client_group::run()).
+    copyable_atomic_bool m_interrupted;
     // Workload requests abandoned because no reply came within
     // TEST_TIME_DRAIN_GRACE_SECS after --test-time ended.
     unsigned long long int m_unanswered_requests;
@@ -229,8 +231,8 @@ public:
     void set_start_time(struct timeval *start_time);
     void set_end_time(struct timeval *end_time);
     struct timeval get_start_time(void) const { return m_start_time; }
-    void set_interrupted(bool interrupted) { m_interrupted = interrupted; }
-    bool get_interrupted() const { return m_interrupted; }
+    void set_interrupted(bool interrupted) { m_interrupted.flag.store(interrupted, std::memory_order_relaxed); }
+    bool get_interrupted() const { return m_interrupted.flag.load(std::memory_order_relaxed); }
     void add_unanswered_requests(unsigned long long int n) { m_unanswered_requests += n; }
     unsigned long long int get_unanswered_requests() const { return m_unanswered_requests; }
 
