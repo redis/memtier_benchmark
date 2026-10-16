@@ -5035,34 +5035,6 @@ int main(int argc, char *argv[])
     }
 #endif
 
-    // Prepare output file
-    FILE *outfile;
-    if (cfg.out_file != NULL) {
-        fprintf(stderr, "Writing results to %s...\n", cfg.out_file);
-        // Fail now rather than run the whole benchmark and then write the
-        // results to a NULL FILE*. Opened before json_handler so this error
-        // leaves an existing --json-out-file untouched. Retry on EINTR, as
-        // json_handler does.
-        do {
-            outfile = fopen(cfg.out_file, "w");
-        } while (!outfile && errno == EINTR);
-        if (!outfile) {
-            fprintf(stderr, "error: cannot open --out-file %s: %s\n", cfg.out_file, strerror(errno));
-            exit(1);
-        }
-    } else {
-        fprintf(stderr, "Writing results to stdout\n");
-        outfile = stdout;
-    }
-
-    // JSON file initiation
-    json_handler *jsonhandler = NULL;
-    if (cfg.json_out_file != NULL) {
-        jsonhandler = new json_handler((const char *) cfg.json_out_file);
-        // We allways print the configuration to the JSON file
-        config_print_to_json(jsonhandler, &cfg);
-    }
-
     struct rlimit rlim;
     if (getrlimit(RLIMIT_NOFILE, &rlim) != 0) {
         benchmark_error_log("error: getrlimit failed: %s\n", strerror(errno));
@@ -5254,6 +5226,35 @@ int main(int argc, char *argv[])
             cfg.key_zipf_exp = 1.0;
         }
         obj_gen->set_key_zipf_distribution(cfg.key_zipf_exp);
+    }
+
+    // Prepare output files. This comes after all option validation and the
+    // data-import loading, so a startup error leaves an existing --out-file
+    // and --json-out-file untouched. --out-file goes first, so its open error
+    // leaves the JSON file untouched too. Nothing has connected yet.
+    FILE *outfile;
+    if (cfg.out_file != NULL) {
+        fprintf(stderr, "Writing results to %s...\n", cfg.out_file);
+        // Fail now rather than run the whole benchmark and then write the
+        // results to a NULL FILE*. Retry on EINTR, as json_handler does.
+        do {
+            outfile = fopen(cfg.out_file, "w");
+        } while (!outfile && errno == EINTR);
+        if (!outfile) {
+            fprintf(stderr, "error: cannot open --out-file %s: %s\n", cfg.out_file, strerror(errno));
+            exit(1);
+        }
+    } else {
+        fprintf(stderr, "Writing results to stdout\n");
+        outfile = stdout;
+    }
+
+    // JSON file initiation
+    json_handler *jsonhandler = NULL;
+    if (cfg.json_out_file != NULL) {
+        jsonhandler = new json_handler((const char *) cfg.json_out_file);
+        // We allways print the configuration to the JSON file
+        config_print_to_json(jsonhandler, &cfg);
     }
 
     if (!cfg.verify_only) {

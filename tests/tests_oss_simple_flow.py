@@ -1716,3 +1716,63 @@ def test_out_file_unwritable(env):
     env.assertLess(elapsed, 20)
     with open(json_path) as f:
         env.assertEqual(f.read(), json_before)
+
+
+def _startup_error_keeps_output_files(env, extra_args, expected_rc, expected_error):
+    """A startup validation error must leave existing output files untouched.
+
+    The --out-file and --json-out-file are opened only after all option
+    validation, so a run that never starts does not truncate them or leave
+    an unterminated JSON file behind (#718).
+    """
+    benchmark_specs = {"name": env.testName, "args": ['--hide-histogram'] + extra_args}
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=1, clients=1, requests=10)
+    add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+    test_dir = tempfile.mkdtemp()
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    out_path = os.path.join(config.results_dir, 'mb.stdout')
+    json_path = os.path.join(config.results_dir, 'mb.json')
+    out_before = 'previous results\n'
+    json_before = '{"previous": "run"}\n'
+    with open(out_path, 'w') as f:
+        f.write(out_before)
+    with open(json_path, 'w') as f:
+        f.write(json_before)
+    benchmark.args += ['--out-file', out_path, '--json-out-file', json_path]
+
+    process = subprocess.Popen(benchmark.args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        _, stderr = process.communicate(timeout=20)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        _, stderr = process.communicate()
+    stderr = stderr.decode(errors='replace')
+    env.assertEqual(process.returncode, expected_rc, message=stderr)
+    env.assertContains(expected_error, stderr)
+    env.assertNotContains("Launching threads", stderr)
+    with open(out_path) as f:
+        env.assertEqual(f.read(), out_before)
+    with open(json_path) as f:
+        env.assertEqual(f.read(), json_before)
+
+
+def test_startup_error_keeps_output_files_data_size(env):
+    _startup_error_keeps_output_files(env, ['--data-size', '10', '--data-size-list', '10:1'], 2,
+                                      "error: data-size cannot be used with data-size-list or data-size-range.")
+
+
+def test_startup_error_keeps_output_files_select_db(env):
+    # --cluster-mode (added for cluster envs) rejects the protocol first.
+    expected = ("error: cluster mode supported only in redis protocol." if env.isCluster()
+                else "error: select-db can only be used with redis protocol.")
+    _startup_error_keeps_output_files(env, ['-P', 'memcache_text', '--select-db', '1'], 2, expected)
+
+
+def test_startup_error_keeps_output_files_data_import(env):
+    # --cluster-mode (added for cluster envs) is rejected with --data-import first.
+    expected = ("error: Cluster mode cannot be specified when importing." if env.isCluster()
+                else "error: failed to read keys.")
+    _startup_error_keeps_output_files(env, ['--data-import', '/nonexistent-memtier-dir/keys.imp'], 1, expected)
