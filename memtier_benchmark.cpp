@@ -2560,7 +2560,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         case o_replica_clients: {
             bool too_large;
             if (!parse_unsigned(optarg, UINT_MAX, &val, &too_large)) {
-                non_negative_option_error("--replica-clients", too_large, UINT_MAX);
+                non_negative_option_error("replica-clients", too_large, UINT_MAX);
                 return -1;
             }
             cfg->replica_clients = (unsigned int) val;
@@ -2569,7 +2569,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         case o_replicas_per_shard: {
             bool too_large;
             if (!parse_unsigned(optarg, UINT_MAX, &val, &too_large)) {
-                non_negative_option_error("--replicas-per-shard", too_large, UINT_MAX);
+                non_negative_option_error("replicas-per-shard", too_large, UINT_MAX);
                 return -1;
             }
             cfg->replicas_per_shard = (unsigned int) val;
@@ -5038,7 +5038,8 @@ int main(int argc, char *argv[])
         /* Our event resolution is (at least) 50 events per second (event every >= 20 ml).
          * When we calculate the number of request per interval, we are taking
          * the upper bound and adjust the interval accordingly to get more accuracy */
-        cfg.request_per_interval = (cfg.request_rate + 50 - 1) / 50;
+        // 64-bit: request_rate + 49 wraps to 0 for rates near UINT_MAX.
+        cfg.request_per_interval = (unsigned int) (((unsigned long long) cfg.request_rate + 50 - 1) / 50);
         unsigned int events_per_second = cfg.request_rate / cfg.request_per_interval;
         cfg.request_interval_microsecond = 1000000 / events_per_second;
         benchmark_debug_log("Rate limiting configured to send %u requests per %u millisecond\n",

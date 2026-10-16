@@ -21,6 +21,10 @@ Run with:
   TEST=test_cli_validation_count_flags.py OSS_STANDALONE=1 ./tests/run_tests.sh
 """
 
+import ctypes
+import ctypes.util
+import errno
+import signal
 import subprocess
 
 from include import MEMTIER_BINARY
@@ -329,8 +333,22 @@ def test_unsigned_options_keep_specific_messages(env):
             env.assertTrue(cap in result.stderr, message="{} {}: {!r}".format(option, value, result.stderr))
 
 
+def _strtod_sets_erange(text):
+    """True if this host's libc strtod() sets errno to ERANGE for *text*.
+
+    C leaves ERANGE for a subnormal result implementation-defined, so check
+    the libc memtier is linked against rather than assume it.
+    """
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    libc.strtod.restype = ctypes.c_double
+    libc.strtod.argtypes = [ctypes.c_char_p, ctypes.c_void_p]
+    ctypes.set_errno(0)
+    libc.strtod(text.encode(), None)
+    return ctypes.get_errno() == errno.ERANGE
+
+
 def test_unsigned_options_ignore_errno_from_earlier_options(env):
-    """parse_unsigned() must reset errno itself.
+    """parse_unsigned() and parse_signed() must reset errno themselves.
 
     --key-median=1e-310 is accepted, but strtod() sets errno to ERANGE for
     the subnormal result, so it leaves a stale errno behind.
@@ -343,8 +361,13 @@ def test_unsigned_options_ignore_errno_from_earlier_options(env):
         probe.returncode, 0,
         message=("--key-median=1e-310 is now rejected. The errno-leak tests use it to leave "
                  "errno == ERANGE behind: pick a new errno source for them. stderr: " + probe.stderr))
-    result = _run_memtier(["--key-median=1e-310", "-c", "5", "--version"])
-    env.assertEqual(result.returncode, 0, message=result.stderr)
+    env.assertTrue(
+        _strtod_sets_erange("1e-310"),
+        message=("strtod(\"1e-310\") does not set ERANGE on this libc, so --key-median=1e-310 leaves no stale "
+                 "errno and the errno-leak tests prove nothing: pick a new errno source for them."))
+    for args in (["-c", "5"], ["--max-retries=5"], ["--max-retries=-1"]):
+        result = _run_memtier(["--key-median=1e-310"] + args + ["--version"])
+        env.assertEqual(result.returncode, 0, message="{}: {}".format(args, result.stderr))
 
 
 # ---------------------------------------------------------------------------
@@ -376,8 +399,8 @@ NON_NEGATIVE_OPTIONS = {
     "--thread-conn-start-max-jitter-micros": ("thread-conn-start-max-jitter-micros", UINT_MAX),
     "--select-db": ("select-db", INT_MAX),
     "--scan-incremental-max-iterations": ("scan-incremental-max-iterations", UINT_MAX),
-    "--replica-clients": ("--replica-clients", UINT_MAX),
-    "--replicas-per-shard": ("--replicas-per-shard", UINT_MAX),
+    "--replica-clients": ("replica-clients", UINT_MAX),
+    "--replicas-per-shard": ("replicas-per-shard", UINT_MAX),
 }
 
 REMAINING_OPTIONS = dict(POSITIVE_OPTIONS, **NON_NEGATIVE_OPTIONS)
@@ -520,3 +543,32 @@ def test_remaining_options_store_the_parsed_value(env):
     for args, expected in cases:
         out = _show_config(args)
         env.assertTrue(expected in out, message="{}: expected {!r} in {!r}".format(args, expected, out))
+
+
+def _assert_no_sigfpe(env, args, label):
+    """Run memtier against a closed port and assert it did not die of SIGFPE.
+
+    The run may end with a connection error, or still be sleeping in the
+    connection jitter when the timeout hits; both are fine.
+    """
+    try:
+        result = subprocess.run([MEMTIER_BINARY, "-s", "127.0.0.1", "-p", "1", "-t", "1", "-n", "1"] + args,
+                                capture_output=True, text=True, timeout=5)
+    except subprocess.TimeoutExpired:
+        return
+    env.assertNotEqual(result.returncode, -signal.SIGFPE, message=label + ": SIGFPE, stderr: " + result.stderr)
+    env.assertNotEqual(result.returncode, 128 + signal.SIGFPE, message=label + ": SIGFPE, stderr: " + result.stderr)
+
+
+def test_rate_limiting_max_does_not_divide_by_zero(env):
+    """(request_rate + 49) / 50 wrapped to 0 above UINT_MAX - 49, then
+    request_rate / 0 raised SIGFPE."""
+    for value in ("4294967247", UINT_MAX):
+        _assert_no_sigfpe(env, ["-c", "1", "--rate-limiting=" + value], "--rate-limiting=" + value)
+
+
+def test_jitter_max_range_does_not_divide_by_zero(env):
+    """A jitter range of UINT_MAX made jitter_range + 1 wrap to 0, and
+    rand() % 0 raised SIGFPE after the first connection."""
+    _assert_no_sigfpe(env, ["-c", "2", "--thread-conn-start-min-jitter-micros=0",
+                            "--thread-conn-start-max-jitter-micros=" + UINT_MAX], "jitter 0.." + UINT_MAX)

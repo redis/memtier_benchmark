@@ -1363,7 +1363,8 @@ int client_group::create_clients(int num)
             unsigned int jitter_micros = m_config->thread_conn_start_min_jitter_micros;
 
             if (jitter_range > 0) {
-                jitter_micros += rand() % (jitter_range + 1);
+                // 64-bit: jitter_range + 1 wraps to 0 for a UINT_MAX range.
+                jitter_micros += rand() % ((unsigned long long) jitter_range + 1);
             }
 
             usleep(jitter_micros);
