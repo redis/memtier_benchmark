@@ -157,6 +157,7 @@ def _check(env, password, target_args, want_uri, want_auth, secrets):
     env.assertEqual(cfg["authenticate"], want_auth)
     env.assertEqual(_show_config_value(stderr, "uri"), want_uri)
     env.assertEqual(_show_config_value(stderr, "authenticate"), want_auth)
+    return stderr
 
 
 def test_config_password_redaction_uri_user_password(env):
@@ -284,15 +285,20 @@ def test_config_uri_at_in_query_or_fragment_not_retargeted(env):
         decoy.close()
 
 
-def test_config_uri_credentials_without_host_rejected(env):
-    """Credentials with an empty host and no --server/--unix-socket must not
-    fall back to the default server."""
-    _host, port = _target(env)
-    with tempfile.TemporaryDirectory() as workdir:
-        _raw, stdout, stderr = _run(env, ["--uri", "redis://default:{}@:{}".format(_CANARY, port)], workdir,
-                                    expect_ok=False)
-    env.assertContains("missing host in URI", stderr)
-    env.assertFalse(_CANARY in stdout + stderr)
+def test_config_uri_credentials_without_host_warns_and_uses_default(env):
+    """Credentials with an empty host and no --server/--unix-socket fall back
+    to the default server (localhost), as on master, but now say so on stderr
+    without the password. The run reaches the target, since it is on
+    localhost, and the credentials are redacted everywhere."""
+    host, port = _target(env)
+    if host != "localhost":
+        env.skip()
+    stderr = _check(env, _CANARY, ["--uri", "redis://default:{}@:{}".format(_CANARY, port)],
+                    "redis://default:***@:{}".format(port), "default:***", [_CANARY])
+    env.assertContains("warning: --uri has no host; connecting to the default server localhost:{}.".format(port),
+                       stderr)
+    env.assertEqual(_show_config_value(stderr, "server"), "localhost")
+    env.assertFalse("missing host in URI" in stderr)
 
 
 def test_config_uri_without_host_uses_explicit_server(env):
@@ -330,8 +336,10 @@ def test_config_uri_at_in_path_without_credentials_known_limit(env):
     redis://host:port/1@other:port is read as credentials "host:port/1" for
     host "other". Treating a '/' before the first '@' as "no userinfo"
     would break a raw '/' in passwords, which master supports. The value is
-    redacted like any credential, and with nothing after the '@' the URI is
-    rejected rather than run against the default server.
+    redacted like any credential. With nothing after the '@', the '/' in the
+    "credentials" shows the '@' was a stray one after the path, so the URI is
+    rejected ("missing host in URI") rather than run against the default
+    server.
     """
     host, port = _target(env)
     closed = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

@@ -1156,14 +1156,20 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
     }
 
     // An '@' with no host after it and no explicit --server/--unix-socket
-    // would fall back to the default server and benchmark the wrong target.
-    // (parse_uri() runs before config_init_defaults(), so a non-NULL server
-    // or unix_socket here was given on the command line.) With an explicit
-    // target the host-less URI only carries credentials/port/db, as before.
+    // falls back to the default server, as before (parse_uri() runs before
+    // config_init_defaults(), so a non-NULL server or unix_socket here was
+    // given on the command line). If the "credentials" contain a '/', '?' or
+    // '#', the '@' was a stray one after the path (redis://host:6379/1@), not
+    // the end of real credentials: reject that rather than benchmark the
+    // default server. Otherwise (redis://user:pw@:6379) say where the run goes.
     if (auth_end && strlen(host_start) == 0 && !cfg->server && !cfg->unix_socket) {
-        fprintf(stderr, "error: missing host in URI.\n");
-        free(uri_copy);
-        return -1;
+        if (strpbrk(uri_authenticate.c_str(), "/?#")) {
+            fprintf(stderr, "error: missing host in URI.\n");
+            free(uri_copy);
+            return -1;
+        }
+        fprintf(stderr, "warning: --uri has no host; connecting to the default server localhost:%u.\n",
+                cfg->port ? cfg->port : 6379);
     }
 
     // Own URI hosts separately from a borrowed --server argument or the default.
