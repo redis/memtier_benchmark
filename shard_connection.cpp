@@ -1970,22 +1970,21 @@ void shard_connection::reconnect_after_setup_error(const char *error_context)
 // connection until a refresh succeeds, so it must not be left waiting.
 // - With --reconnect-on-error, reconnect, so --max-reconnect-attempts bounds
 //   the retries and they stop once the run is over.
-// - Otherwise, once the run has started, handle it like a dropped
+// - Otherwise, once this client has had a reply, handle it like a dropped
 //   connection: end this thread, so the run fails.
-// - Otherwise (at startup, before any connection reached steady state), ask
-//   again after a second, while --connection-stage-timeout lets the node
-//   converge.
+// - Otherwise (this client has not started), ask again after a second, so a
+//   node that has no slots yet can converge. Before any connection reached
+//   steady state, --connection-stage-timeout bounds the retries. After that
+//   it is disarmed, so they stop at the run's --test-time deadline
+//   (run_is_over()), or at once with --requests, which has no deadline.
 void shard_connection::retry_cluster_slots_after_error()
 {
     if (m_config->reconnect_on_error) {
         reconnect_after_setup_error("CLUSTER SLOTS error");
         return;
     }
-    // The run has started once this client had a reply, or once any
-    // connection reached steady state: that disarms
-    // --connection-stage-timeout, so retries at startup would no longer be
-    // bounded.
-    if (m_conns_manager->get_reqs_answered() || connection_stage_steady_state_reached()) {
+    if (m_conns_manager->get_reqs_answered() || run_is_over() ||
+        (m_config->test_time == 0 && connection_stage_steady_state_reached())) {
         attempt_reconnect("CLUSTER SLOTS error");
         return;
     }

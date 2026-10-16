@@ -21,7 +21,7 @@ class _Node(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
     def __init__(self, bad_slots_replies, moved_after=0, bad_reply=b"*0\r\n", replica=None, readonly_delay=0,
-                 first_good=False):
+                 first_good=False, bad_delay=0, auth_error=None):
         super().__init__(("127.0.0.1", 0), _Handler)
         self.lock = threading.Lock()
         # CLUSTER SLOTS requests answered with bad_reply: the ones after the
@@ -32,6 +32,10 @@ class _Node(socketserver.ThreadingTCPServer):
         # refreshes the slot map mid-run.
         self.moved_after = moved_after
         self.first_good = first_good
+        # How long to wait before sending bad_reply.
+        self.bad_delay = bad_delay
+        # Reply to AUTH, if not +OK.
+        self.auth_error = auth_error
         # A node listed as this node's replica in a good reply, and how long
         # a node waits before answering READONLY.
         self.replica = replica
@@ -48,6 +52,7 @@ class _Node(socketserver.ThreadingTCPServer):
             bad = (after_first and 1 < n <= 1 + self.bad_slots_replies) or \
                 (not after_first and n <= self.bad_slots_replies)
         if bad:
+            time.sleep(self.bad_delay)
             return self.bad_reply
         nodes = [self] + ([self.replica] if self.replica else [])
         reply = b"*1\r\n*" + str(2 + len(nodes)).encode() + b"\r\n:0\r\n:16383\r\n"
@@ -71,6 +76,8 @@ class _Handler(socketserver.StreamRequestHandler):
                 verb = args[0].upper()
                 if verb == b"CLUSTER":
                     reply = node.slots_reply()
+                elif verb == b"AUTH" and node.auth_error:
+                    reply = node.auth_error
                 elif verb == b"READONLY":
                     time.sleep(node.readonly_delay)
                     reply = b"+OK\r\n"
@@ -92,14 +99,14 @@ class _Handler(socketserver.StreamRequestHandler):
             node.errors.append(repr(error))
 
 
-def _run(node, extra_args, timeout=20, workers=1, clients=1):
+def _run(node, extra_args, timeout=20, workers=1, clients=1, cluster=True):
     others = [node.replica] if node.replica else []
     threads = [threading.Thread(target=n.serve_forever, daemon=True) for n in [node] + others]
     for thread in threads:
         thread.start()
     args = [MEMTIER_BINARY, "--server=127.0.0.1", "--port={}".format(node.server_address[1]),
-            "--cluster-mode", "--threads={}".format(workers), "--clients={}".format(clients),
-            "--hide-histogram"] + extra_args
+            "--threads={}".format(workers), "--clients={}".format(clients),
+            "--hide-histogram"] + (["--cluster-mode"] if cluster else []) + extra_args
     start = time.time()
     try:
         result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -218,6 +225,32 @@ def test_cluster_slots_empty_reply_for_one_client_honours_test_time(env):
     env.assertContains("CLUSTER SLOTS error, attempting reconnection", stderr)
     env.assertContains("Connection setup failed and the run is over, not reconnecting.", stderr)
     env.assertLess(elapsed, 10)
+
+
+def test_cluster_slots_transient_empty_reply_for_one_client_is_retried(env):
+    # The second client's CLUSTER SLOTS gets one empty reply, late enough
+    # that the first client is already running. It is asked again a second
+    # later and the run completes.
+    node = _Node(bad_slots_replies=1, first_good=True, bad_delay=0.5)
+    returncode, stderr, elapsed = _run(node, ["--test-time=3"], clients=2)
+    env.assertEqual(node.errors, [])
+    env.assertEqual(returncode, 0, message=stderr[-2000:])
+    env.assertContains("cluster slot failed", stderr)
+    env.assertFalse("ending this thread" in stderr, message=stderr[-2000:])
+    env.assertEqual(node.slots_requests, 3)
+
+
+def test_rejected_setup_at_startup_is_bounded_by_connection_stage_timeout(env):
+    # No connection ever reaches steady state, so --connection-stage-timeout
+    # (exit 2), not the --test-time deadline, ends the reconnects.
+    node = _Node(bad_slots_replies=0,
+                 auth_error=b"-ERR AUTH <password> called without any password configured for the default user\r\n")
+    returncode, stderr, elapsed = _run(node, ["-a", "wrongpw", "--reconnect-on-error", "--test-time=1",
+                                              "--connection-stage-timeout=5"], cluster=False)
+    env.assertEqual(node.errors, [])
+    env.assertEqual(returncode, 2, message=stderr[-2000:])
+    env.assertContains("See --connection-stage-timeout.", stderr)
+    env.assertGreaterEqual(elapsed, 4)
 
 
 # Every shard fails validation: the slot range is out of bounds, or the node
