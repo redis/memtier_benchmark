@@ -384,13 +384,14 @@ static void install_alt_signal_stack(void)
     }
 }
 
-// CLOCK_MONOTONIC time (ns) of the first SIGINT/SIGTERM, 0 before it.
-static std::atomic<long long> g_first_interrupt_ns(0);
+// CLOCK_MONOTONIC time of the first SIGINT/SIGTERM, in ms modulo 2^32, and
+// never 0: 0 means no signal yet. Differences are taken modulo 2^32 too, so
+// the wrap every ~49.7 days does not matter.
+static std::atomic<unsigned int> g_first_interrupt_ms(0);
 
-// The handler touches both atomics; that is async-signal-safe only when they
-// are lock-free (not the case for 64-bit atomics on e.g. armv5te).
-static_assert(ATOMIC_INT_LOCK_FREE == 2, "sigint_handler needs lock-free std::atomic<int>");
-static_assert(ATOMIC_LLONG_LOCK_FREE == 2, "sigint_handler needs lock-free std::atomic<long long>");
+// The handler uses only int-sized atomics; that is async-signal-safe only
+// when they are lock-free.
+static_assert(ATOMIC_INT_LOCK_FREE == 2, "sigint_handler needs lock-free int atomics");
 
 // Signal handler for Ctrl+C (SIGINT) and SIGTERM. The first signal stops
 // the run gracefully. A signal at least 1 s later terminates at once, as a
@@ -403,11 +404,12 @@ static void sigint_handler(int signum)
     struct timespec ts;
     // clock_gettime() is async-signal-safe (POSIX.1-2008).
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    long long now = (long long) ts.tv_sec * 1000000000LL + ts.tv_nsec;
-    long long first = 0;
-    if (g_first_interrupt_ns.compare_exchange_strong(first, now)) {
+    unsigned int now = (unsigned int) ts.tv_sec * 1000u + (unsigned int) (ts.tv_nsec / 1000000);
+    if (now == 0) now = 1;
+    unsigned int first = 0;
+    if (g_first_interrupt_ms.compare_exchange_strong(first, now)) {
         g_interrupted = signum;
-    } else if (now - first >= 1000000000LL) {
+    } else if (now - first >= 1000u) {
         signal(signum, SIG_DFL);
         raise(signum);
     }

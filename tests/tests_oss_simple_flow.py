@@ -1283,11 +1283,11 @@ def test_interrupt_signal_handling(env):
         env.assertTrue(total_count > 0)
 
 
-def _run_count_interrupted(env, test_time, sigint_when, run_count=3, sig=signal.SIGINT):
+def _run_count_interrupted(env, test_time, signal_when, run_count=3, sig=signal.SIGINT):
     """Run --run-count=run_count with --print-all-runs and send it sig (SIGINT
-    by default) once sigint_when(stderr_text) is true.
+    by default) once signal_when(stderr_text) is true.
 
-    Returns (returncode, stderr text, seconds from SIGINT to exit, mb.json dict).
+    Returns (returncode, stderr text, seconds from the signal to exit, mb.json dict).
     """
     benchmark_specs = {"name": env.testName,
                        "args": ['--run-count={}'.format(run_count), '--print-all-runs', '--hide-histogram']}
@@ -1312,20 +1312,20 @@ def _run_count_interrupted(env, test_time, sigint_when, run_count=3, sig=signal.
             stdin=None, stdout=subprocess.PIPE, stderr=stderr_file,
             executable=benchmark.binary, args=benchmark.args)
         deadline = time.time() + 60
-        while process.poll() is None and time.time() < deadline and not sigint_when(read_stderr()):
+        while process.poll() is None and time.time() < deadline and not signal_when(read_stderr()):
             time.sleep(0.01)
         # The trigger must fire while memtier still runs; otherwise the test
         # never interrupted anything and its other checks are meaningless.
         env.assertTrue(process.poll() is None,
-                       message="SIGINT trigger did not fire before memtier exited: {}".format(read_stderr()))
+                       message="signal trigger did not fire before memtier exited: {}".format(read_stderr()))
         process.send_signal(sig)
-        t_sigint = time.time()
+        t_signal = time.time()
         try:
             _stdout, _ = process.communicate(timeout=30)
         except subprocess.TimeoutExpired:
             process.kill()
             _stdout, _ = process.communicate()
-        elapsed = time.time() - t_sigint
+        elapsed = time.time() - t_signal
     benchmark.write_file('mb.stdout', _stdout)
     with open('{0}/mb.json'.format(config.results_dir)) as results_json:
         results_dict = json.load(results_json)
