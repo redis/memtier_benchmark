@@ -138,19 +138,6 @@ def test_v6b_port_max_accepted(env):
                         result.stderr))
 
 
-def _squat_port():
-    """Bind and listen on a free port in 14650-14699; return the socket."""
-    for candidate in range(14650, 14700):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            sock.bind(("127.0.0.1", candidate))
-            sock.listen(1)
-            return sock
-        except OSError:
-            sock.close()
-    raise RuntimeError("no free port in 14650-14699")
-
-
 def test_v6c_port_relaxed_forms_accepted(env):
     """Leading whitespace and one '+' are accepted, like the other numeric
     options (#705): " <port>" and "+<port>" must parse to exactly <port>.
@@ -158,11 +145,15 @@ def test_v6c_port_relaxed_forms_accepted(env):
     The port is already taken, so start() fails with "failed to bind
     127.0.0.1:<port>". That shows the value parsed (no E1) to the right port
     without running a workload."""
-    squat = _squat_port()
+    squat = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    squat.bind(("127.0.0.1", 0))
+    squat.listen(1)
     busy_port = squat.getsockname()[1]
     try:
         for value in (" {}".format(busy_port), "+{}".format(busy_port), "\t{}".format(busy_port)):
-            result = _run(_BASE + ["--prometheus-port=" + value])
+            # _BASE_ACCEPT bounds the connect loop, so a startup-order change
+            # fails this test cleanly instead of hanging until the timeout.
+            result = _run(_BASE_ACCEPT + ["--prometheus-port=" + value])
             label = "--prometheus-port={!r}".format(value)
             env.assertFalse(E1_PORT in result.stderr, message=label + ": " + repr(result.stderr))
             env.assertTrue("failed to bind 127.0.0.1:{}".format(busy_port) in _out(result),
