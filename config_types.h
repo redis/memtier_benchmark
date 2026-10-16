@@ -138,7 +138,7 @@ enum command_arg_type
 struct command_arg
 {
     command_arg(const char *arg, unsigned int arg_len) :
-            type(undefined_type), data(arg, arg_len), monitor_index(0), has_key_affixes(false)
+            type(undefined_type), data(arg, arg_len), monitor_index(0), has_key_affixes(false), resolved(false)
     {
         ;
     }
@@ -151,6 +151,10 @@ struct command_arg
     std::string data_suffix;
     // optimization flag to avoid runtime checks
     bool has_key_affixes;
+    // data is final text, set by client::resolve_monitor_placeholders():
+    // format_arbitrary_command() frames it as a constant without scanning it
+    // for placeholders (a generated key can itself contain "__key__").
+    bool resolved;
 };
 
 // What a --command does to the connection's MULTI block. Resolved once from
@@ -184,6 +188,10 @@ struct arbitrary_command
     unsigned int count_user_key_placeholders() const;
 
     std::vector<command_arg> command_args;
+    // __monitor_line@__ only: the first key filled in by
+    // client::resolve_monitor_placeholders() (affixes included), recorded on
+    // the request for --failed-keys-file and --retry-on-error.
+    std::string resolved_key;
     std::string command;
     std::string command_name; // Display name (e.g., "SET (Line 1)" or "SET")
     std::string command_type; // Base command type for aggregation (e.g., "SET")

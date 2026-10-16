@@ -175,6 +175,10 @@ public:
                                  int value_len, unsigned int offset);
     int send_arbitrary_command(const command_arg *arg);
     int send_arbitrary_command(const command_arg *arg, const char *val, int val_len);
+    // Key of an arbitrary command whose key was written as a constant
+    // argument (__monitor_line@__); like a key_type argument, the first one
+    // wins and send_arbitrary_command_end() attaches it to the request.
+    void set_arbitrary_command_key(const char *key, unsigned int key_len);
     void send_arbitrary_command_end(size_t command_index, struct timeval *sent_time, int cmd_size);
 
     // Request a CLUSTER SLOTS refresh. A refresh already in flight (setup_sent)

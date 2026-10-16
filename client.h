@@ -158,6 +158,7 @@ public:
                                               unsigned long long *key_index);
     virtual bool create_arbitrary_request(unsigned int command_index, struct timeval &timestamp, unsigned int conn_id);
     void resolve_monitor_placeholders(arbitrary_command &cmd, unsigned int command_index, unsigned int conn_id);
+    int write_monitor_command_args(const arbitrary_command &cmd, unsigned int conn_id);
     virtual bool create_scan_continuation_request(struct timeval &timestamp, unsigned int conn_id,
                                                   unsigned int stats_index);
     virtual bool create_wait_request(struct timeval &timestamp, unsigned int conn_id);

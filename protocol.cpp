@@ -980,15 +980,12 @@ bool redis_protocol::format_arbitrary_command(arbitrary_command &cmd)
 {
     for (unsigned int i = 0; i < cmd.command_args.size(); i++) {
         command_arg *current_arg = &cmd.command_args[i];
-        // An argument the caller already resolved to literal text (see
-        // client::resolve_monitor_placeholders()) is framed as-is: its
-        // generated key/value must not be scanned for placeholders.
-        const bool literal = current_arg->type == const_type;
         current_arg->type = const_type;
 
         // check arg type
-        if (literal) {
-            // nothing to detect
+        if (current_arg->resolved) {
+            // Already filled in by client::resolve_monitor_placeholders():
+            // frame the generated key as-is, without scanning it again.
         } else if (current_arg->data.find(KEY_PLACEHOLDER) != std::string::npos) {
             if (current_arg->data.length() != strlen(KEY_PLACEHOLDER)) {
                 current_arg->has_key_affixes = true;

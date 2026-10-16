@@ -122,6 +122,65 @@ static std::string basename_only(const char *p)
     return (i == std::string::npos) ? s : s.substr(i + 1);
 }
 
+// Cluster hash tag that every key generated for a monitor-line argument
+// containing __key__ shares: prefix + --key-prefix + <number> + suffix, with
+// only the first __key__ replaced. Same rule as Redis: the text between the
+// first '{' and the first '}' after it, if not empty. Returns false when the
+// tag would include the generated number, or there is none, so the slot
+// varies from key to key.
+static bool monitor_key_arg_fixed_tag(const std::string &arg, const char *key_prefix, std::string *tag)
+{
+    size_t pos = arg.find(KEY_PLACEHOLDER);
+    std::string before = arg.substr(0, pos) + (key_prefix ? key_prefix : "");
+    std::string after = arg.substr(pos + strlen(KEY_PLACEHOLDER));
+    // A '{' before the number: its '}' must come before the number too.
+    // No '{' before it: the number has no braces, so look in the suffix.
+    const std::string &part = before.find('{') != std::string::npos ? before : after;
+    size_t open = part.find('{');
+    if (open == std::string::npos) return false;
+    size_t close = part.find('}', open + 1);
+    if (close == std::string::npos || close == open + 1) return false;
+    tag->assign(part, open + 1, close - open - 1);
+    return true;
+}
+
+// --cluster-mode supports only single-key commands (see the --command check
+// in main()). A __monitor_line@__ line is resolved per request and routed by
+// its first key, so a line with several __key__ arguments is accepted only
+// when every generated key shares one {hash tag}, which keeps them in one
+// slot. Otherwise Redis would answer CROSSSLOT for every such request.
+static bool check_cluster_monitor_lines(const struct monitor_command_list *monitor_commands, const char *key_prefix)
+{
+    for (size_t line = 0; line < monitor_commands->size(); line++) {
+        arbitrary_command cmd(monitor_commands->get_command(line).c_str());
+        if (!cmd.split_command_to_args()) continue; // skipped with a warning at run time
+        unsigned int keys = 0;
+        bool same_slot = true;
+        std::string first_tag;
+        for (size_t i = 1; i < cmd.command_args.size(); i++) {
+            const std::string &data = cmd.command_args[i].data;
+            if (data.find(KEY_PLACEHOLDER) == std::string::npos) continue;
+            std::string tag;
+            if (!monitor_key_arg_fixed_tag(data, key_prefix, &tag)) {
+                same_slot = false;
+            } else if (keys == 0) {
+                first_tag = tag;
+            } else if (tag != first_tag) {
+                same_slot = false;
+            }
+            keys++;
+        }
+        if (keys > 1 && !same_slot) {
+            benchmark_error_log("error: Cluster mode supports only a single key commands: monitor line %zu has %u "
+                                "__key__ arguments that can hash to different slots (give them one {hash tag}, "
+                                "e.g. {t}__key__): %s\n",
+                                line + 1, keys, cmd.command.c_str());
+            return false;
+        }
+    }
+    return true;
+}
+
 // Upper bound for --run-count.  main() allocates several per-run vectors
 // (run_stats, cmd_stats histograms, HDR histograms) that grow linearly with
 // run_count; values in the tens of thousands push tens of MiB of metadata
@@ -4726,11 +4785,16 @@ int main(int argc, char *argv[])
     }
 
     // if user configure arbitrary commands, format and prepare it
+    bool monitor_lines_checked = false;
     for (unsigned int i = 0; i < cfg.arbitrary_commands->size(); i++) {
         arbitrary_command &cmd = cfg.arbitrary_commands->at(i);
 
         // Skip formatting for random monitor commands - they will be formatted at runtime
         if (cmd.command_args.size() == 1 && cmd.command_args[0].type == monitor_random_type) {
+            if (cfg.cluster_mode && !monitor_lines_checked) {
+                if (!check_cluster_monitor_lines(cfg.monitor_commands, cfg.key_prefix)) exit(1);
+                monitor_lines_checked = true;
+            }
             continue;
         }
 

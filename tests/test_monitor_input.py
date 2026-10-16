@@ -1,4 +1,5 @@
 import base64
+import csv
 import tempfile
 import os
 import json
@@ -1429,3 +1430,51 @@ def test_monitor_input_random_line_placeholder_in_key_prefix(env):
         env.assertTrue(len(keys) > 0, message="no keys written with --key-prefix={}".format(prefix))
         env.assertTrue(all(k.startswith(prefix) and k[len(prefix):].isdigit() for k in keys),
                        message="unexpected keys with --key-prefix={}: {}".format(prefix, keys[:10]))
+
+
+def test_monitor_input_random_line_failed_keys_file(env):
+    """
+    --failed-keys-file records the key a __monitor_line@__ request was sent
+    with (affixes included), as it does for --command. A line whose every
+    request fails (INCRBY by a non-integer) must log user:mon-NNN keys, not
+    an empty key.
+    """
+    env.skipOnCluster()
+
+    test_dir = tempfile.mkdtemp()
+    monitor_file = os.path.join(test_dir, "monitor_failed_keys.txt")
+    with open(monitor_file, "w") as f:
+        f.write('[ proxy ] 1764031576.604009 [0 127.0.0.1:5000] "INCRBY" "user:__key__" "x"\n')
+    failed_log = os.path.join(test_dir, "failed_keys.csv")
+
+    requests = 20
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--monitor-input={}".format(monitor_file),
+            "--command=__monitor_line@__",
+            "--key-prefix=mon-",
+            "--key-maximum=100",
+            "--failed-keys-file={}".format(failed_log),
+            "--hide-histogram",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+
+    config = get_default_memtier_config(threads=1, clients=1, requests=requests)
+    add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    memtier_ok = benchmark.run(timeout=60)
+    debugPrintMemtierOnError(config, env)
+    env.assertTrue(memtier_ok == True)
+
+    with open(failed_log) as fh:
+        rows = [r for r in csv.reader(fh) if r and not r[0].startswith("#") and r[0] != "timestamp"]
+    env.assertEqual(len(rows), requests, message="failed-keys rows: {}".format(rows[:5]))
+    keys = [r[2] for r in rows]
+    bad = [k for k in keys if not k.startswith("user:mon-")]
+    env.assertEqual(bad, [], message="logged keys without user:mon- prefix: {}".format(bad[:5]))

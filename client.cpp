@@ -437,37 +437,73 @@ get_key_response client::get_key_for_conn(unsigned int command_index, unsigned i
 // --monitor-input "__monitor_line@__": replace the first __key__ in an
 // argument with a generated key, keeping the text around it (e.g.
 // {tag}__key__ or user:__key__; like the --command path, any later __key__
-// in the same argument stays literal), and a bare __data__ with a generated
-// value. Call it after split_command_to_args() and before
-// format_arbitrary_command(). Resolved arguments are marked const_type, which
-// format_arbitrary_command() frames as-is without scanning the generated text
-// for placeholders again. Every argument is then a constant: the monitor send
-// loops (here and in cluster_client) only write constant arguments, and
-// cluster mode can route by the key that is actually sent.
+// in the same argument stays literal). Call it after split_command_to_args()
+// and before format_arbitrary_command(). Resolved arguments are marked
+// `resolved`, so format_arbitrary_command() frames them as constants without
+// scanning the generated text for placeholders again, and cluster mode can
+// route by the key that is actually sent. The first one is kept in
+// cmd.resolved_key for the request's log key. A bare __data__ (other than as
+// the first argument) is left for format_arbitrary_command() to mark
+// data_type: write_monitor_command_args() writes the value at send time,
+// without copying it into the command.
 void client::resolve_monitor_placeholders(arbitrary_command &cmd, unsigned int command_index, unsigned int conn_id)
 {
     // Argument 0 is the command name.
     for (size_t i = 1; i < cmd.command_args.size(); i++) {
         command_arg &arg = cmd.command_args[i];
         size_t pos = arg.data.find(KEY_PLACEHOLDER);
-        if (pos != std::string::npos) {
-            unsigned long long key_index;
-            // Base-class lookup: cluster_client routes by the resolved key
-            // afterwards, so its per-shard key pool must not be used here.
-            get_key_response res = client::get_key_for_conn(command_index, conn_id, &key_index);
-            assert(res == available_for_conn);
-            (void) res;
-            arg.data.replace(pos, strlen(KEY_PLACEHOLDER), m_obj_gen->get_key(), m_obj_gen->get_key_len());
-            arg.type = const_type;
-        } else if (arg.data == DATA_PLACEHOLDER) {
+        if (pos == std::string::npos) {
+            // The first argument is what cluster mode routes by, so a bare
+            // __data__ there is filled in now rather than at send time.
+            if (i == 1 && arg.data == DATA_PLACEHOLDER) {
+                unsigned int value_len;
+                const char *value = m_obj_gen->get_value(0, &value_len);
+                assert(value != NULL);
+                assert(value_len > 0);
+                arg.data.assign(value, value_len);
+                arg.resolved = true;
+            }
+            continue;
+        }
+        // get_key_for_conn() requires the out-param; the key itself is read
+        // back from m_obj_gen, so the index is not needed here.
+        unsigned long long key_index;
+        // Base-class lookup: cluster_client routes by the resolved key
+        // afterwards, so its per-shard key pool must not be used here.
+        get_key_response res = client::get_key_for_conn(command_index, conn_id, &key_index);
+        assert(res == available_for_conn);
+        (void) res;
+        arg.data.replace(pos, strlen(KEY_PLACEHOLDER), m_obj_gen->get_key(), m_obj_gen->get_key_len());
+        arg.resolved = true;
+        if (cmd.resolved_key.empty()) cmd.resolved_key = arg.data;
+    }
+}
+
+// Write a formatted __monitor_line@__ command (see
+// resolve_monitor_placeholders()) to conn_id: constant arguments as they are,
+// a __data__ argument with a value generated now. Returns the bytes written.
+int client::write_monitor_command_args(const arbitrary_command &cmd, unsigned int conn_id)
+{
+    int cmd_size = 0;
+    for (unsigned int i = 0; i < cmd.command_args.size(); i++) {
+        const command_arg *arg = &cmd.command_args[i];
+        if (arg->type == const_type) {
+            cmd_size += m_connections[conn_id]->send_arbitrary_command(arg);
+        } else if (arg->type == data_type) {
             unsigned int value_len;
             const char *value = m_obj_gen->get_value(0, &value_len);
             assert(value != NULL);
             assert(value_len > 0);
-            arg.data.assign(value, value_len);
-            arg.type = const_type;
+            cmd_size += m_connections[conn_id]->send_arbitrary_command(arg, value, value_len);
         }
     }
+    // Attach the key only to a command that is going out, so it cannot leak
+    // onto the next request when nothing was written.
+    if (cmd_size > 0) {
+        m_connections[conn_id]->set_arbitrary_command_key(cmd.resolved_key.data(),
+                                                          (unsigned int) cmd.resolved_key.size());
+    }
+    return cmd_size;
 }
 
 bool client::create_arbitrary_request(unsigned int command_index, struct timeval &timestamp, unsigned int conn_id)
@@ -517,12 +553,7 @@ bool client::create_arbitrary_request(unsigned int command_index, struct timeval
         }
 
         // Send the randomly selected command
-        for (unsigned int i = 0; i < temp_cmd.command_args.size(); i++) {
-            const command_arg *arg = &temp_cmd.command_args[i];
-            if (arg->type == const_type) {
-                cmd_size += m_connections[conn_id]->send_arbitrary_command(arg);
-            }
-        }
+        cmd_size = write_monitor_command_args(temp_cmd, conn_id);
 
         // Get the stats index for the actual command type (e.g., SET, GET)
         // instead of using the placeholder's index

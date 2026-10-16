@@ -2098,6 +2098,11 @@ int shard_connection::send_arbitrary_command(const command_arg *arg, const char 
     return cmd_size;
 }
 
+void shard_connection::set_arbitrary_command_key(const char *key, unsigned int key_len)
+{
+    if (wants_request_key() && key_len > 0 && m_arbitrary_log_key.empty()) m_arbitrary_log_key.assign(key, key_len);
+}
+
 void shard_connection::send_arbitrary_command_end(size_t command_index, struct timeval *sent_time, int cmd_size)
 {
     // Look up the source command's metadata so the reply handler can route

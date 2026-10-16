@@ -2610,13 +2610,7 @@ void cluster_client::process_staged_monitor_command(struct timeval /*timestamp*/
         return;
     }
 
-    int cmd_size = 0;
-    for (unsigned int i = 0; i < staged.parsed_cmd.command_args.size(); i++) {
-        const command_arg *arg = &staged.parsed_cmd.command_args[i];
-        if (arg->type == const_type) {
-            cmd_size += m_connections[conn_id]->send_arbitrary_command(arg);
-        }
-    }
+    int cmd_size = write_monitor_command_args(staged.parsed_cmd, conn_id);
     if (cmd_size == 0) {
         // format_arbitrary_command succeeded but produced no sendable bytes — guard against
         // pushing a zero-length phantom request that the server would never respond to.
@@ -2653,8 +2647,8 @@ bool cluster_client::create_monitor_request_cluster(unsigned int command_index, 
         return false;
     }
 
-    // Fill in __key__ / __data__ now, so the slot below comes from the key
-    // that is sent and the (possibly staged) command has only constant args.
+    // Fill in __key__ now, so the slot below comes from the key that is sent.
+    // __data__ is written when the command is sent (write_monitor_command_args).
     resolve_monitor_placeholders(temp_cmd, command_index, conn_id);
 
     // Determine target shard from the first key argument (index 1 = first arg after command name).
@@ -2709,13 +2703,7 @@ bool cluster_client::create_monitor_request_cluster(unsigned int command_index, 
         return false;
     }
 
-    int cmd_size = 0;
-    for (unsigned int i = 0; i < temp_cmd.command_args.size(); i++) {
-        const command_arg *arg = &temp_cmd.command_args[i];
-        if (arg->type == const_type) {
-            cmd_size += m_connections[conn_id]->send_arbitrary_command(arg);
-        }
-    }
+    int cmd_size = write_monitor_command_args(temp_cmd, conn_id);
     if (cmd_size == 0) {
         // Defensive: formatted command produced no sendable bytes; nothing was written
         // to the socket so no response will arrive. Don't count as a generated request.

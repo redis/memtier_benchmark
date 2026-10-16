@@ -21,6 +21,7 @@ Run:
     TEST=test_monitor_cluster.py OSS_CLUSTER=1 SHARDS=3 ./tests/run_tests.sh
 """
 
+import csv
 import json
 import os
 import tempfile
@@ -385,6 +386,95 @@ def test_monitor_cluster_line_placeholders_routed_by_full_key(env):
             env.assertEqual(len(owner.execute_command("GET", tag_keys[0])), 20)
         sets_count = js.get("ALL STATS", {}).get("Sets", {}).get("Count", 0)
         env.assertEqual(sets_count, requests * 2, message="Sets count {} != {}".format(sets_count, requests * 2))
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+# ---------------------------------------------------------------------------
+# 5. __monitor_line@__: failed-keys key and multi-key lines
+# ---------------------------------------------------------------------------
+
+def test_monitor_cluster_line_failed_keys_file(env):
+    """--failed-keys-file records the routed key of a __monitor_line@__
+    request (affixes included), not an empty key. request::m_key is also what
+    --retry-on-error routes MOVED/ASK/-READONLY retries by."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    _flush_cluster(env)
+    test_dir = tempfile.mkdtemp()
+    monitor_file = _write_monitor_file(
+        test_dir, ['[ proxy ] 1764031576.604009 [0 127.0.0.1:5000] "INCRBY" "user:__key__" "x"'])
+    failed_log = os.path.join(test_dir, "failed_keys.csv")
+
+    requests = 20
+    ok, run_config, js = _run_monitor_cluster(
+        env, monitor_file, "__monitor_line@__", threads=1, clients=2, requests=requests,
+        extra=["--key-prefix=mon-", "--key-maximum=200", "--failed-keys-file={}".format(failed_log)],
+        timeout=60)
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="monitor-cluster failed-keys run did not complete")
+        with open(failed_log) as fh:
+            rows = [r for r in csv.reader(fh) if r and r[0] != "timestamp"]
+        env.assertEqual(len(rows), requests * 2, message="failed-keys rows: {}".format(rows[:5]))
+        bad = [r[2] for r in rows if not r[2].startswith("user:mon-")]
+        env.assertEqual(bad, [], message="logged keys without user:mon- prefix: {}".format(bad[:5]))
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_monitor_cluster_line_multi_key_needs_hash_tag(env):
+    """Cluster mode supports only single-key commands, so a __monitor_line@__
+    line with two __key__ arguments that can hash to different slots is
+    rejected at startup, as --command and __monitor_lineN__ are. A line whose
+    keys share one {hash tag} stays in one slot and runs."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    test_dir = tempfile.mkdtemp()
+    untagged = _write_monitor_file(
+        test_dir, ['[ proxy ] 1764031576.604009 [0 127.0.0.1:5000] "SET" "s:__key__" "v"',
+                   '[ proxy ] 1764031576.604010 [0 127.0.0.1:5000] "MSET" "__key__" "v" "__key__" "v"'])
+    _flush_cluster(env)
+    ok, run_config, _ = _run_monitor_cluster(
+        env, untagged, "__monitor_line@__", threads=1, clients=1, requests=10,
+        extra=["--key-prefix=mon-"], timeout=60)
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertFalse(ok, message="multi-key line without a hash tag was accepted")
+        with open("{}/mb.stderr".format(run_config.results_dir)) as fh:
+            err = fh.read()
+        env.assertTrue("monitor line 2 has 2 __key__ arguments" in err, message=err[-500:])
+        env.assertEqual(_dbsize_total_and_shards(env)[0], 0)
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+    os.makedirs(os.path.join(test_dir, "tagged"))
+    tagged = _write_monitor_file(
+        os.path.join(test_dir, "tagged"),
+        ['[ proxy ] 1764031576.604009 [0 127.0.0.1:5000] "MSET" "{t}a:__key__" "__data__" "{t}b:__key__" "v"'])
+    _flush_cluster(env)
+    for conn in _master_conns(env):
+        conn.execute_command("CONFIG", "RESETSTAT")
+    ok, run_config, _ = _run_monitor_cluster(
+        env, tagged, "__monitor_line@__", threads=1, clients=2, requests=20,
+        extra=["--key-prefix=mon-", "--key-maximum=200", "--data-size=20"], timeout=60)
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="tagged multi-key monitor run did not complete")
+        keys = [k for keys in _all_keys_by_port(env).values() for k in keys]
+        env.assertTrue(any(k.startswith("{t}a:mon-") for k in keys), message=str(keys[:10]))
+        env.assertTrue(any(k.startswith("{t}b:mon-") for k in keys), message=str(keys[:10]))
+        for conn in _master_conns(env):
+            errs = conn.execute_command("INFO", "errorstats")
+            env.assertEqual(errs, {}, message="server errors: {}".format(errs))
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)
