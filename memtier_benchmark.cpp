@@ -4126,10 +4126,11 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     run_stats stats(cfg);
 
     unsigned int failed_threads = 0;
+    unsigned int merge_iteration = 1;
     for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
         (*i)->join();
         if ((*i)->m_failed) failed_threads++;
-        (*i)->m_cg->merge_run_stats(&stats);
+        (*i)->m_cg->merge_run_stats(&stats, merge_iteration);
     }
 
     // A failed worker stopped before the run's stop condition, so this run

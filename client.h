@@ -373,7 +373,7 @@ public:
     unsigned long long int get_total_retried_ops(void);
     unsigned long long int get_total_errors(void);
 
-    void merge_run_stats(run_stats *target);
+    void merge_run_stats(run_stats *target, unsigned int &iteration_counter);
     void aggregate_inst_histogram(hdr_histogram *target);
     void drain_prom_latency_histogram(hdr_histogram *target, bool run_end);
 };

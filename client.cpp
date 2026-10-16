@@ -1739,7 +1739,7 @@ unsigned long long int client_group::get_total_errors(void)
     return total;
 }
 
-void client_group::merge_run_stats(run_stats *target)
+void client_group::merge_run_stats(run_stats *target, unsigned int &iteration_counter)
 {
     assert(target != NULL);
     // Iterate ALL clients (not just active_client_count) to avoid dropping
@@ -1748,8 +1748,9 @@ void client_group::merge_run_stats(run_stats *target)
     // (set_start_time never called) are merged too, for the connection errors
     // and interrupted flag they recorded; run_stats::merge() leaves their
     // zeroed m_start_time out of the factorial-averaged timestamps, so they
-    // do not advance the iteration counter.
-    unsigned int iteration_counter = 1;
+    // do not advance the iteration counter. The caller owns the counter
+    // (starting at 1) and passes the same one to every client_group merged
+    // into the same target, so the timestamps average over all their clients.
     for (unsigned int i = 0; i < m_clients.size(); i++) {
         run_stats *stats = m_clients[i]->get_stats();
         target->merge(*stats, iteration_counter);
