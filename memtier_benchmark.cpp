@@ -1022,8 +1022,22 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
         }
     }
 
-    // Parse host:port
-    char *port_start = strchr(host_start, ':');
+    // Parse host:port. An IPv6 host is bracketed ([::1]:6379, as accepted by
+    // redis-cli -u): the port separator is the ':' right after the ']'.
+    char *port_start;
+    if (*host_start == '[') {
+        char *bracket = strchr(host_start, ']');
+        if (!bracket || bracket == host_start + 1 || (bracket[1] != '\0' && bracket[1] != ':')) {
+            fprintf(stderr, "error: invalid IPv6 host '%s' in URI.\n", host_start);
+            free(uri_copy);
+            return -1;
+        }
+        *bracket = '\0';
+        port_start = bracket[1] == ':' ? bracket + 1 : NULL;
+        host_start++;
+    } else {
+        port_start = strchr(host_start, ':');
+    }
     if (port_start) {
         *port_start = '\0';
         port_start++;
@@ -2675,7 +2689,7 @@ void usage()
         "  -u, --uri=URI                  Server URI on format redis://user:password@host:port/dbnum\n"
         "                                 User, password and dbnum are optional. For authentication\n"
         "                                 without a username, use username 'default'. For TLS, use\n"
-        "                                 the scheme 'rediss'.\n"
+        "                                 the scheme 'rediss'. Bracket IPv6 hosts: [::1]:6379.\n"
 #ifdef USE_TLS
         "      --tls                      Enable SSL/TLS transport security\n"
         "      --cert=FILE                Use specified client certificate for TLS\n"

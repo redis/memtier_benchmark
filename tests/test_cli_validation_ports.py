@@ -109,3 +109,27 @@ def test_uri_port_rejects_out_of_range_and_malformed(env):
         label = "--uri port {!r}".format(value)
         env.assertNotEqual(result.returncode, 0, message=label + ": " + result.stderr)
         env.assertTrue("error: invalid port number" in result.stderr, message=label + ": " + result.stderr)
+
+
+def test_uri_rejects_malformed_ipv6_host(env):
+    # Bracketed IPv6 hosts (issue #701): the bracket must be closed, non-empty
+    # and followed by ':PORT', '/DB' or nothing. Parsing fails before any
+    # connection attempt, so no server is needed.
+    cases = {
+        "redis://[::1": "error: invalid IPv6 host",
+        "redis://[::1]x": "error: invalid IPv6 host",
+        "redis://[::1]x:6379": "error: invalid IPv6 host",
+        "redis://[]:6379": "error: invalid IPv6 host",
+        "redis://[::1]:": "error: invalid port number",
+        "redis://[::1]:65537": "error: invalid port number '65537'",
+    }
+    for uri, diagnostic in cases.items():
+        result = subprocess.run(
+            [MEMTIER_BINARY, "--uri=" + uri, "-n", "1", "-c", "1", "-t", "1"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        label = "--uri {!r}".format(uri)
+        env.assertNotEqual(result.returncode, 0, message=label + ": " + result.stderr)
+        env.assertTrue(diagnostic in result.stderr, message=label + ": " + result.stderr)
