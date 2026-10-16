@@ -157,3 +157,48 @@ def test_reconnect_backoff_zero_keeps_one_second_delay(env):
     delays = re.findall(r"attempting reconnection \d+/\d+ in ([0-9.]+) seconds", result.stderr)
     env.assertGreaterEqual(len(delays), 2, message=result.stderr[-2000:])
     env.assertEqual(set(delays), {"1.00"}, message=repr(delays))
+
+
+def test_reconnect_backoff_fraction_has_delay_floor(env):
+    """A factor below 1 must not shrink the delay to 0 s (issue #688).
+
+    Without a floor, factor 0.5 reaches "in 0.00 seconds" after 8 attempts
+    and a dead server is reconnected in a tight loop. Every delay must stay
+    at or above the 0.1 s floor once the halving reaches it.
+    """
+    env.skipOnCluster()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    closed_port = sock.getsockname()[1]
+    sock.close()
+
+    attempts = 12
+    result = subprocess.run(
+        [
+            MEMTIER_BINARY,
+            "--server=127.0.0.1",
+            "--port={}".format(closed_port),
+            "--threads=1",
+            "--clients=1",
+            "--reconnect-on-error",
+            "--reconnect-backoff-factor=0.5",
+            "--max-reconnect-attempts={}".format(attempts),
+            "--connection-timeout=1",
+            "--test-time=30",
+            "--hide-histogram",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    delays = [
+        float(d)
+        for d in re.findall(
+            r"(?:attempting reconnection \d+/\d+ in|retrying in) ([0-9.]+) seconds", result.stderr
+        )
+    ]
+    env.assertGreaterEqual(len(delays), attempts - 1, message=result.stderr[-2000:])
+    env.assertLessEqual(len(delays), attempts, message=repr(delays))
+    env.assertGreaterEqual(min(delays), 0.1, message=repr(delays))
+    env.assertEqual(delays[:3], [0.5, 0.25, 0.12], message=repr(delays))
+    env.assertEqual(set(delays[3:]), {0.1}, message=repr(delays))

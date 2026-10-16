@@ -223,7 +223,8 @@ Without it, a lost connection ends its thread and the run exits 1.
 .HP
 \fB\-\-reconnect\-backoff\-factor\fR=\fI\,NUM\/\fR Non\-negative backoff factor for reconnection delays (default: 0, no backoff)
 Zero keeps the delay at one second. Positive values multiply the
-delay on each attempt; values below 1 shrink it toward zero.
+delay on each attempt; values below 1 shrink it, but never
+below 0.1 seconds. The delay is capped at 60 seconds.
 .TP
 \fB\-\-retry\-on\-error\fR
 Resend a request when the server returns a transient error or the
