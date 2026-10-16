@@ -113,7 +113,7 @@ def test_retry_backoff_ignores_errno_from_earlier_options(env):
     result = subprocess.run(
         [
             MEMTIER_BINARY,
-            "--max-reconnect-attempts=99999999999999999999999",
+            "--key-maximum=99999999999999999999999",  # accepted, leaves errno == ERANGE
             "--retry-backoff-factor=1",
             "--version",
         ],

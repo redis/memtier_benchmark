@@ -93,8 +93,11 @@ def _out(result):
 # ===========================================================================
 
 def test_v1_v4_port_rejects_e1(env):
-    """Non-numeric / wrap-guard / negative / trailing-junk / empty -> exit 2 + E1."""
-    for bad in ("abc", "70000", "-1", "9219x", ""):
+    """Non-numeric / wrap-guard / negative / trailing-junk / empty / whitespace-wrapped -> exit 2 + E1."""
+    # The "\n-..." / "\v-1" vectors used to bypass the leading '-' check
+    # (strtoul skips any whitespace) and bind port 616 / 1 (#705).
+    for bad in ("abc", "70000", "-1", "9219x", "", "\n-18446744073709551000", "\n-18446744073709551615", "\v-1",
+                " 9219", "+9219", "99999999999999999999999"):
         result = _run(_BASE + ["--prometheus-port={}".format(bad)])
         env.assertEqual(result.returncode, 2,
                         message="--prometheus-port={!r} must exit 2; got {}".format(

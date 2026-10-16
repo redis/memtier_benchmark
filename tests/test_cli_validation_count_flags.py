@@ -199,3 +199,76 @@ def test_test_time_zero_rejected(env):
             "Expected 'test time must be' in stderr, got: {!r}".format(result.stderr)
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Wrapped / overflowing values on every unsigned option (#705, #695)
+# ---------------------------------------------------------------------------
+
+# option -> diagnostic prefix printed on rejection.
+UNSIGNED_OPTIONS = {
+    "-n": "requests must be",
+    "-c": "clients must be",
+    "-t": "threads must be",
+    "--test-time": "test time must be",
+    "--pipeline": "pipeline must be",
+    "-d": "data-size must be",
+    "--reconnect-interval": "reconnect-interval must be",
+    "--max-reconnect-attempts": "max-reconnect-attempts must be",
+    "--retry-backoff-ms": "retry-backoff-ms must be",
+    "--max-retry-queue": "max-retry-queue must be",
+    "--connection-timeout": "connection-timeout must be",
+    "--connection-stage-timeout": "connection-stage-timeout must be",
+}
+
+# strtoul() skips any isspace() character (not only ' ' and '\t') and then
+# accepts a '-', so "\n-18446744073709551000" used to wrap to 616.
+WRAPPED_VALUES = (
+    "\n-18446744073709551000",
+    "\n-18446744073709551615",
+    "\n-1",
+    "\v-1",
+    "-1",
+    " 5",
+    "+5",
+    "",
+    "99999999999999999999999",
+)
+
+
+def test_unsigned_options_reject_wrapped_values(env):
+    """No unsigned option may accept a value strtoul() would wrap or overflow.
+
+    --version exits 0 right after parsing, so a value that slips through
+    shows up as rc 0 without needing a server.
+    """
+    for option, diagnostic in UNSIGNED_OPTIONS.items():
+        for value in WRAPPED_VALUES:
+            result = _run_memtier([option, value, "--version"])
+            label = "{} {!r}".format(option, value)
+            env.assertEqual(result.returncode, 2, message=label + ": " + result.stderr)
+            env.assertTrue(diagnostic in result.stderr, message=label + ": " + repr(result.stderr))
+
+
+def test_unsigned_int_options_reject_values_above_uint_max(env):
+    """Values above UINT_MAX must not wrap modulo 2^32 (4294967297 -> 1)."""
+    for option, diagnostic in UNSIGNED_OPTIONS.items():
+        if option == "-n":
+            continue  # unsigned long long: 4294967297 is a valid request count
+        result = _run_memtier([option, "4294967297", "--version"])
+        label = "{} 4294967297".format(option)
+        env.assertEqual(result.returncode, 2, message=label + ": " + result.stderr)
+        env.assertTrue(diagnostic in result.stderr, message=label + ": " + repr(result.stderr))
+
+
+def test_unsigned_options_accept_valid_values(env):
+    for option in UNSIGNED_OPTIONS:
+        result = _run_memtier([option, "1", "--version"])
+        env.assertEqual(result.returncode, 0, message=option + " 1: " + result.stderr)
+    for option in ("--max-reconnect-attempts", "--retry-backoff-ms", "--max-retry-queue", "--connection-timeout",
+                   "--connection-stage-timeout"):
+        for value in ("0", "4294967295"):
+            result = _run_memtier([option, value, "--version"])
+            env.assertEqual(result.returncode, 0, message="{} {}: {}".format(option, value, result.stderr))
+    result = _run_memtier(["-n", "18446744073709551615", "--version"])
+    env.assertEqual(result.returncode, 0, message=result.stderr)

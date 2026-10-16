@@ -1215,17 +1215,21 @@ static bool verify_arbitrary_command_option(struct benchmark_config *cfg)
 #define MEMTIER_PIPELINE_MAX 1024u
 #define MEMTIER_DATA_SIZE_MAX (512u * 1024u * 1024u)
 
-// True if optarg's first non-space character is '-'.  strtoul() silently
-// accepts a leading minus and underflows the result to a huge unsigned, which
-// then sails past the >0 check downstream and only manifests as a hang or
-// SIGABRT deep in the run loop.  Catching it at parse time keeps the error
-// message close to the offending flag.
-static bool optarg_is_negative(const char *s)
+// Parse an unsigned decimal option value: the whole string must be a number
+// in [0,max], starting with a digit (no sign or leading whitespace, as in
+// parse_port()).  strtoull() would otherwise skip any whitespace (including
+// '\n', '\v', ...) and accept a '-', wrapping "-1" or "\n-18446744073709551000"
+// into the valid range.  ERANGE and the range are checked BEFORE the caller
+// narrows the result, so values above UINT_MAX cannot wrap modulo 2^32.
+static bool parse_unsigned(const char *s, unsigned long long max, unsigned long long *out)
 {
-    if (s == NULL) return false;
-    while (*s == ' ' || *s == '\t')
-        s++;
-    return *s == '-';
+    if (s == NULL || !isdigit((unsigned char) *s)) return false;
+    char *endptr = NULL;
+    errno = 0;
+    unsigned long long v = strtoull(s, &endptr, 10);
+    if (*endptr != '\0' || errno == ERANGE || v > max) return false;
+    *out = v;
+    return true;
 }
 
 // Parse a backoff factor: the whole string must be a finite, representable
@@ -1482,6 +1486,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
     int option_index;
     int c;
     char *endptr;
+    unsigned long long val;
     while ((c = getopt_long(argc, argv, "vs:S:p:P:o:x:DRn:c:t:d:a:h:46u:", long_options, &option_index)) != -1) {
         switch (c) {
         case o_help:
@@ -1626,17 +1631,10 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             cfg->randomize = random();
             break;
         case 'n':
-            endptr = NULL;
             if (strcmp(optarg, "allkeys") == 0)
                 cfg->requests = -1;
             else {
-                if (optarg_is_negative(optarg)) {
-                    fprintf(stderr, "error: requests must be a positive integer.\n");
-                    return -1;
-                }
-                errno = 0;
-                cfg->requests = (unsigned long long) strtoull(optarg, &endptr, 10);
-                if (errno == ERANGE || !cfg->requests || !endptr || *endptr != '\0') {
+                if (!parse_unsigned(optarg, ULLONG_MAX, &cfg->requests) || !cfg->requests) {
                     fprintf(stderr, "error: requests must be greater than zero.\n");
                     return -1;
                 }
@@ -1647,43 +1645,25 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             }
             break;
         case 'c':
-            endptr = NULL;
-            if (optarg_is_negative(optarg)) {
-                fprintf(stderr, "error: clients must be a positive integer.\n");
-                return -1;
-            }
-            errno = 0;
-            cfg->clients = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (errno == ERANGE || !cfg->clients || !endptr || *endptr != '\0') {
+            if (!parse_unsigned(optarg, UINT_MAX, &val) || !val) {
                 fprintf(stderr, "error: clients must be greater than zero.\n");
                 return -1;
             }
+            cfg->clients = (unsigned int) val;
             break;
         case 't':
-            endptr = NULL;
-            if (optarg_is_negative(optarg)) {
-                fprintf(stderr, "error: threads must be a positive integer.\n");
-                return -1;
-            }
-            errno = 0;
-            cfg->threads = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (errno == ERANGE || !cfg->threads || !endptr || *endptr != '\0') {
+            if (!parse_unsigned(optarg, UINT_MAX, &val) || !val) {
                 fprintf(stderr, "error: threads must be greater than zero.\n");
                 return -1;
             }
+            cfg->threads = (unsigned int) val;
             break;
         case o_test_time:
-            endptr = NULL;
-            if (optarg_is_negative(optarg)) {
-                fprintf(stderr, "error: test time must be a positive integer.\n");
-                return -1;
-            }
-            errno = 0;
-            cfg->test_time = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (errno == ERANGE || !cfg->test_time || !endptr || *endptr != '\0') {
+            if (!parse_unsigned(optarg, UINT_MAX, &val) || !val) {
                 fprintf(stderr, "error: test time must be greater than zero.\n");
                 return -1;
             }
+            cfg->test_time = (unsigned int) val;
             if (cfg->requests) {
                 fprintf(stderr, "error: --test-time and --requests are mutually exclusive.\n");
                 return -1;
@@ -1697,39 +1677,27 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             }
             break;
         case o_pipeline: {
-            endptr = NULL;
-            if (optarg_is_negative(optarg)) {
+            if (!parse_unsigned(optarg, ULLONG_MAX, &val) || !val) {
                 fprintf(stderr, "error: pipeline must be greater than zero.\n");
                 return -1;
             }
-            unsigned long pipeline_val = strtoul(optarg, &endptr, 10);
-            if (!pipeline_val || !endptr || *endptr != '\0') {
-                fprintf(stderr, "error: pipeline must be greater than zero.\n");
-                return -1;
-            }
-            if (pipeline_val > MEMTIER_PIPELINE_MAX) {
+            if (val > MEMTIER_PIPELINE_MAX) {
                 fprintf(stderr, "error: pipeline must be <= %u.\n", MEMTIER_PIPELINE_MAX);
                 return -1;
             }
-            cfg->pipeline = (unsigned int) pipeline_val;
+            cfg->pipeline = (unsigned int) val;
             break;
         }
         case 'd': {
-            endptr = NULL;
-            if (optarg_is_negative(optarg)) {
+            if (!parse_unsigned(optarg, ULLONG_MAX, &val) || !val) {
                 fprintf(stderr, "error: data-size must be greater than zero.\n");
                 return -1;
             }
-            unsigned long data_size_val = strtoul(optarg, &endptr, 10);
-            if (!data_size_val || !endptr || *endptr != '\0') {
-                fprintf(stderr, "error: data-size must be greater than zero.\n");
-                return -1;
-            }
-            if (data_size_val > MEMTIER_DATA_SIZE_MAX) {
+            if (val > MEMTIER_DATA_SIZE_MAX) {
                 fprintf(stderr, "error: data-size must be <= %u bytes (512 MiB).\n", MEMTIER_DATA_SIZE_MAX);
                 return -1;
             }
-            cfg->data_size = (unsigned int) data_size_val;
+            cfg->data_size = (unsigned int) val;
             break;
         }
         case 'R':
@@ -1882,23 +1850,21 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             }
             break;
         case o_reconnect_interval:
-            endptr = NULL;
-            cfg->reconnect_interval = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!cfg->reconnect_interval || !endptr || *endptr != '\0') {
+            if (!parse_unsigned(optarg, UINT_MAX, &val) || !val) {
                 fprintf(stderr, "error: reconnect-interval must be greater than zero.\n");
                 return -1;
             }
+            cfg->reconnect_interval = (unsigned int) val;
             break;
         case o_reconnect_on_error:
             cfg->reconnect_on_error = true;
             break;
         case o_max_reconnect_attempts:
-            endptr = NULL;
-            cfg->max_reconnect_attempts = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!endptr || *endptr != '\0') {
+            if (!parse_unsigned(optarg, UINT_MAX, &val)) {
                 fprintf(stderr, "error: max-reconnect-attempts must be a valid number.\n");
                 return -1;
             }
+            cfg->max_reconnect_attempts = (unsigned int) val;
             break;
         case o_reconnect_backoff_factor:
             if (!parse_backoff_factor(optarg, &cfg->reconnect_backoff_factor)) {
@@ -1922,12 +1888,11 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             break;
         }
         case o_retry_backoff_ms:
-            endptr = NULL;
-            cfg->retry_backoff_ms = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!endptr || *endptr != '\0') {
+            if (!parse_unsigned(optarg, UINT_MAX, &val)) {
                 fprintf(stderr, "error: retry-backoff-ms must be a valid number.\n");
                 return -1;
             }
+            cfg->retry_backoff_ms = (unsigned int) val;
             break;
         case o_retry_backoff_factor:
             if (!parse_backoff_factor(optarg, &cfg->retry_backoff_factor)) {
@@ -1940,12 +1905,11 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             cfg->retry_on_filter = optarg;
             break;
         case o_max_retry_queue:
-            endptr = NULL;
-            cfg->max_retry_queue = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!endptr || *endptr != '\0') {
+            if (!parse_unsigned(optarg, UINT_MAX, &val)) {
                 fprintf(stderr, "error: max-retry-queue must be a valid number.\n");
                 return -1;
             }
+            cfg->max_retry_queue = (unsigned int) val;
             break;
         case o_failed_keys_file:
             if (!optarg || !*optarg) {
@@ -1955,22 +1919,20 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             cfg->failed_keys_file = optarg;
             break;
         case o_connection_timeout:
-            endptr = NULL;
-            cfg->connection_timeout = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!endptr || *endptr != '\0') {
+            if (!parse_unsigned(optarg, UINT_MAX, &val)) {
                 fprintf(stderr, "error: connection-timeout must be a valid number.\n");
                 return -1;
             }
+            cfg->connection_timeout = (unsigned int) val;
             break;
         case o_connection_stage_timeout:
-            endptr = NULL;
-            cfg->connection_stage_timeout = (unsigned int) strtoul(optarg, &endptr, 10);
             // 0 is allowed and disables the supervisor (opt-out for users
             // running long pre-warmed handshakes against slow servers).
-            if (!endptr || *endptr != '\0') {
+            if (!parse_unsigned(optarg, UINT_MAX, &val)) {
                 fprintf(stderr, "error: connection-stage-timeout must be a valid number (seconds, 0 disables).\n");
                 return -1;
             }
+            cfg->connection_stage_timeout = (unsigned int) val;
             break;
         case o_thread_conn_start_min_jitter_micros:
             endptr = NULL;
@@ -2288,22 +2250,16 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             break;
 #ifdef HAVE_EVHTTP
         case o_prometheus_port: {
-            // strtoul pattern (statsd-port) with three deltas: accept 0,
-            // reject a leading '-' before strtoul wraps it, and bound the
-            // value to [0,65535] BEFORE any narrowing cast (a cast would
-            // silently wrap 70000 -> 4464). PLAN.md section 5 / E1.
+            // Unlike --statsd-port this accepts 0; parse_unsigned() rejects a
+            // sign or leading whitespace and bounds the value to [0,65535]
+            // BEFORE the narrowing cast (a cast would silently wrap
+            // 70000 -> 4464). PLAN.md section 5 / E1.
             static const char *E1 = "error: prometheus-port must be a number in the range [0-65535] (0 = ephemeral).\n";
-            if (!optarg || !*optarg || optarg_is_negative(optarg)) {
+            if (!parse_unsigned(optarg, 65535, &val)) {
                 fprintf(stderr, "%s", E1);
                 return -1;
             }
-            endptr = NULL;
-            unsigned long pport = strtoul(optarg, &endptr, 10);
-            if (!endptr || *endptr != '\0' || pport > 65535) {
-                fprintf(stderr, "%s", E1);
-                return -1;
-            }
-            cfg->prometheus_port = (int) pport;
+            cfg->prometheus_port = (int) val;
             break;
         }
         case o_prometheus_bind_addr: {
