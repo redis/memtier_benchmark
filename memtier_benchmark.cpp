@@ -200,9 +200,15 @@ static bool check_cluster_monitor_lines(const struct monitor_command_list *monit
 static std::atomic<int> g_interrupted(0);
 
 // Set when run_benchmark() aborts because --connection-stage-timeout
-// elapsed without any thread reaching steady state. main() reads it after
-// the run loop to decide between exit(0) and exit(2).
+// elapsed without any thread reaching steady state. Reset at the start of
+// every run (connection_stage_supervisor_reset()), so it describes the
+// current run only.
 static std::atomic<bool> g_connection_stage_aborted{false};
+
+// Set by run_benchmark() (main thread) together with
+// g_connection_stage_aborted, but never reset: with --run-count > 1, an abort
+// in any run, not only the last one, makes main() exit 2.
+static bool g_any_run_connection_stage_aborted = false;
 
 // Set by run_benchmark() (main thread, after joining the workers) when any
 // worker thread ended on connection failures it could not recover from (or an
@@ -255,8 +261,8 @@ void connection_stage_supervisor_reset(void)
     g_conn_stage_streak_start_sec.store(0, std::memory_order_release);
     // Must reset g_connection_stage_aborted as well: with --run-count > 1, a
     // run-1 abort would otherwise leave the flag latched into run 2,
-    // suppressing the worker-failure report in cg_thread_start() and
-    // forcing main() to exit with code 2 even after subsequent runs succeed.
+    // suppressing the worker-failure report in cg_thread_start(). The exit
+    // code uses g_any_run_connection_stage_aborted, which is not reset.
     g_connection_stage_aborted.store(false, std::memory_order_release);
     struct timeval now;
     gettimeofday(&now, NULL);
@@ -3760,6 +3766,7 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
                         "(last error: %s). See --connection-stage-timeout.\n",
                         elapsed, last_err.c_str());
                 g_connection_stage_aborted.store(true, std::memory_order_release);
+                g_any_run_connection_stage_aborted = true;
                 for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
                     (*i)->m_cg->interrupt();
                 }
@@ -5593,7 +5600,10 @@ int main(int argc, char *argv[])
     // operator can read why the abort fired. exit(2) keeps the failure
     // distinguishable from a successful test (0) and from --help (also 2 via
     // usage(), but those exits happen before main reaches this point).
-    if (g_connection_stage_aborted.load(std::memory_order_acquire)) {
+    // With --run-count > 1 an abort in any run counts, and it takes
+    // precedence over a worker failure or output error (exit 1) in another
+    // run or in the same one.
+    if (g_any_run_connection_stage_aborted) {
         return 2;
     }
     // A worker thread ended before the run's stop condition (see

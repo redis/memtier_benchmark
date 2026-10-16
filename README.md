@@ -283,6 +283,10 @@ REASON` (or `--json-out-file PATH`, or `results to stdout`) and exits with
 status **1**, also after a graceful interrupt. A connection-stage abort still
 exits with **2** when an output write fails too.
 
+With `--run-count`, the exit status covers every run, not only the last
+one: **2** if any run was aborted by `--connection-stage-timeout`, otherwise
+**1** if any run failed or the results could not be written, otherwise **0**.
+
 One exception: when stdout is a pipe or socket and its reader has gone
 away (e.g. `memtier_benchmark ... | head`), the run is not failed, since the
 reader chose to stop reading. This also applies to an `--out-file` that is
