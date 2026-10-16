@@ -94,13 +94,25 @@ static void write_json_string_body(FILE *fp, const char *str)
 }
 
 /**
+ * Write objectname as a JSON object key. Keys can come from user input (e.g.
+ * a --command name), so they are escaped like string values.
+ */
+static void write_json_key(FILE *fp, const char *objectname, const char *separator)
+{
+    fputc('"', fp);
+    write_json_string_body(fp, objectname);
+    fputc('"', fp);
+    fputs(separator, fp);
+}
+
+/**
  * Write singel object named objectname to the JSON with values stated in ...
  * based on the format defined
  * basically uses fprintf with the same parameters.
  */
 void json_handler::write_obj(const char *objectname, const char *format, ...)
 {
-    fprintf(m_json_file, "\"%s\": ", objectname);
+    write_json_key(m_json_file, objectname, ": ");
     va_list argptr;
     va_start(argptr, format);
     // Check if format includes "%s", indicating a string is expected
@@ -158,7 +170,7 @@ void json_handler::open_nesting(const char *objectname, eJSON_NESTED_TYPE type /
 {
     const char *nestStart = (type == NESTED_GENERAL) ? "{" : "[";
     if (objectname != NULL) {
-        fprintf(m_json_file, "\"%s\":", objectname);
+        write_json_key(m_json_file, objectname, ":");
     }
     fprintf(m_json_file, "%s", nestStart);
     // Adding the type to the nesting closer list to be able to close it properly

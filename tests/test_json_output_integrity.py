@@ -557,6 +557,37 @@ def test_json_configuration_escapes_string_values(env):
             debugPrintMemtierOnError(run_config, env)
 
 
+def test_json_escapes_object_keys(env):
+    """Object keys must be escaped like string values (issue #738).
+
+    A --command name becomes a per-command key in the JSON output. A quote,
+    backslash or control character in it used to be emitted verbatim,
+    producing a document json.load() could not parse.
+    """
+    # The single quotes keep the parser from treating '"' as a quoting
+    # character; they stay part of the command name.
+    names = ['\'EC"HO\'', 'ECHO\\', '\'EC\x01HO\'']
+    test_dir = tempfile.mkdtemp()
+    benchmark, run_config = _build_benchmark(
+        env, test_dir,
+        extra_args=["--command=" + name + " x" for name in names]
+        + ["--print-percentiles=50,99"],
+        threads=1, clients=1, requests=10)
+    ok = benchmark.run()
+    failed_asserts = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier_benchmark exited non-zero")
+        stats = _read_json(run_config, env)["ALL STATS"]
+        for name in names:
+            # Same label as command_row_name() in run_stats.cpp.
+            key = name.lower().capitalize() + "s"
+            env.assertTrue(key in stats,
+                           message=f"{key!r} not in {list(stats)}")
+    finally:
+        if env.getNumberOfFailedAssertion() > failed_asserts:
+            debugPrintMemtierOnError(run_config, env)
+
+
 def _assert_totals_bandwidth_is_sum_of_commands(env, section_name, section):
     """Totals KB/sec (and its RX/TX split) must equal the sum of the
     per-command rows. Each value is printed with %.2f, so allow a small
