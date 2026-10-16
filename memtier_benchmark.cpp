@@ -5240,9 +5240,14 @@ int main(int argc, char *argv[])
     FILE *outfile;
     if (cfg.out_file != NULL) {
         fprintf(stderr, "Writing results to %s...\n", cfg.out_file);
-        outfile = fopen(cfg.out_file, "w");
+        // Fail now rather than run the whole benchmark and then write the
+        // results to a NULL FILE*. Retry on EINTR, as json_handler does.
+        do {
+            outfile = fopen(cfg.out_file, "w");
+        } while (!outfile && errno == EINTR);
         if (!outfile) {
-            perror(cfg.out_file);
+            fprintf(stderr, "error: cannot open --out-file %s: %s\n", cfg.out_file, strerror(errno));
+            exit(1);
         }
     } else {
         fprintf(stderr, "Writing results to stdout\n");

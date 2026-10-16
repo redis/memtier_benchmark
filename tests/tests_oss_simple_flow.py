@@ -1673,3 +1673,36 @@ def test_json_out_file_unwritable(env):
     stderr = stderr.decode(errors='replace')
     env.assertEqual(process.returncode, 1, message=stderr)
     env.assertContains("error: cannot open --json-out-file /nonexistent-memtier-dir/mb.json", stderr)
+
+
+def test_out_file_unwritable(env):
+    """An --out-file that cannot be opened is a clean startup error (#716).
+
+    main() used to print the fopen() error, run the whole benchmark and then
+    write the results to a NULL FILE *, so memtier crashed with SIGSEGV. The
+    run is time-bounded (60 s) so a regression shows up as a crash or timeout
+    rather than a quick exit; no benchmark thread may start.
+    """
+    benchmark_specs = {"name": env.testName,
+                       "args": ['--out-file=/nonexistent-memtier-dir/mb.stdout', '--hide-histogram']}
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=1, clients=1, requests=None, test_time=60)
+    add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+    test_dir = tempfile.mkdtemp()
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+
+    start = time.monotonic()
+    process = subprocess.Popen(benchmark.args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        _, stderr = process.communicate(timeout=20)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        _, stderr = process.communicate()
+    elapsed = time.monotonic() - start
+    stderr = stderr.decode(errors='replace')
+    env.assertEqual(process.returncode, 1, message=stderr)
+    env.assertContains("error: cannot open --out-file /nonexistent-memtier-dir/mb.stdout", stderr)
+    env.assertNotContains("Launching threads", stderr)
+    env.assertLess(elapsed, 20)
