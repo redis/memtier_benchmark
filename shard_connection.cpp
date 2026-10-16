@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <time.h>
 #ifdef HAVE_SYS_SOCKET_H
 #include <sys/socket.h>
 #endif
@@ -50,17 +51,18 @@
 #include "connections_manager.h"
 #include "client.h"
 #include "retry_policy.h"
+#include "retry_backoff.h"
 #include "event2/bufferevent.h"
 
-// Maximum backoff delay enforced after every exponential-backoff multiplication.
+// Maximum reconnect delay enforced after every exponential-backoff
+// multiplication (retry_backoff.h has the one for --retry-on-error).
 // Without a cap, a factor of 2.0 and --max-reconnect-attempts=0 (unlimited)
 // causes the delay to double on every attempt: after ~30 doublings the next
-// scheduled reconnect or retry fires in ~34 years. event_add() silently absorbs
+// scheduled reconnect fires in ~34 years. event_add() silently absorbs
 // that value, making the benchmark go effectively dark instead of surfacing the
 // underlying failure.  60 s is a practical upper bound: tight enough to remain
 // responsive, large enough to avoid thundering-herd reconnect storms.
 static const double MEMTIER_BACKOFF_CAP_SEC = 60.0;
-static const double MEMTIER_BACKOFF_CAP_MS = 60000.0;
 
 // Minimum reconnect delay enforced after every backoff multiplication. A
 // --reconnect-backoff-factor below 1 shrinks the delay on each attempt; with no
@@ -133,6 +135,19 @@ void cluster_client_connection_timeout_handler(evutil_socket_t fd, short what, v
     sc->handle_connection_timeout_event();
 }
 
+// Retry due times use the monotonic clock, like libevent's timers, so a
+// wall-clock step cannot hold queued retries back or resend them early.
+static void retry_clock_now(struct timeval *tv)
+{
+    struct timespec mono;
+    if (clock_gettime(CLOCK_MONOTONIC, &mono) == 0) {
+        tv->tv_sec = mono.tv_sec;
+        tv->tv_usec = mono.tv_nsec / 1000;
+    } else {
+        gettimeofday(tv, NULL);
+    }
+}
+
 void cluster_client_retry_drain_handler(evutil_socket_t fd, short what, void *ctx)
 {
     shard_connection *sc = (shard_connection *) ctx;
@@ -172,6 +187,7 @@ request::request(request_type type, unsigned int size, struct timeval *sent_time
         gettimeofday(&m_sent_time, NULL);
     }
     m_first_sent_time = m_sent_time;
+    timerclear(&m_retry_due);
 }
 
 request::~request(void)
@@ -282,7 +298,6 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_retry_queue(NULL),
         m_replay_queue(NULL),
         m_retry_drain_timer(NULL),
-        m_current_retry_backoff_ms(0.0),
         m_deferred_fill_timer(NULL),
         m_cluster_slots_retry_timer(NULL),
         m_bev_paused(false)
@@ -310,8 +325,8 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
     if (m_config->retry_on_error) {
         m_retry_queue = new std::queue<request *>;
         m_replay_queue = new std::queue<request *>;
-        m_current_retry_backoff_ms = (double) m_config->retry_backoff_ms;
     }
+    timerclear(&m_retry_timer_due);
 }
 
 shard_connection::~shard_connection()
@@ -911,16 +926,34 @@ void shard_connection::capture_serialized_bytes(size_t before_pos, request *req)
     req->m_serialized_len = len;
 }
 
+size_t shard_connection::retry_queue_cap() const
+{
+    size_t cap = m_config->max_retry_queue;
+    if (cap == 0) {
+        // Auto cap: pipeline * 4, floor of 64.
+        cap = (size_t) m_config->pipeline * 4;
+        if (cap < 64) cap = 64;
+    }
+    return cap;
+}
+
 bool shard_connection::retry_queue_full() const
 {
     if (!m_retry_queue) return false;
-    unsigned int cap = m_config->max_retry_queue;
-    if (cap == 0) {
-        // Auto cap: pipeline * 4, floor of 64.
-        cap = m_config->pipeline * 4;
-        if (cap < 64) cap = 64;
-    }
-    return m_retry_queue->size() >= cap;
+    return m_retry_queue->size() >= retry_queue_cap();
+}
+
+bool shard_connection::retry_queue_holds_new_work() const
+{
+    if (!m_retry_queue) return false;
+    // Every request in flight may come back as a retryable error and need a
+    // slot, so count them with the queued retries. A --max-retry-queue below
+    // --pipeline still allows a full pipeline, or requests in flight alone
+    // would cut it on a healthy server; requests in flight beyond the cap
+    // then have no guaranteed slot.
+    size_t cap = retry_queue_cap();
+    if (cap < m_config->pipeline) cap = m_config->pipeline;
+    return m_retry_queue->size() + m_pipeline->size() >= cap;
 }
 
 bool shard_connection::enqueue_retry(request *req)
@@ -941,33 +974,47 @@ bool shard_connection::enqueue_retry(request *req)
         return false;
     }
 
+    // Each request waits its own backoff, from its own resend count, however
+    // many other requests are queued on this connection.
+    struct timeval now;
+    retry_clock_now(&now);
+    double ms = retry_backoff_delay_ms(m_config->retry_backoff_ms, m_config->retry_backoff_factor, req->m_retries);
+    struct timeval delay;
+    delay.tv_sec = (long) (ms / 1000.0);
+    delay.tv_usec = (long) ((ms - delay.tv_sec * 1000.0) * 1000.0);
+    timeradd(&now, &delay, &req->m_retry_due);
+
+    bool had_queued = !m_retry_queue->empty();
     req->m_claimed_by_retry = true;
     m_retry_queue->push(req);
 
-    // (Re)schedule the drain timer if we have a backoff configured. With zero
-    // backoff we still go through the timer with a 0 ms delay to keep the
-    // ordering predictable and the libevent integration simple.
+    // One timer per connection, armed for the earliest due time in the queue.
+    // With zero backoff we still go through the timer with a 0 ms delay to
+    // keep the ordering predictable and the libevent integration simple.
     if (m_retry_drain_timer == NULL) {
         m_retry_drain_timer = event_new(m_event_base, -1, 0, cluster_client_retry_drain_handler, (void *) this);
     }
     if (m_retry_drain_timer != NULL) {
-        // Only (re)add if not pending.
-        if (!evtimer_pending(m_retry_drain_timer, NULL)) {
-            double ms = m_current_retry_backoff_ms;
-            struct timeval delay;
-            delay.tv_sec = (long) (ms / 1000.0);
-            delay.tv_usec = (long) ((ms - delay.tv_sec * 1000.0) * 1000.0);
-            event_add(m_retry_drain_timer, &delay);
-        }
-    }
-
-    // Exponential backoff for the *next* retry on this connection.
-    if (m_config->retry_backoff_factor > 0.0) {
-        m_current_retry_backoff_ms *= m_config->retry_backoff_factor;
-        if (m_current_retry_backoff_ms > MEMTIER_BACKOFF_CAP_MS) m_current_retry_backoff_ms = MEMTIER_BACKOFF_CAP_MS;
+        bool pending = evtimer_pending(m_retry_drain_timer, NULL);
+        struct timeval due = req->m_retry_due;
+        // An idle timer with requests queued fired while the connection could
+        // not send, and m_retry_timer_due is still their earliest due time:
+        // keep it, so they go out as soon as the connection can send rather
+        // than after this request's backoff.
+        if (!pending && had_queued && timercmp(&m_retry_timer_due, &due, <)) due = m_retry_timer_due;
+        if (!pending || timercmp(&due, &m_retry_timer_due, <)) arm_retry_drain_timer(due, now);
     }
 
     return true;
+}
+
+void shard_connection::arm_retry_drain_timer(const struct timeval &due, const struct timeval &now)
+{
+    struct timeval delay = {0, 0};
+    if (timercmp(&due, &now, >)) timersub(&due, &now, &delay);
+    m_retry_timer_due = due;
+    // Replaces the timeout if the timer is already pending.
+    event_add(m_retry_drain_timer, &delay);
 }
 
 void shard_connection::replay_request(request *req)
@@ -1005,11 +1052,29 @@ void shard_connection::handle_retry_drain_event()
         // Will retry once we reconnect (handled by drain_replay_queue_after_reconnect).
         return;
     }
-    while (!m_retry_queue->empty()) {
+    // Resend the requests whose backoff is over, in queue order, and keep the
+    // rest queued in order. The 1 ms slack only saves a timer wakeup for a
+    // request due right after the timer fires.
+    struct timeval now, horizon;
+    struct timeval slack = {0, 1000};
+    retry_clock_now(&now);
+    timeradd(&now, &slack, &horizon);
+    bool have_next = false;
+    struct timeval next = {0, 0};
+    for (size_t n = m_retry_queue->size(); n > 0 && !m_retry_queue->empty(); n--) {
         request *req = m_retry_queue->front();
         m_retry_queue->pop();
-        replay_request(req);
+        if (!timercmp(&req->m_retry_due, &horizon, >)) {
+            replay_request(req);
+            continue;
+        }
+        m_retry_queue->push(req);
+        if (!have_next || timercmp(&req->m_retry_due, &next, <)) {
+            next = req->m_retry_due;
+            have_next = true;
+        }
     }
+    if (have_next && m_retry_drain_timer != NULL) arm_retry_drain_timer(next, now);
 }
 
 void shard_connection::drain_replay_queue_after_reconnect()
@@ -1637,10 +1702,11 @@ void shard_connection::fill_pipeline(void)
             break;
         }
 
-        // Hold new work while the retry queue is at its hard cap. The drain
-        // timer will reschedule fill_pipeline via the event loop once it makes
-        // progress.
-        if (retry_queue_full()) {
+        // Hold new work while the queued retries and the requests in flight
+        // fill the retry queue's cap, so a request that fails in flight
+        // finds room for its retry instead of failing with its retries left.
+        // fill_pipeline runs again as replies come in.
+        if (retry_queue_holds_new_work()) {
             break;
         }
 

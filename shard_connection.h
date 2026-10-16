@@ -88,7 +88,8 @@ struct request
     unsigned int m_keys;
 
     // Retry bookkeeping. Populated by the retry path; ignored when --retry-on-error is off.
-    unsigned int m_retries; // number of resends so far (0 = first attempt)
+    unsigned int m_retries;     // number of resends so far (0 = first attempt)
+    struct timeval m_retry_due; // while in the retry queue: when to resend (CLOCK_MONOTONIC)
     // Set true by enqueue_retry when ownership has transferred to the retry
     // queue. process_response checks this flag and skips its delete, leaving
     // the request to be freed when the retry queue drains.
@@ -302,10 +303,6 @@ public:
     void handle_reconnect_timer_event();
     void handle_connection_timeout_event();
 
-    // Reset retry backoff after a successful response (so a recovered SUT
-    // returns to immediate retries on the next transient burst).
-    void reset_retry_backoff() { m_current_retry_backoff_ms = (double) m_config->retry_backoff_ms; }
-
     // Retry / replay machinery.
     void handle_retry_drain_event();
     // Push `req` back onto the wire (or onto the retry queue if a backoff is
@@ -315,6 +312,8 @@ public:
     // Replay a request (write the captured bytes to the output buffer + push_req).
     // Bumps req->m_retries and updates req->m_sent_time.
     void replay_request(request *req);
+    // Arm m_retry_drain_timer to fire at `due`.
+    void arm_retry_drain_timer(const struct timeval &due, const struct timeval &now);
     // Drain any pending replay-on-reconnect requests back into the pipeline.
     void drain_replay_queue_after_reconnect();
     // Hand-off of requests held for resend when a cluster topology change
@@ -342,9 +341,14 @@ public:
     // into req->m_serialized. No-op when retry is globally disabled.
     void capture_serialized_bytes(size_t before_pos, request *req);
 
-    // Hard cap on retry queue depth. True == cap hit, caller must hold the
-    // pipeline until the queue drains.
+    // Hard cap on retry queue depth (--max-retry-queue, or the auto cap).
+    size_t retry_queue_cap() const;
+    // True == cap hit: enqueue_retry() refuses the request.
     bool retry_queue_full() const;
+    // True when queued retries plus requests in flight reach the cap (at
+    // least --pipeline): hold new work, so that every request in flight has
+    // room for a retry.
+    bool retry_queue_holds_new_work() const;
 
 private:
     // request::m_key is read by --failed-keys-file and, under --retry-on-error,
@@ -466,14 +470,16 @@ private:
     //   m_replay_queue      requests that were in-flight when the socket died,
     //                       to be replayed after reconnect succeeds
     //   m_retry_drain_timer single libevent timer that drains m_retry_queue
-    //                       (avoids one-timer-per-request)
-    //   m_current_retry_backoff_ms  next-retry backoff delay (exponential per
-    //                       retry-backoff-factor; resets to retry_backoff_ms
-    //                       on a successful response)
+    //                       (avoids one-timer-per-request). Each queued
+    //                       request has its own due time (m_retry_due, from
+    //                       its own resend count); the timer is armed for the
+    //                       earliest one and resends only the requests due
+    //   m_retry_timer_due   due time the timer is armed for, or last fired
+    //                       for (CLOCK_MONOTONIC)
     std::queue<request *> *m_retry_queue;
     std::queue<request *> *m_replay_queue;
     struct event *m_retry_drain_timer;
-    double m_current_retry_backoff_ms;
+    struct timeval m_retry_timer_due;
 
     // Cancelable timer for deferred fill_pipeline (replaces event_base_once to
     // avoid UAF when the connection is freed before the callback fires).

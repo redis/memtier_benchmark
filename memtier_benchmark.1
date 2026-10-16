@@ -242,8 +242,10 @@ switch on, N>0 = bounded. MOVED/ASK redirects count toward this.
 \fB\-\-retry\-backoff\-ms\fR=\fI\,NUM\/\fR
 Delay between retries in milliseconds (default: 0, immediate).
 .TP
-\fB\-\-retry\-backoff\-factor\fR=\fI\,NUM\/\fR Exponential multiplier applied to retry\-backoff\-ms on each
-successive retry (default: 0, constant backoff).
+\fB\-\-retry\-backoff\-factor\fR=\fI\,NUM\/\fR Multiply the delay by NUM on each retry of the same request:
+with NUM > 0 the Nth resend waits retry\-backoff\-ms * NUM^(N\-1),
+at most 60 s or retry\-backoff\-ms if larger (default: 0,
+constant retry\-backoff\-ms).
 .TP
 \fB\-\-retry\-on\fR=\fI\,LIST\/\fR
 Restrict retries to error\-status prefixes in this comma list
@@ -251,8 +253,10 @@ Restrict retries to error\-status prefixes in this comma list
 classified as permanent.
 .TP
 \fB\-\-max\-retry\-queue\fR=\fI\,NUM\/\fR
-Hard cap on per\-connection retry queue depth. When full, the
-pipeline stops accepting new work until the queue drains.
+Hard cap on per\-connection retry queue depth. No new request is
+sent while queued retries plus requests in flight reach it (or
+\fB\-\-pipeline\fR, if larger), so with NUM >= \fB\-\-pipeline\fR a request that
+fails in flight always has room to retry.
 Default: 0 (auto = max(pipeline * 4, 64)).
 .TP
 \fB\-\-failed\-keys\-file\fR=\fI\,PATH\/\fR

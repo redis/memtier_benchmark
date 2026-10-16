@@ -60,7 +60,7 @@ memtier_benchmark_SOURCES = \
 	statsd.cpp statsd.h \
 	prometheus_metrics.cpp prometheus_metrics.h \
 	prometheus_exporter.cpp prometheus_exporter.h \
-	retry_policy.cpp retry_policy.h \
+	retry_policy.cpp retry_policy.h retry_backoff.h \
 	deps/hdr_histogram/hdr_histogram_log.c deps/hdr_histogram/hdr_histogram_log.h \
 	deps/hdr_histogram/hdr_histogram.c deps/hdr_histogram/hdr_histogram.h \
 	deps/hdr_histogram/hdr_time.c deps/hdr_histogram/hdr_time.h deps/hdr_histogram/hdr_encoding.c deps/hdr_histogram/hdr_malloc.h
@@ -78,7 +78,7 @@ memtier_benchmark_LDADD = \
 	$(LIBSSL_LIBS)
 
 
-check_PROGRAMS = prometheus_metrics_test rate_limiter_test socket_options_test hdr_histogram_test cluster_transaction_test \
+check_PROGRAMS = prometheus_metrics_test rate_limiter_test retry_backoff_test retry_drain_test socket_options_test hdr_histogram_test cluster_transaction_test \
     cluster_hslot_test run_stats_counters_test
 
 # The metrics test links only the pure layer (prometheus_metrics.{h,cpp}).
@@ -95,6 +95,14 @@ prometheus_metrics_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 rate_limiter_test_SOURCES = tests/unit/rate_limiter_test.cpp rate_limiter.h
 rate_limiter_test_CPPFLAGS = -I$(srcdir)
 rate_limiter_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+retry_backoff_test_SOURCES = tests/unit/retry_backoff_test.cpp retry_backoff.h
+retry_backoff_test_CPPFLAGS = -I$(srcdir)
+retry_backoff_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+# Resend a retry whose drain timer fired before its connection could send.
+retry_drain_test_SOURCES = tests/unit/retry_drain_test.cpp
+retry_drain_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
+retry_drain_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+retry_drain_test_LDADD = $(filter-out memtier_benchmark-memtier_benchmark.$(OBJEXT),$(memtier_benchmark_OBJECTS)) $(memtier_benchmark_LDADD)
 # Exercise the real connection setup with a test-only socket descriptor recorder.
 # The test includes shard_connection.cpp; do not compile it a second time here.
 socket_options_test_SOURCES = tests/unit/socket_options_test.cpp

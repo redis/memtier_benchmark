@@ -1155,13 +1155,6 @@ void client::handle_response(unsigned int conn_id, struct timeval timestamp, req
         assert(0);
         break;
     }
-
-    // On success after one or more retries: reset the per-connection backoff
-    // so a transient burst of errors doesn't keep us in slow-retry mode after
-    // the SUT recovers.
-    if (m_config->retry_on_error && !response->is_error() && request->m_retries > 0) {
-        m_connections[conn_id]->reset_retry_backoff();
-    }
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -1266,14 +1259,6 @@ void verify_client::handle_response(unsigned int conn_id, struct timeval timesta
         } else {
             benchmark_debug_log("key: [%.*s] verified successfuly.\n", vr->m_key_len, vr->m_key);
             m_verified_keys++;
-        }
-        // Reset retry backoff after a non-error protocol response, matching
-        // client::handle_response. A value mismatch is a successful round-trip
-        // from the server's perspective, so the backoff should reset on either
-        // branch — without this, a transient error burst keeps the
-        // per-connection backoff inflated.
-        if (m_config->retry_on_error && request->m_retries > 0) {
-            m_connections[conn_id]->reset_retry_backoff();
         }
     }
 }

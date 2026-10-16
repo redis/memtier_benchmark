@@ -16,8 +16,14 @@ import subprocess
 import tempfile
 import threading
 import time
+import zlib
 from include import *
 from mb import Benchmark, RunConfig
+
+
+# Sanitizer builds (the CI workflows set these) run memtier several times
+# slower, which delays resends by tens of milliseconds.
+_SANITIZER_ACTIVE = any(os.environ.get(k) for k in ("ASAN_OPTIONS", "TSAN_OPTIONS", "UBSAN_OPTIONS"))
 
 
 def _build_benchmark(env, extra_args, threads=1, clients=1, requests=1000):
@@ -482,6 +488,349 @@ def test_retry_after_last_request_is_sent(env):
     env.assertEqual(rc, 0)
     env.assertEqual(conn.execute_command("DBSIZE"), requests,
                     message="a retried SET was never sent")
+
+
+def test_retry_backoff_is_per_request(env):
+    """
+    --retry-backoff-factor grows the backoff of each request from its own
+    retry count, so a request that exhausts --max-retries does not slow down
+    the next one.
+
+    The backoff was one value per connection, multiplied on every retry and
+    reset only when a retried request succeeded. With every SET failing,
+    3 requests took 47 s here instead of about 1 s. 200 requests do not all
+    fit in one batch of retries, so a backoff carried over from earlier
+    requests shows up in the run time and the latency.
+    """
+    # Toggles maxmemory on one server; the key layout assumes a single shard.
+    env.skipOnCluster()
+    requests = 200
+    max_retries = 5
+    test_dir = tempfile.mkdtemp()
+    failed_keys = os.path.join(test_dir, "failed-keys.csv")
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--pipeline=1",
+            "--ratio=1:0",
+            "--key-pattern=P:P",
+            "--key-minimum=1",
+            "--key-maximum={}".format(requests),
+            "--retry-on-error",
+            "--max-retries={}".format(max_retries),
+            # Per request: 10+20+40+80+160 ms = 0.31 s.
+            "--retry-backoff-ms=10",
+            "--retry-backoff-factor=2",
+            # No reply ever succeeds; don't abort on that.
+            "--connection-stage-timeout=0",
+            "--failed-keys-file={}".format(failed_keys),
+            "--hide-histogram",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=1, clients=1, requests=requests)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+
+    conn = env.getOSSMasterNodesConnectionList()[0]
+    conn.execute_command("FLUSHALL")
+    saved = conn.execute_command("CONFIG", "GET", "maxmemory*")
+    # Keys come back as bytes without decoded responses.
+    saved = {k.decode() if isinstance(k, bytes) else k: v for k, v in zip(saved[0::2], saved[1::2])}
+    conn.execute_command("CONFIG", "SET", "maxmemory-policy", "noeviction")
+    # Every SET fails with a retryable -OOM for the whole run.
+    conn.execute_command("CONFIG", "SET", "maxmemory", "1")
+
+    start = time.time()
+    try:
+        try:
+            rc, stderr = _run_with_background(env, benchmark, config, lambda _proc: None, timeout=20)
+        except subprocess.TimeoutExpired:
+            rc, stderr = None, ""
+    finally:
+        for k in ("maxmemory", "maxmemory-policy"):
+            if k in saved:
+                conn.execute_command("CONFIG", "SET", k, saved[k])
+    elapsed = time.time() - start
+
+    env.assertTrue(rc is not None, message="the run did not end within 20 s")
+    env.assertEqual(rc, 0, message=stderr[-2000:])
+    env.assertLess(elapsed, 10, message="the retry backoff grew across requests")
+    # Each request waits 10+20+40+80+160 ms before it is given up on, and its
+    # latency spans all attempts.
+    with open("{0}/mb.json".format(config.results_dir)) as f:
+        latency = json.load(f)["ALL STATS"]["Sets"]["Average Latency"]
+    env.assertGreater(latency, 250, message="retries did not wait their backoff")
+    env.assertLess(latency, 700 if _SANITIZER_ACTIVE else 500, message="retries waited longer than their own backoff")
+    totals = re.findall(r"errors (\d+) \(\+\d+\)\s+retries (\d+) ", stderr)
+    env.assertTrue(totals, message=stderr[-2000:])
+    if totals:
+        env.assertEqual(int(totals[-1][0]), requests)
+        env.assertEqual(int(totals[-1][1]), requests * max_retries)
+    with open(failed_keys) as f:
+        rows = list(csv.DictReader(f))
+    env.assertEqual(len(rows), requests)
+    for row in rows:
+        env.assertEqual(int(row["retries"]), max_retries)
+
+
+class _MixedErrorPeer(socketserver.ThreadingTCPServer):
+    """A standalone peer that answers attempt n (1-based) of SET key with
+    -TRYAGAIN when fails(key, n) is true and +OK otherwise, and records when
+    each attempt arrived."""
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, fails):
+        super().__init__(("127.0.0.1", 0), _MixedErrorHandler)
+        self.fails = fails
+        self.arrivals = {}
+        self.errors = []
+
+
+class _MixedErrorHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        peer = self.server
+        buf = b""
+        try:
+            while True:
+                data = self.request.recv(65536)
+                if not data:
+                    return
+                now = time.monotonic()
+                buf += data
+                out = []
+                while buf.startswith(b"*"):
+                    end = buf.find(b"\r\n")
+                    if end < 0:
+                        break
+                    pos, args = end + 2, []
+                    for _ in range(int(buf[1:end])):
+                        end = buf.find(b"\r\n", pos)
+                        if end < 0:
+                            break
+                        size = int(buf[pos + 1:end])
+                        if len(buf) < end + 4 + size:
+                            end = -1
+                            break
+                        args.append(buf[end + 2:end + 2 + size])
+                        pos = end + 4 + size
+                    if end < 0:
+                        break
+                    buf = buf[pos:]
+                    if args[0].upper() != b"SET":
+                        out.append(b"*0\r\n" if args[0].upper() == b"COMMAND" else b"+OK\r\n")
+                        continue
+                    key = args[1].decode()
+                    attempts = peer.arrivals.setdefault(key, [])
+                    attempts.append(now)
+                    if peer.fails(key, len(attempts)):
+                        out.append(b"-TRYAGAIN mixed failures\r\n")
+                    else:
+                        out.append(b"+OK\r\n")
+                if out:
+                    self.request.sendall(b"".join(out))
+        except (ConnectionResetError, BrokenPipeError):
+            pass
+        except Exception as error:
+            peer.errors.append(repr(error))
+
+
+def test_retry_backoff_with_mixed_failures(env):
+    """
+    Retries of requests at different retry counts, queued on one connection
+    together, each wait their own backoff.
+
+    The connection has one retry timer. It was armed with the backoff of the
+    request that found it idle and then resent the whole queue, so a first
+    retry could wait for a timer armed by a 4th retry (1.28 s instead of
+    20 ms) and a 4th retry could go out after 20 ms. A request queued with an
+    earlier due time must also bring the timer forward.
+
+    --rate-limiting spreads the first sends over about 2 s, so new requests
+    fail while older ones wait for later retries.
+    """
+    base_ms, factor, keys = 20, 4, 40
+    # SET memtier-N fails its first N % 5 attempts.
+    with _MixedErrorPeer(lambda key, attempt: attempt <= int(key.split("-")[-1]) % 5) as peer:
+        thread = threading.Thread(target=peer.serve_forever, daemon=True)
+        thread.start()
+        args = [MEMTIER_BINARY, "--server=127.0.0.1", "--port={}".format(peer.server_address[1]),
+                "--threads=1", "--clients=1", "--pipeline=8", "--requests={}".format(keys), "--rate-limiting=20",
+                "--ratio=1:0", "--key-pattern=P:P", "--key-minimum=1", "--key-maximum={}".format(keys),
+                "--hide-histogram", "--retry-on-error", "--max-retries=4",
+                "--retry-backoff-ms={}".format(base_ms), "--retry-backoff-factor={}".format(factor)]
+        try:
+            result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    timeout=60, text=True)
+        finally:
+            peer.shutdown()
+            thread.join(timeout=5)
+
+    env.assertEqual(result.returncode, 0, message=result.stderr[-2000:])
+    env.assertEqual(peer.errors, [])
+    env.assertEqual(len(peer.arrivals), keys)
+    # A resend may be late, never early. Sanitizer builds get a wider upper
+    # bound and up to 10% of gaps late beyond it: a TSAN build stalls the
+    # worker for ~200 ms about 1 s into the run, with or without
+    # --retry-on-error (first sends stall too), which delays every resend due
+    # in that window. Before the fix 30-75 of the 80 gaps were off.
+    if _SANITIZER_ACTIVE:
+        upper = lambda expected: expected * 1.5 + 100
+        allowed_bad = lambda gaps: gaps // 10
+    else:
+        upper = lambda expected: expected * 1.25 + 25
+        allowed_bad = lambda gaps: 0
+    gaps = bad = 0
+    report = []
+    for key, attempts in sorted(peer.arrivals.items()):
+        env.assertEqual(len(attempts), int(key.split("-")[-1]) % 5 + 1, message=key)
+        for resend in range(1, len(attempts)):
+            expected = base_ms * factor ** (resend - 1)
+            gap = (attempts[resend] - attempts[resend - 1]) * 1000
+            gaps += 1
+            if not expected - 3 <= gap <= upper(expected):
+                bad += 1
+                report.append("{} resend {}: {:.0f} ms, expected {} ms".format(key, resend, gap, expected))
+    env.assertGreater(gaps, 0)
+    env.assertLessEqual(bad, allowed_bad(gaps),
+                        message="{} of {} gaps off their own backoff: {}".format(bad, gaps, "; ".join(report[:10])))
+
+
+def test_requests_in_flight_have_room_to_retry(env):
+    """
+    A request that fails in flight is retried, not given up on with its
+    retries left, when the retry queue fills up.
+
+    New requests were sent until the retry queue itself was full, so
+    requests already in flight that then failed found it full and were
+    logged with retries=0 despite --max-retries=4. New work is now held while
+    queued retries plus requests in flight reach the cap.
+    """
+    keys, max_retries = 600, 4
+
+    def fails(key, attempt):
+        # About 60% of attempts fail, the same ones on every run.
+        return zlib.crc32("{}:{}".format(key, attempt).encode()) % 10 < 6
+
+    with _MixedErrorPeer(fails) as peer, tempfile.TemporaryDirectory() as directory:
+        thread = threading.Thread(target=peer.serve_forever, daemon=True)
+        thread.start()
+        failed_keys = os.path.join(directory, "failed.csv")
+        args = [MEMTIER_BINARY, "--server=127.0.0.1", "--port={}".format(peer.server_address[1]),
+                "--threads=1", "--clients=1", "--pipeline=8", "--requests={}".format(keys),
+                "--ratio=1:0", "--key-pattern=P:P", "--key-minimum=1", "--key-maximum={}".format(keys),
+                "--hide-histogram", "--retry-on-error", "--max-retries={}".format(max_retries),
+                "--retry-backoff-ms=10", "--retry-backoff-factor=2", "--failed-keys-file=" + failed_keys]
+        try:
+            result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    timeout=60, text=True)
+        finally:
+            peer.shutdown()
+            thread.join(timeout=5)
+        with open(failed_keys) as source:
+            rows = list(csv.DictReader(source))
+
+    env.assertEqual(result.returncode, 0, message=result.stderr[-2000:])
+    env.assertEqual(peer.errors, [])
+    expected = sorted(key for key in peer.arrivals
+                      if all(fails(key, attempt) for attempt in range(1, max_retries + 2)))
+    early = [row["key"] for row in rows if int(row["retries"]) < max_retries]
+    env.assertEqual(early, [], message="{} requests given up on with retries left".format(len(early)))
+    env.assertEqual(sorted(row["key"] for row in rows), expected)
+
+
+class _DepthPeer(socketserver.ThreadingTCPServer):
+    """A standalone peer that holds its +OK replies until `depth` SETs are
+    waiting, or 0.5 s went by, and records the most SETs it held at once."""
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, depth):
+        super().__init__(("127.0.0.1", 0), _DepthHandler)
+        self.depth = depth
+        self.most_held = 0
+        self.errors = []
+
+
+class _DepthHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        peer = self.server
+        buf = b""
+        held, since = 0, None
+        try:
+            while True:
+                if select.select([self.request], [], [], 0.01)[0]:
+                    data = self.request.recv(65536)
+                    if not data:
+                        return
+                    buf += data
+                out = []
+                while buf.startswith(b"*"):
+                    end = buf.find(b"\r\n")
+                    if end < 0:
+                        break
+                    pos, args = end + 2, []
+                    for _ in range(int(buf[1:end])):
+                        end = buf.find(b"\r\n", pos)
+                        if end < 0:
+                            break
+                        size = int(buf[pos + 1:end])
+                        if len(buf) < end + 4 + size:
+                            end = -1
+                            break
+                        args.append(buf[end + 2:end + 2 + size])
+                        pos = end + 4 + size
+                    if end < 0:
+                        break
+                    buf = buf[pos:]
+                    if args[0].upper() != b"SET":
+                        out.append(b"*0\r\n" if args[0].upper() == b"COMMAND" else b"+OK\r\n")
+                        continue
+                    held += 1
+                    since = since or time.monotonic()
+                if held and (held >= peer.depth or time.monotonic() - since >= 0.5):
+                    peer.most_held = max(peer.most_held, held)
+                    out.append(b"+OK\r\n" * held)
+                    held, since = 0, None
+                if out:
+                    self.request.sendall(b"".join(out))
+        except (ConnectionResetError, BrokenPipeError):
+            pass
+        except Exception as error:
+            peer.errors.append(repr(error))
+
+
+def test_small_max_retry_queue_keeps_pipeline_depth(env):
+    """
+    A --max-retry-queue below --pipeline does not cut the pipeline on a
+    healthy server.
+
+    New work is held while queued retries plus requests in flight reach the
+    cap, so a cap of 4 alone kept only 4 of 64 requests in flight. The hold
+    now starts at --pipeline at the least; the queue itself stays capped at 4.
+    """
+    pipeline = 64
+    with _DepthPeer(pipeline) as peer:
+        thread = threading.Thread(target=peer.serve_forever, daemon=True)
+        thread.start()
+        args = [MEMTIER_BINARY, "--server=127.0.0.1", "--port={}".format(peer.server_address[1]),
+                "--threads=1", "--clients=1", "--pipeline={}".format(pipeline),
+                "--requests={}".format(pipeline * 3), "--ratio=1:0", "--hide-histogram",
+                "--retry-on-error", "--max-retry-queue=4"]
+        try:
+            result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    timeout=60, text=True)
+        finally:
+            peer.shutdown()
+            thread.join(timeout=5)
+
+    env.assertEqual(result.returncode, 0, message=result.stderr[-2000:])
+    env.assertEqual(peer.errors, [])
+    env.assertEqual(peer.most_held, pipeline, message="requests in flight at once")
 
 
 def test_dropped_replays_do_not_stall_client(env):

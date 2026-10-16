@@ -74,6 +74,8 @@ tests/.env/
 /cluster_transaction_test
 /cluster_hslot_test
 /rate_limiter_test
+/retry_backoff_test
+/retry_drain_test
 /socket_options_test
 /run_stats_counters_test
 tests/unit/prometheus_metrics_test
