@@ -310,10 +310,12 @@ it as an operational signal, not the authoritative result:
   `memtier_latency_seconds_count` trails `memtier_ops_total` by up to about one
   second of operations while a run is in progress. At run end the last partial
   second is folded in, so `_count` catches up with the ops the clients
-  completed. A stalled server adds nothing to `_count` until operations
-  complete again.
-- **HDR quantization (≤1%).** Bucket placement carries up to 1% HDR
-  quantization; the `le` bound rendered is the user-supplied (µs-quantized)
+  completed. While the server is stalled, a connection's in-progress second
+  does not complete, so the gap stays open (and `_count` frozen) until
+  operations complete again.
+- **HDR quantization.** Bucket placement carries up to 1% HDR quantization
+  above ~1 ms, and 8 µs absolute below ~2 ms (e.g. up to 8% at 100 µs); the
+  `le` bound rendered is the user-supplied (µs-quantized)
   bound, not the internal slot edge.
 
 For exact percentiles and totals, use the **end-of-run output** (or the full

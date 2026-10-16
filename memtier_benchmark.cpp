@@ -3416,16 +3416,16 @@ static void prom_fold_thread(benchmark_config *cfg, size_t t, client_group *cg)
 }
 
 // Drain the latency samples of every second the clients completed since the
-// previous drain into the exporter's scratch tick histogram. Threads that
-// already finished are drained by the run-end publish.
-static hdr_histogram *prom_drain_latency(benchmark_config *cfg, std::vector<cg_thread *> &threads, bool finished_too)
+// previous drain into the exporter's scratch tick histogram. Finished threads
+// are drained too (their last partial second is folded by set_end_time): the
+// drain is mutex-protected and every m_cg lives until after the run-end
+// publish.
+static hdr_histogram *prom_drain_latency(benchmark_config *cfg, std::vector<cg_thread *> &threads)
 {
     hdr_histogram *tick = cfg->prometheus->tick_histogram();
     hdr_reset(tick);
     for (size_t t = 0; t < threads.size(); t++) {
-        if (finished_too || !threads[t]->m_finished) {
-            threads[t]->m_cg->drain_prom_latency_histogram(tick);
-        }
+        threads[t]->m_cg->drain_prom_latency_histogram(tick);
     }
     return tick;
 }
@@ -3434,7 +3434,7 @@ static hdr_histogram *prom_drain_latency(benchmark_config *cfg, std::vector<cg_t
 // PLAN.md section 3.7.
 static void prom_publish_tick(benchmark_config *cfg, const metrics_snapshot &snap, std::vector<cg_thread *> &threads)
 {
-    cfg->prometheus->publish(snap, prom_drain_latency(cfg, threads, false));
+    cfg->prometheus->publish(snap, prom_drain_latency(cfg, threads));
 }
 
 static void prom_publish_run_start(benchmark_config *cfg, uint32_t run_id)
@@ -3442,11 +3442,12 @@ static void prom_publish_run_start(benchmark_config *cfg, uint32_t run_id)
     cfg->prometheus->publish_run_start(run_id, cfg->run_count);
 }
 
-// Post-join: drain every thread, so the run's last seconds (folded by each
-// client's set_end_time) reach memtier_latency_seconds.
+// Post-join: drain every thread once more. The loop's last tick normally has
+// drained everything already; this covers exits that skip it (Ctrl+C, the
+// connection-stage abort), so the run-end snapshot always counts every op.
 static void prom_publish_run_end(benchmark_config *cfg, uint32_t run_id, std::vector<cg_thread *> &threads)
 {
-    cfg->prometheus->publish_run_end(run_id, cfg->run_count, prom_drain_latency(cfg, threads, true));
+    cfg->prometheus->publish_run_end(run_id, cfg->run_count, prom_drain_latency(cfg, threads));
 }
 
 #else // !HAVE_EVHTTP — empty stubs keep the run loop ifdef-free.

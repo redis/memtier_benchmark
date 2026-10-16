@@ -441,5 +441,7 @@ run), and a latency histogram (`memtier_latency_seconds`), plus build info. By
 design it echoes **no** connection identity (no server address, password, URI,
 or filesystem path) into the scrape body. The end-of-run output remains the
 authoritative latency source; the histogram counts every operation but trails
-the live counters by up to about one second. See the [Real-Time Metrics Guide](docs/REALTIME_METRICS.md) for
-the full metric mapping, threat model, and operational notes.
+`memtier_ops_total` by up to about one second of operations (longer while the
+server is stalled). See the
+[Real-Time Metrics Guide](docs/REALTIME_METRICS.md) for the full metric
+mapping, threat model, and operational notes.
