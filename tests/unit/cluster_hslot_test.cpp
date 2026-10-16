@@ -40,6 +40,12 @@ bool connection_stage_steady_state_reached()
 {
     abort();
 }
+
+int failure_exit_code()
+{
+    return 1;
+}
+
 bool is_redis_protocol(enum PROTOCOL_TYPE type)
 {
     return type == PROTOCOL_REDIS_DEFAULT || type == PROTOCOL_RESP2 || type == PROTOCOL_RESP3;
