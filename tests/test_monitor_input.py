@@ -1497,7 +1497,12 @@ def _scan_cursor_literal_run(env, args, requests=20):
     benchmark = Benchmark.from_json(config, benchmark_specs)
     memtier_ok = benchmark.run(timeout=30)
     debugPrintMemtierOnError(config, env)
-    return memtier_ok
+    stderr_path = os.path.join(config.results_dir, "mb.stderr")
+    stderr = ""
+    if os.path.isfile(stderr_path):
+        with open(stderr_path) as f:
+            stderr = f.read()
+    return memtier_ok, stderr
 
 
 def _scan_cursor_literal_values(env, pattern):
@@ -1519,13 +1524,52 @@ def test_command_scan_cursor_literal_is_sent(env):
     for conn in env.getOSSMasterNodesConnectionList():
         conn.execute_command("FLUSHALL")
 
-    memtier_ok = _scan_cursor_literal_run(
+    memtier_ok, _ = _scan_cursor_literal_run(
         env, ["--command=SET __key__ __scan_cursor__", "--key-prefix=sc663-", "--key-maximum=50"])
     env.assertTrue(memtier_ok == True, message="--command with a literal __scan_cursor__ failed or hung")
 
     values = _scan_cursor_literal_values(env, "sc663-*")
     env.assertTrue(len(values) > 0, message="no sc663-* keys were written")
     env.assertEqual(set(values), {b"__scan_cursor__"})
+
+    # The literal right after the command name (argv[1]), where the
+    # continuation's keyspace-SCAN cursor slot sits.
+    memtier_ok, stderr = _scan_cursor_literal_run(env, ["--command=ECHO __scan_cursor__"])
+    env.assertTrue(memtier_ok == True, message="ECHO __scan_cursor__ failed or hung")
+    env.assertFalse("error response" in stderr, message="ECHO got an error reply: {}".format(stderr[-500:]))
+
+
+def test_command_scan_cursor_literal_as_command_name(env):
+    """
+    #663: "__scan_cursor__" is not a placeholder, so it is a valid (if
+    unknown) command name: it is sent and the server answers "unknown
+    command". It is no longer rejected at parse time like __key__/__data__.
+    """
+    env.skipOnCluster()
+    memtier_ok, stderr = _scan_cursor_literal_run(env, ["--command=__scan_cursor__ x"], requests=5)
+    env.assertTrue(memtier_ok == True, message="run failed: {}".format(stderr[-500:]))
+    env.assertFalse("first token must be a literal command name" in stderr, message=stderr[-500:])
+    env.assertTrue("unknown command" in stderr, message="command was not sent: {}".format(stderr[-500:]))
+
+
+def test_monitor_input_scan_cursor_literal_as_command_name(env):
+    """
+    #663: a captured line whose first token is "__scan_cursor__" used to be
+    typed as a cursor slot and abort on the "first arg is not command name?"
+    assert (SIGABRT). It is a constant now: the line is sent and the server
+    answers "unknown command".
+    """
+    env.skipOnCluster()
+    monitor_file = os.path.join(tempfile.mkdtemp(), "monitor_scan_cursor_cmd.txt")
+    with open(monitor_file, "w") as f:
+        f.write('[ proxy ] 1764031576.604009 [0 127.0.0.1:5000] "__scan_cursor__" "x"\n')
+
+    for command in ("__monitor_line1__", "__monitor_line@__"):
+        memtier_ok, stderr = _scan_cursor_literal_run(
+            env, ["--monitor-input={}".format(monitor_file), "--command={}".format(command)], requests=5)
+        env.assertTrue(memtier_ok == True, message="{} failed: {}".format(command, stderr[-500:]))
+        env.assertTrue("unknown command" in stderr,
+                       message="{}: line was not sent: {}".format(command, stderr[-500:]))
 
 
 def test_monitor_input_scan_cursor_literal_is_sent(env):
@@ -1543,7 +1587,7 @@ def test_monitor_input_scan_cursor_literal_is_sent(env):
         for conn in env.getOSSMasterNodesConnectionList():
             conn.execute_command("FLUSHALL")
 
-        memtier_ok = _scan_cursor_literal_run(
+        memtier_ok, _ = _scan_cursor_literal_run(
             env, ["--monitor-input={}".format(monitor_file), "--command={}".format(command)])
         env.assertTrue(memtier_ok == True, message="{} with a literal __scan_cursor__ failed or hung".format(command))
         env.assertEqual(_scan_cursor_literal_values(env, "sc663:mon"), [b"__scan_cursor__"],

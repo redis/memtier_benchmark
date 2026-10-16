@@ -1200,11 +1200,13 @@ static bool verify_cluster_option(struct benchmark_config *cfg)
 }
 
 // Returns true when `token` is one of the placeholder tokens that
-// arbitrary-command parsing recognises (__key__, __data__, __monitor_line*__,
-// __scan_cursor__). The first argv of --command must be a literal command
-// name; allowing a placeholder there is what triggers the runtime assert in
-// protocol.cpp ("first arg is not command name?"). We check at parse time so
-// the user gets a readable error instead of SIGABRT.
+// arbitrary-command parsing recognises (__key__, __data__, __monitor_line*__).
+// "__scan_cursor__" is not one: only memtier's own SCAN continuation has a
+// cursor slot, so a user token with that text is a literal (#663).
+// The first argv of --command must be a literal command name; allowing a
+// placeholder there is what triggers the runtime assert in protocol.cpp
+// ("first arg is not command name?"). We check at parse time so the user
+// gets a readable error instead of SIGABRT.
 static bool first_arg_is_placeholder(const std::string &token)
 {
     // The runtime assert in protocol.cpp ("first arg is not command name?")
@@ -1213,7 +1215,6 @@ static bool first_arg_is_placeholder(const std::string &token)
     // this guard. Mirror the same substring contract here at parse time so
     // the user gets a readable error instead of an abort.
     if (token.find(KEY_PLACEHOLDER) != std::string::npos || token.find(DATA_PLACEHOLDER) != std::string::npos ||
-        token.find(SCAN_CURSOR_PLACEHOLDER) != std::string::npos ||
         token.find(MONITOR_RANDOM_PLACEHOLDER) != std::string::npos) {
         return true;
     }
@@ -4883,8 +4884,9 @@ int main(int argc, char *argv[])
         // Only the cursor changes; generated arguments are retained by each client.
         cfg.scan_continuation_command = new arbitrary_command(scan_cmd);
         // The separate formatting pass below classifies this as scan_cursor_type.
-        // Only this flag makes an argument a cursor slot; the text is kept for
-        // debug output (a literal "__scan_cursor__" elsewhere is a constant).
+        // The flag alone marks the cursor slot, whatever its text; the text is
+        // replaced only so --debug logs show the slot (a user-supplied
+        // "__scan_cursor__" never gets the flag and is sent as a constant).
         cfg.scan_continuation_command->command_args[cursor_index].data = SCAN_CURSOR_PLACEHOLDER;
         cfg.scan_continuation_command->command_args[cursor_index].scan_cursor = true;
         cfg.scan_continuation_command->command_name = command_type + " <cursor>";

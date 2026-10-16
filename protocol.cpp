@@ -983,7 +983,9 @@ bool redis_protocol::format_arbitrary_command(arbitrary_command &cmd)
         current_arg->type = const_type;
 
         // check arg type
-        if (current_arg->resolved) {
+        if (current_arg->scan_cursor) {
+            current_arg->type = scan_cursor_type;
+        } else if (current_arg->resolved) {
             // Already filled in by client::resolve_monitor_placeholders():
             // frame the generated key as-is, without scanning it again.
         } else if (current_arg->data.find(KEY_PLACEHOLDER) != std::string::npos) {
@@ -1002,8 +1004,6 @@ bool redis_protocol::format_arbitrary_command(arbitrary_command &cmd)
             }
 
             current_arg->type = data_type;
-        } else if (current_arg->scan_cursor) {
-            current_arg->type = scan_cursor_type;
         }
 
         // we expect that first arg is the COMMAND name
