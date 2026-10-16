@@ -1316,6 +1316,9 @@ def test_monitor_input_random_line_key_affixes_and_data(env):
         f.write('[ proxy ] 1764031576.604010 [0 127.0.0.1:5000] "SET" "{tag}__key__:x" "__data__"\n')
         # Like --command, only the first __key__ in an argument is replaced.
         f.write('[ proxy ] 1764031576.604011 [0 127.0.0.1:5000] "SET" "a:__key__:b:__key__" "v"\n')
+        # Two key arguments in one command: each gets its own generated key,
+        # as with --command.
+        f.write('[ proxy ] 1764031576.604012 [0 127.0.0.1:5000] "MSET" "u:__key__" "__data__" "w:__key__" "v"\n')
 
     benchmark_specs = {
         "name": env.testName,
@@ -1324,6 +1327,9 @@ def test_monitor_input_random_line_key_affixes_and_data(env):
             "--command=__monitor_line@__",
             "--monitor-pattern=S",
             "--key-prefix=mon-",
+            # Sequential keys: the 40 requests draw 40 distinct keys from
+            # 1..100, so two key arguments never get the same key by chance.
+            "--command-key-pattern=S",
             "--key-maximum=100",
             "--data-size=20",
             "--hide-histogram",
@@ -1354,12 +1360,21 @@ def test_monitor_input_random_line_key_affixes_and_data(env):
     user_keys = [k for k in keys if k.startswith("user:mon-")]
     tag_keys = [k for k in keys if k.startswith("{tag}mon-") and k.endswith(":x")]
     rep_keys = [k for k in keys if k.startswith("a:mon-") and k.endswith(":b:__key__")]
+    u_keys = [k for k in keys if k.startswith("u:mon-")]
+    w_keys = [k for k in keys if k.startswith("w:mon-")]
     env.assertTrue(len(user_keys) > 0, message="no user:mon-* keys; keys: {}".format(keys[:10]))
     env.assertTrue(len(tag_keys) > 0, message="no {{tag}}mon-*:x keys; keys: {}".format(keys[:10]))
     env.assertTrue(len(rep_keys) > 0, message="no a:mon-*:b:__key__ keys; keys: {}".format(keys[:10]))
-    env.assertEqual(len(keys), len(user_keys) + len(tag_keys) + len(rep_keys),
-                    message="keys without their affixes: {}".format(
-                        [k for k in keys if k not in user_keys and k not in tag_keys and k not in rep_keys][:10]))
+    env.assertTrue(len(u_keys) > 0, message="no u:mon-* keys from MSET; keys: {}".format(keys[:10]))
+    env.assertTrue(len(w_keys) > 0, message="no w:mon-* keys from MSET; keys: {}".format(keys[:10]))
+    # Each MSET drew a separate key for u: and w:, so with sequential keys the
+    # two sets of key numbers never overlap.
+    u_ids = set(k[len("u:mon-"):] for k in u_keys)
+    w_ids = set(k[len("w:mon-"):] for k in w_keys)
+    env.assertEqual(u_ids & w_ids, set(), message="MSET reused one key for both key arguments")
+    known = set(user_keys + tag_keys + rep_keys + u_keys + w_keys)
+    env.assertEqual(len(keys), len(known),
+                    message="keys without their affixes: {}".format([k for k in keys if k not in known][:10]))
     conn = master_nodes_connections[0]
     if user_keys:
         env.assertEqual(conn.execute_command("GET", user_keys[0]), b"v")

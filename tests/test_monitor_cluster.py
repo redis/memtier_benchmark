@@ -145,7 +145,9 @@ def _run_monitor_cluster(env, monitor_file, command, monitor_pattern=None,
 
     js = {}
     json_path = "{}/mb.json".format(run_config.results_dir)
-    if os.path.isfile(json_path):
+    # A hung (killed) or aborted run can leave a truncated JSON file; callers
+    # report it through `ok` ("did not complete"), not a JSONDecodeError.
+    if ok and os.path.isfile(json_path):
         with open(json_path) as fh:
             js = json.load(fh)
     return ok, run_config, js
@@ -337,6 +339,8 @@ def test_monitor_cluster_line_placeholders_routed_by_full_key(env):
     lines = [
         '[ proxy ] 1764031576.604009 [0 127.0.0.1:5000] "SET" "user:__key__" "v"',
         '[ proxy ] 1764031576.604010 [0 127.0.0.1:5000] "SET" "{mtag}__key__" "__data__"',
+        # Only the first __key__ is replaced; routing hashes the full text.
+        '[ proxy ] 1764031576.604011 [0 127.0.0.1:5000] "SET" "a:__key__:b:__key__" "v"',
     ]
     monitor_file = _write_monitor_file(test_dir, lines)
 
@@ -353,6 +357,7 @@ def test_monitor_cluster_line_placeholders_routed_by_full_key(env):
         by_port = _all_keys_by_port(env)
         user_keys = []
         tag_keys = []
+        rep_keys = []
         for port, keys in by_port.items():
             for k in keys:
                 # Every key must sit on the shard that owns the full key's slot.
@@ -362,10 +367,13 @@ def test_monitor_cluster_line_placeholders_routed_by_full_key(env):
                     user_keys.append(k)
                 elif k.startswith("{mtag}mon-"):
                     tag_keys.append(k)
+                elif k.startswith("a:mon-") and k.endswith(":b:__key__"):
+                    rep_keys.append(k)
                 else:
                     env.assertTrue(False, message="unexpected key {!r} (affixes dropped?)".format(k))
         env.assertTrue(len(user_keys) > 0, message="no user:mon-* keys written")
         env.assertTrue(len(tag_keys) > 0, message="no {mtag}mon-* keys written")
+        env.assertTrue(len(rep_keys) > 0, message="no a:mon-*:b:__key__ keys written")
         # user:__key__ keys hash across the cluster, so routing by the full
         # key must spread them over more than one shard.
         user_ports = set(p for p, keys in by_port.items() for k in keys if k.startswith("user:"))
