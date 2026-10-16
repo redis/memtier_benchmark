@@ -2280,10 +2280,10 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             break;
 #ifdef HAVE_EVHTTP
         case o_prometheus_port: {
-            // Unlike --statsd-port this accepts 0; parse_unsigned() rejects a
-            // sign or leading whitespace and bounds the value to [0,65535]
-            // BEFORE the narrowing cast (a cast would silently wrap
-            // 70000 -> 4464).
+            // Unlike --statsd-port this accepts 0. parse_unsigned() accepts
+            // leading whitespace and one '+', rejects any '-', and bounds the
+            // value to [0,65535] BEFORE the narrowing cast (a cast would
+            // silently wrap 70000 -> 4464).
             static const char *E1 = "error: prometheus-port must be a number in the range [0-65535] (0 = ephemeral).\n";
             if (!parse_unsigned(optarg, 65535, &val)) {
                 fprintf(stderr, "%s", E1);
