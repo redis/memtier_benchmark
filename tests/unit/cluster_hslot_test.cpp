@@ -36,6 +36,10 @@ void report_connection_stage_success()
 {
     abort();
 }
+bool connection_stage_steady_state_reached()
+{
+    abort();
+}
 bool is_redis_protocol(enum PROTOCOL_TYPE type)
 {
     return type == PROTOCOL_REDIS_DEFAULT || type == PROTOCOL_RESP2 || type == PROTOCOL_RESP3;
