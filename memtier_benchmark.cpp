@@ -190,7 +190,8 @@ static bool check_cluster_monitor_lines(const struct monitor_command_list *monit
 // even on memory-constrained hosts.
 #define MAX_RUN_COUNT 1024
 
-// Global flag for signal handling
+// Global flag for signal handling: 0, or the number of the signal
+// (SIGINT / SIGTERM) that interrupted the run
 static volatile sig_atomic_t g_interrupted = 0;
 
 // Set when run_benchmark() aborts because --connection-stage-timeout
@@ -381,11 +382,10 @@ static void install_alt_signal_stack(void)
     }
 }
 
-// Signal handler for Ctrl+C
+// Signal handler for Ctrl+C (SIGINT) and SIGTERM
 static void sigint_handler(int signum)
 {
-    (void) signum; // unused parameter
-    g_interrupted = 1;
+    g_interrupted = signum;
 }
 
 // Crash handler - prints stack trace and other debugging information
@@ -3692,8 +3692,8 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
                 float factor = ((float) (thread_counter - 1) / thread_counter);
                 elapsed_duration = factor * elapsed_duration + (float) (*i)->m_cg->get_duration_usec() / thread_counter;
             }
-            fprintf(stderr, "\n[RUN #%u] Interrupted by user (Ctrl+C) after %.1f secs, stopping threads...\n", run_id,
-                    (float) elapsed_duration / 1000000);
+            fprintf(stderr, "\n[RUN #%u] Interrupted by %s after %.1f secs, stopping threads...\n", run_id,
+                    g_interrupted == SIGTERM ? "SIGTERM" : "user (Ctrl+C)", (float) elapsed_duration / 1000000);
             // Interrupt all threads (marks clients as interrupted, breaks event loops, and finalizes stats)
             for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
                 (*i)->m_cg->interrupt();
@@ -4409,8 +4409,11 @@ int main(int argc, char *argv[])
         fprintf(stderr, "warning: evthread_use_pthreads() failed; cross-thread loop wakeups may stall.\n");
     }
 
-    // Install signal handler for Ctrl+C
+    // Install signal handler for Ctrl+C. SIGTERM (kill, timeout, docker stop,
+    // CI runners) takes the same graceful path, so results are printed and
+    // --json-out-file is closed as valid JSON instead of left truncated.
     signal(SIGINT, sigint_handler);
+    signal(SIGTERM, sigint_handler);
 
     // Ignore SIGPIPE so a peer-initiated TCP/TLS close mid-write returns
     // EPIPE from send()/SSL_write() instead of killing the process. Without

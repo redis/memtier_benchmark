@@ -1486,3 +1486,45 @@ def test_cluster_seed_owns_no_keys(env):
         else:
             env.assertEqual(stats['Totals']['Count'], case_requests, message=name)
         env.assertEqual(stats['Totals']['MOVED/sec'], 0, message=name)
+
+
+def test_sigterm_closes_json(env):
+    """SIGTERM stops the run like Ctrl+C and leaves a valid --json-out-file (#704).
+
+    SIGTERM (kill, timeout, docker stop, CI runners) used to have no handler:
+    the process died with only the configuration section written, so the
+    JSON file was truncated and could not be parsed.
+    """
+    benchmark_specs = {"name": env.testName, "args": ['--hide-histogram']}
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=1, clients=2, requests=None, test_time=60)
+    add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+
+    test_dir = tempfile.mkdtemp()
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+
+    stderr_path = os.path.join(config.results_dir, 'mb.stderr')
+    with open(stderr_path, 'wb') as stderr_file:
+        process = subprocess.Popen(stdin=None, stdout=subprocess.PIPE, stderr=stderr_file,
+                                   executable=benchmark.binary, args=benchmark.args)
+        time.sleep(2)
+        process.send_signal(signal.SIGTERM)
+        try:
+            _stdout, _ = process.communicate(timeout=20)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            _stdout, _ = process.communicate()
+            env.assertTrue(False, message="memtier did not exit within 20s of SIGTERM")
+    benchmark.write_file('mb.stdout', _stdout)
+
+    # The default action would end the process by the signal (-SIGTERM).
+    env.assertEqual(process.returncode, 0)
+    with open(stderr_path) as stderr:
+        env.assertContains("Interrupted by SIGTERM after", stderr.read())
+
+    with open(os.path.join(config.results_dir, 'mb.json')) as results_json:
+        runtime = json.load(results_json)["ALL STATS"]["Runtime"]
+    env.assertEqual(runtime["Interrupted"], "true")
+    env.assertLess(runtime["Total duration"], 10000)
