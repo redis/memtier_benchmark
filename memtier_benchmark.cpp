@@ -3867,7 +3867,7 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         if (cfg->clients_start > 0) {
             struct timeval now;
             gettimeofday(&now, NULL);
-            unsigned int elapsed_secs = now.tv_sec - cfg->benchmark_start_time.tv_sec;
+            unsigned int elapsed_secs = ts_diff(cfg->benchmark_start_time, now) / 1000000;
             unsigned int steps_done = elapsed_secs / cfg->step_duration;
             display_clients = cfg->clients_start + steps_done * cfg->clients_step;
             if (display_clients > cfg->clients) display_clients = cfg->clients;

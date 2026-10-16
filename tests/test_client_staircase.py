@@ -729,3 +729,88 @@ def test_staircase_per_step_ops_consistency(env):
                 debugPrintMemtierOnError(run_config, env)
     finally:
         pass
+
+
+def test_staircase_runs_full_test_time(env):
+    """Verify a staircase run lasts the full --test-time (issue #713).
+
+    The staircase deadline used to compare whole seconds of wall clock time,
+    so a run that started late in a second ended up to 1 s early. Start
+    memtier half way through a second, where the old check ended the run
+    after about test_time - 0.5 s.
+    """
+    env.skipOnCluster()
+
+    test_time = 3
+    test_dir = tempfile.mkdtemp()
+    try:
+        benchmark, run_config = _build_staircase_benchmark(
+            env, test_dir, clients=3, clients_start=1, clients_step=1,
+            step_duration=1, test_time=test_time, threads=1)
+
+        frac = time.time() % 1
+        time.sleep((1.5 - frac) % 1)
+        ok = benchmark.run()
+        failed_asserts = env.getNumberOfFailedAssertion()
+        try:
+            env.assertTrue(ok, message="memtier_benchmark should exit successfully")
+
+            runtime = _load_json(run_config)["ALL STATS"]["Runtime"]
+            duration = runtime["Total duration"]
+            env.assertTrue(test_time * 1000 - 100 <= duration <= test_time * 1000 + 300,
+                           message="Total duration {} ms should be about --test-time {} s "
+                                   "(start {}, finish {})".format(
+                                       duration, test_time, runtime["Start time"],
+                                       runtime["Finish time"]))
+        finally:
+            if env.getNumberOfFailedAssertion() > failed_asserts:
+                debugPrintMemtierOnError(run_config, env)
+    finally:
+        pass
+
+
+def test_staircase_no_step_at_deadline(env):
+    """Verify no clients are added by the step due at --test-time.
+
+    With --test-time 3 and --step-duration 1, the steps at 1 s and 2 s each
+    add a client per thread, and the timer firing at 3 s must only stop. It
+    runs on libevent's monotonic clock and can fire a hair before the
+    deadline by the wall clock, so a check on the elapsed time connected one
+    more client per thread in about a third of the runs. Count the
+    connections the server received.
+    """
+    env.skipOnCluster()
+
+    threads = 8
+    test_time = 3
+    expected = threads * 3  # clients_start + 2 steps
+    # Opened before the first snapshot, so it is not counted.
+    conn = env.getConnection()
+    for run in range(3):
+        test_dir = tempfile.mkdtemp()
+        benchmark, run_config = _build_staircase_benchmark(
+            env, test_dir, clients=5, clients_start=1, clients_step=1,
+            step_duration=1, test_time=test_time, threads=threads)
+
+        before = conn.info("stats")["total_connections_received"]
+        ok = benchmark.run()
+        received = conn.info("stats")["total_connections_received"] - before
+        failed_asserts = env.getNumberOfFailedAssertion()
+        try:
+            env.assertTrue(ok, message="memtier_benchmark should exit successfully")
+            env.assertEqual(received, expected,
+                            message="run {}: server received {} connections, expected {} "
+                                    "(no clients added at the deadline)".format(
+                                        run, received, expected))
+
+            # The last requests can land in a bucket at t = test_time. Its
+            # Active Clients entry must not count a step that was never taken.
+            ac = _load_json(run_config)["ALL STATS"]["Active Clients"]
+            for ts_str, entry in ac.items():
+                want = 1 + min(int(ts_str), test_time - 1)
+                env.assertEqual(entry["Clients per thread"], want,
+                                message="run {}: Active Clients at t={}s is {}, expected {}".format(
+                                    run, ts_str, entry["Clients per thread"], want))
+        finally:
+            if env.getNumberOfFailedAssertion() > failed_asserts:
+                debugPrintMemtierOnError(run_config, env)

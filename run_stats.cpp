@@ -2330,6 +2330,11 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
             char ts_str[16];
             unsigned int ts = timestamps[i];
             unsigned int steps_done = ts / m_config->step_duration;
+            // The last requests can complete just after --test-time, in a
+            // bucket of its own. No step is taken at or after the deadline:
+            // only steps k with k * step_duration < test_time.
+            if (m_config->test_time > 0 && steps_done > (m_config->test_time - 1) / m_config->step_duration)
+                steps_done = (m_config->test_time - 1) / m_config->step_duration;
             unsigned int active = m_config->clients_start + steps_done * m_config->clients_step;
             if (active > m_config->clients) active = m_config->clients;
 

@@ -340,10 +340,12 @@ bool client::finished(void)
     if (m_config->test_time > 0) {
         if (m_config->clients_start > 0) {
             // Staircase mode: use global deadline so all clients stop together
-            struct timeval now;
+            // Compare full timevals: whole seconds alone would end the run
+            // up to 1 s early when it started late in a second.
+            struct timeval now, elapsed;
             gettimeofday(&now, NULL);
-            unsigned int elapsed = now.tv_sec - m_config->benchmark_start_time.tv_sec;
-            if (elapsed >= m_config->test_time) return true;
+            timersub(&now, &m_config->benchmark_start_time, &elapsed);
+            if (elapsed.tv_sec >= (time_t) m_config->test_time) return true;
         } else {
             if (m_stats.get_duration() >= m_config->test_time) return true;
         }
@@ -1278,7 +1280,8 @@ client_group::client_group(benchmark_config *config, abstract_protocol *protocol
         m_protocol(protocol),
         m_obj_gen(obj_gen),
         m_staircase_timer(NULL),
-        m_staircase_active_clients(0)
+        m_staircase_active_clients(0),
+        m_staircase_steps(0)
 {
     m_base = event_base_new();
     assert(m_base != NULL);
@@ -1425,11 +1428,22 @@ void client_group::handle_staircase_step(void)
     // Check if the test deadline has passed. Without this, the EV_PERSIST
     // timer keeps event_base_dispatch alive even after all clients' finished()
     // returns true, extending the run far beyond test_time.
+    // Two checks, either one stops:
+    // - The step count: step k is due at k * step_duration. The clock alone
+    //   can't decide this: the timer runs on libevent's monotonic clock and
+    //   can fire a hair before the deadline by gettimeofday(), which would add
+    //   clients that the deadline stops at once.
+    // - The clock: after a stall of the event loop (SIGSTOP, VM pause), the
+    //   timer is rescheduled from "now", so the count lags behind and a step
+    //   could fire after the deadline. Compare full timevals, as finished()
+    //   does.
+    m_staircase_steps++;
     if (m_config->test_time > 0) {
-        struct timeval now;
+        struct timeval now, elapsed;
         gettimeofday(&now, NULL);
-        unsigned int elapsed = now.tv_sec - m_config->benchmark_start_time.tv_sec;
-        if (elapsed >= m_config->test_time) {
+        timersub(&now, &m_config->benchmark_start_time, &elapsed);
+        if ((unsigned long long) m_staircase_steps * m_config->step_duration >= m_config->test_time ||
+            elapsed.tv_sec >= (time_t) m_config->test_time) {
             if (m_staircase_timer != NULL) {
                 event_del(m_staircase_timer);
                 event_free(m_staircase_timer);
