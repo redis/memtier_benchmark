@@ -4449,18 +4449,12 @@ static void cleanup_openssl(void)
 
 #endif
 
-// True if the write error err on the still-open fp only means that the reader
-// of stdout went away (e.g. `| head`): fp is stdout, or the same file as stdout
-// (e.g. --out-file /dev/stdout), it is a pipe or socket, and the other end is
-// closed. SIGPIPE is ignored, so such writes fail with EPIPE (ECONNRESET on a
-// reset socket). But finish_output_file() returns a synthetic EIO when stdio
-// dropped the failed data (musl does, glibc when line-buffered or unbuffered), and
-// its real cause may also be a lost write to a live reader (EAGAIN on a full
-// non-blocking pipe). That happens in practice: O_NONBLOCK belongs to the open
-// pipe description, so a parent sharing it (e.g. Node or a CI runner that set
-// its own end non-blocking) makes memtier's stdout non-blocking too. So for
-// EIO ask the kernel: poll() reports POLLERR on a pipe with no reader and
-// POLLHUP on a closed socket.
+// True if the write error err on the still-open fp only means that the stdout
+// reader went away (e.g. `| head`): fp is stdout or the same file, a pipe or
+// socket, and the error is EPIPE/ECONNRESET (SIGPIPE is ignored). The EIO from
+// finish_output_file() hides the real errno, which may be EAGAIN on a full
+// stdout pipe made non-blocking by a parent sharing it (e.g. Node or a CI
+// runner), so for EIO poll(): POLLERR/POLLHUP means the reader is gone.
 static bool stdout_reader_gone(FILE *fp, int err)
 {
     if (err != EPIPE && err != ECONNRESET && err != EIO) return false;

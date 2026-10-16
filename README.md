@@ -289,6 +289,10 @@ reader is still there (for example a full non-blocking pipe) still fails the
 run. Any other `--out-file` (for example a FIFO whose reader exits) and
 `--json-out-file` always fail the run when a write fails.
 
+Not covered yet: write errors on the HDR histogram files
+(`--hdr-file-prefix`), the `--client-stats` CSV files and
+`--failed-keys-file` are still not checked.
+
 ## Crash Reporting
 
 memtier_benchmark includes built-in crash handling that automatically generates detailed bug reports when the program crashes. If you encounter a crash, the tool will print a comprehensive report including:
