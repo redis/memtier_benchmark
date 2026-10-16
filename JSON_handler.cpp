@@ -25,6 +25,7 @@
 #include <string.h>
 #include <cmath> // For std::isfinite
 #include "JSON_handler.h"
+#include "file_io.h"
 
 
 /**
@@ -55,17 +56,27 @@ json_handler::json_handler(const char *jsonfilename) : m_json_file(NULL)
 /**
  * D'tor
  * -----
- * Closes all the nesting and the file pointer.
+ * Closes the file if close() was not called; a write error is then ignored.
  */
 json_handler::~json_handler()
 {
-    if (m_json_file) {
-        // close nesting...
-        while (close_nesting())
-            ;
-        fclose(m_json_file);
-        fprintf(stderr, "Json file closed.\n");
-    }
+    close();
+}
+
+/**
+ * Closes all the nesting and the file pointer.
+ * Returns 0 on success, or the errno value of a failed write or close.
+ */
+int json_handler::close()
+{
+    if (!m_json_file) return 0;
+    // close nesting...
+    while (close_nesting())
+        ;
+    int err = finish_output_file(m_json_file, true);
+    m_json_file = NULL;
+    if (err == 0) fprintf(stderr, "Json file closed.\n");
+    return err;
 }
 
 /**

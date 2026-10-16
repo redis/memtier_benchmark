@@ -101,6 +101,7 @@ static bool bitmask_is_contiguous(unsigned int mask);
 #include "client.h"
 #include "cluster_client.h"
 #include "JSON_handler.h"
+#include "file_io.h"
 #include "obj_gen.h"
 #include "memtier_benchmark.h"
 #include "run_stats_types.h"
@@ -5246,14 +5247,9 @@ int main(int argc, char *argv[])
         obj_gen->set_key_zipf_distribution(cfg.key_zipf_exp);
     }
 
-    // Prepare output files. This comes after all option validation and the
-    // data-import loading, so a startup error leaves an existing --out-file
-    // and --json-out-file untouched. Nothing has connected yet.
-    // --out-file is opened without O_TRUNC and only truncated once the
-    // --json-out-file has been opened too, so an error opening either one
-    // leaves the other untouched. Fail now rather than run the whole
-    // benchmark and then write the results to a NULL FILE*. Retry on EINTR,
-    // as json_handler does.
+    // Open the output files after option validation and data import, so a
+    // startup error leaves existing files untouched. Retry on EINTR, as
+    // json_handler does.
     FILE *outfile = stdout;
     if (cfg.out_file != NULL) {
         int fd;
@@ -5270,13 +5266,16 @@ int main(int argc, char *argv[])
     json_handler *jsonhandler = NULL;
     if (cfg.json_out_file != NULL) {
         jsonhandler = new json_handler((const char *) cfg.json_out_file);
-        // We allways print the configuration to the JSON file
+        // We always print the configuration to the JSON file
         config_print_to_json(jsonhandler, &cfg);
     }
 
     if (cfg.out_file != NULL) {
         fprintf(stderr, "Writing results to %s...\n", cfg.out_file);
-        // Only regular files can be truncated (not e.g. /dev/stdout or a FIFO).
+        // --out-file was opened without O_TRUNC and is truncated only now that
+        // --json-out-file is open too, so an error opening either one leaves the
+        // other untouched. Only regular files can be truncated (not e.g.
+        // /dev/stdout or a FIFO).
         struct stat st;
         if (fstat(fileno(outfile), &st) == 0 && S_ISREG(st.st_mode) && ftruncate(fileno(outfile), 0) != 0) {
             fprintf(stderr, "error: cannot truncate --out-file %s: %s\n", cfg.out_file, strerror(errno));
@@ -5484,8 +5483,18 @@ int main(int argc, char *argv[])
         event_base_free(verify_event_base);
     }
 
-    if (outfile != stdout) {
-        fclose(outfile);
+    // A results file that could not be written (disk full, quota, I/O error)
+    // fails the run. On stdout, EPIPE (the reader went away, e.g. `| head`;
+    // SIGPIPE is ignored) is not an error: the reader chose not to read it.
+    bool output_failed = false;
+    int out_err = finish_output_file(outfile, outfile != stdout);
+    if (out_err != 0 && !(outfile == stdout && out_err == EPIPE)) {
+        if (outfile == stdout) {
+            fprintf(stderr, "error: failed writing results to stdout: %s\n", strerror(out_err));
+        } else {
+            fprintf(stderr, "error: failed writing --out-file %s: %s\n", cfg.out_file, strerror(out_err));
+        }
+        output_failed = true;
     }
 
     if (cfg.server_addr) {
@@ -5498,6 +5507,11 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Saving JSON output file: %s\n", cfg.json_out_file);
 
         // closing the JSON
+        int json_err = jsonhandler->close();
+        if (json_err != 0) {
+            fprintf(stderr, "error: failed writing --json-out-file %s: %s\n", cfg.json_out_file, strerror(json_err));
+            output_failed = true;
+        }
         delete jsonhandler;
     }
 
@@ -5559,6 +5573,10 @@ int main(int argc, char *argv[])
     // A worker thread ended before the run's stop condition (see
     // run_benchmark()); the results above do not cover the requested run.
     if (g_worker_failed) {
+        return 1;
+    }
+    // The results could not be written (see above).
+    if (output_failed) {
         return 1;
     }
     return 0;

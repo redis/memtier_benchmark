@@ -20,9 +20,24 @@
 #include "config.h"
 #endif
 
+#include <errno.h>
 #include <string.h>
 #include <stdlib.h>
 #include "file_io.h"
+
+int finish_output_file(FILE *fp, bool do_close)
+{
+    int err = 0;
+    // A failed write leaves the data buffered (glibc), so fflush() retries it
+    // and reports its errno. ferror() catches a failure whose data is gone.
+    if (fflush(fp) != 0) {
+        err = errno;
+    } else if (ferror(fp)) {
+        err = EIO;
+    }
+    if (do_close && fclose(fp) != 0 && err == 0) err = errno;
+    return err;
+}
 
 /** largest support line length */
 #define MAX_LINE_BUFFER 1024

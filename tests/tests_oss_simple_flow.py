@@ -1871,3 +1871,79 @@ def test_startup_error_keeps_output_files_data_import(env):
     expected = ("error: Cluster mode cannot be specified when importing." if env.isCluster()
                 else "error: failed to read keys.")
     _startup_error_keeps_output_files(env, ['--data-import', '/nonexistent-memtier-dir/keys.imp'], 1, expected)
+
+
+def _run_with_unwritable_output(env, extra_args, stdout, drop_default_out_file=False):
+    """Run a short benchmark whose output goes to extra_args/stdout; return (rc, stderr)."""
+    benchmark_specs = {"name": env.testName, "args": ['--hide-histogram'] + extra_args}
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=1, clients=1, requests=10)
+    add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+    test_dir = tempfile.mkdtemp()
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    args = list(benchmark.args)
+    if drop_default_out_file:
+        # mb.py always passes --out-file; without it the results go to stdout.
+        i = args.index('--out-file')
+        del args[i:i + 2]
+    process = subprocess.Popen(args, stdout=stdout, stderr=subprocess.PIPE)
+    try:
+        _, stderr = process.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        _, stderr = process.communicate()
+    return process.returncode, stderr.decode(errors='replace')
+
+
+def test_out_file_write_error(env):
+    """A --out-file that cannot be written fails the run (#719).
+
+    /dev/full accepts the open and fails every write with ENOSPC, like a full
+    disk. memtier used to ignore the failed writes and fclose() and exit 0.
+    """
+    if not os.path.exists('/dev/full'):
+        env.skip()
+        return
+    rc, stderr = _run_with_unwritable_output(env, ['--out-file', '/dev/full'], subprocess.DEVNULL)
+    env.assertEqual(rc, 1, message=stderr)
+    env.assertContains("error: failed writing --out-file /dev/full: No space left on device", stderr)
+
+
+def test_json_out_file_write_error(env):
+    """A --json-out-file that cannot be written fails the run (#719)."""
+    if not os.path.exists('/dev/full'):
+        env.skip()
+        return
+    rc, stderr = _run_with_unwritable_output(env, ['--json-out-file', '/dev/full'], subprocess.DEVNULL)
+    env.assertEqual(rc, 1, message=stderr)
+    env.assertContains("error: failed writing --json-out-file /dev/full: No space left on device", stderr)
+    env.assertNotContains("Json file closed.", stderr)
+
+
+def test_stdout_write_error(env):
+    """Results on stdout that cannot be written fail the run (#719)."""
+    if not os.path.exists('/dev/full'):
+        env.skip()
+        return
+    with open('/dev/full', 'w') as full:
+        rc, stderr = _run_with_unwritable_output(env, [], full, drop_default_out_file=True)
+    env.assertEqual(rc, 1, message=stderr)
+    env.assertContains("error: failed writing results to stdout: No space left on device", stderr)
+
+
+def test_stdout_closed_pipe_is_not_an_error(env):
+    """A stdout reader that went away (e.g. `| head`) is not a failed run (#719).
+
+    SIGPIPE is ignored, so the writes fail with EPIPE; that is the reader's
+    choice, not a lost result, and the exit status stays 0.
+    """
+    rfd, wfd = os.pipe()
+    os.close(rfd)
+    try:
+        rc, stderr = _run_with_unwritable_output(env, [], wfd, drop_default_out_file=True)
+    finally:
+        os.close(wfd)
+    env.assertEqual(rc, 0, message=stderr)
+    env.assertNotContains("error: failed writing", stderr)
