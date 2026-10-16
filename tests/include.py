@@ -68,7 +68,8 @@ def debugPrintMemtierOnError(config, env):
         if not os.path.isfile(path):
             env.debugPrint("### {0} not found (memtier may have exited before writing output): {1}".format(label, path), True)
             continue
-        with open(path) as f:
+        # errors="replace": the output can echo non-UTF-8 user input.
+        with open(path, errors="replace") as f:
             env.debugPrint("### PRINTING {0} OUTPUT OF MEMTIER ON FAILURE ###".format(label), True)
             env.debugPrint("### {0} file location: {1}".format(fname, path), True)
             for line in f:

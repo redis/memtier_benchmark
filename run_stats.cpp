@@ -938,7 +938,10 @@ static std::vector<std::string> unique_command_labels(const arbitrary_command_li
     std::vector<std::string> names;
     for (size_t i = 0; i < command_list.size(); i++) {
         const std::string &name = command_list[i].command_name;
-        names.push_back(for_file_name ? sanitize_file_name_component(name) : name);
+        // JSON keys: replace invalid UTF-8 before deduplication, as the JSON
+        // writer would, so names that differ only in invalid bytes still get
+        // distinct keys. File names keep the raw bytes.
+        names.push_back(for_file_name ? sanitize_file_name_component(name) : utf8_sanitize(name.c_str()));
     }
     return make_unique_labels(names, sep, reserved);
 }
@@ -947,24 +950,28 @@ static std::vector<std::string> unique_command_labels(const arbitrary_command_li
 // (GET -> "Gets").
 static std::string command_row_name(std::string name)
 {
-    std::transform(name.begin(), name.end(), name.begin(), ::tolower);
-    if (!name.empty()) name[0] = static_cast<char>(toupper(name[0]));
+    // Cast to unsigned char: passing a negative char (a byte >= 0x80 on
+    // platforms where char is signed) to tolower/toupper is undefined.
+    std::transform(name.begin(), name.end(), name.begin(),
+                   [](unsigned char c) { return static_cast<char>(tolower(c)); });
+    if (!name.empty()) name[0] = static_cast<char>(toupper(static_cast<unsigned char>(name[0])));
     name.append("s");
     return name;
 }
 
 // Names of the per-command rows of the stats table, shared by the text table
-// and the JSON output so both label a row the same way.
+// and the JSON output so both label a row the same way. Invalid UTF-8 is
+// replaced before deduplication (see unique_command_labels).
 static std::vector<std::string> command_row_labels(const arbitrary_command_list &command_list,
                                                    const std::vector<aggregated_command_type_stats> *aggregated)
 {
     std::vector<std::string> names;
     if (aggregated != nullptr) {
         for (const auto &agg : *aggregated)
-            names.push_back(command_row_name(agg.command_type));
+            names.push_back(command_row_name(utf8_sanitize(agg.command_type.c_str())));
     } else {
         for (size_t i = 0; i < command_list.size(); i++)
-            names.push_back(command_row_name(command_list[i].command_name));
+            names.push_back(command_row_name(utf8_sanitize(command_list[i].command_name.c_str())));
     }
     return make_unique_labels(names, UNIQUE_JSON_KEY_SEP, reserved_stats_keys());
 }
@@ -2383,7 +2390,7 @@ void run_stats::print_histogram(FILE *out, json_handler *jsonhandler, arbitrary_
             // Use aggregated stats by command type
             std::vector<std::string> type_names;
             for (const auto &agg : *aggregated)
-                type_names.push_back(agg.command_type);
+                type_names.push_back(utf8_sanitize(agg.command_type.c_str()));
             const std::vector<std::string> keys =
                 make_unique_labels(type_names, UNIQUE_JSON_KEY_SEP, reserved_stats_keys());
             for (size_t a = 0; a < aggregated->size(); a++) {

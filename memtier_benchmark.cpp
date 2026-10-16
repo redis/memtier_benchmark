@@ -4685,7 +4685,8 @@ int main(int argc, char *argv[])
                 if (cmd.command_name.length() > 0 && cmd.command_name[cmd.command_name.length() - 1] == '"') {
                     cmd.command_name = cmd.command_name.substr(0, cmd.command_name.length() - 1);
                 }
-                std::transform(cmd.command_name.begin(), cmd.command_name.end(), cmd.command_name.begin(), ::toupper);
+                std::transform(cmd.command_name.begin(), cmd.command_name.end(), cmd.command_name.begin(),
+                               [](unsigned char c) { return static_cast<char>(toupper(c)); });
                 // Set command_type for aggregation (base command without line number)
                 cmd.command_type = cmd.command_name;
                 // Append line number to display name for --command-stats-breakdown=line mode

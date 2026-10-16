@@ -319,7 +319,8 @@ arbitrary_command::arbitrary_command(const char *cmd) :
     }
 
     command_name.assign(command.c_str(), pos);
-    std::transform(command_name.begin(), command_name.end(), command_name.begin(), ::toupper);
+    std::transform(command_name.begin(), command_name.end(), command_name.begin(),
+                   [](unsigned char c) { return static_cast<char>(toupper(c)); });
     // command_type is the same as command_name by default (used for aggregation)
     command_type = command_name;
 }
@@ -456,7 +457,8 @@ void arbitrary_command::resolve_command_meta()
         two_word_name.assign(command_args[0].data);
         two_word_name.push_back(' ');
         two_word_name.append(command_args[1].data);
-        std::transform(two_word_name.begin(), two_word_name.end(), two_word_name.begin(), ::toupper);
+        std::transform(two_word_name.begin(), two_word_name.end(), two_word_name.begin(),
+                       [](unsigned char c) { return static_cast<char>(toupper(c)); });
         spec = lookup(two_word_name.c_str());
     }
     if (spec == NULL) {
@@ -566,7 +568,7 @@ bool arbitrary_command::split_command_to_args()
 
     while (1) {
         /* skip blanks */
-        while (*p && isspace(*p)) {
+        while (*p && isspace((unsigned char) *p)) {
             p++;
         }
 
@@ -622,7 +624,7 @@ bool arbitrary_command::split_command_to_args()
                     } else if (*p == '"') {
                         /* closing quote must be followed by a space or
                          * nothing at all. */
-                        if (*(p + 1) && !isspace(*(p + 1))) {
+                        if (*(p + 1) && !isspace((unsigned char) *(p + 1))) {
                             goto err;
                         }
 
@@ -642,7 +644,7 @@ bool arbitrary_command::split_command_to_args()
                     } else if (*p == '\'') {
                         /* closing quote must be followed by a space or
                          * nothing at all. */
-                        if (*(p + 1) && !isspace(*(p + 1))) {
+                        if (*(p + 1) && !isspace((unsigned char) *(p + 1))) {
                             goto err;
                         }
 
@@ -714,7 +716,8 @@ static std::string extract_command_type(const std::string &command_str)
     }
     std::string cmd_type = command_str.substr(start, end - start);
     // Convert to uppercase
-    std::transform(cmd_type.begin(), cmd_type.end(), cmd_type.begin(), ::toupper);
+    std::transform(cmd_type.begin(), cmd_type.end(), cmd_type.begin(),
+                   [](unsigned char c) { return static_cast<char>(toupper(c)); });
     return cmd_type;
 }
 

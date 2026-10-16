@@ -20,10 +20,12 @@ Run:
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import threading
 
 from include import (
+    MEMTIER_BINARY,
     get_default_memtier_config,
     add_required_env_arguments,
     addTLSArgs,
@@ -586,6 +588,184 @@ def test_json_escapes_object_keys(env):
     finally:
         if env.getNumberOfFailedAssertion() > failed_asserts:
             debugPrintMemtierOnError(run_config, env)
+
+
+def _memtier_supports(option):
+    """True when the memtier binary under test lists option in --help."""
+    out = subprocess.run([MEMTIER_BINARY, "--help"], stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, timeout=30).stdout
+    return option.encode() in out
+
+
+def _arg(raw):
+    """A command-line argument holding the bytes raw; Popen encodes the
+    surrogate escapes back to the original (possibly non-UTF-8) bytes."""
+    return os.fsdecode(raw)
+
+
+def _row_name(raw):
+    """command_row_name() of run_stats.cpp on bytes: ASCII-lowercase, ASCII-
+    uppercase the first byte, append "s"."""
+    name = bytes(b + 32 if 0x41 <= b <= 0x5A else b for b in raw)
+    if name and 0x61 <= name[0] <= 0x7A:
+        name = bytes([name[0] - 32]) + name[1:]
+    return name + b"s"
+
+
+def test_json_replaces_invalid_utf8(env):
+    """User strings with invalid UTF-8 must not make the file invalid JSON
+    (issue #745).
+
+    --command names (object keys) and configuration values such as
+    --key-prefix, --uri/--authenticate, --client-stats, --failed-keys-file
+    and --prometheus-run-label were copied into --json-out-file byte for
+    byte, so a non-UTF-8 byte made the file undecodable while memtier exited
+    0. Each invalid sequence must now be written as U+FFFD, with the same
+    maximal-subpart rule Python's errors="replace" uses, and valid
+    multi-byte UTF-8 must be written unchanged.
+    """
+    env.skipOnVersionSmaller('6.0.0')  # The --uri user needs Redis ACLs.
+    invalid = [
+        b"A\xff",                  # byte that never starts a sequence
+        b"B\xc3",                  # truncated 2-byte sequence
+        b"C\xe2\x82",              # truncated 3-byte sequence
+        b"D\x80",                  # lone continuation byte
+        b"E\xc0\xaf",              # overlong 2-byte '/'
+        b"F\xe0\x80\xaf",          # overlong 3-byte '/'
+        b"G\xf0\x80\x80\xaf",      # overlong 4-byte '/'
+        b"H\xed\xa0\x80",          # UTF-16 surrogate U+D800
+        b"I\xf4\x90\x80\x80",      # U+110000, above U+10FFFF
+        b"J\xf5\x80\x80\x80",      # lead byte beyond U+10FFFF
+    ]
+    valid = [
+        "K\u043a\u043b\u044e\u0447",  # "Kключ"
+        "L\u00e4\U0001F600",            # "Lä😀"
+        # Boundary code points, which a too-strict decoder would reject.
+        "M\u07ff",                       # DF BF, last 2-byte
+        "N\u0800",                       # E0 A0 80, first 3-byte
+        "O\ud7ff",                       # ED 9F BF, last before surrogates
+        "P\uffff",                       # EF BF BF, last 3-byte
+        "Q\U00010000",                   # F0 90 80 80, first 4-byte
+        "R\U0010ffff",                   # F4 8F BF BF, last code point
+    ]
+    names = invalid + [v.encode() for v in valid]
+    # Ends in a truncated sequence, so the string's NUL terminates it.
+    prefix = b"k\xfe\xf0\x9f\x98"
+    user, password = b"u\xff", b"p\xed\xa0\x80"
+
+    test_dir = tempfile.mkdtemp()
+    client_stats = os.path.join(os.fsencode(test_dir), b"cs\xff")
+    failed_keys = os.path.join(os.fsencode(test_dir), b"fk\xc0")
+    extra_args = [_arg(b"--command=" + name + b" x") for name in names]
+    extra_args += ["--run-count=2", "--print-percentiles=50,99",
+                   _arg(b"--key-prefix=" + prefix),
+                   _arg(b"--client-stats=" + client_stats),
+                   _arg(b"--failed-keys-file=" + failed_keys)]
+    master_nodes = env.getMasterNodesList()
+    if not env.isCluster() and not env.isUnixSocket():
+        host = master_nodes[0].get("host", "127.0.0.1") or "127.0.0.1"
+        extra_args.append(_arg(b"--uri=redis://" + user + b":" + password + b"@"
+                               + "{}:{}".format(host, master_nodes[0]["port"]).encode()))
+    else:
+        extra_args.append(_arg(b"--authenticate=" + user + b":" + password))
+    label = b"env=v\xf4\x90\x80\x80"
+    with_prometheus = _memtier_supports("--prometheus-run-label")
+    if with_prometheus:
+        # Port 0: the kernel picks a free port for the exporter.
+        extra_args += ["--prometheus-port=0",
+                       _arg(b"--prometheus-run-label=" + label)]
+
+    connections = env.getOSSMasterNodesConnectionList()
+    benchmark, run_config = _build_benchmark(
+        env, test_dir, extra_args=extra_args, threads=1, clients=1, requests=10)
+    try:
+        for conn in connections:
+            conn.execute_command("ACL", "SETUSER", user, "on", b">" + password,
+                                 "~*", "&*", "+@all")
+        ok = benchmark.run()
+    finally:
+        for conn in connections:
+            conn.execute_command("ACL", "DELUSER", user)
+    failed_asserts = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier_benchmark exited non-zero")
+        with open(os.path.join(run_config.results_dir, "mb.json"), "rb") as f:
+            raw = f.read()
+        try:
+            text = raw.decode("utf-8")  # strict: JSON text must be UTF-8
+        except UnicodeDecodeError as e:
+            env.assertTrue(False, message=f"mb.json is not valid UTF-8: {e}")
+            return
+        doc = json.loads(text)
+        for section in ("BEST RUN RESULTS", "WORST RUN RESULTS",
+                        "AGGREGATED AVERAGE RESULTS (2 runs)"):
+            stats = doc[section]
+            for name in names:
+                # The stats row ("Xs") and the percentile array ("X").
+                for key in (_row_name(name), name):
+                    key = key.decode("utf-8", "replace")
+                    env.assertTrue(key in stats,
+                                   message=f"{section}: {key!r} not in {list(stats)}")
+        for v in valid:
+            # Byte-identical, not \u-escaped.
+            env.assertTrue(_row_name(v.encode()) in raw,
+                           message=f"{v!r} not written as raw UTF-8")
+        configuration = doc["configuration"]
+        expected = {
+            "key_prefix": prefix,
+            "client_stats": client_stats,
+            "failed_keys_file": failed_keys,
+        }
+        if with_prometheus:
+            expected["prometheus-run-labels"] = label
+        for field, value in expected.items():
+            env.assertEqual(configuration[field], value.decode("utf-8", "replace"))
+    finally:
+        if env.getNumberOfFailedAssertion() > failed_asserts:
+            debugPrintMemtierOnError(run_config, env)
+        else:
+            shutil.rmtree(test_dir, ignore_errors=True)
+
+
+def test_json_invalid_utf8_keys_stay_unique(env):
+    """Names that only differ in invalid UTF-8 must still get distinct keys.
+
+    "A\\xff", "A\\xfe" and a literal "A\ufffd" are all written as "A\ufffd".
+    Labels are deduplicated after the replacement, so each command keeps its
+    own row and percentile array instead of json.load() silently keeping only
+    the last of several equal keys.
+    """
+    names = [b"A\xff", b"A\xfe", "A\ufffd".encode()]
+    test_dir = tempfile.mkdtemp()
+    benchmark, run_config = _build_benchmark(
+        env, test_dir,
+        extra_args=[_arg(b"--command=" + name + b" x") for name in names],
+        threads=1, clients=1, requests=10)
+    ok = benchmark.run()
+    failed_asserts = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier_benchmark exited non-zero")
+
+        def no_duplicates(pairs):
+            keys = [k for k, _ in pairs]
+            env.assertEqual(len(keys), len(set(keys)),
+                            message=f"duplicate JSON keys: {keys}")
+            return dict(pairs)
+
+        with open(os.path.join(run_config.results_dir, "mb.json"), "rb") as f:
+            doc = json.loads(f.read().decode("utf-8"),
+                             object_pairs_hook=no_duplicates)
+        stats = doc["ALL STATS"]
+        rows = [k for k, v in stats.items()
+                if isinstance(v, dict) and "Count" in v and k != "Totals"]
+        env.assertEqual(len(rows), len(names), message=f"rows: {rows}")
+        env.assertEqual(sum(stats[k]["Count"] for k in rows),
+                        stats["Totals"]["Count"])
+    finally:
+        if env.getNumberOfFailedAssertion() > failed_asserts:
+            debugPrintMemtierOnError(run_config, env)
+        else:
+            shutil.rmtree(test_dir, ignore_errors=True)
 
 
 def _assert_totals_bandwidth_is_sum_of_commands(env, section_name, section):
