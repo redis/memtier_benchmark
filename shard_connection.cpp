@@ -1326,6 +1326,8 @@ void shard_connection::process_response(void)
                 benchmark_error_log("cluster slot failed.\n");
                 report_connection_stage_failure("CLUSTER SLOTS failed (server returned empty or non-cluster reply; "
                                                 "is the server actually cluster-enabled?)");
+                // As after a parsed reply: once the slot map is in, data
+                // replies on this connection must not be copied as values.
                 m_protocol->set_keep_value(false);
                 retry_cluster_slots_after_error();
                 error = true;
@@ -1903,6 +1905,15 @@ void shard_connection::attempt_reconnect(const char *error_context)
         // --max-reconnect-attempts is set.
         return;
     } else {
+        // Without --reconnect-on-error no attempt was made: don't report a
+        // maximum that was never configured.
+        char reason[256];
+        if (m_config->reconnect_on_error) {
+            snprintf(reason, sizeof(reason), "Maximum reconnection attempts (%u) exceeded for %s",
+                     m_config->max_reconnect_attempts, error_context);
+        } else {
+            snprintf(reason, sizeof(reason), "%s and --reconnect-on-error is not set", error_context);
+        }
         // Under --read-preference != primary, ONE dead replica should not
         // tear down the whole worker thread while sibling connections are
         // still mid-setup-ladder on the surviving primary/replicas. The
@@ -1913,14 +1924,12 @@ void shard_connection::attempt_reconnect(const char *error_context)
         // routing path which already gates on is_ready_for_reads() and
         // handles dead-conn cases via the bootstrap-warming hold.
         if (m_config->read_preference != rp_primary && peer_client_has_any_setup_in_progress()) {
-            benchmark_error_log("Maximum reconnection attempts (%u) exceeded for %s on conn %u; peers still mid-setup, "
-                                "leaving connection dead and continuing.\n",
-                                m_config->max_reconnect_attempts, error_context, m_id);
+            benchmark_error_log("%s on conn %u; peers still mid-setup, leaving connection dead and continuing.\n",
+                                reason, m_id);
             disconnect();
             return;
         }
-        benchmark_error_log("Maximum reconnection attempts (%u) exceeded for %s, ending this thread.\n",
-                            m_config->max_reconnect_attempts, error_context);
+        benchmark_error_log("%s, ending this thread.\n", reason);
         disconnect();
         // Nothing will resend the requests held for it now: client_group::run()
         // abandons them, and those of the other connections on this thread,
@@ -1985,7 +1994,9 @@ void shard_connection::handle_cluster_slots_retry_event()
     if (m_cluster_slots != setup_sent) return;
     m_cluster_slots = setup_none;
     // The run has not started: don't charge the time spent waiting for the
-    // slot map to --test-time or to the throughput figures.
+    // slot map to --test-time or to the throughput figures. Once any
+    // connection of this client has had a reply, the run's clock is running
+    // and must not be moved.
     if (!m_conns_manager->get_reqs_answered()) {
         m_conns_manager->set_start_time();
     }

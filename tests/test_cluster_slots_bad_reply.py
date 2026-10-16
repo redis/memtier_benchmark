@@ -20,7 +20,7 @@ class _Node(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, bad_slots_replies, moved_after=0, bad_reply=b"*0\r\n"):
+    def __init__(self, bad_slots_replies, moved_after=0, bad_reply=b"*0\r\n", replica=None, readonly_delay=0):
         super().__init__(("127.0.0.1", 0), _Handler)
         self.lock = threading.Lock()
         # CLUSTER SLOTS requests answered with bad_reply: every one after
@@ -30,6 +30,10 @@ class _Node(socketserver.ThreadingTCPServer):
         # Answer this data command with -MOVED to this node, so memtier
         # refreshes the slot map mid-run.
         self.moved_after = moved_after
+        # A node listed as this node's replica in a good reply, and how long
+        # a node waits before answering READONLY.
+        self.replica = replica
+        self.readonly_delay = readonly_delay
         self.slots_requests = 0
         self.data_requests = 0
         self.errors = []
@@ -42,8 +46,11 @@ class _Node(socketserver.ThreadingTCPServer):
                 (not self.moved_after and n <= self.bad_slots_replies)
         if bad:
             return self.bad_reply
-        port = str(self.server_address[1]).encode()
-        return b"*1\r\n*3\r\n:0\r\n:16383\r\n*2\r\n$9\r\n127.0.0.1\r\n:" + port + b"\r\n"
+        nodes = [self] + ([self.replica] if self.replica else [])
+        reply = b"*1\r\n*" + str(2 + len(nodes)).encode() + b"\r\n:0\r\n:16383\r\n"
+        for node in nodes:
+            reply += b"*2\r\n$9\r\n127.0.0.1\r\n:" + str(node.server_address[1]).encode() + b"\r\n"
+        return reply
 
 
 class _Handler(socketserver.StreamRequestHandler):
@@ -61,6 +68,9 @@ class _Handler(socketserver.StreamRequestHandler):
                 verb = args[0].upper()
                 if verb == b"CLUSTER":
                     reply = node.slots_reply()
+                elif verb == b"READONLY":
+                    time.sleep(node.readonly_delay)
+                    reply = b"+OK\r\n"
                 elif verb in (b"SET", b"GET"):
                     with node.lock:
                         node.data_requests += 1
@@ -80,8 +90,10 @@ class _Handler(socketserver.StreamRequestHandler):
 
 
 def _run(node, extra_args, timeout=20):
-    thread = threading.Thread(target=node.serve_forever, daemon=True)
-    thread.start()
+    others = [node.replica] if node.replica else []
+    threads = [threading.Thread(target=n.serve_forever, daemon=True) for n in [node] + others]
+    for thread in threads:
+        thread.start()
     args = [MEMTIER_BINARY, "--server=127.0.0.1", "--port={}".format(node.server_address[1]),
             "--cluster-mode", "--threads=1", "--clients=1", "--hide-histogram"] + extra_args
     start = time.time()
@@ -94,9 +106,10 @@ def _run(node, extra_args, timeout=20):
         if isinstance(stderr, bytes):
             stderr = stderr.decode(errors="replace")
     finally:
-        node.shutdown()
-        node.server_close()
-        thread.join(timeout=5)
+        for n, thread in zip([node] + others, threads):
+            n.shutdown()
+            n.server_close()
+            thread.join(timeout=5)
     return returncode, stderr, time.time() - start
 
 
@@ -137,9 +150,29 @@ def test_cluster_slots_empty_reply_mid_run_fails_without_reconnect(env):
     env.assertEqual(node.errors, [])
     env.assertNotEqual(returncode, "timeout", message=stderr[-2000:])
     env.assertNotEqual(returncode, 0)
-    env.assertContains("exceeded for CLUSTER SLOTS error", stderr)
+    env.assertContains("CLUSTER SLOTS error and --reconnect-on-error is not set, ending this thread", stderr)
     env.assertEqual(node.slots_requests, 2)
     env.assertLess(elapsed, 3)
+
+
+def test_cluster_slots_empty_reply_mid_run_with_replica_in_setup(env):
+    # With --read-preference other than primary, a connection that fails
+    # while a peer is still in its setup is left disconnected instead of
+    # ending the thread. Here the primary's refresh fails while the
+    # replica's READONLY is pending. Once the replica is ready, a write for
+    # the dead primary makes it refresh the map itself; that fails too and
+    # ends the thread, so the run fails before --test-time.
+    replica = _Node(bad_slots_replies=1000, readonly_delay=1)
+    node = _Node(bad_slots_replies=1000, moved_after=50, replica=replica)
+    returncode, stderr, elapsed = _run(node, ["--test-time=5", "--read-preference=secondary", "--ratio=1:0"])
+    env.assertEqual(node.errors + replica.errors, [])
+    env.assertNotEqual(returncode, "timeout", message=stderr[-2000:])
+    env.assertNotEqual(returncode, 0)
+    env.assertContains("peers still mid-setup, leaving connection dead and continuing", stderr)
+    env.assertContains("CLUSTER SLOTS error and --reconnect-on-error is not set, ending this thread", stderr)
+    env.assertEqual(node.slots_requests, 2)
+    env.assertEqual(replica.slots_requests, 1)
+    env.assertLess(elapsed, 4)
 
 
 def test_cluster_slots_empty_reply_mid_run_honours_test_time(env):
@@ -188,9 +221,10 @@ def test_cluster_slots_malformed_reply_mid_run_honours_test_time(env):
 
 
 def test_cluster_slots_empty_reply_at_startup_still_aborts(env):
-    # A node that never answers: the retries must not count as the run's
-    # time, or the run would finish empty at --test-time with exit 0 instead
-    # of failing at --connection-stage-timeout.
+    # A node that never returns a slot map: memtier keeps asking (master
+    # asked once), and --connection-stage-timeout still ends the run with
+    # exit 2. A short --test-time does not end it first: with no reply the
+    # run has no duration, whether or not the retries reset its clock.
     node = _Node(bad_slots_replies=1000)
     returncode, stderr, _ = _run(node, ["--test-time=1", "--connection-stage-timeout=5"])
     env.assertEqual(node.errors, [])
