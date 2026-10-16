@@ -74,7 +74,11 @@ def test_port_options_accept_valid_values(env):
 
 
 def test_port_ignores_errno_from_earlier_options(env):
-    """An earlier option's strtoul overflow must not reject a valid port."""
+    """An earlier option's strtoul overflow must not reject a valid port.
+
+    --max-reconnect-attempts does not check ERANGE today, so it is used here to
+    leave errno set; if it starts rejecting overflow, pick another such option.
+    """
     result = _run(["--max-reconnect-attempts=99999999999999999999999", "--port=6379", "--statsd-port=8125",
                    "--graphite-port=2003"])
     env.assertEqual(result.returncode, 0, message=result.stderr)

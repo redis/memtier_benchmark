@@ -1186,7 +1186,7 @@ static bool parse_port(const char *s, unsigned short *out)
     char *endptr = NULL;
     errno = 0;
     unsigned long v = strtoul(s, &endptr, 10);
-    if (endptr == s || !endptr || *endptr != '\0' || errno == ERANGE || v < 1 || v > 65535) return false;
+    if (*endptr != '\0' || errno == ERANGE || v < 1 || v > 65535) return false;
     *out = (unsigned short) v;
     return true;
 }
