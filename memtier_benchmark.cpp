@@ -686,6 +686,32 @@ static std::string prometheus_buckets_str(struct benchmark_config *cfg)
 }
 #endif // HAVE_EVHTTP
 
+// Secrets must not reach --show-config or --json-out-file (result files are
+// shared as CI artifacts). Keep the user name, which the redis and
+// memcache_binary authenticate() split off at the first ':', and replace the
+// password with "***": "user:pw" -> "user:***", "pw" -> "***".
+static std::string redact_credentials(const char *credentials)
+{
+    if (!credentials || !*credentials) return "";
+    const char *colon = strchr(credentials, ':');
+    if (!colon) return "***";
+    return std::string(credentials, colon - credentials + 1) + "***";
+}
+
+// --uri with its userinfo password redacted: redis://user:pw@host:port/db ->
+// redis://user:***@host:port/db. The userinfo runs up to the last '@' so no
+// part of a password that itself contains '@' survives.
+static std::string redact_uri(const char *uri)
+{
+    if (!uri) return "";
+    std::string s(uri);
+    size_t start = s.find("://");
+    start = (start == std::string::npos) ? 0 : start + 3;
+    size_t at = s.rfind('@');
+    if (at == std::string::npos || at < start) return s;
+    return s.substr(0, start) + redact_credentials(s.substr(start, at - start).c_str()) + s.substr(at);
+}
+
 static void config_print(FILE *file, struct benchmark_config *cfg)
 {
     char tmpbuf[512];
@@ -762,7 +788,7 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             "prometheus-latency-buckets = %s\n"
 #endif
             ,
-            cfg->server, cfg->port, cfg->uri ? cfg->uri : "", cfg->unix_socket,
+            cfg->server, cfg->port, redact_uri(cfg->uri).c_str(), cfg->unix_socket,
             cfg->resolution == AF_UNSPEC ? "Unspecified"
             : cfg->resolution == AF_INET ? "AF_INET"
                                          : "AF_INET6",
@@ -782,7 +808,7 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             cfg->retry_backoff_factor, cfg->retry_on_filter ? cfg->retry_on_filter : "", cfg->max_retry_queue,
             cfg->failed_keys_file ? cfg->failed_keys_file : "", cfg->connection_timeout, cfg->connection_stage_timeout,
             cfg->thread_conn_start_min_jitter_micros, cfg->thread_conn_start_max_jitter_micros, cfg->multi_key_get,
-            cfg->authenticate ? cfg->authenticate : "", cfg->select_db, cfg->no_expiry ? "yes" : "no",
+            redact_credentials(cfg->authenticate).c_str(), cfg->select_db, cfg->no_expiry ? "yes" : "no",
             cfg->wait_ratio.a, cfg->wait_ratio.b, cfg->num_slaves.min, cfg->num_slaves.max, cfg->wait_timeout.min,
             cfg->wait_timeout.max, cfg->json_out_file, cfg->print_all_runs ? "yes" : "no"
 #ifdef HAVE_EVHTTP
@@ -801,7 +827,7 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
 
     jsonhandler->write_obj("server", "\"%s\"", cfg->server);
     jsonhandler->write_obj("port", "%u", cfg->port);
-    jsonhandler->write_obj("uri", "\"%s\"", cfg->uri ? cfg->uri : "");
+    jsonhandler->write_obj("uri", "\"%s\"", redact_uri(cfg->uri).c_str());
     jsonhandler->write_obj("unix socket", "\"%s\"", cfg->unix_socket);
     jsonhandler->write_obj("address family", "\"%s\"",
                            cfg->resolution == AF_UNSPEC ? "Unspecified"
@@ -859,7 +885,7 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
     jsonhandler->write_obj("thread_conn_start_min_jitter_micros", "%u", cfg->thread_conn_start_min_jitter_micros);
     jsonhandler->write_obj("thread_conn_start_max_jitter_micros", "%u", cfg->thread_conn_start_max_jitter_micros);
     jsonhandler->write_obj("multi_key_get", "%u", cfg->multi_key_get);
-    jsonhandler->write_obj("authenticate", "\"%s\"", cfg->authenticate ? cfg->authenticate : "");
+    jsonhandler->write_obj("authenticate", "\"%s\"", redact_credentials(cfg->authenticate).c_str());
     jsonhandler->write_obj("select-db", "%d", cfg->select_db);
     jsonhandler->write_obj("no-expiry", "\"%s\"", cfg->no_expiry ? "true" : "false");
     jsonhandler->write_obj("wait-ratio", "\"%u:%u\"", cfg->wait_ratio.a, cfg->wait_ratio.b);
