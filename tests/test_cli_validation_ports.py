@@ -1,4 +1,5 @@
-"""Regression tests for -p/--port, --statsd-port and --graphite-port (issue #697).
+"""Regression tests for port values: -p/--port, --statsd-port, --graphite-port,
+--read-server HOST:PORT and the --uri port (issue #697).
 
 Values outside [1,65535] used to be narrowed to unsigned short before the range
 check, so 65537 became port 1 and 88536 became port 23000; negative values were
@@ -77,3 +78,29 @@ def test_port_ignores_errno_from_earlier_options(env):
     result = _run(["--max-reconnect-attempts=99999999999999999999999", "--port=6379", "--statsd-port=8125",
                    "--graphite-port=2003"])
     env.assertEqual(result.returncode, 0, message=result.stderr)
+
+
+def test_read_server_port_rejects_out_of_range_and_malformed(env):
+    for value in ("65537", "0", "-1", "-18446744073709551615", "+6379", "6379x"):
+        result = _run(["--read-server=127.0.0.1:" + value])
+        label = "--read-server port {!r}".format(value)
+        env.assertEqual(result.returncode, 2, message=label + ": " + result.stderr)
+        env.assertTrue("error: --read-server: invalid port" in result.stderr, message=label + ": " + result.stderr)
+    for spec in ("127.0.0.1:6379", "[::1]:6379"):
+        result = _run(["--read-server=" + spec])
+        env.assertEqual(result.returncode, 0, message=spec + ": " + result.stderr)
+
+
+def test_uri_port_rejects_out_of_range_and_malformed(env):
+    # The URI is parsed after --version would exit, so run with no server
+    # listening on the valid control port and look for the parser diagnostic.
+    for value in ("65537", "0", "-18446744073709551615", "+80"):
+        result = subprocess.run(
+            [MEMTIER_BINARY, "--uri=redis://127.0.0.1:" + value, "-n", "1", "-c", "1", "-t", "1"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        label = "--uri port {!r}".format(value)
+        env.assertNotEqual(result.returncode, 0, message=label + ": " + result.stderr)
+        env.assertTrue("error: invalid port number" in result.stderr, message=label + ": " + result.stderr)

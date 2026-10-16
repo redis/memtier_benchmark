@@ -884,6 +884,8 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
 
 // Parse URI and populate config fields
 // Returns 0 on success, -1 on error
+static bool parse_port(const char *s, unsigned short *out);
+
 static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string &uri_authenticate,
                      std::string &uri_server)
 {
@@ -971,9 +973,8 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
     if (port_start) {
         *port_start = '\0';
         port_start++;
-        char *endptr;
-        unsigned long port = strtoul(port_start, &endptr, 10);
-        if (*endptr != '\0' || port == 0 || port > 65535) {
+        unsigned short port;
+        if (!parse_port(port_start, &port)) {
             fprintf(stderr, "error: invalid port number '%s'.\n", port_start);
             free(uri_copy);
             return -1;
@@ -981,7 +982,7 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
         if (cfg->port) {
             fprintf(stderr, "warning: both URI and --port specified, URI takes precedence.\n");
         }
-        cfg->port = (unsigned short) port;
+        cfg->port = port;
     }
 
     // Own URI hosts separately from a borrowed --server argument or the default.
@@ -2436,9 +2437,8 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 fprintf(stderr, "error: --read-server: expected HOST:PORT, got '%s'.\n", optarg);
                 return -1;
             }
-            endptr = NULL;
-            unsigned long rport = strtoul(rscolon + 1, &endptr, 10);
-            if (!endptr || *endptr != '\0' || rport == 0 || rport > 65535) {
+            unsigned short rport;
+            if (!parse_port(rscolon + 1, &rport)) {
                 fprintf(stderr, "error: --read-server: invalid port in '%s'.\n", optarg);
                 return -1;
             }
@@ -2447,7 +2447,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             if (!rhost.empty() && rhost[0] == '[' && rhost[rhost.size() - 1] == ']') {
                 rhost = rhost.substr(1, rhost.size() - 2);
             }
-            cfg->read_servers.push_back(read_server_spec(rhost, (unsigned short) rport));
+            cfg->read_servers.push_back(read_server_spec(rhost, rport));
             break;
         }
         case o_command_is_read: {
