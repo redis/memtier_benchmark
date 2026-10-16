@@ -699,18 +699,22 @@ static std::string redact_credentials(const char *credentials)
 }
 
 // End of the userinfo in a URI authority+path (the text after "scheme://"),
-// or NULL when there is none. The authority ends at a '/' (RFC 3986), so the
-// search for '@' stops at the first '/' after the first '@': a stray '@' in
-// the db path is not taken for the end of the credentials (which would
-// retarget the run), while a raw '@' or '/' inside the password still works.
-// It is the LAST '@' before that point, so no tail of a password containing
-// '@' is taken for the host and echoed by --show-config or a host/port error.
+// or NULL when there is none. The authority ends at a '/', '?' or '#'
+// (RFC 3986), so the search for '@' stops at the first of those after the
+// first '@': a stray '@' in the db path, query or fragment is not taken for
+// the end of the credentials, which would send them to another host. It is
+// the LAST '@' before that point, so a raw '@' in the password works and no
+// tail of it is taken for the host and echoed by --show-config or a
+// host/port error. A raw '/', '?' or '#' in the password works only when no
+// '@' comes before it in the password: "u:a@b/c@host" is still split as
+// host "b" and db "c@host" (as before). Such passwords need the
+// percent-encoding of #732.
 static const char *uri_userinfo_end(const char *s)
 {
     const char *at = strchr(s, '@');
     if (!at) return NULL;
-    const char *slash = strchr(at, '/');
-    const char *end = slash ? slash : at + strlen(at);
+    const char *delim = strpbrk(at, "/?#");
+    const char *end = delim ? delim : at + strlen(at);
     while (end > at && *(end - 1) != '@')
         end--;
     return end - 1;

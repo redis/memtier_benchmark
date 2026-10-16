@@ -13,6 +13,7 @@ Run with:
 """
 import json
 import os
+import socket
 import subprocess
 import tempfile
 from contextlib import contextmanager
@@ -86,7 +87,10 @@ def _requirepass(env, password):
                 conn.config_set("requirepass", old["requirepass"])
                 conn.config_set("masterauth", old["masterauth"])
             except Exception:
-                # requirepass may not have been applied on this node yet.
+                # Connecting with the new password failed, so CONFIG SET
+                # requirepass did not take on this node (masterauth, set
+                # first, did): requirepass is still the old value, so only
+                # masterauth needs restoring, over the old password.
                 conn = _conn(env, host, port, old["requirepass"])
                 conn.config_set("masterauth", old["masterauth"])
 
@@ -185,6 +189,14 @@ def test_config_password_redaction_password_with_colon(env):
            [_CANARY])
 
 
+def test_config_password_redaction_uri_password_with_slash(env):
+    # A raw '/' in the password (with no '@' before it) works, as on master.
+    host, port = _target(env)
+    password = "a/" + _CANARY
+    _check(env, password, ["--uri", "redis://default:{}@{}:{}".format(password, host, port)],
+           "redis://default:***@{}:{}".format(host, port), "default:***", [_CANARY])
+
+
 def test_config_password_redaction_uri_password_with_at(env):
     # The userinfo ends at the LAST '@', so a raw '@' in the password works
     # and the part after it is not taken for the host (and echoed).
@@ -225,15 +237,51 @@ def test_config_uri_stray_at_in_path_rejected(env):
 
 
 def test_config_uri_at_in_password_and_path_keeps_host(env):
-    """redis://u:p@w@host:port/x@y must not be read as host "y"."""
+    """redis://u:p@w@host:port/x@y must not be read as host "y".
+
+    The /x@wrong/2 form also catches a whole-string last-'@' split, which
+    would connect to host "wrong", db 2.
+    """
     host, port = _target(env)
-    uri = "redis://default:{}@{}@{}:{}/x@cfg731-wrong-host".format(_CANARY_HEAD, _CANARY_TAIL, host, port)
-    with tempfile.TemporaryDirectory() as workdir:
-        _raw, stdout, stderr = _run(env, ["--uri", uri], workdir, expect_ok=False)
-    env.assertContains("invalid database number 'x@cfg731-wrong-host'", stderr)
-    env.assertFalse("server = cfg731-wrong-host" in stderr)
-    for secret in (_CANARY_HEAD, _CANARY_TAIL):
-        env.assertFalse(secret in stdout + stderr, message="{!r} leaked: {}".format(secret, stderr[-500:]))
+    for path in ("/x@cfg731-wrong-host", "/x@cfg731-wrong-host/2"):
+        uri = "redis://default:{}@{}@{}:{}{}".format(_CANARY_HEAD, _CANARY_TAIL, host, port, path)
+        with tempfile.TemporaryDirectory() as workdir:
+            _raw, stdout, stderr = _run(env, ["--uri", uri], workdir, expect_ok=False)
+        env.assertContains("invalid database number '{}'".format(path[1:]), stderr)
+        env.assertFalse("server = cfg731-wrong-host" in stderr)
+        for secret in (_CANARY_HEAD, _CANARY_TAIL):
+            env.assertFalse(secret in stdout + stderr, message="{!r} leaked: {}".format(secret, stderr[-500:]))
+
+
+def test_config_uri_at_in_query_or_fragment_not_retargeted(env):
+    """An '@' after '?' or '#' does not end the credentials.
+
+    The authority ends at '?' and '#' too (RFC 3986). Otherwise
+    redis://u:pw@host:port?x=@other:port connected to "other" and sent it
+    AUTH u pw@host:port?x=. The URI must be rejected and nothing may reach
+    the second host.
+    """
+    host, port = _target(env)
+    decoy = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        decoy.bind(("127.0.0.1", 0))
+        decoy.listen(8)
+        decoy.setblocking(False)
+        decoy_port = decoy.getsockname()[1]
+        for sep in ("?x=", "#x"):
+            uri = "redis://default:{}@{}:{}{}@127.0.0.1:{}".format(_CANARY, host, port, sep, decoy_port)
+            with tempfile.TemporaryDirectory() as workdir:
+                _raw, stdout, stderr = _run(env, ["--uri", uri], workdir, expect_ok=False)
+            env.assertContains("invalid port number", stderr)
+            env.assertFalse(_CANARY in stdout + stderr)
+            try:
+                conn, _addr = decoy.accept()
+                conn.close()
+                env.assertTrue(False, message="memtier connected to the second host for {!r}".format(sep))
+            except BlockingIOError:
+                pass
+    finally:
+        decoy.close()
 
 
 def test_config_uri_credentials_without_host_rejected(env):
