@@ -278,14 +278,16 @@ If the results cannot be written to `--out-file`, `--json-out-file` or
 stdout (for example on a full disk, an exceeded quota, an I/O error, or a
 closed stdout), memtier prints `error: failed writing --out-file PATH:
 REASON` (or `--json-out-file PATH`, or `results to stdout`) and exits with
-status **1**, also after a graceful interrupt.
+status **1**, also after a graceful interrupt. A connection-stage abort still
+exits with **2** when an output write fails too.
 
-One exception: when stdout is a pipe or socket and its reader goes away
-(e.g. `memtier_benchmark ... | head`), the run is not failed, since the
+One exception: when stdout is a pipe or socket and its reader has gone
+away (e.g. `memtier_benchmark ... | head`), the run is not failed, since the
 reader chose to stop reading. This also applies to an `--out-file` that is
-the same file as stdout, such as `/dev/stdout`. Any other `--out-file`
-(for example a FIFO whose reader exits) and `--json-out-file` always fail
-the run when a write fails.
+the same file as stdout, such as `/dev/stdout`. A write that fails while the
+reader is still there (for example a full non-blocking pipe) still fails the
+run. Any other `--out-file` (for example a FIFO whose reader exits) and
+`--json-out-file` always fail the run when a write fails.
 
 ## Crash Reporting
 

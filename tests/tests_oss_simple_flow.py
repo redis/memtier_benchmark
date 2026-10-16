@@ -1948,12 +1948,7 @@ def test_stdout_closed_pipe_is_not_an_error(env):
     SIGPIPE is ignored, so the writes fail with EPIPE; that is the reader's
     choice, not a lost result, and the exit status stays 0.
     """
-    rfd, wfd = os.pipe()
-    os.close(rfd)
-    try:
-        rc, stderr = _run_with_unwritable_output(env, [], wfd, drop_default_out_file=True)
-    finally:
-        os.close(wfd)
+    rc, stderr = _closed_pipe_run(env, [])
     env.assertEqual(rc, 0, message=stderr)
     env.assertNotContains("error: failed writing", stderr)
 
@@ -1985,7 +1980,12 @@ def test_stdout_closed_pipe_unbuffered_is_not_an_error(env):
 
 
 def test_stdout_reader_exits_early(env):
-    """`memtier | head -n 1` exits 0, the reader quitting mid-output (#719)."""
+    """`memtier | head -n 1` exits 0, the reader quitting mid-output (#719).
+
+    A best-effort smoke test: whether head has exited before memtier writes
+    depends on timing (it caught the lost-EPIPE bug in 27 of 30 runs). The
+    closed-pipe tests above are the deterministic guard.
+    """
     if shutil.which('stdbuf') is None or shutil.which('head') is None:
         env.skip()
         return
@@ -2009,3 +2009,38 @@ def test_out_file_dev_stdout_closed_pipe_is_not_an_error(env):
     env.assertEqual(rc, 0, message=stderr)
     env.assertNotContains("error: failed writing", stderr)
 
+
+
+def test_stdout_full_nonblocking_pipe_is_an_error(env):
+    """Results lost on a live stdout pipe fail the run (#719).
+
+    stdout is a full non-blocking pipe whose reader is still open (as when it
+    is shared with a parent that set O_NONBLOCK), so the writes fail with
+    EAGAIN. Line-buffered, glibc drops that data and the cause is lost; the
+    reader is still there, so this must not pass as a gone reader.
+    """
+    import fcntl
+    if shutil.which('stdbuf') is None:
+        env.skip()
+        return
+    rfd, wfd = os.pipe()
+    try:
+        try:
+            fcntl.fcntl(wfd, getattr(fcntl, "F_SETPIPE_SZ", 1031), 4096)
+        except OSError:
+            pass  # a larger pipe is just filled with more data
+        os.set_blocking(wfd, False)
+        # Fill it to the last byte: a write <= PIPE_BUF is all-or-nothing.
+        for chunk in (b'x' * 4096, b'x'):
+            try:
+                while True:
+                    os.write(wfd, chunk)
+            except BlockingIOError:
+                pass
+        rc, stderr = _run_with_unwritable_output(env, [], wfd, drop_default_out_file=True,
+                                                 prefix=['stdbuf', '-oL'])
+    finally:
+        os.close(wfd)
+        os.close(rfd)
+    env.assertEqual(rc, 1, message=stderr)
+    env.assertContains("error: failed writing results to stdout: ", stderr)

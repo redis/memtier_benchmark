@@ -49,6 +49,7 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <poll.h>
 #ifdef HAVE_EXECINFO_H
 #include <execinfo.h>
 #endif
@@ -4448,14 +4449,30 @@ static void cleanup_openssl(void)
 
 #endif
 
-// True if fp is stdout, or the same file as stdout, and that is a pipe or a
-// socket.
-static bool output_is_stdout_pipe(FILE *fp)
+// True if the write error err on the still-open fp only means that the reader
+// of stdout went away (e.g. `| head`): fp is stdout, or the same file as stdout
+// (e.g. --out-file /dev/stdout), it is a pipe or socket, and the other end is
+// closed. SIGPIPE is ignored, so such writes fail with EPIPE (ECONNRESET on a
+// reset socket). But finish_output_file() returns a synthetic EIO when stdio
+// dropped the failed data (glibc does when line-buffered or unbuffered), and
+// its real cause may also be a lost write to a live reader (EAGAIN on a full
+// non-blocking pipe). So for EIO ask the kernel: poll() reports POLLERR on a
+// pipe with no reader and POLLHUP on a closed socket.
+static bool stdout_reader_gone(FILE *fp, int err)
 {
+    if (err != EPIPE && err != ECONNRESET && err != EIO) return false;
+    int fd = fileno(fp);
     struct stat st, out_st;
-    if (fstat(fileno(fp), &st) != 0 || !(S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode))) return false;
-    if (fp == stdout) return true;
-    return fstat(STDOUT_FILENO, &out_st) == 0 && st.st_dev == out_st.st_dev && st.st_ino == out_st.st_ino;
+    if (fstat(fd, &st) != 0 || !(S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode))) return false;
+    if (fp != stdout &&
+        (fstat(STDOUT_FILENO, &out_st) != 0 || st.st_dev != out_st.st_dev || st.st_ino != out_st.st_ino))
+        return false;
+    if (err != EIO) return true;
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLOUT;
+    pfd.revents = 0;
+    return poll(&pfd, 1, 0) == 1 && (pfd.revents & (POLLERR | POLLHUP)) != 0;
 }
 
 int main(int argc, char *argv[])
@@ -5497,14 +5514,13 @@ int main(int argc, char *argv[])
     // fails the run, with one exception: stdout (or an --out-file that is
     // stdout, e.g. /dev/stdout) on a pipe or socket whose reader went away,
     // e.g. `| head`. That is the reader's choice, not a lost result.
+    // Keep this check after the last write to outfile.
     bool output_failed = false;
-    bool stdout_pipe = output_is_stdout_pipe(outfile);
-    int out_err = finish_output_file(outfile, outfile != stdout);
-    // SIGPIPE is ignored, so such writes fail with EPIPE. stdio may drop the
-    // failed data (glibc does when line-buffered or unbuffered), and then
-    // finish_output_file() can only report EIO; a pipe or socket write never
-    // fails with EIO itself, so take both as the reader having gone away.
-    if (out_err != 0 && !(stdout_pipe && (out_err == EPIPE || out_err == EIO))) {
+    int out_err = finish_output_file(outfile, false);
+    // Checked before fclose(), while the fd is still open.
+    bool reader_gone = out_err != 0 && stdout_reader_gone(outfile, out_err);
+    if (outfile != stdout && fclose(outfile) != 0 && out_err == 0) out_err = errno;
+    if (out_err != 0 && !reader_gone) {
         if (outfile == stdout) {
             fprintf(stderr, "error: failed writing results to stdout: %s\n", strerror(out_err));
         } else {
