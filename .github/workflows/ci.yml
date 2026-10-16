@@ -333,9 +333,9 @@ jobs:
           ./tests/gen-test-certs.sh
 
     - name: Run tests
-      # Every cell runs the whole suite, so the standalone cells use
-      # PARALLELISM=2 like the cluster cells; the limit (shared by all cells)
-      # leaves headroom for slow runners. See #679.
+      # The standalone and main cluster cells run the whole suite, so the
+      # standalone cells use PARALLELISM=2 like the cluster ones; the limit
+      # (shared by all cells) leaves headroom for slow runners. See #679.
       timeout-minutes: 40
       env: ${{ matrix.test-config.env }}
       run: |
