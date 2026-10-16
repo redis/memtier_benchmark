@@ -1469,10 +1469,12 @@ def test_merged_duration_averages_all_threads(env):
                 if len(workload) == 4:
                     break
                 if proc.poll() is not None or time.monotonic() >= deadline:
-                    raise AssertionError("four active workload clients were not ready before the kill")
+                    raise AssertionError("four active workload clients were not ready before the kill "
+                                         "(rc={}, clients={})".format(proc.poll(), workload))
                 time.sleep(0.02)
             time.sleep(1)
-            env.assertEqual(conn.execute_command("CLIENT", "KILL", "ID", workload[0]["id"]), 1)
+            killed = conn.execute_command("CLIENT", "KILL", "ID", workload[0]["id"])
+            killed_alive = proc.poll() is None
             return_code = proc.wait(timeout=60)
         finally:
             if proc.poll() is None:
@@ -1484,10 +1486,13 @@ def test_merged_duration_averages_all_threads(env):
     with open("{0}/mb.json".format(config.results_dir)) as f:
         runtime = json.load(f)["ALL STATS"]["Runtime"]
     env.debugPrint("Runtime: {}".format(runtime), True)
-    env.assertEqual(return_code, 0)
-    env.assertTrue("Connection dropped" in stderr_content, message="the killed client did not reconnect")
+    diag = "rc={} killed={} memtier alive at kill={} stderr tail:\n{}".format(
+        return_code, killed, killed_alive, stderr_content[-2000:])
+    env.assertEqual(killed, 1, message="CLIENT KILL ID did not kill a workload client; " + diag)
+    env.assertEqual(return_code, 0, message=diag)
+    env.assertTrue("Connection dropped" in stderr_content, message="the killed client did not reconnect; " + diag)
     duration = runtime["Total duration"]
-    env.assertEqual(duration, runtime["Finish time"] - runtime["Start time"])
+    env.assertEqual(duration, runtime["Finish time"] - runtime["Start time"], message=str(runtime))
     undelayed_ms = requests * 1000 // rate
     # Mean of three clients at ~3 s and one at ~4 s; the last thread alone
     # gives ~3 s or ~4 s.

@@ -113,7 +113,13 @@ inline timeval timeval_factorial_average(timeval a, timeval b, unsigned int weig
     // when aggregate spans < 1ms. See issue #463.
     int64_t a_usec = (int64_t) a.tv_sec * 1000000 + a.tv_usec;
     int64_t b_usec = (int64_t) b.tv_sec * 1000000 + b.tv_usec;
-    int64_t avg_usec = (a_usec * (weight - 1) + b_usec) / weight;
+    // a + floor((b - a) / weight) equals (a * (weight - 1) + b) / weight but
+    // does not overflow int64 at large weights: with epoch microseconds
+    // (~1.8e15), a * (weight - 1) wraps past ~5000 merged clients (#709).
+    int64_t diff = b_usec - a_usec;
+    int64_t step = diff / (int64_t) weight;
+    if (diff % (int64_t) weight < 0) step--;
+    int64_t avg_usec = a_usec + step;
     timeval tv;
     tv.tv_sec = (time_t) (avg_usec / 1000000);
     tv.tv_usec = (suseconds_t) (avg_usec % 1000000);

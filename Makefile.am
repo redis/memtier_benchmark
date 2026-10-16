@@ -79,7 +79,7 @@ memtier_benchmark_LDADD = \
 
 
 check_PROGRAMS = prometheus_metrics_test rate_limiter_test retry_backoff_test retry_drain_test socket_options_test hdr_histogram_test cluster_transaction_test \
-    cluster_hslot_test run_stats_counters_test
+    cluster_hslot_test run_stats_counters_test run_stats_merge_test
 
 # The metrics test links only the pure layer (prometheus_metrics.{h,cpp}).
 # First `make check` program in the repo. The metrics layer is config-free and
@@ -142,6 +142,11 @@ run_stats_counters_test_SOURCES = tests/unit/run_stats_counters_test.cpp run_sta
 run_stats_counters_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
 run_stats_counters_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 run_stats_counters_test_LDADD = $(CODE_COVERAGE_LDFLAGS)
+# Average Start/Finish time over thousands of merged runs, as run_benchmark() does.
+run_stats_merge_test_SOURCES = tests/unit/run_stats_merge_test.cpp
+run_stats_merge_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
+run_stats_merge_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+run_stats_merge_test_LDADD = $(filter-out memtier_benchmark-memtier_benchmark.$(OBJEXT),$(memtier_benchmark_OBJECTS)) $(memtier_benchmark_LDADD)
 TESTS = $(check_PROGRAMS)
 
 # Keep the release amalgamation byte-identical to the recorded upstream asset.
