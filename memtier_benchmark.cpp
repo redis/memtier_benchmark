@@ -5200,8 +5200,16 @@ int main(int argc, char *argv[])
         std::vector<run_stats> all_stats;
         all_stats.reserve(cfg.run_count);
 
+        // Ctrl+C ends the whole --run-count series, not only the current run:
+        // no later run starts, checked before and after the settle pause
+        // (SIGINT cuts sleep() short). The interrupted run itself is kept,
+        // marked Interrupted. Run 1 always runs, so all_stats is never empty.
         for (unsigned int run_id = 1; run_id <= cfg.run_count; run_id++) {
-            if (run_id > 1) sleep(1); // let connections settle
+            if (run_id > 1) {
+                if (g_interrupted) break;
+                sleep(1); // let connections settle
+                if (g_interrupted) break;
+            }
 
             run_stats stats = run_benchmark(run_id, &cfg, obj_gen);
             all_stats.push_back(stats);
@@ -5209,6 +5217,10 @@ int main(int argc, char *argv[])
             stats.save_hdr_get_command(&cfg, run_id);
             stats.save_hdr_set_command(&cfg, run_id);
             stats.save_hdr_arbitrary_commands(&cfg, run_id);
+        }
+        if (all_stats.size() < cfg.run_count) {
+            fprintf(stderr, "Interrupted by user (Ctrl+C), skipping the remaining runs (%zu of %u done).\n",
+                    all_stats.size(), cfg.run_count);
         }
         //
         // Print some run information.
@@ -5297,7 +5309,9 @@ int main(int argc, char *argv[])
 #endif
 
         // If more than 1 run was used, compute best, worst and average
-        // Furthermore, if print_all_runs is enabled we save separate histograms per run
+        // Furthermore, if print_all_runs is enabled we save separate histograms per run.
+        // The section layout follows --run-count; their contents and the run
+        // count use only the runs that happened (fewer after Ctrl+C).
         if (cfg.run_count > 1) {
             // User wants to see a separate histogram per run
             if (cfg.print_all_runs) {
@@ -5331,7 +5345,7 @@ int main(int argc, char *argv[])
             run_stats average(&cfg);
             average.aggregate_average(all_stats);
             char average_header[50];
-            snprintf(average_header, sizeof(average_header), "AGGREGATED AVERAGE RESULTS (%u runs)", cfg.run_count);
+            snprintf(average_header, sizeof(average_header), "AGGREGATED AVERAGE RESULTS (%zu runs)", all_stats.size());
             average.print(outfile, &cfg, average_header, jsonhandler);
         } else {
             all_stats.begin()->print(outfile, &cfg, "ALL STATS", jsonhandler);

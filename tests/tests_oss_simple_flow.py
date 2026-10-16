@@ -1282,6 +1282,61 @@ def test_interrupt_signal_handling(env):
         env.assertTrue(total_count > 0)
 
 
+def test_interrupt_stops_run_count(env):
+    """Ctrl+C stops the whole --run-count series, not only the current run (#690).
+
+    Before the fix every remaining run started anyway, sent about 1 s of load,
+    and was counted in BEST/WORST/AGGREGATED ("(3 runs)"). Now memtier exits
+    after the interrupted run, and the summary covers only that run.
+    """
+    benchmark_specs = {"name": env.testName,
+                       "args": ['--run-count=3', '--hide-histogram']}
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=2, clients=5, requests=None, test_time=30)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    test_dir = tempfile.mkdtemp()
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+
+    stderr_path = os.path.join(config.results_dir, 'mb.stderr')
+    with open(stderr_path, 'wb') as stderr_file:
+        process = subprocess.Popen(
+            stdin=None, stdout=subprocess.PIPE, stderr=stderr_file,
+            executable=benchmark.binary, args=benchmark.args)
+        time.sleep(1.5)
+        process.send_signal(signal.SIGINT)
+        t_sigint = time.time()
+        try:
+            _stdout, _ = process.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            _stdout, _ = process.communicate()
+        elapsed = time.time() - t_sigint
+    benchmark.write_file('mb.stdout', _stdout)
+    with open(stderr_path, 'r') as fh:
+        stderr_content = fh.read()
+
+    env.assertEqual(process.returncode, 0, message=stderr_content)
+    # Only run 1 started and was interrupted; no later run was launched.
+    env.assertEqual(stderr_content.count("Interrupted by user (Ctrl+C) after"), 1, message=stderr_content)
+    env.assertFalse("[RUN #2]" in stderr_content, message=stderr_content)
+    env.assertTrue("skipping the remaining runs (1 of 3 done)" in stderr_content, message=stderr_content)
+    # Each skipped run used to add a 1 s pause plus 1 s of load (>= 4 s here).
+    env.assertTrue(elapsed < 3.5, message="exit took {:.1f}s after SIGINT".format(elapsed))
+
+    with open('{0}/mb.json'.format(config.results_dir)) as results_json:
+        results_dict = json.load(results_json)
+    env.assertTrue("AGGREGATED AVERAGE RESULTS (1 runs)" in results_dict, message=list(results_dict))
+    env.assertFalse("AGGREGATED AVERAGE RESULTS (3 runs)" in results_dict, message=list(results_dict))
+    for section in ("BEST RUN RESULTS", "WORST RUN RESULTS", "AGGREGATED AVERAGE RESULTS (1 runs)"):
+        env.assertTrue(section in results_dict, message=list(results_dict))
+        if section in results_dict:
+            env.assertEqual(results_dict[section]["Runtime"]["Interrupted"], "true", message=section)
+
+
 def test_cluster_seed_owns_no_keys(env):
     """Reads must reach their shard when the -p seed owns none of the keys (#610).
 

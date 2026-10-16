@@ -1100,6 +1100,9 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
         }
 
         total_duration_usec += ts_diff(i->m_start_time, i->m_end_time);
+
+        // Like merge(): the average is interrupted if any of its runs was.
+        if (i->m_interrupted) m_interrupted = true;
     }
 
     m_totals.m_set_cmd.aggregate_average(all_stats.size());

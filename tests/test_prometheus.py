@@ -1406,23 +1406,34 @@ def test_F26_run_end_drains_latency(env):
 # F27 -- the run-end snapshot counts every op after Ctrl+C (#637, PR #665).
 # On Ctrl+C, client_group::interrupt() stamps end times from the main thread
 # while workers may still finish a read callback; the post-join run-end drain
-# must pick those ops up. Ctrl+C does not stop later --run-count runs: run 1
-# ends at once and publishes its run-end snapshot (run 1, 0 threads), then
-# run 2 starts after a 1 s pause and is interrupted at once. Renders are
-# cached for 1 s, so the test stops scraping for over 1 s before the SIGINT;
-# its next scrape then renders inside that gap. On the last run-end scrape,
+# must pick those ops up. Ctrl+C ends the whole --run-count series (#690), so
+# the run-end snapshot (run 1, 0 threads) is the last one before exit. To keep
+# the exporter up after it, results go to a FIFO shrunk to one page that the
+# test does not read: memtier blocks writing them until the test drains it.
+# Renders are cached for 1 s, so the test stops scraping for over 1 s before
+# the SIGINT; its next scrape then renders the run-end snapshot. There,
 # _count must equal memtier_ops_total.
 # ---------------------------------------------------------------------------
 def test_F27_interrupt_run_end_counts_every_op(env):
+    import fcntl
     rd = _new_results_dir()
-    proc, out_path, err_path = _popen_memtier(
-        env,
-        ["--test-time=30", "-t", "4", "-c", "10", "--pipeline=16", "--ratio=1:1",
-         "--run-count=2", "--prometheus-port=0"],
-        rd,
-    )
-    run_end = None  # last (ops_total, latency_seconds_count) of run 1's run-end snapshot
+    fifo = os.path.join(rd, "results.fifo")
+    os.mkfifo(fifo)
+    # Open the read end first (non-blocking), so memtier's fopen() does not block.
+    rfd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+    proc = None
     try:
+        try:
+            fcntl.fcntl(rfd, getattr(fcntl, "F_SETPIPE_SZ", 1031), 4096)
+        except OSError:
+            env.skip()  # cannot shrink the pipe; results would not block
+            return
+        proc, out_path, err_path = _popen_memtier(
+            env,
+            ["--test-time=30", "-t", "4", "-c", "10", "--pipeline=16", "--ratio=1:1",
+             "--run-count=2", "--prometheus-port=0", "--out-file=" + fifo],
+            rd,
+        )
         url = wait_for_prometheus_url(out_path, timeout=20)
         env.assertFalse(url is None, message="no announce line")
         live = False
@@ -1436,12 +1447,9 @@ def test_F27_interrupt_run_end_counts_every_op(env):
         env.assertTrue(live, message="no live run-1 scrape: {}".format(_drain(err_path)))
         time.sleep(1.2)  # let the render cache expire; traffic stays in flight
         proc.send_signal(signal.SIGINT)
-        deadline = time.time() + 10
-        while "Interrupted by user" not in _drain(err_path) and time.time() < deadline:
-            time.sleep(0.01)
-        time.sleep(0.3)  # threads join and the run-end snapshot is published
-        deadline = time.time() + 60
-        while proc.poll() is None and time.time() < deadline:
+        run_end = None  # (ops_total, latency_seconds_count) of run 1's run-end snapshot
+        deadline = time.time() + 30
+        while run_end is None and proc.poll() is None and time.time() < deadline:
             r = prom_scrape(url, timeout=2)
             if r.status == 200:
                 p = prom_parse(r.body)
@@ -1452,12 +1460,22 @@ def test_F27_interrupt_run_end_counts_every_op(env):
                 if run == 1 and threads == 0 and ops is not None and count is not None:
                     run_end = (ops, count)
             time.sleep(0.02)
-        proc.wait(timeout=30)
-        if run_end is None:
-            env.skip()  # no render landed between the runs (slow runner)
-            return
-        ops, count = run_end
-        env.assertTrue(ops > 0, message="run 1 completed no ops")
-        env.assertEqual(count, ops, message="run-end _count {} != ops_total {}".format(count, ops))
+        env.assertTrue(run_end is not None,
+                       message="no run-end scrape (exit {}): {}".format(proc.poll(), _drain(err_path)))
+        # Unblock memtier: drain the results until it exits.
+        deadline = time.time() + 30
+        while proc.poll() is None and time.time() < deadline:
+            try:
+                if not os.read(rfd, 65536):
+                    time.sleep(0.01)
+            except BlockingIOError:
+                time.sleep(0.01)
+        env.assertEqual(proc.wait(timeout=10), 0, message=_drain(err_path))
+        if run_end is not None:
+            ops, count = run_end
+            env.assertTrue(ops > 0, message="run 1 completed no ops")
+            env.assertEqual(count, ops, message="run-end _count {} != ops_total {}".format(count, ops))
     finally:
-        _kill(proc)
+        os.close(rfd)
+        if proc is not None:
+            _kill(proc)
