@@ -1681,7 +1681,9 @@ def test_out_file_unwritable(env):
     main() used to print the fopen() error, run the whole benchmark and then
     write the results to a NULL FILE *, so memtier crashed with SIGSEGV. The
     run is time-bounded (60 s) so a regression shows up as a crash or timeout
-    rather than a quick exit; no benchmark thread may start.
+    rather than a quick exit; no benchmark thread may start. The check runs
+    before the --json-out-file is opened, so an existing JSON file is left
+    untouched.
     """
     benchmark_specs = {"name": env.testName,
                        "args": ['--out-file=/nonexistent-memtier-dir/mb.stdout', '--hide-histogram']}
@@ -1692,6 +1694,11 @@ def test_out_file_unwritable(env):
     config = RunConfig(test_dir, env.testName, config, {})
     ensure_clean_benchmark_folder(config.results_dir)
     benchmark = Benchmark.from_json(config, benchmark_specs)
+    json_path = os.path.join(config.results_dir, 'mb.json')
+    json_before = '{"previous": "run"}\n'
+    with open(json_path, 'w') as f:
+        f.write(json_before)
+    benchmark.args += ['--json-out-file', json_path]
 
     start = time.monotonic()
     process = subprocess.Popen(benchmark.args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -1703,6 +1710,9 @@ def test_out_file_unwritable(env):
     elapsed = time.monotonic() - start
     stderr = stderr.decode(errors='replace')
     env.assertEqual(process.returncode, 1, message=stderr)
-    env.assertContains("error: cannot open --out-file /nonexistent-memtier-dir/mb.stdout", stderr)
+    env.assertContains("error: cannot open --out-file /nonexistent-memtier-dir/mb.stdout: "
+                       "No such file or directory", stderr)
     env.assertNotContains("Launching threads", stderr)
     env.assertLess(elapsed, 20)
+    with open(json_path) as f:
+        env.assertEqual(f.read(), json_before)
