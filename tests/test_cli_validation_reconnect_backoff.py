@@ -11,9 +11,11 @@ Run with:
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import tempfile
+import time
 
 from include import (
     MEMTIER_BINARY,
@@ -164,7 +166,8 @@ def test_reconnect_backoff_fraction_has_delay_floor(env):
 
     Without a floor, factor 0.5 reaches "in 0.00 seconds" after 8 attempts
     and a dead server is reconnected in a tight loop. Every delay must stay
-    at or above the 0.1 s floor once the halving reaches it.
+    at or above the 0.1 s floor once the halving reaches it. Factor 0 keeps a
+    constant 1 s delay; any positive factor below 1 settles at 0.1 s.
     """
     env.skipOnCluster()
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -173,6 +176,7 @@ def test_reconnect_backoff_fraction_has_delay_floor(env):
     sock.close()
 
     attempts = 12
+    started = time.monotonic()
     result = subprocess.run(
         [
             MEMTIER_BINARY,
@@ -191,6 +195,7 @@ def test_reconnect_backoff_fraction_has_delay_floor(env):
         text=True,
         timeout=60,
     )
+    elapsed = time.monotonic() - started
     delays = [
         float(d)
         for d in re.findall(
@@ -202,3 +207,68 @@ def test_reconnect_backoff_fraction_has_delay_floor(env):
     env.assertGreaterEqual(min(delays), 0.1, message=repr(delays))
     env.assertEqual(delays[:3], [0.5, 0.25, 0.12], message=repr(delays))
     env.assertEqual(set(delays[3:]), {0.1}, message=repr(delays))
+    # The logged delays must also be the armed ones: 0.5 + 0.25 + 0.125 +
+    # 9 * 0.1 = ~1.78 s of timers before the attempts run out.
+    env.assertGreaterEqual(elapsed, 1.5, message="elapsed {:.2f}s, delays {!r}".format(elapsed, delays))
+
+
+def test_reconnect_backoff_fraction_floor_on_failed_reconnect(env):
+    """The retry path of a failed reconnect() must apply the floor too (#688).
+
+    A closed TCP port reports ECONNREFUSED from the event callback, so every
+    attempt goes through attempt_reconnect(). A unix socket whose server has
+    exited fails synchronously with ENOENT instead, which exercises the
+    "Reconnection attempt N failed, retrying in X seconds" path. SHUTDOWN
+    NOSAVE makes redis exit and unlink its socket.
+    """
+    env.skipOnCluster()
+    redis_server = os.environ.get("REDIS_SERVER") or shutil.which("redis-server")
+    if not hasattr(socket, "AF_UNIX") or not redis_server:
+        env.skip()
+        return
+
+    # RLTest log dirs can exceed the 108-byte sun_path limit; keep it short.
+    directory = tempfile.mkdtemp(prefix="m688.", dir="/tmp")
+    socket_path = os.path.join(directory, "s")
+    server = None
+    try:
+        server = subprocess.Popen(
+            [redis_server, "--port", "0", "--unixsocket", socket_path, "--save", "", "--dir", directory],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + 10
+        while not os.path.exists(socket_path) and server.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if not os.path.exists(socket_path):
+            env.skip()
+            return
+
+        attempts = 12
+        result = subprocess.run(
+            [
+                MEMTIER_BINARY,
+                "--unix-socket={}".format(socket_path),
+                "--threads=1",
+                "--clients=1",
+                "--command=SHUTDOWN NOSAVE",
+                "--reconnect-on-error",
+                "--reconnect-backoff-factor=0.5",
+                "--max-reconnect-attempts={}".format(attempts),
+                "--test-time=30",
+                "--hide-histogram",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        delays = [float(d) for d in re.findall(r"retrying in ([0-9.]+) seconds", result.stderr)]
+        env.assertGreaterEqual(len(delays), attempts - 2, message=result.stderr[-2000:])
+        env.assertGreaterEqual(min(delays or [0.0]), 0.1, message=repr(delays))
+        env.assertEqual(set(delays[2:]), {0.1}, message=repr(delays))
+    finally:
+        if server is not None and server.poll() is None:
+            server.kill()
+        if server is not None:
+            server.wait(timeout=10)
+        shutil.rmtree(directory, ignore_errors=True)
