@@ -3,6 +3,10 @@ import time
 import signal
 import subprocess
 import os
+import shlex
+import shutil
+import sys
+from pathlib import Path
 from include import *
 from mb import Benchmark, RunConfig
 
@@ -291,3 +295,93 @@ def test_crash_handler_worker_thread(env):
     # For RLTest compatibility - mark test as passed
     env.assertTrue(True)
 
+
+
+def test_crash_handler_time_zone_lock_held(env):
+    """
+    Issue #681: the crash handler called localtime(), which takes glibc's time
+    zone lock and on first use mallocs and opens /etc/localtime. A crash that
+    interrupted a thread holding one of those locks deadlocked the handler
+    before it printed anything, and alarm(5) then killed the process with no
+    report. An LD_PRELOAD shim makes the time zone functions block when they
+    are called from a signal handler, which reproduces that deadlock on every
+    run. The report must still be complete.
+    """
+    compiler = shlex.split(os.environ.get("CC", "cc"))
+    if (sys.platform != "linux" or not compiler or not shutil.which(compiler[0])
+            or not shutil.which("ldd")):
+        env.skip()
+        return
+    benchmark_specs = {"name": env.testName, "args": ['--pipeline=10']}
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=2, clients=2, requests=None, test_time=60)
+    add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+    with tempfile.TemporaryDirectory() as directory:
+        config = RunConfig(directory, env.testName, config, {})
+        ensure_clean_benchmark_folder(config.results_dir)
+        benchmark = Benchmark.from_json(config, benchmark_specs)
+        linked = subprocess.run(["ldd", benchmark.args[0]], capture_output=True, text=True, timeout=10)
+        if linked.returncode != 0:
+            env.skip()  # Static executables cannot use this interposition test.
+            return
+        library = Path(directory) / "tz_lock.so"
+        subprocess.run(compiler + ["-shared", "-fPIC",
+                                   str(Path(__file__).with_name("crash_handler_tz_lock_injector.c")),
+                                   "-o", str(library), "-ldl"],
+                       check=True, capture_output=True, timeout=30)
+        # Keep the sanitizer runtime first; its interceptors forward to the shim.
+        runtimes = [line.split()[2] for line in linked.stdout.splitlines()
+                    if line.strip().startswith(("libasan.so", "libtsan.so", "libubsan.so"))
+                    and "=>" in line and len(line.split()) >= 3]
+        preloads = runtimes + [str(library)]
+        if os.environ.get("LD_PRELOAD"):
+            preloads.append(os.environ["LD_PRELOAD"])
+        child_env = dict(os.environ, LD_PRELOAD=":".join(preloads))
+
+        log_file = os.path.join(config.results_dir, "crash_output.log")
+        with open(log_file, 'w') as f:
+            proc = subprocess.Popen(benchmark.args, stdout=f, stderr=subprocess.STDOUT, env=child_env)
+        try:
+            # Wait until the workers exist and have started sending traffic.
+            task_dir = f"/proc/{proc.pid}/task"
+            worker_tids = []
+            for _ in range(50):
+                if proc.poll() is not None:
+                    break
+                worker_tids = [int(t) for t in os.listdir(task_dir) if int(t) != proc.pid]
+                if worker_tids:
+                    break
+                time.sleep(0.1)
+            time.sleep(2)
+            env.assertIsNone(proc.poll(), message="memtier_benchmark exited before the SEGV")
+            env.assertTrue(len(worker_tids) > 0, message="no worker threads found")
+            print(f"Sending SEGV to worker thread TID {worker_tids[0]} (main PID: {proc.pid})")
+            os.kill(worker_tids[0], signal.SIGSEGV)
+            # A deadlocked handler is killed by its own alarm(5) watchdog.
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            env.assertTrue(False, message="Process did not exit after SEGV signal")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+        with open(log_file, 'r') as f:
+            crash_output = f.read()
+        print(crash_output[crash_output.find("=== MEMTIER_BENCHMARK BUG REPORT"):])
+
+        # The process must end by the crash signal, not by the SIGALRM watchdog.
+        env.assertEqual(proc.returncode, -signal.SIGSEGV,
+                        message=f"exit status {proc.returncode}; -{int(signal.SIGALRM)} means the watchdog killed a stuck handler")
+        markers = ("=== MEMTIER_BENCHMARK BUG REPORT START",
+                   "memtier_benchmark crashed by signal: 11",
+                   "Crashed running signal <SIGSEGV>",
+                   "current/crashing thread",
+                   "INFO OUTPUT",
+                   "CLIENT LIST OUTPUT",
+                   "=== MEMTIER_BENCHMARK BUG REPORT END")
+        missing = [m for m in markers if m not in crash_output]
+        env.assertEqual(missing, [], message="crash report incomplete")
+        env.assertNotContains("BUG REPORT INCOMPLETE", crash_output)

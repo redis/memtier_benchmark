@@ -436,31 +436,151 @@ static const char *interrupt_source(void)
     return g_interrupted == SIGTERM ? "SIGTERM" : "user (Ctrl+C)";
 }
 
+// Offset of local time from UTC, in seconds, taken once at startup by
+// prewarm_crash_handler(). The crash handler cannot call localtime(): the
+// first call loads the time zone (malloc, fopen) and every call takes glibc's
+// time zone lock, so a crash that interrupts a thread holding the malloc or
+// time zone lock deadlocked the handler before it printed anything, until
+// alarm(5) killed the process silently (#681). A DST change during the run
+// makes the crash timestamp off by the DST shift; that is acceptable.
+static long g_crash_utc_offset = 0;
+
+static const char *const crash_month_names[12] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+
+// A fixed-size line buffer the crash handler formats into and writes to
+// stderr with write(2). Only async-signal-safe operations: no stdio, no
+// malloc, no locale. Output that does not fit is truncated.
+struct crash_line
+{
+    char buf[256];
+    size_t len;
+    crash_line() : len(0) {}
+    void str(const char *s)
+    {
+        while (s != NULL && *s != '\0' && len < sizeof(buf))
+            buf[len++] = *s++;
+    }
+    void num(unsigned long long v, unsigned int base, int min_digits)
+    {
+        char tmp[32];
+        int n = 0;
+        do {
+            tmp[n++] = "0123456789abcdef"[v % base];
+            v /= base;
+        } while (v != 0 && n < (int) sizeof(tmp));
+        while (n < min_digits && n < (int) sizeof(tmp))
+            tmp[n++] = '0';
+        while (n > 0 && len < sizeof(buf))
+            buf[len++] = tmp[--n];
+    }
+    void num(long long v)
+    {
+        if (v < 0) {
+            str("-");
+            num(0ULL - (unsigned long long) v, 10, 1);
+        } else {
+            num((unsigned long long) v, 10, 1);
+        }
+    }
+    void write_out(void)
+    {
+        size_t off = 0;
+        while (off < len) {
+            ssize_t n = write(STDERR_FILENO, buf + off, len - off);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) break;
+            off += (size_t) n;
+        }
+        len = 0;
+    }
+};
+
+// Format now + g_crash_utc_offset as "%d %b %Y %H:%M:%S" (the format the
+// report has always used) with integer arithmetic only. The date math is
+// Howard Hinnant's civil_from_days.
+static void format_crash_time(char *out, size_t out_len)
+{
+    long long t = (long long) time(NULL) + g_crash_utc_offset;
+    long long days = t / 86400;
+    long long secs = t % 86400;
+    if (secs < 0) {
+        secs += 86400;
+        days -= 1;
+    }
+    long long z = days + 719468;
+    long long era = (z >= 0 ? z : z - 146096) / 146097;
+    long long doe = z - era * 146097;
+    long long yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    long long doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    long long mp = (5 * doy + 2) / 153;
+    long long day = doy - (153 * mp + 2) / 5 + 1;
+    long long month = mp < 10 ? mp + 3 : mp - 9;
+    long long year = yoe + era * 400 + (month <= 2 ? 1 : 0);
+
+    crash_line l;
+    l.num((unsigned long long) day, 10, 2);
+    l.str(" ");
+    l.str(crash_month_names[month - 1]);
+    l.str(" ");
+    l.num(year);
+    l.str(" ");
+    l.num((unsigned long long) (secs / 3600), 10, 2);
+    l.str(":");
+    l.num((unsigned long long) (secs / 60 % 60), 10, 2);
+    l.str(":");
+    l.num((unsigned long long) (secs % 60), 10, 2);
+    size_t n = l.len < out_len - 1 ? l.len : out_len - 1;
+    memcpy(out, l.buf, n);
+    out[n] = '\0';
+}
+
+// Begin a report line: "[pid] timestr # ".
+static void crash_line_prefix(crash_line &l, int pid, const char *timestr)
+{
+    l.str("[");
+    l.num((long long) pid);
+    l.str("] ");
+    l.str(timestr);
+    l.str(" # ");
+}
+
+// SIGALRM handler armed by crash_handler(): say why the report stops, then
+// end the process with the default SIGALRM action as before.
+static void crash_watchdog_handler(int sig)
+{
+    crash_line l;
+    l.str("\n=== MEMTIER_BENCHMARK BUG REPORT INCOMPLETE: crash handler timed out after 5 seconds ===\n");
+    l.write_out();
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
 // Crash handler - prints stack trace and other debugging information
 static void crash_handler(int sig, siginfo_t *info, void *secret)
 {
     (void) secret; // unused parameter
-    struct tm *tm;
-    time_t now;
     char timestr[64];
+    int pid = getpid();
 
     // Watchdog: if the handler itself hangs (e.g. mid-print_client_list while
     // iterating a torn vector under heap corruption), the process is killed
     // after 5 s instead of leaving a half-written report indefinitely. The
     // original signal will be re-raised on a fresh sigaction below, but if
-    // we never get there, SIGALRM provides the floor.
+    // we never get there, SIGALRM provides the floor. The watchdog first
+    // writes a line saying the report is incomplete.
+    struct sigaction alarm_act;
+    sigemptyset(&alarm_act.sa_mask);
+    alarm_act.sa_flags = SA_ONSTACK;
+    alarm_act.sa_handler = crash_watchdog_handler;
+    sigaction(SIGALRM, &alarm_act, NULL);
     alarm(5);
 
-    // Get current time
-    now = time(NULL);
-    tm = localtime(&now);
-    strftime(timestr, sizeof(timestr), "%d %b %Y %H:%M:%S", tm);
+    // The header and signal details use only async-signal-safe calls
+    // (time, getpid, write), so they reach stderr even when the crash
+    // interrupted a thread holding the malloc, stdio or time zone lock.
+    format_crash_time(timestr, sizeof(timestr));
 
-    // Print crash header
-    fprintf(stderr, "\n\n=== MEMTIER_BENCHMARK BUG REPORT START: Cut & paste starting from here ===\n");
-    fprintf(stderr, "[%d] %s # memtier_benchmark crashed by signal: %d\n", getpid(), timestr, sig);
-
-    // Print signal information
     const char *signal_name = "UNKNOWN";
     switch (sig) {
     case SIGSEGV:
@@ -479,57 +599,93 @@ static void crash_handler(int sig, siginfo_t *info, void *secret)
         signal_name = "SIGABRT";
         break;
     }
-    fprintf(stderr, "[%d] %s # Crashed running signal <%s>\n", getpid(), timestr, signal_name);
 
+    crash_line l;
+    l.str("\n\n=== MEMTIER_BENCHMARK BUG REPORT START: Cut & paste starting from here ===\n");
+    l.write_out();
+    crash_line_prefix(l, pid, timestr);
+    l.str("memtier_benchmark crashed by signal: ");
+    l.num((long long) sig);
+    l.str("\n");
+    l.write_out();
+    crash_line_prefix(l, pid, timestr);
+    l.str("Crashed running signal <");
+    l.str(signal_name);
+    l.str(">\n");
+    l.write_out();
     if (info) {
-        fprintf(stderr, "[%d] %s # Signal code: %d\n", getpid(), timestr, info->si_code);
-        fprintf(stderr, "[%d] %s # Fault address: %p\n", getpid(), timestr, info->si_addr);
+        crash_line_prefix(l, pid, timestr);
+        l.str("Signal code: ");
+        l.num((long long) info->si_code);
+        l.str("\n");
+        l.write_out();
+        crash_line_prefix(l, pid, timestr);
+        l.str("Fault address: ");
+        if (info->si_addr == NULL) {
+            l.str("(nil)");
+        } else {
+            l.str("0x");
+            l.num((unsigned long long) (uintptr_t) info->si_addr, 16, 1);
+        }
+        l.str("\n");
+        l.write_out();
     }
 
+    // Everything below is best effort and is NOT async-signal-safe; it comes
+    // after the essential lines above so a hang here still leaves them, and
+    // the watchdog ends a hang after 5 s:
+    // - backtrace() can take the loader lock (dl_iterate_phdr) while
+    //   unwinding; its first-use malloc/dlopen is done by prewarm.
+    // - fprintf(stderr) takes the stderr FILE lock. It is recursive, so it
+    //   only blocks while another thread is inside a stderr call.
+    // - print_client_list() reads the worker's client and connection
+    //   vectors without synchronization; a torn vector can fault or hang.
+    // uname(), getpid(), sigaction() and raise() are async-signal-safe, and
+    // event_get_version() only returns a constant string.
+
     // Print stack trace for all threads
-    print_all_threads_stack_trace(stderr, getpid(), timestr);
+    print_all_threads_stack_trace(stderr, pid, timestr);
 
     // Print system information
-    fprintf(stderr, "\n[%d] %s # --- INFO OUTPUT\n", getpid(), timestr);
+    fprintf(stderr, "\n[%d] %s # --- INFO OUTPUT\n", pid, timestr);
 
     struct utsname name;
     if (uname(&name) == 0) {
-        fprintf(stderr, "[%d] %s # os:%s %s %s\n", getpid(), timestr, name.sysname, name.release, name.machine);
+        fprintf(stderr, "[%d] %s # os:%s %s %s\n", pid, timestr, name.sysname, name.release, name.machine);
     }
 
-    fprintf(stderr, "[%d] %s # memtier_version:%s\n", getpid(), timestr, PACKAGE_VERSION);
-    fprintf(stderr, "[%d] %s # memtier_git_sha1:%s\n", getpid(), timestr, MEMTIER_GIT_SHA1);
-    fprintf(stderr, "[%d] %s # memtier_git_dirty:%s\n", getpid(), timestr, MEMTIER_GIT_DIRTY);
+    fprintf(stderr, "[%d] %s # memtier_version:%s\n", pid, timestr, PACKAGE_VERSION);
+    fprintf(stderr, "[%d] %s # memtier_git_sha1:%s\n", pid, timestr, MEMTIER_GIT_SHA1);
+    fprintf(stderr, "[%d] %s # memtier_git_dirty:%s\n", pid, timestr, MEMTIER_GIT_DIRTY);
 
 #if defined(__x86_64__) || defined(_M_X64)
-    fprintf(stderr, "[%d] %s # arch_bits:64\n", getpid(), timestr);
+    fprintf(stderr, "[%d] %s # arch_bits:64\n", pid, timestr);
 #elif defined(__i386__) || defined(_M_IX86)
-    fprintf(stderr, "[%d] %s # arch_bits:32\n", getpid(), timestr);
+    fprintf(stderr, "[%d] %s # arch_bits:32\n", pid, timestr);
 #elif defined(__aarch64__)
-    fprintf(stderr, "[%d] %s # arch_bits:64\n", getpid(), timestr);
+    fprintf(stderr, "[%d] %s # arch_bits:64\n", pid, timestr);
 #elif defined(__arm__)
-    fprintf(stderr, "[%d] %s # arch_bits:32\n", getpid(), timestr);
+    fprintf(stderr, "[%d] %s # arch_bits:32\n", pid, timestr);
 #else
-    fprintf(stderr, "[%d] %s # arch_bits:unknown\n", getpid(), timestr);
+    fprintf(stderr, "[%d] %s # arch_bits:unknown\n", pid, timestr);
 #endif
 
 #ifdef __GNUC__
-    fprintf(stderr, "[%d] %s # gcc_version:%d.%d.%d\n", getpid(), timestr, __GNUC__, __GNUC_MINOR__,
-            __GNUC_PATCHLEVEL__);
+    fprintf(stderr, "[%d] %s # gcc_version:%d.%d.%d\n", pid, timestr, __GNUC__, __GNUC_MINOR__, __GNUC_PATCHLEVEL__);
 #endif
 
-    fprintf(stderr, "[%d] %s # libevent_version:%s\n", getpid(), timestr, event_get_version());
+    fprintf(stderr, "[%d] %s # libevent_version:%s\n", pid, timestr, event_get_version());
 
 #ifdef USE_TLS
-    fprintf(stderr, "[%d] %s # openssl_version:%s\n", getpid(), timestr, OPENSSL_VERSION_TEXT);
+    fprintf(stderr, "[%d] %s # openssl_version:%s\n", pid, timestr, OPENSSL_VERSION_TEXT);
 #endif
 
     // Print client connection information
-    print_client_list(stderr, getpid(), timestr);
+    print_client_list(stderr, pid, timestr);
 
-    fprintf(stderr, "[%d] %s # For more information, please check the core dump if available.\n", getpid(), timestr);
-    fprintf(stderr, "[%d] %s # To enable core dumps: ulimit -c unlimited\n", getpid(), timestr);
-    fprintf(stderr, "[%d] %s # Core pattern: /proc/sys/kernel/core_pattern\n", getpid(), timestr);
+    fprintf(stderr, "[%d] %s # For more information, please check the core dump if available.\n", pid, timestr);
+    fprintf(stderr, "[%d] %s # To enable core dumps: ulimit -c unlimited\n", pid, timestr);
+    fprintf(stderr, "[%d] %s # Core pattern: /proc/sys/kernel/core_pattern\n", pid, timestr);
 
     fprintf(stderr, "\n=== MEMTIER_BENCHMARK BUG REPORT END. Make sure to include from START to END. ===\n\n");
     fprintf(stderr, "       Please report this bug by opening an issue on github.com/redis/memtier_benchmark\n\n");
@@ -566,6 +722,21 @@ static void prewarm_crash_handler(void)
     fflush(stderr);
     // Resolve event_get_version too — used in the INFO section.
     (void) event_get_version();
+
+    // The handler formats its timestamp by hand from this offset; see
+    // g_crash_utc_offset. tm_gmtoff is not in POSIX, so derive the offset
+    // from the local and UTC broken-down forms of the same instant.
+    time_t now = time(NULL);
+    struct tm lt, gt;
+    if (localtime_r(&now, &lt) != NULL && gmtime_r(&now, &gt) != NULL) {
+        long off = (lt.tm_hour - gt.tm_hour) * 3600L + (lt.tm_min - gt.tm_min) * 60L + (lt.tm_sec - gt.tm_sec);
+        if (lt.tm_year != gt.tm_year) {
+            off += (lt.tm_year > gt.tm_year ? 1 : -1) * 86400L;
+        } else {
+            off += (lt.tm_yday - gt.tm_yday) * 86400L;
+        }
+        g_crash_utc_offset = off;
+    }
 }
 
 // Setup crash handlers
