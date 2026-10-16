@@ -434,6 +434,45 @@ get_key_response client::get_key_for_conn(unsigned int command_index, unsigned i
     return available_for_conn;
 }
 
+// --monitor-input "__monitor_line@__": replace __key__ (keeping any text
+// around it, e.g. {tag}__key__ or user:__key__, as the --command path does)
+// and a bare __data__ with a generated key and value. Call it after
+// split_command_to_args() and before format_arbitrary_command(), so every
+// argument is a constant: the monitor send loops (here and in cluster_client)
+// only write constant arguments, and cluster mode can route by the key that
+// is actually sent.
+void client::resolve_monitor_placeholders(arbitrary_command &cmd, unsigned int command_index, unsigned int conn_id)
+{
+    const size_t key_ph_len = strlen(KEY_PLACEHOLDER);
+    // Argument 0 is the command name.
+    for (size_t i = 1; i < cmd.command_args.size(); i++) {
+        std::string &data = cmd.command_args[i].data;
+        size_t pos = data.find(KEY_PLACEHOLDER);
+        if (pos != std::string::npos) {
+            unsigned long long key_index;
+            // Base-class lookup: cluster_client routes by the resolved key
+            // afterwards, so its per-shard key pool must not be used here.
+            get_key_response res = client::get_key_for_conn(command_index, conn_id, &key_index);
+            assert(res == available_for_conn);
+            (void) res;
+            const char *key = m_obj_gen->get_key();
+            unsigned int key_len = m_obj_gen->get_key_len();
+            // Replace every occurrence: one left behind would be re-parsed as
+            // a key argument by format_arbitrary_command() and never sent.
+            while (pos != std::string::npos) {
+                data.replace(pos, key_ph_len, key, key_len);
+                pos = data.find(KEY_PLACEHOLDER, pos + key_len);
+            }
+        } else if (data == DATA_PLACEHOLDER) {
+            unsigned int value_len;
+            const char *value = m_obj_gen->get_value(0, &value_len);
+            assert(value != NULL);
+            assert(value_len > 0);
+            data.assign(value, value_len);
+        }
+    }
+}
+
 bool client::create_arbitrary_request(unsigned int command_index, struct timeval &timestamp, unsigned int conn_id)
 {
     int cmd_size = 0;
@@ -471,6 +510,8 @@ bool client::create_arbitrary_request(unsigned int command_index, struct timeval
             return true; // Skip this command but continue processing
         }
 
+        resolve_monitor_placeholders(temp_cmd, command_index, conn_id);
+
         // Format the command for the protocol (adds RESP headers)
         if (!m_connections[conn_id]->get_protocol()->format_arbitrary_command(temp_cmd)) {
             fprintf(stderr, "warning: skipping unformattable monitor command at line %zu: %s\n", selected_index + 1,
@@ -483,18 +524,6 @@ bool client::create_arbitrary_request(unsigned int command_index, struct timeval
             const command_arg *arg = &temp_cmd.command_args[i];
             if (arg->type == const_type) {
                 cmd_size += m_connections[conn_id]->send_arbitrary_command(arg);
-            } else if (arg->type == key_type) {
-                unsigned long long key_index;
-                get_key_response res = get_key_for_conn(command_index, conn_id, &key_index);
-                assert(res == available_for_conn);
-                cmd_size +=
-                    m_connections[conn_id]->send_arbitrary_command(arg, m_obj_gen->get_key(), m_obj_gen->get_key_len());
-            } else if (arg->type == data_type) {
-                unsigned int value_len;
-                const char *value = m_obj_gen->get_value(0, &value_len);
-                assert(value != NULL);
-                assert(value_len > 0);
-                cmd_size += m_connections[conn_id]->send_arbitrary_command(arg, value, value_len);
             }
         }
 

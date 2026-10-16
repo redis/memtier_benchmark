@@ -2653,6 +2653,10 @@ bool cluster_client::create_monitor_request_cluster(unsigned int command_index, 
         return false;
     }
 
+    // Fill in __key__ / __data__ now, so the slot below comes from the key
+    // that is sent and the (possibly staged) command has only constant args.
+    resolve_monitor_placeholders(temp_cmd, command_index, conn_id);
+
     // Determine target shard from the first key argument (index 1 = first arg after command name).
     // Fall back to the current connection if topology isn't ready yet or there is no key.
     //

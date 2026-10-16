@@ -1296,3 +1296,69 @@ def test_monitor_input_large_line_no_stack_overflow(env):
     env.assertTrue(found,
                    message="SET with 16 MiB value did not land in redis "
                            "- memtier may have crashed before sending it")
+
+
+def test_monitor_input_random_line_key_affixes_and_data(env):
+    """
+    Regression test for #655: a __monitor_line@__ line keeps the text around
+    __key__ (user:__key__, {tag}__key__:x) and fills __data__, the same way
+    the --command path (and __monitor_lineN__) does.
+
+    Before the fix the @ send loop wrote only the generated key, so the keys
+    landed as bare memtier-NNN.
+    """
+    env.skipOnCluster()
+
+    test_dir = tempfile.mkdtemp()
+    monitor_file = os.path.join(test_dir, "monitor_affixes.txt")
+    with open(monitor_file, "w") as f:
+        f.write('[ proxy ] 1764031576.604009 [0 127.0.0.1:5000] "SET" "user:__key__" "v"\n')
+        f.write('[ proxy ] 1764031576.604010 [0 127.0.0.1:5000] "SET" "{tag}__key__:x" "__data__"\n')
+
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--monitor-input={}".format(monitor_file),
+            "--command=__monitor_line@__",
+            "--monitor-pattern=S",
+            "--key-prefix=mon-",
+            "--key-maximum=100",
+            "--data-size=20",
+            "--hide-histogram",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+
+    config = get_default_memtier_config(threads=1, clients=1, requests=40)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+
+    master_nodes_connections = env.getOSSMasterNodesConnectionList()
+    for conn in master_nodes_connections:
+        conn.execute_command("FLUSHALL")
+
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    memtier_ok = benchmark.run(timeout=60)
+
+    debugPrintMemtierOnError(config, env)
+    env.assertTrue(memtier_ok == True)
+
+    keys = []
+    for conn in master_nodes_connections:
+        keys.extend(k.decode() for k in conn.execute_command("KEYS", "*"))
+    user_keys = [k for k in keys if k.startswith("user:mon-")]
+    tag_keys = [k for k in keys if k.startswith("{tag}mon-") and k.endswith(":x")]
+    env.assertTrue(len(user_keys) > 0, message="no user:mon-* keys; keys: {}".format(keys[:10]))
+    env.assertTrue(len(tag_keys) > 0, message="no {{tag}}mon-*:x keys; keys: {}".format(keys[:10]))
+    env.assertEqual(len(keys), len(user_keys) + len(tag_keys),
+                    message="keys without their affixes: {}".format(
+                        [k for k in keys if k not in user_keys and k not in tag_keys][:10]))
+    conn = master_nodes_connections[0]
+    if user_keys:
+        env.assertEqual(conn.execute_command("GET", user_keys[0]), b"v")
+    if tag_keys:
+        # __data__ is replaced by a generated --data-size value.
+        env.assertEqual(len(conn.execute_command("GET", tag_keys[0])), 20)

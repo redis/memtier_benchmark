@@ -116,7 +116,7 @@ def _require_multi_shard(env):
 
 
 def _run_monitor_cluster(env, monitor_file, command, monitor_pattern=None,
-                         threads=2, clients=4, requests=200, extra=None):
+                         threads=2, clients=4, requests=200, extra=None, timeout=240):
     """Run a monitor-input cluster workload; return (ok, run_config, json_dict)."""
     args = [
         "--monitor-input={}".format(monitor_file),
@@ -139,7 +139,7 @@ def _run_monitor_cluster(env, monitor_file, command, monitor_pattern=None,
     ensure_clean_benchmark_folder(run_config.results_dir)
 
     benchmark = Benchmark.from_json(run_config, benchmark_specs)
-    ok = benchmark.run()
+    ok = benchmark.run(timeout=timeout)
     # Note: callers print mb output via debugPrintMemtierOnError in their own
     # finally-on-failure blocks, so we don't print here (avoids double output).
 
@@ -300,6 +300,83 @@ def test_monitor_cluster_random_distributes_and_attributes_stats(env):
         _total, shards = _dbsize_total_and_shards(env)
         env.assertTrue(shards >= 2,
                        message="SET data reached only {} shard(s) — cross-shard routing not exercised".format(shards))
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+# ---------------------------------------------------------------------------
+# 4. __key__ / __data__ placeholders in a staged (__monitor_line@__) line
+# ---------------------------------------------------------------------------
+
+def _all_keys_by_port(env):
+    """{master_port: [keys]} across the cluster."""
+    out = {}
+    for conn in _master_conns(env):
+        port = int(conn.connection_pool.connection_kwargs["port"])
+        out[port] = [k.decode() for k in conn.execute_command("KEYS", "*")]
+    return out
+
+
+def test_monitor_cluster_line_placeholders_routed_by_full_key(env):
+    """Regression test for #654: a __monitor_line@__ line with __key__ (with
+    text around it) or __data__ must send every argument, and be routed by
+    the key actually sent (prefix + generated key + suffix).
+
+    Before the fix the cluster monitor send loops wrote only constant
+    arguments, so the RESP command was one argument short of its *N header,
+    the server never replied and the run hung."""
+    if not env.isCluster():
+        env.skip()
+        return
+    if not _require_multi_shard(env):
+        return
+
+    _flush_cluster(env)
+    test_dir = tempfile.mkdtemp()
+    lines = [
+        '[ proxy ] 1764031576.604009 [0 127.0.0.1:5000] "SET" "user:__key__" "v"',
+        '[ proxy ] 1764031576.604010 [0 127.0.0.1:5000] "SET" "{mtag}__key__" "__data__"',
+    ]
+    monitor_file = _write_monitor_file(test_dir, lines)
+
+    requests = 60
+    ok, run_config, js = _run_monitor_cluster(
+        env, monitor_file, "__monitor_line@__", monitor_pattern="S",
+        threads=1, clients=2, requests=requests,
+        extra=["--key-prefix=mon-", "--key-maximum=200", "--data-size=20"],
+        timeout=60)
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="monitor-cluster run with key/data placeholders did not complete")
+        by_port = _all_keys_by_port(env)
+        user_keys = []
+        tag_keys = []
+        for port, keys in by_port.items():
+            for k in keys:
+                # Every key must sit on the shard that owns the full key's slot.
+                env.assertEqual(_owning_port(env, k), port,
+                                message="{} stored on {} but owned by {}".format(k, port, _owning_port(env, k)))
+                if k.startswith("user:mon-"):
+                    user_keys.append(k)
+                elif k.startswith("{mtag}mon-"):
+                    tag_keys.append(k)
+                else:
+                    env.assertTrue(False, message="unexpected key {!r} (affixes dropped?)".format(k))
+        env.assertTrue(len(user_keys) > 0, message="no user:mon-* keys written")
+        env.assertTrue(len(tag_keys) > 0, message="no {mtag}mon-* keys written")
+        # user:__key__ keys hash across the cluster, so routing by the full
+        # key must spread them over more than one shard.
+        user_ports = set(p for p, keys in by_port.items() for k in keys if k.startswith("user:"))
+        env.assertTrue(len(user_ports) >= 2,
+                       message="user:mon-* keys on only {} shard(s)".format(len(user_ports)))
+        owner = _conn_for_port(env, _owning_port(env, tag_keys[0])) if tag_keys else None
+        if owner is not None:
+            # __data__ is replaced by a generated --data-size value.
+            env.assertEqual(len(owner.execute_command("GET", tag_keys[0])), 20)
+        sets_count = js.get("ALL STATS", {}).get("Sets", {}).get("Count", 0)
+        env.assertEqual(sets_count, requests * 2, message="Sets count {} != {}".format(sets_count, requests * 2))
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)

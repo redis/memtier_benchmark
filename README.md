@@ -153,7 +153,7 @@ You can replay real command streams by pointing memtier_benchmark to a monitor l
 $ memtier_benchmark --monitor-input=monitor.txt --command=__monitor_line1__
 ```
 
-This lets you mix synthetic workloads with realistic captured traffic. Note that monitor input is only supported in single endpoint mode (not cluster mode).
+This lets you mix synthetic workloads with realistic captured traffic. Monitor input works in both single endpoint and cluster mode (`--cluster-mode`); in cluster mode each command is sent to the shard that owns its first argument's key. Monitor lines may use the `__key__` and `__data__` placeholders, and text around `__key__` (for example `user:__key__` or `{tag}__key__`) is kept.
 
 When the number of requested operations exceeds the number of commands in the monitor file, commands are reused:
 - **Sequential mode** (`--monitor-pattern=S`): Commands wrap around and replay in order. For example, with 10K commands and 1M operations, the commands replay 100 times (0, 1, 2, ..., 9999, 0, 1, 2, ...).
