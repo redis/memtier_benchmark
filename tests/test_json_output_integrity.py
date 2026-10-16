@@ -63,6 +63,11 @@ def _latency_bounds(derived, count):
     exact multiples of 0.001 ms and at most (count-1)/(1000*count) ms low.
     The static floor covers both. Keeping this side tight is what catches an
     average truncated to an integer, for low counts too.
+
+    AGGREGATED AVERAGE RESULTS is the exception: its averages are unweighted
+    means of the per-run averages, while Count and Accumulated are sums, so
+    the invariant holds there only when every run has the same count (as with
+    --requests). See #671.
     """
     below = max(ABS_TOLERANCE_MS, REL_TOLERANCE * derived)
     return below, max(below, 1.0 / count + AVG_PRINT_ROUNDING_MS)
