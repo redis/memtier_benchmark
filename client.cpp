@@ -1303,16 +1303,25 @@ void client_group::run(void)
     event_base_dispatch(m_base);
 
     // The loop can end while requests are still held for resend: a
-    // connection that ran out of reconnect attempts ends the whole thread,
-    // and the other connections on it may hold requests they moved to their
-    // replay queues on the same outage. Nothing resends them now; count
-    // them as errors instead of freeing them silently with the connections.
-    // A run that ended normally has already emptied them (disconnect_all()).
+    // connection that lost its server for good (no --reconnect-on-error, or
+    // out of reconnect attempts) ends the whole thread. The other
+    // connections on it may have moved their in-flight requests to their
+    // replay queues on the same outage, or still have them in flight, their
+    // own EOF not handled yet. Nothing resends them now; count them as
+    // errors instead of freeing them silently with the connections. A run
+    // that ended normally has already emptied them (disconnect_all()). On
+    // Ctrl+C, requests still in flight are dropped as before.
+    const bool interrupted = !m_clients.empty() && m_clients[0]->get_stats()->get_interrupted();
     unsigned long long abandoned = 0;
     for (unsigned int i = 0; i < m_clients.size(); i++) {
         std::vector<shard_connection *> &conns = m_clients[i]->get_connections();
         for (unsigned int j = 0; j < conns.size(); j++) {
-            if (conns[j] != NULL) abandoned += conns[j]->abandon_replay_requests("thread-ended-before-resend");
+            shard_connection *sc = conns[j];
+            if (sc == NULL) continue;
+            // Moves the requests still in flight to the replay queue.
+            if (m_config->retry_on_error && !interrupted && sc->get_pending_resp() > 0) sc->disconnect();
+            const char *reason = sc->get_thread_end_reason();
+            abandoned += sc->abandon_replay_requests(reason ? reason : "thread-ended-before-resend");
         }
     }
     if (abandoned) {

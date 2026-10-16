@@ -263,6 +263,7 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_reconnect_timer(NULL),
         m_reconnecting(false),
         m_setup_rejected(false),
+        m_thread_end_reason(NULL),
         m_connection_timeout_timer(NULL),
         m_retry_queue(NULL),
         m_replay_queue(NULL),
@@ -1049,16 +1050,6 @@ unsigned long long shard_connection::abandon_replay_requests(const char *reason)
     }
     if (abandoned) m_conns_manager->abandon_requests(abandoned);
     return abandoned;
-}
-
-void shard_connection::abandon_held_requests_on_thread_end(const char *reason)
-{
-    unsigned long long abandoned = abandon_replay_requests(reason);
-    if (abandoned) {
-        benchmark_error_log("warning: %llu request(s) held for resend on conn %u were not resent (%s); "
-                            "counted as errors.\n",
-                            abandoned, m_id, reason);
-    }
 }
 
 void shard_connection::adopt_replay_request(request *req)
@@ -1886,11 +1877,11 @@ void shard_connection::attempt_reconnect(const char *error_context)
         benchmark_error_log("Maximum reconnection attempts (%u) exceeded for %s, ending this thread.\n",
                             m_config->max_reconnect_attempts, error_context);
         disconnect();
-        // Nothing will resend the requests held for it now. The requests
-        // held by the other connections on this thread are abandoned by
-        // client_group::run() once the loop returns.
-        abandon_held_requests_on_thread_end(m_config->reconnect_on_error ? "max-reconnect-attempts-exceeded"
-                                                                         : "connection-lost-no-reconnect");
+        // Nothing will resend the requests held for it now: client_group::run()
+        // abandons them, and those of the other connections on this thread,
+        // once the loop returns.
+        set_thread_end_reason(m_config->reconnect_on_error ? "max-reconnect-attempts-exceeded"
+                                                           : "connection-lost-no-reconnect");
         // Break the event loop: the thread ends and run_benchmark() fails the
         // run. It is not restarted.
         event_base_loopbreak(m_event_base);
@@ -1992,7 +1983,8 @@ void shard_connection::handle_reconnect_timer_event()
             }
             benchmark_error_log("Maximum reconnection attempts (%u) exceeded, ending this thread.\n",
                                 m_config->max_reconnect_attempts);
-            abandon_held_requests_on_thread_end("max-reconnect-attempts-exceeded");
+            // Only armed by attempt_reconnect() under --reconnect-on-error.
+            set_thread_end_reason("max-reconnect-attempts-exceeded");
             // Break the event loop: the thread ends and run_benchmark() fails
             // the run. It is not restarted. No state reset needed here: the
             // thread is finished and the shard_connection object destroyed

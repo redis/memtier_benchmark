@@ -1122,17 +1122,14 @@ def test_replays_abandoned_when_reconnects_run_out_are_counted(env):
         env.assertEqual(int(totals[-1]), len(rows), message=result.stderr)
 
 
-def test_replays_held_by_sibling_clients_are_counted_when_thread_ends(env):
+def _run_against_peer_that_drops_clients(env, clients, pipeline, close_all, extra_args):
     """
-    When one connection runs out of reconnect attempts it ends the whole
-    thread. The other clients on that thread hold the requests they had in
-    flight on the same outage; they are logged and counted as errors too.
-
-    The peer accepts every client, stops listening, then closes every
-    connection with its pipeline in flight. Only the requests of the
-    connection that ran out were counted: the siblings' were freed silently.
+    Run memtier with --retry-on-error against a peer that accepts every
+    client, stops listening (so reconnects are refused), waits for each
+    client's whole pipeline and then closes every connection (close_all) or
+    only the first one, leaving the others open and unanswered. Returns the
+    result and the --failed-keys-file rows.
     """
-    clients, pipeline = 4, 16
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     listener.listen(clients)
@@ -1153,6 +1150,13 @@ def test_replays_held_by_sibling_clients_are_counted_when_thread_ends(env):
                     if not data:
                         break
                     buf += data
+            if not close_all:
+                conns[0].close()
+                for conn in conns[1:]:
+                    try:
+                        conn.recv(65536)  # until memtier closes it
+                    except OSError:
+                        pass
         finally:
             listener.close()
             for conn in conns:
@@ -1165,20 +1169,66 @@ def test_replays_held_by_sibling_clients_are_counted_when_thread_ends(env):
         args = [MEMTIER_BINARY, "--server=127.0.0.1", "--port={}".format(port), "--threads=1",
                 "--clients={}".format(clients), "--pipeline={}".format(pipeline), "--requests=200",
                 "--ratio=1:0", "--key-minimum=1", "--key-maximum=1000", "--hide-histogram", "--retry-on-error",
-                "--reconnect-on-error", "--max-reconnect-attempts=1", "--failed-keys-file=" + failed_keys]
+                "--failed-keys-file=" + failed_keys] + extra_args
         result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, text=True)
         thread.join(timeout=15)
         with open(failed_keys) as source:
             rows = list(csv.reader(source))[1:]
+    return result, rows
 
+
+def _assert_every_request_counted(env, result, rows, expected, reasons):
     env.assertNotEqual(result.returncode, 0, message=result.stderr)
     env.assertContains("ending this thread", result.stderr)
     # Every request of every client was in flight and none got a reply.
-    env.assertEqual(len(rows), clients * pipeline, message=result.stderr[-2000:])
-    reasons = set(row[3] for row in rows)
-    env.assertEqual(reasons - {"max-reconnect-attempts-exceeded", "thread-ended-before-resend"}, set(),
-                    message=str(reasons))
+    env.assertEqual(len(rows), expected, message=result.stderr[-2000:])
+    got = set(row[3] for row in rows)
+    env.assertEqual(got - reasons, set(), message=str(got))
     totals = re.findall(r"errors (\d+) \(", result.stderr)
     env.assertTrue(totals, message=result.stderr)
     if totals:
         env.assertEqual(int(totals[-1]), len(rows), message=result.stderr[-2000:])
+
+
+def test_replays_held_by_sibling_clients_are_counted_when_thread_ends(env):
+    """
+    When one connection runs out of reconnect attempts it ends the whole
+    thread. The other clients on that thread hold the requests they had in
+    flight on the same outage; they are logged and counted as errors too.
+
+    Only the requests of the connection that ran out were counted: the
+    siblings' were freed silently.
+    """
+    clients, pipeline = 4, 16
+    result, rows = _run_against_peer_that_drops_clients(
+        env, clients, pipeline, True, ["--reconnect-on-error", "--max-reconnect-attempts=1"])
+    _assert_every_request_counted(env, result, rows, clients * pipeline,
+                                  {"max-reconnect-attempts-exceeded", "thread-ended-before-resend"})
+
+
+def test_in_flight_requests_of_sibling_clients_are_counted_when_thread_ends(env):
+    """
+    The requests siblings still have in flight when the thread ends are
+    counted too, not only the ones they hold for resend.
+
+    The peer closes only the first connection; reconnecting is refused, so
+    that connection ends the thread while the other clients wait for their
+    replies.
+    """
+    clients, pipeline = 4, 8
+    result, rows = _run_against_peer_that_drops_clients(
+        env, clients, pipeline, False, ["--reconnect-on-error", "--max-reconnect-attempts=1"])
+    _assert_every_request_counted(env, result, rows, clients * pipeline,
+                                  {"max-reconnect-attempts-exceeded", "thread-ended-before-resend"})
+
+
+def test_requests_lost_without_reconnect_are_counted_when_thread_ends(env):
+    """
+    Without --reconnect-on-error, the first lost connection ends the thread
+    before the other clients handle their own EOF. Their requests, still in
+    flight, are logged and counted as errors like the first one's.
+    """
+    clients, pipeline = 4, 8
+    result, rows = _run_against_peer_that_drops_clients(env, clients, pipeline, True, [])
+    _assert_every_request_counted(env, result, rows, clients * pipeline,
+                                  {"connection-lost-no-reconnect", "thread-ended-before-resend"})
