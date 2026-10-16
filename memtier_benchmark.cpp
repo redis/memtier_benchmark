@@ -956,6 +956,8 @@ static bool parse_unsigned(const char *s, unsigned long long max, unsigned long 
 // accepted; empty input, trailing junk, ERANGE and values outside [min,max]
 // are rejected before the caller narrows the result.  If too_large is
 // given, it is set when the value is a well-formed number above max.
+// Unlike parse_unsigned(), "-0" is accepted here: a '-' is a legal sign for a
+// signed option, and strtoll() reads "-0" as 0 without any wrap.
 static bool parse_signed(const char *s, long long min, long long max, long long *out, bool *too_large = NULL)
 {
     if (too_large) *too_large = false;
@@ -1287,8 +1289,14 @@ static bool verify_arbitrary_command_option(struct benchmark_config *cfg)
 //   DATA_SIZE_MAX: upper bound on --data-size (and per-entry size in
 //                  --data-size-list).  Matches Redis' default proto-max-bulk-len
 //                  (512 MiB), past which the server rejects the bulk anyway.
+//   MULTI_KEY_GET_MAX: upper bound on --multi-key-get.  Every client
+//                  preallocates a keylist of multi_key_get + 1 entries plus
+//                  256 bytes of key buffer per entry (about 272 MB per client
+//                  at this cap), and the unsigned 256 * entries buffer size
+//                  wraps above 16777215 entries.
 #define MEMTIER_PIPELINE_MAX 1024u
 #define MEMTIER_DATA_SIZE_MAX (512u * 1024u * 1024u)
+#define MEMTIER_MULTI_KEY_GET_MAX 1000000u
 
 // Parse a backoff factor: the whole string must be a finite, representable
 // number >= 0.  Rejects empty input, trailing junk, nan/inf and ERANGE
@@ -2035,9 +2043,9 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             break;
         case o_multi_key_get: {
             bool too_large;
-            bool parsed = parse_unsigned(optarg, INT_MAX, &val, &too_large);
+            bool parsed = parse_unsigned(optarg, MEMTIER_MULTI_KEY_GET_MAX, &val, &too_large);
             if (!parsed || !val) {
-                count_option_error("multi-key-get", parsed, too_large, INT_MAX);
+                count_option_error("multi-key-get", parsed, too_large, MEMTIER_MULTI_KEY_GET_MAX);
                 return -1;
             }
             cfg->multi_key_get = (int) val;
@@ -2904,7 +2912,7 @@ void usage()
         "(default: 0)\n"
         "      --thread-conn-start-max-jitter-micros=NUM Maximum jitter in microseconds between connection creation "
         "(default: 0)\n"
-        "      --multi-key-get=NUM        Enable multi-key get commands, up to NUM keys (default: 0).\n"
+        "      --multi-key-get=NUM        Enable multi-key get commands, up to NUM keys (default: 0, max: 1000000).\n"
         "                                 In cluster mode, keys are probed from the key space so that all\n"
         "                                 keys in one batch route to the same shard (no hash-tag prefix).\n"
         "      --select-db=DB             DB number to select, when testing a redis server\n"

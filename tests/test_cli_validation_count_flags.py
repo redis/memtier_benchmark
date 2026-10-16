@@ -382,7 +382,8 @@ ULLONG_MAX = "18446744073709551615"
 POSITIVE_OPTIONS = {
     "--key-minimum": ("key-minimum", ULLONG_MAX),
     "--key-maximum": ("key-maximum", ULLONG_MAX),
-    "--multi-key-get": ("multi-key-get", INT_MAX),
+    # Capped: each client preallocates ~272 bytes per key (MEMTIER_MULTI_KEY_GET_MAX).
+    "--multi-key-get": ("multi-key-get", "1000000"),
     "--rate-limiting": ("rate", UINT_MAX),
     "--clients-start": ("clients-start", UINT_MAX),
     "--clients-step": ("clients-step", UINT_MAX),
@@ -536,6 +537,7 @@ def test_remaining_options_store_the_parsed_value(env):
         (["--key-minimum=+2", "--key-maximum=" + ULLONG_MAX], "key_minimum = 2\n"),
         (["--key-maximum=" + ULLONG_MAX], "key_maximum = " + ULLONG_MAX),
         (["--multi-key-get= +64"], "multi_key_get = 64\n"),
+        (["--multi-key-get=1000000"], "multi_key_get = 1000000\n"),
         (["--select-db=" + INT_MAX], "select-db = " + INT_MAX),
         (["--rate-limiting= 9"], "rate_limit = 9\n"),
         (["--thread-conn-start-max-jitter-micros=" + UINT_MAX], "thread_conn_start_max_jitter_micros = " + UINT_MAX),
@@ -572,3 +574,15 @@ def test_jitter_max_range_does_not_divide_by_zero(env):
     rand() % 0 raised SIGFPE after the first connection."""
     _assert_no_sigfpe(env, ["-c", "2", "--thread-conn-start-min-jitter-micros=0",
                             "--thread-conn-start-max-jitter-micros=" + UINT_MAX], "jitter 0.." + UINT_MAX)
+
+
+def test_multi_key_get_cap(env):
+    """INT_MAX used to be accepted, then keylist sizing overflowed and the
+    startup allocation exhausted memory (~31 GB RSS before being killed)."""
+    result = _run_memtier(["--multi-key-get=1000000", "--version"])
+    env.assertEqual(result.returncode, 0, message=result.stderr)
+    for value in ("1000001", "16777215", INT_MAX):
+        result = _run_memtier(["--multi-key-get=" + value, "--version"])
+        env.assertEqual(result.returncode, 2, message="{}: {}".format(value, result.stderr))
+        env.assertTrue("error: multi-key-get must be <= 1000000." in result.stderr,
+                       message="{}: {!r}".format(value, result.stderr))
