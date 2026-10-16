@@ -277,8 +277,8 @@ Exit status:
 ### Output write errors
 
 If the results cannot be written to `--out-file`, `--json-out-file` or
-stdout (for example on a full disk, an exceeded quota, an I/O error, or a
-closed stdout), memtier prints `error: failed writing --out-file PATH:
+stdout (for example on a full disk, an exceeded quota or an I/O error),
+memtier prints `error: failed writing --out-file PATH:
 REASON` (or `--json-out-file PATH`, or `results to stdout`) and exits with
 status **1**, also after a graceful interrupt. A connection-stage abort still
 exits with **2** when an output write fails too.
@@ -294,6 +294,46 @@ run. Any other `--out-file` (for example a FIFO whose reader exits) and
 Not covered yet: write errors on the HDR histogram files
 (`--hdr-file-prefix`), the `--client-stats` CSV files and
 `--failed-keys-file` are still not checked.
+
+A stdout that was already closed when memtier started is handled separately,
+see [Closed stdin, stdout or stderr](#closed-stdin-stdout-or-stderr).
+
+### Closed stdin, stdout or stderr
+
+If a benchmark run is started with stdin, stdout or stderr closed (for
+example `memtier_benchmark ... >&-`), memtier reopens that descriptor on
+`/dev/null` before it opens any file. So `--out-file`, `--json-out-file` and
+the other files never share a descriptor with stdin, stdout or stderr. Then
+two checks run at startup, before connecting:
+
+- Right after option parsing, before any file is opened or read: a path
+  option that names a closed descriptor would now silently use
+  `/dev/null`. This covers the outputs `--out-file`, `--json-out-file` and
+  `--failed-keys-file`, and the inputs `--data-import`, `--monitor-input`,
+  `--cert`, `--key` and `--cacert`. The names matched are `/dev/stdout`,
+  `/dev/fd/1`, `/proc/self/fd/1` or a symlink to one of them, and likewise
+  for `/dev/stdin` and `/dev/stderr`. memtier prints `error: --out-file
+  /dev/stdout resolves to stdout, which was closed at startup` and exits
+  **1**. The message is not visible when stderr is the closed one.
+- After all other option checks and the data import, just before the
+  output files are opened: a closed stdout would lose the text results.
+  Unless `--out-file` is given, memtier prints `error: stdout was closed at
+  startup, so the results would not be written; use --out-file` and exits
+  **1**. Since this check is late, a bad option still reports its own
+  error. To keep only the JSON, pass `--out-file /dev/null`.
+
+Otherwise:
+
+- A closed stdin or stderr does not by itself fail the run. With stderr
+  closed, the log lines are lost.
+- Any spelling of `/dev/null` itself is accepted, and so is another
+  process's descriptor such as `/proc/1/fd/1`.
+- `--hdr-file-prefix` and `--client-stats` are prefixes: memtier always
+  appends a suffix (`_FULL_RUN_1.txt`, `-1-0-0.csv`, ...), so they never
+  name `/dev/stdout` or `/dev/fd/N` themselves. They are not checked. A
+  file they cannot open or write is reported but does not fail the run
+  yet; that known gap is tracked in
+  [#744](https://github.com/redis/memtier_benchmark/issues/744).
 
 ## Crash Reporting
 

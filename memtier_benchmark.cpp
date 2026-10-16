@@ -4469,8 +4469,113 @@ static bool stdout_reader_gone(FILE *fp, int err)
     return poll(&pfd, 1, 0) == 1 && (pfd.revents & (POLLERR | POLLHUP)) != 0;
 }
 
+// Make sure fds 0, 1 and 2 are open before anything else opens a file.
+// If one of them was closed when memtier was started (e.g. `memtier >&-`),
+// the next open() gets that fd: --json-out-file or --out-file would become
+// fd 1 (or 2), and the text results (or the stderr log lines) would be
+// written into it. Reopen each closed fd on /dev/null instead, which keeps
+// the numbering safe. Returns a mask with bit (1 << fd) set for each fd that
+// was closed.
+static unsigned int reopen_closed_std_fds(void)
+{
+    unsigned int closed_mask = 0;
+    for (int fd = STDIN_FILENO; fd <= STDERR_FILENO; fd++) {
+        if (fcntl(fd, F_GETFD) != -1 || errno != EBADF) continue;
+        // open() returns the lowest free fd, which is this one, since the
+        // lower ones are open by now.
+        int nfd;
+        do {
+            nfd = open("/dev/null", O_RDWR);
+        } while (nfd < 0 && errno == EINTR);
+        if (nfd != fd) {
+            int err = nfd < 0 ? errno : EBADF;
+            // Report it only if stderr is open (it may be the closed fd).
+            if (fcntl(STDERR_FILENO, F_GETFD) != -1)
+                fprintf(stderr, "error: fd %d is closed and cannot be reopened on /dev/null: %s\n", fd, strerror(err));
+            exit(1);
+        }
+        closed_mask |= 1u << fd;
+    }
+    return closed_mask;
+}
+
+static const char *std_fd_name(int fd)
+{
+    return fd == STDIN_FILENO ? "stdin" : (fd == STDOUT_FILENO ? "stdout" : "stderr");
+}
+
+// True if path is exactly task_prefix + "<tid>" + fd_suffix, with <tid> all
+// digits: e.g. "/proc/123/task/" + "124" + "/fd/1", which /proc/thread-self/fd/1
+// resolves to.
+static bool is_task_fd_path(const std::string &path, const std::string &task_prefix, const std::string &fd_suffix)
+{
+    if (path.compare(0, task_prefix.size(), task_prefix) != 0) return false;
+    std::string rest = path.substr(task_prefix.size()); // "<tid>/fd/N"
+    size_t slash = rest.find('/');
+    if (slash == 0 || slash == std::string::npos || rest.substr(slash) != fd_suffix) return false;
+    for (size_t i = 0; i < slash; i++) {
+        if (!isdigit((unsigned char) rest[i])) return false;
+    }
+    return true;
+}
+
+// With fd 0-2 closed at startup and reopened on /dev/null, an output path
+// that goes through that fd (/dev/stdout, /dev/fd/1, /proc/self/fd/1, or a
+// symlink to one of them; likewise for stdin and stderr) now resolves to
+// /dev/null, and what is written there would be thrown away. Comparing
+// inodes cannot tell such a path from an explicit /dev/null (which is the
+// user's choice and must keep working), so follow the path one symlink at a
+// time and check whether it names this process's fd.
+static bool path_is_closed_fd(const char *path, int fd)
+{
+    char buf[64];
+    snprintf(buf, sizeof(buf), "/dev/%s", std_fd_name(fd));
+    const std::string dev_name(buf);
+    snprintf(buf, sizeof(buf), "/dev/fd/%d", fd);
+    const std::string dev_fd(buf);
+    snprintf(buf, sizeof(buf), "/fd/%d", fd);
+    const std::string fd_suffix(buf);
+    // /proc/self and /proc/thread-self resolve to /proc/<pid> and
+    // /proc/<pid>/task/<tid>. Another process's fd (e.g. /proc/1/fd/1 in a
+    // container) is a different file and is not matched.
+    snprintf(buf, sizeof(buf), "/proc/%d", (int) getpid());
+    const std::string own_proc(buf);
+    const std::string own_task = own_proc + "/task/";
+
+    std::string p(path);
+    for (int depth = 0; depth < 40; depth++) {
+        // Resolve the directory part only, so the last component is kept.
+        size_t slash = p.rfind('/');
+        std::string dir = slash == std::string::npos ? "." : (slash == 0 ? "/" : p.substr(0, slash));
+        std::string base = slash == std::string::npos ? p : p.substr(slash + 1);
+        // If realpath() or readlink() below fails for another reason
+        // (ENOENT, EACCES, ...), the path is treated as not naming a closed
+        // fd on purpose: the later open() then reports the real error.
+        char *rdir = realpath(dir.c_str(), NULL);
+        if (rdir == NULL) return false;
+        std::string resolved_dir(rdir);
+        free(rdir);
+        std::string full = (resolved_dir == "/" ? "" : resolved_dir) + "/" + base;
+
+        // /dev/stdout and /dev/fd/N are device nodes on macOS; on Linux
+        // /dev/fd resolves to /proc/<pid>/fd.
+        if (full == dev_name || full == dev_fd || full == own_proc + fd_suffix) return true;
+        if (is_task_fd_path(full, own_task, fd_suffix)) return true;
+
+        char target[PATH_MAX];
+        ssize_t n = readlink(full.c_str(), target, sizeof(target) - 1);
+        if (n < 0) return false; // not a symlink (EINVAL), or see above
+        target[n] = '\0';
+        p = target[0] == '/' ? std::string(target) : resolved_dir + "/" + target;
+    }
+    return false;
+}
+
 int main(int argc, char *argv[])
 {
+    // Must run first, before any file or socket is opened.
+    unsigned int closed_std_fds = reopen_closed_std_fds();
+
     // Enable libevent's pthreads bindings so event_base_loopbreak() /
     // event_base_loopexit() called from the main thread reliably wake a
     // worker thread that is blocked in epoll_wait() with no live events.
@@ -4539,6 +4644,39 @@ int main(int argc, char *argv[])
 
     if (config_parse_args(argc, argv, &cfg) < 0) {
         usage();
+    }
+
+    // An fd 0-2 was closed at startup and reopened on /dev/null (see
+    // reopen_closed_std_fds()). A path option that names that fd would now
+    // silently use /dev/null: an output file would be thrown away and an
+    // input file would read as empty. Fail right after option parsing,
+    // before any of these files is opened or read and before connecting.
+    if (closed_std_fds != 0) {
+        const struct
+        {
+            const char *opt;
+            const char *path;
+        } path_opts[] = {
+            {"--out-file", cfg.out_file},
+            {"--json-out-file", cfg.json_out_file},
+            {"--failed-keys-file", cfg.failed_keys_file},
+            {"--data-import", cfg.data_import},
+            {"--monitor-input", cfg.monitor_input},
+#ifdef USE_TLS
+            {"--cert", cfg.tls_cert},
+            {"--key", cfg.tls_key},
+            {"--cacert", cfg.tls_cacert},
+#endif
+        };
+        for (size_t i = 0; i < sizeof(path_opts) / sizeof(path_opts[0]); i++) {
+            for (int fd = STDIN_FILENO; path_opts[i].path != NULL && fd <= STDERR_FILENO; fd++) {
+                if ((closed_std_fds & (1u << fd)) && path_is_closed_fd(path_opts[i].path, fd)) {
+                    fprintf(stderr, "error: %s %s resolves to %s, which was closed at startup\n", path_opts[i].opt,
+                            path_opts[i].path, std_fd_name(fd));
+                    exit(1);
+                }
+            }
+        }
     }
 
     // Load monitor input file if specified
@@ -4792,8 +4930,11 @@ int main(int argc, char *argv[])
         }
     }
 
-    // Open the failed-keys log if requested. Failure is reported but doesn't
-    // abort the benchmark.
+    // Open the failed-keys log if requested. A path that cannot be opened is
+    // reported but doesn't abort the benchmark: the error is visible and the
+    // run is otherwise fine. A path that names a closed fd 0-2 was rejected
+    // after option parsing instead, because it opens fine (on /dev/null) and
+    // the log would be lost without any message.
     if (cfg.failed_keys_file) {
         global_failed_keys_logger().open(cfg.failed_keys_file);
     }
@@ -5267,6 +5408,16 @@ int main(int argc, char *argv[])
             cfg.key_zipf_exp = 1.0;
         }
         obj_gen->set_key_zipf_distribution(cfg.key_zipf_exp);
+    }
+
+    // stdout was closed at startup and reopened on /dev/null, and the text
+    // results go to stdout unless --out-file is given: they would be lost.
+    // Fail here, after the option validation (so a bad option still reports
+    // its own error) and before connecting, as for an --out-file that cannot
+    // be opened below.
+    if ((closed_std_fds & (1u << STDOUT_FILENO)) && cfg.out_file == NULL) {
+        fprintf(stderr, "error: stdout was closed at startup, so the results would not be written; use --out-file\n");
+        exit(1);
     }
 
     // Open the output files after option validation and data import, so a
