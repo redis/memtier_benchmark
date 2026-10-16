@@ -224,6 +224,7 @@ Enable automatic reconnection on connection errors (default: disabled).
 Without it, a lost connection ends its thread and the run exits 1.
 .HP
 \fB\-\-max\-reconnect\-attempts\fR=\fI\,NUM\/\fR Maximum number of reconnection attempts (default: 0, unlimited)
+Running out of attempts fails the run.
 .HP
 \fB\-\-reconnect\-backoff\-factor\fR=\fI\,NUM\/\fR Non\-negative backoff factor for reconnection delays (default: 0, no backoff)
 Zero keeps the delay at one second. Positive values multiply the

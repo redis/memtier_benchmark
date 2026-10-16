@@ -356,7 +356,14 @@ bool cluster_client::connect_shard_connection(shard_connection *sc, char *addres
     // no reconnect timer is pending: callers only dial connections without
     // one. Handle it like a connection error, so it is retried with backoff
     // and counts against --max-reconnect-attempts, instead of leaving the
-    // connection dead or redialing it on every slot map refresh.
+    // connection dead or redialing it on every slot map refresh. Once the run
+    // is over, leave it dead: there is nothing left to send, and ending the
+    // client from here (stop_reconnecting_if_run_over()) would disconnect the
+    // main connection in the middle of handling its CLUSTER SLOTS reply.
+    if (sc->stops_at_deadline() && sc->run_is_over()) {
+        sc->count_connection_error();
+        return false;
+    }
     sc->attempt_reconnect("Connection failed");
     return false;
 }

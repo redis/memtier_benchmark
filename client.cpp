@@ -165,6 +165,7 @@ client::client(client_group *group) :
         m_event_base(NULL),
         m_initialized(false),
         m_end_set(false),
+        m_run_failed(false),
         m_config(NULL),
         m_obj_gen(NULL),
         m_stats(group->get_config()),
@@ -203,6 +204,7 @@ client::client(struct event_base *event_base, benchmark_config *config, abstract
         m_event_base(NULL),
         m_initialized(false),
         m_end_set(false),
+        m_run_failed(false),
         m_config(NULL),
         m_obj_gen(NULL),
         m_stats(config),
@@ -443,6 +445,14 @@ bool client::abandon_unanswered_requests(unsigned long long *unanswered, unsigne
     // The caller reports the requests held for retry with the others.
     *held += disconnect_and_abandon_held();
     return true;
+}
+
+void client::set_end_time_at(struct timeval *end_time)
+{
+    if (!m_end_set) {
+        m_stats.set_end_time(end_time);
+        m_end_set = true;
+    }
 }
 
 bool client::hold_pipeline(unsigned int conn_id)
@@ -1668,14 +1678,27 @@ void client_group::finalize_all_clients(struct timeval *end_time)
 }
 
 // Connected (prepare()-d) clients that have not reached their stop condition
-// when the event loop returns. The missing end time establishes incomplete work,
+// when the event loop returns (those marked failed are counted by
+// count_failed_clients()). The missing end time establishes incomplete work,
 // not its cause. Clients a staircase ramp never connected are not counted.
 unsigned int client_group::count_unended_clients(void)
 {
     unsigned int count = 0;
     unsigned int active = active_client_count();
     for (unsigned int i = 0; i < active && i < m_clients.size(); i++) {
-        if (!m_clients[i]->end_time_set()) count++;
+        if (!m_clients[i]->end_time_set() && !m_clients[i]->run_failed()) count++;
+    }
+    return count;
+}
+
+// Connected clients that a connection marked failed after the run was over
+// (client::fail_run(), e.g. a setup rejected since the last reply).
+unsigned int client_group::count_failed_clients(void)
+{
+    unsigned int count = 0;
+    unsigned int active = active_client_count();
+    for (unsigned int i = 0; i < active && i < m_clients.size(); i++) {
+        if (m_clients[i]->run_failed()) count++;
     }
     return count;
 }

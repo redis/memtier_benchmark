@@ -170,11 +170,26 @@ public:
     void count_connection_error();
     void disconnect_after_error();
     void end_thread(const char *reason, const char *thread_end_reason);
-    void reconnect_after_setup_error(const char *error_context);
-    bool run_is_over();
+    void reconnect_after_setup_error(const char *error_context, bool setup_step = true);
+    // Reconnects stop at the --test-time deadline (#656) only with
+    // --reconnect-on-error and unlimited --max-reconnect-attempts; a finite
+    // bound keeps master's behaviour.
+    bool stops_at_deadline(void) const { return m_config->reconnect_on_error && m_config->max_reconnect_attempts == 0; }
+    bool run_deadline(struct timeval *deadline);
+    bool run_deadline_passed(void);
+    // Whether the run's stop condition is reached, also for a client that
+    // never started (see run_deadline()).
+    bool run_is_over(void);
     void retry_cluster_slots_after_error();
     void handle_cluster_slots_retry_event();
     void handle_setup_rejected_check_event();
+    double next_reconnect_delay(void);
+    bool stop_reconnecting_if_run_over(void);
+    // siblings_done() and end_client_after_run() are public only for
+    // tests/unit/reconnect_siblings_test.cpp.
+    bool siblings_done(void);
+    void end_client_after_run(bool end_stats);
+    void warn_reconnecting_indefinitely(void);
 
     void send_wait_command(struct timeval *sent_time, unsigned int num_slaves, unsigned int timeout);
     void send_set_command(struct timeval *sent_time, const char *key, int key_len, const char *value, int value_len,
@@ -220,6 +235,7 @@ public:
     // does not redial it; a refresh that makes the node a primary dials it
     // through the primary path, where reconnect_after_setup_error() applies.
     bool is_setup_rejected_replica() const { return m_setup_rejected_replica; }
+    bool has_requests_to_replay() const { return m_replay_queue != NULL && !m_replay_queue->empty(); }
 
     // Topology role accessors. Defaults to role_primary; cluster_client flips
     // replicas to role_replica after CLUSTER SLOTS reveals them.
@@ -470,6 +486,11 @@ private:
     struct event *m_reconnect_timer;
     bool m_reconnecting;
     // The pending reconnect follows a rejected setup step (AUTH/SELECT/HELLO).
+    // Cleared when its timer fires. reconnect_after_setup_error() also sets it
+    // before calling attempt_reconnect(), so stop_reconnecting_if_run_over()
+    // leaves the rejection to handle_reconnect_timer_event(), which fails the
+    // run (#630). m_setup_failed_since_reply below outlives the timer, until
+    // the next workload reply.
     bool m_setup_rejected;
     // See is_setup_rejected_replica(). Never reset: it lasts as long as this
     // object (kept across disconnect() and role changes). handle_cluster_slots()
@@ -481,6 +502,21 @@ private:
     // (a string literal), never to a formatted buffer.
     const char *m_setup_rejected_context;
     const char *m_thread_end_reason;
+    // The last connection error was a failed connect (not a drop of an
+    // established connection): see stop_reconnecting_if_run_over().
+    bool m_connect_failed;
+    // A drop was reconnected after the run was over: the next one is not.
+    // Never cleared: each connection gets one reconnect after the deadline.
+    bool m_dropped_after_run_over;
+    // A setup step (AUTH/SELECT/HELLO) was rejected since the last workload
+    // reply (errors included): a failed connect after the run is over then
+    // fails the run (#630).
+    bool m_setup_failed_since_reply;
+    // The pending rejected-setup reconnect follows an empty or error CLUSTER
+    // SLOTS reply (with m_setup_rejected), and whether this connection already
+    // got its one refresh after the run was over (never cleared).
+    bool m_slots_rejected;
+    bool m_slots_retried_after_run_over;
 
     // Connection timeout tracking
     struct event *m_connection_timeout_timer;

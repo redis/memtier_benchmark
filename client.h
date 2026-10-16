@@ -78,6 +78,8 @@ protected:
     struct event_base *m_event_base;
     bool m_initialized;
     bool m_end_set;
+    // A connection ended the run as failed (see fail_run()).
+    bool m_run_failed;
 
     // test related
     benchmark_config *m_config;
@@ -163,6 +165,11 @@ public:
     // True once set_end_time() ran: the client reached its stop condition
     // (finished()) or was finalized by client_group::finalize_all_clients().
     bool end_time_set(void) const { return m_end_set; }
+    // A connection found the run failed after it was over (a setup rejected
+    // since its last reply) while another connection was still busy: that
+    // one may still end the client normally, so the failure is recorded here.
+    void fail_run(void) { m_run_failed = true; }
+    bool run_failed(void) const { return m_run_failed; }
     // Ends a client whose --test-time deadline passed TEST_TIME_DRAIN_GRACE_SECS
     // ago with replies still pending, or with --retry-on-error retries it
     // keeps resending; returns whether it did. Adds the workload requests
@@ -219,10 +226,15 @@ public:
     virtual bool finished(void);
     virtual bool all_connections_idle(void);
     virtual void set_start_time();
+    // set_start_time() at a given time, e.g. the benchmark's start.
+    void set_start_time_at(struct timeval *start_time) { m_stats.set_start_time(start_time); }
     virtual void set_end_time();
     // set_end_time() at the time client_group::interrupt() was called, after
     // the worker thread was joined.
     void set_end_time_interrupted(struct timeval *end_time);
+    // set_end_time() at a given time, e.g. the --test-time deadline, on the
+    // worker thread.
+    void set_end_time_at(struct timeval *end_time);
     virtual void create_request(struct timeval timestamp, unsigned int conn_id);
     virtual bool hold_pipeline(unsigned int conn_id);
     virtual int connect(void);
@@ -372,6 +384,7 @@ public:
     void mark_joined(void) { m_joined.store(true, std::memory_order_release); }
     void set_all_clients_interrupted(void);
     unsigned int count_unended_clients(void);
+    unsigned int count_failed_clients(void);
     void end_stalled_clients(void);
 
     void write_client_stats(const char *prefix);

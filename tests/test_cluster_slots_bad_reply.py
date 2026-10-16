@@ -24,7 +24,8 @@ class _Node(socketserver.ThreadingTCPServer):
 
     def __init__(self, bad_slots_replies, moved_after=0, bad_reply=b"*0\r\n", replica=None, readonly_delay=0,
                  first_good=False, bad_delay=0, auth_error=None, auth_error_with_next=False, select_error=None,
-                 moved_every=0, auth_reject_first=0, first_data_delay=0):
+                 moved_every=0, auth_reject_first=0, first_data_delay=0, gone_after_bad=False, bad_for=None,
+                 drop_after=0, reject_auth=0):
         super().__init__(("127.0.0.1", 0), _Handler)
         self.lock = threading.Lock()
         # CLUSTER SLOTS requests answered with bad_reply: the ones after the
@@ -55,6 +56,18 @@ class _Node(socketserver.ThreadingTCPServer):
         self.moved_to = None
         # Replaces slots_reply() when set: called with this node.
         self.slots_fn = None
+        # After the first bad reply, close the connection and stop
+        # listening: the node is gone for good.
+        self.gone_after_bad = gone_after_bad
+        # With first_good, answer the CLUSTER SLOTS requests after the first
+        # with bad_reply for this many seconds after the first one, then
+        # correctly (instead of a fixed count).
+        self.bad_for = bad_for
+        self.first_slots_time = None
+        # Close the connection after answering this data command, and reject
+        # this AUTH (counting from 1) with -WRONGPASS.
+        self.drop_after = drop_after
+        self.reject_auth = reject_auth
         self.auth_requests = 0
         # A node listed as this node's replica in a good reply, and how long
         # a node waits before answering READONLY.
@@ -73,10 +86,17 @@ class _Node(socketserver.ThreadingTCPServer):
             self.slots_requests += 1
             n = self.slots_requests
             after_first = self.moved_after or self.first_good
-            bad = (after_first and 1 < n <= 1 + self.bad_slots_replies) or \
-                (not after_first and n <= self.bad_slots_replies)
+            if self.first_slots_time is None:
+                self.first_slots_time = time.time()
+            if self.bad_for is not None:
+                bad = n > 1 and time.time() - self.first_slots_time < self.bad_for
+            else:
+                bad = (after_first and 1 < n <= 1 + self.bad_slots_replies) or \
+                    (not after_first and n <= self.bad_slots_replies)
         if bad:
             time.sleep(self.bad_delay)
+            if self.gone_after_bad:
+                self.socket.close()
             return self.bad_reply
         nodes = [self] + ([self.replica] if self.replica else [])
         reply = b"*1\r\n*" + str(2 + len(nodes)).encode() + b"\r\n:0\r\n:16383\r\n"
@@ -114,6 +134,11 @@ class _Handler(socketserver.StreamRequestHandler):
                         continue
                     else:
                         reply = node.auth_error
+                elif verb == b"AUTH" and node.reject_auth:
+                    with node.lock:
+                        node.auth_requests += 1
+                        rejected = node.auth_requests == node.reject_auth
+                    reply = b"-WRONGPASS invalid username-password pair\r\n" if rejected else b"+OK\r\n"
                 elif verb == b"READONLY":
                     time.sleep(node.readonly_delay)
                     reply = b"+OK\r\n"
@@ -122,6 +147,7 @@ class _Handler(socketserver.StreamRequestHandler):
                         node.data_requests += 1
                         moved = node.data_requests == node.moved_after or \
                             (node.moved_every and node.data_requests % node.moved_every == 0)
+                        dropped = node.data_requests == node.drop_after
                         first = node.data_requests == 1
                     if first:
                         time.sleep(node.first_data_delay)
@@ -135,6 +161,10 @@ class _Handler(socketserver.StreamRequestHandler):
                 self.wfile.write(held + reply)
                 self.wfile.flush()
                 held = b""
+                if node.gone_after_bad and node.socket.fileno() == -1:
+                    return
+                if verb in (b"SET", b"GET") and dropped:
+                    return
         except (ConnectionResetError, BrokenPipeError):
             pass
         except Exception as error:
@@ -383,3 +413,73 @@ def test_cluster_slots_empty_reply_at_startup_still_aborts(env):
     env.assertEqual(returncode, 2, message=stderr[-2000:])
     env.assertContains("See --connection-stage-timeout.", stderr)
     env.assertGreater(node.slots_requests, 1)
+
+
+def test_cluster_slots_empty_reply_then_node_gone_ends_at_test_time(env):
+    # A refresh gets an empty reply (a node with no slots yet) and then the
+    # node goes away for good, before the reconnected connection gets a
+    # workload reply. That is a server that is gone (#656): the run ends
+    # normally at --test-time. An empty or error CLUSTER SLOTS reply is not a
+    # rejected setup step (AUTH/SELECT/HELLO), so it must not fail the run as
+    # one.
+    node = _Node(bad_slots_replies=1, moved_after=50, gone_after_bad=True)
+    returncode, stderr, elapsed = _run(node, ["--test-time=3", "--reconnect-on-error"])
+    env.assertEqual(node.errors, [])
+    env.assertEqual(returncode, 0, message=stderr[-2000:])
+    env.assertContains("cluster slot failed", stderr)
+    env.assertContains("run is over, not reconnecting", stderr)
+    env.assertFalse("setup failed earlier" in stderr, message=stderr[-2000:])
+    env.assertLess(elapsed, 10)
+
+
+def test_cluster_slots_one_empty_reply_at_deadline_is_retried(env):
+    # One transient empty CLUSTER SLOTS reply in the last second of the run:
+    # the retry is due at the deadline (#656 caps the delay there), and it
+    # must still get its refresh then, as on master, which succeeds and ends
+    # the run normally. Only slot errors that persist past it fail the run
+    # (test_cluster_slots_empty_reply_mid_run_honours_test_time).
+    for moved_after in (2300, 2700):
+        node = _Node(bad_slots_replies=1, moved_after=moved_after)
+        returncode, stderr, elapsed = _run(node, ["--test-time=3", "--reconnect-on-error", "--rate-limiting=1000"])
+        env.assertEqual(node.errors, [])
+        env.assertContains("cluster slot failed", stderr)
+        env.assertEqual(returncode, 0, message="moved_after={}: {}".format(moved_after, stderr[-2000:]))
+        # The first map, the empty one, and the refresh after the deadline.
+        env.assertEqual(node.slots_requests, 3, message="moved_after={}".format(moved_after))
+        env.assertFalse("Connection setup failed and the run is over" in stderr,
+                        message="moved_after={}: a one-off slot error at the deadline failed the run".format(
+                            moved_after))
+        env.assertLess(elapsed, 10)
+
+
+def test_cluster_slots_never_started_client_fails_at_deadline(env):
+    # Two clients: the first gets its slot map and runs; the second's CLUSTER
+    # SLOTS requests get empty replies until just before the deadline. Its
+    # retry is due at the deadline, but it never started: it must not get a
+    # refresh then and start its clock after the deadline, running a whole
+    # extra --test-time. It fails the run at the deadline, as #667 intends.
+    test_time = 3
+    node = _Node(bad_slots_replies=0, first_good=True, bad_for=test_time - 0.5)
+    returncode, stderr, elapsed = _run(node, ["--test-time={}".format(test_time), "--reconnect-on-error",
+                                              "--rate-limiting=1000"], clients=2)
+    env.assertEqual(node.errors, [])
+    env.assertNotEqual(returncode, "timeout", message=stderr[-2000:])
+    env.assertNotEqual(returncode, 0, message="a client that never started must fail the run")
+    env.assertLess(elapsed, test_time + 2, message="run took {:.1f}s: the never-started client ran after the "
+                   "deadline".format(elapsed))
+
+
+def test_rejected_auth_once_at_deadline_fails_the_run(env):
+    # Standalone. The server drops the connection about 0.3 s before the
+    # deadline and rejects the AUTH of the reconnect, which is due at the
+    # deadline, once; it would accept the next one. A rejected setup step at
+    # the deadline fails the run (#630): only an empty or error CLUSTER SLOTS
+    # reply gets a refresh after the deadline.
+    node = _Node(bad_slots_replies=0, drop_after=2700, reject_auth=2)
+    returncode, stderr, elapsed = _run(node, ["--test-time=3", "--reconnect-on-error", "--rate-limiting=1000",
+                                              "--authenticate=pw"], cluster=False)
+    env.assertEqual(node.errors, [])
+    env.assertContains("authentication failed", stderr)
+    env.assertEqual(returncode, 1, message=stderr[-2000:])
+    env.assertContains("Connection setup failed and the run is over", stderr)
+    env.assertLess(elapsed, 10)

@@ -1284,6 +1284,668 @@ def test_auth_failure_on_reconnect_with_retry_on_error_honors_test_time(env):
     env.assertLess(elapsed, test_time + 5, message="run took {:.1f}s for --test-time={}".format(elapsed, test_time))
 
 
+def _sanitized():
+    return any(os.environ.get(k) for k in ("ASAN_OPTIONS", "TSAN_OPTIONS", "UBSAN_OPTIONS"))
+
+
+# Extra seconds for wall-clock bounds under sanitizers, which slow memtier down.
+_SLACK = 5 if _sanitized() else 0
+
+
+class _StoppableProxy:
+    """Proxy to the test server over TCP, or over a unix socket when
+    upstream_unix is set. stop() closes the listener and every proxied
+    connection (and removes the unix socket), so the server looks gone for
+    good: reconnects are refused (TCP) or fail before reaching the event loop
+    (unix socket). stop(keep_accepting=True) instead keeps accepting and
+    closes each new connection at once, like a proxy with a dead backend.
+    With forward_first_only, only the first connection is proxied: later ones
+    are accepted but never answered. freeze() holds the replies on the current
+    connections; drop() then closes them and forwards new ones normally."""
+
+    def __init__(self, upstream_port=None, upstream_unix=None, forward_first_only=False):
+        import socket
+
+        self._upstream_unix = upstream_unix
+        self._upstream_port = upstream_port
+        self.unix_path = None
+        if upstream_unix:
+            self.unix_path = os.path.join(tempfile.mkdtemp(), "proxy.sock")
+            self._srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self._srv.bind(self.unix_path)
+        else:
+            self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._srv.bind(("127.0.0.1", 0))
+            self.port = self._srv.getsockname()[1]
+        self._srv.listen(64)
+        self._socks = []
+        self._forward_first_only = forward_first_only
+        self._forwarded = 0
+        self._stopped = False
+        self._keep_accepting = False
+        self._frozen = False
+        self._lock = threading.Lock()
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _connect_upstream(self):
+        import socket
+
+        if self._upstream_unix:
+            upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            # A relative path dodges the 108-byte sun_path limit under deep
+            # working directories.
+            path = min(self._upstream_unix, os.path.relpath(self._upstream_unix), key=len)
+            upstream.connect(path)
+            return upstream
+        return socket.create_connection(("127.0.0.1", self._upstream_port))
+
+    def _accept(self):
+        while True:
+            try:
+                client, _ = self._srv.accept()
+            except OSError:
+                return
+            with self._lock:
+                if self._stopped:
+                    client.close()
+                    if self._keep_accepting:
+                        continue
+                    return
+                if self._forward_first_only and self._forwarded:
+                    self._socks.append(client)
+                    continue
+                self._forwarded += 1
+                upstream = self._connect_upstream()
+                self._socks += [client, upstream]
+            for src, dst, replies in ((client, upstream, False), (upstream, client, True)):
+                threading.Thread(target=self._pump, args=(src, dst, replies), daemon=True).start()
+
+    def _pump(self, src, dst, replies):
+        try:
+            while True:
+                data = src.recv(65536)
+                if not data:
+                    break
+                while replies and self._frozen and dst in self._socks:
+                    time.sleep(0.01)
+                dst.sendall(data)
+        except OSError:
+            pass
+
+    def freeze(self):
+        self._frozen = True
+
+    def restart(self):
+        """Listen again on the same address after stop(): the server is back."""
+        import socket
+
+        with self._lock:
+            if self.unix_path:
+                srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                srv.bind(self.unix_path)
+            else:
+                srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                srv.bind(("127.0.0.1", self.port))
+            srv.listen(64)
+            self._srv = srv
+            self._stopped = False
+            self._keep_accepting = False
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def drop(self):
+        import socket
+
+        with self._lock:
+            socks, self._socks = self._socks, []
+            self._frozen = False
+            for s in socks:
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                s.close()
+
+    def stop(self, keep_accepting=False, blackhole=False):
+        """With blackhole, the port then gets a listener whose accept queue is
+        full, so new connects hang (TCP only)."""
+        import socket
+
+        with self._lock:
+            for s in getattr(self, "_blackhole", []):
+                s.close()
+            self._blackhole = []
+            self._stopped = True
+            self._keep_accepting = keep_accepting
+            if not keep_accepting:
+                try:
+                    # Wakes the accept() blocked in _accept(); close() alone does not.
+                    self._srv.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                self._srv.close()
+                if self.unix_path and os.path.exists(self.unix_path):
+                    os.unlink(self.unix_path)
+            socks, self._socks = self._socks, []
+            for s in socks:
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                s.close()
+            if blackhole and not self.unix_path:
+                # Linux queues backlog + 1 connections and then drops the
+                # SYNs of new ones: one filler makes every later connect hang.
+                srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                srv.bind(("127.0.0.1", self.port))
+                srv.listen(0)
+                filler = socket.create_connection(("127.0.0.1", self.port))
+                self._blackhole = [filler, srv]
+
+
+def _run_until_server_gone(env, extra_args, test_time, requests=None, stop_after=2, wait=None, threads=1, clients=2,
+                           forward_first_only=False, accept_after_stop=False, script=None, before_start=None):
+    """Run through a proxy that is stopped after stop_after seconds, or before
+    memtier starts when stop_after is None. With accept_after_stop, the
+    stopped proxy accepts and closes every new connection. script, a list of
+    (seconds, function(proxy)), replaces stop_after. Return (rc, elapsed, stderr,
+    stdout, json); rc is None if memtier had to be killed, json is None if
+    no JSON report was written."""
+    import subprocess
+
+    benchmark_specs = {
+        "name": env.testName,
+        "args": ["--reconnect-on-error", "--rate-limiting=200", "--hide-histogram"] + extra_args,
+    }
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=threads, clients=clients, requests=requests, test_time=test_time)
+    node = dict(env.getMasterNodesList()[0])
+    if env.isUnixSocket():
+        proxy = _StoppableProxy(upstream_unix=node["unix_socket_path"], forward_first_only=forward_first_only)
+        node["unix_socket_path"] = proxy.unix_path
+    else:
+        proxy = _StoppableProxy(upstream_port=int(node["port"]), forward_first_only=forward_first_only)
+        node["port"] = proxy.port
+    add_required_env_arguments(benchmark_specs, config, env, [node])
+    test_dir = tempfile.mkdtemp()
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+
+    stderr_path = "{0}/mb.stderr".format(config.results_dir)
+    stdout_path = "{0}/mb.stdout".format(config.results_dir)
+    rc = None
+    if stop_after is None:
+        proxy.stop()
+    if before_start is not None:
+        before_start()
+    started = time.monotonic()
+    with open(stdout_path, "w") as stdout_f, open(stderr_path, "w") as stderr_f:
+        proc = subprocess.Popen(benchmark.args, stdout=stdout_f, stderr=stderr_f, cwd=config.results_dir)
+        try:
+            if script is not None:
+                for at, action in script:
+                    time.sleep(max(0, at - (time.monotonic() - started)))
+                    action(proxy)
+            elif stop_after is not None:
+                time.sleep(stop_after)
+                proxy.stop(keep_accepting=accept_after_stop)
+            rc = proc.wait(timeout=wait if wait is not None else test_time + 15)
+        except subprocess.TimeoutExpired:
+            pass
+        finally:
+            proxy.stop()
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=10)
+    elapsed = time.monotonic() - started
+    with open(stderr_path) as f:
+        stderr_content = f.read()
+    with open(stdout_path) as f:
+        stdout_content = f.read()
+    json_path = "{0}/mb.json".format(config.results_dir)
+    results = None
+    if os.path.isfile(json_path):
+        with open(json_path) as f:
+            try:
+                results = json.load(f)
+            except ValueError:
+                pass
+    env.debugPrint("memtier exit code: {}, elapsed {:.1f}s".format(rc, elapsed), True)
+    env.debugPrint("STDERR:\n{}".format(stderr_content[-2000:]), True)
+    return rc, elapsed, stderr_content, stdout_content, results
+
+
+def test_server_gone_unlimited_reconnects_honor_test_time(env):
+    """
+    With --reconnect-on-error and unlimited --max-reconnect-attempts, a server
+    that goes away for good must not keep a --test-time run going: it used to
+    retry once a second forever, never printing the report (#656). The run now
+    stops reconnecting at the deadline and ends with its report. Under a unix
+    socket the reconnects fail before reaching the event loop, which must
+    advance the run's clock too. A backoff factor below 1 makes more than 10
+    attempts before the deadline, so the --requests-only warning would show.
+    """
+    env.skipOnCluster()
+    test_time = 6
+    rc, elapsed, stderr_content, stdout_content, results = _run_until_server_gone(
+        env, ["--reconnect-backoff-factor=0.7"], test_time)
+    env.assertIsNotNone(rc, message="memtier kept reconnecting past --test-time")
+    env.assertEqual(rc, 0, message="a run that reached --test-time must end normally")
+    env.assertTrue("run is over, not reconnecting" in stderr_content,
+                   message="the run did not stop reconnecting at --test-time")
+    env.assertTrue("Totals" in stdout_content, message="the report was not printed")
+    env.assertFalse("server still unreachable" in stderr_content,
+                    message="the wait-for-the-server warning is only for --requests runs")
+    env.assertLess(elapsed, test_time + 5 + _SLACK,
+                   message="run took {:.1f}s for --test-time={}".format(elapsed, test_time))
+    # Every failed reconnect counts as a connection error on top of the drop,
+    # over TCP and over a unix socket alike: 2 clients reconnecting for 4 s
+    # report well over one error each.
+    env.assertIsNotNone(results, message="no JSON report")
+    if results is not None:
+        conn_errors = results["ALL STATS"]["Totals"]["Connection Errors"]
+        env.assertGreaterEqual(conn_errors, 4, message="failed reconnects were not counted: {}".format(conn_errors))
+
+
+def test_server_gone_long_backoff_ends_at_test_time(env):
+    """
+    A reconnect armed just before the --test-time deadline must not wait out
+    its full backoff delay: the run used to end only when that attempt failed,
+    up to 60 s late, and report that dead time in its duration and throughput
+    (#656). The delay is capped at the time left, and the client's stats end
+    at the deadline.
+    """
+    env.skipOnCluster()
+    test_time = 4
+    rc, elapsed, stderr_content, _, results = _run_until_server_gone(
+        env, ["--reconnect-backoff-factor=20"], test_time, stop_after=1.5)
+    env.assertIsNotNone(rc, message="memtier kept reconnecting past --test-time")
+    env.assertEqual(rc, 0, message="a run that reached --test-time must end normally")
+    env.assertTrue("run is over, not reconnecting" in stderr_content,
+                   message="the run did not stop reconnecting at --test-time")
+    env.assertLess(elapsed, test_time + 3 + _SLACK,
+                   message="run took {:.1f}s for --test-time={}".format(elapsed, test_time))
+    env.assertIsNotNone(results, message="no JSON report")
+    if results is not None:
+        # The stats end at the deadline itself; a 20 s backoff would overshoot
+        # it by far more than this tolerance.
+        duration_ms = results["ALL STATS"]["Runtime"]["Total duration"]
+        env.assertGreaterEqual(duration_ms, test_time * 1000 - 100,
+                               message="Total duration {} ms for --test-time={}".format(duration_ms, test_time))
+        env.assertLessEqual(duration_ms, test_time * 1000 + (2000 if _SLACK else 500),
+                            message="Total duration {} ms for --test-time={}".format(duration_ms, test_time))
+
+
+def test_server_gone_never_started_client_ends_at_test_time(env):
+    """
+    A client whose connection is up but never answered when the server goes
+    away, while another client's is, never starts its own clock. The
+    connection-stage supervisor is already disarmed by the other client, so
+    the run's deadline (from the benchmark's start) must stop its reconnects
+    too, instead of retrying forever (#656). That client did no work, so the
+    run fails (exit 1), as for any client that ends before its stop condition.
+    """
+    env.skipOnCluster()
+    test_time = 4
+    for threads, clients in ((2, 1), (1, 2)):
+        rc, elapsed, stderr_content, _, _ = _run_until_server_gone(
+            env, ["--rate-limiting=50"], test_time, threads=threads, clients=clients, forward_first_only=True)
+        env.assertIsNotNone(rc, message="-t {} -c {}: memtier kept reconnecting past --test-time".format(threads, clients))
+        env.assertEqual(rc, 1, message="-t {} -c {}: a client that never started must fail the run".format(
+            threads, clients))
+        env.assertTrue("stopped before reaching their stop condition" in stderr_content,
+                       message="-t {} -c {}: the never-started client was not reported".format(threads, clients))
+        env.assertTrue("run is over, not reconnecting" in stderr_content,
+                       message="-t {} -c {}: the run did not stop reconnecting".format(threads, clients))
+        env.assertLess(elapsed, test_time + 5 + _SLACK,
+                       message="-t {} -c {}: run took {:.1f}s for --test-time={}".format(threads, clients, elapsed,
+                                                                                       test_time))
+
+
+def _assert_late_client_timed_from_run_start(env, results, test_time):
+    """The client that only connects after the deadline is timed from the run's
+    start: the JSON Total duration, the average over all clients, covers
+    --test-time. Timed from its late connect instead, its own duration would
+    be a fraction of a second, pulling the average well below --test-time."""
+    env.assertIsNotNone(results, message="no JSON report")
+    if results is not None:
+        duration_ms = results["ALL STATS"]["Runtime"]["Total duration"]
+        env.assertGreaterEqual(duration_ms, test_time * 1000 - 100,
+                               message="Total duration {} ms for --test-time={}: the late client was timed from its "
+                               "connect".format(duration_ms, test_time))
+
+
+def test_never_started_client_dropped_after_deadline_does_not_restart(env):
+    """
+    A client whose connection is up but never answered, while another
+    client's is, is dropped after the deadline by a server that then answers
+    new connections. Once it reconnects it must not start its clock then and
+    run a whole --test-time after the deadline: it is timed from the
+    benchmark's start, so its first reply ends it, and the run ends normally
+    (#656).
+
+    Under TLS the proxy cannot hold a connection after its handshake (it
+    forwards raw bytes): the unanswered connection never completes its
+    handshake, so it is still connecting, and its drop is a failed connect,
+    as from a server that is gone. That client fails the run (exit 1). The
+    started-late path itself is transport-independent; under TLS it is
+    exercised by test_json_aggregated_connection_errors_sec, where the server
+    kills connections after their handshake.
+    """
+    env.skipOnCluster()
+    test_time = 3
+
+    def drop_and_serve(proxy):
+        proxy._forward_first_only = False
+        proxy.drop()
+
+    rc, elapsed, stderr_content, _, results = _run_until_server_gone(
+        env, ["--rate-limiting=50"], test_time, threads=1, clients=2, forward_first_only=True,
+        script=[(test_time + 0.3, drop_and_serve)])
+    if env.useTLS:
+        env.assertEqual(rc, 1, message="TLS: a never-completed handshake is a failed connect and fails the run")
+        env.assertTrue("Connection failed and the run is over" in stderr_content)
+    else:
+        env.assertEqual(rc, 0, message="the run must end normally")
+        _assert_late_client_timed_from_run_start(env, results, test_time)
+    env.assertLess(elapsed, test_time + 2 + _SLACK,
+                   message="run took {:.1f}s: the never-started client ran after the deadline".format(elapsed))
+
+
+def test_never_started_client_dropped_before_deadline_does_not_restart(env):
+    """
+    Same as above, but the drop comes shortly before the deadline: the
+    reconnect is due at the deadline (its delay is capped there), when the run
+    is over. Connected then, the client must not start its clock and run a
+    whole --test-time after the deadline (#656). This is what a server that
+    keeps killing connections does to a client killed before each first reply
+    (test_json_aggregated_connection_errors_sec under TLS).
+
+    Under TLS the proxy cannot hold a connection after its handshake (it
+    forwards raw bytes): the unanswered connection never completes its
+    handshake, so it is still connecting, and its drop is a failed connect,
+    as from a server that is gone. That client fails the run (exit 1). The
+    started-late path itself is transport-independent; under TLS it is
+    exercised by test_json_aggregated_connection_errors_sec, where the server
+    kills connections after their handshake.
+    """
+    env.skipOnCluster()
+    test_time = 3
+
+    def drop_and_serve(proxy):
+        proxy._forward_first_only = False
+        proxy.drop()
+
+    for at in (-0.5, -0.05):
+        rc, elapsed, stderr_content, _, results = _run_until_server_gone(
+            env, ["--rate-limiting=50"], test_time, threads=1, clients=2, forward_first_only=True,
+            script=[(test_time + at, drop_and_serve)])
+        if env.useTLS:
+            env.assertEqual(rc, 1, message="drop at {:+.2f}s, TLS: a never-completed handshake is a failed connect "
+                            "and fails the run".format(at))
+            env.assertTrue("Connection failed and the run is over" in stderr_content)
+        else:
+            env.assertEqual(rc, 0, message="drop at {:+.2f}s: the run must end normally".format(at))
+            _assert_late_client_timed_from_run_start(env, results, test_time)
+        env.assertLess(elapsed, test_time + 2 + _SLACK,
+                       message="drop at {:+.2f}s: run took {:.1f}s: the never-started client ran after the "
+                       "deadline".format(at, elapsed))
+
+
+def test_accept_then_close_peer_with_retry_on_error_ends_at_test_time(env):
+    """
+    A peer that accepts each connection and closes it at once (a proxy with
+    a dead backend, a TLS terminator, maxclients) drops an established
+    connection, which is still reconnected after the deadline so held
+    requests are resent. With --retry-on-error every reconnect resends the
+    replay queue and is dropped again: past the deadline that must not turn
+    into an endless zero-delay reconnect loop (#656). One reconnect after the
+    run is over is allowed; a second drop ends the run.
+    """
+    env.skipOnCluster()
+    test_time = 4
+    rc, elapsed, stderr_content, stdout_content, _ = _run_until_server_gone(
+        env, ["--retry-on-error"], test_time, accept_after_stop=True)
+    env.assertIsNotNone(rc, message="memtier kept reconnecting past --test-time")
+    env.assertEqual(rc, 0, message="a run that reached --test-time must end normally")
+    env.assertTrue("run is over, not reconnecting" in stderr_content,
+                   message="the run did not stop reconnecting at --test-time")
+    env.assertTrue("Totals" in stdout_content, message="the report was not printed")
+    env.assertLess(elapsed, test_time + 4 + _SLACK,
+                   message="run took {:.1f}s for --test-time={}".format(elapsed, test_time))
+
+
+def test_live_server_drop_after_deadline_resends_held_requests(env):
+    """
+    A live server that drops connections with replies pending just after the
+    --test-time deadline: the drop is reconnected and, with --retry-on-error,
+    the held requests are resent and answered, so the run ends normally with
+    none abandoned. Only a failed connect (or a second drop) ends the
+    reconnects once the run is over (#656). The proxy holds the replies from
+    just before the deadline, then closes the connections just after it.
+    """
+    env.skipOnCluster()
+    test_time = 3
+    rc, elapsed, stderr_content, stdout_content, _ = _run_until_server_gone(
+        env, ["--retry-on-error", "--pipeline=8"], test_time, clients=1,
+        script=[(test_time - 0.5, lambda p: p.freeze()), (test_time + 0.7, lambda p: p.drop())])
+    env.assertEqual(rc, 0, message="a run that reached --test-time must end normally")
+    # Over TLS the proxy's close (no close_notify) is reported as a
+    # connection error rather than an EOF; both are drops of an established
+    # connection.
+    dropped = "connection dropped." in stderr_content or "Connection error, attempting" in stderr_content
+    env.assertTrue(dropped, message="the proxy did not drop the connection")
+    env.assertFalse("run is over, not reconnecting" in stderr_content,
+                    message="a drop from a live server after the deadline was not reconnected")
+    env.assertFalse("held for retry when the run ended were not resent" in stderr_content,
+                    message="the requests held for replay were abandoned")
+    env.assertTrue("Totals" in stdout_content, message="the report was not printed")
+    env.assertLess(elapsed, test_time + 5 + _SLACK,
+                   message="run took {:.1f}s for --test-time={}".format(elapsed, test_time))
+
+
+def test_reconnect_hanging_past_drain_grace_is_left_to_connection_timeout(env):
+    """
+    A client whose reconnect is still connecting when the 10 s drain grace
+    after --test-time expires has nothing in flight: it is not a stalled
+    client, and must be left to the reconnect logic (#669's idle-client
+    guard), not ended as "got no reply". The server's port stops answering
+    SYNs, so the reconnect armed for the deadline hangs until
+    --connection-timeout, after the grace; that failed connect then ends the
+    run normally (#656).
+    """
+    env.skipOnCluster()
+    if env.isUnixSocket():
+        env.skip()  # a full unix-socket backlog fails the connect at once
+    test_time = 3
+    rc, elapsed, stderr_content, _, results = _run_until_server_gone(
+        env, ["--connection-timeout=12"], test_time, clients=1,
+        script=[(1.5, lambda p: p.stop(blackhole=True))], wait=40 + _SLACK)
+    env.assertEqual(rc, 0, message="a run that reached --test-time must end normally")
+    env.assertFalse("got no reply" in stderr_content,
+                    message="a client waiting for its reconnect was ended as stalled")
+    env.assertTrue("Connection timeout" in stderr_content, message="the reconnect did not hang until the timeout")
+    env.assertTrue("run is over, not reconnecting" in stderr_content,
+                   message="the timed-out reconnect did not end the run")
+    # Ended by the 12 s connect timeout, not by the 10 s grace.
+    env.assertGreater(elapsed, test_time + 10, message="run took {:.1f}s".format(elapsed))
+    env.assertLess(elapsed, 30 + _SLACK, message="run took {:.1f}s".format(elapsed))
+    if results is not None:
+        duration_ms = results["ALL STATS"]["Runtime"]["Total duration"]
+        env.assertLessEqual(duration_ms, test_time * 1000 + (2000 if _SLACK else 500),
+                            message="Total duration {} ms for --test-time={}".format(duration_ms, test_time))
+
+
+def test_setup_rejected_then_server_gone_fails_the_run(env):
+    """
+    The server rejects AUTH on a reconnect, then goes away: the last failure
+    is a failed connect, but the setup had been rejected since the last reply.
+    That run must fail at the deadline (#630), not end normally as for a
+    server that is only gone (#656). Over a unix socket the failed connect
+    happens inside reconnect(), which used to lose the rejection.
+    """
+    env.skipOnCluster()
+    test_time = 5
+    conn = env.getOSSMasterNodesConnectionList()[0]
+
+    def change_password(proxy):
+        conn.execute_command("CONFIG", "SET", "requirepass", "other-656")
+        proxy.drop()  # the reconnects reach the server and get -WRONGPASS
+
+    try:
+        rc, elapsed, stderr_content, _, _ = _run_until_server_gone(
+            env, ["--authenticate=pw-656"], test_time,
+            before_start=lambda: conn.execute_command("CONFIG", "SET", "requirepass", "pw-656"),
+            # The reconnect due 1 s after the drop gets -WRONGPASS; the
+            # server is gone for the next ones.
+            script=[(1.5, change_password), (3.0, lambda p: p.stop())])
+    finally:
+        _clear_requirepass(conn, ("other-656", "pw-656"))
+    env.assertTrue("authentication failed" in stderr_content, message="AUTH was not rejected on reconnect")
+    env.assertEqual(rc, 1, message="a run whose setup was rejected before the server went away must fail")
+    env.assertTrue("Connection setup failed earlier and the run is over" in stderr_content,
+                   message="the rejected setup was not taken into account")
+    env.assertTrue("client(s) failed once the run was over" in stderr_content,
+                   message="the failed client was not reported as such")
+    env.assertLess(elapsed, test_time + 4 + _SLACK,
+                   message="run took {:.1f}s for --test-time={}".format(elapsed, test_time))
+
+
+def test_setup_recovered_then_server_gone_ends_normally(env):
+    """
+    The server rejects AUTH on a reconnect, a later reconnect authenticates
+    and gets replies, then the server goes away before the deadline. The
+    rejection was recovered from, so the run ends normally at the deadline
+    (#656), not as a rejected setup (#630). Any workload reply shows the
+    connection serves requests again, error replies included (the SETEX
+    variant only gets errors).
+    """
+    env.skipOnCluster()
+    test_time = 7
+    conn = env.getOSSMasterNodesConnectionList()[0]
+
+    def change_password(proxy):
+        conn.execute_command("CONFIG", "SET", "requirepass", "other-656")
+        proxy.drop()
+
+    for extra in ([], ["--command=SETEX __key__ -1 v"]):
+        try:
+            rc, elapsed, stderr_content, _, _ = _run_until_server_gone(
+                env, ["--authenticate=pw-656", "--reconnect-backoff-factor=0"] + extra, test_time,
+                before_start=lambda: conn.execute_command("CONFIG", "SET", "requirepass", "pw-656"),
+                # Rejected at ~2.2 s, accepted at ~3.2 s, server gone at 4.5 s.
+                script=[(1.2, change_password),
+                        (2.5, lambda p: conn.execute_command("CONFIG", "SET", "requirepass", "pw-656")),
+                        (4.5, lambda p: p.stop())])
+        finally:
+            _clear_requirepass(conn, ("other-656", "pw-656"))
+        label = " ".join(extra) or "default workload"
+        env.assertTrue("authentication failed" in stderr_content,
+                       message="{}: AUTH was not rejected on reconnect".format(label))
+        env.assertEqual(rc, 0, message="{}: a run that recovered from a rejected setup must end normally".format(label))
+        env.assertFalse("setup failed earlier" in stderr_content,
+                        message="{}: the recovered setup failure was still counted".format(label))
+        env.assertTrue("Connection failed and the run is over" in stderr_content,
+                       message="{}: the run did not end at the deadline".format(label))
+        env.assertLess(elapsed, test_time + 4 + _SLACK,
+                       message="{}: run took {:.1f}s for --test-time={}".format(label, elapsed, test_time))
+
+
+def test_server_gone_bounded_reconnects_fail_as_before(env):
+    """
+    With a finite --max-reconnect-attempts the attempts bound the run, as on
+    master, also around the --test-time deadline: a server that stays down
+    fails the run (exit 1) once they run out, at their usual backoff (no
+    burst of attempts at the deadline).
+    """
+    env.skipOnCluster()
+    test_time = 6
+    for attempts in (6, 1):
+        rc, elapsed, stderr_content, _, results = _run_until_server_gone(
+            env, ["--reconnect-backoff-factor=0", "--max-reconnect-attempts={}".format(attempts)], test_time)
+        env.assertEqual(rc, 1, message="--max-reconnect-attempts={}: a server that stays down must fail the run".format(
+            attempts))
+        env.assertTrue("Maximum reconnection attempts ({}) exceeded".format(attempts) in stderr_content)
+        env.assertFalse("run is over, not reconnecting" in stderr_content,
+                        message="the deadline ended a run with bounded attempts")
+        # The server goes at 2 s; one attempt a second.
+        env.assertLess(elapsed, 2 + attempts + 4 + _SLACK, message="run took {:.1f}s".format(elapsed))
+        if results is not None:
+            conn_errors = results["ALL STATS"]["Totals"]["Connection Errors"]
+            env.assertLessEqual(conn_errors, 2 * (attempts + 2),
+                                message="{} connection errors for 2 clients and {} attempts".format(conn_errors, attempts))
+
+
+def test_server_restarting_around_deadline_bounded_ends_normally(env):
+    """
+    With a finite --max-reconnect-attempts, a server that restarts around the
+    --test-time deadline (down just before it, back after it) is reconnected
+    once it is back, and the run ends normally (exit 0), as on master: the
+    attempts were not exhausted.
+    """
+    env.skipOnCluster()
+    test_time = 6
+    rc, elapsed, stderr_content, _, _ = _run_until_server_gone(
+        env, ["--reconnect-backoff-factor=0", "--max-reconnect-attempts=10"], test_time,
+        script=[(5.3, lambda p: p.stop()), (6.8, lambda p: p.restart())])
+    env.assertEqual(rc, 0, message="a bounded run whose server came back must end normally")
+    env.assertFalse("Maximum reconnection attempts" in stderr_content)
+    env.assertLess(elapsed, test_time + 5 + _SLACK,
+                   message="run took {:.1f}s for --test-time={}".format(elapsed, test_time))
+
+
+def test_server_gone_unlimited_reconnects_warn_with_requests(env):
+    """
+    With --requests and unlimited --max-reconnect-attempts the run waits for
+    the server indefinitely, as documented, but must say so, once (#656).
+    """
+    env.skipOnCluster()
+    # A backoff factor below 1 shrinks the delay (down to the 0.1 s floor),
+    # so the 10 attempts that trigger the warning take about 2.5 s instead of
+    # 10: it shows about 4.5 s into the run (the server goes at 2 s).
+    rc, _, stderr_content, _, _ = _run_until_server_gone(env, ["--reconnect-backoff-factor=0.7"], None,
+                                                         requests=1000000, wait=8 + _SLACK)
+    env.assertIsNone(rc, message="a --requests run with unlimited reconnects must keep waiting for the server")
+    env.assertTrue("server still unreachable after 10 reconnection attempts" in stderr_content,
+                   message="no warning that the run is waiting for an unreachable server")
+    # Once per run, not once per connection (2 clients here).
+    env.assertEqual(stderr_content.count("server still unreachable"), 1,
+                    message="the wait-for-the-server warning was repeated")
+
+
+def test_server_gone_before_start_unlimited_reconnects_end_at_stage_timeout(env):
+    """
+    A server that is gone before the first connect never starts the run's
+    clock, which --test-time is measured on. That startup phase is bounded by
+    --connection-stage-timeout instead (#426): the run must abort with exit
+    code 2 once it expires, not keep reconnecting (#656).
+    """
+    env.skipOnCluster()
+    stage_timeout = 6 if _sanitized() else 3
+    rc, elapsed, stderr_content, _, _ = _run_until_server_gone(
+        env, ["--reconnect-backoff-factor=0", "--connection-stage-timeout={}".format(stage_timeout)], 2,
+        stop_after=None, wait=stage_timeout + 15)
+    env.assertIsNotNone(rc, message="memtier kept reconnecting to a server that was never up")
+    # --test-time (2 s) passes first, but no connection reached steady state,
+    # so it does not apply: the supervisor must end the run.
+    env.assertFalse("run is over, not reconnecting" in stderr_content,
+                    message="--test-time ended a run that never started")
+    if env.isUnixSocket():
+        # A missing unix socket fails the first connect synchronously, in
+        # prepare(), so the run fails at once without reconnecting.
+        env.assertEqual(rc, 1, message="a run that cannot connect its unix socket must fail")
+        env.assertTrue("failed to connect" in stderr_content)
+        return
+    env.assertEqual(rc, 2, message="a run that never connected must fail through --connection-stage-timeout")
+    env.assertTrue("memtier_benchmark: aborting after" in stderr_content,
+                   message="the --connection-stage-timeout supervisor did not end the run")
+    env.assertLess(elapsed, stage_timeout + 5,
+                   message="run took {:.1f}s for --connection-stage-timeout={}".format(elapsed, stage_timeout))
+
+
 def test_merged_duration_averages_all_threads(env):
     """
     With several threads, the JSON Start time / Finish time / Total duration

@@ -956,11 +956,17 @@ def test_json_aggregated_connection_errors_sec(env):
     stop = threading.Event()
 
     def killer():
+        # Only connections that have served a workload command: a client
+        # whose every connection is killed during its setup (e.g. the TLS
+        # handshake) never gets a reply, and a run with a client that never
+        # ran is invalid and fails (#656). That is not what this test is
+        # about: it needs connection errors in every run.
         while not stop.wait(0.25):
             for conn in connections:
                 try:
-                    conn.execute_command("CLIENT", "KILL", "TYPE", "normal",
-                                         "SKIPME", "yes")
+                    for client in conn.client_list(_type="normal"):
+                        if client.get("cmd") in ("get", "set"):
+                            conn.execute_command("CLIENT", "KILL", "ID", client["id"])
                 except Exception:
                     pass
 

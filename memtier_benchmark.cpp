@@ -3064,6 +3064,7 @@ void usage()
         "      --reconnect-on-error       Enable automatic reconnection on connection errors (default: disabled).\n"
         "                                 Without it, a lost connection ends its thread and the run exits 1.\n"
         "      --max-reconnect-attempts=NUM Maximum number of reconnection attempts (default: 0, unlimited)\n"
+        "                                 Running out of attempts fails the run.\n"
         "      --reconnect-backoff-factor=NUM Non-negative backoff factor for reconnection delays (default: 0, no "
         "backoff)\n"
         "                                 Zero keeps the delay at one second. Positive values multiply the\n"
@@ -3486,6 +3487,12 @@ static void *cg_thread_start(void *t)
             if (unended > 0) {
                 benchmark_error_log("Thread %u: %u client(s) stopped before reaching their stop condition.\n",
                                     thread->m_thread_id, unended);
+                thread->m_failed = true;
+            }
+            unsigned int failed = thread->m_cg->count_failed_clients();
+            if (failed > 0) {
+                benchmark_error_log("Thread %u: %u client(s) failed once the run was over (see errors above).\n",
+                                    thread->m_thread_id, failed);
                 thread->m_failed = true;
             }
         }

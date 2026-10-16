@@ -78,6 +78,29 @@ def test_replica_rejecting_auth_does_not_hold_test_time_run(env):
     env.assertLess(elapsed, 8)
 
 
+def test_replica_rejecting_auth_with_reconnect_is_closed_not_redialed(env):
+    # --reconnect-on-error must not turn the unneeded replica into a
+    # connection redialed about once a second, only to be rejected again: its
+    # reconnect, due at the --test-time deadline, would then find the run over
+    # and fail a run the primary served in full (#656). It is closed as
+    # without --reconnect-on-error, also with bounded attempts.
+    for extra in ([], ["--max-reconnect-attempts=50"]):
+        node = _primary_with_replica_rejecting_auth()
+        returncode, stderr, elapsed, stats = _run_json(env, node, ["-a", "dummy-pw-737", "--test-time=2",
+                                                                   "--reconnect-on-error",
+                                                                   "--connection-stage-timeout=5"] + extra,
+                                                       clients=2)
+        label = " ".join(extra) or "unlimited attempts"
+        env.assertEqual(node.errors + node.replica.errors, [])
+        env.assertEqual(returncode, 0, message="{}: {}".format(label, stderr[-2000:]))
+        env.assertEqual(stderr.count(_CLOSED_REPLICA), 2, message="{}: {}".format(label, stderr[-2000:]))
+        env.assertFalse("attempting reconnection" in stderr, message="{}: {}".format(label, stderr[-2000:]))
+        env.assertEqual(node.replica.auth_requests, 2, message=label)
+        env.assertEqual(node.replica.data_requests, 0)
+        env.assertEqual(stats.get("Connection Errors"), 0, message=label)
+        env.assertLess(elapsed, 8)
+
+
 def test_replica_rejecting_select_does_not_hold_requests_run(env):
     replica = _Node(bad_slots_replies=0, select_error=b"-ERR DB index is out of range\r\n")
     node = _Node(bad_slots_replies=0, replica=replica)
