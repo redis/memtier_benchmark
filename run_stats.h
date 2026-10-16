@@ -168,6 +168,9 @@ protected:
         }
     } m_started;
     bool m_interrupted;
+    // Workload requests abandoned because no reply came within
+    // TEST_TIME_DRAIN_GRACE_SECS after --test-time ended.
+    unsigned long long int m_unanswered_requests;
 
     totals m_totals;
 
@@ -228,6 +231,8 @@ public:
     struct timeval get_start_time(void) const { return m_start_time; }
     void set_interrupted(bool interrupted) { m_interrupted = interrupted; }
     bool get_interrupted() const { return m_interrupted; }
+    void add_unanswered_requests(unsigned long long int n) { m_unanswered_requests += n; }
+    unsigned long long int get_unanswered_requests() const { return m_unanswered_requests; }
 
     void update_get_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency,
                        unsigned int hits, unsigned int misses);

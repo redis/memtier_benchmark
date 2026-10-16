@@ -123,6 +123,7 @@ inline timeval timeval_factorial_average(timeval a, timeval b, unsigned int weig
 run_stats::run_stats(benchmark_config *config) :
         m_config(config),
         m_interrupted(false),
+        m_unanswered_requests(0),
         m_totals(),
         m_cur_stats(0),
         m_cluster_endpoints(0),
@@ -1060,6 +1061,7 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
         // warning sees them. Summed across runs, like m_arbitrary_misses below.
         m_totals.m_hits += i->m_totals.m_hits;
         m_totals.m_misses += i->m_totals.m_misses;
+        m_unanswered_requests += i->m_unanswered_requests;
 
         // aggregate latency data; summarize() leaves i_totals.latency_histogram
         // empty, so the per-run totals histogram must be merged explicitly.
@@ -1182,6 +1184,7 @@ void run_stats::merge(const run_stats &other, int iteration)
     if (other.m_interrupted) {
         m_interrupted = true;
     }
+    m_unanswered_requests += other.m_unanswered_requests;
 
     // aggregate the one_second_stats vectors. this is not efficient
     // but it's not really important (small numbers, not realtime)
@@ -2008,6 +2011,7 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
         jsonhandler->write_obj("Total duration", "%lld", end_time_ms - start_time_ms);
         jsonhandler->write_obj("Time unit", "\"%s\"", "MILLISECONDS");
         jsonhandler->write_obj("Interrupted", "\"%s\"", m_interrupted ? "true" : "false");
+        jsonhandler->write_obj("Unanswered requests", "%llu", m_unanswered_requests);
         jsonhandler->close_nesting();
     }
 

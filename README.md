@@ -301,6 +301,19 @@ new top-level blocks (emitted only when `--cluster-mode` is on AND
   `Latency Samples`. `conn_id` is the shard_connection vector index
   (NOT a stable cluster shard identity).
 
+### End of a `--test-time` run
+
+When `--test-time` expires, memtier stops sending and waits for the replies to
+requests already in flight. It waits at most 10 seconds (a fixed grace period).
+If the server has stopped replying, each client still waiting after that is
+ended: its unanswered requests are counted as errors, written to
+`--failed-keys-file` (status `no-reply-after-test-time`) when set, and reported
+as `"Unanswered requests"` in the JSON `Runtime` section. A warning is printed
+to stderr and the run reports the `--test-time` window as usual, with exit
+code 0. Commands that legitimately take longer than 10 seconds to reply after
+the deadline (for example a slow `--command` Lua script) are reported the same
+way.
+
 ### Testing limitations
 
 The `OSS-CLUSTER + replicas: read-preference` CI matrix cell exercises the

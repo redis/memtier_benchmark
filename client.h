@@ -55,8 +55,12 @@ class object_generator;
 
 // How long a --test-time run waits, past its deadline, for replies to requests
 // already sent. A client still waiting after that (the server stopped
-// replying) is ended and its unanswered requests are counted as errors.
+// replying) is ended; its unanswered requests are counted as errors, logged to
+// --failed-keys-file and reported as "Unanswered requests" in the JSON Runtime.
 #define TEST_TIME_DRAIN_GRACE_SECS 10
+
+// Short uppercase name of a request type, for --failed-keys-file rows.
+const char *request_type_to_name(request_type t);
 
 enum get_key_response
 {

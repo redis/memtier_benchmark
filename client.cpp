@@ -399,11 +399,7 @@ unsigned int client::abandon_unanswered_requests(void)
 
     // Only a client that is waiting for replies: one with nothing in flight
     // ends by itself, or is waiting for a reconnect.
-    bool waiting = false;
-    for (unsigned int i = 0; i < m_connections.size(); i++) {
-        if (m_connections[i] != NULL && m_connections[i]->get_pending_resp() > 0) waiting = true;
-    }
-    if (!waiting) return 0;
+    if (all_connections_idle()) return 0;
 
     // Drop them before disconnecting, so --retry-on-error does not hold them
     // for a resend that will never come (disconnect_all() would then count
@@ -415,6 +411,7 @@ unsigned int client::abandon_unanswered_requests(void)
     }
     for (unsigned int i = 0; i < abandoned; i++)
         m_stats.inc_error();
+    m_stats.add_unanswered_requests(abandoned);
 
     // The run measured --test-time, not the grace period spent waiting.
     struct timeval end_time = m_stats.get_start_time();
@@ -906,7 +903,7 @@ int client::prepare(void)
 }
 
 // Maps internal request_type to a short uppercase string for failed-keys logs.
-static const char *request_type_to_name(request_type t)
+const char *request_type_to_name(request_type t)
 {
     switch (t) {
     case rt_get:
@@ -1534,7 +1531,8 @@ void client_group::handle_end_stalled_clients(void)
             m_staircase_timer = NULL;
         }
         benchmark_error_log("warning: %u client(s) got no reply to %llu request(s) %u seconds after the test time "
-                            "ended; counted as errors.\n",
+                            "ended; abandoned them (counted as errors, \"Unanswered requests\" in the JSON "
+                            "Runtime).\n",
                             stalled, abandoned, TEST_TIME_DRAIN_GRACE_SECS);
     }
 }
