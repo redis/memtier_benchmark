@@ -332,17 +332,191 @@ def test_unsigned_options_keep_specific_messages(env):
 def test_unsigned_options_ignore_errno_from_earlier_options(env):
     """parse_unsigned() must reset errno itself.
 
-    --key-maximum does not check ERANGE yet (#725), so it is used here to
-    leave errno set; once #725 lands, pick another errno source.
+    --key-median=1e-310 is accepted, but strtod() sets errno to ERANGE for
+    the subnormal result, so it leaves a stale errno behind.
     """
-    # Guard: if --key-maximum starts rejecting overflow, the errno-leak tests
-    # below and in test_cli_validation_{ports,reconnect_backoff,retry_backoff}.py
+    # Guard: if --key-median starts rejecting subnormal values, the errno-leak
+    # tests below and in test_cli_validation_{ports,reconnect_backoff,retry_backoff}.py
     # would pass for the wrong reason (or fail confusingly). Fail loudly instead.
-    probe = _run_memtier(["--key-maximum=99999999999999999999999", "--version"])
+    probe = _run_memtier(["--key-median=1e-310", "--version"])
     env.assertEqual(
         probe.returncode, 0,
-        message=("--key-maximum=99999999999999999999999 is now rejected (#725 fixed?). The errno-leak tests "
-                 "use it to leave errno == ERANGE behind: pick a new errno source for them. stderr: "
-                 + probe.stderr))
-    result = _run_memtier(["--key-maximum=99999999999999999999999", "-c", "5", "--version"])
+        message=("--key-median=1e-310 is now rejected. The errno-leak tests use it to leave "
+                 "errno == ERANGE behind: pick a new errno source for them. stderr: " + probe.stderr))
+    result = _run_memtier(["--key-median=1e-310", "-c", "5", "--version"])
     env.assertEqual(result.returncode, 0, message=result.stderr)
+
+
+# ---------------------------------------------------------------------------
+# The remaining numeric options (#725)
+# ---------------------------------------------------------------------------
+
+UINT_MAX = "4294967295"
+INT_MAX = "2147483647"
+ULLONG_MAX = "18446744073709551615"
+
+# Options where 0 is rejected: option -> (message prefix, maximum).
+POSITIVE_OPTIONS = {
+    "--key-minimum": ("key-minimum", ULLONG_MAX),
+    "--key-maximum": ("key-maximum", ULLONG_MAX),
+    "--multi-key-get": ("multi-key-get", INT_MAX),
+    "--rate-limiting": ("rate", UINT_MAX),
+    "--clients-start": ("clients-start", UINT_MAX),
+    "--clients-step": ("clients-step", UINT_MAX),
+    "--step-duration": ("step-duration", UINT_MAX),
+    "--pipeline": ("pipeline", "1024"),
+    "-d": ("data-size", "536870912"),
+    "--reconnect-interval": ("reconnect-interval", UINT_MAX),
+}
+
+# Options where 0 is a valid value: option -> (message prefix, maximum).
+NON_NEGATIVE_OPTIONS = {
+    "--data-offset": ("data-offset", UINT_MAX),
+    "--thread-conn-start-min-jitter-micros": ("thread-conn-start-min-jitter-micros", UINT_MAX),
+    "--thread-conn-start-max-jitter-micros": ("thread-conn-start-max-jitter-micros", UINT_MAX),
+    "--select-db": ("select-db", INT_MAX),
+    "--scan-incremental-max-iterations": ("scan-incremental-max-iterations", UINT_MAX),
+    "--replica-clients": ("--replica-clients", UINT_MAX),
+    "--replicas-per-shard": ("--replicas-per-shard", UINT_MAX),
+}
+
+REMAINING_OPTIONS = dict(POSITIVE_OPTIONS, **NON_NEGATIVE_OPTIONS)
+
+
+def _above(maximum):
+    return str(int(maximum) + 1)
+
+
+def test_remaining_options_reject_wrapped_values(env):
+    """-1, overflow, junk and empty values used to wrap or saturate (#725)."""
+    for option, (prefix, _) in REMAINING_OPTIONS.items():
+        for value in WRAPPED_VALUES:
+            result = _run_memtier([option, value, "--version"])
+            label = "{} {!r}".format(option, value)
+            env.assertEqual(result.returncode, 2, message=label + ": " + result.stderr)
+            env.assertTrue("error: {} must be".format(prefix) in result.stderr,
+                           message=label + ": " + repr(result.stderr))
+
+
+def test_remaining_options_reject_values_above_their_type(env):
+    """4294967297 used to become 1 through the narrowing cast; values just
+    above the field's type, and above UINT_MAX, are rejected and name the limit."""
+    for option, (prefix, maximum) in REMAINING_OPTIONS.items():
+        values = {_above(maximum), "99999999999999999999999"}
+        if int(maximum) < 4294967297:
+            values.add("4294967297")
+        for value in sorted(values):
+            result = _run_memtier([option, value, "--version"])
+            label = "{} {}".format(option, value)
+            env.assertEqual(result.returncode, 2, message=label + ": " + result.stderr)
+            env.assertTrue("error: {} must be <= {}".format(prefix, maximum) in result.stderr,
+                           message=label + ": " + repr(result.stderr))
+
+
+def test_remaining_options_messages(env):
+    """Malformed input says what is expected; zero is rejected only where it
+    has no meaning."""
+    for option, (prefix, _) in POSITIVE_OPTIONS.items():
+        for value in ("-1", "5x", ""):
+            result = _run_memtier([option, value, "--version"])
+            env.assertTrue("error: {} must be a positive integer.".format(prefix) in result.stderr,
+                           message="{} {!r}: {!r}".format(option, value, result.stderr))
+        result = _run_memtier([option, "0", "--version"])
+        env.assertEqual(result.returncode, 2, message="{} 0: {}".format(option, result.stderr))
+        env.assertTrue("error: {} must be greater than zero.".format(prefix) in result.stderr,
+                       message="{} 0: {!r}".format(option, result.stderr))
+    for option, (prefix, _) in NON_NEGATIVE_OPTIONS.items():
+        for value in ("-1", "5x", ""):
+            result = _run_memtier([option, value, "--version"])
+            env.assertTrue("error: {} must be a non-negative integer.".format(prefix) in result.stderr,
+                           message="{} {!r}: {!r}".format(option, value, result.stderr))
+    result = _run_memtier(["-d", "536870913", "--version"])
+    env.assertTrue("error: data-size must be <= 536870912 bytes (512 MiB)." in result.stderr,
+                   message=repr(result.stderr))
+
+
+def test_remaining_options_accept_valid_values(env):
+    for option, (_, maximum) in REMAINING_OPTIONS.items():
+        values = ("1", maximum) + RELAXED_VALUES
+        if option in NON_NEGATIVE_OPTIONS:
+            values += ("0",)
+        for value in values:
+            result = _run_memtier([option, value, "--version"])
+            env.assertEqual(result.returncode, 0, message="{} {!r}: {}".format(option, value, result.stderr))
+
+
+MAX_RETRIES_REJECTED = (
+    "-2",
+    "\n-2",
+    "-4294967295",
+    "-9223372036854775809",
+    "-99999999999999999999999",
+    "- 1",
+    "+-1",
+    "-+1",
+    "--1",
+    "++1",
+    "+ 1",
+    "-",
+    "+",
+    "",
+    " ",
+    "5x",
+    "-1x",
+    "5 ",
+)
+
+
+def test_max_retries_rejects_out_of_range_and_malformed(env):
+    """--max-retries is an int with -1 = unlimited: strtol() was cast to int
+    with no upper bound, so 4294967295 became -1 and 4294967297 became 1."""
+    for value in MAX_RETRIES_REJECTED:
+        result = _run_memtier(["--max-retries", value, "--version"])
+        label = "--max-retries {!r}".format(value)
+        env.assertEqual(result.returncode, 2, message=label + ": " + result.stderr)
+        env.assertTrue("error: max-retries must be an integer >= -1 (-1 means unlimited)." in result.stderr,
+                       message=label + ": " + repr(result.stderr))
+    for value in ("2147483648", "4294967295", "4294967297", "9223372036854775808", "99999999999999999999999"):
+        result = _run_memtier(["--max-retries", value, "--version"])
+        label = "--max-retries {}".format(value)
+        env.assertEqual(result.returncode, 2, message=label + ": " + result.stderr)
+        env.assertTrue("error: max-retries must be <= 2147483647." in result.stderr,
+                       message=label + ": " + repr(result.stderr))
+
+
+def test_max_retries_accepts_valid_values(env):
+    for value in ("-1", " -1", "\t-1", "0", "+0", "-0", "1", " +5", INT_MAX):
+        result = _run_memtier(["--max-retries", value, "--version"])
+        env.assertEqual(result.returncode, 0, message="--max-retries {!r}: {}".format(value, result.stderr))
+
+
+def _show_config(args):
+    """Parse *args* and return the --show-config dump (printed on stderr).
+
+    The config is printed before memtier connects, so port 1 (nothing
+    listens there) is enough; the connect failure that follows is ignored.
+    """
+    result = _run_memtier(["-s", "127.0.0.1", "-p", "1", "-n", "1", "-c", "1", "-t", "1", "--show-config"] + args)
+    return result.stderr
+
+
+def test_remaining_options_store_the_parsed_value(env):
+    """The value that reaches the config is the one given: no wrap, no
+    truncation, and the -1 sentinel of --max-retries survives."""
+    cases = (
+        (["--max-retries=-1"], "max_retries = -1"),
+        (["--max-retries= -1"], "max_retries = -1"),
+        (["--max-retries=" + INT_MAX], "max_retries = " + INT_MAX),
+        (["--max-retries=+7"], "max_retries = 7"),
+        # main() later caps --data-offset at 2^29 - 1.
+        (["--data-offset=+536870911"], "data_offset = 536870911"),
+        (["--key-minimum=+2", "--key-maximum=" + ULLONG_MAX], "key_minimum = 2\n"),
+        (["--key-maximum=" + ULLONG_MAX], "key_maximum = " + ULLONG_MAX),
+        (["--multi-key-get= +64"], "multi_key_get = 64\n"),
+        (["--select-db=" + INT_MAX], "select-db = " + INT_MAX),
+        (["--rate-limiting= 9"], "rate_limit = 9\n"),
+        (["--thread-conn-start-max-jitter-micros=" + UINT_MAX], "thread_conn_start_max_jitter_micros = " + UINT_MAX),
+    )
+    for args, expected in cases:
+        out = _show_config(args)
+        env.assertTrue(expected in out, message="{}: expected {!r} in {!r}".format(args, expected, out))

@@ -114,15 +114,15 @@ def test_reconnect_backoff_invalid_values_rejected(env):
 
 
 def test_reconnect_backoff_ignores_errno_from_earlier_options(env):
-    """An earlier option's strtoul overflow must not reject a valid factor.
+    """An earlier option's ERANGE must not reject a valid factor.
 
-    --key-maximum does not check ERANGE yet (#725), so it is used here to
-    leave errno set; once #725 lands, pick another errno source.
+    --key-median=1e-310 is accepted, but strtod() sets errno to ERANGE for
+    the subnormal result, so it leaves a stale errno behind.
     """
     result = subprocess.run(
         [
             MEMTIER_BINARY,
-            "--key-maximum=99999999999999999999999",  # accepted, leaves errno == ERANGE
+            "--key-median=1e-310",  # accepted, leaves errno == ERANGE
             "--reconnect-backoff-factor=1",
             "--version",
         ],

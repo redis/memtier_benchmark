@@ -145,7 +145,7 @@ $ memtier_benchmark --help
 
 for command line options.
 
-Numeric options that take a count, size, timeout or port (for example `-n`, `-c`, `-t`, `--test-time`, `--pipeline`, `-d`, `--max-reconnect-attempts`, `--prometheus-port`) reject negative, empty, out-of-range and malformed values instead of silently wrapping them. Leading whitespace and a `+` are still accepted. Note that an empty value such as `--max-reconnect-attempts=` used to mean 0 (unlimited) and is now an error.
+Numeric options that take a count, size, timeout or port (for example `-n`, `-c`, `-t`, `--test-time`, `--pipeline`, `-d`, `--max-reconnect-attempts`, `--prometheus-port`) reject negative, empty, out-of-range and malformed values instead of silently wrapping them. Leading whitespace and a `+` are still accepted. Note that an empty value such as `--max-reconnect-attempts=` used to mean 0 (unlimited) and is now an error. The same applies to `--max-retries`, which takes -1 (unlimited) up to 2147483647: an empty `--max-retries=` used to mean 0 (retries disabled) and is now an error, and values above 2147483647 are rejected instead of wrapping (4294967295 used to become -1, unlimited). Empty values are also rejected for `--data-offset`, `--select-db`, `--thread-conn-start-min-jitter-micros`, `--thread-conn-start-max-jitter-micros`, `--scan-incremental-max-iterations`, `--replica-clients` and `--replicas-per-shard`, where they used to mean 0; pass `0` explicitly.
 
 ### Using monitor input files
 

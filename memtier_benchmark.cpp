@@ -951,6 +951,33 @@ static bool parse_unsigned(const char *s, unsigned long long max, unsigned long 
     return true;
 }
 
+// Signed counterpart of parse_unsigned(), for options with a negative
+// sentinel (--max-retries -1).  Leading whitespace and one '+' or '-' are
+// accepted; empty input, trailing junk, ERANGE and values outside [min,max]
+// are rejected before the caller narrows the result.  If too_large is
+// given, it is set when the value is a well-formed number above max.
+static bool parse_signed(const char *s, long long min, long long max, long long *out, bool *too_large = NULL)
+{
+    if (too_large) *too_large = false;
+    if (s == NULL) return false;
+    while (isspace((unsigned char) *s))
+        s++;
+    const char *digits = s;
+    if (*digits == '+' || *digits == '-') digits++;
+    if (!isdigit((unsigned char) *digits)) return false;
+    char *endptr = NULL;
+    errno = 0;
+    long long v = strtoll(s, &endptr, 10);
+    if (*endptr != '\0') return false;
+    if ((errno == ERANGE && v > 0) || (errno != ERANGE && v > max)) {
+        if (too_large) *too_large = true;
+        return false;
+    }
+    if (errno == ERANGE || v < min) return false;
+    *out = v;
+    return true;
+}
+
 // Parse a TCP/UDP port number: the whole string must be a decimal number in
 // [1,65535] (see parse_unsigned()). Shared by -p/--port, --statsd-port,
 // --graphite-port, the --uri port and --read-server HOST:PORT.
@@ -962,17 +989,29 @@ static bool parse_port(const char *s, unsigned short *out)
     return true;
 }
 
-// Error for a count option (-n, -c, -t, --test-time) that parse_unsigned()
+// Error for a count option (-n, -c, -t, --pipeline, ...) that parse_unsigned()
 // rejected (parsed == false) or that was zero: say why, so "-1", "5x",
 // "99999..." and "0" are not all reported as "must be greater than zero".
-static void count_option_error(const char *name, bool parsed, bool too_large, unsigned long long max)
+// unit, if given, follows the maximum (" bytes (512 MiB)").
+static void count_option_error(const char *name, bool parsed, bool too_large, unsigned long long max,
+                               const char *unit = "")
 {
     if (too_large)
-        fprintf(stderr, "error: %s must be <= %llu.\n", name, max);
+        fprintf(stderr, "error: %s must be <= %llu%s.\n", name, max, unit);
     else if (parsed)
         fprintf(stderr, "error: %s must be greater than zero.\n", name);
     else
         fprintf(stderr, "error: %s must be a positive integer.\n", name);
+}
+
+// Error for an option where 0 is a valid value (--data-offset, --select-db,
+// ...) that parse_unsigned() rejected.
+static void non_negative_option_error(const char *name, bool too_large, unsigned long long max)
+{
+    if (too_large)
+        fprintf(stderr, "error: %s must be <= %llu.\n", name, max);
+    else
+        fprintf(stderr, "error: %s must be a non-negative integer.\n", name);
 }
 
 // Parse URI and populate config fields
@@ -1709,11 +1748,9 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             break;
         case o_pipeline: {
             bool too_large;
-            if (!parse_unsigned(optarg, MEMTIER_PIPELINE_MAX, &val, &too_large) || !val) {
-                if (too_large)
-                    fprintf(stderr, "error: pipeline must be <= %u.\n", MEMTIER_PIPELINE_MAX);
-                else
-                    fprintf(stderr, "error: pipeline must be greater than zero.\n");
+            bool parsed = parse_unsigned(optarg, MEMTIER_PIPELINE_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("pipeline", parsed, too_large, MEMTIER_PIPELINE_MAX);
                 return -1;
             }
             cfg->pipeline = (unsigned int) val;
@@ -1721,11 +1758,9 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         }
         case 'd': {
             bool too_large;
-            if (!parse_unsigned(optarg, MEMTIER_DATA_SIZE_MAX, &val, &too_large) || !val) {
-                if (too_large)
-                    fprintf(stderr, "error: data-size must be <= %u bytes (512 MiB).\n", MEMTIER_DATA_SIZE_MAX);
-                else
-                    fprintf(stderr, "error: data-size must be greater than zero.\n");
+            bool parsed = parse_unsigned(optarg, MEMTIER_DATA_SIZE_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("data-size", parsed, too_large, MEMTIER_DATA_SIZE_MAX, " bytes (512 MiB)");
                 return -1;
             }
             cfg->data_size = (unsigned int) val;
@@ -1734,14 +1769,15 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         case 'R':
             cfg->random_data = true;
             break;
-        case o_data_offset:
-            endptr = NULL;
-            cfg->data_offset = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!endptr || *endptr != '\0') {
-                fprintf(stderr, "error: data-offset must be greater than or equal to zero.\n");
+        case o_data_offset: {
+            bool too_large;
+            if (!parse_unsigned(optarg, UINT_MAX, &val, &too_large)) {
+                non_negative_option_error("data-offset", too_large, UINT_MAX);
                 return -1;
             }
+            cfg->data_offset = (unsigned int) val;
             break;
+        }
         case o_data_size_range:
             cfg->data_size_range = config_range(optarg);
             if (!cfg->data_size_range.is_defined() || cfg->data_size_range.min < 1) {
@@ -1818,22 +1854,26 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         case o_key_prefix:
             cfg->key_prefix = optarg;
             break;
-        case o_key_minimum:
-            endptr = NULL;
-            cfg->key_minimum = strtoull(optarg, &endptr, 10);
-            if (cfg->key_minimum < 1 || !endptr || *endptr != '\0') {
-                fprintf(stderr, "error: key-minimum must be greater than zero.\n");
+        case o_key_minimum: {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, ULLONG_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("key-minimum", parsed, too_large, ULLONG_MAX);
                 return -1;
             }
+            cfg->key_minimum = val;
             break;
-        case o_key_maximum:
-            endptr = NULL;
-            cfg->key_maximum = strtoull(optarg, &endptr, 10);
-            if (cfg->key_maximum < 1 || !endptr || *endptr != '\0') {
-                fprintf(stderr, "error: key-maximum must be greater than zero.\n");
+        }
+        case o_key_maximum: {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, ULLONG_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("key-maximum", parsed, too_large, ULLONG_MAX);
                 return -1;
             }
+            cfg->key_maximum = val;
             break;
+        }
         case o_key_stddev:
             endptr = NULL;
             cfg->key_stddev = strtod(optarg, &endptr);
@@ -1880,13 +1920,16 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 return -1;
             }
             break;
-        case o_reconnect_interval:
-            if (!parse_unsigned(optarg, UINT_MAX, &val) || !val) {
-                fprintf(stderr, "error: reconnect-interval must be greater than zero.\n");
+        case o_reconnect_interval: {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, UINT_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("reconnect-interval", parsed, too_large, UINT_MAX);
                 return -1;
             }
             cfg->reconnect_interval = (unsigned int) val;
             break;
+        }
         case o_reconnect_on_error:
             cfg->reconnect_on_error = true;
             break;
@@ -1909,10 +1952,13 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             cfg->retry_on_error = true;
             break;
         case o_max_retries: {
-            endptr = NULL;
-            long parsed = strtol(optarg, &endptr, 10);
-            if (!endptr || *endptr != '\0' || parsed < -1) {
-                fprintf(stderr, "error: max-retries must be an integer >= -1 (-1 means unlimited).\n");
+            long long parsed;
+            bool too_large;
+            if (!parse_signed(optarg, -1, INT_MAX, &parsed, &too_large)) {
+                if (too_large)
+                    fprintf(stderr, "error: max-retries must be <= %d.\n", INT_MAX);
+                else
+                    fprintf(stderr, "error: max-retries must be an integer >= -1 (-1 means unlimited).\n");
                 return -1;
             }
             cfg->max_retries = (int) parsed;
@@ -1966,33 +2012,37 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             }
             cfg->connection_stage_timeout = (unsigned int) val;
             break;
-        case o_thread_conn_start_min_jitter_micros:
-            endptr = NULL;
-            cfg->thread_conn_start_min_jitter_micros = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!endptr || *endptr != '\0') {
-                fprintf(stderr, "error: thread-conn-start-min-jitter-micros must be a valid number.\n");
+        case o_thread_conn_start_min_jitter_micros: {
+            bool too_large;
+            if (!parse_unsigned(optarg, UINT_MAX, &val, &too_large)) {
+                non_negative_option_error("thread-conn-start-min-jitter-micros", too_large, UINT_MAX);
                 return -1;
             }
+            cfg->thread_conn_start_min_jitter_micros = (unsigned int) val;
             break;
-        case o_thread_conn_start_max_jitter_micros:
-            endptr = NULL;
-            cfg->thread_conn_start_max_jitter_micros = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!endptr || *endptr != '\0') {
-                fprintf(stderr, "error: thread-conn-start-max-jitter-micros must be a valid number.\n");
+        }
+        case o_thread_conn_start_max_jitter_micros: {
+            bool too_large;
+            if (!parse_unsigned(optarg, UINT_MAX, &val, &too_large)) {
+                non_negative_option_error("thread-conn-start-max-jitter-micros", too_large, UINT_MAX);
                 return -1;
             }
+            cfg->thread_conn_start_max_jitter_micros = (unsigned int) val;
             break;
+        }
         case o_generate_keys:
             cfg->generate_keys = 1;
             break;
-        case o_multi_key_get:
-            endptr = NULL;
-            cfg->multi_key_get = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (cfg->multi_key_get < 1 || !endptr || *endptr != '\0') {
-                fprintf(stderr, "error: multi-key-get must be greater than zero.\n");
+        case o_multi_key_get: {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, INT_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("multi-key-get", parsed, too_large, INT_MAX);
                 return -1;
             }
+            cfg->multi_key_get = (int) val;
             break;
+        }
         case 'a':
             cfg->authenticate = optarg;
             break;
@@ -2000,13 +2050,15 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         case o_uri:
             cfg->uri = optarg;
             break;
-        case o_select_db:
-            cfg->select_db = (int) strtoul(optarg, &endptr, 10);
-            if (cfg->select_db < 0 || !endptr || *endptr != '\0') {
-                fprintf(stderr, "error: select-db must be greater or equal zero.\n");
+        case o_select_db: {
+            bool too_large;
+            if (!parse_unsigned(optarg, INT_MAX, &val, &too_large)) {
+                non_negative_option_error("select-db", too_large, INT_MAX);
                 return -1;
             }
+            cfg->select_db = (int) val;
             break;
+        }
         case o_no_expiry:
             cfg->no_expiry = true;
             break;
@@ -2189,12 +2241,13 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             break;
         }
         case o_rate_limiting: {
-            endptr = NULL;
-            cfg->request_rate = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!cfg->request_rate || !endptr || *endptr != '\0') {
-                fprintf(stderr, "error: rate must be greater than zero.\n");
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, UINT_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("rate", parsed, too_large, UINT_MAX);
                 return -1;
             }
+            cfg->request_rate = (unsigned int) val;
             break;
         }
 #ifdef USE_TLS
@@ -2399,38 +2452,44 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             cfg->scan_incremental_iteration = true;
             break;
         case o_scan_incremental_max_iterations: {
-            endptr = NULL;
-            cfg->scan_incremental_max_iterations = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!endptr || *endptr != '\0') {
-                fprintf(stderr, "error: scan-incremental-max-iterations must be a positive number.\n");
+            bool too_large;
+            if (!parse_unsigned(optarg, UINT_MAX, &val, &too_large)) {
+                non_negative_option_error("scan-incremental-max-iterations", too_large, UINT_MAX);
                 return -1;
             }
+            cfg->scan_incremental_max_iterations = (unsigned int) val;
             break;
         }
-        case o_clients_start:
-            endptr = NULL;
-            cfg->clients_start = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!cfg->clients_start || !endptr || *endptr != '\0') {
-                fprintf(stderr, "error: clients-start must be greater than zero.\n");
+        case o_clients_start: {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, UINT_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("clients-start", parsed, too_large, UINT_MAX);
                 return -1;
             }
+            cfg->clients_start = (unsigned int) val;
             break;
-        case o_clients_step:
-            endptr = NULL;
-            cfg->clients_step = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!cfg->clients_step || !endptr || *endptr != '\0') {
-                fprintf(stderr, "error: clients-step must be greater than zero.\n");
+        }
+        case o_clients_step: {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, UINT_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("clients-step", parsed, too_large, UINT_MAX);
                 return -1;
             }
+            cfg->clients_step = (unsigned int) val;
             break;
-        case o_step_duration:
-            endptr = NULL;
-            cfg->step_duration = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!cfg->step_duration || !endptr || *endptr != '\0') {
-                fprintf(stderr, "error: step-duration must be greater than zero.\n");
+        }
+        case o_step_duration: {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, UINT_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("step-duration", parsed, too_large, UINT_MAX);
                 return -1;
             }
+            cfg->step_duration = (unsigned int) val;
             break;
+        }
         case o_read_preference: {
             if (!optarg) {
                 fprintf(stderr, "error: --read-preference requires a value.\n");
@@ -2499,21 +2558,21 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             break;
         }
         case o_replica_clients: {
-            endptr = NULL;
-            cfg->replica_clients = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!endptr || *endptr != '\0') {
-                fprintf(stderr, "error: --replica-clients must be a non-negative integer.\n");
+            bool too_large;
+            if (!parse_unsigned(optarg, UINT_MAX, &val, &too_large)) {
+                non_negative_option_error("--replica-clients", too_large, UINT_MAX);
                 return -1;
             }
+            cfg->replica_clients = (unsigned int) val;
             break;
         }
         case o_replicas_per_shard: {
-            endptr = NULL;
-            cfg->replicas_per_shard = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!endptr || *endptr != '\0') {
-                fprintf(stderr, "error: --replicas-per-shard must be a non-negative integer.\n");
+            bool too_large;
+            if (!parse_unsigned(optarg, UINT_MAX, &val, &too_large)) {
+                non_negative_option_error("--replicas-per-shard", too_large, UINT_MAX);
                 return -1;
             }
+            cfg->replicas_per_shard = (unsigned int) val;
             break;
         }
         case o_read_preference_fallback: {
