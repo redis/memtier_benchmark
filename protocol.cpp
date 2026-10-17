@@ -1306,6 +1306,8 @@ class memcache_meta_protocol : public memcache_text_protocol
         bool get;
         unsigned int remaining;
     };
+    // Validate before returning a completed response to shard_connection.
+    // Raw serialized retries must restore this metadata through the replay hook.
     std::deque<expected_reply> m_expected_replies;
 
 public:
@@ -1417,8 +1419,8 @@ int memcache_meta_protocol::parse_response(void)
             if (!line) return 0;
 
             m_response_len += tmplen + 2; // For CRLF
-            // First line of the response is adopted as the status; subsequent lines (e.g. follow-up
-            // sections in a pipelined multi-get) are just freed below.
+            // Adopt the first status; a later defined error replaces it so
+            // error accounting/retry sees the error rather than a prior hit.
             if (m_last_response.get_status() == NULL) {
                 m_last_response.set_status(line);
             }
@@ -1431,9 +1433,20 @@ int memcache_meta_protocol::parse_response(void)
             bool need_value = false;
             bool done = false;
             bool unknown = false;
+            bool server_error = false;
 
             if (memchr(line, '\0', tmplen) != NULL) {
                 unknown = true;
+            } else if ((tmplen == 5 && memcmp(line, "ERROR", 5) == 0) ||
+                       (tmplen >= 12 && (tmplen == 12 || line[12] == ' ') &&
+                        (memcmp(line, "CLIENT_ERROR", 12) == 0 || memcmp(line, "SERVER_ERROR", 12) == 0))) {
+                // Every command may return a defined error instead of its
+                // normal section. Retain the first error even if an earlier
+                // MGET section supplied a valid status, and still drain to MN.
+                server_error = true;
+                if (!m_last_response.is_error() && m_last_response.get_status() != line)
+                    m_last_response.set_status(line);
+                m_last_response.set_error();
             } else if (tmplen >= 3 && memcmp(line, "VA ", 3) == 0) {
                 // Parse the value size with strtoul rather than sscanf -- on
                 // the GET hot path this avoids the full stdio scanner machinery
@@ -1476,17 +1489,17 @@ int memcache_meta_protocol::parse_response(void)
                 } else {
                     expected_reply &expected = m_expected_replies.front();
                     bool get_reply = need_value || memcmp(line, "EN", 2) == 0;
-                    unknown = expected.remaining == 0 || expected.get != get_reply;
+                    unknown = expected.remaining == 0 || (!server_error && expected.get != get_reply);
                     if (!unknown) --expected.remaining;
                 }
             }
 
+            if (unknown) benchmark_debug_log("invalid meta response: %s\n", line);
             // Free `line` if it wasn't adopted as status.
             if (m_last_response.get_status() != line) free(line);
 
             if (unknown) {
                 m_last_response.set_error();
-                benchmark_debug_log("unknown meta response: %s\n", m_last_response.get_status());
                 // Reset state so the connection (reused by shard_connection)
                 // starts cleanly on the next call.
                 m_response_state = rs_initial;

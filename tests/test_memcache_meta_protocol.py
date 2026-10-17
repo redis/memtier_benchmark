@@ -52,7 +52,8 @@ class MetaProtocolMockServer(threading.Thread):
     by `MN`. Tests therefore expect (and assert on) one `mn` per logical command.
     """
 
-    def __init__(self, miss_keys=None, ms_response=b"HD\r\n", garbage_after=None, fragment_va=False, raw_response=None):
+    def __init__(self, miss_keys=None, ms_response=b"HD\r\n", garbage_after=None, fragment_va=False, raw_response=None,
+                 garbage_response=b"NOT_META\r\n"):
         super().__init__(daemon=True)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -69,6 +70,7 @@ class MetaProtocolMockServer(threading.Thread):
         # parse_response's -1 path resets state cleanly so subsequent valid
         # responses are not misclassified as multi-get sections.
         self.garbage_after = garbage_after
+        self.garbage_response = garbage_response
         self.raw_response = raw_response
         self.fragment_va = fragment_va       # split VA header and value across two sends
         self.stop_event = threading.Event()
@@ -143,8 +145,7 @@ class MetaProtocolMockServer(threading.Thread):
             inject_now = (self.garbage_after is not None
                           and len(self.commands) == self.garbage_after + 1)
             if inject_now:
-                # Inject one SERVER_ERROR (which the meta parser must classify
-                # as unknown -> -1 with state reset). For ms commands we still
+                # Inject one selected response. For ms commands we still
                 # need to consume the value bytes from the wire.
                 if cmd == b"ms" and len(parts) >= 3:
                     try:
@@ -156,7 +157,7 @@ class MetaProtocolMockServer(threading.Thread):
                     buf = rest[datalen + 2:]
                 else:
                     buf = rest
-                out += b"SERVER_ERROR injected\r\n"
+                out += self.garbage_response
             elif cmd == b"ms":
                 # ms <key> <datalen> [flags...]
                 if len(parts) < 3:
@@ -528,8 +529,8 @@ class MetaProtocolTests(unittest.TestCase):
         under-filled evbuffer and return 0 ("need more data"). When the next
         libevent callback fires with the value, parsing must resume cleanly.
 
-        Catches off-by-one bugs in the value-length guard (e.g. `< value_len`
-        instead of `< value_len + 2`).
+        The parser unit separately checks every byte split, including a
+        complete payload with an incomplete CRLF delimiter.
         """
         self._restart_server(fragment_va=True)
         for i in range(1, 21):
@@ -548,6 +549,41 @@ class MetaProtocolTests(unittest.TestCase):
         self.assertEqual(int(gets["Count"]), 20)
         self.assertAlmostEqual(gets["Hits/sec"], gets["Ops/sec"], places=2)
         self.assertEqual(gets["Misses/sec"], 0.0)
+
+    def test_defined_errors_after_success_are_counted(self):
+        for reply in (b"ERROR\r\n", b"CLIENT_ERROR bad command\r\n",
+                      b"SERVER_ERROR out of memory\r\n"):
+            with self.subTest(reply=reply):
+                self._restart_server(garbage_after=2, garbage_response=reply)
+                failures = os.path.join(self.tmpdir, reply.split()[0].decode() + ".csv")
+                result = _run_memtier(
+                    ["--ratio=1:0", "--pipeline=1", "--connection-stage-timeout=1",
+                     "--failed-keys-file=" + failures],
+                    self.server.port, self.json_path, requests=3, clients=1, threads=1, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr.decode())
+                self.assertNotIn(b"response parsing failed", result.stderr)
+                self.assertIn(reply.strip(), result.stderr)
+                with open(self.json_path) as report:
+                    self.assertEqual(json.load(report)["ALL STATS"]["Sets"]["Count"], 3)
+                with open(failures) as report:
+                    rows = report.read().splitlines()
+                self.assertEqual(len(rows), 2)
+                self.assertIn(reply.decode().strip(), rows[1])
+
+    def test_defined_server_error_can_retry(self):
+        self._restart_server(garbage_after=2, garbage_response=b"SERVER_ERROR temporary\r\n")
+        failures = os.path.join(self.tmpdir, "failures.csv")
+        result = _run_memtier(
+            ["--ratio=1:0", "--pipeline=1", "--retry-on-error", "--retry-on=SERVER_ERROR",
+             "--max-retries=1", "--retry-backoff-ms=1", "--failed-keys-file=" + failures],
+            self.server.port, self.json_path, requests=3, clients=1, threads=1, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertNotIn(b"response parsing failed", result.stderr)
+        self.assertEqual(self.server.count("ms"), 4)
+        with open(self.json_path) as report:
+            self.assertEqual(json.load(report)["ALL STATS"]["Sets"]["Count"], 3)
+        with open(failures) as report:
+            self.assertEqual(len(report.read().splitlines()), 1)
 
     def test_unknown_response_classified_as_parse_error(self):
         """Unsupported response lines must produce the parser-error diagnostic."""
@@ -686,6 +722,8 @@ test_meta_ns_response_does_not_error = _adapt("test_ns_response_does_not_error")
 test_meta_ex_response_does_not_error = _adapt("test_ex_response_does_not_error")
 test_meta_nf_response_does_not_error = _adapt("test_nf_response_does_not_error")
 test_meta_fragmented_va_response_is_reassembled = _adapt("test_fragmented_va_response_is_reassembled")
+test_meta_defined_errors_after_success_are_counted = _adapt("test_defined_errors_after_success_are_counted")
+test_meta_defined_server_error_can_retry = _adapt("test_defined_server_error_can_retry")
 test_meta_unknown_response_classified_as_parse_error = _adapt("test_unknown_response_classified_as_parse_error")
 test_meta_pipelined_set_completes = _adapt("test_pipelined_set_completes")
 test_meta_pipelined_mixed_set_and_multi_get = _adapt("test_pipelined_mixed_set_and_multi_get")

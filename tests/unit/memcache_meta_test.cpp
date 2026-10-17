@@ -74,6 +74,35 @@ struct fixture
     }
 };
 
+static void error_tests()
+{
+    const char *errors[] = {"ERROR", "CLIENT_ERROR bad command", "SERVER_ERROR out of memory"};
+    for (int keep = 0; keep < 2; ++keep) {
+        for (const char *error : errors) {
+            for (unsigned int gets = 0; gets <= 3; ++gets) {
+                fixture f(keep != 0);
+                f.issue(gets);
+                f.issue(1);
+                std::string wire;
+                if (gets >= 2) wire = "VA 1\r\nx\r\n";
+                wire += error;
+                wire += "\r\n";
+                if (gets == 3) wire += "CLIENT_ERROR later\r\n";
+                wire += "MN\r\n";
+                evbuffer_add(f.input, wire.data(), wire.size());
+                check(f.protocol->parse_response() == 1, "defined error completes through MN");
+                check(f.protocol->get_response()->is_error(), "defined error flag retained");
+                check(strcmp(f.protocol->get_response()->get_status(), error) == 0,
+                      "first error overrides prior valid status");
+                check(f.protocol->get_response()->get_total_len() == wire.size(), "error response bytes exact");
+                evbuffer_add(f.input, "EN\r\nMN\r\n", 8);
+                check(f.protocol->parse_response() == 1, "following reply still aligns");
+                check(!f.protocol->get_response()->is_error(), "error flag does not leak");
+            }
+        }
+    }
+}
+
 static void framing_tests()
 {
     struct reply_case
@@ -81,15 +110,12 @@ static void framing_tests()
         const char *wire;
         unsigned int gets;
     };
-    const reply_case invalid[] = {{"HD\r\nHD\r\nMN\r\n", 1},
-                                  {"VA 1\r\nx\r\nMN\r\n", 0},
-                                  {"EN\r\nMN\r\n", 2},
-                                  {"EN\r\nEN\r\nMN\r\n", 1},
-                                  {"VA 1\r\nx\r\nVA 1\r\ny\r\nMN\r\n", 1},
-                                  {"HD\r\nHD\r\nMN\r\n", 0},
-                                  {"MN\r\n", 1},
-                                  {"VA 2147483648\r\n", 1},
-                                  {"VA 4294967295\r\n", 1}};
+    const reply_case invalid[] = {{"SERVER_ERRORjunk\r\nMN\r\n", 1}, {"CLIENT_ERRORjunk\r\nMN\r\n", 1},
+                                  {"ERROR junk\r\nMN\r\n", 1},       {"HD\r\nHD\r\nMN\r\n", 1},
+                                  {"VA 1\r\nx\r\nMN\r\n", 0},        {"EN\r\nMN\r\n", 2},
+                                  {"EN\r\nEN\r\nMN\r\n", 1},         {"VA 1\r\nx\r\nVA 1\r\ny\r\nMN\r\n", 1},
+                                  {"HD\r\nHD\r\nMN\r\n", 0},         {"MN\r\n", 1},
+                                  {"VA 2147483648\r\n", 1},          {"VA 4294967295\r\n", 1}};
     {
         fixture f(false);
         f.issue(1);
@@ -162,6 +188,7 @@ static void framing_tests()
 int main()
 {
     framing_tests();
+    error_tests();
     // A new connection must not inherit either a partially read value or
     // accumulated bytes/hits from a reply whose MN never arrived.
     const char *partial[] = {"V", "VA 100\r\nx", "VA 1\r\nx\r\n", "EN\r\n", "HD\r\n"};
