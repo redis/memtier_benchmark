@@ -476,7 +476,9 @@ private:
     // matches replicas by address, so it always names the same endpoint.
     bool m_setup_rejected_replica;
     // Without --reconnect-on-error: the setup step the server rejected on this
-    // still-open connection, while the run has not reached steady state.
+    // still-open connection, while the run has not reached steady state. It is
+    // read when the re-check timer fires, so it must point to static storage
+    // (a string literal), never to a formatted buffer.
     const char *m_setup_rejected_context;
     const char *m_thread_end_reason;
 

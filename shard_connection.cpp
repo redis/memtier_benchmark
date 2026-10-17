@@ -2054,8 +2054,9 @@ bool shard_connection::run_is_over()
 //   --max-reconnect-attempts bounds it.
 // - A replica connection under --read-preference primary is not needed: keyed
 //   requests go to the primaries, and so do the keyless ones the replica
-//   connection would have sent. Close it, as for a READONLY error, and leave
-//   it closed: a slot map refresh does not redial it as a replica.
+//   connection would have sent. Close it with a warning, and leave it closed:
+//   a slot map refresh does not redial it as a replica. It is not counted as a
+//   connection error, since memtier chose to drop it and the run is complete.
 // - Otherwise, once the run has reached steady state, end this thread, so
 //   the run fails. Unlike a dropped connection, this does not wait for peers
 //   still in their setup: the server rejected this one, and it stays needed.
@@ -2074,7 +2075,7 @@ void shard_connection::reconnect_after_setup_error(const char *error_context)
         benchmark_error_log("warning: %s on replica connection %s; it is not needed under --read-preference "
                             "primary, closing it.\n",
                             error_context, get_readable_id());
-        disconnect_after_error();
+        disconnect();
         m_setup_rejected_replica = true;
         return;
     }

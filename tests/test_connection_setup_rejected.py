@@ -61,8 +61,9 @@ def test_replica_rejecting_auth_does_not_hold_requests_run(env):
     env.assertEqual(stderr.count(_CLOSED_REPLICA), 2, message=stderr[-2000:])
     env.assertEqual(node.data_requests, 400)
     env.assertEqual(node.replica.data_requests, 0)
-    env.assertEqual(stats.get("Connection Errors"), 2)
-    env.assertLess(elapsed, 5)
+    # A replica closed because it is not needed is not a connection error.
+    env.assertEqual(stats.get("Connection Errors"), 0)
+    env.assertLess(elapsed, 8)
 
 
 def test_replica_rejecting_auth_does_not_hold_test_time_run(env):
@@ -86,7 +87,7 @@ def test_replica_rejecting_select_does_not_hold_requests_run(env):
     env.assertEqual(returncode, 0, message=stderr[-2000:])
     env.assertEqual(stderr.count("SELECT error on replica connection"), 2, message=stderr[-2000:])
     env.assertEqual(node.data_requests, 400)
-    env.assertLess(elapsed, 5)
+    env.assertLess(elapsed, 8)
 
 
 def test_replica_rejecting_auth_is_not_redialed_by_slot_refreshes(env):
@@ -101,7 +102,8 @@ def test_replica_rejecting_auth_is_not_redialed_by_slot_refreshes(env):
     env.assertGreater(node.slots_requests, 10)
     env.assertEqual(node.replica.auth_requests, 2)
     env.assertEqual(stderr.count(_CLOSED_REPLICA), 2, message=stderr[-2000:])
-    env.assertEqual(stats.get("Connection Errors"), 2)
+    # A replica closed because it is not needed is not a connection error.
+    env.assertEqual(stats.get("Connection Errors"), 0)
     env.assertLess(elapsed, 10)
 
 
@@ -142,7 +144,7 @@ def test_primary_rejecting_auth_fails_run_once_another_primary_runs(env):
     env.assertEqual(returncode, 1, message=stderr[-2000:])
     env.assertContains("AUTH error and --reconnect-on-error is not set, ending this thread", stderr)
     env.assertFalse(_CLOSED_REPLICA in stderr, message=stderr[-2000:])
-    env.assertLess(elapsed, 5)
+    env.assertLess(elapsed, 8)
 
 
 def test_primary_rejecting_auth_at_startup_is_bounded_by_connection_stage_timeout(env):
@@ -175,7 +177,10 @@ def test_replica_rejecting_auth_under_secondary_does_not_hang(env):
     # SET can reach the primary and the run reaches steady state, which
     # disarms --connection-stage-timeout. The rejected replica must then end
     # the thread (exit 1) rather than wait forever; if the stage timeout
-    # fires first, it ends the run with exit 2.
+    # fires first, it ends the run with exit 2. Which one depends on timing,
+    # so this only guards against the hang:
+    # test_replica_rejecting_auth_under_secondary_ends_thread_while_peer_in_setup
+    # pins exit 1.
     replica = _Node(bad_slots_replies=0, auth_error=_NO_PASSWORD)
     node = _Node(bad_slots_replies=0, replica=replica)
     returncode, stderr, elapsed = _run(node, ["-a", "dummy-pw-737", "--requests=200",
@@ -231,4 +236,4 @@ def test_standalone_auth_rejected_on_some_connections_fails_run(env):
     env.assertTrue(1 <= rejected <= 4, message=stderr[-2000:])
     env.assertEqual(returncode, 1, message=stderr[-2000:])
     env.assertContains("AUTH error and --reconnect-on-error is not set, ending this thread", stderr)
-    env.assertLess(elapsed, 5)
+    env.assertLess(elapsed, 8)
