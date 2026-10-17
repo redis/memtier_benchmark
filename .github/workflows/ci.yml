@@ -50,6 +50,8 @@ jobs:
         test -f "$RUNNER_TEMP/memtier-prefix/share/bash-completion/completions/memtier_benchmark"
         make uninstall
         test ! -e "$RUNNER_TEMP/memtier-prefix/share/bash-completion/completions/memtier_benchmark"
+    - name: Check incremental version metadata
+      run: python3 tests/test_version_build.py
     - name: Check distribution with the default completion directory
       run: make -j2 distcheck
 

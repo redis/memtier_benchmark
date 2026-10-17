@@ -3,14 +3,17 @@
 
 GIT_SHA1="00000000"
 GIT_DIRTY="0"
+srcdir=${1:-$(dirname "$0")}
 
-# Check if we're in a git repository
-if command -v git >/dev/null 2>&1 && [ -d .git ] || git rev-parse --git-dir > /dev/null 2>&1; then
+# Use the source checkout, not an unrelated out-of-tree build directory.
+# A source archive unpacked inside another repository must not inherit its SHA.
+if command -v git >/dev/null 2>&1 &&
+    git -C "$srcdir" ls-files --error-unmatch -- version.sh >/dev/null 2>&1; then
     # Get the short SHA1
-    GIT_SHA1=$(git rev-parse --short=8 HEAD 2>/dev/null || echo "00000000")
+    GIT_SHA1=$(git -C "$srcdir" rev-parse --short=8 HEAD 2>/dev/null || echo "00000000")
     
     # Check if working directory is dirty
-    git diff-index --quiet HEAD -- 2>/dev/null
+    git -C "$srcdir" diff-index --quiet HEAD -- 2>/dev/null
     if [ $? -ne 0 ]; then
         GIT_DIRTY="1"
     else
