@@ -3316,6 +3316,8 @@ void usage()
         "Imported Data Options:\n"
         "      --data-import=FILE         Read object data from file\n"
         "      --data-verify              Enable data verification when test is complete\n"
+        "                                 (exit status 1 if any key fails verification,\n"
+        "                                 or if no key is verified)\n"
         "      --verify-only              Only perform --data-verify, without any other test\n"
         "      --generate-keys            Generate keys for imported objects\n"
         "      --no-expiry                Ignore expiry information in imported data\n"
@@ -6029,6 +6031,7 @@ int main(int argc, char *argv[])
     }
 
     // If needed, data verification is done now...
+    bool verify_failed = false;
     if (cfg.data_verify) {
         struct event_base *verify_event_base = event_base_new();
         abstract_protocol *verify_protocol = protocol_factory(cfg.protocol);
@@ -6051,6 +6054,16 @@ int main(int argc, char *argv[])
             jsonhandler->write_obj("keys verified successfuly", "%-10llu", client->get_verified_keys());
             jsonhandler->write_obj("keys failed", "%-10llu", client->get_errors());
             jsonhandler->close_nesting();
+        }
+
+        const unsigned long long verified_keys = client->get_verified_keys();
+        const unsigned long long failed_keys = client->get_errors();
+        if (failed_keys > 0) {
+            fprintf(stderr, "error: %llu of %llu keys failed verification\n", failed_keys, verified_keys + failed_keys);
+            verify_failed = true;
+        } else if (verified_keys == 0) {
+            fprintf(stderr, "error: no keys were verified\n");
+            verify_failed = true;
         }
 
         // Clean up...
@@ -6168,7 +6181,7 @@ int main(int argc, char *argv[])
         return 1;
     }
     // An output could not be written (see g_output_failed).
-    if (g_output_failed) {
+    if (g_output_failed || verify_failed) {
         return 1;
     }
     return 0;

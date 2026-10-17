@@ -152,6 +152,10 @@ awk '$2==1{l1=$1+0} $2==2 && !d{d=1; exit !($1+0 >= l1)}' /tmp/mono.txt || fail 
 rc=0; wait "$MBPID" || rc=$?; assert_eq "$rc" 0 "memtier exit code"
 promtool_check < /tmp/prom_scrape.txt                  || fail "promtool lint"
 curl -s --max-time 2 "$URL" >/dev/null 2>&1 && fail "port not released after exit (F14)" || true
+# A successful verify-only teardown requires matching data (#768).
+timeout 30 "$MB" -s 127.0.0.1 -p "$RPORT" --data-import=tests/data-import-2-keys.txt \
+  --ratio=1:0 --key-pattern=P:P -t 1 -c 1 -n 2 >/tmp/mbv-preload.out 2>&1 \
+  || fail "verify-only preload"
 for i in $(seq 1 10); do
   timeout 30 "$MB" -s 127.0.0.1 -p "$RPORT" --verify-only \
     --data-import=tests/data-import-2-keys.txt --prometheus-port=0 >/tmp/mbv.out 2>&1 \

@@ -374,6 +374,21 @@ The same rule covers the other output files:
 A stdout that was already closed when memtier started is handled separately,
 see [Closed stdin, stdout or stderr](#closed-stdin-stdout-or-stderr).
 
+### Data verification (`--data-verify`, `--verify-only`)
+
+With `--data-import=FILE`, `--data-verify` reads imported keys back after the
+benchmark and compares their values with the file. `--verify-only` runs only
+that verification pass. The existing text and JSON summaries count matching
+and failed keys.
+
+If any checked key is missing, has the wrong value, or returns an error,
+memtier prints `error: N of M keys failed verification` and exits with status
+**1**. A pass that verifies no key (for example, because the server is
+unreachable) prints `error: no keys were verified` and also exits with **1**.
+Successful verification exits with **0**, unless another run or output error
+occurred. A benchmark connection-stage abort still takes precedence and exits
+with **2**. Import and verification remain unsupported in cluster mode.
+
 ### Closed stdin, stdout or stderr
 
 If a benchmark run is started with stdin, stdout or stderr closed (for

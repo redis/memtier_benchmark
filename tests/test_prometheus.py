@@ -824,6 +824,10 @@ def test_F15_teardown_race_window(env):
         import_file = alt if os.path.isfile(alt) else import_file
     env.assertTrue(os.path.isfile(import_file),
                    message="data-import fixture not found: {}".format(import_file))
+    # A teardown success requires a successful verification (#768).
+    conn = env.getConnection()
+    conn.set("key1", "xxxxxxxxxx")
+    conn.set("key2", "aaaaaaaaaaaa")
     for i in range(8):
         rd = _new_results_dir()
         proc, out_path, err_path = _popen_memtier(
