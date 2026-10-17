@@ -38,6 +38,7 @@ class json_handler
 {
 protected:
     FILE *m_json_file;
+    bool m_error_written;
     // This list is used later for closing the nesting
     std::list<eJSON_NESTED_TYPE> m_nest_closer_types;
     void beutify(bool only_tabs = false);
@@ -52,6 +53,10 @@ public:
 
     // Write a single object to JSON
     void write_obj(const char *objectname, const char *format, ...);
+
+    // Append one escaped, top-level fatal-error summary. Existing results are
+    // retained. Call only after all normal fields have been written.
+    void write_error(const char *message);
 
     // Starts nesting, the type is used for deciding which charecter to be used for opening and closing
     // the nesting ('{}','[]')

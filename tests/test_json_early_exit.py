@@ -32,9 +32,10 @@ def _configuration_only(env, result, path, diagnostic):
     env.assertContains(diagnostic, result.stderr)
     with open(path) as output:
         document = json.load(output)
-    env.assertEqual(list(document), ["configuration"])
+    env.assertEqual(list(document), ["configuration", "FATAL_ERROR"])
+    env.assertEqual(document["FATAL_ERROR"], "Benchmark terminated before completing results")
     env.assertEqual(document["configuration"]["threads"], 1)
-    env.assertEqual(result.stderr.count("Json file closed."), 1)
+    env.assertNotContains("Json file closed.", result.stderr)
 
 
 def test_json_closed_on_thread_prepare_failure(env):

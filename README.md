@@ -374,6 +374,20 @@ The same rule covers the other output files:
 A stdout that was already closed when memtier started is handled separately,
 see [Closed stdin, stdout or stderr](#closed-stdin-stdout-or-stderr).
 
+### Fatal errors in JSON results
+
+Once `--json-out-file` has opened, a fatal benchmark, connection-setup,
+verification or other output failure adds a top-level `FATAL_ERROR` string.
+Configuration and any results already written are retained. The string is a
+short failure category; stderr keeps the detailed diagnostic, and the existing
+exit status remains authoritative. Successful runs, recovered errors and graceful
+interrupts do not acquire a fatal summary unless another failure occurred.
+
+Validation failures before JSON initialization leave an existing JSON file
+untouched. A failure writing the JSON file itself, a crash, or a forced process
+termination cannot guarantee a complete artifact. JSON lifecycle notices are
+printed only with `--debug`.
+
 ### Import-file validation
 
 `--data-import` validates the file before connecting, including with

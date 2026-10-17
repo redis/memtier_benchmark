@@ -26,6 +26,7 @@
 #include <cmath> // For std::isfinite
 #include "JSON_handler.h"
 #include "file_io.h"
+#include "memtier_benchmark.h"
 
 
 /**
@@ -34,7 +35,7 @@
  * Opens the file named jsonfilename and sets the first nesting as NESTED_GENERAL
  * In case of failure to create the file, prints the error and exits
  */
-json_handler::json_handler(const char *jsonfilename) : m_json_file(NULL)
+json_handler::json_handler(const char *jsonfilename) : m_json_file(NULL), m_error_written(false)
 {
     // Try to open a file and add the first level. Retry on EINTR: a Ctrl+C or
     // SIGTERM can arrive while fopen() blocks (e.g. on a FIFO), and not every
@@ -47,7 +48,7 @@ json_handler::json_handler(const char *jsonfilename) : m_json_file(NULL)
         exit(1);
     }
     // opening the JSON
-    fprintf(stderr, "Json file %s created...\n", jsonfilename);
+    benchmark_debug_log("Json file %s created...\n", jsonfilename);
     fprintf(m_json_file, "{");
     m_nest_closer_types.push_back(NESTED_GENERAL);
     beutify();
@@ -75,8 +76,17 @@ int json_handler::close()
         ;
     int err = finish_output_file(m_json_file, true);
     m_json_file = NULL;
-    if (err == 0) fprintf(stderr, "Json file closed.\n");
+    if (err == 0) benchmark_debug_log("Json file closed.\n");
     return err;
+}
+
+void json_handler::write_error(const char *message)
+{
+    if (m_json_file == NULL || m_error_written) return;
+    while (m_nest_closer_types.size() > 1)
+        close_nesting();
+    write_obj("FATAL_ERROR", "\"%s\"", message ? message : "Unknown fatal error");
+    m_error_written = true;
 }
 
 /**

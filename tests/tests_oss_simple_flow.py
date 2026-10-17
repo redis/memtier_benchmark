@@ -1812,9 +1812,9 @@ def test_out_file_replaces_existing(env):
     process = subprocess.run(benchmark.args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=60)
     stderr = process.stderr.decode(errors='replace')
     env.assertEqual(process.returncode, 0, message=stderr)
-    # The JSON file is opened before the results file is truncated, but the
-    # stderr notes keep their old order.
-    env.assertLess(stderr.index("Json file "), stderr.index("Writing results to " + out_path))
+    # JSON lifecycle notices are debug-only; normal result diagnostics remain.
+    env.assertNotContains("Json file ", stderr)
+    env.assertContains("Writing results to " + out_path, stderr)
     with open(out_path) as f:
         out = f.read()
     env.assertNotContains('stale', out)

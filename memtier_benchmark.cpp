@@ -226,13 +226,16 @@ static bool g_worker_failed = false;
 static bool g_output_failed = false;
 
 // main owns the JSON writer. Workers never write JSON, and main writes results
-// after joining them, so the exit callback sees a quiescent writer. Close only
+// after joining them, so the exit callback sees a quiescent writer. Retain
 // content already emitted, including benchmark results if verification exits.
 static json_handler *g_json_out_file = NULL;
 
 static void close_json_out_file_at_exit(void)
 {
-    if (g_json_out_file != NULL) g_json_out_file->close();
+    if (g_json_out_file != NULL) {
+        g_json_out_file->write_error("Benchmark terminated before completing results");
+        g_json_out_file->close();
+    }
 }
 
 // Forward declarations
@@ -6129,9 +6132,25 @@ int main(int argc, char *argv[])
         cfg.server_addr = NULL;
     }
 
+    // Workers have joined, so close the failed-key log before finalizing JSON
+    // to include any late write failure in its fatal-error summary.
+    if (cfg.failed_keys_file && global_failed_keys_logger().close() != 0) {
+        g_output_failed = true;
+    }
+
     if (jsonhandler != NULL) {
-        // Log message for saving JSON file
-        fprintf(stderr, "Saving JSON output file: %s\n", cfg.json_out_file);
+        // Summaries are fixed strings: detailed diagnostics remain on stderr,
+        // and server replies or credentials are not copied into the artifact.
+        if (g_any_run_connection_stage_aborted.load(std::memory_order_acquire)) {
+            jsonhandler->write_error("Connection setup failed");
+        } else if (g_worker_failed) {
+            jsonhandler->write_error("Benchmark worker stopped before completion");
+        } else if (g_output_failed) {
+            jsonhandler->write_error("A requested output could not be written");
+        } else if (verify_failed) {
+            jsonhandler->write_error("Data verification failed or did not complete");
+        }
+        benchmark_debug_log("Saving JSON output file: %s\n", cfg.json_out_file);
 
         // closing the JSON
         int json_err = jsonhandler->close();
@@ -6141,15 +6160,6 @@ int main(int argc, char *argv[])
         }
         g_json_out_file = NULL;
         delete jsonhandler;
-    }
-
-    // On this normal path all worker threads are joined, so nothing logs
-    // failed keys any more and the log can be closed and checked. A record
-    // that could not be written was reported when it happened. The early
-    // exit(failure_exit_code()) paths skip both the join and this close (see
-    // global_failed_keys_logger()).
-    if (cfg.failed_keys_file && global_failed_keys_logger().close() != 0) {
-        g_output_failed = true;
     }
 
     delete obj_gen;
