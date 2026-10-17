@@ -1530,6 +1530,18 @@ void shard_connection::rearm_readonly()
     m_readonly_state = setup_sent;
 }
 
+// Redis can send these errors before accepting workload, then close the
+// connection. They must not disarm startup supervision or reset retry budgets.
+static bool is_redis_connection_rejection(const char *status)
+{
+    static const char protocol[] = "-ERR Protocol error:";
+    static const char maxclients[] = "-ERR max number of clients ";
+    static const char protected_mode[] = "-DENIED Redis is running in protected mode ";
+    return status && (strncmp(status, protocol, sizeof(protocol) - 1) == 0 ||
+                      strncmp(status, maxclients, sizeof(maxclients) - 1) == 0 ||
+                      strncmp(status, protected_mode, sizeof(protected_mode) - 1) == 0);
+}
+
 void shard_connection::process_response(void)
 {
     int ret;
@@ -1732,15 +1744,14 @@ void shard_connection::process_response(void)
                 m_conns_manager->inc_reqs_processed();
                 responses_handled = true;
             }
-            // First *successful* post-setup response observed: tell the
-            // supervisor we reached steady state. Idempotent.
-            //
-            // We deliberately do NOT count error responses as steady state
-            // — a -ERR can fire on the very first request (e.g. the
-            // 'invalid bulk length' loop from #426 #8) and then close the
-            // connection, dropping the worker into an infinite reconnect
-            // loop that the supervisor would otherwise be disarmed against.
-            if (!r->is_error()) {
+            // A valid workload reply proves setup completed, even when the
+            // command was rejected or queued for retry. Redis protocol and
+            // accept-time rejections are different: the server closes after
+            // replying. Treating them as progress would disarm the startup
+            // supervisor and reset the reconnect budget on every attempt.
+            bool connection_rejected = r->is_error() && is_redis_protocol(m_config->protocol) &&
+                                       is_redis_connection_rejection(r->get_status());
+            if (!connection_rejected) {
                 report_connection_stage_success();
                 // Steady state reached: reset the per-connection reconnect
                 // attempts counter now (not at BEV_EVENT_CONNECTED). The
@@ -1748,7 +1759,7 @@ void shard_connection::process_response(void)
                 // -NOREPLICATION lands, so resetting on connect would
                 // defeat --max-reconnect-attempts; resetting here ties the
                 // counter to setup-ladder lifetime instead. Idempotent —
-                // subsequent successful responses just re-assign 0.
+                // subsequent workload replies just re-assign 0.
                 if (m_reconnect_attempts > 0) {
                     benchmark_error_log("Reconnection successful after %u attempts.\n", m_reconnect_attempts);
                 }
