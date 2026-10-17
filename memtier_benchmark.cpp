@@ -227,7 +227,7 @@ static bool g_output_failed = false;
 
 // main owns the JSON writer. Workers never write JSON, and main only writes
 // results after joining them, so an exit() from preparation or a worker can
-// safely finish the configuration/previous runs without publishing partial stats.
+// safely finish the configuration without publishing partial stats.
 static json_handler *g_json_out_file = NULL;
 
 static void close_json_out_file_at_exit(void)
