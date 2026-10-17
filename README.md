@@ -725,7 +725,7 @@ mapping, threat model, and operational notes.
 
 ### Progress display interval
 
-Use `--print-frequency=5` (or `-f 5`) to print progress every five seconds.
+Use `--progress-interval=5` to print progress every five seconds.
 The default is one second; values must be positive whole seconds. This applies
 to both the single-line display and `--realtime-latencies`. A final progress
 update is printed on normal completion. Connection errors and other
@@ -734,4 +734,4 @@ diagnostics are not suppressed.
 Only display rendering is throttled. Timeouts, interruption, StatsD/Prometheus
 exports and CPU/latency sampling retain their existing cadence. Instantaneous
 rates and latencies describe the most recent sample, not the whole display
-interval. JSON configuration records the interval as `print_frequency`.
+interval. JSON configuration records the interval as `progress_interval`.

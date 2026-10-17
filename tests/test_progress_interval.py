@@ -35,46 +35,50 @@ def _run(env, extra, seconds=None, requests=None):
     return frames, results
 
 
-def test_print_frequency_validation(env):
+def test_progress_interval_validation(env):
     for value in ("0", "-1", "-0", "", "1.5", "2x", "4294967296", "999999999999999999999"):
-        result = subprocess.run([MEMTIER_BINARY, "--print-frequency=" + value, "--version"],
+        result = subprocess.run([MEMTIER_BINARY, "--progress-interval=" + value, "--version"],
                                 capture_output=True, text=True, timeout=10)
         env.assertEqual(result.returncode, 2, message=repr(value) + result.stderr)
-        env.assertContains("print-frequency must be", result.stderr)
+        env.assertContains("progress-interval must be", result.stderr)
     for value in ("1", "2", "4294967295"):
-        result = subprocess.run([MEMTIER_BINARY, "-f", value, "--version"],
+        result = subprocess.run([MEMTIER_BINARY, "--progress-interval", value, "--version"],
                                 capture_output=True, text=True, timeout=10)
         env.assertEqual(result.returncode, 0, message=repr(value) + result.stderr)
 
 
-def test_print_frequency_default_and_short_option(env):
+def test_progress_interval_default_and_maximum(env):
     frames, results = _run(env, [], seconds=3)
     env.assertGreaterEqual(len(frames), 3)
-    env.assertEqual(results["configuration"]["print_frequency"], 1)
+    env.assertEqual(results["configuration"]["progress_interval"], 1)
     env.assertGreater(results["ALL STATS"]["Totals"]["Count"], 0)
-    # The short spelling and the largest accepted value must still render the
+    # The largest accepted interval must still render the
     # final frame even when no periodic frame was due.
-    frames, results = _run(env, ["-f", "4294967295"], requests=10)
+    frames, results = _run(env, ["--progress-interval", "4294967295"], requests=10)
     env.assertEqual(len(frames), 1)
     env.assertContains("100%", frames[0])
-    env.assertEqual(results["configuration"]["print_frequency"], 4294967295)
+    env.assertEqual(results["configuration"]["progress_interval"], 4294967295)
     env.assertEqual(results["ALL STATS"]["Totals"]["Count"], 10)
 
 
-def test_print_frequency_throttles_both_displays(env):
+def test_progress_interval_throttles_both_displays(env):
     for display in ([], ["--realtime-latencies"]):
-        frames, results = _run(env, ["--print-frequency=2"] + display, seconds=5)
+        frames, results = _run(env, ["--progress-interval=2"] + display, seconds=5)
         # At least one periodic frame plus completion; fewer frames than the
         # unthrottled five-second run. Bounds allow a delayed supervisor tick.
         env.assertGreaterEqual(len(frames), 2, message=str(frames))
         env.assertLessEqual(len(frames), 4, message=str(frames))
-        env.assertContains("100%", frames[-1])
-        env.assertEqual(results["configuration"]["print_frequency"], 2)
+        # A delayed final tick can legitimately finish above 100%.
+        completion = re.search(r"(\d+)%", frames[-1])
+        env.assertTrue(completion is not None, message=frames[-1])
+        if completion is not None:
+            env.assertGreaterEqual(int(completion.group(1)), 100)
+        env.assertEqual(results["configuration"]["progress_interval"], 2)
         env.assertGreater(results["ALL STATS"]["Totals"]["Count"], 0)
 
 
-def test_print_frequency_final_frame_each_run(env):
-    frames, results = _run(env, ["--print-frequency=100", "--run-count=2"], requests=10)
+def test_progress_interval_final_frame_each_run(env):
+    frames, results = _run(env, ["--progress-interval=100", "--run-count=2"], requests=10)
     env.assertEqual(len(frames), 2, message=str(frames))
     if len(frames) == 2:
         env.assertContains("RUN #1", frames[0])
@@ -83,14 +87,14 @@ def test_print_frequency_final_frame_each_run(env):
     env.assertEqual(results["configuration"]["run_count"], 2)
 
 
-def test_print_frequency_does_not_throttle_metrics(env):
+def test_progress_interval_does_not_throttle_metrics(env):
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver, socket.socket() as graphite:
         # Reserve an unlistened TCP endpoint so event annotations cannot reach
         # an unrelated Graphite service on the default port.
         graphite.bind(("127.0.0.1", 0))
         receiver.bind(("127.0.0.1", 0))
         receiver.settimeout(0.1)
-        frames, results = _run(env, ["--print-frequency=100", "--statsd-host=127.0.0.1",
+        frames, results = _run(env, ["--progress-interval=100", "--statsd-host=127.0.0.1",
                                    "--statsd-port=" + str(receiver.getsockname()[1]),
                                    "--graphite-port=" + str(graphite.getsockname()[1]),
                                    "--statsd-prefix=frequency"], seconds=3)
@@ -108,7 +112,7 @@ def test_print_frequency_does_not_throttle_metrics(env):
     env.assertGreater(results["ALL STATS"]["Totals"]["Count"], 0)
 
 
-def test_print_frequency_keeps_latency_samples_from_hidden_ticks(env):
+def test_progress_interval_keeps_latency_samples_from_hidden_ticks(env):
     """A slow first request must survive until the sole final latency frame."""
     import socketserver
     import threading
@@ -144,7 +148,7 @@ def test_print_frequency_keeps_latency_samples_from_hidden_ticks(env):
                 result = subprocess.run(
                     [MEMTIER_BINARY, "-s", "127.0.0.1", "-p", str(peer.server_address[1]),
                      "-a", "dummy-frequency", "-t", "1", "-c", "1", "--ratio=1:0",
-                     "--requests=250", "--rate-limiting=100", "--print-frequency=100",
+                     "--requests=250", "--rate-limiting=100", "--progress-interval=100",
                      "--realtime-latencies", "--print-percentiles=100", "--json-out-file=" + path],
                     capture_output=True, text=True, timeout=15)
                 env.assertEqual(result.returncode, 0, message=result.stderr)

@@ -876,7 +876,7 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             "out_file = %s\n"
             "client_stats = %s\n"
             "run_count = %u\n"
-            "print_frequency = %u\n"
+            "progress_interval = %u\n"
             "debug = %u\n"
             "requests = %llu\n"
             "rate_limit = %u\n"
@@ -940,7 +940,7 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             cfg->tls ? "yes" : "no", cfg->tls_cert, cfg->tls_key, cfg->tls_cacert, cfg->tls_skip_verify ? "yes" : "no",
             cfg->tls_sni,
 #endif
-            cfg->out_file, cfg->client_stats, cfg->run_count, cfg->print_frequency, cfg->debug, cfg->requests,
+            cfg->out_file, cfg->client_stats, cfg->run_count, cfg->progress_interval, cfg->debug, cfg->requests,
             cfg->request_rate, cfg->clients, cfg->threads, cfg->test_time, cfg->ratio.a, cfg->ratio.b, cfg->pipeline,
             cfg->transaction ? "yes" : "no", cfg->data_size, cfg->data_offset, cfg->random_data ? "yes" : "no",
             cfg->data_size_range.min, cfg->data_size_range.max, cfg->data_size_list.print(tmpbuf, sizeof(tmpbuf) - 1),
@@ -997,7 +997,7 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
 #endif
     jsonhandler->write_obj("client_stats", "\"%s\"", cfg->client_stats);
     jsonhandler->write_obj("run_count", "%u", cfg->run_count);
-    jsonhandler->write_obj("print_frequency", "%u", cfg->print_frequency);
+    jsonhandler->write_obj("progress_interval", "%u", cfg->progress_interval);
     jsonhandler->write_obj("debug", "%u", cfg->debug);
     jsonhandler->write_obj("requests", "%llu", cfg->requests);
     jsonhandler->write_obj("rate_limit", "%u", cfg->request_rate);
@@ -1456,7 +1456,7 @@ static void config_init_defaults(struct benchmark_config *cfg)
     if (!cfg->port && !cfg->unix_socket) cfg->port = 6379;
     if (!cfg->resolution) cfg->resolution = AF_UNSPEC;
     if (!cfg->run_count) cfg->run_count = 1;
-    if (!cfg->print_frequency) cfg->print_frequency = 1;
+    if (!cfg->progress_interval) cfg->progress_interval = 1;
     if (!cfg->clients) cfg->clients = 50;
     if (!cfg->threads) cfg->threads = 4;
     if (!cfg->ratio.is_defined()) cfg->ratio = config_ratio("1:10");
@@ -1674,6 +1674,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_key_zipf_exp,
         o_show_config,
         o_hide_histogram,
+        o_progress_interval,
         o_print_percentiles,
         o_print_all_runs,
         o_realtime_latencies,
@@ -1771,7 +1772,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         {"debug", 0, 0, 'D'},
         {"show-config", 0, 0, o_show_config},
         {"hide-histogram", 0, 0, o_hide_histogram},
-        {"print-frequency", 1, 0, 'f'},
+        {"progress-interval", 1, 0, o_progress_interval},
         {"print-percentiles", 1, 0, o_print_percentiles},
         {"print-all-runs", 0, 0, o_print_all_runs},
         {"realtime-latencies", 0, 0, o_realtime_latencies},
@@ -1867,7 +1868,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
     int c;
     char *endptr;
     unsigned long long val;
-    while ((c = getopt_long(argc, argv, "vs:S:p:P:f:o:x:DRn:c:t:d:a:h:46u:", long_options, &option_index)) != -1) {
+    while ((c = getopt_long(argc, argv, "vs:S:p:P:o:x:DRn:c:t:d:a:h:46u:", long_options, &option_index)) != -1) {
         switch (c) {
         case o_help:
             return -1;
@@ -1923,14 +1924,14 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 return -1;
             }
             break;
-        case 'f': {
+        case o_progress_interval: {
             bool too_large;
             bool parsed = parse_unsigned(optarg, UINT_MAX, &val, &too_large);
             if (!parsed || !val) {
-                count_option_error("print-frequency", parsed, too_large, UINT_MAX, " seconds");
+                count_option_error("progress-interval", parsed, too_large, UINT_MAX, " seconds");
                 return -1;
             }
-            cfg->print_frequency = (unsigned int) val;
+            cfg->progress_interval = (unsigned int) val;
             break;
         }
         case '4':
@@ -3131,7 +3132,7 @@ void usage()
         "latency histogram files\n"
         "      --show-config              Print detailed configuration before running\n"
         "      --hide-histogram           Don't print detailed latency histogram\n"
-        "  -f, --print-frequency=SECONDS  Progress display interval in positive whole seconds (default: 1).\n"
+        "      --progress-interval=SECONDS  Progress display interval in positive whole seconds (default: 1).\n"
         "                                 A final update is printed on normal completion; errors are not throttled.\n"
         "                                 Supervision and metric sampling keep their existing cadence.\n"
         "                                 Instantaneous rates describe the most recent sample, not the display "
@@ -4324,13 +4325,13 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         const std::vector<int64_t> &inst_values = inst_percentiles.values();
 
         // Keep all samples in the run-lifetime histogram, including ticks
-        // whose progress frame is suppressed by --print-frequency.
+        // whose progress frame is suppressed by --progress-interval.
         if (rtl_totals_hist != NULL && inst_samples) hdr_add(rtl_totals_hist, inst_hist_agg);
 
         // Only rendering is throttled. Keep supervisor deadlines, metric
         // exports and per-second sampling on their existing cadence.
         auto progress_now = std::chrono::steady_clock::now();
-        if (active_threads == 0 || progress_now - last_progress_time >= std::chrono::seconds(cfg->print_frequency)) {
+        if (active_threads == 0 || progress_now - last_progress_time >= std::chrono::seconds(cfg->progress_interval)) {
             last_progress_time = progress_now;
             if (cfg->realtime_latencies) {
                 // Two-line, time-series-friendly block. On a TTY we move the cursor

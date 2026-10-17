@@ -120,7 +120,7 @@ struct benchmark_config
     int debug;
     int show_config;
     int hide_histogram;
-    unsigned int print_frequency;
+    unsigned int progress_interval;
     config_quantiles print_percentiles;
     bool print_all_runs;
     bool realtime_latencies;
