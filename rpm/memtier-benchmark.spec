@@ -15,7 +15,6 @@ BuildRequires:  gcc-c++
 BuildRequires:  make
 BuildRequires:  autoconf
 BuildRequires:  automake
-BuildRequires:  libtool
 BuildRequires:  libevent-devel
 BuildRequires:  openssl-devel
 BuildRequires:  zlib-devel

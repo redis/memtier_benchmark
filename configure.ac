@@ -22,7 +22,6 @@ AC_CONFIG_HEADER([config.h])
 AM_INIT_AUTOMAKE
 AM_SILENT_RULES([yes])
 AC_CONFIG_MACRO_DIR([m4])
-LT_INIT
 
 # Python is only required for the maintainer-only `make commands-meta` target.
 # Resolve to ":" (the no-op shell builtin) when absent so end-user builds keep

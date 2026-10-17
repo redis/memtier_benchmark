@@ -43,7 +43,7 @@ $ sudo apt-get install build-essential autoconf automake \
 To build natively on macOS, use Homebrew to install the required dependencies:
 
 ```
-$ brew install autoconf automake libtool libevent pkg-config clang-format
+$ brew install autoconf automake libevent pkg-config clang-format
 ```
 
 memtier must use the same OpenSSL that Homebrew's `libevent` is linked against.
