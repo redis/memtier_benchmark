@@ -33,6 +33,7 @@
 
 #include "version.h"
 
+#include <chrono>
 #include <pthread.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -880,6 +881,7 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             "out_file = %s\n"
             "client_stats = %s\n"
             "run_count = %u\n"
+            "progress_interval = %u\n"
             "debug = %u\n"
             "requests = %llu\n"
             "rate_limit = %u\n"
@@ -943,8 +945,8 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             cfg->tls ? "yes" : "no", cfg->tls_cert, cfg->tls_key, cfg->tls_cacert, cfg->tls_skip_verify ? "yes" : "no",
             cfg->tls_sni,
 #endif
-            cfg->out_file, cfg->client_stats, cfg->run_count, cfg->debug, cfg->requests, cfg->request_rate,
-            cfg->clients, cfg->threads, cfg->test_time, cfg->ratio.a, cfg->ratio.b, cfg->pipeline,
+            cfg->out_file, cfg->client_stats, cfg->run_count, cfg->progress_interval, cfg->debug, cfg->requests,
+            cfg->request_rate, cfg->clients, cfg->threads, cfg->test_time, cfg->ratio.a, cfg->ratio.b, cfg->pipeline,
             cfg->transaction ? "yes" : "no", cfg->data_size, cfg->data_offset, cfg->random_data ? "yes" : "no",
             cfg->data_size_range.min, cfg->data_size_range.max, cfg->data_size_list.print(tmpbuf, sizeof(tmpbuf) - 1),
             cfg->data_size_pattern, cfg->expiry_range.min, cfg->expiry_range.max, cfg->data_import,
@@ -1000,6 +1002,7 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
 #endif
     jsonhandler->write_obj("client_stats", "\"%s\"", cfg->client_stats);
     jsonhandler->write_obj("run_count", "%u", cfg->run_count);
+    jsonhandler->write_obj("progress_interval", "%u", cfg->progress_interval);
     jsonhandler->write_obj("debug", "%u", cfg->debug);
     jsonhandler->write_obj("requests", "%llu", cfg->requests);
     jsonhandler->write_obj("rate_limit", "%u", cfg->request_rate);
@@ -1458,6 +1461,7 @@ static void config_init_defaults(struct benchmark_config *cfg)
     if (!cfg->port && !cfg->unix_socket) cfg->port = 6379;
     if (!cfg->resolution) cfg->resolution = AF_UNSPEC;
     if (!cfg->run_count) cfg->run_count = 1;
+    if (!cfg->progress_interval) cfg->progress_interval = 1;
     if (!cfg->clients) cfg->clients = 50;
     if (!cfg->threads) cfg->threads = 4;
     if (!cfg->ratio.is_defined()) cfg->ratio = config_ratio("1:10");
@@ -1675,6 +1679,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_key_zipf_exp,
         o_show_config,
         o_hide_histogram,
+        o_progress_interval,
         o_print_percentiles,
         o_print_all_runs,
         o_realtime_latencies,
@@ -1772,6 +1777,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         {"debug", 0, 0, 'D'},
         {"show-config", 0, 0, o_show_config},
         {"hide-histogram", 0, 0, o_hide_histogram},
+        {"progress-interval", 1, 0, o_progress_interval},
         {"print-percentiles", 1, 0, o_print_percentiles},
         {"print-all-runs", 0, 0, o_print_all_runs},
         {"realtime-latencies", 0, 0, o_realtime_latencies},
@@ -1923,6 +1929,16 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 return -1;
             }
             break;
+        case o_progress_interval: {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, UINT_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("progress-interval", parsed, too_large, UINT_MAX, " seconds");
+                return -1;
+            }
+            cfg->progress_interval = (unsigned int) val;
+            break;
+        }
         case '4':
             cfg->resolution = AF_INET;
             break;
@@ -3133,6 +3149,12 @@ void usage()
         "latency histogram files\n"
         "      --show-config              Print detailed configuration before running\n"
         "      --hide-histogram           Don't print detailed latency histogram\n"
+        "      --progress-interval=SECONDS  Progress display interval in positive whole seconds (default: 1).\n"
+        "                                 A final update is printed on normal completion; separate error diagnostics "
+        "are not throttled.\n"
+        "                                 Supervision and metric sampling keep their existing cadence.\n"
+        "                                 Instantaneous rates describe the most recent sample, not the display "
+        "interval.\n"
         "      --print-percentiles        Specify which percentiles info to print on the results table (by default "
         "prints percentiles: 50,99,99.9)\n"
         "      --print-all-runs           When performing multiple test iterations, print and save results for all "
@@ -4140,6 +4162,7 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     // These stats are only for progress display and are approximate. Final results are
     // collected after pthread_join() when all threads have finished (race-free).
     unsigned int active_threads = 0;
+    auto last_progress_time = std::chrono::steady_clock::now();
     do {
         active_threads = 0;
         sleep(1);
@@ -4319,161 +4342,165 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         if (inst_samples) inst_percentiles.calculate(inst_hist_agg);
         const std::vector<int64_t> &inst_values = inst_percentiles.values();
 
-        if (cfg->realtime_latencies) {
-            // Two-line, time-series-friendly block. On a TTY we move the cursor
-            // back up 2 lines so the block redraws in place; on a non-TTY (file
-            // capture / piped log) we just keep appending, which turns the
-            // stderr stream into a clean 2-rows-per-second time series.
-            char tag[40];
-            snprintf(tag, sizeof(tag), "[RUN #%u %3.0f%% %3lus]", run_id, progress,
-                     (unsigned long) (duration / 1000000));
+        // Keep all samples in the run-lifetime histogram, including ticks
+        // whose progress frame is suppressed by --progress-interval.
+        if (rtl_totals_hist != NULL && inst_samples) hdr_add(rtl_totals_hist, inst_hist_agg);
 
-            char cur_ops_str[32], avg_ops_str[32];
-            format_with_commas(cur_ops_sec, cur_ops_str, sizeof(cur_ops_str));
-            format_with_commas(ops_sec, avg_ops_str, sizeof(avg_ops_str));
+        // Only rendering is throttled. Keep supervisor deadlines, metric
+        // exports and per-second sampling on their existing cadence.
+        auto progress_now = std::chrono::steady_clock::now();
+        if (active_threads == 0 || progress_now - last_progress_time >= std::chrono::seconds(cfg->progress_interval)) {
+            last_progress_time = progress_now;
+            if (cfg->realtime_latencies) {
+                // Two-line, time-series-friendly block. On a TTY we move the cursor
+                // back up 2 lines so the block redraws in place; on a non-TTY (file
+                // capture / piped log) we just keep appending, which turns the
+                // stderr stream into a time series at the selected display interval.
+                char tag[40];
+                snprintf(tag, sizeof(tag), "[RUN #%u %3.0f%% %3lus]", run_id, progress,
+                         (unsigned long) (duration / 1000000));
 
-            // Miss ratio: per-second (delta) and cumulative.
-            unsigned long long int cur_lookups = (total_hits - prev_hits) + (total_misses - prev_misses);
-            unsigned long long int tot_lookups = total_hits + total_misses;
-            char cur_miss_str[16], avg_miss_str[16];
-            if (cur_lookups > 0)
-                snprintf(cur_miss_str, sizeof(cur_miss_str), "%5.2f%%",
-                         100.0 * (double) (total_misses - prev_misses) / (double) cur_lookups);
-            else
-                snprintf(cur_miss_str, sizeof(cur_miss_str), "  -  ");
-            if (tot_lookups > 0)
-                snprintf(avg_miss_str, sizeof(avg_miss_str), "%5.2f%%",
-                         100.0 * (double) total_misses / (double) tot_lookups);
-            else
-                snprintf(avg_miss_str, sizeof(avg_miss_str), "  -  ");
+                char cur_ops_str[32], avg_ops_str[32];
+                format_with_commas(cur_ops_sec, cur_ops_str, sizeof(cur_ops_str));
+                format_with_commas(ops_sec, avg_ops_str, sizeof(avg_ops_str));
 
-            // Abort ratio (--transaction only): EXEC optimistic-lock aborts as a
-            // share of the same lookup denominator. Aborts are a subset of misses,
-            // so abort% <= miss%. It's a blended live indicator across all
-            // arbitrary commands; the authoritative per-command abort rate is in
-            // the final table / "abort rate" warning.
-            char cur_abort_str[16], avg_abort_str[16];
-            if (cur_lookups > 0)
-                snprintf(cur_abort_str, sizeof(cur_abort_str), "%5.2f%%",
-                         100.0 * (double) (total_aborts - prev_aborts) / (double) cur_lookups);
-            else
-                snprintf(cur_abort_str, sizeof(cur_abort_str), "  -  ");
-            if (tot_lookups > 0)
-                snprintf(avg_abort_str, sizeof(avg_abort_str), "%5.2f%%",
-                         100.0 * (double) total_aborts / (double) tot_lookups);
-            else
-                snprintf(avg_abort_str, sizeof(avg_abort_str), "  -  ");
+                // Miss ratio: per-second (delta) and cumulative.
+                unsigned long long int cur_lookups = (total_hits - prev_hits) + (total_misses - prev_misses);
+                unsigned long long int tot_lookups = total_hits + total_misses;
+                char cur_miss_str[16], avg_miss_str[16];
+                if (cur_lookups > 0)
+                    snprintf(cur_miss_str, sizeof(cur_miss_str), "%5.2f%%",
+                             100.0 * (double) (total_misses - prev_misses) / (double) cur_lookups);
+                else
+                    snprintf(cur_miss_str, sizeof(cur_miss_str), "  -  ");
+                if (tot_lookups > 0)
+                    snprintf(avg_miss_str, sizeof(avg_miss_str), "%5.2f%%",
+                             100.0 * (double) total_misses / (double) tot_lookups);
+                else
+                    snprintf(avg_miss_str, sizeof(avg_miss_str), "  -  ");
 
-            char line1[640];
-            int line1_used = 0;
-            if (total_connection_errors > 0) {
-                line1_used = snprintf(
-                    line1, sizeof(line1),
-                    "%s throughput %s (avg: %s) ops/sec   %s/sec (avg: %s/sec)   miss %s (avg: %s)   conn_err %llu",
-                    tag, cur_ops_str, avg_ops_str, cur_bytes_str, bytes_str, cur_miss_str, avg_miss_str,
-                    total_connection_errors);
-            } else {
-                line1_used =
-                    snprintf(line1, sizeof(line1),
-                             "%s throughput %s (avg: %s) ops/sec   %s/sec (avg: %s/sec)   miss %s (avg: %s)", tag,
-                             cur_ops_str, avg_ops_str, cur_bytes_str, bytes_str, cur_miss_str, avg_miss_str);
-            }
-            // Abort tail: only under --transaction so default arbitrary-command
-            // output is unchanged for existing log-scraping.
-            if (cfg->transaction && line1_used > 0 && (size_t) line1_used < sizeof(line1)) {
-                int n = snprintf(line1 + line1_used, sizeof(line1) - line1_used, "   abort %s (avg: %s)", cur_abort_str,
-                                 avg_abort_str);
-                if (n > 0) line1_used += n;
-            }
-            // Retry/error tail: only printed when --retry-on-error is enabled
-            // so existing CI / log-scraping is unaffected by default.
-            if (cfg->retry_on_error && line1_used > 0 && (size_t) line1_used < sizeof(line1)) {
-                unsigned long long int cur_errors = total_errors - prev_errors;
-                unsigned long long int cur_retries = total_retry_attempts - prev_retry_attempts;
-                snprintf(line1 + line1_used, sizeof(line1) - line1_used,
-                         "   errors %llu (+%llu)   retries %llu (+%llu)   retried_ops %llu", total_errors, cur_errors,
-                         total_retry_attempts, cur_retries, total_retried_ops);
-            }
+                // Abort ratio (--transaction only): EXEC optimistic-lock aborts as a
+                // share of the same lookup denominator. Aborts are a subset of misses,
+                // so abort% <= miss%. It's a blended live indicator across all
+                // arbitrary commands; the authoritative per-command abort rate is in
+                // the final table / "abort rate" warning.
+                char cur_abort_str[16], avg_abort_str[16];
+                if (cur_lookups > 0)
+                    snprintf(cur_abort_str, sizeof(cur_abort_str), "%5.2f%%",
+                             100.0 * (double) (total_aborts - prev_aborts) / (double) cur_lookups);
+                else
+                    snprintf(cur_abort_str, sizeof(cur_abort_str), "  -  ");
+                if (tot_lookups > 0)
+                    snprintf(avg_abort_str, sizeof(avg_abort_str), "%5.2f%%",
+                             100.0 * (double) total_aborts / (double) tot_lookups);
+                else
+                    snprintf(avg_abort_str, sizeof(avg_abort_str), "  -  ");
 
-            // Accumulate this tick's instantaneous percentile samples into the
-            // run-lifetime histogram so '(avg: X.XXX)' on the latency line covers
-            // the whole run so far, not just the last second.
-            if (rtl_totals_hist != NULL && inst_hist_agg != NULL && hdr_total_count(inst_hist_agg) > 0) {
-                hdr_add(rtl_totals_hist, inst_hist_agg);
-            }
-
-            // Latency lines: per-configured-percentile "cur (avg: avg)", chunked
-            // to at most kPctPerLine entries per line so a long --print-percentiles
-            // list (e.g. 50,99,99.9,99.99,99.99999,99.999999) doesn't blow out the
-            // terminal. Line count is deterministic given the configured list,
-            // which keeps the in-place cursor-up redraw stable across ticks.
-            const std::vector<double> &quantiles = cfg->print_percentiles.quantile_list;
-            const size_t kPctPerLine = 3;
-            size_t num_latency_lines = quantiles.empty() ? 1 : ((quantiles.size() + kPctPerLine - 1) / kPctPerLine);
-            std::vector<std::string> lat_chunks(num_latency_lines);
-            bool any_samples = (rtl_totals_hist != NULL && hdr_total_count(rtl_totals_hist) > 0);
-            bool cur_samples = inst_samples;
-            const std::vector<int64_t> *overall_values =
-                any_samples ? &overall_percentiles.calculate(rtl_totals_hist) : NULL;
-            for (std::size_t i = 0; i < quantiles.size(); i++) {
-                char cur_p[16], avg_p[16];
-                if (cur_samples) {
-                    double ms = inst_values[i] / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
-                    snprintf(cur_p, sizeof(cur_p), "%6.3f", ms);
+                char line1[640];
+                int line1_used = 0;
+                if (total_connection_errors > 0) {
+                    line1_used = snprintf(
+                        line1, sizeof(line1),
+                        "%s throughput %s (avg: %s) ops/sec   %s/sec (avg: %s/sec)   miss %s (avg: %s)   conn_err %llu",
+                        tag, cur_ops_str, avg_ops_str, cur_bytes_str, bytes_str, cur_miss_str, avg_miss_str,
+                        total_connection_errors);
                 } else {
-                    snprintf(cur_p, sizeof(cur_p), "   -  ");
+                    line1_used =
+                        snprintf(line1, sizeof(line1),
+                                 "%s throughput %s (avg: %s) ops/sec   %s/sec (avg: %s/sec)   miss %s (avg: %s)", tag,
+                                 cur_ops_str, avg_ops_str, cur_bytes_str, bytes_str, cur_miss_str, avg_miss_str);
                 }
-                if (any_samples) {
-                    double ms = (*overall_values)[i] / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
-                    snprintf(avg_p, sizeof(avg_p), "%6.3f", ms);
-                } else {
-                    snprintf(avg_p, sizeof(avg_p), "   -  ");
+                // Abort tail: only under --transaction so default arbitrary-command
+                // output is unchanged for existing log-scraping.
+                if (cfg->transaction && line1_used > 0 && (size_t) line1_used < sizeof(line1)) {
+                    int n = snprintf(line1 + line1_used, sizeof(line1) - line1_used, "   abort %s (avg: %s)",
+                                     cur_abort_str, avg_abort_str);
+                    if (n > 0) line1_used += n;
                 }
-                char entry[96];
-                snprintf(entry, sizeof(entry), "  p%.10g %s (avg: %s)", quantiles[i], cur_p, avg_p);
-                lat_chunks[i / kPctPerLine] += entry;
-            }
-            if (quantiles.empty()) lat_chunks[0] = "  (no samples this tick)";
+                // Retry/error tail: only printed when --retry-on-error is enabled
+                // so existing CI / log-scraping is unaffected by default.
+                if (cfg->retry_on_error && line1_used > 0 && (size_t) line1_used < sizeof(line1)) {
+                    unsigned long long int cur_errors = total_errors - prev_errors;
+                    unsigned long long int cur_retries = total_retry_attempts - prev_retry_attempts;
+                    snprintf(line1 + line1_used, sizeof(line1) - line1_used,
+                             "   errors %llu (+%llu)   retries %llu (+%llu)   retried_ops %llu", total_errors,
+                             cur_errors, total_retry_attempts, cur_retries, total_retried_ops);
+                }
 
-            size_t total_lines = 1 + num_latency_lines;
-            // The ms unit applies to every value on the latency lines (both cur
-            // and avg are in milliseconds), so we always append it to the last
-            // chunk — even when the last tick had no fresh samples.
-            bool show_ms = cur_samples || any_samples;
-            if (stderr_is_tty && !first_rtl_frame) {
-                // Move cursor up the number of lines we last emitted, then
-                // overwrite each with \033[K to wipe residue from a wider frame.
-                fprintf(stderr, "\033[%zuA\r", total_lines);
-                fprintf(stderr, "%s\033[K\n", line1);
-                for (size_t k = 0; k < num_latency_lines; k++) {
-                    const char *unit_suffix = (k + 1 == num_latency_lines && show_ms) ? " ms" : "";
-                    fprintf(stderr, "%s latency%s%s\033[K\n", tag, lat_chunks[k].c_str(), unit_suffix);
+                // Latency lines: per-configured-percentile "cur (avg: avg)", chunked
+                // to at most kPctPerLine entries per line so a long --print-percentiles
+                // list (e.g. 50,99,99.9,99.99,99.99999,99.999999) doesn't blow out the
+                // terminal. Line count is deterministic given the configured list,
+                // which keeps the in-place cursor-up redraw stable across ticks.
+                const std::vector<double> &quantiles = cfg->print_percentiles.quantile_list;
+                const size_t kPctPerLine = 3;
+                size_t num_latency_lines = quantiles.empty() ? 1 : ((quantiles.size() + kPctPerLine - 1) / kPctPerLine);
+                std::vector<std::string> lat_chunks(num_latency_lines);
+                bool any_samples = (rtl_totals_hist != NULL && hdr_total_count(rtl_totals_hist) > 0);
+                bool cur_samples = inst_samples;
+                const std::vector<int64_t> *overall_values =
+                    any_samples ? &overall_percentiles.calculate(rtl_totals_hist) : NULL;
+                for (std::size_t i = 0; i < quantiles.size(); i++) {
+                    char cur_p[16], avg_p[16];
+                    if (cur_samples) {
+                        double ms = inst_values[i] / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
+                        snprintf(cur_p, sizeof(cur_p), "%6.3f", ms);
+                    } else {
+                        snprintf(cur_p, sizeof(cur_p), "   -  ");
+                    }
+                    if (any_samples) {
+                        double ms = (*overall_values)[i] / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
+                        snprintf(avg_p, sizeof(avg_p), "%6.3f", ms);
+                    } else {
+                        snprintf(avg_p, sizeof(avg_p), "   -  ");
+                    }
+                    char entry[96];
+                    snprintf(entry, sizeof(entry), "  p%.10g %s (avg: %s)", quantiles[i], cur_p, avg_p);
+                    lat_chunks[i / kPctPerLine] += entry;
                 }
-            } else {
-                fprintf(stderr, "%s\n", line1);
-                for (size_t k = 0; k < num_latency_lines; k++) {
-                    const char *unit_suffix = (k + 1 == num_latency_lines && show_ms) ? " ms" : "";
-                    fprintf(stderr, "%s latency%s%s\n", tag, lat_chunks[k].c_str(), unit_suffix);
+                if (quantiles.empty()) lat_chunks[0] = "  (no samples this tick)";
+
+                size_t total_lines = 1 + num_latency_lines;
+                // The ms unit applies to every value on the latency lines (both cur
+                // and avg are in milliseconds), so we always append it to the last
+                // chunk — even when the last tick had no fresh samples.
+                bool show_ms = cur_samples || any_samples;
+                if (stderr_is_tty && !first_rtl_frame) {
+                    // Move cursor up the number of lines we last emitted, then
+                    // overwrite each with \033[K to wipe residue from a wider frame.
+                    fprintf(stderr, "\033[%zuA\r", total_lines);
+                    fprintf(stderr, "%s\033[K\n", line1);
+                    for (size_t k = 0; k < num_latency_lines; k++) {
+                        const char *unit_suffix = (k + 1 == num_latency_lines && show_ms) ? " ms" : "";
+                        fprintf(stderr, "%s latency%s%s\033[K\n", tag, lat_chunks[k].c_str(), unit_suffix);
+                    }
+                } else {
+                    fprintf(stderr, "%s\n", line1);
+                    for (size_t k = 0; k < num_latency_lines; k++) {
+                        const char *unit_suffix = (k + 1 == num_latency_lines && show_ms) ? " ms" : "";
+                        fprintf(stderr, "%s latency%s%s\n", tag, lat_chunks[k].c_str(), unit_suffix);
+                    }
                 }
-            }
-            first_rtl_frame = false;
-        } else if (total_connection_errors > 0) {
-            // Only show connection errors if there are any (backwards compatible output)
-            fprintf(stderr,
+                first_rtl_frame = false;
+            } else if (total_connection_errors > 0) {
+                // Only show connection errors if there are any (backwards compatible output)
+                fprintf(
+                    stderr,
                     "[RUN #%u %.0f%%, %3u secs] %2u threads %2u conns %llu conn errors: %11llu ops, %7llu (avg: %7llu) "
                     "ops/sec, %s/sec (avg: %s/sec), %5.2f (avg: %5.2f) msec latency",
                     run_id, progress, (unsigned int) (duration / 1000000), active_threads, display_clients,
                     total_connection_errors, total_ops, cur_ops_sec, ops_sec, cur_bytes_str, bytes_str, cur_latency,
                     avg_latency);
-            if (cfg->retry_on_error) {
-                fprintf(stderr, "   errors %llu (+%llu)   retries %llu (+%llu)   retried_ops %llu", total_errors,
-                        total_errors - prev_errors, total_retry_attempts, total_retry_attempts - prev_retry_attempts,
-                        total_retried_ops);
-            }
-            fprintf(stderr, "\r");
-        } else if (cfg->retry_on_error && (total_errors > 0 || total_retry_attempts > 0)) {
-            // Quick path when only request-level errors / retries are non-zero.
-            fprintf(stderr,
+                if (cfg->retry_on_error) {
+                    fprintf(stderr, "   errors %llu (+%llu)   retries %llu (+%llu)   retried_ops %llu", total_errors,
+                            total_errors - prev_errors, total_retry_attempts,
+                            total_retry_attempts - prev_retry_attempts, total_retried_ops);
+                }
+                fprintf(stderr, "\r");
+            } else if (cfg->retry_on_error && (total_errors > 0 || total_retry_attempts > 0)) {
+                // Quick path when only request-level errors / retries are non-zero.
+                fprintf(
+                    stderr,
                     "[RUN #%u %.0f%%, %3u secs] %2u threads %2u conns: %11llu ops, %7llu (avg: %7llu) ops/sec, %s/sec "
                     "(avg: %s/sec), %5.2f (avg: %5.2f) msec latency   errors %llu (+%llu)   retries %llu (+%llu)   "
                     "retried_ops %llu\r",
@@ -4481,12 +4508,14 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
                     cur_ops_sec, ops_sec, cur_bytes_str, bytes_str, cur_latency, avg_latency, total_errors,
                     total_errors - prev_errors, total_retry_attempts, total_retry_attempts - prev_retry_attempts,
                     total_retried_ops);
-        } else {
-            fprintf(stderr,
+            } else {
+                fprintf(
+                    stderr,
                     "[RUN #%u %.0f%%, %3u secs] %2u threads %2u conns: %11llu ops, %7llu (avg: %7llu) ops/sec, %s/sec "
                     "(avg: %s/sec), %5.2f (avg: %5.2f) msec latency\r",
                     run_id, progress, (unsigned int) (duration / 1000000), active_threads, display_clients, total_ops,
                     cur_ops_sec, ops_sec, cur_bytes_str, bytes_str, cur_latency, avg_latency);
+            }
         }
 
         prev_hits = total_hits;
