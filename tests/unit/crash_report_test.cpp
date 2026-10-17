@@ -27,11 +27,24 @@
 #include "crash_report.h"
 
 static int failures = 0;
+static long skipped = 0;
+
+// True when v is representable as time_t. A 32-bit time_t (i386, older
+// armhf) only covers 1901-12-13 to 2038-01-19, so libc cannot be the
+// reference outside that range; crash_format_time() itself uses long long.
+static bool fits_time_t(long long v)
+{
+    return (long long) (time_t) v == v;
+}
 
 static void check_format(long long t, long offset)
 {
     char got[64];
     char want[64];
+    if (!fits_time_t(t + offset)) {
+        skipped++;
+        return;
+    }
     crash_format_time(got, sizeof(got), t, offset);
     time_t shifted = (time_t) (t + offset);
     struct tm tm;
@@ -128,6 +141,7 @@ int main(void)
         fprintf(stderr, "%d crash report test(s) failed\n", failures);
         return 1;
     }
+    if (skipped != 0) printf("%ld cases outside the %zu-byte time_t range skipped\n", skipped, sizeof(time_t));
     printf("crash report tests passed\n");
     return 0;
 }

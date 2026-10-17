@@ -390,7 +390,9 @@ with this line instead of the END marker:
 If even that line cannot be written (for example, stderr is a pipe that nobody
 reads), the process still exits about a second later. In both cases the
 process ends by SIGALRM rather than the original signal, so no core dump is
-written.
+written. ThreadSanitizer builds never print the INCOMPLETE line: there the
+watchdog keeps the default SIGALRM action, because TSan would defer a handler
+for it indefinitely.
 
 ### Testing the Crash Handler
 

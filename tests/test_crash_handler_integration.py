@@ -344,6 +344,9 @@ def _shim_marker(child_env):
         return []
 
 
+_TSAN_BUILD = {}
+
+
 def _tsan_build():
     """
     True for a ThreadSanitizer build. Those keep SIG_DFL for the watchdog
@@ -351,11 +354,14 @@ def _tsan_build():
     Look for the runtime's __tsan_init symbol name in the binary: it is there
     whether the runtime is a shared library (GCC) or linked in (clang).
     """
-    try:
-        with open(shutil.which(MEMTIER_BINARY) or MEMTIER_BINARY, "rb") as f:
-            return b"__tsan_init" in f.read()
-    except OSError:
-        return False
+    binary = shutil.which(MEMTIER_BINARY) or MEMTIER_BINARY
+    if binary not in _TSAN_BUILD:
+        try:
+            with open(binary, "rb") as f:
+                _TSAN_BUILD[binary] = b"__tsan_init" in f.read()
+        except OSError:
+            _TSAN_BUILD[binary] = False
+    return _TSAN_BUILD[binary]
 
 
 def _worker_tids(pid):
@@ -392,7 +398,7 @@ def _signal_thread(pid, tid, sig):
     """
     Send sig to thread tid of process pid. os.kill(tid) is kill(2): it sends a
     process-directed signal that any thread may take, so use tgkill(2) when
-    this architecture's syscall number is known.
+    libc has it or this architecture's syscall number is known.
 
     TSan builds get kill(2) to the process instead. TSan runs the handler for
     a signal sent to a busy thread later, from an intercepted call and not on
@@ -404,11 +410,16 @@ def _signal_thread(pid, tid, sig):
     if _tsan_build():
         os.kill(pid, sig)
         return
-    number = _SYS_TGKILL.get(platform.machine())
-    if number is not None:
-        libc = ctypes.CDLL(None, use_errno=True)
-        if libc.syscall(number, pid, tid, sig) == 0:
-            return
+    libc = ctypes.CDLL(None, use_errno=True)
+    if hasattr(libc, "tgkill"):  # glibc 2.30 and later
+        result = libc.tgkill(pid, tid, sig)
+    elif platform.machine() in _SYS_TGKILL:
+        result = libc.syscall(_SYS_TGKILL[platform.machine()], pid, tid, sig)
+    else:
+        result = None
+    if result == 0:
+        return
+    if result is not None:
         print(f"tgkill failed (errno {ctypes.get_errno()}), falling back to kill")
     os.kill(tid, sig)
 
@@ -507,7 +518,10 @@ def test_crash_handler_time_zone_lock_held(env):
     env.assertIsNotNone(stamp, message="no timestamp on the crash header")
     if stamp is not None and sent_at is not None:
         expected = (sent_at + datetime.timedelta(hours=5, minutes=30)).replace(tzinfo=None)
-        shown = datetime.datetime.strptime(stamp.group(1), "%d %b %Y %H:%M:%S")
+        # Parse by hand: strptime's %b follows the locale, the report is English.
+        day, month, rest = stamp.group(1).split(" ", 2)
+        months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        shown = datetime.datetime.strptime(f"{day} {months.index(month) + 1} {rest}", "%d %m %Y %H:%M:%S")
         env.assertLess(abs((shown - expected).total_seconds()), 5,
                        message=f"header time {shown}, expected about {expected} (UTC+05:30)")
 

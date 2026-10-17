@@ -503,6 +503,9 @@ static void crash_handler(int sig, siginfo_t *info, void *secret)
     sigemptyset(&alarm_act.sa_mask);
     alarm_act.sa_flags = SA_ONSTACK | SA_NODEFER | SA_RESETHAND;
     alarm_act.sa_handler = crash_watchdog_handler;
+    // SIGALRM may land on any thread, not only this one. That is fine: the
+    // watchdog only calls alarm, write and raise, which are safe on any
+    // thread, and SA_RESETHAND resets the disposition for the whole process.
     sigaction(SIGALRM, &alarm_act, NULL);
 #endif
     alarm(5);
@@ -575,48 +578,49 @@ static void crash_handler(int sig, siginfo_t *info, void *secret)
     // event_get_version() only returns a constant string.
 
     // Print stack trace for all threads
-    print_all_threads_stack_trace(stderr, pid, timestr);
+    print_all_threads_stack_trace(stderr, getpid(), timestr);
 
     // Print system information
-    fprintf(stderr, "\n[%d] %s # --- INFO OUTPUT\n", pid, timestr);
+    fprintf(stderr, "\n[%d] %s # --- INFO OUTPUT\n", getpid(), timestr);
 
     struct utsname name;
     if (uname(&name) == 0) {
-        fprintf(stderr, "[%d] %s # os:%s %s %s\n", pid, timestr, name.sysname, name.release, name.machine);
+        fprintf(stderr, "[%d] %s # os:%s %s %s\n", getpid(), timestr, name.sysname, name.release, name.machine);
     }
 
-    fprintf(stderr, "[%d] %s # memtier_version:%s\n", pid, timestr, PACKAGE_VERSION);
-    fprintf(stderr, "[%d] %s # memtier_git_sha1:%s\n", pid, timestr, MEMTIER_GIT_SHA1);
-    fprintf(stderr, "[%d] %s # memtier_git_dirty:%s\n", pid, timestr, MEMTIER_GIT_DIRTY);
+    fprintf(stderr, "[%d] %s # memtier_version:%s\n", getpid(), timestr, PACKAGE_VERSION);
+    fprintf(stderr, "[%d] %s # memtier_git_sha1:%s\n", getpid(), timestr, MEMTIER_GIT_SHA1);
+    fprintf(stderr, "[%d] %s # memtier_git_dirty:%s\n", getpid(), timestr, MEMTIER_GIT_DIRTY);
 
 #if defined(__x86_64__) || defined(_M_X64)
-    fprintf(stderr, "[%d] %s # arch_bits:64\n", pid, timestr);
+    fprintf(stderr, "[%d] %s # arch_bits:64\n", getpid(), timestr);
 #elif defined(__i386__) || defined(_M_IX86)
-    fprintf(stderr, "[%d] %s # arch_bits:32\n", pid, timestr);
+    fprintf(stderr, "[%d] %s # arch_bits:32\n", getpid(), timestr);
 #elif defined(__aarch64__)
-    fprintf(stderr, "[%d] %s # arch_bits:64\n", pid, timestr);
+    fprintf(stderr, "[%d] %s # arch_bits:64\n", getpid(), timestr);
 #elif defined(__arm__)
-    fprintf(stderr, "[%d] %s # arch_bits:32\n", pid, timestr);
+    fprintf(stderr, "[%d] %s # arch_bits:32\n", getpid(), timestr);
 #else
-    fprintf(stderr, "[%d] %s # arch_bits:unknown\n", pid, timestr);
+    fprintf(stderr, "[%d] %s # arch_bits:unknown\n", getpid(), timestr);
 #endif
 
 #ifdef __GNUC__
-    fprintf(stderr, "[%d] %s # gcc_version:%d.%d.%d\n", pid, timestr, __GNUC__, __GNUC_MINOR__, __GNUC_PATCHLEVEL__);
+    fprintf(stderr, "[%d] %s # gcc_version:%d.%d.%d\n", getpid(), timestr, __GNUC__, __GNUC_MINOR__,
+            __GNUC_PATCHLEVEL__);
 #endif
 
-    fprintf(stderr, "[%d] %s # libevent_version:%s\n", pid, timestr, event_get_version());
+    fprintf(stderr, "[%d] %s # libevent_version:%s\n", getpid(), timestr, event_get_version());
 
 #ifdef USE_TLS
-    fprintf(stderr, "[%d] %s # openssl_version:%s\n", pid, timestr, OPENSSL_VERSION_TEXT);
+    fprintf(stderr, "[%d] %s # openssl_version:%s\n", getpid(), timestr, OPENSSL_VERSION_TEXT);
 #endif
 
     // Print client connection information
-    print_client_list(stderr, pid, timestr);
+    print_client_list(stderr, getpid(), timestr);
 
-    fprintf(stderr, "[%d] %s # For more information, please check the core dump if available.\n", pid, timestr);
-    fprintf(stderr, "[%d] %s # To enable core dumps: ulimit -c unlimited\n", pid, timestr);
-    fprintf(stderr, "[%d] %s # Core pattern: /proc/sys/kernel/core_pattern\n", pid, timestr);
+    fprintf(stderr, "[%d] %s # For more information, please check the core dump if available.\n", getpid(), timestr);
+    fprintf(stderr, "[%d] %s # To enable core dumps: ulimit -c unlimited\n", getpid(), timestr);
+    fprintf(stderr, "[%d] %s # Core pattern: /proc/sys/kernel/core_pattern\n", getpid(), timestr);
 
     fprintf(stderr, "\n=== MEMTIER_BENCHMARK BUG REPORT END. Make sure to include from START to END. ===\n\n");
     fprintf(stderr, "       Please report this bug by opening an issue on github.com/redis/memtier_benchmark\n\n");
