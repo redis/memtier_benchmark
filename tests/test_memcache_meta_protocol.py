@@ -244,7 +244,7 @@ def _run_memtier(extra_args, server_port, json_path, requests=200, clients=2, th
 class MetaProtocolTests(unittest.TestCase):
     def setUp(self):
         if not os.path.isfile(MEMTIER_BINARY) or not os.access(MEMTIER_BINARY, os.X_OK):
-            self.skipTest(f"memtier_benchmark binary not found or not executable at {MEMTIER_BINARY}")
+            self.fail(f"memtier_benchmark binary not found or not executable at {MEMTIER_BINARY}")
         self.server = MetaProtocolMockServer()
         self.server.start()
         # Synchronization on the ready event eliminates time.sleep() races on
@@ -553,25 +553,11 @@ class MetaProtocolTests(unittest.TestCase):
         """Unsupported response lines must produce the parser-error diagnostic."""
         # Inject the garbage on command index 0 -- the very first command.
         self._restart_server(garbage_after=0)
-        # Use a short test_time and skip waiting for completion: we just need
-        # the parse error to surface on stderr. Kill the binary after a brief
-        # window.
-        cmd = [
-            MEMTIER_BINARY, "-P", "memcache_meta",
-            "-s", "127.0.0.1", "-p", str(self.server.port),
-            "-c", "1", "-t", "1", "-n", "5",
-            "--ratio=1:0", "--key-pattern=P:P", "--key-prefix=err:",
-            "--key-minimum=1", "--key-maximum=5", "--data-size=4",
-            "--hide-histogram",
-        ]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        try:
-            _, stderr = proc.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            _, stderr = proc.communicate()
-        self.assertIn(b"response parsing failed", stderr,
-                      f"expected parse-error log on stderr; got: {stderr[-500:]!r}")
+        result = _run_memtier(
+            ["--ratio=1:0", "--connection-stage-timeout=1"],
+            self.server.port, self.json_path, requests=1, clients=1, threads=1, timeout=8)
+        self.assertEqual(result.returncode, 2, result.stderr.decode())
+        self.assertIn(b"response parsing failed", result.stderr)
 
     def test_pipelined_set_completes(self):
         """--pipeline=4 forces 4 in-flight `ms` commands per connection. The
@@ -674,8 +660,8 @@ def _adapt(method_name):
         case = MetaProtocolTests(method_name)
         result = unittest.TestResult()
         case.run(result)
-        if result.errors or result.failures:
-            details = "\n".join(t for _, t in result.errors + result.failures)
+        if result.errors or result.failures or result.skipped:
+            details = "\n".join(t for _, t in result.errors + result.failures + result.skipped)
             raise AssertionError(f"{method_name} failed:\n{details}")
     _runner.__name__ = method_name
     return _runner

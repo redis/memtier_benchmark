@@ -81,13 +81,7 @@ memtier_benchmark_LDADD = \
 
 
 check_PROGRAMS = prometheus_metrics_test rate_limiter_test retry_backoff_test keylist_growth_test retry_drain_test socket_options_test hdr_histogram_test cluster_transaction_test \
-    cluster_hslot_test run_stats_counters_test run_stats_merge_test crash_report_test reconnect_siblings_test
-
-check_PROGRAMS += memcache_meta_test
-memcache_meta_test_SOURCES = tests/unit/memcache_meta_test.cpp protocol.cpp protocol.h
-memcache_meta_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
-memcache_meta_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
-memcache_meta_test_LDADD = $(memtier_benchmark_LDADD)
+    cluster_hslot_test run_stats_counters_test run_stats_merge_test crash_report_test reconnect_siblings_test memcache_meta_test
 
 # The metrics test links only the pure layer (prometheus_metrics.{h,cpp}, utf8.{h,cpp}).
 # First `make check` program in the repo. The metrics layer is config-free and
@@ -100,6 +94,12 @@ prometheus_metrics_test_SOURCES = tests/unit/prometheus_metrics_test.cpp \
     deps/hdr_histogram/hdr_histogram.c deps/hdr_histogram/hdr_histogram.h
 prometheus_metrics_test_CPPFLAGS = -I$(srcdir)
 prometheus_metrics_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+
+memcache_meta_test_SOURCES = tests/unit/memcache_meta_test.cpp protocol.cpp protocol.h
+memcache_meta_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
+memcache_meta_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+memcache_meta_test_LDADD = $(memtier_benchmark_LDADD)
+
 rate_limiter_test_SOURCES = tests/unit/rate_limiter_test.cpp rate_limiter.h
 rate_limiter_test_CPPFLAGS = -I$(srcdir)
 rate_limiter_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g

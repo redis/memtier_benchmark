@@ -25,6 +25,7 @@
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
+#include <deque>
 #ifdef HAVE_ASSERT_H
 #include <assert.h>
 #endif
@@ -1284,8 +1285,8 @@ int memcache_text_protocol::write_arbitrary_command(const char *val, int val_len
 // Inheriting from memcache_text_protocol lets us share the read/write buffers
 // and the methods that are also unsupported on the text path
 // (select_db / authenticate / configure_protocol / write_command_cluster_slots /
-// write_command_wait / *arbitrary_command -- all assert(0)). Only the four
-// methods whose wire format differs are overridden here.
+// write_command_wait / *arbitrary_command -- all assert(0)). Meta overrides
+// its command writers, parser and reconnect reset.
 //
 // IMPORTANT design choice -- every command is terminated on the wire by `mn`,
 // the meta protocol's no-op:
@@ -1294,13 +1295,19 @@ int memcache_text_protocol::write_arbitrary_command(const char *val, int val_len
 //   <pipelined mg ...> mn\r\n            ->  ...VA/EN..., MN  (mn is the natural terminator)
 //
 // This makes parse_response uniform: it always reads sections until it sees
-// `MN`. There is no "is this multi-get?" mode flag and therefore no possibility
-// of write-time/parse-time mode-attribution races under pipelining (which can
-// interleave a single-shot ms with a multi-get's mg+mg+...+mn within the same
-// pipeline depth). The wire cost is 4 request + 4 response bytes per command;
+// `MN`. An ordered queue checks each reply's kind and section count without
+// a mutable write-side mode that would misattribute mixed pipelined replies.
+// The wire cost is 4 request + 4 response bytes per command;
 // its relative bandwidth and processing overhead depend on the workload.
 class memcache_meta_protocol : public memcache_text_protocol
 {
+    struct expected_reply
+    {
+        bool get;
+        unsigned int remaining;
+    };
+    std::deque<expected_reply> m_expected_replies;
+
 public:
     memcache_meta_protocol() {}
     virtual memcache_meta_protocol *clone(void) { return new memcache_meta_protocol(); }
@@ -1310,6 +1317,7 @@ public:
         m_response_state = rs_initial;
         m_value_len = 0;
         m_response_len = 0;
+        m_expected_replies.clear();
     }
 
     virtual int write_command_set(const char *key, int key_len, const char *value, int value_len, int expiry,
@@ -1342,12 +1350,13 @@ int memcache_meta_protocol::write_command_set(const char *key, int key_len, cons
     assert(value_len > 0);
 
     // `ms <key> <datalen> T<exp>\r\n<value>\r\nmn\r\n`. The trailing mn makes
-    // every command's response self-terminating at MN, eliminating the need
-    // for parse-side mode tracking under pipelined / mixed-command workloads.
+    // every command's response self-terminating at MN. The expectation queue
+    // also validates that this section is a storage reply.
     int size = evbuffer_add_printf(m_write_buf, "ms %.*s %u T%u\r\n", key_len, key, (unsigned int) value_len, expiry);
     evbuffer_add(m_write_buf, value, value_len);
     evbuffer_add(m_write_buf, "\r\n", 2);
     evbuffer_add(m_write_buf, k_mn_term, k_mn_term_len);
+    m_expected_replies.push_back({false, 1});
     return size + value_len + 2 + (int) k_mn_term_len;
 }
 
@@ -1359,6 +1368,7 @@ int memcache_meta_protocol::write_command_get(const char *key, int key_len, unsi
     evbuffer_add(m_write_buf, key, key_len);
     evbuffer_add(m_write_buf, k_mg_suffix, k_mg_suffix_len);
     evbuffer_add(m_write_buf, k_mn_term, k_mn_term_len);
+    m_expected_replies.push_back({true, 1});
     return (int) (k_mg_prefix_len + key_len + k_mg_suffix_len + k_mn_term_len);
 }
 
@@ -1381,6 +1391,7 @@ int memcache_meta_protocol::write_command_multi_get(const keylist *keylist)
     // in this multi-get logical request, mirroring the per-command `mn`
     // suffix used by ms / mg above.
     evbuffer_add(m_write_buf, k_mn_term, k_mn_term_len);
+    m_expected_replies.push_back({true, keylist->get_keys_count()});
     return size + (int) k_mn_term_len;
 }
 
@@ -1450,6 +1461,22 @@ int memcache_meta_protocol::parse_response(void)
                 unknown = true;
             }
 
+            // Non-quiet mg returns exactly one VA/EN per key, while ms
+            // returns one storage status. Keep expectations in issue order:
+            // a single mutable mode cannot describe mixed pipelined requests.
+            if (!unknown) {
+                if (m_expected_replies.empty()) {
+                    unknown = true;
+                } else if (done) {
+                    unknown = m_expected_replies.front().remaining != 0;
+                } else {
+                    expected_reply &expected = m_expected_replies.front();
+                    bool get_reply = need_value || memcmp(line, "EN", 2) == 0;
+                    unknown = expected.remaining == 0 || expected.get != get_reply;
+                    if (!unknown) --expected.remaining;
+                }
+            }
+
             // Free `line` if it wasn't adopted as status.
             if (m_last_response.get_status() != line) free(line);
 
@@ -1504,6 +1531,7 @@ int memcache_meta_protocol::parse_response(void)
             break;
 
         case rs_read_end:
+            m_expected_replies.pop_front();
             m_response_state = rs_initial;
             return 1;
 
