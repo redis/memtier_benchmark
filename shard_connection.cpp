@@ -1732,15 +1732,16 @@ void shard_connection::process_response(void)
                 m_conns_manager->inc_reqs_processed();
                 responses_handled = true;
             }
-            // First *successful* post-setup response observed: tell the
-            // supervisor we reached steady state. Idempotent.
-            //
-            // We deliberately do NOT count error responses as steady state
-            // — a -ERR can fire on the very first request (e.g. the
-            // 'invalid bulk length' loop from #426 #8) and then close the
-            // connection, dropping the worker into an infinite reconnect
-            // loop that the supervisor would otherwise be disarmed against.
-            if (!r->is_error()) {
+            // A valid workload reply proves setup completed, even when the
+            // command was rejected or queued for retry. Redis wire-protocol
+            // errors are different: the server closes after replying, and
+            // treating them as progress would disarm the startup supervisor
+            // and reset the reconnect budget on every failed attempt (#426).
+            const char *status = r->get_status();
+            const char protocol_error[] = "-ERR Protocol error:";
+            bool framing_error = r->is_error() && is_redis_protocol(m_config->protocol) && status &&
+                                 strncmp(status, protocol_error, sizeof(protocol_error) - 1) == 0;
+            if (!framing_error) {
                 report_connection_stage_success();
                 // Steady state reached: reset the per-connection reconnect
                 // attempts counter now (not at BEV_EVENT_CONNECTED). The
@@ -1748,7 +1749,7 @@ void shard_connection::process_response(void)
                 // -NOREPLICATION lands, so resetting on connect would
                 // defeat --max-reconnect-attempts; resetting here ties the
                 // counter to setup-ladder lifetime instead. Idempotent —
-                // subsequent successful responses just re-assign 0.
+                // subsequent workload replies just re-assign 0.
                 if (m_reconnect_attempts > 0) {
                     benchmark_error_log("Reconnection successful after %u attempts.\n", m_reconnect_attempts);
                 }

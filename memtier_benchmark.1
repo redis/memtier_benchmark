@@ -252,6 +252,8 @@ NOAUTH, NOPERM, syntax/argcount/unknown\-command). Default: disabled.
 Maximum retries per request when \fB\-\-retry\-on\-error\fR is set.
 \fB\-1\fR = unlimited (default), 0 = disable retries even with the master
 switch on, N>0 = bounded. MOVED/ASK redirects count toward this.
+Unlimited retries with \fB\-\-requests\fR may run indefinitely; use a
+finite limit or \fB\-\-test\-time\fR to bound repeated rejections.
 .TP
 \fB\-\-retry\-backoff\-ms\fR=\fI\,NUM\/\fR
 Delay between retries in milliseconds (default: 0, immediate).
