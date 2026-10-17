@@ -23,6 +23,8 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <list>
+#include <string>
+#include "utf8.h"
 
 // enum for holding type of nesting
 typedef enum
@@ -43,6 +45,10 @@ protected:
 public:
     json_handler(const char *jsonfilename);
     ~json_handler();
+
+    // Closes all the nesting and the file. Returns 0 if the whole document was
+    // written, otherwise an errno value. Further calls return 0.
+    int close();
 
     // Write a single object to JSON
     void write_obj(const char *objectname, const char *format, ...);

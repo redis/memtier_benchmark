@@ -130,9 +130,13 @@ unsigned long long gaussian_noise::gaussian_distribution_range(double stddev, do
     if (median == 0) median = len / 2.0 + min + 0.5;
     if (stddev == 0) stddev = len / 6.0;
     assert(median > min && median < max);
+    // max + 1 in double: in unsigned long long it wraps to 0 for
+    // max == ULLONG_MAX and every sample would be rejected.
     do {
         val = gaussian_distribution(stddev) + median;
-    } while (val < min || val > max + 1);
+    } while (val < min || val > (double) max + 1);
+    // Converting a double >= 2^64 to unsigned long long is undefined.
+    if (val >= (double) max) return max;
     return val;
 }
 
@@ -155,6 +159,8 @@ object_generator::object_generator(size_t n_key_iterators /*= OBJECT_GENERATOR_K
         m_key_zipf_Hmin(0),
         m_key_zipf_Hmax(0),
         m_key_zipf_s(0),
+        m_key_buffer(NULL),
+        m_key_buffer_size(0),
         m_value_buffer(NULL),
         m_value_buffer_size(0),
         m_value_buffer_mutation_pos(0)
@@ -162,6 +168,10 @@ object_generator::object_generator(size_t n_key_iterators /*= OBJECT_GENERATOR_K
     m_next_key.resize(n_key_iterators, 0);
 
     m_data_size.size_list = NULL;
+
+    // Ensure m_key_buffer is allocated even before set_key_prefix() is called,
+    // since cluster_client::get_key_for_conn invokes generate_key() unconditionally.
+    set_key_prefix(NULL);
 }
 
 object_generator::object_generator(const object_generator &copy) :
@@ -184,6 +194,8 @@ object_generator::object_generator(const object_generator &copy) :
         m_key_zipf_Hmin(copy.m_key_zipf_Hmin),
         m_key_zipf_Hmax(copy.m_key_zipf_Hmax),
         m_key_zipf_s(copy.m_key_zipf_s),
+        m_key_buffer(NULL),
+        m_key_buffer_size(0),
         m_value_buffer(NULL),
         m_value_buffer_size(0),
         m_value_buffer_mutation_pos(0)
@@ -192,6 +204,8 @@ object_generator::object_generator(const object_generator &copy) :
         m_data_size.size_list = new config_weight_list(*m_data_size.size_list);
     }
     alloc_value_buffer();
+    // Allocate m_key_buffer unconditionally; NULL prefix is treated as empty.
+    set_key_prefix(m_key_prefix);
 
     m_next_key.resize(copy.m_next_key.size(), 0);
 }
@@ -199,6 +213,7 @@ object_generator::object_generator(const object_generator &copy) :
 object_generator::~object_generator()
 {
     if (m_value_buffer != NULL) free(m_value_buffer);
+    if (m_key_buffer != NULL) free(m_key_buffer);
     if (m_data_size_type == data_size_weighted && m_data_size.size_list != NULL) {
         delete m_data_size.size_list;
     }
@@ -290,6 +305,19 @@ void object_generator::set_expiry_range(unsigned int expiry_min, unsigned int ex
 void object_generator::set_key_prefix(const char *key_prefix)
 {
     m_key_prefix = key_prefix;
+
+    // Ensure m_key_buffer can hold prefix + 20 digits (max for unsigned long long) + NUL.
+    size_t prefix_len = (key_prefix != NULL) ? strlen(key_prefix) : 0;
+    size_t required = prefix_len + 21;
+    if (required > m_key_buffer_size) {
+        char *new_buf = (char *) realloc(m_key_buffer, required);
+        if (new_buf == NULL) {
+            fprintf(stderr, "error: failed to allocate %zu bytes for key buffer\n", required);
+            exit(1);
+        }
+        m_key_buffer = new_buf;
+        m_key_buffer_size = required;
+    }
 }
 
 void object_generator::set_key_range(unsigned long long key_min, unsigned long long key_max)
@@ -345,11 +373,18 @@ void object_generator::set_key_zipf_distribution(double key_exp)
     }
 }
 
-// return a random number between r_min and r_max
+// return a random number between r_min and r_max.  get_random() yields 62
+// bits (get_random_max()), so this is only uniform for spans up to 2^62:
+// above that the result never exceeds r_min + 2^62 - 1, and spans that do not
+// divide 2^62 are biased toward the low part (as they always were).
 unsigned long long object_generator::random_range(unsigned long long r_min, unsigned long long r_max)
 {
     unsigned long long rn = m_random.get_random();
-    return (rn % (r_max - r_min + 1)) + r_min;
+    unsigned long long span = r_max - r_min + 1;
+    // A full 0..ULLONG_MAX range wraps span to 0 (rn % 0 is SIGFPE); every
+    // rn is in range then.
+    if (span == 0) return rn;
+    return (rn % span) + r_min;
 }
 
 // return a random number between r_min and r_max using normal distribution according to r_stddev
@@ -357,6 +392,15 @@ unsigned long long object_generator::normal_distribution(unsigned long long r_mi
                                                          double r_stddev, double r_median)
 {
     return m_random.gaussian_distribution_range(r_stddev, r_median, r_min, r_max);
+}
+
+// Convert a Zipf sample to a key: with --key-maximum near ULLONG_MAX the
+// double can reach 2^64, and converting that to unsigned long long is
+// undefined, so clamp to the range maximum as the Gaussian path does.
+static unsigned long long zipf_key(double k, unsigned long long max)
+{
+    if (k >= (double) max) return max;
+    return (unsigned long long) k;
 }
 
 // following sampler is based on:
@@ -378,8 +422,8 @@ unsigned long long object_generator::zipf_distribution()
             if (x < m_key_zipf_min - 0.5) x = m_key_zipf_min + 0.5;
             if (x >= m_key_zipf_max + 0.5) x = m_key_zipf_max;
             double k = floor(x + 0.5);
-            if (k - x <= m_key_zipf_s) return k;
-            if (u > log(k + 0.5) - 1. / k) return k;
+            if (k - x <= m_key_zipf_s) return zipf_key(k, m_key_zipf_max);
+            if (u > log(k + 0.5) - 1. / k) return zipf_key(k, m_key_zipf_max);
         }
     } else {
         while (true) {
@@ -389,9 +433,9 @@ unsigned long long object_generator::zipf_distribution()
             if (x < m_key_zipf_min - 0.5) x = m_key_zipf_min + 0.5;
             if (x >= m_key_zipf_max + 0.5) x = m_key_zipf_max;
             double k = floor(x + 0.5);
-            if (k - x <= m_key_zipf_s) return k;
+            if (k - x <= m_key_zipf_s) return zipf_key(k, m_key_zipf_max);
             double t = (u - pow(k + 0.5, m_key_zipf_1mexp));
-            if (m_key_zipf_1mexpInv * t > -pow(k, -m_key_zipf_exp)) return k;
+            if (m_key_zipf_1mexpInv * t > -pow(k, -m_key_zipf_exp)) return zipf_key(k, m_key_zipf_max);
         }
     }
 }
@@ -419,7 +463,8 @@ unsigned long long object_generator::get_key_index(int iter)
 
 void object_generator::generate_key(unsigned long long key_index)
 {
-    m_key_len = snprintf(m_key_buffer, sizeof(m_key_buffer) - 1, "%s%llu", m_key_prefix, key_index);
+    const char *prefix = (m_key_prefix != NULL) ? m_key_prefix : "";
+    m_key_len = snprintf(m_key_buffer, m_key_buffer_size, "%s%llu", prefix, key_index);
     m_key = m_key_buffer;
 }
 
@@ -436,7 +481,14 @@ const char *object_generator::get_value(unsigned long long key_index, unsigned i
         new_size = m_data_size.size_fixed;
     } else if (m_data_size_type == data_size_range) {
         if (m_data_size_pattern && *m_data_size_pattern == 'S') {
-            double a = (key_index - m_key_min) / static_cast<double>(m_key_max - m_key_min);
+            // Clamp into the key range: an index below m_key_min would wrap
+            // the unsigned subtraction, and a single-key range would divide
+            // 0 by 0. Either way the out-of-range double would then be
+            // converted to unsigned int (undefined behaviour).
+            if (key_index < m_key_min) key_index = m_key_min;
+            if (key_index > m_key_max) key_index = m_key_max;
+            double a = 0;
+            if (m_key_max > m_key_min) a = (key_index - m_key_min) / static_cast<double>(m_key_max - m_key_min);
             new_size = (m_data_size.size_range.size_max - m_data_size.size_range.size_min) * a +
                        m_data_size.size_range.size_min;
         } else {
@@ -485,23 +537,30 @@ imported_keylist::~imported_keylist()
     m_keys.clear();
 }
 
-bool imported_keylist::read_keys(void)
+bool imported_keylist::read_keys(bool keep_keys)
 {
     file_reader f(m_filename);
 
     if (!f.open_file()) return false;
-    while (!f.is_eof()) {
-        memcache_item *i = f.read_item();
-
-        if (i != NULL) {
+    // read_item() returns NULL both at the end of the file and on a malformed
+    // item, and it does not skip past the bad input. Stop at the first NULL.
+    unsigned int count = 0;
+    memcache_item *i;
+    while ((i = f.read_item()) != NULL) {
+        count++;
+        if (keep_keys) {
             key *k = (key *) malloc(i->get_nkey() + sizeof(key) + 1);
             assert(k != NULL);
             k->key_len = i->get_nkey();
             memcpy(k->key_data, i->get_key(), i->get_nkey());
-            delete i;
-
             m_keys.push_back(k);
         }
+        delete i;
+    }
+    if (f.has_error()) return false;
+    if (count == 0) {
+        fprintf(stderr, "%s: no items found.\n", m_filename);
+        return false;
     }
 
     return true;

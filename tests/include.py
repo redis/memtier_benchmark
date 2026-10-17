@@ -1,6 +1,10 @@
 import glob
 import os
+import re
 import logging
+import time
+import urllib.error
+import urllib.request
 
 MEMTIER_BINARY = os.environ.get("MEMTIER_BINARY", "memtier_benchmark")
 TLS_CERT = os.environ.get("TLS_CERT", "")
@@ -59,16 +63,17 @@ def add_required_env_arguments(benchmark_specs, config, env, master_nodes_list):
 
 
 def debugPrintMemtierOnError(config, env):
-    with open('{0}/mb.stderr'.format(config.results_dir)) as stderr:
-        env.debugPrint("### PRINTING STDERR OUTPUT OF MEMTIER ON FAILURE ###", True)
-        env.debugPrint("### mb.stderr file location: {0}".format('{0}/mb.stderr'.format(config.results_dir)), True)
-        for line in stderr:
-            env.debugPrint(line.rstrip(), True)
-    with open('{0}/mb.stdout'.format(config.results_dir)) as stderr:
-        env.debugPrint("### PRINTING STDOUT OUTPUT OF MEMTIER ON FAILURE ###", True)
-        env.debugPrint("### mb.stdout file location: {0}".format('{0}/mb.stdout'.format(config.results_dir)), True)
-        for line in stderr:
-            env.debugPrint(line.rstrip(), True)
+    for fname, label in [('mb.stderr', 'STDERR'), ('mb.stdout', 'STDOUT')]:
+        path = '{0}/{1}'.format(config.results_dir, fname)
+        if not os.path.isfile(path):
+            env.debugPrint("### {0} not found (memtier may have exited before writing output): {1}".format(label, path), True)
+            continue
+        # errors="replace": the output can echo non-UTF-8 user input.
+        with open(path, errors="replace") as f:
+            env.debugPrint("### PRINTING {0} OUTPUT OF MEMTIER ON FAILURE ###".format(label), True)
+            env.debugPrint("### {0} file location: {1}".format(fname, path), True)
+            for line in f:
+                env.debugPrint(line.rstrip(), True)
 
     if not env.isCluster():
         if env.envRunner is not None:
@@ -119,6 +124,13 @@ def addTLSArgs(benchmark_specs, env):
 
 
 def get_default_memtier_config(threads=10, clients=5, requests=1000, test_time=None):
+    """Build a default memtier_benchmark config dict.
+
+    Pass requests=None to omit --requests entirely; this is required when the
+    caller wants to bound the run by --test-time only (memtier rejects
+    --requests and --test-time as mutually exclusive). mb.py skips the
+    --requests emission when this value is None.
+    """
     config = {
         "memtier_benchmark": {
             "binary": MEMTIER_BINARY,
@@ -160,7 +172,359 @@ def agg_keyspace_range(master_nodes_connections):
     return overall_keyspace_range
 
 
-def get_column_csv(filename,column_name):
+def get_cluster_replica_connections(env):
+    """Return List[redis.Redis] for every replica advertised by CLUSTER NODES.
+
+    Cluster-mode only.  Requires the env was started with useSlaves=True.
+    Returns an empty list when not in cluster mode or when no replicas are
+    found (so callers can gracefully skip rather than crash).
+
+    When the env was started with ``--use-slaves`` (RLTest's useSlaves=True)
+    but CLUSTER NODES advertises no replicas, this helper emits a loud
+    stderr warning before returning an empty list.  This is the known
+    RLTest harness gap: ``--use-slaves`` starts replicas via ``--slaveof``
+    *without* ``--cluster-enabled yes``, so the slave processes are
+    standalone and never join cluster gossip.  See the
+    ``Read Preference -> Testing limitations`` section in README.md for
+    the full background.
+    """
+    import sys
+    import redis as _redis
+
+    if not env.isCluster():
+        return []
+    try:
+        any_conn = env.getOSSMasterNodesConnectionList()[0]
+        raw = any_conn.execute_command("CLUSTER", "NODES")
+    except Exception:
+        return []
+
+    # raw may be a bytes string or a plain str depending on the redis-py version
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+
+    conns = []
+    for line in raw.strip().split("\n"):
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        flags = parts[2]
+        if "slave" not in flags and "replica" not in flags:
+            continue
+        host_part, _, _ = parts[1].partition("@")
+        host, _, port_str = host_part.rpartition(":")
+        if not port_str:
+            continue
+        try:
+            port = int(port_str)
+        except ValueError:
+            continue
+        conns.append(
+            _redis.Redis(
+                host=host,
+                port=port,
+                decode_responses=True,
+                socket_connect_timeout=5,
+            )
+        )
+
+    # If RLTest was launched with useSlaves=True but CLUSTER NODES
+    # advertises zero replicas, emit a loud warning so the silent skip
+    # is at least visible in test output.  Use getattr() chains because
+    # RLTest's env.envRunner shape varies across versions.
+    if not conns:
+        use_slaves = False
+        runner = getattr(env, "envRunner", None)
+        if runner is not None:
+            use_slaves = bool(
+                getattr(runner, "useSlaves", False)
+                or getattr(runner, "use_slaves", False)
+            )
+        if use_slaves:
+            sys.stderr.write(
+                "warning: OSS_CLUSTER_REPLICAS=1 is set and RLTest started "
+                "slave nodes,\nbut CLUSTER NODES shows zero replicas "
+                "(slaves were started with --slaveof\nand not "
+                "--cluster-enabled yes, so they are not in cluster "
+                "gossip).\nThe read-preference tests will skip. See README "
+                "\"Read Preference -\ntesting limitations\" for the known "
+                "harness gap.\n"
+            )
+            sys.stderr.flush()
+    return conns
+
+
+def harness_client_ids(connections):
+    """Per connection, the IDs of the normal clients already on that server.
+
+    Take it before starting memtier: every normal client that shows up later
+    and is not one of these is memtier's, so the kills below leave the
+    harness's own connections (RLTest's, redis-py's pool) alone and count only
+    memtier's.
+
+    This assumes no harness connection opens after the snapshot. It holds
+    while the kills run on the calling thread, which reuses the one pooled
+    connection per server. Polling from a second thread through the same
+    pool can open a new pooled connection, which would be taken for
+    memtier's and killed.
+    """
+    harness = []
+    for conn in connections:
+        ids = set(int(c["id"]) for c in conn.client_list(_type="normal"))
+        ids.add(int(conn.client_id()))
+        harness.append(ids)
+    return harness
+
+
+_client_list_errors = set()
+
+
+def memtier_client_ids(env, connections, harness):
+    """Per connection, the IDs of memtier's clients (see harness_client_ids).
+
+    Only normal clients: a replica link that connects later is not memtier's.
+    """
+    found = []
+    for conn, ids in zip(connections, harness):
+        try:
+            found.append([int(c["id"]) for c in conn.client_list(_type="normal") if int(c["id"]) not in ids])
+        except Exception as e:
+            # Log each distinct failure once, not on every 1ms poll.
+            if str(e) not in _client_list_errors:
+                _client_list_errors.add(str(e))
+                env.debugPrint("CLIENT LIST failed: {}".format(e), True)
+            found.append([])
+    return found
+
+
+def wait_for_memtier_clients(env, connections, harness, proc, timeout=30.0):
+    """Poll until memtier has a client on some server; False if proc exits first."""
+    deadline = time.time() + timeout
+    while time.time() < deadline and proc.poll() is None:
+        if any(memtier_client_ids(env, connections, harness)):
+            return True
+        time.sleep(0.001)
+    return False
+
+
+def kill_memtier_clients(env, connections, harness):
+    """CLIENT KILL memtier's clients; returns how many were killed."""
+    killed = 0
+    for conn, ids in zip(connections, memtier_client_ids(env, connections, harness)):
+        for client_id in ids:
+            try:
+                killed += int(conn.execute_command("CLIENT", "KILL", "ID", client_id, "SKIPME", "yes"))
+            except Exception:
+                pass  # already gone
+    return killed
+
+
+def reset_commandstats(connections):
+    """CONFIG RESETSTAT on each connection.  Use to baseline before a run."""
+    for c in connections:
+        try:
+            c.execute_command("CONFIG", "RESETSTAT")
+        except Exception:
+            pass
+
+
+def server_supports_resp3(env):
+    """Detect whether the test cluster's Redis version supports RESP3.
+
+    Capability probe used by tests that pass --protocol=resp3. RESP3 was
+    introduced in Redis 6.0, so checking the server's major version is
+    sufficient.
+
+    HELLO 3 cannot be used as a probe over a RESP2 connection: the server
+    switches wire format to RESP3 mid-reply (the response is a %7\\r\\n map),
+    redis-py's RESP2 parser fails with a protocol error, and the broad
+    ``except`` would silently classify a fully RESP3-capable Redis 6+ server
+    as "not supported" (R5 round-18 caused 3 RESP3 read-preference tests to
+    silent-skip on Redis 6+). Parse ``redis_version`` from ``INFO server``
+    instead — that reply stays RESP2 and tells us exactly what we need.
+    """
+    try:
+        conn = env.getConnection()
+        info = conn.execute_command("INFO", "server")
+        version = None
+        if isinstance(info, dict):
+            version = info.get("redis_version")
+        else:
+            # Raw bulk string fallback (older redis-py / decode_responses=True).
+            if isinstance(info, bytes):
+                info = info.decode("utf-8", errors="replace")
+            for line in info.splitlines():
+                line = line.strip()
+                if line.startswith("redis_version:"):
+                    version = line.split(":", 1)[1].strip()
+                    break
+        if not version:
+            return False
+        major = int(version.split(".")[0])
+        return major >= 6
+    except Exception:
+        return False
+
+
+def get_get_call_count(conn):
+    """Read 'cmdstat_get' from INFO COMMANDSTATS.  Returns 0 if absent."""
+    try:
+        info = conn.execute_command("INFO", "COMMANDSTATS")
+    except Exception:
+        return 0
+
+    # INFO COMMANDSTATS may be returned as a dict (redis-py >= 4) or a raw str.
+    if isinstance(info, dict):
+        stat = info.get("cmdstat_get", {})
+        return int(stat.get("calls", 0))
+
+    # Raw string fallback (older redis-py or decode_responses=True).
+    for line in info.split("\n"):
+        line = line.strip()
+        if not line.startswith("cmdstat_get:"):
+            continue
+        # format: cmdstat_get:calls=N,usec=M,...
+        for kv in line.split(":", 1)[1].split(","):
+            kv = kv.strip()
+            if kv.startswith("calls="):
+                try:
+                    return int(kv.split("=", 1)[1])
+                except ValueError:
+                    return 0
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Prometheus exporter scrape helpers (shared by tests/test_prometheus.py).
+#
+# The exporter prints exactly one stdout announce line once its socket is
+# bound (PLAN.md §3.2, Decisions #9 / #26):
+#
+#     Prometheus exporter listening on http://127.0.0.1:46127/metrics
+#     Prometheus exporter listening on http://[::1]:46127/metrics   (IPv6)
+#
+# PROM_LISTEN_RE captures the URL (IPv6 host kept bracketed, RFC 3986).
+# ---------------------------------------------------------------------------
+PROM_LISTEN_RE = re.compile(
+    r"Prometheus exporter listening on (http://(?:\[[0-9A-Fa-f:]+\]|[^:/\s]+):\d+/metrics)"
+)
+
+# The byte-exact OpenMetrics/Prometheus 0.0.4 content type the exporter emits
+# (PLAN.md §3.3, prom::CONTENT_TYPE).
+PROM_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
+
+
+def wait_for_prometheus_url(stdout_path, timeout=30.0, interval=0.1):
+    """Poll *stdout_path* for the exporter announce line and return the URL.
+
+    Returns the captured /metrics URL (IPv6 host stays bracketed) or None if
+    the announce line never appears within *timeout* seconds.  The file is
+    re-read each poll because the producer flushes the line asynchronously.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with open(stdout_path) as fh:
+                m = PROM_LISTEN_RE.search(fh.read())
+        except FileNotFoundError:
+            m = None
+        if m:
+            return m.group(1)
+        time.sleep(interval)
+    return None
+
+
+class PromScrape(object):
+    """Result of a single /metrics HTTP GET.
+
+    Attributes:
+      status   -- HTTP status code (int), or None on a connection-level failure
+      body     -- decoded response body (str), or "" on a connection failure
+      headers  -- email.message.Message of response headers, or None
+      error    -- the exception instance on a connection-level failure, else None
+
+    A connection-level failure (refused / reset / timeout) is *not* an
+    exception out of prom_scrape: it is reported as status=None so callers
+    with a "200-or-connection-failure" closed outcome set (F15) can branch
+    cleanly.  HTTP error statuses (404/501/503) are returned as a normal
+    result with the real status code and body (urllib raises HTTPError for
+    >=400, which we catch and unwrap).
+    """
+
+    def __init__(self, status=None, body="", headers=None, error=None):
+        self.status = status
+        self.body = body
+        self.headers = headers
+        self.error = error
+
+    def header(self, name):
+        """Case-insensitive single-header lookup; returns None if absent."""
+        if self.headers is None:
+            return None
+        return self.headers.get(name)
+
+
+def prom_scrape(url, timeout=2.0, method="GET"):
+    """HTTP-scrape *url*, returning a PromScrape.
+
+    * 2xx                       -> status/body/headers populated, error=None
+    * HTTP >= 400 (404/501/503) -> real status + body via HTTPError unwrap
+    * connection-level failure  -> status=None, error set (the process beat
+                                   the scrape to teardown, etc.)
+    """
+    req = urllib.request.Request(url, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            return PromScrape(status=resp.status, body=body, headers=resp.headers)
+    except urllib.error.HTTPError as e:
+        # >= 400: a real HTTP reply (404 / 501 / 503).  Unwrap to a result.
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        return PromScrape(status=e.code, body=body, headers=e.headers)
+    except (urllib.error.URLError, OSError) as e:
+        # Connection refused / reset / timeout: the closed-outcome "the
+        # process beat us to teardown" branch.  Report, don't raise.
+        return PromScrape(status=None, body="", headers=None, error=e)
+
+
+def prom_parse(body):
+    """Parse a Prometheus exposition body into {sample_name: [Sample, ...]}.
+
+    Uses prometheus_client's official text parser (test_requirements.txt pins
+    prometheus_client>=0.20).  The return value is a dict keyed by the *sample*
+    name (so memtier_latency_seconds yields memtier_latency_seconds_bucket,
+    _count, _sum entries) mapping to a list of prometheus_client Sample
+    namedtuples (name, labels, value, timestamp, exemplar).
+
+    Raises on a malformed body so tests that "hard-assert prom_parse" (F2)
+    fail loudly on a corrupt scrape.
+    """
+    from prometheus_client.parser import text_string_to_metric_families
+
+    out = {}
+    for family in text_string_to_metric_families(body):
+        for sample in family.samples:
+            out.setdefault(sample.name, []).append(sample)
+    return out
+
+
+def prom_sample_value(parsed, name, labels=None):
+    """Return the value of the first sample named *name* matching *labels*.
+
+    *parsed* is the dict from prom_parse.  *labels* is an optional dict of
+    label key/value pairs the sample must contain (subset match).  Returns
+    None if no matching sample exists.
+    """
+    for s in parsed.get(name, []):
+        if labels is None or all(s.labels.get(k) == v for k, v in labels.items()):
+            return s.value
+    return None
+
+
+def get_column_csv(filename, column_name):
     found = False
     with open(filename,"r") as fd:
         stop_line = 0

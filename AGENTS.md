@@ -2,6 +2,22 @@
 
 This document provides guidance for AI agents working with the memtier_benchmark codebase.
 
+## Claude and Codex interoperability
+
+`AGENTS.md` is the shared guide; `CLAUDE.md` links to this file so both agents load
+identical instructions. Skills are maintained under `.claude/skills/` and exposed
+to Codex through `.agents/skills`, which links to the same directory. Keep each
+skill's references and scripts beside its `SKILL.md` so both clients resolve them.
+
+Use `/adversarial-review` or `/memtier-maintainer-review` in Claude, and
+`$adversarial-review` or `$memtier-maintainer-review` in Codex. Both entry points
+load the same workflow. Add new skills to the shared directory, not a separate copy.
+
+This repository does not require an MCP server. Personal or parent-workspace MCP
+connections are configured separately in each client; do not commit credentials or
+machine-specific server settings here. Run `python3 utils/check_agent_parity.py`
+after changing agent instructions or skills to verify the shared entry points.
+
 ## Project Overview
 
 memtier_benchmark is a high-performance load generation and benchmarking tool for NoSQL databases (Redis and Memcached) developed by Redis. It is written in C++ and uses libevent for async I/O.
@@ -17,6 +33,7 @@ memtier_benchmark is a high-performance load generation and benchmarking tool fo
 ├── obj_gen.cpp/h          # Object/key generation
 ├── run_stats.cpp/h        # Statistics collection and reporting
 ├── JSON_handler.cpp/h     # JSON output support
+├── utf8.cpp/h             # UTF-8 sanitizer (U+FFFD) shared by JSON and /metrics
 ├── file_io.cpp/h          # File I/O operations
 ├── config_types.cpp/h     # Configuration types
 ├── deps/hdr_histogram/    # HdrHistogram library (vendored)
@@ -57,6 +74,7 @@ make
 - Run `make format-check` to verify formatting
 - CI enforces formatting on all PRs
 - **Always run `make format` after modifying C++ files and before committing.** Verify with `make format-check` that no formatting issues remain.
+- Run `make install-hooks` once per clone to enable the `.githooks/pre-commit` hook, which runs `make format-check-staged` automatically on staged C/C++ blobs (the content in the index, not the working tree).
 
 ## Testing
 
@@ -137,6 +155,113 @@ Every new CLI option **must** be added in **all** of these locations:
 - Protocol implementations are in `protocol.cpp`
 - Each protocol (redis/memcached) has its own class hierarchy
 - Connection state machine is in `shard_connection.cpp`
+
+## Releasing
+
+### Release-note style
+
+GitHub release notes are curated, not auto-generated. Follow the pattern established
+from 2.2.1 onward:
+
+```markdown
+# What's Changed
+
+## New Features
+- **Short title**: One-sentence description ending with the PR number (#123).
+
+## Bug Fixes
+- **Short title**: Description with `inline code` for flag/identifier names (#124).
+
+## Packaging & Distribution
+- ...
+
+## Developer Tooling & CI Improvements
+- ...
+
+## Maintenance
+- ...
+
+## New Contributors
+- @handle made their first contribution (#125)
+
+**Full Changelog**: https://github.com/redis/memtier_benchmark/compare/<prev>...<this>
+```
+
+Conventions:
+- `# What's Changed` heading, then `##` sections (only the sections that have
+  content — drop empty ones).
+- Section order, when present: New Features → Bug Fixes → Packaging & Distribution
+  → Developer Tooling & CI Improvements → Build & Configuration Improvements →
+  Maintenance → AI → New Contributors.
+- Bullet form: `- **Bold lead phrase**: Sentence-cased description ending with a
+  period, with the PR number in parens before the period (#NNN).`
+- Use inline backticks for CLI flags, file names, and identifiers.
+- Close with the `**Full Changelog**` compare link.
+- Do *not* paste the GitHub auto-generated `* by @user in <PR-link>` style — it
+  was used up to 2.2.0 but has been replaced by the curated form.
+
+### Patch releases (cherry-picks to a release branch)
+
+Patch releases live on a release branch (e.g. `2.3` for the 2.3.x line). The flow:
+
+1. **List the candidates**: `git log --oneline origin/master ^origin/<release-branch>`.
+   For each commit, decide whether it belongs in a patch release. Skip duplicates
+   that were applied independently to the release branch (compare diffs, not just
+   subjects — see `0cb8e9a` vs `d92b163` in the 2.3.1 history).
+2. **Branch from the release branch**: `git switch -c release.<X.Y.Z> origin/<release-branch>`.
+3. **Cherry-pick in chronological order** so the release-branch history reads
+   forward. Resolve conflicts as they arise.
+4. **Verify CI workflows fire on the release branch.** Workflow files
+   (`asan.yml`, `ci.yml`, `code-style.yml`, `tsan.yml`, `ubsan.yml`,
+   `release-rpm.yml`) historically restricted `pull_request: branches:` to
+   `[master, main]` only. A PR targeting the release branch will run **zero**
+   checks until the branch list includes the release branch — extend each
+   workflow's `branches:` filter as part of the release PR if it is missing.
+5. **Run `utils/prepare_release.sh <X.Y.Z>`** as the last commit. See gotchas
+   below.
+6. **Open a single PR base `<release-branch>` ← `release.<X.Y.Z>`.** Don't split
+   the cherry-picks and the version bump into separate PRs for a patch release;
+   the atomic shape leaves the release branch self-consistent if the PR is
+   delayed.
+7. **After merge, tag and publish a Release** on the merged release-branch HEAD.
+   The `release: published` event fires `dockers.yml`, `release-rpm.yml`, and
+   `release.yml` (APT) automatically.
+8. **Mirror any review-driven follow-ups back to master** as a separate PR.
+   Cursor Bugbot frequently catches latent issues on release-prep PRs (e.g. the
+   `get_total_latency()` narrowing flagged on the 2.3.1 backport); do not let
+   those fixes live only on the release branch.
+
+### `utils/prepare_release.sh` gotchas
+
+`utils/prepare_release.sh <version>` bumps `configure.ac`, runs
+`autoreconf -ivf && ./configure && make && make rebuild-man`, and commits
+`configure.ac + memtier_benchmark.1` as a single `Release <version>` commit.
+Watch out for:
+
+- **Stale `version.h` corrupts the man page.** The Makefile rule
+  `version.h: $(SHELL) $(srcdir)/version.sh` has **no dependencies**, so once
+  `version.h` exists `make` won't re-run `version.sh`. The script then bakes an
+  outdated git SHA into `memtier_benchmark.1` via `help2man`. **Always
+  `rm -f version.h` before running the script** so the SHA matches HEAD.
+- **No branch sanity check.** The script doesn't verify the current branch.
+  Confirm `git branch --show-current` matches the intended release branch
+  before running.
+- **No version-string validation.** A typo like `2.3.1.` writes a broken
+  `AC_INIT` line and the failure only surfaces on the next build. Sanity-check
+  with `grep AC_INIT configure.ac` after the bump commit lands.
+- **No tag is created.** The script commits but doesn't tag. After merge you
+  still need `git tag <X.Y.Z>` on the merged release-branch tip, push the tag,
+  and publish a GitHub Release for the workflows to fire.
+- **Untracked-file check is dirty-state-only.** The script blocks on tracked
+  modifications but ignores untracked files. Editor backups like
+  `configure.ac~` won't trigger the guard.
+
+### Release-note generation
+
+Use `gh release create <tag> --generate-notes --draft` as a starting point,
+then rewrite the body in the curated style above before publishing. Don't
+publish the auto-generated draft as-is — it doesn't match the project's
+release-note conventions.
 
 ## Debugging
 

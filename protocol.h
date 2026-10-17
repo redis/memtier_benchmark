@@ -21,6 +21,7 @@
 
 #include <event2/buffer.h>
 #include <vector>
+#include <cstdint>
 #include "memtier_benchmark.h"
 
 enum mbulk_element_type
@@ -42,6 +43,13 @@ public:
     virtual mbulk_size_el *as_mbulk_size() = 0;
     virtual bulk_el *as_bulk() = 0;
 
+    // Safe type predicates so callers can avoid as_bulk() / as_mbulk_size()
+    // assertions when the element kind is unknown (e.g. when walking a
+    // top-level reply array whose elements may be either bulks or nested
+    // arrays, as in GEOPOS, COMMAND INFO, SORT_RO).
+    bool is_bulk() const { return type == mbulk_element_bulk; }
+    bool is_mbulk_size() const { return type == mbulk_element_mbulk_size; }
+
 protected:
     mbulk_element_type type;
 };
@@ -52,11 +60,28 @@ public:
     mbulk_size_el() : mbulk_element(mbulk_element_mbulk_size), upper_level(NULL), bulks_count(0) { ; }
     virtual ~mbulk_size_el()
     {
-        for (unsigned int i = 0; i < mbulks_elements.size(); i++) {
-            mbulk_element *el = mbulks_elements[i];
+        // Iterative teardown. A naive recursive `delete el` on each child
+        // would blow the stack when a (malicious or buggy) server sends
+        // deeply nested arrays (`*1\r\n*1\r\n*1\r\n…`). We walk the tree
+        // non-recursively by stealing each visited node's children into a
+        // worklist; once a node's `mbulks_elements` has been swapped out
+        // its destructor's body is a no-op so the eventual `delete` does
+        // not recurse.
+        std::vector<mbulk_element *> worklist;
+        worklist.swap(mbulks_elements);
+        for (size_t i = 0; i < worklist.size(); i++) {
+            mbulk_element *el = worklist[i];
+            if (el == NULL) continue;
+            if (el->is_mbulk_size()) {
+                mbulk_size_el *m = el->as_mbulk_size();
+                std::vector<mbulk_element *> stolen;
+                stolen.swap(m->mbulks_elements);
+                for (size_t j = 0; j < stolen.size(); j++) {
+                    worklist.push_back(stolen[j]);
+                }
+            }
             delete el;
         }
-        mbulks_elements.clear();
     }
 
     virtual mbulk_size_el *as_mbulk_size() { return this; }
@@ -92,7 +117,7 @@ public:
 class bulk_el : public mbulk_element
 {
 public:
-    bulk_el() : mbulk_element(mbulk_element_bulk), value(NULL), value_len(0) { ; }
+    bulk_el() : mbulk_element(mbulk_element_bulk), value(NULL), value_len(0), is_resp3_null(false) { ; }
     virtual ~bulk_el()
     {
         free(value);
@@ -105,6 +130,11 @@ public:
 
     char *value;
     unsigned int value_len;
+    // True only when this element was produced by the single_type parser
+    // branch for the RESP3 null type byte '_'. Distinguishes a genuine
+    // RESP3 null from a legitimate bulk string whose content happens to be
+    // the single character '_' (parsed via blob_type / rs_read_bulk).
+    bool is_resp3_null;
 };
 
 struct protocol_response
@@ -117,6 +147,22 @@ protected:
     unsigned int m_total_len;
     unsigned int m_hits;
     bool m_error;
+    // Declared element count of the reply's top-level aggregate (* array, %
+    // map, ~ set), captured once per response from the header line. -1 means
+    // the top-level reply was not such an aggregate (a scalar, bulk, error, or
+    // unparsed). Lets miss-tracking classify empty vs non-empty collections
+    // without materializing element values via set_keep_value(). A null array
+    // ($-1/*-1) and an empty array (*0) both record 0.
+    int m_top_array_len;
+    // Per-element hit/miss flags for the reply's top-level array, recorded at
+    // parse time when miss tracking is enabled (set_track_elem_misses). 1=hit
+    // (non-null element), 0=miss (null bulk, RESP3 null, or empty sub-array).
+    // This is the alloc-free alternative to materializing the reply tree via
+    // set_keep_value() purely to attribute per-position misses for the
+    // ArrayPerElementNulls shape (HMGET/MGET/ZMSCORE/GEOPOS/...). Only top-level
+    // elements are recorded; children of nested sub-arrays are skipped (a
+    // nested element is a hit iff its sub-array is non-empty).
+    std::vector<uint8_t> m_elem_hits;
 
 public:
     protocol_response();
@@ -137,6 +183,13 @@ public:
     void incr_hits(void);
     unsigned int get_hits(void);
 
+    void set_top_array_len(int len);
+    int get_top_array_len(void);
+
+    void elem_hits_reserve(size_t n);
+    void elem_hit_push(bool hit);
+    const std::vector<uint8_t> &get_elem_hits(void);
+
     void clear();
 
     void set_mbulk_value(mbulk_size_el *element);
@@ -154,7 +207,9 @@ protected:
 
     char *m_buffer;
     char *m_buffer_ptr;
-    unsigned int m_buffer_size;
+    size_t m_buffer_size;
+    // A 32-bit size wrapped to 0 past 2 GiB and add_key()'s growth never ended.
+    static_assert(sizeof(m_buffer_size) >= sizeof(size_t), "keylist buffer size must be size_t");
 
     key_entry *m_keys;
     unsigned int m_keys_size;
@@ -178,6 +233,12 @@ protected:
     struct evbuffer *m_write_buf;
 
     bool m_keep_value;
+    // When set, the parser records per-top-level-element hit/miss flags into
+    // m_last_response.m_elem_hits without materializing the reply tree. Used by
+    // the ArrayPerElementNulls miss-tracking path as an alloc-free replacement
+    // for set_keep_value(). Independent of m_keep_value (both may be on if a
+    // SCAN-style command shares the connection).
+    bool m_track_elem_misses;
     struct protocol_response m_last_response;
 
 public:
@@ -186,11 +247,30 @@ public:
     virtual abstract_protocol *clone(void) = 0;
     void set_buffers(struct evbuffer *read_buf, struct evbuffer *write_buf);
     void set_keep_value(bool flag);
+    void set_track_elem_misses(bool flag);
 
+    // Drop any partial-parse state that would otherwise survive a
+    // bufferevent_free/reconnect cycle. The bufferevent input/output
+    // buffers themselves are owned by the bufferevent and are gone by
+    // the time we get here, so we only need to discard the in-protocol
+    // parser cursor (response_state, total_bulks_count, attribute/push
+    // drain flags, current mbulk tree) and clear m_last_response so
+    // its mbulk children are freed.
+    // The default implementation only clears m_last_response; redis_protocol
+    // overrides to also reset its parser fields. memcache subclasses keep
+    // the default for now (their state machine resets at every reply boundary
+    // and they have no RESP3-style push frame drain to leak).
+    // m_resp3 (negotiated protocol version) is intentionally NOT touched -- a
+    // TCP flap should not roll back the HELLO 3 negotiation result.
+    virtual void reset_state();
     virtual int select_db(int db) = 0;
     virtual int authenticate(const char *credentials) = 0;
     virtual int configure_protocol(enum PROTOCOL_TYPE type) = 0;
     virtual int write_command_cluster_slots() = 0;
+    // Send READONLY (cluster mode only; used to allow replica connections to
+    // serve reads). Not applicable to memcached; the memcached implementations
+    // assert(0) since the READONLY ladder is only fired for cluster replicas.
+    virtual int write_command_readonly() = 0;
     virtual int write_command_set(const char *key, int key_len, const char *value, int value_len, int expiry,
                                   unsigned int offset) = 0;
     virtual int write_command_get(const char *key, int key_len, unsigned int offset) = 0;

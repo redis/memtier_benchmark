@@ -31,9 +31,12 @@ protected:
     const char *m_filename; /** name of file */
     FILE *m_file;           /** handle of open file */
 
-    unsigned int m_line; /** current line being read */
+    unsigned int m_line;  /** current line being read */
+    bool m_error;         /** read_item() hit a malformed item */
+    unsigned int m_items; /** items read since open_file() */
 
     char *read_string(unsigned int len, unsigned int alloc_len, unsigned int *actual_len);
+    memcache_item *bad_item(void);
 
 public:
     file_reader(const char *filename);
@@ -42,6 +45,8 @@ public:
 
     bool open_file(void);
     bool is_eof(void);
+    bool has_error(void) const { return m_error; }
+    const char *get_filename(void) const { return m_filename; }
     memcache_item *read_item(void);
 };
 
@@ -63,5 +68,25 @@ public:
     bool open_file(void);
     bool write_item(memcache_item *item);
 };
+
+/** Flushes fp and, if do_close is true, closes it. Returns 0 if every write
+ * to fp reached the OS, otherwise an errno value describing the failure (EIO
+ * when an earlier write failed and its errno is no longer known). */
+int finish_output_file(FILE *fp, bool do_close);
+
+/** True if the write error err on the still-open fp only means that the
+ * stdout reader went away (e.g. `| head`): fp is stdout or the same file, a
+ * pipe or socket, and the error is EPIPE/ECONNRESET (SIGPIPE is ignored). The
+ * EIO from finish_output_file() hides the real errno, which may be EAGAIN on
+ * a full stdout pipe made non-blocking by a parent sharing it (e.g. Node or a
+ * CI runner), so for EIO poll(): POLLERR/POLLHUP means the reader is gone.
+ * Such a write error does not fail the run. */
+bool stdout_reader_gone(FILE *fp, int err);
+
+/** Flushes and closes fp, a file opened for one of the output options.
+ * Returns 0 if every write reached the OS or the only failure is a stdout
+ * reader that went away (stdout_reader_gone()), otherwise an errno value as
+ * finish_output_file() does. */
+int close_output_file(FILE *fp);
 
 #endif /* _FILE_IO_H */

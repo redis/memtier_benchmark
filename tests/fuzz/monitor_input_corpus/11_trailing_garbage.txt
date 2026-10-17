@@ -1,0 +1,4 @@
+[ proxy1 ] 1.0 [0 127.0.0.1:1] "SET" "k" "v"xxxx
+[ proxy2 ] 1.0 [0 127.0.0.1:2] "GET" "k"trailing
+[ proxy3 ] 1.0 [0 127.0.0.1:3] "HSET" "h" "f" "v"123
+[ proxy4 ] 1.0 [0 127.0.0.1:4] 'SET' 'k' 'v'garbage

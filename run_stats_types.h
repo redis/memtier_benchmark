@@ -77,13 +77,13 @@ public:
 class one_sec_cmd_stats
 {
 public:
-    unsigned long int m_bytes_rx;
-    unsigned long int m_bytes_tx;
-    unsigned long int m_ops;
-    unsigned int m_hits;
-    unsigned int m_misses;
-    unsigned int m_moved;
-    unsigned int m_ask;
+    unsigned long long int m_bytes_rx;
+    unsigned long long int m_bytes_tx;
+    unsigned long long int m_ops;
+    unsigned long long int m_hits;
+    unsigned long long int m_misses;
+    unsigned long long int m_moved;
+    unsigned long long int m_ask;
     unsigned long long int m_total_latency;
     std::vector<double> summarized_quantile_values;
     double m_avg_latency;
@@ -98,13 +98,14 @@ public:
      * @param histogram The histogram from which quantile values are extracted.
      * @param sorted_quantiles A sorted (ascending order) vector of quantiles for which values will be computed.
      *                         The caller must ensure the vector is sorted from smallest to largest.
+     * @param values Reusable scratch, shared across a client's sequential command summaries.
+     *               Batch p0/empty semantics are retained for existing per-second history.
      */
-    void summarize_quantiles(safe_hdr_histogram histogram, std::vector<double> sorted_quantiles);
+    void summarize_quantiles(const hdr_histogram *histogram, const std::vector<double> &sorted_quantiles,
+                             std::vector<int64_t> &values);
     void update_op(unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency);
     void update_op(unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency, unsigned int hits,
                    unsigned int misses);
-    void update_moved_op(unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency);
-    void update_ask_op(unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency);
 };
 
 class one_second_stats; // forward declaration
@@ -116,8 +117,9 @@ public:
     void setup(size_t n_arbitrary_commands);
     void reset();
     void merge(const ar_one_sec_cmd_stats &other);
-    unsigned long int ops();
-    unsigned long int bytes();
+    unsigned long long int ops();
+    unsigned long long int bytes_rx();
+    unsigned long long int bytes_tx();
     unsigned long long int total_latency();
     size_t size() const;
     one_sec_cmd_stats &at(std::size_t idx) { return m_commands.at(idx); }
@@ -147,6 +149,76 @@ public:
     void merge(const one_second_stats &other);
 };
 
+// Per-second, per-thread CPU utilization snapshot produced by the live
+// (advisory) sampler in run_benchmark's monitor loop. m_main_thread_cpu_pct
+// and each m_thread_cpu_pct entry are "% of a single core" for that 1s window
+// (so a fully-busy worker reads ~100.0). Used for the per-second JSON detail
+// and the live one-shot high-CPU warning. Trivially copyable.
+struct per_second_cpu_stats
+{
+    unsigned int m_second;
+    double m_main_thread_cpu_pct;
+    std::vector<double> m_thread_cpu_pct;
+    per_second_cpu_stats() : m_second(0), m_main_thread_cpu_pct(0.0) {}
+};
+
+// Authoritative per-worker CPU total for the whole run, derived from
+// getrusage(RUSAGE_THREAD) deltas captured inside the worker (accumulated
+// across restarts). Seconds are wall-independent CPU time; cores_used is
+// total_seconds / wall_seconds (i.e. average busy cores for this thread).
+struct per_thread_cpu_total
+{
+    unsigned int thread_id;
+    double user_seconds;
+    double sys_seconds;
+    double total_seconds;
+    double wall_seconds;
+    double cores_used;
+    bool valid; // false => getrusage unavailable/failed; excluded from sums
+    per_thread_cpu_total() :
+            thread_id(0),
+            user_seconds(0.0),
+            sys_seconds(0.0),
+            total_seconds(0.0),
+            wall_seconds(0.0),
+            cores_used(0.0),
+            valid(false)
+    {
+    }
+};
+
+// Whole-process CPU aggregate for the run: sum of every worker (plus the main
+// thread) folded once from the per-thread totals after join. avg_utilization_pct
+// is normalized to the worker-thread count, so 100% means "all worker threads
+// were saturated". peak_utilization_pct is the highest single-second whole-process
+// utilization observed by the live sampler.
+struct cpu_summary
+{
+    double user_seconds;
+    double sys_seconds;
+    double total_seconds;        // whole process: workers + main thread
+    double worker_total_seconds; // workers only; basis for avg_utilization_pct
+    double wall_seconds;
+    double cores_used;
+    double avg_utilization_pct;
+    double peak_utilization_pct;
+    unsigned int threads_counted; // number of valid worker threads in the sums
+    bool valid;
+    cpu_summary() :
+            user_seconds(0.0),
+            sys_seconds(0.0),
+            total_seconds(0.0),
+            worker_total_seconds(0.0),
+            wall_seconds(0.0),
+            cores_used(0.0),
+            avg_utilization_pct(0.0),
+            peak_utilization_pct(0.0),
+            threads_counted(0),
+            valid(false)
+    {
+    }
+};
+
 class totals_cmd
 {
 public:
@@ -158,11 +230,11 @@ public:
     double m_ask_sec;
     double m_latency;
     unsigned long long int m_total_latency;
-    unsigned long int m_ops;
+    unsigned long long int m_ops;
     totals_cmd();
     void add(const totals_cmd &other);
     void aggregate_average(size_t stats_size);
-    void summarize(const one_sec_cmd_stats &other, unsigned long test_duration_usec);
+    void summarize(const one_sec_cmd_stats &other, unsigned long long test_duration_usec);
 };
 
 class ar_totals_cmd
@@ -172,7 +244,7 @@ public:
     void setup(size_t n_arbitrary_commands);
     void add(const ar_totals_cmd &other);
     void aggregate_average(size_t stats_size);
-    void summarize(const ar_one_sec_cmd_stats &other, unsigned long test_duration_usec);
+    void summarize(const ar_one_sec_cmd_stats &other, unsigned long long test_duration_usec);
     size_t size() const;
 
     totals_cmd &at(std::size_t idx) { return m_commands.at(idx); }
@@ -202,19 +274,39 @@ public:
     double m_misses_sec;
     double m_moved_sec;
     double m_ask_sec;
-    unsigned long long int m_latency;
+    double m_latency;
     unsigned long long int m_total_latency;
     // number of bytes received
-    unsigned long int m_bytes_rx;
+    unsigned long long int m_bytes_rx;
     // number of bytes sent
-    unsigned long int m_bytes_tx;
-    unsigned long int m_ops;
-    unsigned long int m_connection_errors;
+    unsigned long long int m_bytes_tx;
+    unsigned long long int m_ops;
+    // Lock-free running totals for live progress display. Workers bump these
+    // from update_op() without synchronization; the main thread reads via
+    // get_total_hits()/get_total_misses(). Same benign-race pattern as m_ops.
+    unsigned long long int m_hits;
+    unsigned long long int m_misses;
+    unsigned long long int m_connection_errors;
     double m_connection_errors_sec;
+    // Retry/error counters. Same benign-race pattern as m_ops: incremented
+    // lock-free by workers, read from the main thread for progress display.
+    //   m_retry_attempts   total number of resends across all requests
+    //   m_retried_ops      number of distinct requests that needed at least
+    //                      one retry (regardless of final outcome)
+    //   m_errors           number of requests that ultimately failed (retries
+    //                      exhausted, permanent error, or given up on without
+    //                      a reply under --retry-on-error). Excludes
+    //                      connection errors which already have their own
+    //                      counter.
+    unsigned long long int m_retry_attempts;
+    unsigned long long int m_retried_ops;
+    unsigned long long int m_errors;
     totals();
     void setup_arbitrary_commands(size_t n_arbitrary_commands);
     void add(const totals &other);
-    void update_op(unsigned long int bytes_rx, unsigned long int bytes_tx, unsigned int latency);
+    void update_op(unsigned long long int bytes_rx, unsigned long long int bytes_tx, unsigned int latency);
+    void update_op(unsigned long long int bytes_rx, unsigned long long int bytes_tx, unsigned int latency,
+                   unsigned int hits, unsigned int misses);
     void update_connection_error();
 };
 

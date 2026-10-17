@@ -75,12 +75,45 @@ class Benchmark(object):
         with open(os.path.join(self.config.results_dir, name), 'wb') as outfile:
             outfile.write(data)
 
-    def run(self):
+    def run(self, timeout=240):
+        """Run memtier_benchmark to completion.
+
+        timeout: hard upper bound (seconds) on the child process. A real
+        spin or hang in memtier would otherwise block communicate() until
+        the CI job's 6-hour cap, which produces no diagnostic. When the
+        timeout fires we kill the child, drain its pipes, write a
+        truncated mb.stderr, and return False so the calling test fails
+        fast rather than hanging.
+
+        The default of 240s accommodates ASAN+TLS+reconnect-heavy workloads
+        with margin. test_short_reconnect_interval, for example, runs 50,000
+        ops at --reconnect-interval=1 with a full TLS handshake per op and
+        sustains only ~380-450 ops/sec under ASAN+TLS (110-130s wall time),
+        so a tighter default would flake on slow CI cells. Spin-guard tests
+        that need a tight bound to fail fast on a real hang still override
+        with a small explicit timeout (e.g. timeout=20 in
+        test_read_preference_mget).
+        """
         logging.debug('  Command: %s', ' '.join(self.args))
         process = subprocess.Popen(
             stdin=None, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             executable=self.binary, args=self.args)
-        _stdout, _stderr = process.communicate()
+        try:
+            _stdout, _stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            logging.error(
+                '  memtier_benchmark exceeded %ds timeout; killing child', timeout)
+            process.kill()
+            try:
+                _stdout, _stderr = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                _stdout, _stderr = b'', b''
+            if _stderr:
+                self.write_file('mb.stderr', _stderr)
+            self.write_file(
+                'mb.timeout',
+                'memtier_benchmark timed out after {}s\n'.format(timeout).encode())
+            return False
         if _stderr:
             logging.debug('  >>> stderr <<<\n%s\n', _stderr)
             self.write_file('mb.stderr', _stderr)

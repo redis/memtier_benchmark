@@ -66,7 +66,7 @@ else
   PKG=yum
 fi
 $PKG install -y rpm-build rpmdevtools rsync gcc-c++ make autoconf automake \
-  libtool libevent-devel openssl-devel zlib-devel pkgconfig
+  libevent-devel openssl-devel zlib-devel pkgconfig
 
 # Stage a writable copy of the source tree.
 cp -r /src /work

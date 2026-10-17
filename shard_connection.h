@@ -19,6 +19,8 @@
 #ifndef MEMTIER_BENCHMARK_SHARD_CONNECTION_H
 #define MEMTIER_BENCHMARK_SHARD_CONNECTION_H
 
+#include <atomic>
+#include <climits>
 #include <queue>
 #include <string>
 #include <netdb.h>
@@ -35,6 +37,7 @@ class connections_manager;
 struct benchmark_config;
 class abstract_protocol;
 class object_generator;
+struct arbitrary_command;
 
 enum connection_state
 {
@@ -49,6 +52,16 @@ enum setup_state
     setup_done
 };
 
+// Topology role of a shard connection. Primary == owns slots and accepts writes.
+// Replica == read-only mirror of a primary; requires READONLY after HELLO before
+// it will serve any user traffic in cluster mode. Cluster mode only; standalone
+// replicas don't get this treatment (see P2 design brief).
+enum shard_role
+{
+    role_primary,
+    role_replica
+};
+
 enum request_type
 {
     rt_unknown,
@@ -59,31 +72,69 @@ enum request_type
     rt_auth,
     rt_select_db,
     rt_cluster_slots,
-    rt_hello
+    rt_hello,
+    rt_readonly,
+    rt_discard,
+    rt_asking
 };
 struct request
 {
     request_type m_type;
-    struct timeval m_sent_time;
+    struct timeval m_sent_time; // most-recent attempt; updated on each replay
+    // First-attempt send time. Stats are computed against this so retries appear
+    // as a single op spanning first-send to final outcome.
+    struct timeval m_first_sent_time;
     unsigned int m_size;
     unsigned int m_keys;
 
+    // Retry bookkeeping. Populated by the retry path; ignored when --retry-on-error is off.
+    unsigned int m_retries;     // number of resends so far (0 = first attempt)
+    struct timeval m_retry_due; // while in the retry queue: when to resend (CLOCK_MONOTONIC)
+    // Set true by enqueue_retry when ownership has transferred to the retry
+    // queue. process_response checks this flag and skips its delete, leaving
+    // the request to be freed when the retry queue drains.
+    bool m_claimed_by_retry;
+    // Set by an -ASK redirect: every resend to the node it named is preceded
+    // by ASKING, or that node, importing the slot, answers -MOVED back to the
+    // migrating node. Cleared when the request is routed by the slot map.
+    bool m_asking;
+
+    // Captured serialized command bytes for resend. Owned; freed in dtor.
+    // NULL/0 when retry is disabled or capture failed. Stored as opaque protocol
+    // bytes so any command type can be replayed without per-type re-serialization.
+    char *m_serialized;
+    size_t m_serialized_len;
+
+    // Optional key string for failed-keys logging. NULL/0 for commands without
+    // a key (WAIT, setup) or when key capture was not attempted.
+    char *m_key;
+    unsigned int m_key_len;
+
     request(request_type type, unsigned int size, struct timeval *sent_time, unsigned int keys);
-    virtual ~request(void) {}
+    virtual ~request(void);
+
+    // Attach serialized command bytes (takes ownership). Safe to call once.
+    void set_serialized(const char *data, size_t len);
+    // Attach a key for failed-keys logging (copies bytes; takes ownership).
+    void set_key_for_log(const char *key, unsigned int key_len);
 };
 
 struct arbitrary_request : public request
 {
     size_t index;
+    // Nullable pointer to the source command's metadata (NULL for memcached
+    // and any path where lookup is unavailable). When non-null and
+    // miss_tracking_enabled is true, the response handler walks the reply to
+    // record hits/misses per key bucket.
+    const arbitrary_command *m_cmd_meta;
 
-    arbitrary_request(size_t request_index, request_type type, unsigned int size, struct timeval *sent_time);
+    arbitrary_request(size_t request_index, request_type type, unsigned int size, struct timeval *sent_time,
+                      const arbitrary_command *cmd_meta = NULL);
     virtual ~arbitrary_request(void) {}
 };
 
 struct verify_request : public request
 {
-    char *m_key;
-    unsigned int m_key_len;
     char *m_value;
     unsigned int m_value_len;
 
@@ -95,12 +146,16 @@ struct verify_request : public request
 class shard_connection
 {
     friend void cluster_client_timer_handler(evutil_socket_t fd, short what, void *ctx);
+    friend void deferred_fill_pipeline_cb(evutil_socket_t fd, short what, void *ctx);
+    friend void cluster_slots_retry_cb(evutil_socket_t fd, short what, void *ctx);
+    friend void setup_rejected_check_cb(evutil_socket_t fd, short what, void *ctx);
     friend void cluster_client_read_handler(bufferevent *bev, void *ctx);
     friend void cluster_client_event_handler(bufferevent *bev, short events, void *ctx);
 
 public:
     shard_connection(unsigned int id, connections_manager *conn_man, benchmark_config *config,
-                     struct event_base *event_base, abstract_protocol *abs_protocol);
+                     struct event_base *event_base, abstract_protocol *abs_protocol,
+                     unsigned int request_rate_phase_microsecond = 0);
     ~shard_connection();
 
     void set_address_port(const char *address, const char *port);
@@ -108,6 +163,33 @@ public:
 
     int connect(struct connect_info *addr);
     void disconnect();
+    // Count a connection error and disconnect. If --reconnect-on-error
+    // allows another attempt, schedule a reconnect with backoff; otherwise
+    // end this thread.
+    void attempt_reconnect(const char *error_context);
+    void count_connection_error();
+    void disconnect_after_error();
+    void end_thread(const char *reason, const char *thread_end_reason);
+    void reconnect_after_setup_error(const char *error_context, bool setup_step = true);
+    // Reconnects stop at the --test-time deadline (#656) only with
+    // --reconnect-on-error and unlimited --max-reconnect-attempts; a finite
+    // bound keeps master's behaviour.
+    bool stops_at_deadline(void) const { return m_config->reconnect_on_error && m_config->max_reconnect_attempts == 0; }
+    bool run_deadline(struct timeval *deadline);
+    bool run_deadline_passed(void);
+    // Whether the run's stop condition is reached, also for a client that
+    // never started (see run_deadline()).
+    bool run_is_over(void);
+    void retry_cluster_slots_after_error();
+    void handle_cluster_slots_retry_event();
+    void handle_setup_rejected_check_event();
+    double next_reconnect_delay(void);
+    bool stop_reconnecting_if_run_over(void);
+    // siblings_done() and end_client_after_run() are public only for
+    // tests/unit/reconnect_siblings_test.cpp.
+    bool siblings_done(void);
+    void end_client_after_run(bool end_stats);
+    void warn_reconnecting_indefinitely(void);
 
     void send_wait_command(struct timeval *sent_time, unsigned int num_slaves, unsigned int timeout);
     void send_set_command(struct timeval *sent_time, const char *key, int key_len, const char *value, int value_len,
@@ -118,9 +200,23 @@ public:
                                  int value_len, unsigned int offset);
     int send_arbitrary_command(const command_arg *arg);
     int send_arbitrary_command(const command_arg *arg, const char *val, int val_len);
+    // Key of an arbitrary command whose key was written as a constant
+    // argument (__monitor_line@__); like a key_type argument, the first one
+    // wins and send_arbitrary_command_end() attaches it to the request.
+    void set_arbitrary_command_key(const char *key, unsigned int key_len);
     void send_arbitrary_command_end(size_t command_index, struct timeval *sent_time, int cmd_size);
 
-    void set_cluster_slots() { m_cluster_slots = setup_none; }
+    // Request a CLUSTER SLOTS refresh. A refresh already in flight (setup_sent)
+    // will update the slot map anyway: sending a second one would leave two
+    // replies pending, and the first one turns off keeping the reply value the
+    // second needs. disconnect() resets the state, so a reconnect still sends
+    // a new one.
+    void set_cluster_slots()
+    {
+        if (m_cluster_slots != setup_sent) m_cluster_slots = setup_none;
+    }
+    void schedule_fill(void);
+    bool has_request_rate_budget() const;
 
     enum setup_state get_cluster_slots_state() { return m_cluster_slots; }
 
@@ -133,8 +229,100 @@ public:
     const char *get_port() { return m_port; }
 
     enum connection_state get_connection_state() { return m_connection_state; }
+    bool is_reconnect_pending() const { return m_reconnecting; }
+    // A replica connection closed because the server rejected its setup
+    // under --read-preference primary (or secondaryPreferred with
+    // --reconnect-on-error). The replica path of a slot map refresh
+    // does not redial it; a refresh that makes the node a primary dials it
+    // through the primary path, where reconnect_after_setup_error() applies.
+    bool is_setup_rejected_replica() const { return m_setup_rejected_replica; }
+    // A setup step was rejected since this connection's last workload reply.
+    bool setup_failed_since_reply() const { return m_setup_failed_since_reply; }
+    bool has_requests_to_replay() const { return m_replay_queue != NULL && !m_replay_queue->empty(); }
 
-    int get_pending_resp() { return m_pending_resp; }
+    // Topology role accessors. Defaults to role_primary; cluster_client flips
+    // replicas to role_replica after CLUSTER SLOTS reveals them.
+    enum shard_role get_role() const { return m_role; }
+    void set_role(enum shard_role role) { m_role = role; }
+    bool is_replica() const { return m_role == role_replica; }
+    // --transaction: a MULTI was written and its EXEC/DISCARD not yet.
+    bool is_multi_open() const { return m_multi_open; }
+
+    // READONLY ladder state accessor. setup_done means the server has
+    // acknowledged the READONLY command for this connection. Primary
+    // connections skip the ladder (m_readonly_state starts and stays
+    // setup_done) so this always returns setup_done for them.
+    enum setup_state get_readonly_state() const { return m_readonly_state; }
+
+    // Re-arm and immediately send READONLY on an already-connected replica
+    // connection whose role was just flipped from primary → replica by a live
+    // CLUSTER SLOTS refresh. Re-sets m_readonly_state to setup_none (so
+    // is_conn_setup_done() returns false) and fires the READONLY wire bytes
+    // immediately. If the connection is not yet in conn_connected state the
+    // call is a no-op: connect() will arm the ladder normally.
+    void rearm_readonly();
+
+    // True iff this connection is ready to serve user-level reads:
+    // TCP connected, cluster-slots ladder done, and (for replicas) the
+    // READONLY ladder also done. Primaries satisfy the last condition
+    // trivially because m_readonly_state is initialised to setup_done.
+    bool is_ready_for_reads() const
+    {
+        if (m_connection_state != conn_connected) return false;
+        if (m_cluster_slots != setup_done) return false;
+        // Replicas must have completed the READONLY handshake before the
+        // server will serve reads; sending a read before READONLY gets
+        // a -READONLY error from the server.
+        if (m_role == role_replica && m_readonly_state != setup_done) return false;
+        return true;
+    }
+
+    // ----------------------------------------------------------------------
+    // Read-preference observability hooks
+    // ----------------------------------------------------------------------
+    //
+    // Per-endpoint EWMA latency in microseconds. Updated on every successful
+    // response via `update_latency_ewma`. Until `m_latency_samples` reaches
+    // `LATENCY_EWMA_MIN_SAMPLES` the EWMA is treated as +inf by
+    // `nearest`-mode selection, so cold or unproven endpoints never win the
+    // lowest-latency tiebreak.
+    //
+    // Per-role op counters track how many user-level requests were routed
+    // to this endpoint. They feed the "Endpoints" array in mb.json and the
+    // "Ops from Primary"/"Ops from Replica" counts in the per-command "Read
+    // Routing" sub-object. The counters live on the connection (not on
+    // run_stats) because routing is per-conn, and the connection's role can
+    // be flipped at topology refresh time.
+    // C++11 forbids in-class initializers for static constexpr doubles
+    // (technically allowed but odr-use would require an out-of-class
+    // definition, which is brittle); wrap the constants in static inline
+    // accessors instead.
+    static double latency_ewma_alpha() { return 0.1; }
+    static unsigned int latency_ewma_min_samples() { return 10; }
+
+    double get_latency_ewma_us() const { return m_latency_ewma_us; }
+    unsigned int get_latency_samples() const { return m_latency_samples; }
+    bool latency_ewma_warm() const { return m_latency_samples >= latency_ewma_min_samples(); }
+    void update_latency_ewma(double sample_us)
+    {
+        if (m_latency_samples == 0)
+            m_latency_ewma_us = sample_us;
+        else {
+            const double a = latency_ewma_alpha();
+            m_latency_ewma_us = a * sample_us + (1.0 - a) * m_latency_ewma_us;
+        }
+        if (m_latency_samples < UINT_MAX) m_latency_samples++;
+    }
+
+    void inc_routed_ops() { m_routed_ops++; }
+    unsigned long long get_routed_ops() const { return m_routed_ops; }
+
+    // Snapshot the pending-response counter. Read by the crash-handler signal
+    // path (print_client_list) which races with worker-thread push_req/pop_req
+    // mutations; std::atomic with relaxed ordering gives TSAN a clean
+    // happens-before edge and is signal-safe for lock-free integer atomics.
+    int get_pending_resp() { return m_pending_resp.load(std::memory_order_relaxed); }
+    bool holds_retries() const { return m_retry_queue != NULL && !m_retry_queue->empty(); }
 
     // Get local port for crash reporting
     int get_local_port();
@@ -145,13 +333,86 @@ public:
     void handle_reconnect_timer_event();
     void handle_connection_timeout_event();
 
+    // Retry / replay machinery.
+    void handle_retry_drain_event();
+    // Push `req` back onto the wire (or onto the retry queue if a backoff is
+    // configured). Caller must guarantee req->m_serialized is non-NULL.
+    // Returns false if max_retries exceeded or queue full (caller must finalize).
+    bool enqueue_retry(request *req);
+    // Replay a request (write the captured bytes to the output buffer + push_req).
+    // Bumps req->m_retries and updates req->m_sent_time.
+    void replay_request(request *req);
+    // Arm m_retry_drain_timer to fire at `due`.
+    void arm_retry_drain_timer(const struct timeval &due, const struct timeval &now);
+    // Drain any pending replay-on-reconnect requests back into the pipeline.
+    void drain_replay_queue_after_reconnect();
+    // Hand-off of requests held for resend when a cluster topology change
+    // retires this connection: pop_replay_request() returns them one at a
+    // time (NULL when none are left), and the connection that now owns the
+    // slot takes each one with adopt_replay_request(). It is resent from
+    // fill_pipeline() once that connection is connected and set up, never
+    // from inside the refresh.
+    request *pop_replay_request();
+    // Drops the requests still waiting for a reply (the run is over and the
+    // server stopped answering), so they are neither resent nor waited for.
+    // Returns how many of them were workload requests; those are also logged
+    // to --failed-keys-file as "no-reply-after-test-time".
+    unsigned int drop_pending_requests();
+    void adopt_replay_request(request *req);
+    // Give up on every request held for resend: log each one to
+    // --failed-keys-file with `reason` and count it as an error. Returns how
+    // many were dropped.
+    unsigned long long abandon_replay_requests(const char *reason);
+    // Why this connection ended its thread early, if it did: the reason
+    // client_group::run() logs its held requests with. NULL otherwise.
+    void set_thread_end_reason(const char *reason) { m_thread_end_reason = reason; }
+    const char *get_thread_end_reason() const { return m_thread_end_reason; }
+    // Capture bytes added between `before_pos` and the current evbuffer length
+    // into req->m_serialized. No-op when retry is globally disabled.
+    void capture_serialized_bytes(size_t before_pos, request *req);
+
+    // Hard cap on retry queue depth (--max-retry-queue, or the auto cap).
+    size_t retry_queue_cap() const;
+    // True == cap hit: enqueue_retry() refuses the request.
+    bool retry_queue_full() const;
+    // True when queued retries plus requests in flight reach the cap (at
+    // least --pipeline): hold new work, so that every request in flight has
+    // room for a retry.
+    bool retry_queue_holds_new_work() const;
+
 private:
+    // request::m_key is read by --failed-keys-file and, under --retry-on-error,
+    // by cluster MOVED/ASK retry, replay and -READONLY routing; skip the copy
+    // when neither is on.
+    bool wants_request_key() const { return m_config->retry_on_error || m_config->failed_keys_file; }
+
     void setup_event(int sockfd);
     int setup_socket(struct connect_info *addr);
     void set_readable_id();
 
     bool is_conn_setup_done();
+    // True when the only setup step left is a CLUSTER SLOTS refresh not yet sent.
+    bool cluster_slots_refresh_pending() const
+    {
+        return m_cluster_slots == setup_none && m_authentication == setup_done && m_db_selection == setup_done &&
+               m_hello == setup_done && m_readonly_state == setup_done;
+    }
+    // True while a CLUSTER SLOTS refresh must wait for the pinned
+    // --transaction rotation this connection drives to close its MULTI.
+    bool setup_held_for_transaction();
     void send_conn_setup_commands(struct timeval timestamp);
+    // Schedule a fill on every other connected connection of this client, so
+    // that those held in hold_pipeline() re-check it.
+    void wake_peers(void);
+
+    // True iff any peer connection on this client is still climbing the
+    // setup ladder (TCP-up or in-progress, but not yet ready for reads).
+    // Used by attempt_reconnect's terminal-else to avoid tearing down the
+    // whole worker thread when ONE connection has exhausted its reconnect
+    // budget but its sibling connections are still mid-HELLO/READONLY on
+    // surviving nodes — cluster_client's routing path can fall back to
+    // those peers via the existing is_ready_for_reads() gate.
+    bool peer_client_has_any_setup_in_progress() const;
 
     request *pop_req();
     void push_req(request *req);
@@ -163,7 +424,6 @@ private:
 
     void handle_event(short evtype);
     void handle_timer_event(void);
-    void attempt_reconnect(const char *error_context);
 
     unsigned int m_id;
     connections_manager *m_conns_manager;
@@ -181,24 +441,148 @@ private:
     abstract_protocol *m_protocol;
     std::queue<request *> *m_pipeline;
     unsigned int m_request_per_cur_interval; // number requests to send during the current interval
+    unsigned int m_request_rate_phase_microsecond;
+    bool m_request_rate_phase_pending;
 
-    int m_pending_resp;
+    // Pending-response counter. Mutated only by the connection's owning worker
+    // thread (push_req/pop_req on the libevent callback) but read from the
+    // crash-handler signal context on a foreign thread. std::atomic<int>
+    // serializes those accesses cleanly under TSAN; on every supported
+    // platform std::atomic<int> is lock-free and the loads/stores are
+    // async-signal-safe.
+    std::atomic<int> m_pending_resp;
+
+    // Snapshot of the most recently pushed request's type. Updated on every
+    // push_req() and read by get_last_request_type() from the crash-handler
+    // signal context. std::atomic<int> (lock-free, signal-safe) replaces the
+    // earlier `volatile int` which was not sufficient to silence TSAN's
+    // foreign-thread read race report.
+    std::atomic<int> m_last_pushed_req_type;
 
     enum connection_state m_connection_state;
+    // Topology role; defaults to role_primary. Cluster_client sets it to
+    // role_replica after CLUSTER SLOTS reveals the connection is a replica node.
+    // Connection-scoped (preserved across reconnects so the READONLY ladder
+    // re-fires on every reconnect).
+    enum shard_role m_role;
 
     enum setup_state m_hello;
     enum setup_state m_authentication;
     enum setup_state m_db_selection;
     enum setup_state m_cluster_slots;
+    // READONLY ladder stage. Only ever leaves setup_done when m_role ==
+    // role_replica; primaries skip the stage entirely. Re-armed on every
+    // reconnect because READONLY is connection-scoped on the server side.
+    enum setup_state m_readonly_state;
+    // True between writing a MULTI and writing the EXEC/DISCARD that closes
+    // it (--transaction). Anything else written meanwhile is queued by the
+    // server (+QUEUED) instead of run, so setup commands must wait for it.
+    bool m_multi_open;
+    // First __key__ argument of the arbitrary command being written, attached
+    // to the request in send_arbitrary_command_end(). Empty when the command
+    // has no key or wants_request_key() is false.
+    std::string m_arbitrary_log_key;
 
     // Reconnection state tracking
     unsigned int m_reconnect_attempts;
     double m_current_backoff_delay;
     struct event *m_reconnect_timer;
     bool m_reconnecting;
+    // The pending reconnect follows a rejected setup step (AUTH/SELECT/HELLO).
+    // Cleared when its timer fires. reconnect_after_setup_error() also sets it
+    // before calling attempt_reconnect(), so stop_reconnecting_if_run_over()
+    // leaves the rejection to handle_reconnect_timer_event(), which fails the
+    // run (#630). m_setup_failed_since_reply below outlives the timer, until
+    // the next workload reply.
+    bool m_setup_rejected;
+    // See is_setup_rejected_replica(). Never reset: it lasts as long as this
+    // object (kept across disconnect() and role changes). handle_cluster_slots()
+    // matches replicas by address, so it always names the same endpoint.
+    bool m_setup_rejected_replica;
+    // Without --reconnect-on-error: the setup step the server rejected on this
+    // still-open connection, while the run has not reached steady state. It is
+    // read when the re-check timer fires, so it must point to static storage
+    // (a string literal), never to a formatted buffer.
+    const char *m_setup_rejected_context;
+    const char *m_thread_end_reason;
+    // The last connection error was a failed connect (not a drop of an
+    // established connection): see stop_reconnecting_if_run_over().
+    bool m_connect_failed;
+    // A drop was reconnected after the run was over: the next one is not.
+    // Never cleared: each connection gets one reconnect after the deadline.
+    bool m_dropped_after_run_over;
+    // A setup step (AUTH/SELECT/HELLO) was rejected since the last workload
+    // reply (errors included): a failed connect after the run is over then
+    // fails the run (#630).
+    bool m_setup_failed_since_reply;
+    // The pending rejected-setup reconnect follows an empty or error CLUSTER
+    // SLOTS reply (with m_setup_rejected), and whether this connection already
+    // got its one refresh after the run was over (never cleared).
+    bool m_slots_rejected;
+    bool m_slots_retried_after_run_over;
 
     // Connection timeout tracking
     struct event *m_connection_timeout_timer;
+
+    // Retry plumbing.
+    //   m_retry_queue       requests waiting for backoff before resending
+    //   m_replay_queue      requests that were in-flight when the socket died,
+    //                       to be replayed after reconnect succeeds
+    //   m_retry_drain_timer single libevent timer that drains m_retry_queue
+    //                       (avoids one-timer-per-request). Each queued
+    //                       request has its own due time (m_retry_due, from
+    //                       its own resend count); the timer is armed for the
+    //                       earliest one and resends only the requests due
+    //   m_retry_timer_due   due time the timer is armed for, or last fired
+    //                       for (CLOCK_MONOTONIC)
+    std::queue<request *> *m_retry_queue;
+    std::queue<request *> *m_replay_queue;
+    struct event *m_retry_drain_timer;
+    struct timeval m_retry_timer_due;
+
+    // Cancelable timer for deferred fill_pipeline (replaces event_base_once to
+    // avoid UAF when the connection is freed before the callback fires).
+    struct event *m_deferred_fill_timer;
+
+    // Resends CLUSTER SLOTS after an empty, error or rejected reply at startup.
+    struct event *m_cluster_slots_retry_timer;
+
+    // Checks once a second whether a connection left open with a rejected
+    // setup must now end the thread (reconnect_after_setup_error()).
+    struct event *m_setup_rejected_timer;
+
+    // Tracks whether the bufferevent was paused via bufferevent_disable(EV_READ|
+    // EV_WRITE) by fill_pipeline's idle-disable branch. fill_pipeline used to
+    // call bufferevent_enable() unconditionally on every invocation to recover
+    // from a --transaction hold_pipeline pause; that fired per-response and
+    // took libevent's BEV_LOCK in the hot path. The flag lets the resume be
+    // conditional. Invariant: m_bev_paused == true iff m_bev is currently in
+    // the EV_READ|EV_WRITE-disabled state.
+    bool m_bev_paused;
+
+    // Bumped by every disconnect(). process_response() compares it against
+    // the value it started with and stops parsing once the connection was
+    // torn down by a handler it called (e.g. a CLUSTER SLOTS reply retiring
+    // this very connection): the pipeline those replies answer is gone. A
+    // counter rather than a state check, so that a disconnect followed by a
+    // reconnect inside the same handler is caught too.
+    unsigned long m_disconnect_count = 0;
+
+    // EWMA of per-response latency in microseconds; see public accessors above
+    // (LATENCY_EWMA_ALPHA / LATENCY_EWMA_MIN_SAMPLES). Driven by
+    // update_latency_ewma() from the response handler. Read by the
+    // `nearest` selector in cluster_client. Per-conn, single-threaded: no
+    // synchronization needed.
+    double m_latency_ewma_us = 0.0;
+    unsigned int m_latency_samples = 0;
+
+    // Number of user-facing requests this endpoint has handled (after the
+    // routing decision lands at send-time). Distinct from m_pending_resp,
+    // which is in-flight depth, and from run_stats counters, which aggregate
+    // across endpoints and don't know about role. Bumped at send-time, not
+    // at response time, so per-endpoint Ops reflects what we routed there
+    // even when a request later fails.
+    unsigned long long m_routed_ops = 0;
 };
 
 #endif // MEMTIER_BENCHMARK_SHARD_CONNECTION_H

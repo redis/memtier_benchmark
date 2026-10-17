@@ -110,7 +110,8 @@ protected:
     std::vector<unsigned long long> m_next_key;
 
     unsigned long long m_key_index;
-    char m_key_buffer[250];
+    char *m_key_buffer;
+    size_t m_key_buffer_size;
     const char *m_key;
     int m_key_len;
     char *m_value_buffer;
@@ -172,7 +173,9 @@ public:
     imported_keylist(const char *filename);
     ~imported_keylist();
 
-    bool read_keys(void);
+    // Read the whole file, stopping at the first malformed item. With
+    // keep_keys false the file is only validated and no keys are stored.
+    bool read_keys(bool keep_keys = true);
     unsigned int size();
     const char *get(unsigned int pos, unsigned int *len);
 };

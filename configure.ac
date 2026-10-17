@@ -22,11 +22,21 @@ AC_CONFIG_HEADER([config.h])
 AM_INIT_AUTOMAKE
 AM_SILENT_RULES([yes])
 AC_CONFIG_MACRO_DIR([m4])
-LT_INIT
 
-CXXFLAGS="-O2 -g -Wall $CXXFLAGS"
+# Python is only required for the maintainer-only `make commands-meta` target.
+# Resolve to ":" (the no-op shell builtin) when absent so end-user builds keep
+# working without Python installed.
+AM_PATH_PYTHON([3.6],, [:])
 
-# Checks for programs.
+dnl -Werror=vla rejects variable-length arrays at compile time. VLAs on the
+dnl worker-thread stack are how PR #405 / issue #404 shipped: an input-sized
+dnl `char buffer[N]` blew an 8-12 MB stack the moment a 20 MB MONITOR-replay
+dnl line was selected. Keep this hard-error to prevent the next one.
+CXXFLAGS="-O2 -g -Wall -Werror=vla -std=c++11 $CXXFLAGS"
+
+# Checks for programs. AC_PROG_CC is for the hdr_histogram C sources, and it
+# must come before AX_CODE_COVERAGE, which reads $GCC.
+AC_PROG_CC
 AC_PROG_CXX
 
 # Coverage
@@ -76,7 +86,7 @@ AC_ARG_ENABLE([sanitizers],
                   [Enable AddressSanitizer and LeakSanitizer for memory error detection])])
 AS_IF([test "x$enable_sanitizers" = "xyes"], [
        AC_MSG_NOTICE([Enabling AddressSanitizer and LeakSanitizer])
-       CXXFLAGS="$CXXFLAGS -fsanitize=address -fsanitize=leak -fno-omit-frame-pointer -O1"
+       CXXFLAGS="$CXXFLAGS -fsanitize=address -fsanitize=leak -fno-omit-frame-pointer -O1 -g"
        LDFLAGS="$LDFLAGS -fsanitize=address -fsanitize=leak"
        ], [])
 
@@ -86,7 +96,7 @@ AC_ARG_ENABLE([ubsan],
                   [Enable UndefinedBehaviorSanitizer for undefined behavior detection])])
 AS_IF([test "x$enable_ubsan" = "xyes"], [
        AC_MSG_NOTICE([Enabling UndefinedBehaviorSanitizer])
-       CXXFLAGS="$CXXFLAGS -fsanitize=undefined -fno-omit-frame-pointer"
+       CXXFLAGS="$CXXFLAGS -fsanitize=undefined -fno-omit-frame-pointer -O1 -g"
        LDFLAGS="$LDFLAGS -fsanitize=undefined"
        ], [])
 
@@ -99,9 +109,25 @@ AS_IF([test "x$enable_thread_sanitizer" = "xyes"], [
               AC_MSG_ERROR([--enable-thread-sanitizer and --enable-sanitizers are mutually exclusive])
        ])
        AC_MSG_NOTICE([Enabling ThreadSanitizer])
-       CXXFLAGS="$CXXFLAGS -fsanitize=thread -fno-omit-frame-pointer -O1"
+       CXXFLAGS="$CXXFLAGS -fsanitize=thread -fno-omit-frame-pointer -O1 -g"
        LDFLAGS="$LDFLAGS -fsanitize=thread"
        ], [])
+
+# libFuzzer-based in-process fuzz harnesses (requires clang++).
+# When enabled, builds tests/fuzz/*_fuzz binaries under noinst_PROGRAMS.
+# Does not perturb the main memtier_benchmark binary's build flags.
+AC_ARG_ENABLE([fuzz],
+  [AS_HELP_STRING([--enable-fuzz],
+                  [Build libFuzzer harnesses under tests/fuzz/ (requires clang++)])])
+AS_IF([test "x$enable_fuzz" = "xyes"], [
+       AC_MSG_CHECKING([whether $CXX is clang++])
+       AS_CASE(["`$CXX --version 2>/dev/null | head -n 1`"],
+               [*clang*], [AC_MSG_RESULT([yes])],
+               [AC_MSG_RESULT([no])
+                AC_MSG_ERROR([--enable-fuzz requires clang++; re-run configure with CXX=clang++ CC=clang])])
+       AC_MSG_NOTICE([Enabling libFuzzer fuzz harnesses (tests/fuzz/)])
+       ], [])
+AM_CONDITIONAL([FUZZ_ENABLED], [test "x$enable_fuzz" = "xyes"])
 
 # clock_gettime requires -lrt on old glibc only.
 AC_SEARCH_LIBS([clock_gettime], [rt], , AC_MSG_ERROR([rt is required libevent.]))
@@ -117,11 +143,70 @@ PKG_CHECK_MODULES(LIBEVENT,
     AC_SUBST(LIBEVENT_CFLAGS) AC_SUBST(LIBEVENT_LIBS)
 )
 
-# bash completion
-PKG_CHECK_MODULES([BASH_COMPLETION], [bash-completion >= 2.0],
-    [BASH_COMPLETION_DIR="`pkg-config --variable=completionsdir bash-completion`"],
-    [BASH_COMPLETION_DIR="$datadir/bash-completion/completions"])
+# libevent_pthreads: needed for evthread_use_pthreads(). Without this,
+# event_base_loopbreak() / event_base_loopexit() called from a *different*
+# thread than the one running event_base_dispatch() do not wake the
+# epoll_wait(), so an idle worker hangs after a cross-thread shutdown
+# request (Phase 1 of #426 / Ctrl+C). The pthreads bindings ship as a
+# separate .so since libevent 2.0, so we have to depend on it explicitly.
+PKG_CHECK_MODULES(LIBEVENT_PTHREADS,
+    [libevent_pthreads >= 2.0.10],
+    AC_SUBST(LIBEVENT_PTHREADS_CFLAGS) AC_SUBST(LIBEVENT_PTHREADS_LIBS)
+)
+
+# Prometheus exporter (evhttp) is optional, default ON. PKG check = non-fatal hygiene;
+# the LINK test is the real gate (bare AC_CHECK_HEADERS mis-detects on keg-only Homebrew
+# arm64). Link test deliberately uses the NEWEST evhttp symbol the exporter calls
+# (>= 2.1.1) so old libevent fails here, loudly.
+AC_ARG_ENABLE([prometheus],
+  [AS_HELP_STRING([--disable-prometheus],
+                  [Disable the Prometheus /metrics HTTP exporter])])
+AS_IF([test "x$enable_prometheus" != "xno"], [
+       PKG_CHECK_MODULES([LIBEVENT_EXTRA], [libevent_extra >= 2.1.1],
+                         [AC_SUBST(LIBEVENT_EXTRA_CFLAGS) AC_SUBST(LIBEVENT_EXTRA_LIBS)],
+                         [LIBEVENT_EXTRA_CFLAGS="" LIBEVENT_EXTRA_LIBS=""])
+       memtier_saved_CFLAGS="$CFLAGS"; memtier_saved_LIBS="$LIBS"
+       CFLAGS="$CFLAGS $LIBEVENT_CFLAGS $LIBEVENT_EXTRA_CFLAGS"
+       LIBS="$LIBEVENT_EXTRA_LIBS $LIBEVENT_LIBS $LIBS"
+       AC_MSG_CHECKING([whether libevent evhttp is usable (evhttp_request_set_on_complete_cb)])
+       AC_LINK_IFELSE(
+         [AC_LANG_PROGRAM([[#include <event2/event.h>
+#include <event2/http.h>
+static void mt_done_cb(struct evhttp_request *r, void *a) { (void)r; (void)a; }]],
+                          [[struct event_base *b = event_base_new();
+                            struct evhttp *h = evhttp_new(b);
+                            evhttp_request_set_on_complete_cb((struct evhttp_request *)0,
+                                                              mt_done_cb, (void *)0);
+                            evhttp_free(h); event_base_free(b);]])],
+         [AC_MSG_RESULT([yes])
+          AC_DEFINE([HAVE_EVHTTP], [1], [define to enable the Prometheus /metrics exporter])],
+         [AC_MSG_RESULT([no])
+          AC_MSG_ERROR([libevent evhttp >= 2.1.1 is required for the Prometheus exporter.
+Install libevent development packages (libevent-dev / libevent-devel),
+or configure with --disable-prometheus.])])
+       CFLAGS="$memtier_saved_CFLAGS"; LIBS="$memtier_saved_LIBS"
+       ], [
+       LIBEVENT_EXTRA_CFLAGS=""
+       LIBEVENT_EXTRA_LIBS=""
+       AC_SUBST(LIBEVENT_EXTRA_CFLAGS)
+       AC_SUBST(LIBEVENT_EXTRA_LIBS)
+       ])
+
+# bash completion. The default follows --prefix, so a non-root prefix install
+# and make distcheck stay inside the prefix; --prefix=/usr gives the distro
+# path. Pass DIR to install elsewhere, or --without-bash-completion-dir to skip.
+AC_ARG_WITH([bash-completion-dir],
+  [AS_HELP_STRING([--with-bash-completion-dir@<:@=DIR@:>@],
+                  [install the bash completion script in DIR
+                   @<:@DATADIR/bash-completion/completions@:>@])],
+  [], [with_bash_completion_dir=yes])
+AS_CASE(["$with_bash_completion_dir"],
+  [yes], [BASH_COMPLETION_DIR='${datadir}/bash-completion/completions'],
+  [no], [BASH_COMPLETION_DIR=],
+  [/*], [BASH_COMPLETION_DIR="$with_bash_completion_dir"],
+  [AC_MSG_ERROR([--with-bash-completion-dir requires an absolute, non-empty directory; use --without-bash-completion-dir to disable installation])])
 AC_SUBST([BASH_COMPLETION_DIR])
+AM_CONDITIONAL([INSTALL_BASH_COMPLETION], [test "x$with_bash_completion_dir" != "xno"])
 
 AC_CONFIG_FILES([
    	Makefile

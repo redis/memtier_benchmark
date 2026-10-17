@@ -1,6 +1,9 @@
+import base64
+import csv
 import tempfile
 import os
 import json
+import zlib
 from include import *
 from mb import Benchmark, RunConfig
 
@@ -504,6 +507,7 @@ def test_monitor_random_reproducible_without_randomize(env):
     ]
 
     config_dict = get_default_memtier_config(threads=1, clients=1, requests=100)
+    expected_requests = get_expected_request_count(config_dict)
     master_nodes_list = env.getMasterNodesList()
 
     # Helper function to run benchmark and get command counts
@@ -513,9 +517,14 @@ def test_monitor_random_reproducible_without_randomize(env):
 
         benchmark_specs = {"name": run_name, "args": base_args.copy()}
         addTLSArgs(benchmark_specs, env)
-        add_required_env_arguments(benchmark_specs, config_dict.copy(), env, master_nodes_list)
+        add_required_env_arguments(benchmark_specs, config_dict, env, master_nodes_list)
 
-        config = RunConfig(run_dir, run_name, config_dict.copy(), {})
+        # Catch a discarded helper mutation even when the fixture uses port 6379.
+        if not env.isUnixSocket() and config_dict.get('redis_process_port') != master_nodes_list[0]['port']:
+            env.assertEqual(config_dict.get('redis_process_port'), master_nodes_list[0]['port'],
+                            message="The Redis fixture port must reach RunConfig explicitly")
+            return {}
+        config = RunConfig(run_dir, run_name, config_dict, {})
         ensure_clean_benchmark_folder(config.results_dir)
 
         benchmark = Benchmark.from_json(config, benchmark_specs)
@@ -536,6 +545,8 @@ def test_monitor_random_reproducible_without_randomize(env):
                     if isinstance(val, bytes):
                         val = val.decode("utf-8")
                     counts[key] = int(val)
+        env.assertEqual(sum(counts.values()), expected_requests,
+                        message="Each run must execute its full INCR budget on the configured Redis")
         return counts
 
     # Clear any existing keys
@@ -714,6 +725,215 @@ def test_command_stats_breakdown_by_line(env):
         env.assertEqual(gets_count, 2)
 
 
+def _hist_count(stats):
+    """Sample count of a JSON row's encoded HDR histogram (V2 wire format)."""
+    encoded = stats["Percentile Latencies"]["Histogram log format"]["Compressed Histogram"]
+    compressed = base64.b64decode(encoded, validate=True)
+    raw = zlib.decompress(compressed[8:])
+    count, word, shift = 0, 0, 0
+    for byte in raw[40:]:
+        word |= (byte & 0x7F) << shift
+        if byte & 0x80:
+            shift += 7
+            continue
+        value = (word >> 1) ^ -(word & 1)
+        if value > 0:
+            count += value
+        word, shift = 0, 0
+    return count
+
+
+def _run_duplicate_command_lines(env, breakdown, commands, extra_args=()):
+    """
+    Run the given --command args with --command-stats-breakdown=<breakdown>
+    (1 client, 300 requests) and return (results dict, list of duplicate JSON
+    object keys found anywhere in the document).
+    """
+    test_dir = tempfile.mkdtemp()
+    benchmark_specs = {
+        "name": env.testName,
+        "args": list(commands)
+        + list(extra_args)
+        + ["--command-stats-breakdown={}".format(breakdown)],
+    }
+    addTLSArgs(benchmark_specs, env)
+
+    config = get_default_memtier_config(threads=1, clients=1, requests=300)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    memtier_ok = benchmark.run()
+    debugPrintMemtierOnError(config, env)
+    env.assertTrue(memtier_ok == True)
+
+    duplicates = []
+
+    def no_duplicates(pairs):
+        keys = [k for k, _ in pairs]
+        duplicates.extend(sorted(set(k for k in keys if keys.count(k) > 1)))
+        return dict(pairs)
+
+    with open("{0}/mb.json".format(config.results_dir)) as results_json:
+        results_dict = json.load(results_json, object_pairs_hook=no_duplicates)
+    return results_dict, duplicates
+
+
+# The first GET line runs 3x as often as the second, so the two lines have
+# different counts (180 / 60 / 60 for 300 requests in rounds of 3 + 1 + 1)
+# and a swapped or reversed numbering cannot pass.
+_DUPLICATE_GET_COMMANDS = [
+    "--command=GET __key__",
+    "--command-ratio=3",
+    "--command=GET __key__",
+    "--command=SET __key__ __data__",
+]
+
+
+def test_command_stats_breakdown_line_duplicate_json_keys(env):
+    """
+    Two --command lines with the same name used to produce duplicate "Gets"
+    (and "GET") keys in the JSON output with --command-stats-breakdown=line;
+    JSON parsers keep only the last one, so the per-command rows no longer
+    added up to Totals. Repeated names must be disambiguated with " #N" in
+    --command order while unique names keep their usual key.
+    """
+    results_dict, duplicates = _run_duplicate_command_lines(env, "line", _DUPLICATE_GET_COMMANDS)
+    env.assertEqual(duplicates, [])
+
+    all_stats = results_dict["ALL STATS"]
+    env.assertFalse("Gets" in all_stats)
+    env.assertFalse("GET" in all_stats)
+    expected = {"Gets #1": 180, "Gets #2": 60, "Sets": 60}
+    for key, count in expected.items():
+        env.assertTrue(key in all_stats)
+        if key in all_stats:
+            env.assertEqual(all_stats[key]["Count"], count)
+            env.assertEqual(_hist_count(all_stats[key]), count)
+    env.assertEqual(all_stats["Totals"]["Count"], 300)
+
+    # Per-line latency histogram arrays: one per line, no plain "GET".
+    for key in ("GET #1", "GET #2", "SET"):
+        env.assertTrue(key in all_stats)
+
+    per_key = all_stats["Per-Key Misses"]
+    env.assertEqual(sorted(per_key.keys()), ["GET #1", "GET #2"])
+    env.assertEqual(per_key["GET #1"]["Total Hits"] + per_key["GET #1"]["Total Misses"], 180)
+    env.assertEqual(per_key["GET #2"]["Total Hits"] + per_key["GET #2"]["Total Misses"], 60)
+
+
+def test_command_stats_breakdown_command_duplicate_json_keys(env):
+    """
+    With the default --command-stats-breakdown=command the rows are aggregated
+    by type ("Gets"), but the per-line "Per-Key Misses" section must still
+    keep one entry per --command line.
+    """
+    results_dict, duplicates = _run_duplicate_command_lines(env, "command", _DUPLICATE_GET_COMMANDS)
+    env.assertEqual(duplicates, [])
+
+    all_stats = results_dict["ALL STATS"]
+    env.assertEqual(all_stats["Gets"]["Count"], 240)
+    env.assertEqual(all_stats["Sets"]["Count"], 60)
+    per_key = all_stats["Per-Key Misses"]
+    env.assertEqual(sorted(per_key.keys()), ["GET #1", "GET #2"])
+    env.assertEqual(per_key["GET #1"]["Total Hits"] + per_key["GET #1"]["Total Misses"], 180)
+    env.assertEqual(per_key["GET #2"]["Total Hits"] + per_key["GET #2"]["Total Misses"], 60)
+
+
+def test_command_stats_breakdown_line_duplicate_monitor_lines(env):
+    """
+    Repeating the same __monitor_lineN__ gives two lines with the same display
+    name ("GET (Line 1)"); they must get distinct JSON keys too.
+    """
+    # cluster mode does not support monitor-input option
+    env.skipOnCluster()
+    monitor_file = os.path.join(tempfile.mkdtemp(), "monitor.txt")
+    with open(monitor_file, "w") as f:
+        f.write('1764031576.604009 [0 127.0.0.1:51682] "GET" "key1"\n')
+        f.write('1764031576.605000 [0 127.0.0.1:51682] "SET" "key1" "value1"\n')
+
+    results_dict, duplicates = _run_duplicate_command_lines(
+        env,
+        "line",
+        ["--command=__monitor_line1__", "--command-ratio=3", "--command=__monitor_line1__"],
+        ["--monitor-input={}".format(monitor_file)],
+    )
+    env.assertEqual(duplicates, [])
+
+    all_stats = results_dict["ALL STATS"]
+    expected = {"Get (line 1)s #1": 225, "Get (line 1)s #2": 75}
+    for key, count in expected.items():
+        env.assertTrue(key in all_stats)
+        if key in all_stats:
+            env.assertEqual(all_stats[key]["Count"], count)
+            env.assertEqual(_hist_count(all_stats[key]), count)
+    for key in ("GET (Line 1) #1", "GET (Line 1) #2"):
+        env.assertTrue(key in all_stats)
+
+
+# TOTAL prints as "Totals", the fixed aggregate row, ENDPOINT prints as
+# "Endpoints" (the cluster read-routing array, absent here, but reserved in
+# every mode), and CPU's histogram key is "CPU", the CPU summary object.
+# 300 requests in rounds of 3 + 1 + 1 + 1 give 150 / 50 / 50 / 50.
+_RESERVED_NAME_COMMANDS = [
+    "--command=TOTAL __key__",
+    "--command-ratio=3",
+    "--command=CPU __key__",
+    "--command=GET __key__",
+    "--command=ENDPOINT __key__",
+]
+
+
+def test_command_stats_breakdown_line_reserved_json_keys(env):
+    """
+    A --command whose row or histogram key equals a fixed key of the stats
+    object (--command=TOTAL -> "Totals", --command=CPU -> "CPU") used to
+    produce duplicate JSON keys; parsers kept the fixed one and dropped the
+    command's row. Such names must get a " #N" suffix like repeated names.
+    --command=ENDPOINT -> "Endpoints" is reserved even where the fixed
+    "Endpoints" array is not emitted, so a row keeps one label in all modes.
+    """
+    results_dict, duplicates = _run_duplicate_command_lines(env, "line", _RESERVED_NAME_COMMANDS)
+    env.assertEqual(duplicates, [])
+
+    all_stats = results_dict["ALL STATS"]
+    expected = {"Totals #1": 150, "Cpus": 50, "Gets": 50, "Endpoints #1": 50}
+    for key, count in expected.items():
+        env.assertTrue(key in all_stats)
+        if key in all_stats:
+            env.assertEqual(all_stats[key]["Count"], count)
+            env.assertEqual(_hist_count(all_stats[key]), count)
+    env.assertEqual(all_stats["Totals"]["Count"], 300)
+    # The fixed CPU summary object is still the CPU summary.
+    env.assertTrue("cpu_total_seconds" in all_stats["CPU"])
+
+    # Per-line latency histogram arrays: "TOTAL" is free, "CPU" is not.
+    for key in ("TOTAL", "CPU #1", "GET", "ENDPOINT"):
+        env.assertTrue(key in all_stats)
+        if key in all_stats:
+            env.assertTrue(isinstance(all_stats[key], list))
+
+
+def test_command_stats_breakdown_command_reserved_json_keys(env):
+    """
+    Same as above with the default aggregated --command-stats-breakdown.
+    """
+    results_dict, duplicates = _run_duplicate_command_lines(env, "command", _RESERVED_NAME_COMMANDS)
+    env.assertEqual(duplicates, [])
+
+    all_stats = results_dict["ALL STATS"]
+    expected = {"Totals #1": 150, "Cpus": 50, "Gets": 50, "Endpoints #1": 50}
+    for key, count in expected.items():
+        env.assertTrue(key in all_stats)
+        if key in all_stats:
+            env.assertEqual(all_stats[key]["Count"], count)
+    env.assertEqual(all_stats["Totals"]["Count"], 300)
+    env.assertTrue("cpu_total_seconds" in all_stats["CPU"])
+    env.assertTrue(isinstance(all_stats.get("CPU #1"), list))
+
+
 def test_monitor_input_malformed_command_skipped(env):
     """
     Test that malformed monitor commands are skipped with a warning instead of
@@ -779,3 +999,596 @@ def test_monitor_input_malformed_command_skipped(env):
             "warning: skipping" in stderr_content.lower()
             or "Loaded" in stderr_content  # At minimum, the file was loaded
         )
+
+
+def test_monitor_input_all_unparseable_fails_fast(env):
+    """
+    Regression test for the Monitor-Input Fuzz nightly timeout.
+
+    The loader's only validity check used to be that a command *type* (the first
+    quoted word) could be extracted. A line like
+
+        "SET" "key" "unterminated
+
+    has a valid type ("SET") but an unterminated final quote, so it passes that
+    check yet fails arbitrary_command::split_command_to_args() at request time.
+    When *every* loaded command is like that, create_arbitrary_request() skips
+    each one without enqueuing a request, and shard_connection::fill_pipeline()
+    busy-spins forever -- the --test-time deadline is only re-evaluated when an
+    operation completes, and none ever does. The run hung until CI killed it
+    (90s) while flooding stderr with "skipping malformed monitor command".
+
+    The fix validates every command with split_command_to_args() at load time,
+    so a file with no parseable command fails fast (clean non-zero exit) instead
+    of hanging. This test feeds such a file and asserts memtier exits cleanly and
+    reports the error rather than timing out.
+    """
+    env.skipOnCluster()
+    test_dir = tempfile.mkdtemp()
+    monitor_file = os.path.join(test_dir, "monitor.txt")
+    with open(monitor_file, "w") as f:
+        # Every line: valid type ("SET"/"GET"), unparseable body (open quote).
+        f.write('1764031576.604009 [0 127.0.0.1:51682] "SET" "key1" "unterminated\n')
+        f.write('1764031576.605000 [0 127.0.0.1:51682] "GET" "k\n')
+        f.write('1764031576.606000 [0 127.0.0.1:51682] "HSET" "h" "f" "v\n')
+
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--monitor-input={}".format(monitor_file),
+            "--command=__monitor_line@__",
+            "--hide-histogram",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+
+    # test-time bounds the run; pre-fix this hung well past it (the busy-spin
+    # never re-checked the deadline), so a hang shows up as an RLTest timeout.
+    config = get_default_memtier_config(threads=1, clients=1, requests=None, test_time=2)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    memtier_ok = benchmark.run()
+
+    # Loader rejects the file -> memtier exits non-zero before the run starts.
+    debugPrintMemtierOnError(config, env)
+    env.assertTrue(memtier_ok == False,
+                   message="memtier should fail fast on an all-unparseable "
+                           "monitor file, not hang in fill_pipeline")
+
+    with open("{0}/mb.stderr".format(config.results_dir)) as stderr:
+        stderr_content = stderr.read()
+        env.assertTrue(
+            "no valid commands found" in stderr_content,
+            message="expected a clean 'no valid commands found' error; got: {}".format(
+                stderr_content[-500:]))
+        # The hang signature was millions of these lines; the loader must no
+        # longer defer the failure to the per-request path.
+        env.assertFalse("skipping malformed monitor command" in stderr_content)
+
+
+def test_monitor_input_nul_byte_in_prefix_not_truncated(env):
+    """
+    Regression test for NUL-truncation in load_from_file (review finding #30, bug F1).
+
+    Before the fix, load_from_file used strchr(line, '"') to locate the start
+    of the command portion.  strchr stops at the first NUL byte, so a MONITOR
+    capture line whose metadata prefix contains an embedded \\0 (e.g. a binary
+    timestamp field) caused the entire line to be skipped with a "no commands
+    found" warning — even though getline had read the full byte count and the
+    '"CMD"' portion was intact.
+
+    The fix replaces strchr with memchr(seg_start, '"', seg_len), which searches
+    exactly the byte count returned by getline and therefore finds the opening
+    quote regardless of NUL bytes in the prefix.
+
+    This test writes three MONITOR-format lines to a binary file, where the
+    second line has a NUL byte embedded in its metadata prefix (before the
+    first '"').  The benchmark is run with __monitor_line@__ and we assert that
+    all three commands are loaded (i.e. line 2 was NOT silently dropped).
+    """
+    env.skipOnCluster()
+
+    test_dir = tempfile.mkdtemp()
+    monitor_file = os.path.join(test_dir, "monitor_nul.bin")
+
+    # Write the file in binary mode so the NUL byte is preserved verbatim.
+    # Line 2 has '\x00' in the metadata prefix, before the first '"'.
+    line1 = b'1764031576.604009 [0 127.0.0.1:51682] "SET" "nul_key1" "value1"\n'
+    line2 = b'1764031576.605000\x00[0 127.0.0.1:51682] "SET" "nul_key2" "value2"\n'
+    line3 = b'1764031576.606000 [0 127.0.0.1:51682] "SET" "nul_key3" "value3"\n'
+    with open(monitor_file, "wb") as f:
+        f.write(line1 + line2 + line3)
+
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--monitor-input={}".format(monitor_file),
+            "--command=__monitor_line@__",
+            "--hide-histogram",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+
+    config = get_default_memtier_config(threads=1, clients=1, requests=9)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    memtier_ok = benchmark.run()
+
+    debugPrintMemtierOnError(config, env)
+    env.assertTrue(memtier_ok == True,
+                   message="memtier failed while replaying monitor file with NUL byte in prefix")
+
+    # All three commands must have been loaded — if line 2 was dropped due to
+    # NUL truncation the count would be 2, not 3.
+    with open("{0}/mb.stderr".format(config.results_dir)) as stderr:
+        stderr_content = stderr.read()
+        env.assertTrue(
+            "Loaded 3 monitor commands from 3 total lines" in stderr_content,
+            message="Expected 3 loaded commands (NUL-in-prefix line was silently dropped). "
+                    "stderr: {}".format(stderr_content[-800:]),
+        )
+
+
+def test_monitor_input_cr_only_line_endings(env):
+    """
+    Regression test for CR-only line-ending handling in load_from_file
+    (review finding #30, bug F2).
+
+    Before the fix, getline() used '\\n' as the sole delimiter.  A monitor
+    capture file whose lines are separated by bare '\\r' (classic Mac / some
+    Windows exporters) was therefore read as a single giant line; the metadata
+    of every line after the first was appended as extra tokens to the first
+    command, and most commands were dropped or mis-routed silently.
+
+    The fix normalises bare '\\r' bytes to '\\n' before tokenising, so each
+    logical MONITOR line is treated as a separate segment.
+
+    This test writes three MONITOR-format SET commands separated by '\\r' only
+    (no '\\n') and asserts that all three commands are loaded.
+    """
+    env.skipOnCluster()
+
+    test_dir = tempfile.mkdtemp()
+    monitor_file = os.path.join(test_dir, "monitor_cr.bin")
+
+    # Three SET commands, separated by \r only (no \n).
+    line1 = b'1764031576.604009 [0 127.0.0.1:51682] "SET" "cr_key1" "value1"'
+    line2 = b'1764031576.605000 [0 127.0.0.1:51682] "SET" "cr_key2" "value2"'
+    line3 = b'1764031576.606000 [0 127.0.0.1:51682] "SET" "cr_key3" "value3"'
+    with open(monitor_file, "wb") as f:
+        f.write(line1 + b"\r" + line2 + b"\r" + line3 + b"\r")
+
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--monitor-input={}".format(monitor_file),
+            "--command=__monitor_line@__",
+            "--hide-histogram",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+
+    config = get_default_memtier_config(threads=1, clients=1, requests=9)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    memtier_ok = benchmark.run()
+
+    debugPrintMemtierOnError(config, env)
+    env.assertTrue(memtier_ok == True,
+                   message="memtier failed while replaying CR-only monitor file")
+
+    # All three commands must have been loaded.  Pre-fix, the entire file was
+    # read as one line and only one (malformed) command would be found.
+    with open("{0}/mb.stderr".format(config.results_dir)) as stderr:
+        stderr_content = stderr.read()
+        env.assertTrue(
+            "Loaded 3 monitor commands from 3 total lines" in stderr_content,
+            message="Expected 3 loaded commands (CR-only line endings not split correctly). "
+                    "stderr: {}".format(stderr_content[-800:]),
+        )
+
+    # Verify that all three keys were actually set in Redis.
+    master_nodes_connections = env.getOSSMasterNodesConnectionList()
+    keys_found = set()
+    for master_connection in master_nodes_connections:
+        for key in ("cr_key1", "cr_key2", "cr_key3"):
+            try:
+                result = master_connection.execute_command("EXISTS", key)
+                if result:
+                    keys_found.add(key)
+            except Exception:
+                pass
+    env.assertTrue(
+        len(keys_found) == 3,
+        message="Expected all 3 CR-only keys in Redis, found: {}".format(keys_found),
+    )
+
+
+def test_monitor_input_large_line_no_stack_overflow(env):
+    """
+    Regression test for the VLA stack-overflow in
+    arbitrary_command::split_command_to_args (config_types.cpp).
+
+    Before the fix the function declared `char buffer[command_len]` on the
+    stack and was called per-request from shard_connection::fill_pipeline ->
+    client::create_arbitrary_request. Any MONITOR-replay line larger than
+    the worker thread's stack (default 8-12 MB on Linux) blew the stack the
+    moment the random/sequential picker selected it -> SIGSEGV (or, when
+    glibc's canary caught it first, "*** stack smashing detected ***").
+
+    The fix moves the buffer to the heap (std::vector<char>); this test
+    feeds memtier a single SET line whose value is comfortably larger than
+    the default per-thread stack and asserts memtier completes the run
+    without crashing.
+    """
+    # --monitor-input does not support cluster mode (see other tests).
+    env.skipOnCluster()
+
+    # 16 MiB value: comfortably larger than the typical 8-12 MB Linux
+    # per-thread stack on CI runners and dev boxes, smaller than redis'
+    # default proto-max-bulk-len (512 MB). Pre-fix this crashed
+    # deterministically on the very first request that selected the line.
+    test_dir = tempfile.mkdtemp()
+    monitor_file = os.path.join(test_dir, "monitor_huge.txt")
+    big_value = "A" * (16 * 1024 * 1024)
+    with open(monitor_file, "w") as f:
+        f.write('"SET" "regression_key" "' + big_value + '"\n')
+
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--monitor-input={}".format(monitor_file),
+            "--command=__monitor_line@__",
+            "--hide-histogram",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+
+    # Small request count: 10 SETs of 16 MiB is ~160 MB on loopback - fast
+    # enough for CI, and 10 calls is well past the first one that would have
+    # crashed pre-fix.
+    config = get_default_memtier_config(threads=1, clients=1, requests=10)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    memtier_ok = benchmark.run()
+
+    debugPrintMemtierOnError(config, env)
+    env.assertTrue(memtier_ok == True,
+                   message="memtier crashed (likely VLA stack overflow regression) "
+                           "while replaying a large --monitor-input line")
+    # Sanity: stderr must not carry the canary message.
+    with open("{0}/mb.stderr".format(config.results_dir)) as stderr:
+        stderr_content = stderr.read()
+        env.assertFalse("stack smashing detected" in stderr_content,
+                        message="glibc stack canary tripped: {}".format(
+                            stderr_content[-500:]))
+
+    # Sanity: the value made it to the server.
+    master_nodes_connections = env.getOSSMasterNodesConnectionList()
+    found = False
+    for master_connection in master_nodes_connections:
+        try:
+            result = master_connection.execute_command("STRLEN", "regression_key")
+        except Exception:
+            continue
+        if result == len(big_value):
+            found = True
+            break
+    env.assertTrue(found,
+                   message="SET with 16 MiB value did not land in redis "
+                           "- memtier may have crashed before sending it")
+
+
+def test_monitor_input_random_line_key_affixes_and_data(env):
+    """
+    Regression test for #655: a __monitor_line@__ line keeps the text around
+    __key__ (user:__key__, {tag}__key__:x) and fills __data__, the same way
+    the --command path (and __monitor_lineN__) does.
+
+    Before the fix the @ send loop wrote only the generated key, so the keys
+    landed as bare memtier-NNN.
+    """
+    env.skipOnCluster()
+
+    test_dir = tempfile.mkdtemp()
+    monitor_file = os.path.join(test_dir, "monitor_affixes.txt")
+    with open(monitor_file, "w") as f:
+        f.write('[ proxy ] 1764031576.604009 [0 127.0.0.1:5000] "SET" "user:__key__" "v"\n')
+        f.write('[ proxy ] 1764031576.604010 [0 127.0.0.1:5000] "SET" "{tag}__key__:x" "__data__"\n')
+        # Like --command, only the first __key__ in an argument is replaced.
+        f.write('[ proxy ] 1764031576.604011 [0 127.0.0.1:5000] "SET" "a:__key__:b:__key__" "v"\n')
+        # Two key arguments in one command: each gets its own generated key,
+        # as with --command.
+        f.write('[ proxy ] 1764031576.604012 [0 127.0.0.1:5000] "MSET" "u:__key__" "__data__" "w:__key__" "v"\n')
+
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--monitor-input={}".format(monitor_file),
+            "--command=__monitor_line@__",
+            "--monitor-pattern=S",
+            "--key-prefix=mon-",
+            # Sequential keys: the 40 requests draw 40 distinct keys from
+            # 1..100, so two key arguments never get the same key by chance.
+            "--command-key-pattern=S",
+            "--key-maximum=100",
+            "--data-size=20",
+            "--hide-histogram",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+
+    config = get_default_memtier_config(threads=1, clients=1, requests=40)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+
+    master_nodes_connections = env.getOSSMasterNodesConnectionList()
+    for conn in master_nodes_connections:
+        conn.execute_command("FLUSHALL")
+
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    memtier_ok = benchmark.run(timeout=60)
+
+    debugPrintMemtierOnError(config, env)
+    env.assertTrue(memtier_ok == True)
+
+    keys = []
+    for conn in master_nodes_connections:
+        keys.extend(k.decode() for k in conn.execute_command("KEYS", "*"))
+    user_keys = [k for k in keys if k.startswith("user:mon-")]
+    tag_keys = [k for k in keys if k.startswith("{tag}mon-") and k.endswith(":x")]
+    rep_keys = [k for k in keys if k.startswith("a:mon-") and k.endswith(":b:__key__")]
+    u_keys = [k for k in keys if k.startswith("u:mon-")]
+    w_keys = [k for k in keys if k.startswith("w:mon-")]
+    env.assertTrue(len(user_keys) > 0, message="no user:mon-* keys; keys: {}".format(keys[:10]))
+    env.assertTrue(len(tag_keys) > 0, message="no {{tag}}mon-*:x keys; keys: {}".format(keys[:10]))
+    env.assertTrue(len(rep_keys) > 0, message="no a:mon-*:b:__key__ keys; keys: {}".format(keys[:10]))
+    env.assertTrue(len(u_keys) > 0, message="no u:mon-* keys from MSET; keys: {}".format(keys[:10]))
+    env.assertTrue(len(w_keys) > 0, message="no w:mon-* keys from MSET; keys: {}".format(keys[:10]))
+    # Each MSET drew a separate key for u: and w:, so with sequential keys the
+    # two sets of key numbers never overlap.
+    u_ids = set(k[len("u:mon-"):] for k in u_keys)
+    w_ids = set(k[len("w:mon-"):] for k in w_keys)
+    env.assertEqual(u_ids & w_ids, set(), message="MSET reused one key for both key arguments")
+    known = set(user_keys + tag_keys + rep_keys + u_keys + w_keys)
+    env.assertEqual(len(keys), len(known),
+                    message="keys without their affixes: {}".format([k for k in keys if k not in known][:10]))
+    conn = master_nodes_connections[0]
+    if user_keys:
+        env.assertEqual(conn.execute_command("GET", user_keys[0]), b"v")
+    if tag_keys:
+        # __data__ is replaced by a generated --data-size value.
+        env.assertEqual(len(conn.execute_command("GET", tag_keys[0])), 20)
+
+
+def test_monitor_input_random_line_placeholder_in_key_prefix(env):
+    """
+    A generated key or value that itself contains placeholder text must be
+    sent as-is. With --key-prefix=__key__ (or __data__), the key filled into a
+    __monitor_line@__ line is "__key__NNN"; it must not be parsed again as a
+    key/data argument (that dropped the argument and hung the run, or
+    rejected the line). __monitor_line1__ already handles this.
+    """
+    env.skipOnCluster()
+
+    test_dir = tempfile.mkdtemp()
+    monitor_file = os.path.join(test_dir, "monitor_prefix_placeholder.txt")
+    with open(monitor_file, "w") as f:
+        f.write('[ proxy ] 1764031576.604009 [0 127.0.0.1:5000] "SET" "__key__" "v"\n')
+
+    master_nodes_connections = env.getOSSMasterNodesConnectionList()
+    conn = master_nodes_connections[0]
+    for prefix in ("__key__", "__data__"):
+        conn.execute_command("FLUSHALL")
+        benchmark_specs = {
+            "name": env.testName,
+            "args": [
+                "--monitor-input={}".format(monitor_file),
+                "--command=__monitor_line@__",
+                "--key-prefix={}".format(prefix),
+                "--key-maximum=100",
+                "--hide-histogram",
+            ],
+        }
+        addTLSArgs(benchmark_specs, env)
+
+        config = get_default_memtier_config(threads=1, clients=1, requests=20)
+        add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+
+        config = RunConfig(tempfile.mkdtemp(), env.testName, config, {})
+        ensure_clean_benchmark_folder(config.results_dir)
+
+        benchmark = Benchmark.from_json(config, benchmark_specs)
+        memtier_ok = benchmark.run(timeout=30)
+
+        debugPrintMemtierOnError(config, env)
+        env.assertTrue(memtier_ok == True, message="run failed with --key-prefix={}".format(prefix))
+        keys = [k.decode() for k in conn.execute_command("KEYS", "*")]
+        env.assertTrue(len(keys) > 0, message="no keys written with --key-prefix={}".format(prefix))
+        env.assertTrue(all(k.startswith(prefix) and k[len(prefix):].isdigit() for k in keys),
+                       message="unexpected keys with --key-prefix={}: {}".format(prefix, keys[:10]))
+
+
+def test_monitor_input_random_line_failed_keys_file(env):
+    """
+    --failed-keys-file records the key a __monitor_line@__ request was sent
+    with (affixes included), as it does for --command. A line whose every
+    request fails (INCRBY by a non-integer) must log user:mon-NNN keys, not
+    an empty key. The logged key is argument 1, the one cluster mode routes
+    by, even when __key__ is only in a later argument: "INCRBY" "fixed"
+    "x:__key__" logs "fixed", not the generated x:mon-NNN.
+    """
+    env.skipOnCluster()
+
+    test_dir = tempfile.mkdtemp()
+    monitor_file = os.path.join(test_dir, "monitor_failed_keys.txt")
+    with open(monitor_file, "w") as f:
+        f.write('[ proxy ] 1764031576.604009 [0 127.0.0.1:5000] "INCRBY" "user:__key__" "x"\n')
+        f.write('[ proxy ] 1764031576.604010 [0 127.0.0.1:5000] "INCRBY" "fixed" "x:__key__"\n')
+    failed_log = os.path.join(test_dir, "failed_keys.csv")
+
+    requests = 20
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--monitor-input={}".format(monitor_file),
+            "--command=__monitor_line@__",
+            "--key-prefix=mon-",
+            "--key-maximum=100",
+            "--failed-keys-file={}".format(failed_log),
+            "--hide-histogram",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+
+    config = get_default_memtier_config(threads=1, clients=1, requests=requests)
+    add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    memtier_ok = benchmark.run(timeout=60)
+    debugPrintMemtierOnError(config, env)
+    env.assertTrue(memtier_ok == True)
+
+    with open(failed_log) as fh:
+        rows = [r for r in csv.reader(fh) if r and not r[0].startswith("#") and r[0] != "timestamp"]
+    env.assertEqual(len(rows), requests, message="failed-keys rows: {}".format(rows[:5]))
+    keys = [r[2] for r in rows]
+    bad = [k for k in keys if not k.startswith("user:mon-") and k != "fixed"]
+    env.assertEqual(bad, [], message="logged keys other than user:mon-* / fixed: {}".format(bad[:5]))
+    # The default --monitor-pattern=S alternates the two lines.
+    env.assertTrue("fixed" in keys, message="no row for the fixed-key line: {}".format(keys[:10]))
+    env.assertTrue(any(k.startswith("user:mon-") for k in keys), message="no user:mon-* rows: {}".format(keys[:10]))
+
+
+def _scan_cursor_literal_run(env, args, requests=20):
+    """Run memtier with a hard timeout; a hang returns False instead of blocking."""
+    benchmark_specs = {"name": env.testName, "args": args + ["--hide-histogram"]}
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=1, clients=1, requests=requests)
+    add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+    config = RunConfig(tempfile.mkdtemp(), env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    memtier_ok = benchmark.run(timeout=30)
+    debugPrintMemtierOnError(config, env)
+    stderr_path = os.path.join(config.results_dir, "mb.stderr")
+    stderr = ""
+    if os.path.isfile(stderr_path):
+        with open(stderr_path) as f:
+            stderr = f.read()
+    return memtier_ok, stderr
+
+
+def _scan_cursor_literal_values(env, pattern):
+    values = []
+    for conn in env.getOSSMasterNodesConnectionList():
+        for key in conn.execute_command("KEYS", pattern):
+            values.append(conn.execute_command("GET", key))
+    return values
+
+
+def test_command_scan_cursor_literal_is_sent(env):
+    """
+    Regression test for #663: a --command argument that is literally
+    "__scan_cursor__" is an ordinary constant. Before the fix it was typed as
+    the --scan-incremental-iteration cursor slot, counted in the *N header
+    but never written, so the server waited for the missing argument and the
+    run hung with 0 ops.
+    """
+    for conn in env.getOSSMasterNodesConnectionList():
+        conn.execute_command("FLUSHALL")
+
+    memtier_ok, _ = _scan_cursor_literal_run(
+        env, ["--command=SET __key__ __scan_cursor__", "--key-prefix=sc663-", "--key-maximum=50"])
+    env.assertTrue(memtier_ok == True, message="--command with a literal __scan_cursor__ failed or hung")
+
+    values = _scan_cursor_literal_values(env, "sc663-*")
+    env.assertTrue(len(values) > 0, message="no sc663-* keys were written")
+    env.assertEqual(set(values), {b"__scan_cursor__"})
+
+    # The literal right after the command name (argv[1]), where the
+    # continuation's keyspace-SCAN cursor slot sits.
+    memtier_ok, stderr = _scan_cursor_literal_run(env, ["--command=ECHO __scan_cursor__"])
+    env.assertTrue(memtier_ok == True, message="ECHO __scan_cursor__ failed or hung")
+    env.assertFalse("error response" in stderr, message="ECHO got an error reply: {}".format(stderr[-500:]))
+
+
+def test_command_scan_cursor_literal_as_command_name(env):
+    """
+    #663: "__scan_cursor__" is not a placeholder, so it is a valid (if
+    unknown) command name: it is sent and the server answers "unknown
+    command". It is no longer rejected at parse time like __key__/__data__.
+    """
+    env.skipOnCluster()
+    memtier_ok, stderr = _scan_cursor_literal_run(env, ["--command=__scan_cursor__ x"], requests=5)
+    env.assertTrue(memtier_ok == True, message="run failed: {}".format(stderr[-500:]))
+    env.assertFalse("first token must be a literal command name" in stderr, message=stderr[-500:])
+    env.assertTrue("unknown command" in stderr, message="command was not sent: {}".format(stderr[-500:]))
+
+
+def test_monitor_input_scan_cursor_literal_as_command_name(env):
+    """
+    #663: a captured line whose first token is "__scan_cursor__" used to be
+    typed as a cursor slot and abort on the "first arg is not command name?"
+    assert (SIGABRT). It is a constant now: the line is sent and the server
+    answers "unknown command".
+    """
+    env.skipOnCluster()
+    monitor_file = os.path.join(tempfile.mkdtemp(), "monitor_scan_cursor_cmd.txt")
+    with open(monitor_file, "w") as f:
+        f.write('[ proxy ] 1764031576.604009 [0 127.0.0.1:5000] "__scan_cursor__" "x"\n')
+
+    for command in ("__monitor_line1__", "__monitor_line@__"):
+        memtier_ok, stderr = _scan_cursor_literal_run(
+            env, ["--monitor-input={}".format(monitor_file), "--command={}".format(command)], requests=5)
+        env.assertTrue(memtier_ok == True, message="{} failed: {}".format(command, stderr[-500:]))
+        env.assertTrue("unknown command" in stderr,
+                       message="{}: line was not sent: {}".format(command, stderr[-500:]))
+
+
+def test_monitor_input_scan_cursor_literal_is_sent(env):
+    """
+    Regression test for #663 on the --monitor-input paths: a captured line
+    with a literal "__scan_cursor__" argument is replayed as-is, through both
+    __monitor_line1__ and __monitor_line@__ (standalone and cluster).
+    """
+    test_dir = tempfile.mkdtemp()
+    monitor_file = os.path.join(test_dir, "monitor_scan_cursor.txt")
+    with open(monitor_file, "w") as f:
+        f.write('[ proxy ] 1764031576.604009 [0 127.0.0.1:5000] "SET" "sc663:mon" "__scan_cursor__"\n')
+
+    for command in ("__monitor_line1__", "__monitor_line@__"):
+        for conn in env.getOSSMasterNodesConnectionList():
+            conn.execute_command("FLUSHALL")
+
+        memtier_ok, _ = _scan_cursor_literal_run(
+            env, ["--monitor-input={}".format(monitor_file), "--command={}".format(command)])
+        env.assertTrue(memtier_ok == True, message="{} with a literal __scan_cursor__ failed or hung".format(command))
+        env.assertEqual(_scan_cursor_literal_values(env, "sc663:mon"), [b"__scan_cursor__"],
+                        message="{} did not write the literal value".format(command))

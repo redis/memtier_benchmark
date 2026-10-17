@@ -20,24 +20,31 @@
 #include "config.h"
 #endif
 
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
-#include <cmath> // For std::isnan
+#include <cmath> // For std::isfinite
 #include "JSON_handler.h"
+#include "file_io.h"
 
 
 /**
  * C'tor
  * -----
  * Opens the file named jsonfilename and sets the first nesting as NESTED_GENERAL
- * In case of failure to create the file, will state the error perror
+ * In case of failure to create the file, prints the error and exits
  */
 json_handler::json_handler(const char *jsonfilename) : m_json_file(NULL)
 {
-    // Try to open a file and add the first level
-    m_json_file = fopen(jsonfilename, "w");
+    // Try to open a file and add the first level. Retry on EINTR: a Ctrl+C or
+    // SIGTERM can arrive while fopen() blocks (e.g. on a FIFO), and not every
+    // libc interceptor (TSAN) restarts it.
+    do {
+        m_json_file = fopen(jsonfilename, "w");
+    } while (!m_json_file && errno == EINTR);
     if (!m_json_file) {
-        perror(jsonfilename);
+        fprintf(stderr, "error: cannot open --json-out-file %s: %s\n", jsonfilename, strerror(errno));
+        exit(1);
     }
     // opening the JSON
     fprintf(stderr, "Json file %s created...\n", jsonfilename);
@@ -49,17 +56,67 @@ json_handler::json_handler(const char *jsonfilename) : m_json_file(NULL)
 /**
  * D'tor
  * -----
- * Closes all the nesting and the file pointer.
+ * Closes the file if close() was not called; a write error is then ignored.
  */
 json_handler::~json_handler()
 {
-    if (m_json_file) {
-        // close nesting...
-        while (close_nesting())
-            ;
-        fclose(m_json_file);
-        fprintf(stderr, "Json file closed.\n");
+    close();
+}
+
+/**
+ * Closes all the nesting and the file pointer.
+ * Returns 0 on success, or the errno value of a failed write or close.
+ */
+int json_handler::close()
+{
+    if (!m_json_file) return 0;
+    // close nesting...
+    while (close_nesting())
+        ;
+    int err = finish_output_file(m_json_file, true);
+    m_json_file = NULL;
+    if (err == 0) fprintf(stderr, "Json file closed.\n");
+    return err;
+}
+
+/**
+ * Write str to fp as the body of a JSON string: escape '"', '\' and control
+ * characters. A configuration value such as --key-prefix, or a path that
+ * contains a backslash, would otherwise make the document invalid JSON.
+ * JSON text must be UTF-8, so invalid UTF-8 is first replaced by
+ * utf8_sanitize().
+ */
+static void write_json_string_body(FILE *fp, const char *str)
+{
+    const std::string valid = utf8_sanitize(str);
+    for (const unsigned char *p = (const unsigned char *) valid.c_str(); *p; p++) {
+        switch (*p) {
+        case '"':
+            fputs("\\\"", fp);
+            break;
+        case '\\':
+            fputs("\\\\", fp);
+            break;
+        default:
+            if (*p < 0x20) {
+                fprintf(fp, "\\u%04x", *p);
+            } else {
+                fputc(*p, fp);
+            }
+        }
     }
+}
+
+/**
+ * Write objectname as a JSON object key. Keys can come from user input (e.g.
+ * a --command name), so they are escaped like string values.
+ */
+static void write_json_key(FILE *fp, const char *objectname, const char *separator)
+{
+    fputc('"', fp);
+    write_json_string_body(fp, objectname);
+    fputc('"', fp);
+    fputs(separator, fp);
 }
 
 /**
@@ -69,7 +126,7 @@ json_handler::~json_handler()
  */
 void json_handler::write_obj(const char *objectname, const char *format, ...)
 {
-    fprintf(m_json_file, "\"%s\": ", objectname);
+    write_json_key(m_json_file, objectname, ": ");
     va_list argptr;
     va_start(argptr, format);
     // Check if format includes "%s", indicating a string is expected
@@ -83,6 +140,13 @@ void json_handler::write_obj(const char *objectname, const char *format, ...)
         if (str_arg == nullptr) {
             // Handle NULL strings by writing "null" to the JSON file
             fprintf(m_json_file, "null");
+        } else if (strcmp(format, "\"%s\"") == 0) {
+            // A quoted string value: escape it so the output stays valid JSON.
+            // Only a format of exactly "\"%s\"" is escaped; a different quoted
+            // format (e.g. "\"%s:%d\"") would be written unescaped.
+            fputc('"', m_json_file);
+            write_json_string_body(m_json_file, str_arg);
+            fputc('"', m_json_file);
         } else {
             // Print the valid string argument
             vfprintf(m_json_file, format, argptr);
@@ -95,7 +159,9 @@ void json_handler::write_obj(const char *objectname, const char *format, ...)
         double value = va_arg(tmp_argptr, double);
         va_end(tmp_argptr);
 
-        if (std::isnan(value)) {
+        // Emit JSON null for any non-finite value (NaN and +/-Inf). Bare
+        // 'nan'/'inf' tokens from vfprintf would otherwise produce invalid JSON.
+        if (!std::isfinite(value)) {
             fprintf(m_json_file, "null");
         } else {
             vfprintf(m_json_file, format, argptr);
@@ -118,7 +184,7 @@ void json_handler::open_nesting(const char *objectname, eJSON_NESTED_TYPE type /
 {
     const char *nestStart = (type == NESTED_GENERAL) ? "{" : "[";
     if (objectname != NULL) {
-        fprintf(m_json_file, "\"%s\":", objectname);
+        write_json_key(m_json_file, objectname, ":");
     }
     fprintf(m_json_file, "%s", nestStart);
     // Adding the type to the nesting closer list to be able to close it properly

@@ -19,29 +19,65 @@
 #ifndef MEMTIER_BENCHMARK_CLIENT_DATA_MANAGER_H
 #define MEMTIER_BENCHMARK_CLIENT_DATA_MANAGER_H
 
+#include <vector>
+
+class shard_connection;
+
 class connections_manager
 {
 public:
     virtual unsigned long long get_reqs_processed(void) = 0;
     virtual void inc_reqs_processed(void) = 0;
+    virtual unsigned long long get_reqs_answered(void) = 0;
+    virtual void inc_reqs_answered(void) = 0;
     virtual unsigned long long get_reqs_generated(void) = 0;
     virtual void inc_reqs_generated(void) = 0;
+    virtual void dec_reqs_generated(unsigned long long count) = 0;
+    // Requests sent and then given up for good under --retry-on-error (never
+    // resent, never answered): uncount them and count each as an error.
+    virtual void abandon_requests(unsigned long long count) = 0;
     virtual bool finished(void) = 0;
     virtual bool all_connections_idle(void) = 0;
 
     virtual void set_start_time(void) = 0;
     virtual void set_end_time(void) = 0;
 
-    virtual void handle_cluster_slots(protocol_response *r) = 0;
+    // Returns true if the reply produced a usable topology that was committed
+    // to the manager's internal slot map; false if the reply was rejected
+    // (malformed, empty, or every shard was skipped during parsing). The
+    // caller -- shard_connection's CLUSTER SLOTS response handler -- uses
+    // the return value to decide whether to transition m_cluster_slots to
+    // setup_done. A rejected reply must NOT advance setup_done, otherwise the
+    // worker enters steady-state routing with an empty topology and every
+    // slot lookup returns UINT_MAX. Non-cluster clients (no override) return
+    // false because they never produce a topology.
+    virtual bool handle_cluster_slots(protocol_response *r) = 0;
     virtual void handle_response(unsigned int conn_id, struct timeval timestamp, request *request,
                                  protocol_response *response) = 0;
 
     virtual void create_request(struct timeval timestamp, unsigned int conn_id) = 0;
     virtual bool hold_pipeline(unsigned int conn_id) = 0;
 
+    // Routed requests can be waiting on another connection's rate budget.
+    virtual void handle_rate_limit_refill(unsigned int) {}
+    virtual void handle_connection_disconnect(unsigned int) {}
+
     virtual int connect(void) = 0;
+    // Reconnect one dropped connection: returns 0 once a connect is issued,
+    // 1 if the reconnect was left to a later step, -1 on failure. Only the
+    // main connection exists outside cluster mode, so the default reconnects it.
+    virtual int reconnect(unsigned int) { return connect(); }
+    // --transaction: true while the given connection holds the pin of the
+    // in-flight command rotation, i.e. it will send the rotation's EXEC.
+    virtual bool is_transaction_pinned(unsigned int) { return false; }
     virtual void disconnect(void) = 0;
     virtual void disconnect_all(void) = 0;
+
+    // Read-preference helpers: shard_connection's READONLY response handler
+    // needs to wake peers that may be blocked in hold_pipeline waiting for a
+    // live replica. Exposing get_connections via the abstract interface keeps
+    // shard_connection decoupled from client / cluster_client concrete types.
+    virtual std::vector<shard_connection *> &get_connections(void) = 0;
 };
 
 

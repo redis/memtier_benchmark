@@ -215,6 +215,68 @@ def test_scan_incremental_with_match(env):
         pass
 
 
+def test_scan_incremental_literal_scan_cursor_in_match(env):
+    """
+    Regression test for #663: only the cursor slot of the internal
+    continuation command is a cursor. A user argument that is literally
+    "__scan_cursor__" (here the MATCH pattern) is sent as typed in both the
+    initial SCAN 0 and the continuation. Before the fix it was dropped from
+    the initial SCAN (the *N header still counted it) and the run hung.
+    """
+    env.skipOnCluster()
+    _preload_keys(env, count=200, prefix="scanlit")
+
+    # Log every command so the test can check what was actually sent.
+    conn = env.getConnection()
+    old_slower_than = conn.execute_command("CONFIG", "GET", "slowlog-log-slower-than")[1]
+    old_max_len = conn.execute_command("CONFIG", "GET", "slowlog-max-len")[1]
+    conn.execute_command("CONFIG", "SET", "slowlog-log-slower-than", "0")
+    conn.execute_command("CONFIG", "SET", "slowlog-max-len", "1000")
+    conn.execute_command("SLOWLOG", "RESET")
+
+    test_dir = tempfile.mkdtemp()
+    extra_args = [
+        '--command', 'SCAN 0 MATCH __scan_cursor__ COUNT 10',
+        '--scan-incremental-iteration',
+        '--pipeline', '1',
+    ]
+    benchmark, run_config = _build_scan_benchmark(
+        env, test_dir, extra_args, threads=1, clients=1, requests=50)
+    ok = benchmark.run(timeout=30)
+    entries = conn.execute_command("SLOWLOG", "GET", "1000")
+    conn.execute_command("CONFIG", "SET", "slowlog-log-slower-than", old_slower_than)
+    conn.execute_command("CONFIG", "SET", "slowlog-max-len", old_max_len)
+    conn.execute_command("SLOWLOG", "RESET")
+
+    failed_asserts = env.getNumberOfFailedAssertion()
+    try:
+        # Entry layout: [id, timestamp, duration, argv, ...].
+        scans = [[a.decode() for a in e[3]] for e in entries
+                 if e[3] and e[3][0].upper() == b"SCAN"]
+        env.assertEqual(len(scans), 50, message="SCANs logged: {}".format(scans[:5]))
+        # Every SCAN, initial and continuation, carries a numeric cursor in
+        # argv[1] and the MATCH literal unchanged in argv[3].
+        bad = [a for a in scans if len(a) != 6 or not a[1].isdigit() or a[2] != "MATCH" or a[3] != "__scan_cursor__"]
+        env.assertEqual(bad, [], message="SCANs with a wrong cursor or MATCH: {}".format(bad[:5]))
+        env.assertTrue(any(a[1] != "0" for a in scans),
+                       message="no continuation with a real cursor: {}".format(scans[:5]))
+        env.assertTrue(ok, message="run failed or hung (timeout)")
+        if not ok:
+            return
+        stderr = _read_stderr(run_config)
+        env.assertFalse('error response' in stderr,
+                        message="server rejected a request: {}".format(stderr[-500:]))
+        with open(os.path.join(run_config.results_dir, "mb.json")) as f:
+            all_stats = json.load(f).get("ALL STATS", {})
+        # 200 keys at COUNT 10 need many pages, so the continuation (with
+        # the real cursor in its slot) must have been sent too.
+        env.assertGreater(all_stats.get("Scan 0s", {}).get("Count", 0), 0)
+        env.assertGreater(all_stats.get("Scan <cursor>s", {}).get("Count", 0), 0)
+    finally:
+        if env.getNumberOfFailedAssertion() > failed_asserts:
+            debugPrintMemtierOnError(run_config, env)
+
+
 # ---------------------------------------------------------------------------
 # Test: bare SCAN (no MATCH, COUNT, or TYPE)
 # ---------------------------------------------------------------------------

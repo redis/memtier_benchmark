@@ -26,8 +26,10 @@ Read more at:
 
 ### Installing on Debian and Ubuntu
 
-Pre-compiled binaries are available for these platforms from the packages.redis.io Redis APT
-repository. To configure this repository, use the following steps:
+Pre-compiled binaries are available from the packages.redis.io Redis APT repository for
+Debian 11 (bullseye), 12 (bookworm), and 13 (trixie), and for Ubuntu 20.04 (focal),
+22.04 (jammy), 24.04 (noble), and 26.04 (resolute). To configure this repository, use the
+following steps:
 
 ```
 sudo apt install lsb-release curl gpg
@@ -111,10 +113,10 @@ Use available images on Docker Hub:
 
 ```
 # latest stable release
-$ docker run --rm redis/memtier_benchmark:latest --help
+$ docker run --rm redislabs/memtier_benchmark:latest --help
 
 # master branch edge build
-$ docker run --rm redis/memtier_benchmark:edge --help
+$ docker run --rm redislabs/memtier_benchmark:edge --help
 ```
 
 Or, build locally:
@@ -143,6 +145,18 @@ $ memtier_benchmark --help
 
 for command line options.
 
+Numeric options that take a count, size, timeout or port (for example `-n`, `-c`, `-t`, `--test-time`, `--pipeline`, `-d`, `--max-reconnect-attempts`, `--prometheus-port`) reject negative, empty, out-of-range and malformed values instead of silently wrapping them. Leading whitespace and a `+` are still accepted. Note that an empty value such as `--max-reconnect-attempts=` used to mean 0 (unlimited) and is now an error. The same applies to `--max-retries`, which takes -1 (unlimited) up to 2147483647: an empty `--max-retries=` used to mean 0 (retries disabled) and is now an error, and values above 2147483647 are rejected instead of wrapping (4294967295 used to become -1, unlimited). Empty values are also rejected for `--data-offset`, `--select-db`, `--thread-conn-start-min-jitter-micros`, `--thread-conn-start-max-jitter-micros`, `--scan-incremental-max-iterations`, `--replica-clients` and `--replicas-per-shard`, where they used to mean 0; pass `0` explicitly. `-0` (and `-00`) still parse as 0 on every option, since `strtoul()` never wrapped them; every other negative value is rejected. `--data-offset` above 536870911 is now rejected when the option is parsed, with "must be <= 536870911", instead of later with "data-offset too long". `--pipeline`, `-d` and `--reconnect-interval` now print "must be a positive integer" for `-1`, empty values and trailing junk (they used to print "must be greater than zero"), and `--rate-limiting` errors now name the option ("rate-limiting must be ..." instead of "rate must be ..."). `--multi-key-get` is now capped at 16777214, the largest value whose preallocated per-client key buffer (256 bytes per key) stays below 4 GiB (above it, keylist's old 32-bit size wrapped). It is a memory sanity limit: each client preallocates about 272 bytes per key, so size memory accordingly.
+
+### Connecting with `--uri`
+
+`--uri=redis://user:password@host:port/dbnum` (or `rediss://` for TLS) sets the server, port, credentials and database in one option, in the format `redis-cli -u` takes. As with `redis-cli -u`, the user name and password are percent-decoded, so characters that have a meaning in the URI can be written as `%40` (`@`), `%3A` (`:`, in the password), `%2F` (`/`), `%3F` (`?`), `%23` (`#`) and `%25` (`%`):
+
+```
+$ memtier_benchmark --uri 'redis://default:p%40ss%2Fword@127.0.0.1:6379/0'
+```
+
+Earlier releases sent `%XX` to the server literally, so a password that contains a valid `%XX` sequence must now be written with `%25` for its `%`. A `%` that is not followed by two hex digits (for example a password ending in `%`) is still taken literally, with a warning. `%00` is rejected, and so are a `%3A` and control characters in the user name, since `AUTH` credentials are split at the first `:` and the user name is printed by `--show-config`. A raw `/`, `?` or `#` in the credentials still works but prints a note, because it cannot be told apart from an `@` in the path; if the password is not recognised, percent-encode it. The host, port and database number are not decoded: to give an IPv6 zone id, write it with a raw `%` (for example `[fe80::1%eth0]`), since `%25` is not decoded in the host. `--show-config` and `--json-out-file` print the password as `***`.
+
 ### Using monitor input files
 
 You can replay real command streams by pointing memtier_benchmark to a monitor log file with the `--monitor-input=/path/to/file` option. Special commands such as `__monitor_line1__` pick a specific entry from the file, while `__monitor_line@__` selects commands at runtime (optionally combined with `--monitor-pattern` and `--command-ratio`). For example, the following command replays the first command from the file on each request:
@@ -151,7 +165,7 @@ You can replay real command streams by pointing memtier_benchmark to a monitor l
 $ memtier_benchmark --monitor-input=monitor.txt --command=__monitor_line1__
 ```
 
-This lets you mix synthetic workloads with realistic captured traffic. Note that monitor input is only supported in single endpoint mode (not cluster mode).
+This lets you mix synthetic workloads with realistic captured traffic. Monitor input works in both single endpoint and cluster mode (`--cluster-mode`); in cluster mode each command is sent to the shard that owns its first argument's key. Monitor lines may use the `__key__` and `__data__` placeholders, and text around `__key__` (for example `user:__key__` or `{tag}__key__`) is kept. Each `__key__` argument gets its own generated key, so in cluster mode a `__monitor_line@__` line with more than one `__key__` argument must give them all the same `{hash tag}` (for example `"MSET" "{t}a:__key__" "v" "{t}b:__key__" "v"`), or memtier_benchmark refuses to start; without a tag the keys could land in different slots. The check looks only at `__key__` arguments: a literal key next to a generated one (for example `"MSET" "fixed" "v" "k:__key__" "v"`) is not detected, and Redis answers `CROSSSLOT` unless both share a hash tag. `--failed-keys-file` and `--retry-on-error` use the first argument as the request's key, the same one the command is routed by.
 
 When the number of requested operations exceeds the number of commands in the monitor file, commands are reused:
 - **Sequential mode** (`--monitor-pattern=S`): Commands wrap around and replay in order. For example, with 10K commands and 1M operations, the commands replay 100 times (0, 1, 2, ..., 9999, 0, 1, 2, ...).
@@ -170,6 +184,12 @@ OK
 
 You can pipe this output and filter specific patterns with tools such as `grep`, then save it to a file and use it as a `--monitor-input` source. For more details, see the official Redis documentation on [monitoring commands executed in Redis](https://redis.io/docs/latest/develop/tools/cli/#monitor-commands-executed-in-redis).
 
+> **What's new in 2.4**
+>
+> **Binary payloads** — the monitor capture loader preserves binary payloads (including embedded NUL bytes) end-to-end into `monitor_command_list`. **However**, dispatch via `arbitrary_command(const char *)` currently re-truncates at the first NUL — full binary blob support through replay is tracked as #439.
+>
+> **CR-only line endings** (classic Mac `\r`, and some Windows export tools that emit bare `\r` without a following `\n`) parse correctly; previously the whole file would be read as one giant line and no commands were replayed.
+
 ### Command statistics breakdown
 
 By default, when using arbitrary commands (`--command`), statistics are aggregated by command type (e.g., all SET commands are grouped together, all GET commands are grouped together). You can control this behavior with the `--command-stats-breakdown` option:
@@ -183,9 +203,229 @@ For example, if you run:
 $ memtier_benchmark --command="SET foo __data__" --command="SET bar __data__" --command="GET foo"
 ```
 
+(`SET foo __data__` has no `__key__`, so under `--data-size-pattern=S` its value always gets the minimum size: each `__data__` is sized by the most recent `__key__` before it in the command.)
+
 With the default `command` breakdown, you'll see aggregated stats for "Sets" and "Gets". With `--command-stats-breakdown=line`, you'll see separate rows for each command line.
 
+JSON object keys must be unique, so when several command lines share a name their per-line JSON entries are numbered in output-row order (`--command` order for user lines), e.g. `"Sets #1"`, `"Sets #2"`, and `"SET #1"`, `"SET #2"` for the latency histograms and `Per-Key Misses`. The per-command `--hdr-file-prefix` files use a shell-safe `_N` suffix instead (e.g. `<prefix>_GET_1_command_run_1.hgrm`, `<prefix>_GET_2_command_run_1.hgrm`), so they do not overwrite each other. Names that appear only once keep their plain key (`"Gets"`) and file name.
+
 > **Note:** When using `--command-stats-breakdown=command`, the JSON output's Time-Serie percentiles (p50, p99, etc.) for aggregated command types are approximate. They reflect only one of the underlying commands rather than a true merge of all commands of that type. Totals, counts, bytes, and average latency are correctly aggregated.
+
+### Cursor iteration
+
+`--scan-incremental-iteration` follows the cursors returned by `SCAN`, `SSCAN`,
+`HSCAN`, and `ZSCAN`, restarting when the cursor returns zero. Use one `--command`,
+`--pipeline=1`, and a standalone Redis endpoint. For example:
+
+```sh
+memtier_benchmark --command="SSCAN myset 0 COUNT 100" --scan-incremental-iteration --pipeline=1
+memtier_benchmark --command="HSCAN __key__ 0 MATCH field:* COUNT 100" --scan-incremental-iteration --pipeline=1
+memtier_benchmark --command="ZSCAN myzset 0 COUNT 100" --scan-incremental-iteration --pipeline=1
+```
+
+Each client keeps its own cursor and generated arguments (including `__key__`
+affixes) throughout a walk. A new walk selects new generated arguments.
+For existing `SCAN` workloads, this changes generated `MATCH` arguments:
+`SCAN 0 MATCH __data__` now reuses the initial pattern until the walk ends,
+instead of regenerating it for each continuation.
+Likewise, `SCAN 0 MATCH __key__` advances the key generator once per walk rather
+than once per request, so the same request budget can visit fewer generated patterns.
+`MATCH`, `COUNT`, and command-specific options such as `HSCAN NOVALUES` are
+preserved; option availability depends on the Redis server version.
+`--scan-incremental-max-iterations=N` caps the number of continuation requests
+per walk (zero means unlimited). Statistics separate initial requests, such as
+`HSCAN 0`, from continuations, such as `HSCAN <cursor>`. For compatibility, the
+initial statistics label remains `0` even when the command specifies a nonzero
+starting cursor; each new walk restarts at that supplied cursor.
+
+### End of a `--test-time` run
+
+When `--test-time` expires, memtier stops sending and waits for the replies to
+requests already in flight. It waits at most 10 seconds (a fixed grace period).
+If the server has stopped replying, each client still waiting after that is
+ended: its unanswered requests are counted as errors, written to
+`--failed-keys-file` (status `no-reply-after-test-time`) when set, and reported
+as `"Unanswered requests"` in the JSON `Runtime` section. A warning is printed
+to stderr and the run reports the `--test-time` window as usual, with exit
+code 0. Commands that legitimately take longer than 10 seconds to reply after
+the deadline (for example a slow `--command` Lua script) are reported the same
+way.
+
+With `--retry-on-error`, requests that get a retryable error after the
+deadline are still retried, so a slot migration or a failover in progress can
+complete. A client that is still retrying when the grace period is over (for
+example against a server that rejects every write with `-OOM`, with the
+default unlimited `--max-retries`) is ended the same way: its requests held
+for retry are not resent, are counted as errors and written to
+`--failed-keys-file` with status `run-ended-before-resend`, and stderr shows
+`warning: N client(s) were still retrying M request(s) 10 seconds after the
+test time ended`. They are not part of `"Unanswered requests"`, which only
+counts requests that were waiting for a reply.
+
+### Repeated runs (`--run-count`)
+
+With `--run-count N`, memtier reports the best and the worst run (by
+Ops/sec), and an `AGGREGATED AVERAGE RESULTS (N runs)` section with per-run
+values:
+
+- The counts (`Count`, `Accumulated Latency`, `Connection Errors`,
+  `Unanswered requests` and the `Per-Key Misses` counts) are the mean over
+  the runs, rounded to the nearest integer, so they keep the integer type of
+  the other sections (29659 ops over 3 runs give `"Count": 9886`). A count
+  that is not 0 over the series never rounds to 0: 1 connection error over 3
+  runs gives 1, not 0, next to its non-zero rate. The `Totals` `Count` and
+  `Accumulated Latency` are the sum of the rounded command rows, so `Totals`
+  is exactly the sum of its rows; it can differ from the mean of the per-run
+  `Totals` by about one unit per row. In the same way, the `Per-Key Misses`
+  `Total Hits` / `Total Misses` are the sum of the rounded `key[i]` values.
+- Ops/sec, KB/sec, the default workload's Hits/sec and Misses/sec, and the
+  JSON `Latency` / `Average Latency` are the mean of the per-run values. The
+  Hits/sec and Misses/sec of `--command` rows are time-weighted instead: the
+  hits (or misses) of all runs divided by the duration of all runs.
+- Percentiles come from the latency histograms of all the runs merged
+  together, so the section's `Histogram log format` holds the samples of all
+  the runs (N times its `Count`).
+- `Runtime` `Total duration` is the mean run duration, `Start time` is the
+  start of the first run, and `Finish time` is `Start time` plus
+  `Total duration`.
+- The `CPU` seconds are the mean over the runs that reported CPU usage (all
+  of them on Linux).
+
+The section name always shows `--run-count`, so the JSON key does not
+change. If the series is cut short (see below), the means are over the runs
+that happened, `"Runs completed"` in the JSON `run information` section.
+
+### Interrupting a run
+
+Ctrl+C (SIGINT) and SIGTERM (sent by `kill`, `timeout`, `docker stop`,
+Kubernetes and most CI runners) stop a run gracefully: memtier stops the
+threads, prints the results for the time it ran, and writes a complete
+`--json-out-file` with `"Interrupted": "true"` in the `Runtime` section. With
+`--run-count`, no further run starts; the summary covers the runs that
+happened (`"Runs completed"` in the JSON `run information` section).
+
+A second signal sent more than about 1 second after the first ends memtier
+immediately, without results, as a way out of a stuck shutdown. Signals
+within that second count as one: Ctrl+C under `timeout`, or a kill of the
+whole process group, delivers the same signal twice.
+
+Exit status:
+
+- after a graceful interrupt (first SIGINT or SIGTERM): **0**. Check
+  `"Interrupted": "true"` in the JSON to tell an interrupted run from a
+  complete one. If the results cannot be written, the exit status is 1
+  instead (see below). If an earlier `--run-count` run was aborted by
+  `--connection-stage-timeout`, it is 2.
+- after a second signal: memtier dies by that signal (128 + signal number in
+  a shell: 130 for SIGINT, 143 for SIGTERM), and the JSON file is
+  incomplete.
+- with `--run-count`, the exit status covers every run, not only the last
+  one: **2** if any run was aborted by `--connection-stage-timeout`,
+  otherwise **1** if any run failed or the results could not be written,
+  otherwise **0**. An aborted run still counts in `AGGREGATED AVERAGE
+  RESULTS`, which is then marked `"Interrupted": "true"` (as are `BEST RUN
+  RESULTS` or `WORST RUN RESULTS` when they are that run).
+
+### Output write errors
+
+If the results cannot be written to `--out-file`, `--json-out-file` or
+stdout (for example on a full disk, an exceeded quota or an I/O error),
+memtier prints `error: failed writing --out-file PATH:
+REASON` (or `--json-out-file PATH`, or `results to stdout`) and exits with
+status **1**, also after a graceful interrupt. A connection-stage abort still
+exits with **2** when an output write fails too.
+
+One exception: when stdout is a pipe or socket and its reader has gone
+away (e.g. `memtier_benchmark ... | head`), the run is not failed, since the
+reader chose to stop reading. This also applies to an `--out-file` that is
+the same file as stdout, such as `/dev/stdout`. A write that fails while the
+reader is still there (for example a full non-blocking pipe) still fails the
+run. Any other `--out-file` (for example a FIFO whose reader exits) and
+`--json-out-file` always fail the run when a write fails.
+
+The same rule covers the other output files:
+
+- `--failed-keys-file` is opened at startup, after option validation and
+  before connecting. If it cannot be opened, or its CSV header cannot be
+  written, memtier prints `error: cannot open --failed-keys-file PATH:
+  REASON` (or `failed writing`) and exits with status **1** right away, as
+  for `--out-file`. If a record cannot be written during the run, memtier
+  prints `error: failed writing --failed-keys-file PATH: REASON; logging
+  disabled.`, the benchmark goes on without the log, and memtier exits
+  with **1** at the end. A `--failed-keys-file` on stdout whose reader
+  went away (for example `/dev/stdout` and `| head`) only stops logging.
+- The HDR histogram files (`--hdr-file-prefix`) and the `--client-stats`
+  CSV files are only created when a run ends. At startup, before
+  connecting, memtier checks that the directory of each prefix exists and
+  is a writable directory (no file is created, and `--verify-only` skips
+  the check), and otherwise prints `error: cannot write --hdr-file-prefix
+  directory DIR: REASON` (or `--client-stats`) and exits with **1**. The
+  check is best-effort: it uses `access()`, which tests the real user ID,
+  so when running as root or on an NFS `root_squash` mount an unwritable
+  directory can still only be caught when the run ends. A full disk is
+  only seen when the run ends: if one of
+  these files cannot be opened or written then, memtier prints `error:
+  cannot open --hdr-file-prefix file PATH: REASON` or `error: failed
+  writing --client-stats file PATH: REASON`, still writes the other files,
+  and exits with **1**. For `--client-stats` only the first failing file of
+  a run is named, followed by `error: N more --client-stats files could not
+  be written`.
+
+A stdout that was already closed when memtier started is handled separately,
+see [Closed stdin, stdout or stderr](#closed-stdin-stdout-or-stderr).
+
+### Import-file validation
+
+`--data-import` validates the file before connecting, including with
+`--generate-keys` and `--verify-only`. A malformed item or a file with no
+complete items exits **1**. Keys and values must be nonempty and no larger
+than 512 MiB each; the declared key and value lengths must match the columns.
+Previously a short key column could import uninitialized trailing bytes; it
+now fails validation.
+
+A truncated final item after complete items is ignored with a
+`premature end of file` warning, so size-capped dumps can still be used.
+The existing warnings for a missing final newline or closing quote remain.
+With `--generate-keys`, validation adds one full sequential scan at startup
+without storing the imported keys. In one local measurement, this added
+about 3.9 seconds for a 488 MiB file containing two million items; the cost
+depends on file size and storage speed.
+
+### Closed stdin, stdout or stderr
+
+If a benchmark run is started with stdin, stdout or stderr closed (for
+example `memtier_benchmark ... >&-`), memtier reopens that descriptor on
+`/dev/null` before it opens any file. So `--out-file`, `--json-out-file` and
+the other files never share a descriptor with stdin, stdout or stderr. Then
+two checks run at startup, before connecting:
+
+- Right after option parsing, before any file is opened or read: a path
+  option that names a closed descriptor would now silently use
+  `/dev/null`. This covers the outputs `--out-file`, `--json-out-file` and
+  `--failed-keys-file`, and the inputs `--data-import`, `--monitor-input`,
+  `--cert`, `--key` and `--cacert`. The names matched are `/dev/stdout`,
+  `/dev/fd/1`, `/proc/self/fd/1` or a symlink to one of them, and likewise
+  for `/dev/stdin` and `/dev/stderr`. memtier prints `error: --out-file
+  /dev/stdout resolves to stdout, which was closed at startup` and exits
+  **1**. The message is not visible when stderr is the closed one.
+- After all other option checks and the data import, just before the
+  output files are opened: a closed stdout would lose the text results.
+  Unless `--out-file` is given, memtier prints `error: stdout was closed at
+  startup, so the results would not be written; use --out-file` and exits
+  **1**. Since this check is late, a bad option still reports its own
+  error. To keep only the JSON, pass `--out-file /dev/null`.
+
+Otherwise:
+
+- A closed stdin or stderr does not by itself fail the run. With stderr
+  closed, the log lines are lost.
+- Any spelling of `/dev/null` itself is accepted, and so is another
+  process's descriptor such as `/proc/1/fd/1`.
+- `--hdr-file-prefix` and `--client-stats` are prefixes: memtier always
+  appends a suffix (`_FULL_RUN_1.txt`, `-1-0-0.csv`, ...), so they never
+  name `/dev/stdout` or `/dev/fd/N` themselves. They are not checked. A
+  file they cannot open or write fails the run, see
+  [Output write errors](#output-write-errors).
 
 ## Crash Reporting
 
@@ -215,7 +455,128 @@ Also, the ratio and the key generator is per client (and not connection).
 In this case, setting the ratio to 1:1 does not guarantee 100% hits because
 the keys spread to different connections/nodes.
 
+### Read Preference (cluster mode)
 
+`--read-preference` selects which class of node receives read commands when
+running against a Redis Cluster with replicas.  Four modes are available:
+
+* `primary` (default) - reads land on the slot owner (primary). Legacy
+  behaviour.
+* `secondary` - all reads go to a replica; if no live replica owns the
+  slot the `--read-preference-fallback` policy decides what happens.
+* `secondaryPreferred` - prefer a replica; on absence of a live replica
+  fall back silently to the primary.
+* `nearest` - EWMA-based selection. Cold replicas are seeded round-robin
+  until warm, then reads are routed to the lowest-EWMA endpoint among
+  warm replicas (primary may participate once it has accumulated samples).
+
+Replica setup rejection (AUTH, SELECT or HELLO) has a separate policy from
+routing around an unavailable node. Under `primary`, a rejected replica is
+closed and left closed because it is not needed. With `--reconnect-on-error`,
+`secondaryPreferred` also closes such a replica without redialing it or
+failing the run; reads can fall back to the primary. Without that flag,
+`secondaryPreferred` keeps the existing setup-failure handling. `secondary`
+and `nearest` do not use this optional-replica exception: although routing
+may allow a primary fallback, an unrecovered setup rejection can still fail
+the run. Ordinary connection losses continue to follow the reconnect policy.
+
+When the target node class is unavailable, the fallback is controlled by
+`--read-preference-fallback`:
+
+* `error` (default) - return an error.
+* `primary` - fall back silently to the primary.
+* `queue` - reserved; currently treated as `error`. Request queuing is
+  not yet implemented.
+
+Built-in read commands (GET, MGET) and arbitrary commands marked with
+`--command-is-read` participate in read-preference routing.  Reads on
+arbitrary keyless commands (e.g. `DBSIZE`, `CLUSTER NODES`) are routed
+to the same node class.
+
+`--read-server=HOST:PORT` lets you declare additional replica endpoints
+for standalone (non-cluster) runs. The flag is parsed in all modes, but
+read dispatch via the `--read-preference` policy currently fires only in
+cluster mode.
+
+`--replica-clients=N` and `--replicas-per-shard=K` are parsed but not yet
+wired into the connection topology in this release; see the open
+limitations in the PR.
+
+Read-preference also extends the JSON output (`--json-out-file`) with two
+new top-level blocks (emitted only when `--cluster-mode` is on AND
+`--read-preference != primary`):
+
+* `Read Routing` - `Ops from Primary`, `Ops from Replica`, and
+  `Primary Fraction` for the built-in GET/MGET classes. Arbitrary
+  per-command totals appear under `Arbitrary Read Routing`.
+* `Endpoints` - one entry per distinct shard connection (address + role)
+  with `conn_id`, `role`, `Ops`, `Avg Latency (us)`, and
+  `Latency Samples`. `conn_id` is the shard_connection vector index
+  (NOT a stable cluster shard identity).
+
+### Testing limitations
+
+The `OSS-CLUSTER + replicas: read-preference` CI matrix cell exercises the
+RLTest harness with `--use-slaves`, which starts replicas using `--slaveof`
+without `--cluster-enabled yes`. The resulting slave nodes are not part of
+cluster gossip - `CLUSTER SLOTS` returns empty replica arrays from each
+master, so memtier_benchmark cannot discover them. The test helper's
+`get_cluster_replica_connections()` gate detects this and skips the tests
+with a stderr warning.
+
+The production read-routing code was verified empirically against real
+`redis-cli --cluster create` clusters with cluster-aware replicas under
+both RESP2 and RESP3. See PR #456 round-18 reviewer reports for the
+measurements: all four modes (primary, secondary, secondaryPreferred,
+nearest) route reads correctly to replicas, with zero leakage to primaries.
+
+A follow-up fixture that bootstraps a real `redis-cli --cluster create`
+cluster within the test harness is tracked in issue #462 (filed by this PR).
+
+### Reconnecting after connection errors
+
+With `--reconnect-on-error`, a lost connection is reconnected with a delay
+(`--reconnect-backoff-factor`) instead of ending its thread.
+`--max-reconnect-attempts` bounds the consecutive failed attempts; when they
+are exhausted, the thread ends and the run fails (exit code 1), whether or not
+the `--test-time` deadline has passed. Every failed reconnect counts as a
+connection error in the report, over TCP and over a unix socket alike. With
+the default of 0 (unlimited), a server that stays down is retried until the
+run's stop condition:
+
+- `--test-time`: once the deadline has passed, memtier stops reconnecting and
+  ends the run normally with its report. A pending reconnect is due no later
+  than the deadline, whatever the backoff delay, and the report's duration and
+  throughput cover `--test-time`, not the time spent waiting for a failed
+  reconnect.
+  - A required connection whose setup step (AUTH, SELECT, HELLO) was rejected
+    since its last reply fails the run instead (exit code 1), as when setup
+    keeps failing at the deadline. The optional-replica exceptions are
+    described under Read Preference above.
+  - A connection that a live server drops around the deadline is still
+    reconnected once, so requests held for replay are resent; if that
+    reconnect fails or is dropped again, the run ends. So a peer that accepts
+    connections and closes them after a delay can extend the run by up to
+    about twice that delay past `--test-time`.
+  - In cluster mode this holds for the main connection only: another shard's
+    connection is reconnected through a slot map refresh. Once the run is
+    over, a refresh still redials it; if that dial fails, the connection is
+    left closed and the requests it held count as errors.
+  - A client that never got a reply before the server went away did no work:
+    it stops at the deadline too, but fails the run (exit code 1), even if
+    other clients on its thread completed requests. This includes a client
+    prevented from starting by repeated TLS-handshake failures. One whose
+    first connection only completes after the deadline (e.g. a server killing
+    connections before their first reply) is timed from the start of the run,
+    so it ends at its first reply instead of running a whole `--test-time`.
+  - The deadline is measured from the start of the run, so it does not cover
+    a server that is gone before any connection got a reply: that startup
+    phase is bounded by `--connection-stage-timeout` (default 30 s), which
+    fails the run with exit code 2.
+- `--requests`: with unlimited attempts (the default of 0), the run waits for
+  the server indefinitely, since the requests can only complete once it is
+  back. memtier warns once, after 10 failed attempts, that the server is still
+  unreachable; set `--max-reconnect-attempts` to give up instead.
 
 ### Using rate-limiting for informed benchmarking
 
@@ -265,6 +626,12 @@ To output different percentiles you should use the --print-percentiles option fo
 #### Saving the full latency spectrum
 To save the full latencies you should use the --hdr-file-prefix option followed by the prefix name you wish the filenames to have. 
 Each distinct command will be saved into two different files - one in .txt (textual format) and another in .hgrm (HistogramLogProcessor format).
+The per-command files are named `<prefix>_<command>_command_run_<run>.txt` and `.hgrm`. In `<command>`, spaces, control characters and `< > : " / \ | ? *` are replaced with `_`, so names stay valid on Windows and in CI artifact uploads (e.g. `SCAN <cursor>` from `--scan-incremental-iteration` is written as `<prefix>_SCAN__cursor__command_run_1.hgrm`, and `GET (Line 1)` from `--command-stats-breakdown=line` as `<prefix>_GET_(Line_1)_command_run_1.hgrm`). Names that become identical after this replacement get the same `_N` suffix as duplicate names.
+The JSON output also includes a `Compressed Histogram` string under
+`Percentile Latencies` / `Histogram log format`, encoded as standard V2 compressed
+HDR data in base64. If encoding fails, memtier reports the HDR error on stderr and
+writes JSON `null` for that field. Consumers should check for `null` before
+decoding; the other latency statistics remain available.
 The textual format can be hard to analyze solely, but you can use an [online formatter](http://hdrhistogram.github.io/HdrHistogram/plotFiles.html) to generate visual histograms from it. The .hgrm format will be later added as input to Redislabs [mbdirector](https://github.com/redislabs/mbdirector) to enable visualization of time-domain results.
 
 Sample Visual Feel of the full latency spectrum using an [online formatter](http://hdrhistogram.github.io/HdrHistogram/plotFiles.html):
@@ -299,3 +666,40 @@ docker-compose -f docker-compose.statsd.yml up -d
 | `--statsd-run-label=LABEL` | `default` | Label to identify/compare benchmark runs. |
 
 For detailed setup instructions, dashboard usage, and troubleshooting, see [Real-Time Metrics Guide](docs/REALTIME_METRICS.md).
+
+#### Prometheus /metrics exporter
+
+memtier_benchmark can also expose live metrics as a Prometheus `/metrics`
+endpoint, scrapable by Prometheus or any OpenMetrics-compatible collector. The
+exporter is built in by default (it requires libevent 2.1.1 or newer; see
+[DEVELOPMENT.md](DEVELOPMENT.md) for the `--disable-prometheus` build flavor).
+It is **off at runtime** until you pass `--prometheus-port`:
+
+```bash
+# Bind the exporter on a fixed port (loopback by default)
+./memtier_benchmark -s <redis-host> --test-time=60 --prometheus-port=8080
+# Scrape it:
+curl http://127.0.0.1:8080/metrics
+
+# Or let the OS pick an ephemeral port; the bound URL is announced on stdout:
+./memtier_benchmark -s <redis-host> --test-time=60 --prometheus-port=0
+# -> "Prometheus exporter listening on http://127.0.0.1:43217/metrics"
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--prometheus-port=PORT` | *(disabled)* | TCP port for the `/metrics` HTTP endpoint. `0` selects an ephemeral port (announced on stdout). Enables the exporter when set. |
+| `--prometheus-bind-addr=ADDR` | `127.0.0.1` | Address to bind the exporter to. Loopback by default; a non-loopback address prints a one-shot warning. |
+| `--prometheus-run-label=K=V` | *(none)* | Repeatable label applied to every exported sample, e.g. to compare runs. Invalid UTF-8 in a value is replaced with U+FFFD and a warning is printed. |
+| `--prometheus-latency-buckets=L` | *(26 defaults)* | Comma-separated histogram bucket upper bounds in seconds. |
+
+The exporter exposes cumulative counters (ops, bytes, hits/misses, errors,
+connection errors, retries), gauges (connections, threads, current/configured
+run), and a latency histogram (`memtier_latency_seconds`), plus build info. By
+design it echoes **no** connection identity (no server address, password, URI,
+or filesystem path) into the scrape body. The end-of-run output remains the
+authoritative latency source; the histogram counts every operation but trails
+`memtier_ops_total` by about one second of operations (longer while the server
+is stalled or under a low `--rate-limiting` rate), and never exceeds it. See the
+[Real-Time Metrics Guide](docs/REALTIME_METRICS.md) for the full metric
+mapping, threat model, and operational notes.
