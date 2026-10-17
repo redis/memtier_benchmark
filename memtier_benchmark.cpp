@@ -3062,6 +3062,7 @@ void usage()
         "  -s, --server=ADDR              Same as --host\n"
         "  -p, --port=PORT                Server port (default: 6379)\n"
         "  -S, --unix-socket=SOCKET       UNIX Domain socket name (default: none)\n"
+        "                                Linux: @NAME selects an abstract socket\n"
         "  -4, --ipv4                     Force IPv4 address resolution.\n"
         "  -6  --ipv6                     Force IPv6 address resolution.\n"
         "  -P, --protocol=PROTOCOL        Protocol to use (default: redis).\n"

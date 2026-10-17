@@ -723,6 +723,17 @@ is stalled or under a low `--rate-limiting` rate), and never exceeds it. See the
 [Real-Time Metrics Guide](docs/REALTIME_METRICS.md) for the full metric
 mapping, threat model, and operational notes.
 
+### Linux abstract Unix sockets
+
+On Linux, `memtier_benchmark --unix-socket @NAME` connects to an abstract Unix
+socket named `NAME`. No socket file or writable filesystem directory is needed.
+The name is limited to 107 bytes, excluding `@`; longer names fail instead of
+being silently truncated. The terminating NUL is not part of the abstract name.
+Use `--unix-socket ./@NAME` for a relative filesystem socket beginning with `@`.
+On other platforms, `@NAME` continues to be an ordinary filesystem pathname.
+Abstract sockets do not have filesystem permission checks; access control must
+be provided by the server (for example, Redis authentication).
+
 ### Progress display interval
 
 Use `--progress-interval=5` to print progress every five seconds.

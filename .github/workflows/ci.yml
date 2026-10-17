@@ -572,6 +572,8 @@ jobs:
       run: |
         ./memtier_benchmark --version
         bash scripts/check-macos-tls-links.sh "$(brew --prefix openssl@${{ matrix.openssl }})"
+    - name: Unix socket regression tests
+      run: MEMTIER_BINARY="$PWD/memtier_benchmark" python3 tests/test_unix_socket.py
     - name: Unit tests
       run: |
         if ! make check; then
