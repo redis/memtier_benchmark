@@ -33,7 +33,7 @@ def _configuration_only(env, result, path, diagnostic):
     with open(path) as output:
         document = json.load(output)
     env.assertEqual(list(document), ["configuration", "FATAL_ERROR"])
-    env.assertEqual(document["FATAL_ERROR"], "Benchmark terminated before completing results")
+    env.assertEqual(document["FATAL_ERROR"], "Benchmark terminated before normal finalization")
     env.assertEqual(document["configuration"]["threads"], 1)
     env.assertNotContains("Json file closed.", result.stderr)
 
@@ -82,6 +82,56 @@ def test_json_closed_on_worker_reconnect_failure(env):
             env.assertFalse(peer.is_alive())
             env.assertEqual(errors, [])
         _configuration_only(env, result, path, "failed to reconnect.")
+
+
+
+def test_json_retains_results_when_verifier_prepare_fails(env):
+    with tempfile.TemporaryDirectory() as directory:
+        address = os.path.join(directory, "s")
+        source_path = os.path.join(directory, "import.csv")
+        with open(source_path, "w") as output:
+            output.write("dumpflags, time, exptime, nbytes, nsuffix, it_flags, clsid, nkey, key, data\n")
+            output.write("0, 0, 0, 5, 0, 0, 0, 8, json-key, abc\n")
+        errors = []
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            listener.bind(address)
+            listener.listen(1)
+            listener.settimeout(15)
+
+            def complete_benchmark():
+                try:
+                    with listener.accept()[0] as connection:
+                        connection.settimeout(15)
+                        # The established benchmark connection remains usable;
+                        # only the verifier's later connection will fail.
+                        os.unlink(address)
+                        with connection.makefile("rb") as source:
+                            for _ in range(4):
+                                count = int(source.readline()[1:])
+                                command = []
+                                for _ in range(count):
+                                    length = int(source.readline()[1:])
+                                    command.append(source.read(length))
+                                    assert source.read(2) == b"\r\n"
+                                assert command[0].upper() == b"SET", command
+                                connection.sendall(b"+OK\r\n")
+                except Exception as error:
+                    errors.append(repr(error))
+
+            peer = threading.Thread(target=complete_benchmark, daemon=True)
+            peer.start()
+            try:
+                result, path = _run(env, directory, ["-S", address, "--requests=4", "--ratio=1:0",
+                                                     "--data-import", source_path, "--data-verify"])
+            finally:
+                peer.join(timeout=16)
+            env.assertFalse(peer.is_alive())
+            env.assertEqual(errors, [])
+        env.assertEqual(result.returncode, 1, message=result.stderr)
+        with open(path) as output:
+            document = json.load(output)
+        env.assertEqual(document["ALL STATS"]["Totals"]["Count"], 4)
+        env.assertEqual(document["FATAL_ERROR"], "Data verification failed or did not complete")
 
 
 def _mget_allocation_failure(env, cluster):

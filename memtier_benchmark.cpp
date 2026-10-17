@@ -227,13 +227,13 @@ static bool g_output_failed = false;
 
 // main owns the JSON writer. Workers never write JSON, and main writes results
 // after joining them, so the exit callback sees a quiescent writer. Retain
-// content already emitted, including benchmark results if verification exits.
+// content already emitted, without assuming which output stage was reached.
 static json_handler *g_json_out_file = NULL;
 
 static void close_json_out_file_at_exit(void)
 {
     if (g_json_out_file != NULL) {
-        g_json_out_file->write_error("Benchmark terminated before completing results");
+        g_json_out_file->write_error("Benchmark terminated before normal finalization");
         g_json_out_file->close();
     }
 }
