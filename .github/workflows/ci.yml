@@ -64,7 +64,9 @@ jobs:
       DEBIAN_FRONTEND: noninteractive
     strategy:
       matrix:
-        image: ${{ fromJSON(vars.SMOKE_TEST_IMAGES) }}
+        # Repository variables may be unavailable for fork pull requests.
+        # Keep the default matrix equivalent to the configured upstream images.
+        image: ${{ fromJSON(vars.SMOKE_TEST_IMAGES || '["ubuntu:noble", "ubuntu:jammy", "ubuntu:focal", "ubuntu:resolute", "debian:bookworm", "debian:bullseye", "debian:trixie"]') }}
     container: ${{ matrix.image }}
     name: Build ${{ matrix.image }}
     steps:
