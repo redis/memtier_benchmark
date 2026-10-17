@@ -1530,6 +1530,18 @@ void shard_connection::rearm_readonly()
     m_readonly_state = setup_sent;
 }
 
+// Redis can send these errors before accepting workload, then close the
+// connection. They must not disarm startup supervision or reset retry budgets.
+static bool is_redis_connection_rejection(const char *status)
+{
+    static const char protocol[] = "-ERR Protocol error:";
+    static const char maxclients[] = "-ERR max number of clients ";
+    static const char protected_mode[] = "-DENIED Redis is running in protected mode ";
+    return status && (strncmp(status, protocol, sizeof(protocol) - 1) == 0 ||
+                      strncmp(status, maxclients, sizeof(maxclients) - 1) == 0 ||
+                      strncmp(status, protected_mode, sizeof(protected_mode) - 1) == 0);
+}
+
 void shard_connection::process_response(void)
 {
     int ret;
@@ -1733,15 +1745,13 @@ void shard_connection::process_response(void)
                 responses_handled = true;
             }
             // A valid workload reply proves setup completed, even when the
-            // command was rejected or queued for retry. Redis wire-protocol
-            // errors are different: the server closes after replying, and
-            // treating them as progress would disarm the startup supervisor
-            // and reset the reconnect budget on every failed attempt (#426).
-            const char *status = r->get_status();
-            const char protocol_error[] = "-ERR Protocol error:";
-            bool framing_error = r->is_error() && is_redis_protocol(m_config->protocol) && status &&
-                                 strncmp(status, protocol_error, sizeof(protocol_error) - 1) == 0;
-            if (!framing_error) {
+            // command was rejected or queued for retry. Redis protocol and
+            // accept-time rejections are different: the server closes after
+            // replying. Treating them as progress would disarm the startup
+            // supervisor and reset the reconnect budget on every attempt.
+            bool connection_rejected = r->is_error() && is_redis_protocol(m_config->protocol) &&
+                                       is_redis_connection_rejection(r->get_status());
+            if (!connection_rejected) {
                 report_connection_stage_success();
                 // Steady state reached: reset the per-connection reconnect
                 // attempts counter now (not at BEV_EVENT_CONNECTED). The

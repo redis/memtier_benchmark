@@ -35,6 +35,9 @@ class _Handler(socketserver.StreamRequestHandler):
             connection = peer.connections
         local = 0
         try:
+            if peer.mode == 'greeting':
+                self.wfile.write(peer.reply)
+                return
             while not peer.stop.is_set():
                 line = self.rfile.readline()
                 if not line:
@@ -82,7 +85,7 @@ class _Handler(socketserver.StreamRequestHandler):
             peer.failures.append(repr(error))
 
 
-def _run(env, peer, extra=(), duration=3):
+def _run(env, peer, extra=(), duration=3, authenticate=True):
     thread = threading.Thread(target=peer.serve_forever, daemon=True)
     thread.start()
     try:
@@ -90,9 +93,11 @@ def _run(env, peer, extra=(), duration=3):
             stats_path = os.path.join(directory, 'stats.json')
             failed_path = os.path.join(directory, 'failed.csv')
             args = [MEMTIER_BINARY, '-s', '127.0.0.1', '-p', str(peer.server_address[1]),
-                    '-a', 'dummy-workload-error-686', '-t', '1', '-c', '1', '--ratio=1:0',
+                    '-t', '1', '-c', '1', '--ratio=1:0',
                     '--pipeline=1', '--rate-limiting=20', '--connection-stage-timeout=1',
                     '--hide-histogram', '--json-out-file=' + stats_path, '--failed-keys-file=' + failed_path]
+            if authenticate:
+                args.extend(['-a', 'dummy-workload-error-686'])
             if duration is not None:
                 args.append('--test-time=' + str(duration))
             args.extend(extra)
@@ -124,7 +129,8 @@ def _assert_completed(env, result, stats, peer):
 def test_ordinary_workload_errors_reach_steady_state(env):
     for error in (b'-ERR dummy command rejection\r\n', b'-READONLY dummy replica rejection\r\n',
                   b'-NOPERM dummy command denial\r\n', b'-OOM dummy memory rejection\r\n',
-                  b'-ERR command mentions Protocol error: in its text\r\n'):
+                  b'-ERR command mentions Protocol error: in its text\r\n',
+                  b'-DENIED dummy command denial\r\n'):
         peer = _Peer(error)
         result, stats, failures, elapsed = _run(env, peer, ['--pipeline=4'])
         _assert_completed(env, result, stats, peer)
@@ -217,3 +223,21 @@ def test_workload_error_progress_is_reset_between_runs(env):
     env.assertEqual(peer.replies, 4)
     env.assertEqual(len(failures), 4)
     env.assertLess(elapsed, 8)
+
+
+def test_accept_time_rejections_do_not_count_as_workload_progress(env):
+    for reply in (b'-ERR max number of clients reached\r\n',
+                  b'-ERR max number of clients + cluster connections reached\r\n',
+                  b'-DENIED Redis is running in protected mode because of dummy settings\r\n'):
+        # No AUTH/SELECT/HELLO: the unsolicited greeting can be read as the
+        # first pipelined data reply. It must still be a startup failure.
+        peer = _Peer(reply, mode='greeting')
+        result, _stats, _failures, _ = _run(env, peer, ['--reconnect-on-error'], authenticate=False)
+        env.assertEqual(result.returncode, 2, message=result.stderr[-2000:])
+        env.assertContains('connection-stage failures', result.stderr)
+        peer = _Peer(reply, mode='greeting')
+        result, _stats, _failures, _ = _run(env, peer, ['--reconnect-on-error', '--max-reconnect-attempts=1',
+                                                     '--connection-stage-timeout=0'],
+                                          duration=5, authenticate=False)
+        env.assertEqual(result.returncode, 1, message=result.stderr[-2000:])
+        env.assertEqual(peer.connections, 2)
