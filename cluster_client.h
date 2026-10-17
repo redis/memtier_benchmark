@@ -298,7 +298,7 @@ public:
     void print_topology_summary() const;
 
     // client manager api's
-    virtual bool handle_cluster_slots(protocol_response *r);
+    virtual bool handle_cluster_slots(unsigned int conn_id, protocol_response *r);
     virtual void create_request(struct timeval timestamp, unsigned int conn_id);
     virtual bool hold_pipeline(unsigned int conn_id);
     virtual void handle_rate_limit_refill(unsigned int conn_id);

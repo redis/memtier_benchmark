@@ -148,6 +148,32 @@ def test_cpu_stats_high_load(env):
             env.assertTrue('averaged' in stderr_content and 'of a core' in stderr_content)
 
 
+def _cpu_warning_count_bounds(per_thread, threshold):
+    # run_stats.cpp prints cores_used with %.3f but compares the unrounded
+    # value to the warning threshold. Half the last printed unit bounds the
+    # uncertainty; only threads whose interval crosses the threshold are optional.
+    half_unit = 0.0005
+    required = sum(pt['cores_used'] - half_unit > threshold for pt in per_thread.values())
+    possible = sum(pt['cores_used'] + half_unit > threshold for pt in per_thread.values())
+    return required, possible
+
+
+def test_cpu_warning_count_rounding_bounds(env):
+    for rounded, expected in ((0.999, (0, 0)), (1.000, (0, 1)), (1.001, (1, 1))):
+        threads = {'Thread 0': {'cores_used': rounded}}
+        env.assertEqual(_cpu_warning_count_bounds(threads, 1.0), expected)
+    # Both sides of the threshold can serialize to 1.000. Check the actual
+    # warning decision against the bounds instead of treating JSON as exact.
+    for raw in (0.9994, 0.9999, 1.0, 1.0001, 1.0004, 1.0006):
+        threads = {'Thread 0': {'cores_used': float('%.3f' % raw)}}
+        required, possible = _cpu_warning_count_bounds(threads, 1.0)
+        env.assertTrue(required <= int(raw > 1.0) <= possible, message='raw cores_used={}'.format(raw))
+    threads = {'Thread 0': {'cores_used': 0.999}, 'Thread 1': {'cores_used': 1.0},
+               'Thread 2': {'cores_used': 1.001}}
+    env.assertEqual(_cpu_warning_count_bounds(threads, 1.0), (1, 2))
+    env.assertEqual(_cpu_warning_count_bounds({}, 1.0), (0, 0))
+
+
 def test_cpu_warn_threshold_flag(env):
     """--cpu-warn-threshold=0 must warn; a high threshold must suppress the
     authoritative end-of-run warning."""
@@ -166,9 +192,10 @@ def test_cpu_warn_threshold_flag(env):
     # threshold=100 -> the authoritative end-of-run warning fires only for a
     # thread whose run-average cores_used exceeds 1.0. A single thread over its
     # own wall bracket physically cannot exceed ~1.0 core, so this is normally
-    # silent. Rather than assert blanket silence (which clock/wall jitter could
-    # rarely break at exactly 1.0), assert the warning count is CONSISTENT with
-    # the authoritative JSON: one end-of-run line per thread with cores_used>1.0.
+    # silent. JSON rounds cores_used to three decimals, so 1.000 can represent
+    # either side of the threshold. Require warnings for definitely over-limit
+    # threads and silence for definitely under-limit threads, allowing either
+    # result only inside the JSON rounding interval.
     specs100 = {"name": env.testName, "args": base_args + ['--cpu-warn-threshold=100']}
     addTLSArgs(specs100, env)
     cfg100 = get_default_memtier_config(threads=1, clients=50, requests=None, test_time=3)
@@ -179,8 +206,11 @@ def test_cpu_warn_threshold_flag(env):
     end_warnings = stderr100.count('of a core over the run')
     all100 = results100['ALL STATS']
     if 'CPU' in all100:
-        over_one_core = sum(1 for pt in all100['CPU']['Per Thread'].values() if pt['cores_used'] > 1.0)
-        env.assertTrue(end_warnings == over_one_core)
+        per_thread = all100['CPU']['Per Thread']
+        required, possible = _cpu_warning_count_bounds(per_thread, 1.0)
+        env.assertTrue(required <= end_warnings <= possible,
+                       message='end warnings={}, expected {}..{}; per-thread CPU={}; stderr={}'.format(
+                           end_warnings, required, possible, per_thread, stderr100))
     else:
         # No authoritative aggregate (non-Linux): no end-of-run warning possible.
         env.assertTrue(end_warnings == 0)

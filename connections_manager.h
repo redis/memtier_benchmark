@@ -51,7 +51,7 @@ public:
     // worker enters steady-state routing with an empty topology and every
     // slot lookup returns UINT_MAX. Non-cluster clients (no override) return
     // false because they never produce a topology.
-    virtual bool handle_cluster_slots(protocol_response *r) = 0;
+    virtual bool handle_cluster_slots(unsigned int conn_id, protocol_response *r) = 0;
     virtual void handle_response(unsigned int conn_id, struct timeval timestamp, request *request,
                                  protocol_response *response) = 0;
 

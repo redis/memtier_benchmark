@@ -213,7 +213,7 @@ public:
         m_stats.inc_error(count);
     }
 
-    virtual bool handle_cluster_slots(protocol_response *r)
+    virtual bool handle_cluster_slots(unsigned int conn_id, protocol_response *r)
     {
         assert(false && "handle_cluster_slots not supported");
         return false;
