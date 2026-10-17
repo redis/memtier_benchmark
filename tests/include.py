@@ -255,48 +255,63 @@ def get_cluster_replica_connections(env):
 
 
 def harness_client_ids(connections):
-    """Per connection, the IDs of the clients already on that server.
+    """Per connection, the IDs of the normal clients already on that server.
 
-    Take it before starting memtier: every client that shows up later and is
-    not one of these is memtier's, so the kills below leave the harness's own
-    connections (RLTest's, redis-py's pool) alone and count only memtier's.
+    Take it before starting memtier: every normal client that shows up later
+    and is not one of these is memtier's, so the kills below leave the
+    harness's own connections (RLTest's, redis-py's pool) alone and count only
+    memtier's.
+
+    This assumes no harness connection opens after the snapshot. It holds
+    while the kills run on the calling thread, which reuses the one pooled
+    connection per server. Polling from a second thread through the same
+    pool can open a new pooled connection, which would be taken for
+    memtier's and killed.
     """
     harness = []
     for conn in connections:
-        ids = set(int(c["id"]) for c in conn.client_list())
+        ids = set(int(c["id"]) for c in conn.client_list(_type="normal"))
         ids.add(int(conn.client_id()))
         harness.append(ids)
     return harness
 
 
-def memtier_client_ids(connections, harness):
-    """Per connection, the IDs of memtier's clients (see harness_client_ids)."""
+_client_list_errors = set()
+
+
+def memtier_client_ids(env, connections, harness):
+    """Per connection, the IDs of memtier's clients (see harness_client_ids).
+
+    Only normal clients: a replica link that connects later is not memtier's.
+    """
     found = []
     for conn, ids in zip(connections, harness):
         try:
-            found.append([int(c["id"]) for c in conn.client_list() if int(c["id"]) not in ids])
-        except Exception:
+            found.append([int(c["id"]) for c in conn.client_list(_type="normal") if int(c["id"]) not in ids])
+        except Exception as e:
+            # Log each distinct failure once, not on every 1ms poll.
+            if str(e) not in _client_list_errors:
+                _client_list_errors.add(str(e))
+                env.debugPrint("CLIENT LIST failed: {}".format(e), True)
             found.append([])
     return found
 
 
-def wait_for_memtier_clients(connections, harness, proc, timeout=30.0):
+def wait_for_memtier_clients(env, connections, harness, proc, timeout=30.0):
     """Poll until memtier has a client on some server; False if proc exits first."""
     deadline = time.time() + timeout
     while time.time() < deadline and proc.poll() is None:
-        if any(memtier_client_ids(connections, harness)):
+        if any(memtier_client_ids(env, connections, harness)):
             return True
         time.sleep(0.001)
     return False
 
 
-def kill_memtier_clients(connections, harness, limit=None):
+def kill_memtier_clients(env, connections, harness):
     """CLIENT KILL memtier's clients; returns how many were killed."""
     killed = 0
-    for conn, ids in zip(connections, memtier_client_ids(connections, harness)):
+    for conn, ids in zip(connections, memtier_client_ids(env, connections, harness)):
         for client_id in ids:
-            if limit is not None and killed >= limit:
-                return killed
             try:
                 killed += int(conn.execute_command("CLIENT", "KILL", "ID", client_id, "SKIPME", "yes"))
             except Exception:

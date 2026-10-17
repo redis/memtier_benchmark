@@ -31,9 +31,9 @@ def _run_with_memtier_kills(env, benchmark, config, conns, waves, timeout=60):
         proc = subprocess.Popen(benchmark.args, stdout=stdout_f, stderr=stderr_f, cwd=config.results_dir)
         try:
             for _wave in range(waves):
-                if not wait_for_memtier_clients(conns, harness, proc):
+                if not wait_for_memtier_clients(env, conns, harness, proc):
                     break
-                kills.append(kill_memtier_clients(conns, harness))
+                kills.append(kill_memtier_clients(env, conns, harness))
                 # Let the killed clients leave CLIENT LIST before looking for
                 # the reconnected ones.
                 time.sleep(0.05)
@@ -170,6 +170,7 @@ def test_reconnect_cluster_mode_no_assertion(env):
     benchmark = Benchmark.from_json(config, benchmark_specs)
 
     master_nodes_connections = env.getOSSMasterNodesConnectionList()
+    harness = harness_client_ids(master_nodes_connections)
 
     import subprocess
 
@@ -189,18 +190,9 @@ def test_reconnect_cluster_mode_no_assertion(env):
         kill_count = 0
         # Two waves of CLIENT KILL to ensure the reconnect path is exercised
         # at least once per shard.
+        # Only memtier's clients are killed and counted.
         for _wave in range(2):
-            for master_connection in master_nodes_connections:
-                try:
-                    killed = master_connection.execute_command(
-                        "CLIENT", "KILL", "TYPE", "normal"
-                    )
-                    if isinstance(killed, int):
-                        kill_count += killed
-                except Exception as e:
-                    env.debugPrint(
-                        "CLIENT KILL failed: {}".format(str(e)), True
-                    )
+            kill_count += kill_memtier_clients(env, master_nodes_connections, harness)
             time.sleep(2)
 
         # Generous timeout: --test-time=10 + reconnect backoff + summary flush.
@@ -252,11 +244,13 @@ def test_reconnect_unlimited_no_spurious_thread_restart(env):
 
     …even though the user had explicitly requested unlimited reconnects.
 
-    This test verifies that:
-    1. memtier's connections were killed and it reconnected.
-    2. The misleading "Maximum reconnection attempts (0) exceeded" message
-       does NOT appear in stderr.
-    3. memtier_benchmark completes successfully (threads survive the kills).
+    This test kills memtier's connections with --max-reconnect-attempts=0 and
+    checks that it reconnects, never prints that message, and completes.
+
+    It does not reproduce the #391 storm itself: CLIENT KILL delivers one
+    error per connection here, plain or TLS, so the run passes with the
+    m_reconnecting guard removed too. It covers the unlimited-reconnect path
+    around that guard, not the duplicate callbacks.
     """
     key_max = 10000
     key_min = 1
@@ -298,14 +292,12 @@ def test_reconnect_unlimited_no_spurious_thread_restart(env):
     env.assertGreaterEqual(stderr_content.count("attempting reconnection"), 1,
                            message="memtier logged no reconnection attempt")
     env.assertGreaterEqual(totals.get("Connection Errors", 0), 1, message="no connection error in mb.json")
-    # Core regression assertion: the misleading terminal message must not appear.
-    # Before the fix, duplicate error callbacks while m_reconnecting==True landed
-    # in the terminal else and printed this with the configured cap (0) rather
-    # than the actual attempt count, then killed the thread.
+    # With unlimited reconnects, no kill may end a thread. (The duplicate
+    # callbacks of #391 that used to print this are not produced here; see
+    # the docstring.)
     env.assertFalse(
         "Maximum reconnection attempts (0) exceeded" in stderr_content,
-        message="Spurious thread-kill message found: duplicate error callback while "
-        "reconnect already pending incorrectly triggered event_base_loopbreak()",
+        message="a thread ended under --max-reconnect-attempts=0 (unlimited)",
     )
     env.assertGreaterEqual(stderr_content.count("Reconnection successful"), 1,
                            message="memtier logged no successful reconnection")

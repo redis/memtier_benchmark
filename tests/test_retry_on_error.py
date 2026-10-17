@@ -1106,12 +1106,17 @@ def _run_transaction_with_kills(env, extra_args, requests=None, test_time=None, 
     harness = harness_client_ids(conns)
     kills = []
 
+    poll_errors = []
+
     def sending():
         try:
             return any(conn.execute_command("INFO", "commandstats").get("cmdstat_multi", {}).get("calls", 0)
                        for conn in conns)
         except Exception as e:
-            env.debugPrint("INFO commandstats failed: {}".format(e), True)
+            # Polled every 1ms: log the first failure only.
+            if not poll_errors:
+                env.debugPrint("INFO commandstats failed: {}".format(e), True)
+            poll_errors.append(e)
             return False
 
     def kill_loop(proc):
@@ -1122,7 +1127,7 @@ def _run_transaction_with_kills(env, extra_args, requests=None, test_time=None, 
         while time.time() < end and proc.poll() is None and not sending():
             time.sleep(0.001)
         while time.time() < end and proc.poll() is None and (max_waves is None or len(kills) < max_waves):
-            kills.append(kill_memtier_clients(conns, harness))
+            kills.append(kill_memtier_clients(env, conns, harness))
             time.sleep(kill_interval)
 
     rc, stderr_content = _run_with_background(env, benchmark, config, kill_loop, timeout=(test_time or 60) + 30)
