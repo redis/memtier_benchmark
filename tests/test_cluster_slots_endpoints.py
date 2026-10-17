@@ -1,9 +1,20 @@
 """CLUSTER SLOTS empty/null hosts use the actual replying endpoint (#684)."""
+import errno
 import json
 import os
 import tempfile
 
 from test_cluster_slots_bad_reply import _Node, _run
+
+
+def _alternate_node(env):
+    # Some hosts (notably macOS without a loopback alias) cannot bind this IP.
+    try:
+        return _Node(0, host="127.0.0.2")
+    except OSError as error:
+        if error.errno in (errno.EADDRNOTAVAIL, errno.EAFNOSUPPORT, 10049):
+            env.skip()
+        raise
 
 
 def _bulk(value):
@@ -64,7 +75,7 @@ def test_cluster_slots_refresh_uses_actual_sender_host_and_advertised_port(env):
     # The seed's 127.0.0.1 cannot reach target, which only binds 127.0.0.2.
     # Reusing the sender's port would send back to sender instead of target.
     for host in [_bulk(b""), b"$-1\r\n", b"_\r\n"]:
-        target = _Node(0, host="127.0.0.2")
+        target = _alternate_node(env)
         sender = _Node(0, moved_after=1, host="127.0.0.2")
         seed = _Node(0)
         seed.extra = [sender, target]
@@ -100,3 +111,28 @@ def test_cluster_slots_normalized_primary_keeps_role_over_replica_alias(env):
     stderr = _check(env, seed, ["--reconnect-on-error"])
     env.assertContains("preserving primary role", stderr)
     env.assertEqual(later.readonly_requests, 0)
+
+
+def test_cluster_slots_replica_refresh_uses_replica_sender_host(env):
+    target = _alternate_node(env)
+    replica = _Node(0, moved_after=1, host="127.0.0.2")
+    seed = _Node(0, replica=replica)
+    seed.extra = [target]
+    seed.slots_fn = lambda n: _slots(_endpoint(_bulk(b"127.0.0.1"), seed),
+                                   [_endpoint(_bulk(b"127.0.0.2"), replica)])
+    replica.slots_fn = lambda n: _slots(_endpoint(_bulk(b"127.0.0.1"), seed),
+                                      [_endpoint(b"_\r\n", target)])
+    _check(env, seed, ["--protocol=resp3", "--ratio=0:1", "--read-preference=secondary",
+                       "--reconnect-on-error"])
+    env.assertGreaterEqual(replica.slots_requests, 1)
+    env.assertEqual(seed.data_requests, 0)
+    env.assertGreaterEqual(target.data_requests, 19)
+    env.assertGreaterEqual(target.readonly_requests, 1)
+
+
+def test_cluster_slots_hostname_seed_reuses_connection_across_host_forms(env):
+    node = _Node(0, moved_after=1, auth_error=b"+OK\r\n")
+    node.slots_fn = lambda n: _slots(_endpoint(_bulk(b"" if n.slots_requests == 1 else b"127.0.0.1"), n))
+    _check(env, node, ["--server=localhost", "--ipv4", "--reconnect-on-error"])
+    env.assertEqual(node.slots_requests, 2)
+    env.assertEqual(node.auth_requests, 1)
