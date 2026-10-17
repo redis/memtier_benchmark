@@ -1394,15 +1394,18 @@ def _assert_series_cut_after_run_1(env, rc, stderr_content, results_dict, run_1_
         env.assertTrue(best_ops > 0 and abs(agg_ops - best_ops) <= 0.01 * best_ops,
                        message="AGG Ops/sec {} vs BEST {}".format(agg_ops, best_ops))
     if agg in results_dict and "RUN #1 RESULTS" in results_dict:
-        # #703: the AGGREGATED counts are means, written as doubles even when
-        # only one run completed; the run's own section keeps integers.
+        # #703: the AGGREGATED counts are per-run means, integers like the
+        # run's own section, also when only one run completed.
         run_1 = results_dict["RUN #1 RESULTS"]
         for path in (("Totals", "Count"), ("Totals", "Accumulated Latency"),
                      ("Totals", "Connection Errors"), ("Runtime", "Unanswered requests")):
             value = results_dict[agg][path[0]][path[1]]
             own = run_1[path[0]][path[1]]
-            env.assertTrue(isinstance(value, float), message="{} {}: {!r}".format(agg, path, value))
-            env.assertTrue(isinstance(own, int), message="RUN #1 {}: {!r}".format(path, own))
+            env.assertTrue(isinstance(value, int), message="{} {}: {!r}".format(agg, path, value))
+            # Totals Accumulated Latency is the sum of the rows, each of
+            # them truncated to the ms, so it can be a little below RUN #1's.
+            slack = 3 if path[1] == "Accumulated Latency" else 0
+            env.assertTrue(abs(value - own) <= slack, message="{} {}: {} vs RUN #1 {}".format(agg, path, value, own))
         env.assertEqual(results_dict[agg]["Totals"]["Count"], run_1["Totals"]["Count"])
 
 

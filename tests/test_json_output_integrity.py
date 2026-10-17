@@ -816,17 +816,22 @@ def _assert_aggregated_totals_are_run_mean(env, results, run_count, fields):
                     f"per-run values {values} ({expected:.4f})")
 
 
-# The AGGREGATED counts are exact means written as doubles; the per-run
-# counts are exact integers. Only float printing separates the two.
-COUNT_MEAN_SLACK = 1e-6
+def _mean_count(total, runs):
+    """memtier's AGGREGATED count (#703): the per-run mean rounded to the
+    nearest integer, except that a non-zero total never rounds to 0."""
+    if total == 0:
+        return 0
+    return max(1, (total + runs // 2) // runs)
 
 
 def _assert_aggregated_counts_are_run_mean(env, results, run_count, section,
-                                           fields, slack=COUNT_MEAN_SLACK):
+                                           fields, slack=None):
     """Issue #703: each AGGREGATED count in results[...][section][field] must
-    be the mean of the per-run counts, not their sum (needs --print-all-runs).
-    `section` is a key or a tuple of nested keys. Pass a larger `slack` for a
-    value that each run prints truncated (Accumulated Latency)."""
+    be the per-run mean of the counts, not their sum (needs --print-all-runs),
+    and an integer like in every other section. `section` is a key or a tuple
+    of nested keys. Without `slack` the value must be exactly _mean_count();
+    with it, within `slack` of the exact mean (for a value each run prints
+    truncated, like Accumulated Latency, or a Totals made of rounded rows)."""
     agg_key = _aggregated_key(env, results)
     runs = [results.get(f"RUN #{i} RESULTS") for i in range(1, run_count + 1)]
     env.assertTrue(all(runs),
@@ -841,18 +846,24 @@ def _assert_aggregated_counts_are_run_mean(env, results, run_count, section,
         return stats
 
     for field in fields:
-        values = [float(lookup(run)[field]) for run in runs]
-        expected = sum(values) / run_count
+        values = [lookup(run)[field] for run in runs]
         actual = lookup(results[agg_key])[field]
         env.assertTrue(
-            isinstance(actual, float),
-            message=f"{agg_key}: {section} '{field}' ({actual!r}) is not "
-                    f"written as a double")
-        actual = float(actual)
-        env.assertLessEqual(
-            abs(actual - expected), slack,
-            message=f"{agg_key}: {section} '{field}' ({actual}) != mean of the "
-                    f"per-run values {values} ({expected:.4f})")
+            isinstance(actual, int) and not isinstance(actual, bool),
+            message=f"{agg_key}: {section} '{field}' ({actual!r}) is not an "
+                    f"integer")
+        if slack is None:
+            expected = _mean_count(sum(values), run_count)
+            env.assertEqual(
+                actual, expected,
+                message=f"{agg_key}: {section} '{field}' ({actual}) != rounded "
+                        f"mean of the per-run values {values} ({expected})")
+        else:
+            expected = sum(values) / run_count
+            env.assertLessEqual(
+                abs(actual - expected), slack,
+                message=f"{agg_key}: {section} '{field}' ({actual}) != mean of "
+                        f"the per-run values {values} ({expected:.4f})")
 
 
 def _assert_aggregated_totals_rx_tx(env, results, run_count):
@@ -1029,12 +1040,18 @@ def test_json_aggregated_duration_and_counts_are_run_mean(env):
         env.assertEqual(
             runtime["Finish time"] - runtime["Start time"], duration,
             message=f"{agg_key}: Finish - Start != Total duration; {runtime}")
-        for section in ("Totals", "Sets", "Gets"):
+        for section in ("Sets", "Gets"):
             _assert_aggregated_counts_are_run_mean(
                 env, results, run_count, section, ("Count",))
             _assert_aggregated_counts_are_run_mean(
                 env, results, run_count, section, ("Accumulated Latency",),
                 slack=1)
+        # Totals is the sum of the rounded rows (Sets, Gets, Waits).
+        _assert_aggregated_counts_are_run_mean(
+            env, results, run_count, "Totals", ("Count",), slack=1.5)
+        _assert_aggregated_counts_are_run_mean(
+            env, results, run_count, "Totals", ("Accumulated Latency",),
+            slack=3)
         _assert_aggregated_counts_are_run_mean(
             env, results, run_count, "Runtime", ("Unanswered requests",))
         _assert_totals_count_is_sum_of_rows(env, agg_key, results[agg_key])
@@ -1067,21 +1084,23 @@ def _command_rows(section):
 
 
 def _assert_totals_count_is_sum_of_rows(env, section_name, section):
-    """Issue #703: the AGGREGATED Totals Count must stay the sum of its
-    command rows; rounding each mean separately broke that."""
+    """Issue #703: the AGGREGATED Totals Count and Accumulated Latency must
+    be exactly the sum of the command rows; rounding Totals separately from
+    the rows broke that."""
     rows = _command_rows(section)
-    expected = sum(float(row["Count"]) for row in rows.values())
-    actual = float(section["Totals"]["Count"])
-    env.assertLessEqual(
-        abs(actual - expected), COUNT_MEAN_SLACK,
-        message=f"{section_name}: Totals Count ({actual}) != sum of the rows "
-                f"{ {k: v['Count'] for k, v in rows.items()} } ({expected})")
+    for field in ("Count", "Accumulated Latency"):
+        expected = sum(row[field] for row in rows.values())
+        actual = section["Totals"][field]
+        env.assertEqual(
+            actual, expected,
+            message=f"{section_name}: Totals {field} ({actual}) != sum of the "
+                    f"rows { {k: v[field] for k, v in rows.items()} } ({expected})")
 
 
 def _check_aggregated_arbitrary_command_counts(env, breakdown, expected_rows):
     """Issue #703 with 9 --command lines of 8 types: each AGGREGATED row Count
-    and the Per-Key Misses counts are the per-run means, written as doubles,
-    and the Totals Count is still the sum of the rows."""
+    and the Per-Key Misses counts are the rounded per-run means, integers, and
+    the Totals Count is exactly the sum of the rows."""
     env.skipOnCluster()  # MGET of random keys would cross slots
     run_count = 2
     # Two GET lines, so the default per-type breakdown merges two lines.
@@ -1109,9 +1128,12 @@ def _check_aggregated_arbitrary_command_counts(env, breakdown, expected_rows):
         env.assertEqual(len(rows), expected_rows,
                         message=f"{agg_key}: rows {list(rows)}")
         _assert_totals_count_is_sum_of_rows(env, agg_key, results[agg_key])
-        for name in list(rows) + ["Totals"]:
+        for name in rows:
             _assert_aggregated_counts_are_run_mean(
                 env, results, run_count, name, ("Count",))
+        _assert_aggregated_counts_are_run_mean(
+            env, results, run_count, "Totals", ("Count",),
+            slack=0.5 * len(rows) + 0.5)
         # Most MGET keys of a 50000-key range are missing, so every run
         # records misses for each MGET position.
         per_key = results[agg_key].get("Per-Key Misses", {})
@@ -1137,6 +1159,44 @@ def test_json_aggregated_arbitrary_command_counts_are_run_mean(env):
 def test_json_aggregated_arbitrary_command_line_counts_are_run_mean(env):
     """--command-stats-breakdown=line: one row per --command line."""
     _check_aggregated_arbitrary_command_counts(env, "line", 9)
+
+
+def test_json_aggregated_small_count_never_rounds_to_zero(env):
+    """Issue #703: a count that is non-zero over the series must not print 0
+    in the AGGREGATED section. One client sends GET then SET of one key per
+    run, so only run 1's GET misses: 1 miss over 3 runs, whose rounded mean
+    would be 0 next to a non-zero Misses/sec."""
+    env.skipOnCluster()
+    run_count = 3
+    env.flush()
+    test_dir = tempfile.mkdtemp()
+    benchmark, run_config = _build_benchmark(
+        env, test_dir,
+        extra_args=[f"--run-count={run_count}", "--print-all-runs",
+                    "--key-minimum=1", "--key-maximum=1",
+                    "--command=GET __key__", "--command-key-pattern=S",
+                    "--command=SET __key__ v", "--command-key-pattern=S"],
+        threads=1, clients=1, requests=2)
+    ok = benchmark.run()
+    failed_asserts = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier_benchmark exited non-zero")
+        results = _read_json(run_config, env)
+        agg_key = _aggregated_key(env, results)
+        misses = [results[f"RUN #{i} RESULTS"]["Per-Key Misses"]["GET"]["Total Misses"]
+                  for i in range(1, run_count + 1)]
+        env.assertEqual(misses, [1, 0, 0])
+        per_key = results[agg_key]["Per-Key Misses"]["GET"]
+        env.assertEqual(per_key["Total Misses"], 1, message=str(per_key))
+        env.assertEqual(per_key["key[0] Misses"], 1, message=str(per_key))
+        env.assertGreater(float(results[agg_key]["Gets"]["Misses/sec"]), 0)
+        _assert_aggregated_counts_are_run_mean(
+            env, results, run_count, ("Per-Key Misses", "GET"),
+            ("Total Hits", "Total Misses", "key[0] Hits", "key[0] Misses"))
+    finally:
+        if env.getNumberOfFailedAssertion() > failed_asserts:
+            debugPrintMemtierOnError(run_config, env)
+        shutil.rmtree(test_dir, ignore_errors=True)
 
 
 def test_json_aggregated_unanswered_requests_are_run_mean(env):

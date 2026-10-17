@@ -258,9 +258,13 @@ values:
 
 - The counts (`Count`, `Accumulated Latency`, `Connection Errors`,
   `Unanswered requests` and the `Per-Key Misses` counts) are the mean over
-  the runs, written as doubles (for example `"Count": 9886.3333333333339`), so
-  `Totals` stays the sum of the command rows and a single miss over 3 runs is
-  not rounded to 0.
+  the runs, rounded to the nearest integer, so they keep the integer type of
+  the other sections (29659 ops over 3 runs give `"Count": 9886`). A count
+  that is not 0 over the series never rounds to 0: 1 connection error over 3
+  runs gives 1, not 0, next to its non-zero rate. The `Totals` `Count` and
+  `Accumulated Latency` are the sum of the rounded command rows, so `Totals`
+  is exactly the sum of its rows; it can differ from the mean of the per-run
+  `Totals` by up to half a unit per row.
 - Ops/sec, KB/sec, the default workload's Hits/sec and Misses/sec, and the
   JSON `Latency` / `Average Latency` are the mean of the per-run values. The
   Hits/sec and Misses/sec of `--command` rows are time-weighted instead: the
