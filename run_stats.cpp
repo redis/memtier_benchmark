@@ -1153,6 +1153,9 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
 
     // Start at the first run's start, and span the summed run duration; the
     // JSON Runtime prints the mean duration from it (print_json()).
+    // Warning: m_end_time is then a synthetic end time (first start + summed
+    // duration) that no run had; it is only meant for ts_diff() and the
+    // Runtime print.
     if (have_start && total_duration_usec > 0) {
         const unsigned long long start_usec =
             (unsigned long long) first_start.tv_sec * 1000000 + (unsigned long long) first_start.tv_usec;

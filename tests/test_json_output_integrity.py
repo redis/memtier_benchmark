@@ -21,6 +21,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 
@@ -1037,7 +1038,13 @@ def test_json_aggregated_duration_and_counts_are_run_mean(env):
         _assert_aggregated_counts_are_run_mean(
             env, results, run_count, "Runtime", ("Unanswered requests",))
         _assert_totals_count_is_sum_of_rows(env, agg_key, results[agg_key])
-        if all("CPU" in run for run in runs) and "CPU" in results[agg_key]:
+        # The CPU block needs per-thread CPU accounting (RUSAGE_THREAD), so it
+        # must be there on Linux.
+        missing_cpu = [name for name in [agg_key] + [f"RUN #{i} RESULTS" for i in range(1, run_count + 1)]
+                       if "CPU" not in results[name]]
+        if sys.platform.startswith("linux"):
+            env.assertEqual(missing_cpu, [], message="no CPU block on Linux")
+        if not missing_cpu:
             for field in ("cpu_user_seconds", "cpu_sys_seconds",
                           "cpu_total_seconds", "cpu_wall_seconds"):
                 values = [float(run["CPU"][field]) for run in runs]
@@ -1071,13 +1078,14 @@ def _assert_totals_count_is_sum_of_rows(env, section_name, section):
                 f"{ {k: v['Count'] for k, v in rows.items()} } ({expected})")
 
 
-def test_json_aggregated_arbitrary_command_counts_are_run_mean(env):
-    """Issue #703 with 8 --command lines: each AGGREGATED row Count and the
-    Per-Key Misses counts are the per-run means, written as doubles, and the
-    Totals Count is still the sum of the 8 rows."""
+def _check_aggregated_arbitrary_command_counts(env, breakdown, expected_rows):
+    """Issue #703 with 9 --command lines of 8 types: each AGGREGATED row Count
+    and the Per-Key Misses counts are the per-run means, written as doubles,
+    and the Totals Count is still the sum of the rows."""
     env.skipOnCluster()  # MGET of random keys would cross slots
     run_count = 2
-    commands = ["SET __key__ __data__", "GET __key__",
+    # Two GET lines, so the default per-type breakdown merges two lines.
+    commands = ["SET __key__ __data__", "GET __key__", "GET __key__",
                 "MGET __key__ __key__ __key__", "EXISTS __key__",
                 "STRLEN __key__", "TTL __key__", "TYPE __key__",
                 "ECHO __data__"]
@@ -1086,7 +1094,7 @@ def test_json_aggregated_arbitrary_command_counts_are_run_mean(env):
     benchmark, run_config = _build_benchmark(
         env, test_dir,
         extra_args=[f"--run-count={run_count}", "--print-all-runs",
-                    "--command-stats-breakdown=line",
+                    f"--command-stats-breakdown={breakdown}",
                     "--key-minimum=1", "--key-maximum=50000"]
                    + [arg for c in commands
                       for arg in (f"--command={c}", "--command-key-pattern=R")],
@@ -1098,7 +1106,7 @@ def test_json_aggregated_arbitrary_command_counts_are_run_mean(env):
         results = _read_json(run_config, env)
         agg_key = _aggregated_key(env, results)
         rows = _command_rows(results[agg_key])
-        env.assertEqual(len(rows), len(commands),
+        env.assertEqual(len(rows), expected_rows,
                         message=f"{agg_key}: rows {list(rows)}")
         _assert_totals_count_is_sum_of_rows(env, agg_key, results[agg_key])
         for name in list(rows) + ["Totals"]:
@@ -1119,6 +1127,16 @@ def test_json_aggregated_arbitrary_command_counts_are_run_mean(env):
         if env.getNumberOfFailedAssertion() > failed_asserts:
             debugPrintMemtierOnError(run_config, env)
         shutil.rmtree(test_dir, ignore_errors=True)
+
+
+def test_json_aggregated_arbitrary_command_counts_are_run_mean(env):
+    """Default --command-stats-breakdown=command: one row per command type."""
+    _check_aggregated_arbitrary_command_counts(env, "command", 8)
+
+
+def test_json_aggregated_arbitrary_command_line_counts_are_run_mean(env):
+    """--command-stats-breakdown=line: one row per --command line."""
+    _check_aggregated_arbitrary_command_counts(env, "line", 9)
 
 
 def test_json_aggregated_unanswered_requests_are_run_mean(env):
