@@ -4731,16 +4731,27 @@ static void cleanup_openssl(void)
 #endif
 
 // --hdr-file-prefix and --client-stats files are only created when a run
-// ends. Check at startup that the directory they go into is writable (without
-// creating anything), so a typo does not cost a whole run. A full disk is
-// still only seen at the end. Exits 1 on failure.
+// ends. Check at startup that the directory they go into is a writable
+// directory (without creating anything), so a typo does not cost a whole run.
+// This is best-effort: access() uses the real UID, so as root or on an NFS
+// root_squash mount an unwritable directory can pass, and a full disk is only
+// seen at the end anyway. Exits 1 on failure.
 static void check_output_prefix_dir(const char *option, const char *prefix)
 {
     std::string dir(prefix);
     size_t slash = dir.rfind('/');
     dir = slash == std::string::npos ? "." : (slash == 0 ? "/" : dir.substr(0, slash));
-    if (access(dir.c_str(), W_OK | X_OK) != 0) {
-        fprintf(stderr, "error: cannot write %s directory %s: %s\n", option, dir.c_str(), strerror(errno));
+    struct stat st;
+    int err = 0;
+    if (stat(dir.c_str(), &st) != 0) {
+        err = errno;
+    } else if (!S_ISDIR(st.st_mode)) {
+        err = ENOTDIR;
+    } else if (access(dir.c_str(), W_OK | X_OK) != 0) {
+        err = errno;
+    }
+    if (err != 0) {
+        fprintf(stderr, "error: cannot write %s directory %s: %s\n", option, dir.c_str(), strerror(err));
         exit(1);
     }
 }
@@ -5688,8 +5699,11 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
-    if (cfg.hdr_prefix[0] != '\0') check_output_prefix_dir("--hdr-file-prefix", cfg.hdr_prefix);
-    if (cfg.client_stats != NULL) check_output_prefix_dir("--client-stats", cfg.client_stats);
+    // --verify-only writes no HDR or --client-stats files.
+    if (!cfg.verify_only) {
+        if (cfg.hdr_prefix[0] != '\0') check_output_prefix_dir("--hdr-file-prefix", cfg.hdr_prefix);
+        if (cfg.client_stats != NULL) check_output_prefix_dir("--client-stats", cfg.client_stats);
+    }
 
     // Open the output files after option validation and data import, so a
     // startup error leaves existing files untouched. Retry on EINTR, as

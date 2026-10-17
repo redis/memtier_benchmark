@@ -2168,6 +2168,47 @@ def test_client_stats_missing_directory(env):
         env.assertNotContains("Preparing benchmark client", stderr)
 
 
+def test_verify_only_skips_output_prefix_dir_check(env):
+    """--verify-only writes no HDR or --client-stats files, so their directories are not checked (#744)."""
+    if env.isCluster():  # --data-import (needed by --verify-only) is standalone only
+        env.skip()
+        return
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        missing = os.path.join(tmp_dir, 'missing')
+        data_import = os.path.join(tmp_dir, 'import.csv')
+        with open(data_import, 'w') as f:
+            f.write('dumpflags, time, exptime, nbytes, nsuffix, it_flags, clsid, nkey, key, data\n'
+                    '0, 0, 0, 7, 1, 0, 0, 3, "key", "value"\n')
+        rc, stderr = _run_with_unwritable_output(
+            env, ['--data-import', data_import, '--data-verify', '--verify-only',
+                  '--hdr-file-prefix', os.path.join(missing, 'h'), '--client-stats', os.path.join(missing, 'cs')],
+            subprocess.DEVNULL)
+        # Past the point where the directories would have been checked.
+        env.assertContains("Writing results to", stderr)
+        env.assertNotContains("directory {}".format(missing), stderr)
+        env.assertNotContains("cannot open", stderr)
+
+
+def test_output_prefix_dir_is_a_file(env):
+    """A regular file where the prefix directory should be fails at startup with ENOTDIR (#744).
+
+    Both with and without the execute bit, for both prefix options.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        not_dir = os.path.join(tmp_dir, 'not-a-dir')
+        with open(not_dir, 'w'):
+            pass
+        for mode in (0o755, 0o644):
+            os.chmod(not_dir, mode)
+            for option in ('--hdr-file-prefix', '--client-stats'):
+                rc, stderr = _run_with_unwritable_output(env, [option, os.path.join(not_dir, 'p')],
+                                                         subprocess.DEVNULL)
+                env.assertEqual(rc, 1, message=stderr)
+                env.assertContains("error: cannot write {} directory {}: Not a directory".format(option, not_dir),
+                                   stderr)
+                env.assertNotContains("Preparing benchmark client", stderr)
+
+
 def test_hdr_file_open_error(env):
     """An HDR file that cannot be opened when the run ends fails the run (#744).
 
