@@ -166,10 +166,10 @@ jobs:
     - name: Install build dependencies
       run: |
         if command -v dnf &> /dev/null; then
-          dnf install -y rpm-build gcc-c++ make autoconf automake libtool \
+          dnf install -y rpm-build gcc-c++ make autoconf automake \
             libevent-devel openssl-devel zlib-devel pkgconfig
         else
-          yum install -y rpm-build gcc-c++ make autoconf automake libtool \
+          yum install -y rpm-build gcc-c++ make autoconf automake \
             libevent-devel openssl-devel zlib-devel pkgconfig
         fi
 

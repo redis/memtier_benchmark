@@ -5682,7 +5682,15 @@ int main(int argc, char *argv[])
             exit(1);
         }
 
-        if (!cfg.generate_keys) {
+        if (cfg.generate_keys) {
+            // Nothing else reads the file before the run starts; validate it
+            // now so a malformed or empty file fails before connecting.
+            imported_keylist check(cfg.data_import);
+            if (!check.read_keys(false)) {
+                fprintf(stderr, "error: %s: invalid --data-import file.\n", cfg.data_import);
+                exit(1);
+            }
+        } else {
             // read keys
             fprintf(stderr, "Reading keys from %s...", cfg.data_import);
             keylist = new imported_keylist(cfg.data_import);

@@ -1,7 +1,7 @@
 FROM alpine:latest as builder
 RUN \
   apk add \
-    make g++ autoconf automake libtool pkgconfig \
+    make g++ autoconf automake pkgconfig \
     libevent-dev zlib-dev openssl-dev
 COPY . /src
 WORKDIR /src

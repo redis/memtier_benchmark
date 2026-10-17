@@ -374,6 +374,23 @@ The same rule covers the other output files:
 A stdout that was already closed when memtier started is handled separately,
 see [Closed stdin, stdout or stderr](#closed-stdin-stdout-or-stderr).
 
+### Import-file validation
+
+`--data-import` validates the file before connecting, including with
+`--generate-keys` and `--verify-only`. A malformed item or a file with no
+complete items exits **1**. Keys and values must be nonempty and no larger
+than 512 MiB each; the declared key and value lengths must match the columns.
+Previously a short key column could import uninitialized trailing bytes; it
+now fails validation.
+
+A truncated final item after complete items is ignored with a
+`premature end of file` warning, so size-capped dumps can still be used.
+The existing warnings for a missing final newline or closing quote remain.
+With `--generate-keys`, validation adds one full sequential scan at startup
+without storing the imported keys. In one local measurement, this added
+about 3.9 seconds for a 488 MiB file containing two million items; the cost
+depends on file size and storage speed.
+
 ### Data verification (`--data-verify`, `--verify-only`)
 
 With `--data-import=FILE`, `--data-verify` reads imported keys back after the

@@ -22,6 +22,37 @@ permissions:
   contents: read
 
 jobs:
+  prefix-install-distcheck:
+    runs-on: ubuntu-latest
+    name: Non-root prefix install and distcheck
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install build dependencies and bash-completion metadata
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y build-essential autoconf automake pkg-config \
+          libevent-dev libssl-dev zlib1g-dev bash-completion
+    - name: Check completion options and non-root installation
+      run: |
+        test "$(id -u)" -ne 0
+        pkg-config --exists bash-completion
+        autoreconf -ivf
+        for invalid in '' relative/path; do
+          if ./configure --with-bash-completion-dir="$invalid" > configure-invalid.log 2>&1; then
+            echo "configure accepted invalid completion directory: '$invalid'" >&2
+            exit 1
+          fi
+          grep -F 'requires an absolute, non-empty directory' configure-invalid.log
+        done
+        ./configure --prefix="$RUNNER_TEMP/memtier-prefix"
+        make -j2
+        make install
+        test -f "$RUNNER_TEMP/memtier-prefix/share/bash-completion/completions/memtier_benchmark"
+        make uninstall
+        test ! -e "$RUNNER_TEMP/memtier-prefix/share/bash-completion/completions/memtier_benchmark"
+    - name: Check distribution with the default completion directory
+      run: make -j2 distcheck
+
   smoketest-build-distros:
     runs-on: ubuntu-latest
     continue-on-error: true
@@ -220,7 +251,6 @@ jobs:
         name: memtier-build-${{ matrix.platform }}
         path: |
           memtier_benchmark
-          .libs/
         retention-days: 1
 
   test-ubuntu:
@@ -488,11 +518,27 @@ jobs:
     - name: Install build dependencies
       run: |
         apk add --no-cache \
-          make g++ autoconf automake libtool pkgconfig \
+          make g++ autoconf automake pkgconfig \
           libevent-dev zlib-dev openssl-dev
 
     - name: Build
-      run: autoreconf -ivf && ./configure && make -j
+      run: |
+        autoreconf -ivf
+        ./configure 2> configure.err || { cat configure.err >&2; exit 1; }
+        cat configure.err >&2
+        make -j
+
+    # This image has no libtool. An unexpanded macro (LT_INIT before #640) is
+    # left as a literal line in configure, which only prints "LT_INIT: not
+    # found" (busybox sh; bash says "command not found") and still exits 0.
+    - name: Check configure has no unexpanded macros
+      run: |
+        if grep -nE '^[[:space:]]*LT_[A-Z_]+' configure; then
+          echo "configure contains unexpanded libtool macros" >&2; exit 1
+        fi
+        if grep -nE '^\./configure: (line [0-9]+: )?[^ ]+: (command )?not found' configure.err; then
+          echo "configure ran an unknown command" >&2; exit 1
+        fi
 
     - name: Verify version
       run: ./memtier_benchmark --version
@@ -510,7 +556,7 @@ jobs:
     steps:
     - uses: actions/checkout@v6
     - name: Install dependencies
-      run: brew install autoconf automake libtool pkg-config openssl@${{ matrix.openssl }}
+      run: brew install autoconf automake pkg-config openssl@${{ matrix.openssl }}
     - name: Build libevent against the selected OpenSSL
       run: bash scripts/build-macos-libevent.sh "$(brew --prefix openssl@${{ matrix.openssl }})"
     - name: Build
@@ -539,7 +585,7 @@ jobs:
     - uses: actions/checkout@v6
     - name: Install dependencies
       run: |
-        brew install autoconf automake libtool pkg-config libevent
+        brew install autoconf automake pkg-config libevent
         ssl="$(brew deps libevent | grep '^openssl@' | head -n 1)"
         test -n "$ssl" || { echo "brew deps libevent lists no openssl@*" >&2; exit 1; }
         brew install "$ssl"
@@ -568,7 +614,7 @@ jobs:
     steps:
     - uses: actions/checkout@v6
     - name: Install dependencies
-      run: brew install autoconf automake libtool pkg-config openssl@1.1
+      run: brew install autoconf automake pkg-config openssl@1.1
     - name: Build libevent against the selected OpenSSL
       run: bash scripts/build-macos-libevent.sh "$(brew --prefix openssl@1.1)"
     - name: Build
@@ -592,7 +638,7 @@ jobs:
     steps:
     - uses: actions/checkout@v6
     - name: Install dependencies
-      run: brew install autoconf automake libtool pkg-config
+      run: brew install autoconf automake pkg-config
     - name: Install openssl v1.0.2
       run: brew install rbenv/tap/openssl@1.0
     # Retain the already-tested legacy libevent version; upgrading it is separate.

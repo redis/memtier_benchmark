@@ -73,10 +73,29 @@ int close_output_file(FILE *fp)
 /** largest support line length */
 #define MAX_LINE_BUFFER 1024
 
+/** largest key or value accepted from an import file (Redis's default
+ * proto-max-bulk-len) */
+#define MAX_IMPORT_FIELD_LEN (512U * 1024 * 1024)
+
+// fscanf("%u") can wrap an oversized decimal into a small valid length.
+// Parse bounded tokens before narrowing, including on 32-bit platforms.
+static bool parse_import_length(const char *text, unsigned int maximum, unsigned int *value)
+{
+    char *end;
+    errno = 0;
+    unsigned long parsed = strtoul(text, &end, 10);
+    if (*text == '-' || end == text || *end != '\0' || errno == ERANGE || parsed > maximum) return false;
+    *value = static_cast<unsigned int>(parsed);
+    return true;
+}
+
 /** \brief file_reader constructor.
  * \param filename name of file to open.
  */
-file_reader::file_reader(const char *filename) : m_filename(filename), m_file(NULL), m_line(2) {}
+file_reader::file_reader(const char *filename) :
+        m_filename(filename), m_file(NULL), m_line(2), m_error(false), m_items(0)
+{
+}
 
 /** \brief file_reader destructor.
  */
@@ -87,7 +106,10 @@ file_reader::~file_reader()
     }
 }
 
-file_reader::file_reader(const file_reader &from) : m_filename(from.m_filename), m_file(NULL), m_line(2) {}
+file_reader::file_reader(const file_reader &from) :
+        m_filename(from.m_filename), m_file(NULL), m_line(2), m_error(false), m_items(0)
+{
+}
 
 /** \brief open file and prepare to read items.
  *
@@ -103,6 +125,9 @@ bool file_reader::open_file(void)
 
     if (m_file != NULL) fclose(m_file);
 
+    m_line = 2;
+    m_error = false;
+    m_items = 0;
     m_file = fopen(m_filename, "r");
     if (!m_file) {
         perror(m_filename);
@@ -149,6 +174,10 @@ char *file_reader::read_string(unsigned int len, unsigned int alloc_len, unsigne
     bool dequote = false;
 
     d = dest_str = (char *) malloc(alloc_len);
+    if (dest_str == NULL) {
+        fprintf(stderr, "%s:%d: error: out of memory reading a %u-byte column.\n", m_filename, m_line, alloc_len);
+        return NULL;
+    }
     while (len > 0) {
         int c = fgetc(m_file);
 
@@ -230,7 +259,29 @@ bool file_reader::is_eof(void)
     return (feof(m_file) != 0);
 }
 
+/** \brief finish a read_item() call that failed while parsing an item.
+ *
+ * A failure that ran into the end of the file after at least one complete
+ * item is a truncated last item (e.g. a size-capped dump): it is reported
+ * and treated as the end of the file. Any other failure is an error.
+ * \return NULL
+ */
+memcache_item *file_reader::bad_item(void)
+{
+    if (is_eof() && !ferror(m_file) && m_items > 0) {
+        fprintf(stderr, "%s:%u: warning: premature end of file, ignoring the truncated last item.\n", m_filename,
+                m_line);
+        return NULL;
+    }
+    m_error = true;
+    return NULL;
+}
+
 /** \brief read the next memcache_item object from the opened file.
+ *
+ * A malformed item is reported on stderr, sets the error flag (see
+ * has_error()) and returns NULL, like the end of the file does. The stream
+ * is not resynchronized, so callers must stop reading after a NULL.
  * \return pointer to heap-allocated object, or NULL if error/no more items in file.
  */
 
@@ -246,21 +297,51 @@ memcache_item *file_reader::read_item(void)
     unsigned int s_clsid = 0;
     unsigned int s_nkey = 0;
 
-    // scan int values
-    if (fscanf(m_file, "%u, %u, %u, %u, %u, %u, %u, %u, ", &s_dumpflags, &s_time, &s_exptime, &s_nbytes, &s_nsuffix,
-               &s_flags, &s_clsid, &s_nkey) < 8) {
-        if (is_eof()) return NULL;
+    char nbytes_text[32] = {0};
+    char nkey_text[32] = {0};
+    // Bound length tokens as well as their numeric values before allocation.
+    int n = fscanf(m_file, "%u, %u, %u, %31[+0-9-], %u, %u, %u, %31[+0-9-], ", &s_dumpflags, &s_time, &s_exptime,
+                   nbytes_text, &s_nsuffix, &s_flags, &s_clsid, nkey_text);
+    if (n < 8) {
+        // Only EOF before the first field is a clean end of file; a partial
+        // match is a truncated or malformed line.
+        if (n == EOF && is_eof() && !ferror(m_file)) return NULL;
 
+        if (is_eof() && !ferror(m_file) && m_items > 0) return bad_item();
         fprintf(stderr, "%s:%u: error parsing item values.\n", m_filename, m_line);
+        m_error = true;
+        return NULL;
+    }
+
+    if (!parse_import_length(nkey_text, MAX_IMPORT_FIELD_LEN, &s_nkey) ||
+        !parse_import_length(nbytes_text, MAX_IMPORT_FIELD_LEN + 2, &s_nbytes)) {
+        fprintf(stderr, "%s:%u: error: key or value too large or invalid (maximum %u bytes each).\n", m_filename,
+                m_line, MAX_IMPORT_FIELD_LEN);
+        m_error = true;
+        return NULL;
+    }
+
+    // nbytes counts the trailing \r\n of the data. Empty keys and values
+    // cannot be sent (the protocol layer asserts on them).
+    if (s_nkey == 0 || s_nbytes <= 2) {
+        fprintf(stderr, "%s:%u: error: empty keys/values are not supported (nkey %u, nbytes %u).\n", m_filename, m_line,
+                s_nkey, s_nbytes);
+        m_error = true;
         return NULL;
     }
 
     // read key
     unsigned int key_actlen = 0;
     char *key = read_string(s_nkey, s_nkey + 1, &key_actlen);
+    if (key == NULL) {
+        return bad_item();
+    }
     if (key_actlen != s_nkey) {
-        fprintf(stderr, "%s:%u: warning: key column is %u bytes, expected %u bytes.\n", m_filename, m_line, key_actlen,
+        fprintf(stderr, "%s:%u: error: key column is %u bytes, expected %u bytes.\n", m_filename, m_line, key_actlen,
                 s_nkey);
+        free(key);
+        m_error = true;
+        return NULL;
     }
     key[s_nkey] = '\0';
 
@@ -269,17 +350,22 @@ memcache_item *file_reader::read_item(void)
     if (c != ',') {
         fprintf(stderr, "%s:%u: error parsing csv file, got '%c' instead of delmiter.\n", m_filename, m_line, c);
         free(key);
-        return NULL;
+        return bad_item();
     }
     fgetc(m_file);
 
     unsigned int data_actlen = 0;
     char *data = read_string(s_nbytes - 2, s_nbytes, &data_actlen);
+    if (data == NULL) {
+        free(key);
+        return bad_item();
+    }
     if (data_actlen != s_nbytes - 2) {
-        fprintf(stderr, "%s:%u: warning: data column is %u bytes, expected %u bytes.\n", m_filename, m_line,
-                data_actlen, s_nbytes);
+        fprintf(stderr, "%s:%u: error: data column is %u bytes, expected %u bytes.\n", m_filename, m_line, data_actlen,
+                s_nbytes - 2);
         free(key);
         free(data);
+        m_error = true;
         return NULL;
     }
     data[s_nbytes - 2] = '\r';
@@ -295,6 +381,7 @@ memcache_item *file_reader::read_item(void)
     }
 
     m_line++;
+    m_items++;
 
     // return item
     memcache_item *item = new memcache_item(s_dumpflags, s_time, s_exptime, s_flags, s_nsuffix, s_clsid);

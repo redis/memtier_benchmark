@@ -32,8 +32,10 @@ version.h:
 	$(SHELL) $(srcdir)/version.sh
 
 bin_PROGRAMS = memtier_benchmark
-completionsdir=$(BASH_COMPLETION_DIR)
-dist_completions_DATA=bash-completion/memtier_benchmark
+if INSTALL_BASH_COMPLETION
+completionsdir = $(BASH_COMPLETION_DIR)
+dist_completions_DATA = bash-completion/memtier_benchmark
+endif
 
 memtier_benchmark_CPPFLAGS = \
 	$(CODE_COVERAGE_CFLAGS) \
@@ -154,6 +156,11 @@ run_stats_merge_test_LDADD = $(filter-out memtier_benchmark-memtier_benchmark.$(
 crash_report_test_SOURCES = tests/unit/crash_report_test.cpp crash_report.h
 crash_report_test_CPPFLAGS = -I$(srcdir)
 crash_report_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+# --data-import reader: errors, truncated last item, reopen (#766).
+check_PROGRAMS += file_io_test
+file_io_test_SOURCES = tests/unit/file_io_test.cpp file_io.cpp file_io.h item.cpp item.h
+file_io_test_CPPFLAGS = -I$(srcdir)
+file_io_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 TESTS = $(check_PROGRAMS)
 
 # Keep the release amalgamation byte-identical to the recorded upstream asset.

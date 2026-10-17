@@ -537,23 +537,30 @@ imported_keylist::~imported_keylist()
     m_keys.clear();
 }
 
-bool imported_keylist::read_keys(void)
+bool imported_keylist::read_keys(bool keep_keys)
 {
     file_reader f(m_filename);
 
     if (!f.open_file()) return false;
-    while (!f.is_eof()) {
-        memcache_item *i = f.read_item();
-
-        if (i != NULL) {
+    // read_item() returns NULL both at the end of the file and on a malformed
+    // item, and it does not skip past the bad input. Stop at the first NULL.
+    unsigned int count = 0;
+    memcache_item *i;
+    while ((i = f.read_item()) != NULL) {
+        count++;
+        if (keep_keys) {
             key *k = (key *) malloc(i->get_nkey() + sizeof(key) + 1);
             assert(k != NULL);
             k->key_len = i->get_nkey();
             memcpy(k->key_data, i->get_key(), i->get_nkey());
-            delete i;
-
             m_keys.push_back(k);
         }
+        delete i;
+    }
+    if (f.has_error()) return false;
+    if (count == 0) {
+        fprintf(stderr, "%s: no items found.\n", m_filename);
+        return false;
     }
 
     return true;

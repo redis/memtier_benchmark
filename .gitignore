@@ -79,6 +79,7 @@ tests/.env/
 /retry_drain_test
 /socket_options_test
 /run_stats_counters_test
+/file_io_test
 /run_stats_merge_test
 /crash_report_test
 tests/unit/prometheus_metrics_test
