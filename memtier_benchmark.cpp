@@ -2989,6 +2989,12 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         return -1;
     }
 
+    if (cfg->protocol == PROTOCOL_MEMCACHE_META &&
+        (cfg->wait_ratio.is_defined() || cfg->arbitrary_commands->is_defined())) {
+        fprintf(stderr, "error: memcache_meta does not support --wait-ratio or --command.\n");
+        return -1;
+    }
+
 #ifdef HAVE_EVHTTP
     // Prometheus post-parse tail (PLAN.md section 5). Runs once, before
     // config_init_defaults, so a NULL bind-addr still means "unset" and the

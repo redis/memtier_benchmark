@@ -21,6 +21,8 @@
 #endif
 
 #include <stdlib.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 #ifdef HAVE_ASSERT_H
@@ -1280,7 +1282,7 @@ int memcache_text_protocol::write_arbitrary_command(const char *val, int val_len
 //   <pipelined mg ...> mn\r\n                 ->  ...VA/EN..., MN  (multi-get)
 //
 // Inheriting from memcache_text_protocol lets us share the read/write buffers
-// and the four trivial methods that are also unsupported on the text path
+// and the methods that are also unsupported on the text path
 // (select_db / authenticate / configure_protocol / write_command_cluster_slots /
 // write_command_wait / *arbitrary_command -- all assert(0)). Only the four
 // methods whose wire format differs are overridden here.
@@ -1296,8 +1298,7 @@ int memcache_text_protocol::write_arbitrary_command(const char *val, int val_len
 // of write-time/parse-time mode-attribution races under pipelining (which can
 // interleave a single-shot ms with a multi-get's mg+mg+...+mn within the same
 // pipeline depth). The wire cost is 4 request + 4 response bytes per command;
-// at typical value sizes (>= 64B) this is <1% of bandwidth and the server-side
-// cost of `mn` is a single integer compare + a 4-byte write.
+// its relative bandwidth and processing overhead depend on the workload.
 class memcache_meta_protocol : public memcache_text_protocol
 {
 public:
@@ -1315,8 +1316,7 @@ public:
 //   (a) `mg ... v\r\n` is built with three raw `evbuffer_add` calls instead of
 //       a `vsnprintf`-driven `evbuffer_add_printf`. libevent appends each piece
 //       to the tail chain as a single memcpy, which matches the existing
-//       memcache_text_protocol multi-get write path and avoids ~100 ns of
-//       format-string parsing per key on the hot pipelined path.
+//       memcache_text_protocol multi-get write path.
 //   (b) Trailer length is shared between get / multi-get so the math is
 //       impossible to drift.
 static const char k_mg_prefix[] = "mg ";
@@ -1410,14 +1410,20 @@ int memcache_meta_protocol::parse_response(void)
             bool done = false;
             bool unknown = false;
 
-            if (tmplen >= 3 && memcmp(line, "VA ", 3) == 0) {
+            if (memchr(line, '\0', tmplen) != NULL) {
+                unknown = true;
+            } else if (tmplen >= 3 && memcmp(line, "VA ", 3) == 0) {
                 // Parse the value size with strtoul rather than sscanf -- on
                 // the GET hot path this avoids the full stdio scanner machinery
                 // (locale, format-string re-parse) for what is just a single
                 // unsigned integer immediately following a fixed prefix.
                 char *endptr = NULL;
+                errno = 0;
                 unsigned long v = strtoul(line + 3, &endptr, 10);
-                if (endptr == line + 3) {
+                // evbuffer_remove returns int; reject sizes that cannot be
+                // represented, signs, missing digits and partial number tokens.
+                if (line[3] < '0' || line[3] > '9' || errno == ERANGE || v > INT_MAX ||
+                    (*endptr != '\0' && *endptr != ' ')) {
                     unknown = true;
                 } else {
                     m_value_len = (unsigned int) v;
@@ -1426,8 +1432,9 @@ int memcache_meta_protocol::parse_response(void)
             } else if (tmplen == 2 && memcmp(line, "MN", 2) == 0) {
                 // MN is the universal response terminator. Every command we
                 // write ends in `mn\r\n`, so every response ends with `MN`.
-                done = true;
-            } else if (tmplen >= 2 &&
+                done = m_last_response.get_status() != line;
+                unknown = !done; // A terminator alone is not a command reply.
+            } else if (tmplen >= 2 && (tmplen == 2 || line[2] == ' ') &&
                        (memcmp(line, "HD", 2) == 0 || memcmp(line, "EN", 2) == 0 || memcmp(line, "NS", 2) == 0 ||
                         memcmp(line, "EX", 2) == 0 || memcmp(line, "NF", 2) == 0)) {
                 // 2-letter status: stored / miss / not-stored / exists / not-found.
@@ -1459,10 +1466,14 @@ int memcache_meta_protocol::parse_response(void)
         }
 
         case rs_read_value:
-            if (evbuffer_get_length(m_read_buf) < m_value_len + 2) return 0;
+            if (evbuffer_get_length(m_read_buf) < (size_t) m_value_len + 2) return 0;
             if (m_keep_value) {
-                char *value = (char *) malloc(m_value_len);
-                assert(value != NULL);
+                char *value = (char *) malloc(m_value_len ? m_value_len : 1);
+                if (value == NULL) {
+                    m_last_response.set_error();
+                    m_response_state = rs_initial;
+                    return -1;
+                }
                 int ret = evbuffer_remove(m_read_buf, value, m_value_len);
                 assert(ret == (int) m_value_len);
                 m_last_response.set_value(value, m_value_len);
@@ -1471,8 +1482,13 @@ int memcache_meta_protocol::parse_response(void)
                 assert(ret == 0);
             }
             {
-                int ret = evbuffer_drain(m_read_buf, 2); // CRLF after value
-                assert(ret == 0);
+                char ending[2];
+                int ret = evbuffer_remove(m_read_buf, ending, sizeof(ending));
+                if (ret != 2 || ending[0] != '\r' || ending[1] != '\n') {
+                    m_last_response.set_error();
+                    m_response_state = rs_initial;
+                    return -1;
+                }
             }
             m_last_response.incr_hits();
             m_response_len += m_value_len + 2;

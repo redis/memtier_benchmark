@@ -25,6 +25,7 @@ import socket
 import subprocess
 import threading
 import time
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -51,7 +52,7 @@ class MetaProtocolMockServer(threading.Thread):
     by `MN`. Tests therefore expect (and assert on) one `mn` per logical command.
     """
 
-    def __init__(self, miss_keys=None, ms_response=b"HD\r\n", garbage_after=None, fragment_va=False):
+    def __init__(self, miss_keys=None, ms_response=b"HD\r\n", garbage_after=None, fragment_va=False, raw_response=None):
         super().__init__(daemon=True)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -68,6 +69,7 @@ class MetaProtocolMockServer(threading.Thread):
         # parse_response's -1 path resets state cleanly so subsequent valid
         # responses are not misclassified as multi-get sections.
         self.garbage_after = garbage_after
+        self.raw_response = raw_response
         self.fragment_va = fragment_va       # split VA header and value across two sends
         self.stop_event = threading.Event()
         # Signaled by run() right before the accept loop -- tests use this to
@@ -95,6 +97,7 @@ class MetaProtocolMockServer(threading.Thread):
     def _serve(self, conn):
         conn.settimeout(2.0)
         buf = b""
+        raw_response = self.raw_response
         try:
             while not self.stop_event.is_set():
                 try:
@@ -105,6 +108,10 @@ class MetaProtocolMockServer(threading.Thread):
                     return  # peer closed -- normal at end of memtier run
                 if not chunk:
                     return
+                if raw_response is not None:
+                    conn.sendall(raw_response)
+                    raw_response = None
+                    continue
                 buf += chunk
                 try:
                     buf = self._drain(conn, buf)
@@ -243,8 +250,9 @@ class MetaProtocolTests(unittest.TestCase):
         # Synchronization on the ready event eliminates time.sleep() races on
         # slow CI hosts. 5s is generous; in practice it's signaled in <1ms.
         self.assertTrue(self.server.ready.wait(timeout=5.0), "mock server failed to start")
-        self.tmpdir = os.path.join(HERE, "_meta_tmp")
-        os.makedirs(self.tmpdir, exist_ok=True)
+        self.temporary = tempfile.TemporaryDirectory(prefix="memtier-meta-")
+        self.addCleanup(self.temporary.cleanup)
+        self.tmpdir = self.temporary.name
         # Per-test method name keeps the JSON path stable across runs and
         # avoids id()-collision aliasing between TestCase instances.
         self.json_path = os.path.join(self.tmpdir, f"meta_{self._testMethodName}.json")
@@ -259,6 +267,56 @@ class MetaProtocolTests(unittest.TestCase):
             os.remove(self.json_path)
         except OSError:
             pass
+
+    def test_unsupported_options_fail_before_connection(self):
+        for options in (["--authenticate=dummy-meta-test"], ["--select-db=1"],
+                        ["--cluster-mode"], ["--data-offset=1"],
+                        ["--wait-ratio=1:1"], ["--command=PING"]):
+            with self.subTest(options=options):
+                result = _run_memtier(options, self.server.port, self.json_path,
+                                      requests=1, clients=1, threads=1, timeout=8)
+                self.assertEqual(result.returncode, 2, result.stderr.decode())
+                self.assertIn(b"error:", result.stderr)
+                self.assertEqual(self.server.commands, [])
+                self.assertFalse(os.path.exists(self.json_path))
+
+    def test_malformed_responses_are_rejected(self):
+        # These were accepted as successful commands by the original parser.
+        cases = [
+            b"VA 4294967296\r\n\r\nMN\r\n",  # uint32 truncation to zero
+            b"VA 18446744073709551616\r\n\r\nMN\r\n",  # strtoul overflow
+            b"VA -0\r\n\r\nMN\r\n",
+            b"VA +0\r\n\r\nMN\r\n",
+            b"VA 0x\r\n\r\nMN\r\n",
+            b"VA 1\r\naXXMN\r\n",  # value lacks its CRLF
+            b"HDjunk\r\nMN\r\n",  # status must be a complete token
+            b"VA 0\x00junk\r\n\r\nMN\r\n",  # embedded NUL in a header
+            b"MN\r\n",  # missing reply before the command terminator
+        ]
+        for reply in cases:
+            with self.subTest(reply=reply):
+                self._restart_server(raw_response=reply)
+                result = _run_memtier(
+                    ["--ratio=0:1", "--connection-stage-timeout=1"],
+                    self.server.port, self.json_path,
+                    requests=1, clients=1, threads=1, timeout=8,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr.decode())
+                self.assertIn(b"response parsing failed", result.stderr)
+                with open(self.json_path) as report:
+                    self.assertEqual(json.load(report)["ALL STATS"]["Gets"]["Count"], 0)
+
+    def test_zero_length_and_flagged_values(self):
+        for reply in (b"VA 0\r\n\r\nMN\r\n", b"VA 1 c42\r\na\r\nMN\r\n"):
+            with self.subTest(reply=reply):
+                self._restart_server(raw_response=reply)
+                result = _run_memtier(["--ratio=0:1"], self.server.port,
+                                      self.json_path, requests=1, clients=1, threads=1)
+                self.assertEqual(result.returncode, 0, result.stderr.decode())
+                with open(self.json_path) as report:
+                    gets = json.load(report)["ALL STATS"]["Gets"]
+                self.assertEqual(gets["Count"], 1)
+                self.assertGreater(gets["Hits/sec"], 0)
 
     # ---- write_command_set : ms <key> <datalen> T<exp>\r\n<data>\r\n ----
     def test_set_wire_format_and_storage(self):
@@ -293,6 +351,7 @@ class MetaProtocolTests(unittest.TestCase):
         # JSON output is well-formed and reports SETs.
         with open(self.json_path) as fp:
             results = json.load(fp)
+        self.assertEqual(results["configuration"]["protocol"], "memcache_meta")
         sets = results["ALL STATS"]["Sets"]
         self.assertEqual(int(sets["Count"]), 50)
         self.assertEqual(int(results["ALL STATS"]["Gets"]["Count"]), 0)
@@ -655,6 +714,12 @@ def _adapt(method_name):
     _runner.__name__ = method_name
     return _runner
 
+
+test_meta_unsupported_options_fail_before_connection = _adapt("test_unsupported_options_fail_before_connection")
+
+# Parser boundaries and valid zero-length/flagged controls.
+test_meta_malformed_responses_are_rejected = _adapt("test_malformed_responses_are_rejected")
+test_meta_zero_length_and_flagged_values = _adapt("test_zero_length_and_flagged_values")
 
 # Happy path.
 test_meta_set_wire_format_and_storage = _adapt("test_set_wire_format_and_storage")
