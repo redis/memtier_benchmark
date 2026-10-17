@@ -224,8 +224,11 @@ def test_standalone_auth_rejected_on_some_connections_fails_run(env):
     returncode, stderr, elapsed = _run(node, ["-a", "dummy-pw-737", "--requests=2000",
                                               "--connection-stage-timeout=1"], workers=4, clients=4, cluster=False)
     env.assertEqual(node.errors, [])
-    env.assertEqual(node.auth_requests, 16)
+    # A thread ended by a rejected connection fails the run, and threads that
+    # have not dialed yet then never send AUTH: only bound the counts.
+    env.assertGreaterEqual(node.auth_requests, 5)
+    rejected = stderr.count("authentication failed")
+    env.assertTrue(1 <= rejected <= 4, message=stderr[-2000:])
     env.assertEqual(returncode, 1, message=stderr[-2000:])
-    env.assertEqual(stderr.count("authentication failed"), 4, message=stderr[-2000:])
     env.assertContains("AUTH error and --reconnect-on-error is not set, ending this thread", stderr)
     env.assertLess(elapsed, 5)

@@ -471,7 +471,9 @@ private:
     bool m_reconnecting;
     // The pending reconnect follows a rejected setup step (AUTH/SELECT/HELLO).
     bool m_setup_rejected;
-    // See is_setup_rejected_replica(). Kept across disconnect().
+    // See is_setup_rejected_replica(). Never reset: it lasts as long as this
+    // object (kept across disconnect() and role changes). handle_cluster_slots()
+    // matches replicas by address, so it always names the same endpoint.
     bool m_setup_rejected_replica;
     // Without --reconnect-on-error: the setup step the server rejected on this
     // still-open connection, while the run has not reached steady state.
