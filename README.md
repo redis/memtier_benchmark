@@ -149,13 +149,13 @@ Numeric options that take a count, size, timeout or port (for example `-n`, `-c`
 
 ### Connecting with `--uri`
 
-`--uri=redis://user:password@host:port/dbnum` (or `rediss://` for TLS) sets the server, port, credentials and database in one option, in the format `redis-cli -u` takes. As with `redis-cli -u`, the user name and password are percent-decoded, so characters that have a meaning in the URI can be written as `%40` (`@`), `%3A` (`:`), `%2F` (`/`), `%3F` (`?`), `%23` (`#`) and `%25` (`%`):
+`--uri=redis://user:password@host:port/dbnum` (or `rediss://` for TLS) sets the server, port, credentials and database in one option, in the format `redis-cli -u` takes. As with `redis-cli -u`, the user name and password are percent-decoded, so characters that have a meaning in the URI can be written as `%40` (`@`), `%3A` (`:`, in the password), `%2F` (`/`), `%3F` (`?`), `%23` (`#`) and `%25` (`%`):
 
 ```
 $ memtier_benchmark --uri 'redis://default:p%40ss%2Fword@127.0.0.1:6379/0'
 ```
 
-Earlier releases sent `%XX` to the server literally, so a password that contains a valid `%XX` sequence must now be written with `%25` for its `%`. A `%` that is not followed by two hex digits (for example a password ending in `%`) is still taken literally, with a warning. `%00` is rejected, and so is a `%3A` in the user name, since `AUTH` credentials are split at the first `:`. A raw `/`, `?` or `#` in the credentials still works but prints a warning, because it cannot be told apart from an `@` in the path; percent-encode it instead. The host, port and database number are not decoded. `--show-config` and `--json-out-file` print the password as `***`.
+Earlier releases sent `%XX` to the server literally, so a password that contains a valid `%XX` sequence must now be written with `%25` for its `%`. A `%` that is not followed by two hex digits (for example a password ending in `%`) is still taken literally, with a warning. `%00` is rejected, and so are a `%3A` and control characters in the user name, since `AUTH` credentials are split at the first `:` and the user name is printed by `--show-config`. A raw `/`, `?` or `#` in the credentials still works but prints a note, because it cannot be told apart from an `@` in the path; if the password is not recognised, percent-encode it. The host, port and database number are not decoded: to give an IPv6 zone id, write it with a raw `%` (for example `[fe80::1%eth0]`), since `%25` is not decoded in the host. `--show-config` and `--json-out-file` print the password as `***`.
 
 ### Using monitor input files
 

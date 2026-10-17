@@ -5,8 +5,9 @@ Both print the run configuration: "uri" and "authenticate" in the JSON
 "configuration" object, and "uri = " / "authenticate = " on stderr with
 --show-config. They used to echo the --uri and -a/--authenticate values
 verbatim, so a JSON result file uploaded as a CI artifact carried the
-password. The user name is kept and only the password is replaced by "***". The --uri user name and password are
-percent-decoded (#732); neither form of the password may be printed.
+password. The user name is kept and only the password is replaced by "***".
+The --uri user name and password are percent-decoded (#732); neither form
+of the password may be printed.
 
 Run with:
   TEST=test_config_password_redaction.py OSS_STANDALONE=1 \
@@ -208,7 +209,7 @@ def test_config_password_redaction_password_with_colon(env):
            [_CANARY])
 
 
-_RAW_DELIM_WARNING = "warning: --uri credentials contain a raw '/', '?' or '#'"
+_RAW_DELIM_WARNING = "note: --uri credentials contain a raw '/', '?' or '#'; this is accepted"
 _LITERAL_PERCENT_WARNING = "warning: --uri password has a '%' not followed by two hex digits"
 
 
@@ -220,6 +221,68 @@ def test_config_password_redaction_uri_password_with_slash(env):
     stderr = _check(env, password, ["--uri", "redis://default:{}@{}:{}".format(password, host, port)],
                     "redis://default:***@{}:{}".format(host, port), "default:***", [_CANARY])
     env.assertContains(_RAW_DELIM_WARNING, stderr)
+
+
+def test_config_uri_raw_delimiters_note(env):
+    """A raw '?' or '#' in the password, or a raw '/' in a password-only
+    userinfo, works and prints the same note as a raw '/'."""
+    host, port = _target(env)
+    for password in ("a?" + _CANARY, "a#" + _CANARY):
+        stderr = _check(env, password, ["--uri", "redis://default:{}@{}:{}".format(password, host, port)],
+                        "redis://default:***@{}:{}".format(host, port), "default:***", [_CANARY])
+        env.assertContains(_RAW_DELIM_WARNING, stderr)
+    password = "a/" + _CANARY
+    stderr = _check(env, password, ["--uri", "redis://{}@{}:{}".format(password, host, port)],
+                    "redis://***@{}:{}".format(host, port), "***", [_CANARY])
+    env.assertContains(_RAW_DELIM_WARNING, stderr)
+
+
+def test_config_uri_password_with_raw_colon(env):
+    """The user ends at the first raw ':'; "default:a:<canary>" authenticates
+    with the password "a:<canary>"."""
+    host, port = _target(env)
+    password = "a:" + _CANARY
+    _check(env, password, ["--uri", "redis://default:{}@{}:{}".format(password, host, port)],
+           "redis://default:***@{}:{}".format(host, port), "default:***", [_CANARY])
+
+
+def test_config_uri_percent_decoded_password_hex_and_control(env):
+    """Every hex digit class decodes (%39, %46/%66, %7F/%7f), and a non-NUL
+    control byte such as %09 is allowed in the password: AUTH is
+    length-prefixed and the password is never printed."""
+    host, port = _target(env)
+    password = _CANARY + "\t9Ff\x7f\x7f"
+    encoded = _CANARY + "%09%39%46%66%7F%7f"
+    _check(env, password, ["--uri", "redis://default:{}@{}:{}".format(encoded, host, port)],
+           "redis://default:***@{}:{}".format(host, port), "default:***", [_CANARY])
+
+
+def test_config_uri_host_not_percent_decoded(env):
+    """The host is not decoded: a raw '%' keeps an IPv6 zone id, and a %25
+    there stays as written. Only the printed server is checked; the
+    connection goes to a closed port."""
+    closed = _closed_port(env)
+    for zone_host in ("::1%lo", "::1%25lo"):
+        with tempfile.TemporaryDirectory() as workdir:
+            _raw, _stdout, stderr = _run(env, ["--uri", "redis://[{}]:{}".format(zone_host, closed)], workdir,
+                                         expect_ok=None)
+        env.assertEqual(_show_config_value(stderr, "server"), zone_host)
+
+
+def test_config_uri_memcache_binary_password_only_rejected(env):
+    """memcache_binary needs USER:PASSWORD. A password-only --uri is rejected
+    as on master, also when the password decodes to a ':' (which is stored
+    behind a leading ':' for AUTH)."""
+    closed = _closed_port(env)
+    for userinfo in (_CANARY, "a%3A" + _CANARY):
+        args = [MEMTIER_BINARY, "-P", "memcache_binary", "--uri",
+                "redis://{}@127.0.0.1:{}".format(userinfo, closed), "-n", "1", "-t", "1", "-c", "1"]
+        with tempfile.TemporaryDirectory() as workdir:
+            proc = subprocess.run(args, cwd=workdir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        err = proc.stderr.decode("utf-8", "replace")
+        env.assertEqual(proc.returncode, 2, message=err[-1000:])
+        env.assertContains("error: binary_memcache credentials must be in the form of USER:PASSWORD.", err)
+        env.assertFalse(_CANARY in err)
 
 
 def test_config_uri_percent_decoded_password(env):
@@ -283,6 +346,10 @@ def test_config_uri_percent_decoding_rejects(env):
         "redis://%00{}:x@{}:{}".format(_CANARY, host, port): "error: --uri user name contains %00",
         "redis://a%3A{}:{}@{}:{}".format(_CANARY_HEAD, _CANARY, host, port): "error: --uri user name contains ':'",
     }
+    # Control bytes in the user name would reach --show-config and the log.
+    for esc in ("%0A", "%1F", "%7F", "%1b"):
+        uri = "redis://{}{}:{}@{}:{}".format(_CANARY_HEAD, esc, _CANARY, host, port)
+        cases[uri] = "error: --uri user name contains a control character."
     for uri, diagnostic in cases.items():
         with tempfile.TemporaryDirectory() as workdir:
             _raw, stdout, stderr = _run(env, ["--uri", uri], workdir, expect_ok=False)
@@ -417,9 +484,10 @@ def test_config_uri_password_with_slash_without_host_warns(env):
 def test_config_uri_password_with_slash_nothing_after_at_warns(env):
     """redis://u:a/b@ (nothing after the '@') falls back to the default server
     with the host-less warning, like every other host-less form, as on master.
-    It has the same shape as a stray '@' after a path, so it warns about the
-    raw '/' (%2F is unambiguous). -p points the default server at the target, so the run
-    authenticates with the "a/<canary>" password and is redacted."""
+    It has the same shape as a stray '@' after a path, so it prints a note
+    about the raw '/' (%2F is unambiguous). -p points the default server at
+    the target, so the run authenticates with the "a/<canary>" password and
+    is redacted."""
     host, port = _target(env)
     env.assertContains(host, _LOOPBACK)
     password = "a/" + _CANARY
@@ -474,7 +542,7 @@ def test_config_uri_without_host_uses_explicit_unix_socket(env):
 
 def test_config_uri_at_in_path_without_credentials_warns(env):
     """Without credentials, an '@' in the db path still ends a "userinfo", as
-    on master, but now warns (#732).
+    on master, but now prints a note (#732).
 
     redis://host:port/1@other:port is read as credentials "host:port/1" for
     host "other", and redis://host:port/1@ as those credentials with no host,

@@ -1244,14 +1244,21 @@ static bool uri_percent_decode(const char *s, const char *what, std::string &out
 // can carry a ':' in the password. authenticate() splits user and password at
 // the first ':', so a decoded ':' cannot be part of the user name; a password
 // with no user that decodes to a ':' gets a leading ':', which authenticate()
-// reads as "password only". Returns false on error.
-static bool uri_decode_userinfo(const char *userinfo, std::string &out)
+// reads as "password only"; password_only tells the caller there was no
+// user name, so the memcache_binary USER:PASSWORD check still applies. The
+// decoded user name is printed by --show-config and the JSON, so control
+// bytes are rejected there (Redis rejects such user names anyway); the
+// password is never printed and AUTH is length-prefixed, so it may hold
+// them. Returns false on error.
+static bool uri_decode_userinfo(const char *userinfo, std::string &out, bool &password_only)
 {
     if (strpbrk(userinfo, "/?#")) {
-        fprintf(stderr, "warning: --uri credentials contain a raw '/', '?' or '#'; they are read as part of the "
-                        "credentials. Percent-encode them (%%2F, %%3F, %%23) to avoid ambiguity with the path.\n");
+        fprintf(stderr, "note: --uri credentials contain a raw '/', '?' or '#'; this is accepted, but if the "
+                        "password is not being recognised, percent-encode them (%%2F, %%3F, %%23). Without "
+                        "credentials, an '@' after a '/', '?' or '#' is read as the credentials separator.\n");
     }
     const char *colon = strchr(userinfo, ':');
+    password_only = !colon;
     if (!colon) {
         std::string password;
         if (!uri_percent_decode(userinfo, "password", password)) return false;
@@ -1266,6 +1273,13 @@ static bool uri_decode_userinfo(const char *userinfo, std::string &out)
         fprintf(stderr, "error: --uri user name contains ':' (%%3A), which AUTH credentials cannot carry.\n");
         return false;
     }
+    for (size_t i = 0; i < user.size(); i++) {
+        unsigned char c = (unsigned char) user[i];
+        if (c < 0x20 || c == 0x7f) {
+            fprintf(stderr, "error: --uri user name contains a control character.\n");
+            return false;
+        }
+    }
     out = user + ":" + password;
     return true;
 }
@@ -1273,7 +1287,7 @@ static bool uri_decode_userinfo(const char *userinfo, std::string &out)
 // Parse URI and populate config fields
 // Returns 0 on success, -1 on error
 static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string &uri_authenticate,
-                     std::string &uri_server)
+                     std::string &uri_server, bool &uri_password_only)
 {
     if (!uri || strlen(uri) == 0) {
         fprintf(stderr, "error: empty URI provided.\n");
@@ -1333,7 +1347,7 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
         // other part, an IPv6 zone id ("[fe80::1%eth0]") passes through
         // raw, and the port and db number are digits only.
         *auth_end = '\0';
-        if (!uri_decode_userinfo(ptr, uri_authenticate)) {
+        if (!uri_decode_userinfo(ptr, uri_authenticate, uri_password_only)) {
             free(uri_copy);
             return -1;
         }
@@ -3027,8 +3041,8 @@ void usage()
         "                                 without a username, use username 'default'. For TLS, use\n"
         "                                 the scheme 'rediss'. Bracket IPv6 hosts: [::1]:6379.\n"
         "                                 User and password are percent-decoded, as by\n"
-        "                                 redis-cli -u: write '@' as %%40, ':' as %%3A, '/' as %%2F\n"
-        "                                 and '%%' as %%25.\n"
+        "                                 redis-cli -u: write '@' as %%40, '/' as %%2F, '%%' as\n"
+        "                                 %%25 and, in the password, ':' as %%3A.\n"
 #ifdef USE_TLS
         "      --tls                      Enable SSL/TLS transport security\n"
         "      --cert=FILE                Use specified client certificate for TLS\n"
@@ -4974,6 +4988,7 @@ int main(int argc, char *argv[])
     // Keep URI storage alive for cfg and its workers; neither string changes after parsing.
     std::string uri_authenticate;
     std::string uri_server;
+    bool uri_password_only = false;
     benchmark_config cfg = benchmark_config();
     cfg.arbitrary_commands = new arbitrary_command_list();
     cfg.monitor_commands = new monitor_command_list();
@@ -5234,7 +5249,7 @@ int main(int argc, char *argv[])
 
     // Process URI if provided
     if (cfg.uri) {
-        if (parse_uri(cfg.uri, &cfg, uri_authenticate, uri_server) < 0) {
+        if (parse_uri(cfg.uri, &cfg, uri_authenticate, uri_server, uri_password_only) < 0) {
             exit(1);
         }
 
@@ -5680,7 +5695,9 @@ int main(int argc, char *argv[])
             fprintf(stderr, "error: authenticate can only be used with redis or memcache_binary.\n");
             usage();
         }
-        if (cfg.protocol == PROTOCOL_MEMCACHE_BINARY && strchr(cfg.authenticate, ':') == NULL) {
+        // A password-only --uri may carry a decoded ':' (behind a leading ':'),
+        // but it still has no user name.
+        if (cfg.protocol == PROTOCOL_MEMCACHE_BINARY && (strchr(cfg.authenticate, ':') == NULL || uri_password_only)) {
             fprintf(stderr, "error: binary_memcache credentials must be in the form of USER:PASSWORD.\n");
             usage();
         }
