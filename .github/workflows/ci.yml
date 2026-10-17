@@ -220,7 +220,6 @@ jobs:
         name: memtier-build-${{ matrix.platform }}
         path: |
           memtier_benchmark
-          .libs/
         retention-days: 1
 
   test-ubuntu:
@@ -492,7 +491,23 @@ jobs:
           libevent-dev zlib-dev openssl-dev
 
     - name: Build
-      run: autoreconf -ivf && ./configure && make -j
+      run: |
+        autoreconf -ivf
+        ./configure 2> configure.err || { cat configure.err >&2; exit 1; }
+        cat configure.err >&2
+        make -j
+
+    # This image has no libtool. An unexpanded macro (LT_INIT before #640) is
+    # left as a literal line in configure, which only prints "LT_INIT: not
+    # found" (busybox sh; bash says "command not found") and still exits 0.
+    - name: Check configure has no unexpanded macros
+      run: |
+        if grep -nE '^[[:space:]]*LT_[A-Z_]+' configure; then
+          echo "configure contains unexpanded libtool macros" >&2; exit 1
+        fi
+        if grep -nE '^\./configure: (line [0-9]+: )?[^ ]+: (command )?not found' configure.err; then
+          echo "configure ran an unknown command" >&2; exit 1
+        fi
 
     - name: Verify version
       run: ./memtier_benchmark --version

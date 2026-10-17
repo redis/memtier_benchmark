@@ -34,7 +34,9 @@ dnl `char buffer[N]` blew an 8-12 MB stack the moment a 20 MB MONITOR-replay
 dnl line was selected. Keep this hard-error to prevent the next one.
 CXXFLAGS="-O2 -g -Wall -Werror=vla -std=c++11 $CXXFLAGS"
 
-# Checks for programs.
+# Checks for programs. AC_PROG_CC is for the hdr_histogram C sources, and it
+# must come before AX_CODE_COVERAGE, which reads $GCC.
+AC_PROG_CC
 AC_PROG_CXX
 
 # Coverage
