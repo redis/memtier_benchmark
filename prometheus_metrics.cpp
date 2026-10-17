@@ -163,6 +163,7 @@ std::string format_le(int64_t bound_us)
 // --prometheus-run-label value, is replaced by U+FFFD before escaping.
 std::string escape_label_value(const std::string &s)
 {
+    // Values are C strings, so an embedded NUL ends the value (argv and the build strings cannot contain one).
     const std::string valid = utf8_sanitize(s.c_str());
     std::string out;
     out.reserve(valid.size() + 8);

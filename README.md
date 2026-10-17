@@ -585,7 +585,7 @@ curl http://127.0.0.1:8080/metrics
 |--------|---------|-------------|
 | `--prometheus-port=PORT` | *(disabled)* | TCP port for the `/metrics` HTTP endpoint. `0` selects an ephemeral port (announced on stdout). Enables the exporter when set. |
 | `--prometheus-bind-addr=ADDR` | `127.0.0.1` | Address to bind the exporter to. Loopback by default; a non-loopback address prints a one-shot warning. |
-| `--prometheus-run-label=K=V` | *(none)* | Repeatable label applied to every exported sample, e.g. to compare runs. |
+| `--prometheus-run-label=K=V` | *(none)* | Repeatable label applied to every exported sample, e.g. to compare runs. Invalid UTF-8 in a value is replaced with U+FFFD and a warning is printed. |
 | `--prometheus-latency-buckets=L` | *(26 defaults)* | Comma-separated histogram bucket upper bounds in seconds. |
 
 The exporter exposes cumulative counters (ops, bytes, hits/misses, errors,

@@ -255,7 +255,7 @@ curl http://127.0.0.1:8080/metrics
 |--------|---------|-------------|
 | `--prometheus-port=PORT` | *(disabled)* | TCP port for `/metrics`. `0` selects an ephemeral port. Setting it enables the exporter. |
 | `--prometheus-bind-addr=ADDR` | `127.0.0.1` | Numeric IPv4/IPv6 address to bind to. Hostnames are not supported. A non-loopback address prints a one-shot warning. |
-| `--prometheus-run-label=KEY=VALUE` | *(none)* | Constant label applied to every sample; repeatable, max 16. |
+| `--prometheus-run-label=KEY=VALUE` | *(none)* | Constant label applied to every sample; repeatable, max 16. Invalid UTF-8 in a value is replaced with U+FFFD and a warning is printed. |
 | `--prometheus-latency-buckets=LIST` | *(26 built-in)* | Comma-separated, strictly ascending latency bucket bounds in seconds. Bounds within ~1% of each other collapse to one HDR slot and are rejected. |
 
 ### Ephemeral-port contract

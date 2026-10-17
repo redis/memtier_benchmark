@@ -220,7 +220,7 @@ for f in --prometheus-port --prometheus-bind-addr --prometheus-run-label --prome
 done
 MEMTIER_FUZZ=1 MEMTIER_FUZZ_MAX_EXAMPLES=100 OSS_STANDALONE=1 ./tests/run_tests.sh
 grep -nE '#include[[:space:]]*[<"](event2/|event\.h|evhttp)|#include[[:space:]]*"(config|version)\.h"|PACKAGE_VERSION|MEMTIER_GIT_SHA1' \
-  prometheus_metrics.cpp prometheus_metrics.h tests/unit/prometheus_metrics_test.cpp \
+  prometheus_metrics.cpp prometheus_metrics.h utf8.cpp utf8.h tests/unit/prometheus_metrics_test.cpp \
   && fail "purity breach: config/version/libevent reference in the unconditional metrics layer" || true
 grep -q -- '--disable-prometheus' DEVELOPMENT.md || fail "DEVELOPMENT.md missing --disable-prometheus"
 grep -qE 'evhttp >= 2\.1\.1|libevent 2\.1\.1' DEVELOPMENT.md || fail "DEVELOPMENT.md missing the 2.1.1 floor"

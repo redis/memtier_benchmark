@@ -218,13 +218,13 @@ def _promtool_validate(env, body, scrape_path):
     if not promtool:
         env.debugPrint("[SKIP] promtool not on PATH; gate uses docker promtool", True)
         return
-    with open(scrape_path, "w") as fh:
-        fh.write(body)
+    raw = body.encode("utf-8")
+    with open(scrape_path, "wb") as fh:
+        fh.write(raw)
     proc = subprocess.run(
         [promtool, "check", "metrics"],
-        input=body,
+        input=raw,
         capture_output=True,
-        text=True,
         timeout=30,
     )
     env.assertEqual(

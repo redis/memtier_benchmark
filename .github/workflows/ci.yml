@@ -662,27 +662,39 @@ jobs:
         set -euo pipefail
         redis-server --port 6399 --save '' --daemonize yes
         for i in $(seq 1 30); do redis-cli -p 6399 ping >/dev/null 2>&1 && break; sleep 0.2; done
-        ./memtier_benchmark -s 127.0.0.1 -p 6399 --test-time=8 --prometheus-port=0 \
-          >mb.out 2>mb.err &
-        MBPID=$!
-        URL=""
-        for i in $(seq 1 100); do
-          URL=$(grep -oP 'listening on \Khttp://[^ ]+/metrics' mb.out || true)
-          [ -n "$URL" ] && break
-          sleep 0.1
-        done
-        [ -n "$URL" ] || { echo "no announce line"; cat mb.out mb.err; exit 1; }
-        sleep 1
-        curl -fsS "$URL" > prom_scrape.txt
-        wait "$MBPID"
-        # rc != 0 OR any output = failure (PLAN.md §7.4e)
-        out=$(promtool check metrics < prom_scrape.txt 2>&1) || { echo "promtool rc != 0"; echo "$out"; exit 1; }
-        if [ -n "$out" ]; then echo "promtool produced output (lint warnings):"; echo "$out"; exit 1; fi
-        echo "promtool check metrics: clean"
+        # scrape_and_lint OUT [memtier args...]
+        scrape_and_lint() {
+          local out_file="$1"; shift
+          ./memtier_benchmark -s 127.0.0.1 -p 6399 --test-time=8 --prometheus-port=0 "$@" \
+            >mb.out 2>mb.err &
+          local MBPID=$!
+          local URL=""
+          for i in $(seq 1 100); do
+            URL=$(grep -oP 'listening on \Khttp://[^ ]+/metrics' mb.out || true)
+            [ -n "$URL" ] && break
+            sleep 0.1
+          done
+          [ -n "$URL" ] || { echo "no announce line"; cat mb.out mb.err; exit 1; }
+          sleep 1
+          curl -fsS "$URL" > "$out_file"
+          wait "$MBPID"
+          # rc != 0 OR any output = failure (PLAN.md §7.4e)
+          local out
+          out=$(promtool check metrics < "$out_file" 2>&1) || { echo "promtool rc != 0 ($out_file)"; echo "$out"; exit 1; }
+          if [ -n "$out" ]; then echo "promtool produced output (lint warnings) ($out_file):"; echo "$out"; exit 1; fi
+          echo "promtool check metrics: clean ($out_file)"
+        }
+        scrape_and_lint prom_scrape.txt
+        # #753: a run-label value with an invalid UTF-8 byte must be sanitized.
+        scrape_and_lint prom_scrape_utf8.txt "--prometheus-run-label=env=x"$'\xff'"y" \
+          "--prometheus-run-label=ok=caf"$'\xc3\xa9'
+        grep -q 'env="x'$'\xef\xbf\xbd''y"' prom_scrape_utf8.txt || { echo "U+FFFD missing"; exit 1; }
 
     - name: Upload scraped exposition
       if: always()
       uses: actions/upload-artifact@v4
       with:
         name: prom_scrape
-        path: prom_scrape.txt
+        path: |
+          prom_scrape.txt
+          prom_scrape_utf8.txt

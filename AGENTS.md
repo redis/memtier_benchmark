@@ -17,6 +17,7 @@ memtier_benchmark is a high-performance load generation and benchmarking tool fo
 ├── obj_gen.cpp/h          # Object/key generation
 ├── run_stats.cpp/h        # Statistics collection and reporting
 ├── JSON_handler.cpp/h     # JSON output support
+├── utf8.cpp/h             # UTF-8 sanitizer (U+FFFD) shared by JSON and /metrics
 ├── file_io.cpp/h          # File I/O operations
 ├── config_types.cpp/h     # Configuration types
 ├── deps/hdr_histogram/    # HdrHistogram library (vendored)

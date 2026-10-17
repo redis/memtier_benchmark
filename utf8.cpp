@@ -16,6 +16,8 @@
  * along with memtier_benchmark.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <stddef.h>
+
 #include "utf8.h"
 
 /**

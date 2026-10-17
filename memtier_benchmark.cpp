@@ -102,6 +102,7 @@ static bool bitmask_is_contiguous(unsigned int mask);
 #include "client.h"
 #include "cluster_client.h"
 #include "JSON_handler.h"
+#include "utf8.h"
 #include "file_io.h"
 #include "obj_gen.h"
 #include "memtier_benchmark.h"
