@@ -1931,7 +1931,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 cfg->protocol = PROTOCOL_MEMCACHE_META;
             } else {
                 fprintf(stderr, "error: supported protocols are 'memcache_text', 'memcache_binary', "
-                                "'memcache_meta', 'redis', 'resp2' and resp3'.\n");
+                                "'memcache_meta', 'redis', 'resp2' and 'resp3'.\n");
                 return -1;
             }
             break;
@@ -3052,7 +3052,8 @@ void usage()
         "                                 other supported protocols are resp2, resp3, memcache_text, "
         "memcache_binary and memcache_meta.\n"
         "                                 memcache_meta is the modern Memcached meta-command protocol "
-        "(memcached 1.6+).\n"
+        "(memcached 1.6.10+).\n"
+        "                                 Each meta operation includes an mn no-op terminator.\n"
         "                                 when using one of resp2 or resp3 the redis protocol version will be set via "
         "HELLO command.\n"
         "  -a, --authenticate=CREDENTIALS Authenticate using specified credentials.\n"

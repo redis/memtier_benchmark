@@ -257,9 +257,8 @@ public:
     // drain flags, current mbulk tree) and clear m_last_response so
     // its mbulk children are freed.
     // The default implementation only clears m_last_response; redis_protocol
-    // overrides to also reset its parser fields. memcache subclasses keep
-    // the default for now (their state machine resets at every reply boundary
-    // and they have no RESP3-style push frame drain to leak).
+    // and memcache_meta_protocol override to also reset their parser fields.
+    // The legacy memcache text and binary implementations retain the default.
     // m_resp3 (negotiated protocol version) is intentionally NOT touched -- a
     // TCP flap should not roll back the HELLO 3 negotiation result.
     virtual void reset_state();

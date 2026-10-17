@@ -1271,7 +1271,7 @@ int memcache_text_protocol::write_arbitrary_command(const char *val, int val_len
 
 /////////////////////////////////////////////////////////////////////////
 //
-// Memcache Meta Protocol (memcached 1.6+).
+// Memcache Meta Protocol (memcached 1.6.10+).
 //
 // The meta protocol is a compact, flag-based ASCII protocol that supersedes
 // the classic text protocol. We implement just enough to drive a representative
@@ -1304,6 +1304,13 @@ class memcache_meta_protocol : public memcache_text_protocol
 public:
     memcache_meta_protocol() {}
     virtual memcache_meta_protocol *clone(void) { return new memcache_meta_protocol(); }
+    virtual void reset_state()
+    {
+        abstract_protocol::reset_state();
+        m_response_state = rs_initial;
+        m_value_len = 0;
+        m_response_len = 0;
+    }
 
     virtual int write_command_set(const char *key, int key_len, const char *value, int value_len, int expiry,
                                   unsigned int offset);

@@ -550,23 +550,7 @@ class MetaProtocolTests(unittest.TestCase):
         self.assertEqual(gets["Misses/sec"], 0.0)
 
     def test_unknown_response_classified_as_parse_error(self):
-        """Server returns a malformed response (`SERVER_ERROR ...`) that the
-        meta parser must classify as unknown and surface as a parse error.
-
-        memtier's framework-level recovery from parse errors is the same for
-        every protocol (it logs and stops popping requests on that connection),
-        so we cannot use a successful end-to-end run as the assertion. What we
-        CAN verify is the meta parser's contract: an unknown response line
-        must produce an `error: response parsing failed` log line on stderr,
-        which only happens when parse_response returns -1.
-
-        This indirectly proves the state-reset code path is taken, because
-        the same branch that emits the error code also runs the
-        m_response_state = rs_initial / m_multi_mode = false reset. (A
-        future regression that re-introduced the state-leak bug would by
-        construction have to keep this -1 return, so this test stays a
-        meaningful regression guard.)
-        """
+        """Unsupported response lines must produce the parser-error diagnostic."""
         # Inject the garbage on command index 0 -- the very first command.
         self._restart_server(garbage_after=0)
         # Use a short test_time and skip waiting for completion: we just need
@@ -586,10 +570,6 @@ class MetaProtocolTests(unittest.TestCase):
         except subprocess.TimeoutExpired:
             proc.kill()
             _, stderr = proc.communicate()
-        # The parser surfaced the error -- this is the observable evidence
-        # that parse_response returned -1, which is exactly the code path
-        # that ALSO performs the state reset (m_response_state = rs_initial,
-        # m_multi_mode = false).
         self.assertIn(b"response parsing failed", stderr,
                       f"expected parse-error log on stderr; got: {stderr[-500:]!r}")
 
@@ -615,20 +595,7 @@ class MetaProtocolTests(unittest.TestCase):
         self.assertEqual(int(results["ALL STATS"]["Sets"]["Count"]), 40)
 
     def test_pipelined_mixed_set_and_multi_get(self):
-        """Regression for the second-pass review's MEDIUM finding.
-
-        --pipeline=2 --ratio=1:4 --multi-key-get=4 enqueues alternating
-        single-shot SET and multi-key GET commands in the same pipeline
-        depth. An earlier (now-fixed) implementation tracked multi-get mode
-        as a write-time flag, which caused the SET's HD response to be
-        absorbed as if it were a multi-get section -- crashing memtier on
-        a m_pending_resp >= 0 assertion.
-
-        This test would crash / hang on the buggy version. The fix (always
-        terminate every command with `mn` so every response ends at `MN`)
-        makes parse_response uniform across single-shot and multi-get and
-        removes the race entirely.
-        """
+        """Mixed pipelined SET/MGET replies retain logical-command boundaries."""
         # Pre-load some keys so multi-gets don't all miss.
         for i in range(1, 11):
             self.server.kv[f"mix:{i}"] = b"M" * 8
@@ -655,8 +622,7 @@ class MetaProtocolTests(unittest.TestCase):
         # number of multi-get batches.
         #
         # This is the property that makes the always-mn design safe under
-        # mixed pipelining -- without it, the v2 m_multi_mode race would have
-        # been masked by a non-counting test.
+        # mixed pipelining, including both single and multi-key replies.
         multi_get_batches = mg_count // 4
         self.assertEqual(
             mn_count, ms_count + multi_get_batches,
