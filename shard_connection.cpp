@@ -2108,10 +2108,15 @@ bool shard_connection::run_deadline_passed(void)
 // Whether the run's stop condition is reached: --requests done or the
 // --test-time deadline passed (see run_deadline(), which also covers a client
 // that never started). finished() reads the run's clock, which only moves
-// with stats updates, so the deadline is also checked on the wall clock.
+// with stats updates. For a started client only unlimited reconnects add the
+// wall-clock check; bounded reconnects retain the stats-clock stop condition.
+// A never-started client still uses the benchmark deadline, as on master.
 bool shard_connection::run_is_over(void)
 {
-    if (m_conns_manager->get_reqs_answered() && m_conns_manager->finished()) return true;
+    if (m_conns_manager->get_reqs_answered()) {
+        if (m_conns_manager->finished()) return true;
+        if (!stops_at_deadline()) return false;
+    }
     return run_deadline_passed();
 }
 
@@ -2266,10 +2271,16 @@ void shard_connection::reconnect_after_setup_error(const char *error_context, bo
     // Redialing an unneeded replica would only be rejected again, about once
     // a second, and once the run is over the rejection would fail a run that
     // the primaries served in full (#656).
-    if (setup_step && m_role == role_replica && m_config->read_preference == rp_primary) {
+    // With --reconnect-on-error, the same holds under secondaryPreferred: the
+    // reads fall back to the primaries. Without it, #750 keeps that replica,
+    // so --connection-stage-timeout reports the misconfiguration at startup.
+    const bool optional_replica = m_config->read_preference == rp_primary ||
+                                  (m_config->read_preference == rp_secondary_preferred && m_config->reconnect_on_error);
+    if (setup_step && m_role == role_replica && optional_replica) {
         benchmark_error_log("warning: %s on replica connection %s; it is not needed under --read-preference "
-                            "primary, closing it.\n",
-                            error_context, get_readable_id());
+                            "%s, closing it.\n",
+                            error_context, get_readable_id(),
+                            m_config->read_preference == rp_primary ? "primary" : "secondaryPreferred");
         disconnect();
         m_setup_rejected_replica = true;
         return;

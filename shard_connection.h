@@ -231,10 +231,13 @@ public:
     enum connection_state get_connection_state() { return m_connection_state; }
     bool is_reconnect_pending() const { return m_reconnecting; }
     // A replica connection closed because the server rejected its setup
-    // under --read-preference primary. The replica path of a slot map refresh
+    // under --read-preference primary (or secondaryPreferred with
+    // --reconnect-on-error). The replica path of a slot map refresh
     // does not redial it; a refresh that makes the node a primary dials it
     // through the primary path, where reconnect_after_setup_error() applies.
     bool is_setup_rejected_replica() const { return m_setup_rejected_replica; }
+    // A setup step was rejected since this connection's last workload reply.
+    bool setup_failed_since_reply() const { return m_setup_failed_since_reply; }
     bool has_requests_to_replay() const { return m_replay_queue != NULL && !m_replay_queue->empty(); }
 
     // Topology role accessors. Defaults to role_primary; cluster_client flips

@@ -47,12 +47,12 @@ void benchmark_log_file_line(int, const char *, unsigned int, const char *, ...)
 void benchmark_log(int, const char *, ...) {}
 void report_connection_stage_failure(const char *) {}
 void report_connection_stage_success() {}
-// No connection reaches steady state here, so a client that never started has
-// no --test-time deadline (run_deadline()): run_is_over() stays false and the
-// failed connects below arm reconnects instead of ending the run.
+// Keep startup active for the sibling tests, so failed connects arm a
+// reconnect. The deadline tests explicitly enable steady state below.
+static bool steady_state = false;
 bool connection_stage_steady_state_reached()
 {
-    return false;
+    return steady_state;
 }
 int failure_exit_code()
 {
@@ -82,6 +82,11 @@ public:
             client(base, config, protocol, generator)
     {
         m_connections.push_back(new shard_connection(1, this, config, base, protocol));
+    }
+    void mark_started(struct timeval *start)
+    {
+        m_reqs_answered = 1;
+        m_stats.set_start_time(start);
     }
 };
 
@@ -197,6 +202,26 @@ int main()
         second.disconnect();
         first.end_client_after_run(false);
         check(!second.is_reconnect_pending(), "the client is torn down once no sibling is busy");
+    }
+    {
+        object_generator generator;
+        generator.set_data_size_fixed(1);
+        two_connection_client manager(base, &config, protocol, &generator);
+        shard_connection &first = *manager.get_connections()[0];
+        gettimeofday(&config.benchmark_start_time, NULL);
+        config.benchmark_start_time.tv_sec -= config.test_time + 2;
+        steady_state = true;
+        config.max_reconnect_attempts = 5;
+        check(first.run_is_over(), "a never-started bounded client retains the benchmark deadline");
+        config.reconnect_on_error = false;
+        check(first.run_is_over(), "a never-started client without reconnect retains the benchmark deadline");
+        manager.mark_started(&config.benchmark_start_time);
+        check(!manager.finished(), "a started client's stats clock has not advanced");
+        check(!first.run_is_over(), "without reconnect a started client uses its stats clock");
+        config.reconnect_on_error = true;
+        check(!first.run_is_over(), "bounded reconnects use a started client's stats clock");
+        config.max_reconnect_attempts = 0;
+        check(first.run_is_over(), "unlimited reconnects check a started client's wall-clock deadline");
     }
     delete protocol;
     event_base_free(base);

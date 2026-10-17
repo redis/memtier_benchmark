@@ -101,6 +101,43 @@ def test_replica_rejecting_auth_with_reconnect_is_closed_not_redialed(env):
         env.assertLess(elapsed, 8)
 
 
+def test_replica_rejecting_auth_with_reconnect_under_secondary_preferred_is_closed(env):
+    # Under secondaryPreferred the reads fall back to the primary, so with
+    # --reconnect-on-error a replica whose AUTH is rejected is closed as an
+    # unneeded one, not redialed until its retry at the deadline fails the
+    # run (#656). (Without --reconnect-on-error it is kept, see
+    # test_replica_rejecting_auth_is_kept_when_it_serves_reads.)
+    node = _primary_with_replica_rejecting_auth()
+    returncode, stderr, elapsed, stats = _run_json(env, node, ["-a", "dummy-pw-737", "--test-time=2", "--reconnect-on-error",
+                                              "--read-preference=secondaryPreferred",
+                                              "--connection-stage-timeout=5"], clients=2)
+    env.assertEqual(node.errors + node.replica.errors, [])
+    env.assertEqual(returncode, 0, message=stderr[-2000:])
+    env.assertEqual(stderr.count("not needed under --read-preference secondaryPreferred, closing it"), 2,
+                    message=stderr[-2000:])
+    env.assertFalse("attempting reconnection" in stderr, message=stderr[-2000:])
+    env.assertEqual(node.replica.auth_requests, 2)
+    env.assertEqual(node.replica.data_requests, 0)
+    env.assertGreater(node.data_requests, 0)
+    env.assertEqual(stats.get("Connection Errors"), 0)
+    env.assertLess(elapsed, 8)
+
+
+def test_replica_rejecting_auth_with_reconnect_under_secondary_fails_run(env):
+    # Under --read-preference secondary the replica is required: with
+    # --reconnect-on-error it is redialed, and a setup still rejected at the
+    # deadline fails the run (#630).
+    node = _primary_with_replica_rejecting_auth()
+    returncode, stderr, elapsed = _run(node, ["-a", "dummy-pw-737", "--test-time=2", "--reconnect-on-error",
+                                              "--read-preference=secondary", "--read-preference-fallback=primary",
+                                              "--connection-stage-timeout=5"], clients=2)
+    env.assertEqual(node.errors + node.replica.errors, [])
+    env.assertEqual(returncode, 1, message=stderr[-2000:])
+    env.assertFalse(_CLOSED_REPLICA in stderr, message=stderr[-2000:])
+    env.assertFalse("closing it" in stderr, message=stderr[-2000:])
+    env.assertLess(elapsed, 8)
+
+
 def test_replica_rejecting_select_does_not_hold_requests_run(env):
     replica = _Node(bad_slots_replies=0, select_error=b"-ERR DB index is out of range\r\n")
     node = _Node(bad_slots_replies=0, replica=replica)

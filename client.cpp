@@ -393,6 +393,14 @@ void client::set_end_time()
 
         m_stats.set_end_time(NULL);
         m_end_set = true;
+        // A connection whose setup the server rejected since its last reply
+        // (a required replica, say) and that never recovered fails the run
+        // (#630), also when another connection ends the client first: which
+        // one ends first is only timing.
+        for (unsigned int i = 0; i < m_connections.size(); i++) {
+            shard_connection *sc = m_connections[i];
+            if (sc != NULL && sc->stops_at_deadline() && sc->setup_failed_since_reply()) m_run_failed = true;
+        }
     }
 }
 
