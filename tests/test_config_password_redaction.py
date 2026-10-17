@@ -285,20 +285,67 @@ def test_config_uri_at_in_query_or_fragment_not_retargeted(env):
         decoy.close()
 
 
-def test_config_uri_credentials_without_host_warns_and_uses_default(env):
-    """Credentials with an empty host and no --server/--unix-socket fall back
-    to the default server (localhost), as on master, but now say so on stderr
-    without the password. The run reaches the target, since it is on
-    localhost, and the credentials are redacted everywhere."""
-    host, port = _target(env)
-    if host != "localhost":
-        env.skip()
-    stderr = _check(env, _CANARY, ["--uri", "redis://default:{}@:{}".format(_CANARY, port)],
-                    "redis://default:***@:{}".format(port), "default:***", [_CANARY])
+# The default server is "localhost"; RLTest nodes listen on loopback, which
+# _target() reports as "localhost" (or "127.0.0.1" as a fallback). Either way
+# the default server reaches the test target.
+_LOOPBACK = ("localhost", "127.0.0.1")
+
+
+def _check_default_server_warning(env, stderr, port):
     env.assertContains("warning: --uri has no host; connecting to the default server localhost:{}.".format(port),
                        stderr)
     env.assertEqual(_show_config_value(stderr, "server"), "localhost")
     env.assertFalse("missing host in URI" in stderr)
+
+
+def test_config_uri_credentials_without_host_warns_and_uses_default(env):
+    """Credentials with an empty host and no --server/--unix-socket fall back
+    to the default server (localhost), as on master, but now say so on stderr
+    without the password. The run reaches the target, which is on loopback,
+    and the credentials are redacted everywhere."""
+    host, port = _target(env)
+    env.assertContains(host, _LOOPBACK)  # never skip: the warning path needs coverage
+    stderr = _check(env, _CANARY, ["--uri", "redis://default:{}@:{}".format(_CANARY, port)],
+                    "redis://default:***@:{}".format(port), "default:***", [_CANARY])
+    _check_default_server_warning(env, stderr, port)
+
+
+def test_config_uri_password_with_slash_without_host_warns(env):
+    """A raw '/' in the password with an empty host but a port after the '@'
+    (redis://u:a/b@:port) is real credentials: it falls back and warns like
+    the other host-less forms."""
+    _host, port = _target(env)
+    password = "a/" + _CANARY
+    stderr = _check(env, password, ["--uri", "redis://default:{}@:{}".format(password, port)],
+                    "redis://default:***@:{}".format(port), "default:***", [_CANARY])
+    _check_default_server_warning(env, stderr, port)
+
+
+def test_config_uri_password_with_slash_nothing_after_at_rejected(env):
+    """redis://u:a/b@ (nothing after the '@') has the same shape as a stray
+    '@' after a path (redis://host:6379/1@) and cannot be told apart from it
+    without percent-encoding (#732), so it is rejected rather than run
+    against the default server."""
+    with tempfile.TemporaryDirectory() as workdir:
+        _raw, stdout, stderr = _run(env, ["--uri", "redis://default:a/{}@".format(_CANARY)], workdir,
+                                    expect_ok=False)
+    env.assertContains("missing host in URI", stderr)
+    env.assertFalse(_CANARY in stdout + stderr)
+
+
+def test_config_uri_without_host_or_credentials_warns(env):
+    """redis://:port (no '@') warns the same way as redis://u:pw@:port: the
+    warning keys on the empty host, not on credentials."""
+    if env.getMasterNodesList()[0].get("password"):
+        env.skip()
+    host, port = _target(env)
+    env.assertContains(host, _LOOPBACK)
+    with tempfile.TemporaryDirectory() as workdir:
+        raw_json, _stdout, stderr = _run(env, ["--uri", "redis://:{}".format(port)], workdir)
+    _check_default_server_warning(env, stderr, port)
+    cfg = json.loads(raw_json)["configuration"]
+    env.assertEqual(cfg["uri"], "redis://:{}".format(port))
+    env.assertEqual(cfg["authenticate"], "")
 
 
 def test_config_uri_without_host_uses_explicit_server(env):

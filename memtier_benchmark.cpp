@@ -1091,6 +1091,7 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
     // Parse user:password@host:port/db; see uri_userinfo_end() for where the
     // userinfo ends (redact_uri() splits at the same place).
     char *auth_end = (char *) uri_userinfo_end(ptr);
+    bool nothing_after_at = false;
     char *host_start = ptr;
 
     if (auth_end) {
@@ -1098,6 +1099,7 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
             fprintf(stderr, "warning: both URI and --authenticate specified, URI takes precedence.\n");
         }
         // Own URI credentials separately from the borrowed --authenticate argument.
+        nothing_after_at = auth_end[1] == '\0';
         *auth_end = '\0';
         uri_authenticate = ptr;
         cfg->authenticate = uri_authenticate.c_str();
@@ -1155,15 +1157,17 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
         cfg->port = port;
     }
 
-    // An '@' with no host after it and no explicit --server/--unix-socket
-    // falls back to the default server, as before (parse_uri() runs before
+    // An empty host with no explicit --server/--unix-socket falls back to the
+    // default server, as before (parse_uri() runs before
     // config_init_defaults(), so a non-NULL server or unix_socket here was
-    // given on the command line). If the "credentials" contain a '/', '?' or
-    // '#', the '@' was a stray one after the path (redis://host:6379/1@), not
-    // the end of real credentials: reject that rather than benchmark the
-    // default server. Otherwise (redis://user:pw@:6379) say where the run goes.
-    if (auth_end && strlen(host_start) == 0 && !cfg->server && !cfg->unix_socket) {
-        if (strpbrk(uri_authenticate.c_str(), "/?#")) {
+    // given on the command line); say where the run goes. The one exception
+    // is the shape of a stray '@' after the path, redis://host:6379/1@:
+    // nothing at all after the '@' and a '/', '?' or '#' in the "credentials".
+    // That is rejected rather than benchmark the default server. A password
+    // with a raw '/' is ambiguous only in that same shape (redis://u:a/b@);
+    // redis://u:a/b@:6379 has a port after the '@' and falls back as usual.
+    if (strlen(host_start) == 0 && !cfg->server && !cfg->unix_socket) {
+        if (nothing_after_at && strpbrk(uri_authenticate.c_str(), "/?#")) {
             fprintf(stderr, "error: missing host in URI.\n");
             free(uri_copy);
             return -1;
