@@ -18,6 +18,7 @@ import os
 import subprocess
 import tempfile
 import threading
+import time
 
 import redis
 
@@ -31,6 +32,12 @@ from mb import Benchmark, RunConfig
 from test_cluster_failover_retry import _cluster_nodes
 
 KEY_MAXIMUM = 200
+# Rounds of CLIENT KILL, each dropping at least one memtier connection to
+# the importing node, before the killer stops. Each one leaves the -ASK
+# retries waiting on the reconnect timer (1 s). A killer running for the
+# whole run left no bound on its length: the retries completed only when a
+# reconnect, its setup and the resends fit between two kills (#680).
+KILL_WAVES = 5
 
 
 def _conn(env, node):
@@ -103,15 +110,26 @@ def _asking_calls(env, node):
     return int(stats.get("cmdstat_asking", {}).get("calls", 0))
 
 
-def _kill_clients(env, node, stop):
-    # Drop every client connection to the importing node (but this one) while
-    # memtier runs, so its connection keeps waiting on a reconnect timer.
-    conn = _conn(env, node)
-    while not stop.wait(0.5):
+def _client_ids(conn):
+    return set(int(c["id"]) for c in conn.client_list())
+
+
+def _kill_clients(conn, ignore, stop, waves):
+    """Every 0.5 s, drop the connections to the importing node opened after
+    `ignore` was listed (memtier's), until `waves` rounds dropped at least
+    one. Returns the number of connections dropped."""
+    killed = 0
+    while waves > 0 and not stop.wait(0.5):
+        dropped = 0
         try:
-            conn.execute_command("CLIENT", "KILL", "TYPE", "normal")
+            for client_id in _client_ids(conn) - ignore:
+                dropped += conn.execute_command("CLIENT", "KILL", "ID", client_id)
         except redis.RedisError:
             pass
+        if dropped:
+            killed += dropped
+            waves -= 1
+    return killed
 
 
 def _run(env, label, extra_args, pipeline, transaction=False, kill=False, requests=2000, timeout=30):
@@ -144,20 +162,41 @@ def _run(env, label, extra_args, pipeline, transaction=False, kill=False, reques
     source, target, other = masters[0], masters[1], masters[2]
     slots = _migrate_even_keys(env, masters)
     stop = threading.Event()
-    killer = threading.Thread(target=_kill_clients, args=(env, target, stop), daemon=True)
+    killed = []
     if kill:
+        kill_conn = _conn(env, target)
+        ignore = _client_ids(kill_conn)
+        killer = threading.Thread(target=lambda: killed.append(_kill_clients(kill_conn, ignore, stop, KILL_WAVES)),
+                                  daemon=True)
         killer.start()
+    stderr_path = os.path.join(run_config.results_dir, "mb.stderr")
+    start = time.time()
     try:
-        result = subprocess.run(benchmark.args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                                timeout=timeout)
+        with open(stderr_path, "wb") as stderr_file:
+            proc = subprocess.Popen(benchmark.args, stdout=subprocess.DEVNULL, stderr=stderr_file)
+            try:
+                rc = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                # Keep what memtier printed: it tells a stall from a hang.
+                proc.kill()
+                proc.wait()
+                rc = None
+        elapsed = time.time() - start
     finally:
         stop.set()
         if kill:
             killer.join()
         asking = dict((n["port"], _asking_calls(env, n)) for n in masters)
         _restore(env, masters, slots)
-    stderr = result.stderr.decode("utf-8", errors="replace")
-    env.assertEqual(result.returncode, 0, message=label + "\n" + stderr[-4000:])
+    with open(stderr_path, "rb") as f:
+        stderr = f.read().decode("utf-8", errors="replace")
+    env.assertEqual(rc, 0, message="{} (ran {:.1f} s, timeout {} s)\n{}".format(
+        label, elapsed, timeout, stderr[-4000:]))
+    if rc != 0:
+        return
+    if kill:
+        # The kills did hit memtier while it ran.
+        env.assertGreater(killed[0], 0, message=label)
     with open(os.path.join(run_config.results_dir, "mb.json")) as f:
         stats = json.load(f)["ALL STATS"]
     totals = stats["Totals"]
