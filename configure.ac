@@ -202,7 +202,8 @@ AC_ARG_WITH([bash-completion-dir],
 AS_CASE(["$with_bash_completion_dir"],
   [yes], [BASH_COMPLETION_DIR='${datadir}/bash-completion/completions'],
   [no], [BASH_COMPLETION_DIR=],
-  [BASH_COMPLETION_DIR="$with_bash_completion_dir"])
+  [/*], [BASH_COMPLETION_DIR="$with_bash_completion_dir"],
+  [AC_MSG_ERROR([--with-bash-completion-dir requires an absolute, non-empty directory; use --without-bash-completion-dir to disable installation])])
 AC_SUBST([BASH_COMPLETION_DIR])
 AM_CONDITIONAL([INSTALL_BASH_COMPLETION], [test "x$with_bash_completion_dir" != "xno"])
 
