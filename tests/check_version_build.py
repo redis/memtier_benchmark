@@ -79,9 +79,9 @@ def check(build_dir):
         make()
         expect(second + ':0')
 
-        # A failed metadata read must neither replace valid provenance nor
-        # compile another binary using stale provenance. Simulate each Git
-        # failure separately; status 1 from diff-index was covered above.
+        # Metadata errors warn and use explicitly unknown provenance, preserving
+        # build compatibility without claiming a possibly stale SHA. Exercise
+        # each Git failure; ordinary diff-index status 1 was covered above.
         fake_bin = root / 'fake-bin'
         fake_bin.mkdir()
         fake_git = fake_bin / 'git'
@@ -92,14 +92,14 @@ def check(build_dir):
                                 'if [ "$3" = "' + operation + '" ]; then exit 128; fi\n'
                                 'exec ' + real_git + ' "$@"\n')
             fake_git.chmod(0o755)
+            output = make(env=refused_env)
+            assert 'warning: cannot read Git metadata' in output, output
+            expect('00000000:0')
             unchanged = stamps()
-            try:
-                make(env=refused_env)
-            except subprocess.CalledProcessError as error:
-                assert 'cannot read Git metadata' in error.stdout, error.stdout
-            else:
-                raise AssertionError(operation + ' failure did not stop the build')
-            assert stamps() == unchanged, operation + ' failure changed build artifacts'
+            output = make(env=refused_env)
+            assert 'warning: cannot read Git metadata' in output, output
+            assert stamps() == unchanged, operation + ' failure repeatedly rebuilt artifacts'
+            make()
             expect(second + ':0')
 
         # Archives can be unpacked within an unrelated repository. They must

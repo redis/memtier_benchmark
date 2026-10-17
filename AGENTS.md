@@ -242,8 +242,9 @@ Watch out for:
   metadata on every invocation and updates `version.h` only when it changes.
   Older branches with the dependencyless header rule still require removing
   `version.h` before running this script, or `help2man` can embed a stale SHA.
-  A Git metadata error in a checkout stops the build before changing the header;
-  correct repository access/ownership before retrying the build or installation.
+  A Git metadata error warns and uses unknown provenance; correct repository
+  access/ownership to recover the SHA. Installation also rechecks metadata and
+  can rebuild its consumers if the SHA, dirty state or Git access changed.
 - **No branch sanity check.** The script doesn't verify the current branch.
   Confirm `git branch --show-current` matches the intended release branch
   before running.
