@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Exercise the configured version.h rule without changing the real checkout."""
+"""Standalone CI check of version.h generation; does not require RLTest."""
 
 import argparse
+import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import tempfile
 
 
-def run(command, cwd):
-    return subprocess.run(command, cwd=cwd, check=True, text=True,
+def run(command, cwd, env=None):
+    return subprocess.run(command, cwd=cwd, env=env, check=True, text=True,
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                           timeout=30).stdout
 
@@ -41,12 +43,12 @@ def check(build_dir):
         (build / 'probe.mk').write_text(
             'probe: probe.c version.h\n\t$(CC) -o $@ probe.c\n')
 
-        def make(target='probe', src=source):
+        def make(target='probe', src=source, env=None):
             # Use the actual configured production rule. Only the tiny consumer
             # is a fixture; no version dependency or recipe is duplicated here.
             return run(['make', '--no-print-directory', '-j4', '-f', str(makefile),
                         '-f', 'probe.mk', 'srcdir=' + str(src),
-                        'top_srcdir=' + str(src), target], build)
+                        'top_srcdir=' + str(src), target], build, env=env)
 
         def expect(value):
             assert run([str(build / 'probe')], build).strip() == value
@@ -77,6 +79,29 @@ def check(build_dir):
         make()
         expect(second + ':0')
 
+        # A failed metadata read must neither replace valid provenance nor
+        # compile another binary using stale provenance. Simulate each Git
+        # failure separately; status 1 from diff-index was covered above.
+        fake_bin = root / 'fake-bin'
+        fake_bin.mkdir()
+        fake_git = fake_bin / 'git'
+        real_git = shlex.quote(shutil.which('git'))
+        refused_env = dict(os.environ, PATH=str(fake_bin) + os.pathsep + os.environ['PATH'])
+        for operation in ('ls-files', 'rev-parse', 'diff-index'):
+            fake_git.write_text('#!/bin/sh\n'
+                                'if [ "$3" = "' + operation + '" ]; then exit 128; fi\n'
+                                'exec ' + real_git + ' "$@"\n')
+            fake_git.chmod(0o755)
+            unchanged = stamps()
+            try:
+                make(env=refused_env)
+            except subprocess.CalledProcessError as error:
+                assert 'cannot read Git metadata' in error.stdout, error.stdout
+            else:
+                raise AssertionError(operation + ' failure did not stop the build')
+            assert stamps() == unchanged, operation + ' failure changed build artifacts'
+            expect(second + ':0')
+
         # Archives can be unpacked within an unrelated repository. They must
         # report unknown provenance instead of that surrounding checkout's SHA.
         archive = source / 'archive'
@@ -91,7 +116,7 @@ def check(build_dir):
         make(src=source)
         expect(second + ':0')
         print('PASS: first/direct build, HEAD advance, dirty/clean transitions, '
-              'unchanged timestamps, VPATH source and archive provenance')
+              'unchanged timestamps, metadata failures, VPATH source and archive provenance')
 
 
 if __name__ == '__main__':

@@ -19,7 +19,7 @@ AUTOMAKE_OPTIONS = foreign 1.9 subdir-objects
 CODE_COVERAGE_IGNORE_PATTERN='*/deps/hdr_histogram/*' '*/tests/*'
 
 EXTRA_DIST = README.md COPYING version.sh \
-	tests/test_version_build.py \
+	tests/check_version_build.py \
 	scripts/fetch_commands_meta.sh \
 	scripts/gen_command_meta.py \
 	deps/commands_json/REDIS_TAG.txt \
