@@ -2225,8 +2225,24 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
                 if (t.per_key_hits.empty()) continue;
                 if (i >= command_list.size()) continue;
                 jsonhandler->open_nesting(keys[i].c_str());
-                jsonhandler->write_obj("Total Hits", "%llu", mean_count(t.total_hits, m_averaged_runs));
-                jsonhandler->write_obj("Total Misses", "%llu", mean_count(t.total_misses, m_averaged_runs));
+                // In an AVERAGE, when the totals are the sum of the per-key
+                // buckets, keep them so: sum the rounded buckets, like Totals
+                // and its rows.
+                unsigned long long total_hits = mean_count(t.total_hits, m_averaged_runs);
+                unsigned long long total_misses = mean_count(t.total_misses, m_averaged_runs);
+                if (m_averaged_runs > 0) {
+                    unsigned long long key_hits = 0, key_misses = 0, mean_hits = 0, mean_misses = 0;
+                    for (size_t k = 0; k < t.per_key_hits.size(); ++k) {
+                        key_hits += t.per_key_hits[k];
+                        key_misses += t.per_key_misses[k];
+                        mean_hits += mean_count(t.per_key_hits[k], m_averaged_runs);
+                        mean_misses += mean_count(t.per_key_misses[k], m_averaged_runs);
+                    }
+                    if (key_hits == t.total_hits) total_hits = mean_hits;
+                    if (key_misses == t.total_misses) total_misses = mean_misses;
+                }
+                jsonhandler->write_obj("Total Hits", "%llu", total_hits);
+                jsonhandler->write_obj("Total Misses", "%llu", total_misses);
                 for (size_t k = 0; k < t.per_key_hits.size(); ++k) {
                     char label[32];
                     snprintf(label, sizeof(label), "key[%zu] Hits", k);

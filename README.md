@@ -264,7 +264,8 @@ values:
   runs gives 1, not 0, next to its non-zero rate. The `Totals` `Count` and
   `Accumulated Latency` are the sum of the rounded command rows, so `Totals`
   is exactly the sum of its rows; it can differ from the mean of the per-run
-  `Totals` by up to half a unit per row.
+  `Totals` by about one unit per row. In the same way, the `Per-Key Misses`
+  `Total Hits` / `Total Misses` are the sum of the rounded `key[i]` values.
 - Ops/sec, KB/sec, the default workload's Hits/sec and Misses/sec, and the
   JSON `Latency` / `Average Latency` are the mean of the per-run values. The
   Hits/sec and Misses/sec of `--command` rows are time-weighted instead: the

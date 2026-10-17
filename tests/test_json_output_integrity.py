@@ -1143,8 +1143,20 @@ def _check_aggregated_arbitrary_command_counts(env, breakdown, expected_rows):
             fields = [f for f in per_key[mget[0]] if f.startswith(("Total", "key["))]
             env.assertEqual(len(fields), 2 + 2 * 3, message=str(fields))
             env.assertGreater(float(per_key[mget[0]]["Total Misses"]), 0)
+            key_fields = [f for f in fields if f.startswith("key[")]
             _assert_aggregated_counts_are_run_mean(
-                env, results, run_count, ("Per-Key Misses", mget[0]), fields)
+                env, results, run_count, ("Per-Key Misses", mget[0]), key_fields)
+            # Each Total is the sum of its rounded key[i] values, like Totals
+            # and its rows, and so within about one unit per key of the mean.
+            for kind in ("Hits", "Misses"):
+                keys_sum = sum(per_key[mget[0]][f] for f in key_fields
+                               if f.endswith(" " + kind))
+                env.assertEqual(per_key[mget[0]][f"Total {kind}"], keys_sum,
+                                message=f"{agg_key}: MGET Total {kind} != sum "
+                                        f"of the key[i] {kind}: {per_key[mget[0]]}")
+                _assert_aggregated_counts_are_run_mean(
+                    env, results, run_count, ("Per-Key Misses", mget[0]),
+                    (f"Total {kind}",), slack=3)
     finally:
         if env.getNumberOfFailedAssertion() > failed_asserts:
             debugPrintMemtierOnError(run_config, env)
