@@ -333,9 +333,14 @@ reader is still there (for example a full non-blocking pipe) still fails the
 run. Any other `--out-file` (for example a FIFO whose reader exits) and
 `--json-out-file` always fail the run when a write fails.
 
-Not covered yet: write errors on the HDR histogram files
+The same rule covers the other output files: the HDR histogram files
 (`--hdr-file-prefix`), the `--client-stats` CSV files and
-`--failed-keys-file` are still not checked.
+`--failed-keys-file`. If one of them cannot be opened or written, memtier
+prints `error: cannot open --hdr-file-prefix file PATH: REASON` or `error:
+failed writing --client-stats file PATH: REASON` (or `--failed-keys-file
+PATH`), still writes the other files, and exits with status **1**. The run
+itself is not cut short: a `--failed-keys-file` that fails stops logging
+(`logging disabled`) and the benchmark goes on.
 
 A stdout that was already closed when memtier started is handled separately,
 see [Closed stdin, stdout or stderr](#closed-stdin-stdout-or-stderr).
@@ -373,9 +378,8 @@ Otherwise:
 - `--hdr-file-prefix` and `--client-stats` are prefixes: memtier always
   appends a suffix (`_FULL_RUN_1.txt`, `-1-0-0.csv`, ...), so they never
   name `/dev/stdout` or `/dev/fd/N` themselves. They are not checked. A
-  file they cannot open or write is reported but does not fail the run
-  yet; that known gap is tracked in
-  [#744](https://github.com/redis/memtier_benchmark/issues/744).
+  file they cannot open or write fails the run, see
+  [Output write errors](#output-write-errors).
 
 ## Crash Reporting
 

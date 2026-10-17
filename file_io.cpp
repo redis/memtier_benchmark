@@ -23,6 +23,9 @@
 #include <errno.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
+#include <poll.h>
+#include <sys/stat.h>
 #include "file_io.h"
 
 int finish_output_file(FILE *fp, bool do_close)
@@ -39,6 +42,32 @@ int finish_output_file(FILE *fp, bool do_close)
     }
     if (do_close && fclose(fp) != 0 && err == 0) err = errno;
     return err;
+}
+
+bool stdout_reader_gone(FILE *fp, int err)
+{
+    if (err != EPIPE && err != ECONNRESET && err != EIO) return false;
+    int fd = fileno(fp);
+    struct stat st, out_st;
+    if (fstat(fd, &st) != 0 || !(S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode))) return false;
+    if (fp != stdout &&
+        (fstat(STDOUT_FILENO, &out_st) != 0 || st.st_dev != out_st.st_dev || st.st_ino != out_st.st_ino))
+        return false;
+    if (err != EIO) return true;
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLOUT;
+    pfd.revents = 0;
+    return poll(&pfd, 1, 0) == 1 && (pfd.revents & (POLLERR | POLLHUP)) != 0;
+}
+
+int close_output_file(FILE *fp)
+{
+    int err = finish_output_file(fp, false);
+    // Checked before fclose(), while the fd is still open.
+    bool reader_gone = err != 0 && stdout_reader_gone(fp, err);
+    if (fclose(fp) != 0 && err == 0) err = errno;
+    return reader_gone ? 0 : err;
 }
 
 /** largest support line length */

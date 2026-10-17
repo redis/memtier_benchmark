@@ -1897,15 +1897,17 @@ void client_group::drain_prom_latency_histogram(hdr_histogram *target, bool run_
 }
 
 
-void client_group::write_client_stats(const char *prefix)
+// Returns false if any client's CSV could not be written (save_csv() prints
+// why); the remaining clients are still written.
+bool client_group::write_client_stats(const char *prefix)
 {
+    bool ok = true;
     for (unsigned int i = 0; i < m_clients.size(); i++) {
         if (!m_clients[i]->get_stats()->has_started()) continue;
         char filename[PATH_MAX];
 
         snprintf(filename, sizeof(filename) - 1, "%s-%u.csv", prefix, i);
-        if (!m_clients[i]->get_stats()->save_csv(filename, m_config)) {
-            fprintf(stderr, "error: %s: failed to write client stats.\n", filename);
-        }
+        if (!m_clients[i]->get_stats()->save_csv(filename, m_config)) ok = false;
     }
+    return ok;
 }

@@ -2043,6 +2043,99 @@ def test_connection_stage_abort_keeps_rc_2_on_write_error(env):
     env.assertContains("error: failed writing --out-file /dev/full: No space left on device", stderr)
 
 
+
+def _symlink_to_dev_full(directory, names):
+    """Make each of names in directory a symlink to /dev/full; return their paths."""
+    paths = [os.path.join(directory, name) for name in names]
+    for path in paths:
+        os.symlink('/dev/full', path)
+    return paths
+
+
+def test_hdr_file_write_error(env):
+    """--hdr-file-prefix files that cannot be written fail the run (#744).
+
+    The names are built from the prefix, so a symlink to /dev/full stands in
+    for each one. This covers the .txt and .hgrm files of the full run and
+    of a command; the other files are still written.
+    """
+    if not os.path.exists('/dev/full'):
+        env.skip()
+        return
+    with tempfile.TemporaryDirectory() as hdr_dir:
+        prefix = os.path.join(hdr_dir, 'h')
+        full = _symlink_to_dev_full(hdr_dir, ['h_FULL_RUN_1.txt', 'h_FULL_RUN_1.hgrm',
+                                              'h_SET_command_run_1.txt', 'h_GET_command_run_1.hgrm'])
+        rc, stderr = _run_with_unwritable_output(env, ['--hdr-file-prefix', prefix], subprocess.DEVNULL)
+        env.assertEqual(rc, 1, message=stderr)
+        for path in full:
+            env.assertContains("error: failed writing --hdr-file-prefix file {}: ".format(path), stderr)
+        for name in ['h_SET_command_run_1.hgrm', 'h_GET_command_run_1.txt']:
+            env.assertGreater(os.path.getsize(os.path.join(hdr_dir, name)), 0)
+
+
+def test_client_stats_write_error(env):
+    """A --client-stats CSV that cannot be written fails the run (#744)."""
+    if not os.path.exists('/dev/full'):
+        env.skip()
+        return
+    with tempfile.TemporaryDirectory() as stats_dir:
+        csv, = _symlink_to_dev_full(stats_dir, ['cs-1-0-0.csv'])
+        rc, stderr = _run_with_unwritable_output(env, ['--client-stats', os.path.join(stats_dir, 'cs')],
+                                                 subprocess.DEVNULL)
+        env.assertEqual(rc, 1, message=stderr)
+        env.assertContains("error: failed writing --client-stats file {}: No space left on device".format(csv),
+                           stderr)
+
+
+def _run_with_oom_sets(env, extra_args, closed_stdout_pipe=False):
+    """Run SETs that all fail with -OOM, so each one is logged to --failed-keys-file."""
+    conns = env.getOSSMasterNodesConnectionList()
+    for conn in conns:
+        conn.execute_command('CONFIG', 'SET', 'maxmemory', '1')
+    try:
+        if closed_stdout_pipe:
+            return _closed_pipe_run(env, ['--ratio', '1:0'] + extra_args)
+        return _run_with_unwritable_output(env, ['--ratio', '1:0'] + extra_args, subprocess.DEVNULL)
+    finally:
+        for conn in conns:
+            conn.execute_command('CONFIG', 'SET', 'maxmemory', '0')
+
+
+def test_failed_keys_file_write_error(env):
+    """A --failed-keys-file that cannot be written fails the run (#744).
+
+    The records were flushed, but the failed flush was not checked, so no
+    record reached the file and memtier exited 0 without a message.
+    """
+    if not os.path.exists('/dev/full'):
+        env.skip()
+        return
+    rc, stderr = _run_with_oom_sets(env, ['--failed-keys-file', '/dev/full'])
+    env.assertEqual(rc, 1, message=stderr)
+    env.assertContains("error: failed writing --failed-keys-file /dev/full: No space left on device", stderr)
+
+
+def test_failed_keys_file_stdout_reader_gone(env):
+    """A --failed-keys-file on stdout whose reader went away is not an error (#744).
+
+    Same rule as for the results on stdout (#719): only logging stops.
+    """
+    rc, stderr = _run_with_oom_sets(env, ['--failed-keys-file', '/dev/stdout'], closed_stdout_pipe=True)
+    env.assertEqual(rc, 0, message=stderr)
+    env.assertNotContains("--failed-keys-file", stderr)
+
+def test_failed_keys_file_written(env):
+    """The same -OOM run with a writable --failed-keys-file logs every key and exits 0."""
+    with tempfile.TemporaryDirectory() as log_dir:
+        path = os.path.join(log_dir, 'failed-keys.csv')
+        rc, stderr = _run_with_oom_sets(env, ['--failed-keys-file', path])
+        env.assertEqual(rc, 0, message=stderr)
+        with open(path) as f:
+            lines = f.read().splitlines()
+        env.assertEqual(lines[0], 'timestamp,command,key,status,retries')
+        env.assertEqual(len(lines), 11, message=stderr)
+
 def test_out_file_fifo_reader_exits_is_an_error(env):
     """An --out-file FIFO whose reader exits fails the run (#719).
 

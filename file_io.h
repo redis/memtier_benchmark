@@ -69,4 +69,19 @@ public:
  * when an earlier write failed and its errno is no longer known). */
 int finish_output_file(FILE *fp, bool do_close);
 
+/** True if the write error err on the still-open fp only means that the
+ * stdout reader went away (e.g. `| head`): fp is stdout or the same file, a
+ * pipe or socket, and the error is EPIPE/ECONNRESET (SIGPIPE is ignored). The
+ * EIO from finish_output_file() hides the real errno, which may be EAGAIN on
+ * a full stdout pipe made non-blocking by a parent sharing it (e.g. Node or a
+ * CI runner), so for EIO poll(): POLLERR/POLLHUP means the reader is gone.
+ * Such a write error does not fail the run. */
+bool stdout_reader_gone(FILE *fp, int err);
+
+/** Flushes and closes fp, a file opened for one of the output options.
+ * Returns 0 if every write reached the OS or the only failure is a stdout
+ * reader that went away (stdout_reader_gone()), otherwise an errno value as
+ * finish_output_file() does. */
+int close_output_file(FILE *fp);
+
 #endif /* _FILE_IO_H */

@@ -17,6 +17,7 @@
  */
 
 #include "retry_policy.h"
+#include "file_io.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -105,7 +106,7 @@ bool is_retryable_error(const char *status, const char *filter_csv)
     return true;
 }
 
-failed_keys_logger::failed_keys_logger() : m_fp(NULL), m_disabled(false), m_path(NULL)
+failed_keys_logger::failed_keys_logger() : m_fp(NULL), m_disabled(false), m_err(0), m_path(NULL)
 {
     pthread_mutex_init(&m_mtx, NULL);
 }
@@ -131,8 +132,9 @@ bool failed_keys_logger::open(const char *path)
     }
     m_fp = fopen(path, "a");
     if (!m_fp) {
-        fprintf(stderr, "warning: failed-keys-file '%s' could not be opened (%s); logging disabled.\n", path,
-                strerror(errno));
+        // The run goes on, but close() reports the error and main() exits 1.
+        m_err = errno;
+        fprintf(stderr, "error: cannot open --failed-keys-file %s: %s; logging disabled.\n", path, strerror(m_err));
         m_disabled = true;
         pthread_mutex_unlock(&m_mtx);
         return false;
@@ -145,19 +147,42 @@ bool failed_keys_logger::open(const char *path)
     if (pos == 0) {
         fprintf(m_fp, "timestamp,command,key,status,retries\n");
     }
-    fflush(m_fp);
+    int err = finish_output_file(m_fp, false);
+    if (err != 0) write_failed_locked(err);
     pthread_mutex_unlock(&m_mtx);
-    return true;
+    return err == 0;
 }
 
-void failed_keys_logger::close()
+// Called with m_mtx held when a write (or the flush that performs it) failed,
+// e.g. on a full disk: report it once, stop logging and keep the error for
+// close(), so the run exits 1 like for --out-file. A stdout reader that went
+// away (a path such as /dev/stdout and `| head`) only stops logging.
+void failed_keys_logger::write_failed_locked(int err)
+{
+    if (!stdout_reader_gone(m_fp, err)) {
+        fprintf(stderr, "error: failed writing --failed-keys-file %s: %s; logging disabled.\n", m_path ? m_path : "?",
+                strerror(err));
+        if (m_err == 0) m_err = err;
+    }
+    m_disabled = true;
+    fclose(m_fp);
+    m_fp = NULL;
+}
+
+int failed_keys_logger::close()
 {
     pthread_mutex_lock(&m_mtx);
     if (m_fp) {
-        fclose(m_fp);
+        int err = close_output_file(m_fp);
         m_fp = NULL;
+        if (err != 0) {
+            fprintf(stderr, "error: failed writing --failed-keys-file %s: %s\n", m_path ? m_path : "?", strerror(err));
+            if (m_err == 0) m_err = err;
+        }
     }
+    int err = m_err;
     pthread_mutex_unlock(&m_mtx);
+    return err;
 }
 
 // Escape `in` for CSV: wrap in quotes, double inner quotes, write a
@@ -216,17 +241,11 @@ void failed_keys_logger::log_failure(const struct timeval &ts, const char *comma
 
     int rc = fprintf(m_fp, "%s,%s,%s,%s,%u\n", tsbuf, command ? command : "UNKNOWN", keyfield.c_str(),
                      statusfield.c_str(), retries);
-    if (rc < 0) {
-        fprintf(stderr, "warning: failed-keys-file '%s' write failed (%s); logging disabled.\n", m_path ? m_path : "?",
-                strerror(errno));
-        m_disabled = true;
-        fclose(m_fp);
-        m_fp = NULL;
-    } else {
-        // Flush per-record so a crash doesn't lose the trailing window. Failed
-        // keys are rare, so the perf cost is irrelevant.
-        fflush(m_fp);
-    }
+    // Flush per-record so a crash doesn't lose the trailing window. Failed
+    // keys are rare, so the perf cost is irrelevant. fprintf() only fills the
+    // stdio buffer; a full disk shows up in the flush.
+    int err = rc < 0 ? (errno != 0 ? errno : EIO) : finish_output_file(m_fp, false);
+    if (err != 0) write_failed_locked(err);
     pthread_mutex_unlock(&m_mtx);
 }
 
