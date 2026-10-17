@@ -1267,9 +1267,10 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
         *db_start = '\0';
         db_start++;
         if (strlen(db_start) > 0) {
-            char *endptr;
-            int db = (int) strtol(db_start, &endptr, 10);
-            if (*endptr != '\0' || db < 0) {
+            // Same rule as --select-db: (int) strtol() turned 4294967297
+            // into db 1 and 4294967296 into db 0.
+            unsigned long long db;
+            if (!parse_unsigned(db_start, INT_MAX, &db)) {
                 fprintf(stderr, "error: invalid database number '%s'.\n", db_start);
                 free(uri_copy);
                 return -1;
@@ -1277,7 +1278,7 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
             if (cfg->select_db) {
                 fprintf(stderr, "warning: both URI and --select-db specified, URI takes precedence.\n");
             }
-            cfg->select_db = db;
+            cfg->select_db = (int) db;
         }
     }
 
