@@ -191,11 +191,20 @@ or configure with --disable-prometheus.])])
        AC_SUBST(LIBEVENT_EXTRA_LIBS)
        ])
 
-# bash completion
-PKG_CHECK_MODULES([BASH_COMPLETION], [bash-completion >= 2.0],
-    [BASH_COMPLETION_DIR="`pkg-config --variable=completionsdir bash-completion`"],
-    [BASH_COMPLETION_DIR="$datadir/bash-completion/completions"])
+# bash completion. The default follows --prefix, so a non-root prefix install
+# and make distcheck stay inside the prefix; --prefix=/usr gives the distro
+# path. Pass DIR to install elsewhere, or --without-bash-completion-dir to skip.
+AC_ARG_WITH([bash-completion-dir],
+  [AS_HELP_STRING([--with-bash-completion-dir@<:@=DIR@:>@],
+                  [install the bash completion script in DIR
+                   @<:@DATADIR/bash-completion/completions@:>@])],
+  [], [with_bash_completion_dir=yes])
+AS_CASE(["$with_bash_completion_dir"],
+  [yes], [BASH_COMPLETION_DIR='${datadir}/bash-completion/completions'],
+  [no], [BASH_COMPLETION_DIR=],
+  [BASH_COMPLETION_DIR="$with_bash_completion_dir"])
 AC_SUBST([BASH_COMPLETION_DIR])
+AM_CONDITIONAL([INSTALL_BASH_COMPLETION], [test "x$with_bash_completion_dir" != "xno"])
 
 AC_CONFIG_FILES([
    	Makefile

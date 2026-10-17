@@ -92,6 +92,13 @@ $ make
 $ sudo make install
 ```
 
+The bash completion script is installed under the prefix, in
+`$prefix/share/bash-completion/completions` (`/usr/local/share/...` by
+default), where bash-completion 2.x finds it through `XDG_DATA_DIRS`. Use
+`./configure --with-bash-completion-dir=DIR` to install it elsewhere, for
+example in `$(pkg-config --variable=completionsdir bash-completion)`, or
+`--without-bash-completion-dir` to skip it.
+
 **Note**: Debug symbols (`-g`) are included by default in all builds for crash analysis and debugging. The default build flags are `-O2 -g -Wall`, which provides:
 - Full optimizations (`-O2`) for production performance
 - Debug symbols (`-g`) for meaningful stack traces and core dump analysis

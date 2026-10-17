@@ -32,8 +32,14 @@ version.h:
 	$(SHELL) $(srcdir)/version.sh
 
 bin_PROGRAMS = memtier_benchmark
-completionsdir=$(BASH_COMPLETION_DIR)
-dist_completions_DATA=bash-completion/memtier_benchmark
+if INSTALL_BASH_COMPLETION
+completionsdir = $(BASH_COMPLETION_DIR)
+dist_completions_DATA = bash-completion/memtier_benchmark
+else
+EXTRA_DIST += bash-completion/memtier_benchmark
+endif
+# distcheck installs into a private prefix; keep the completion inside it.
+AM_DISTCHECK_CONFIGURE_FLAGS = --with-bash-completion-dir=$$dc_install_base/share/bash-completion/completions
 
 memtier_benchmark_CPPFLAGS = \
 	$(CODE_COVERAGE_CFLAGS) \
