@@ -258,7 +258,7 @@ values:
 
 - The counts (`Count`, `Accumulated Latency`, `Connection Errors`,
   `Unanswered requests` and the `Per-Key Misses` counts) are the mean over
-  the runs, written as doubles (for example `"Count": 9886.333333333334`), so
+  the runs, written as doubles (for example `"Count": 9886.3333333333339`), so
   `Totals` stays the sum of the command rows and a single miss over 3 runs is
   not rounded to 0.
 - Ops/sec, KB/sec, the default workload's Hits/sec and Misses/sec, and the

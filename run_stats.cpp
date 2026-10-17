@@ -1450,15 +1450,17 @@ static void write_json_mean(json_handler *jsonhandler, const char *key, double v
     char buf[64];
     snprintf(buf, sizeof(buf), "%.15g", value);
     if (strtod(buf, NULL) != value) snprintf(buf, sizeof(buf), "%.17g", value);
-    if (strpbrk(buf, ".eEn") == NULL) strncat(buf, ".0", sizeof(buf) - strlen(buf) - 1);
+    if (strpbrk(buf, ".eE") == NULL) strncat(buf, ".0", sizeof(buf) - strlen(buf) - 1);
     jsonhandler->write_obj(key, "%s", buf);
 }
 
-// Writes a count. In an AVERAGE section (runs > 1) the count is the sum over
-// the runs and is written as its per-run mean.
+// Writes a count. In an AVERAGE section (runs > 0, the number of runs it
+// averages, even if only 1 of a --run-count series completed) the count is
+// the sum over the runs and is written as its per-run mean, always a double.
+// A real run (runs == 0) writes the integer.
 static void write_json_count(json_handler *jsonhandler, const char *key, unsigned long long count, size_t runs)
 {
-    if (runs > 1) {
+    if (runs > 0) {
         write_json_mean(jsonhandler, key, (double) count / (double) runs);
     } else {
         jsonhandler->write_obj(key, "%llu", count);
@@ -1499,7 +1501,10 @@ void result_print_to_json(json_handler *jsonhandler, const char *type, double op
         // to be retrocompatible
         jsonhandler->write_obj("Latency", "%.3f", avg_latency);
         jsonhandler->write_obj("Average Latency", "%.3f", avg_latency);
-        if (runs > 1) {
+        // A run's sections keep the integer (truncated) ms; an AVERAGE writes
+        // the exact fractional mean, so it can differ from the mean of the
+        // per-run values by up to 1.
+        if (runs > 0) {
             write_json_mean(jsonhandler, "Accumulated Latency",
                             (double) m_total_latency / LATENCY_HDR_RESULTS_MULTIPLIER / (double) runs);
         } else {
