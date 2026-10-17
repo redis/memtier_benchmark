@@ -2321,8 +2321,8 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         case o_key_minimum: {
             bool too_large;
             bool parsed = parse_unsigned(optarg, ULLONG_MAX, &val, &too_large);
-            if (!parsed || !val) {
-                count_option_error("key-minimum", parsed, too_large, ULLONG_MAX);
+            if (!parsed) {
+                non_negative_option_error("key-minimum", too_large, ULLONG_MAX);
                 return -1;
             }
             cfg->key_minimum = val;

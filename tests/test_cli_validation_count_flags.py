@@ -24,10 +24,15 @@ Run with:
 import ctypes
 import ctypes.util
 import errno
+import json
+import os
 import signal
 import subprocess
+import tempfile
 
-from include import MEMTIER_BINARY, addTLSArgs
+from include import (MEMTIER_BINARY, addTLSArgs, add_required_env_arguments,
+                     get_default_memtier_config)
+from mb import Benchmark, RunConfig
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +391,6 @@ ULLONG_MAX = "18446744073709551615"
 
 # Options where 0 is rejected: option -> (message prefix, maximum).
 POSITIVE_OPTIONS = {
-    "--key-minimum": ("key-minimum", ULLONG_MAX),
     "--key-maximum": ("key-maximum", ULLONG_MAX),
     # Capped where keylist's initial 256 * (N + 1) buffer reaches 4 GiB (MEMTIER_MULTI_KEY_GET_MAX).
     "--multi-key-get": ("multi-key-get", "16777214"),
@@ -401,6 +405,7 @@ POSITIVE_OPTIONS = {
 
 # Options where 0 is a valid value: option -> (message prefix, maximum).
 NON_NEGATIVE_OPTIONS = {
+    "--key-minimum": ("key-minimum", ULLONG_MAX),
     "--data-offset": ("data-offset", "536870911"),  # (1 << 29) - 1
     "--thread-conn-start-min-jitter-micros": ("thread-conn-start-min-jitter-micros", UINT_MAX),
     "--thread-conn-start-max-jitter-micros": ("thread-conn-start-max-jitter-micros", UINT_MAX),
@@ -539,6 +544,7 @@ def test_remaining_options_store_the_parsed_value(env):
         (["--max-retries=" + INT_MAX], "max_retries = " + INT_MAX),
         (["--max-retries=+7"], "max_retries = 7"),
         (["--data-offset=+536870911"], "data_offset = 536870911"),
+        (["--key-minimum=0"], "key_minimum = 0\n"),
         (["--key-minimum=+2", "--key-maximum=" + ULLONG_MAX], "key_minimum = 2\n"),
         (["--key-maximum=" + ULLONG_MAX], "key_maximum = " + ULLONG_MAX),
         (["--multi-key-get= +64"], "multi_key_get = 64\n"),
@@ -629,6 +635,57 @@ def test_multi_key_get_cap(env):
         env.assertEqual(result.returncode, 2, message="{}: {}".format(value, result.stderr))
         env.assertTrue("error: multi-key-get must be <= 16777214." in result.stderr,
                        message="{}: {!r}".format(value, result.stderr))
+
+
+def test_key_minimum_zero_matches_default(env):
+    """Explicit zero uses the same key range as the documented default (#776)."""
+    env.skipOnCluster()
+    conn = env.getConnection()
+    password = conn.connection_pool.connection_kwargs.get("password")
+    for pattern, threads, clients, requests, maximum in (
+            ("S:S", 1, 1, 10, 9), ("R:R", 1, 1, 100, 1), ("P:P", 2, 2, 10, 39)):
+        for minimum in (None, 0, 1):
+            lower = minimum or 0
+            upper = maximum + lower
+            prefix = "minimum-{}-{}-".format(pattern[0], minimum)
+            specs = {"name": env.testName, "args": [
+                "--ratio=1:0", "--key-pattern=" + pattern, "--key-prefix=" + prefix,
+                "--key-maximum=" + str(upper), "--hide-histogram"]}
+            if minimum is not None:
+                specs["args"].append("--key-minimum=" + str(minimum))
+            if password:
+                specs["args"].append("--authenticate=" + password)
+            addTLSArgs(specs, env)
+            config = get_default_memtier_config(threads=threads, clients=clients, requests=requests)
+            add_required_env_arguments(specs, config, env, env.getMasterNodesList())
+            before = conn.info("commandstats").get("cmdstat_set", {}).get("calls", 0)
+            with tempfile.TemporaryDirectory() as directory:
+                run = RunConfig(directory, env.testName, config, {})
+                os.makedirs(run.results_dir)
+                benchmark = Benchmark.from_json(run, specs)
+                ok = benchmark.run(timeout=20)
+                with open(os.path.join(run.results_dir, "mb.stderr")) as source:
+                    stderr = source.read()
+                env.assertTrue(ok, message="{} minimum={}: {}".format(pattern, minimum, stderr))
+                if not ok:
+                    continue
+                with open(os.path.join(run.results_dir, "mb.json")) as source:
+                    results = json.load(source)
+            count = threads * clients * requests
+            env.assertEqual(results["configuration"]["key_minimum"], lower)
+            env.assertEqual(results["ALL STATS"]["Sets"]["Count"], count)
+            after = conn.info("commandstats")["cmdstat_set"]["calls"]
+            env.assertEqual(after - before, count)
+            keys = list(conn.scan_iter(match=prefix + "*"))
+            numbers = {int(key[len(prefix):]) for key in keys}
+            expected = set(range(lower, upper + 1))
+            env.assertTrue(bool(numbers))
+            if pattern == "R:R":
+                env.assertTrue(numbers.issubset(expected))
+            else:
+                env.assertEqual(numbers, expected)
+            if keys:
+                conn.delete(*keys)
 
 
 def test_key_maximum_full_range_runs(env):
