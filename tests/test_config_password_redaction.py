@@ -296,10 +296,12 @@ def test_config_uri_percent_decoded_password(env):
     host, port = _target(env)
     password = _CANARY_HEAD + "@/:" + _CANARY_TAIL
     encoded = _CANARY_HEAD + "%40%2f%3A" + _CANARY_TAIL
-    stderr = _check(env, password, ["--uri", "redis://default:{}@{}:{}".format(encoded, host, port)],
-                    "redis://default:***@{}:{}".format(host, port), "default:***", [_CANARY_HEAD, _CANARY_TAIL])
-    env.assertFalse(_RAW_DELIM_WARNING in stderr)
-    env.assertFalse(_LITERAL_PERCENT_WARNING in stderr)
+    for user in ("default:", ""):
+        stderr = _check(env, password, ["--uri", "redis://{}{}@{}:{}".format(user, encoded, host, port)],
+                        "redis://{}***@{}:{}".format(user, host, port),
+                        (user or ":") + "***", [_CANARY_HEAD, _CANARY_TAIL])
+        env.assertFalse(_RAW_DELIM_WARNING in stderr)
+        env.assertFalse(_LITERAL_PERCENT_WARNING in stderr)
 
 
 def test_config_uri_percent_decoded_user(env):
@@ -383,6 +385,36 @@ def test_config_password_with_at_bad_port_no_leak(env):
         env.assertFalse(secret in stdout + stderr, message="{!r} leaked: {}".format(secret, stderr[-500:]))
 
 
+def test_config_uri_invalid_database_does_not_echo_password_tail(env):
+    """A raw '@' before '/' is ambiguous and remains rejected (#783).
+
+    The database substring can contain the intended password tail. Do not
+    echo it, even though this is not a valid way to encode URI credentials.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as guard:
+        guard.bind(("127.0.0.1", 0))
+        port = guard.getsockname()[1]
+        host = "127.0.0.1:{}".format(port)
+        # Bind without listening: this parser-only test needs no live server.
+        for user in ("default:", ""):
+            passwords = (
+                _CANARY_HEAD + "@" + host + "/" + _CANARY_TAIL,
+                _CANARY_HEAD + "%40" + host + "%2F" + _CANARY_TAIL,
+                _CANARY_HEAD + "%40" + host + "/" + _CANARY_TAIL,
+            )
+            for password in passwords:
+                uri = "redis://{}{}@{}/bad-db".format(user, password, host)
+                with tempfile.TemporaryDirectory() as workdir:
+                    _raw, stdout, stderr = _run(
+                        env, ["--server=127.0.0.1", "--port=" + str(port), "--uri", uri],
+                        workdir, expect_ok=False)
+                    env.assertFalse(os.path.exists(os.path.join(workdir, "out.json")))
+                env.assertContains("error: invalid database number in URI.", stderr)
+                for secret in (_CANARY_HEAD, _CANARY_TAIL):
+                    env.assertFalse(secret in stdout + stderr,
+                                    message="dummy password fragment leaked in URI error")
+
+
 def test_config_uri_stray_at_in_path_rejected(env):
     """An '@' after the db path is not the end of the credentials.
 
@@ -393,7 +425,7 @@ def test_config_uri_stray_at_in_path_rejected(env):
     with tempfile.TemporaryDirectory() as workdir:
         uri = "redis://default:{}@{}:{}/1@".format(_CANARY, host, port)
         _raw, stdout, stderr = _run(env, ["--uri", uri], workdir, expect_ok=False)
-    env.assertContains("invalid database number '1@'", stderr)
+    env.assertContains("error: invalid database number in URI.", stderr)
     env.assertFalse(_CANARY in stdout + stderr)
 
 
@@ -408,7 +440,7 @@ def test_config_uri_at_in_password_and_path_keeps_host(env):
         uri = "redis://default:{}@{}@{}:{}{}".format(_CANARY_HEAD, _CANARY_TAIL, host, port, path)
         with tempfile.TemporaryDirectory() as workdir:
             _raw, stdout, stderr = _run(env, ["--uri", uri], workdir, expect_ok=False)
-        env.assertContains("invalid database number '{}'".format(path[1:]), stderr)
+        env.assertContains("error: invalid database number in URI.", stderr)
         env.assertFalse("server = cfg731-wrong-host" in stderr)
         for secret in (_CANARY_HEAD, _CANARY_TAIL):
             env.assertFalse(secret in stdout + stderr, message="{!r} leaked: {}".format(secret, stderr[-500:]))
