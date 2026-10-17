@@ -260,8 +260,12 @@ void failed_keys_logger::log_failure(const struct timeval &ts, const char *comma
 
 failed_keys_logger &global_failed_keys_logger()
 {
-    // Never destroyed: main() closes it, and a worker thread may still log
-    // while exit() runs the static destructors (the mutex would be gone).
+    // Never destroyed. On the normal path main() joins the worker threads and
+    // then closes it. The early exit() / exit(failure_exit_code()) paths (e.g.
+    // a thread that fails to prepare, or a fatal error in a worker thread)
+    // skip the join, so other worker threads may still log while exit() runs
+    // the static destructors; a destroyed mutex would then be used. exit()
+    // still flushes the stdio buffers.
     static failed_keys_logger *inst = new failed_keys_logger;
     return *inst;
 }

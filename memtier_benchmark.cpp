@@ -4730,6 +4730,21 @@ static void cleanup_openssl(void)
 
 #endif
 
+// --hdr-file-prefix and --client-stats files are only created when a run
+// ends. Check at startup that the directory they go into is writable (without
+// creating anything), so a typo does not cost a whole run. A full disk is
+// still only seen at the end. Exits 1 on failure.
+static void check_output_prefix_dir(const char *option, const char *prefix)
+{
+    std::string dir(prefix);
+    size_t slash = dir.rfind('/');
+    dir = slash == std::string::npos ? "." : (slash == 0 ? "/" : dir.substr(0, slash));
+    if (access(dir.c_str(), W_OK | X_OK) != 0) {
+        fprintf(stderr, "error: cannot write %s directory %s: %s\n", option, dir.c_str(), strerror(errno));
+        exit(1);
+    }
+}
+
 // Make sure fds 0, 1 and 2 are open before anything else opens a file.
 // If one of them was closed when memtier was started (e.g. `memtier >&-`),
 // the next open() gets that fd: --json-out-file or --out-file would become
@@ -5673,6 +5688,9 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
+    if (cfg.hdr_prefix[0] != '\0') check_output_prefix_dir("--hdr-file-prefix", cfg.hdr_prefix);
+    if (cfg.client_stats != NULL) check_output_prefix_dir("--client-stats", cfg.client_stats);
+
     // Open the output files after option validation and data import, so a
     // startup error leaves existing files untouched. Retry on EINTR, as
     // json_handler does.
@@ -5956,8 +5974,11 @@ int main(int argc, char *argv[])
         delete jsonhandler;
     }
 
-    // All worker threads are joined, so nothing logs failed keys any more.
-    // A record that could not be written was reported when it happened.
+    // On this normal path all worker threads are joined, so nothing logs
+    // failed keys any more and the log can be closed and checked. A record
+    // that could not be written was reported when it happened. The early
+    // exit(failure_exit_code()) paths skip both the join and this close (see
+    // global_failed_keys_logger()).
     if (cfg.failed_keys_file && global_failed_keys_logger().close() != 0) {
         g_output_failed = true;
     }

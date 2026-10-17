@@ -345,8 +345,12 @@ The same rule covers the other output files:
   with **1** at the end. A `--failed-keys-file` on stdout whose reader
   went away (for example `/dev/stdout` and `| head`) only stops logging.
 - The HDR histogram files (`--hdr-file-prefix`) and the `--client-stats`
-  CSV files are only created when a run ends, so they cannot be checked at
-  startup. If one cannot be opened or written, memtier prints `error:
+  CSV files are only created when a run ends. At startup, before
+  connecting, memtier checks that the directory of each prefix exists and
+  is writable (no file is created), and otherwise prints `error: cannot
+  write --hdr-file-prefix directory DIR: REASON` (or `--client-stats`) and
+  exits with **1**. A full disk is only seen when the run ends: if one of
+  these files cannot be opened or written then, memtier prints `error:
   cannot open --hdr-file-prefix file PATH: REASON` or `error: failed
   writing --client-stats file PATH: REASON`, still writes the other files,
   and exits with **1**. For `--client-stats` only the first failing file of

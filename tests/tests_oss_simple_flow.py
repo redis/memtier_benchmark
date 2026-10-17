@@ -2145,30 +2145,57 @@ def test_client_stats_write_error(env):
 
 
 def test_hdr_file_prefix_missing_directory(env):
-    """--hdr-file-prefix files that cannot be opened fail the run (#744).
-
-    They are only created when the run ends, so this is reported then.
-    """
+    """An --hdr-file-prefix in a missing directory fails at startup (#744)."""
     with tempfile.TemporaryDirectory() as tmp_dir:
-        prefix = os.path.join(tmp_dir, 'missing', 'h')
-        rc, stderr = _run_with_unwritable_output(env, ['--hdr-file-prefix', prefix], subprocess.DEVNULL)
+        missing = os.path.join(tmp_dir, 'missing')
+        rc, stderr = _run_with_unwritable_output(env, ['--hdr-file-prefix', os.path.join(missing, 'h')],
+                                                 subprocess.DEVNULL)
         env.assertEqual(rc, 1, message=stderr)
-        env.assertContains("error: cannot open --hdr-file-prefix file {}_FULL_RUN_1.txt: No such file or directory"
-                           .format(prefix), stderr)
+        env.assertContains("error: cannot write --hdr-file-prefix directory {}: No such file or directory"
+                           .format(missing), stderr)
+        env.assertNotContains("Preparing benchmark client", stderr)
 
 
 def test_client_stats_missing_directory(env):
+    """A --client-stats prefix in a missing directory fails at startup (#744)."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        missing = os.path.join(tmp_dir, 'missing')
+        rc, stderr = _run_with_unwritable_output(env, ['--client-stats', os.path.join(missing, 'cs')],
+                                                 subprocess.DEVNULL)
+        env.assertEqual(rc, 1, message=stderr)
+        env.assertContains("error: cannot write --client-stats directory {}: No such file or directory"
+                           .format(missing), stderr)
+        env.assertNotContains("Preparing benchmark client", stderr)
+
+
+def test_hdr_file_open_error(env):
+    """An HDR file that cannot be opened when the run ends fails the run (#744).
+
+    A directory in the file's place makes fopen() fail with EISDIR.
+    """
+    with tempfile.TemporaryDirectory() as hdr_dir:
+        prefix = os.path.join(hdr_dir, 'h')
+        os.mkdir(prefix + '_FULL_RUN_1.txt')
+        rc, stderr = _run_with_unwritable_output(env, ['--hdr-file-prefix', prefix], subprocess.DEVNULL)
+        env.assertEqual(rc, 1, message=stderr)
+        env.assertContains("error: cannot open --hdr-file-prefix file {}_FULL_RUN_1.txt: Is a directory"
+                           .format(prefix), stderr)
+
+
+def test_client_stats_open_error_reported_once(env):
     """--client-stats CSVs that cannot be opened fail the run, reported once (#744).
 
     Only the first file is named, then the count of the others.
     """
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        prefix = os.path.join(tmp_dir, 'missing', 'cs')
+    with tempfile.TemporaryDirectory() as stats_dir:
+        prefix = os.path.join(stats_dir, 'cs')
+        for i in range(3):
+            os.mkdir('{}-1-0-{}.csv'.format(prefix, i))
         rc, stderr = _run_with_unwritable_output(env, ['--client-stats', prefix, '--clients', '3'],
                                                  subprocess.DEVNULL)
         env.assertEqual(rc, 1, message=stderr)
-        env.assertContains("error: cannot open --client-stats file {}-1-0-0.csv: No such file or directory"
-                           .format(prefix), stderr)
+        env.assertContains("error: cannot open --client-stats file {}-1-0-0.csv: Is a directory".format(prefix),
+                           stderr)
         env.assertEqual(stderr.count("error: cannot open --client-stats file"), 1, message=stderr)
         env.assertContains("error: 2 more --client-stats files could not be written", stderr)
 
