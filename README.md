@@ -253,14 +253,30 @@ counts requests that were waiting for a reply.
 ### Repeated runs (`--run-count`)
 
 With `--run-count N`, memtier reports the best and the worst run (by
-Ops/sec), and an `AGGREGATED AVERAGE RESULTS (N runs)` section in which
-every value is the mean over the runs: rates, latencies, `Count`,
-`Accumulated Latency`, `Connection Errors`, `Unanswered requests`, the
-`Per-Key Misses` counts and the `CPU` seconds. Its `Runtime` `Total duration`
-is the mean run duration, `Start time` is the start of the first run, and
-`Finish time` is `Start time` plus `Total duration`. Percentiles come from the
-latency histograms of all the runs merged together, so the section's
-`Histogram log format` holds the samples of all N runs (N times its `Count`).
+Ops/sec), and an `AGGREGATED AVERAGE RESULTS (N runs)` section with per-run
+values:
+
+- The counts (`Count`, `Accumulated Latency`, `Connection Errors`,
+  `Unanswered requests` and the `Per-Key Misses` counts) are the mean over
+  the runs, written as doubles (for example `"Count": 9886.333333333334`), so
+  `Totals` stays the sum of the command rows and a single miss over 3 runs is
+  not rounded to 0.
+- Ops/sec, KB/sec, the default workload's Hits/sec and Misses/sec, and the
+  JSON `Latency` / `Average Latency` are the mean of the per-run values. The
+  Hits/sec and Misses/sec of `--command` rows are time-weighted instead: the
+  hits (or misses) of all runs divided by the duration of all runs.
+- Percentiles come from the latency histograms of all the runs merged
+  together, so the section's `Histogram log format` holds the samples of all
+  the runs (N times its `Count`).
+- `Runtime` `Total duration` is the mean run duration, `Start time` is the
+  start of the first run, and `Finish time` is `Start time` plus
+  `Total duration`.
+- The `CPU` seconds are the mean over the runs that reported CPU usage (all
+  of them on Linux).
+
+The section name always shows `--run-count`, so the JSON key does not
+change. If the series is cut short (see below), the means are over the runs
+that happened, `"Runs completed"` in the JSON `run information` section.
 
 ### Interrupting a run
 
