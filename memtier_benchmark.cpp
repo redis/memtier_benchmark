@@ -1503,7 +1503,8 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
             // Same rule as --select-db: parse_unsigned() with an INT_MAX bound.
             unsigned long long db;
             if (!parse_unsigned(db_start, INT_MAX, &db)) {
-                fprintf(stderr, "error: invalid database number '%s'.\n", db_start);
+                // An ambiguous raw URI password can extend into this substring.
+                fprintf(stderr, "error: invalid database number in URI.\n");
                 free(uri_copy);
                 return -1;
             }

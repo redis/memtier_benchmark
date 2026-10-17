@@ -711,7 +711,7 @@ def test_uri_database_number(env):
         result = run(path)
         label = "--uri .../{!r}".format(path)
         env.assertNotEqual(result.returncode, 0, message=label + ": " + result.stderr)
-        env.assertTrue("error: invalid database number '{}'.".format(path) in result.stderr,
+        env.assertTrue("error: invalid database number in URI." in result.stderr,
                        message=label + ": " + result.stderr)
     # An empty path selects no database, so the --select-db value is kept.
     result = _run_memtier(["--select-db=3", "--uri=redis://127.0.0.1:1/", "-n", "1", "-c", "1", "-t", "1",
