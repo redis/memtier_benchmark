@@ -328,21 +328,34 @@ def _crash_shim_env(env, directory, binary):
     if os.environ.get("LD_PRELOAD"):
         preloads.append(os.environ["LD_PRELOAD"])
     child_env = dict(os.environ, LD_PRELOAD=":".join(preloads))
-    child_env.pop("MEMTIER_TEST_BLOCK_BACKTRACE", None)
+    for name in ("MEMTIER_TEST_BLOCK_BACKTRACE", "MEMTIER_TEST_LOCK_STDERR"):
+        child_env.pop(name, None)
+    # The shim records here what it saw; see _shim_marker().
+    child_env["MEMTIER_TEST_SHIM_MARKER"] = str(Path(directory) / "shim_marker.txt")
     return child_env
+
+
+def _shim_marker(child_env):
+    """Lines the preload shim wrote to its marker file."""
+    try:
+        with open(child_env["MEMTIER_TEST_SHIM_MARKER"]) as f:
+            return f.read().split("\n")
+    except OSError:
+        return []
 
 
 def _tsan_build():
     """
     True for a ThreadSanitizer build. Those keep SIG_DFL for the watchdog
     (TSan would defer its handler forever), so they print no INCOMPLETE line.
+    Look for the runtime's __tsan_init symbol name in the binary: it is there
+    whether the runtime is a shared library (GCC) or linked in (clang).
     """
     try:
-        linked = subprocess.run(["ldd", shutil.which(MEMTIER_BINARY) or MEMTIER_BINARY],
-                                capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.TimeoutExpired):
+        with open(shutil.which(MEMTIER_BINARY) or MEMTIER_BINARY, "rb") as f:
+            return b"__tsan_init" in f.read()
+    except OSError:
         return False
-    return "libtsan" in linked.stdout
 
 
 def _worker_tids(pid):
@@ -380,7 +393,17 @@ def _signal_thread(pid, tid, sig):
     Send sig to thread tid of process pid. os.kill(tid) is kill(2): it sends a
     process-directed signal that any thread may take, so use tgkill(2) when
     this architecture's syscall number is known.
+
+    TSan builds get kill(2) to the process instead. TSan runs the handler for
+    a signal sent to a busy thread later, from an intercepted call and not on
+    the alternate signal stack, and in 1 of about 20 local runs that handler
+    printed nothing before the watchdog fired. kill(2) is what these tests
+    always used; the kernel then picks a thread, normally the main thread
+    sleeping between progress lines, where TSan delivers it at once.
     """
+    if _tsan_build():
+        os.kill(pid, sig)
+        return
     number = _SYS_TGKILL.get(platform.machine())
     if number is not None:
         libc = ctypes.CDLL(None, use_errno=True)
@@ -460,6 +483,11 @@ def test_crash_handler_time_zone_lock_held(env):
         # zone data is needed: the header must show this local time.
         child_env["TZ"] = "<+0530>-5:30"
         returncode, output, _, sent_at = _crash_worker(env, child_env)
+        marker = _shim_marker(child_env)
+
+    # Without this the test would pass trivially if the shim was not loaded
+    # or the handler did not run on a signal stack, where the shim blocks.
+    env.assertContains("signal-stack", marker, message="the shim never saw the crash handler")
 
     # The process must end by the crash signal, not by the SIGALRM watchdog.
     env.assertEqual(returncode, -signal.SIGSEGV,
@@ -495,6 +523,9 @@ def test_crash_handler_watchdog_marks_incomplete_report(env):
         child_env = _crash_shim_env(env, directory, shutil.which(MEMTIER_BINARY) or MEMTIER_BINARY)
         child_env["MEMTIER_TEST_BLOCK_BACKTRACE"] = "1"
         returncode, output, elapsed, _ = _crash_worker(env, child_env)
+        marker = _shim_marker(child_env)
+
+    env.assertContains("blocked backtrace", marker, message="the shim did not block backtrace()")
 
     env.assertEqual(returncode, -signal.SIGALRM)
     env.assertIsNotNone(elapsed)
@@ -515,11 +546,27 @@ def test_crash_handler_header_survives_stderr_lock(env):
     must still appear, and the watchdog must add the INCOMPLETE line and end
     the process. The shim takes the lock from a helper thread when the crash
     handler arms its alarm.
+
+    Skipped on TSan builds. There the crash signal reaches memtier's handler
+    only through TSan's deferred delivery, which waits for the thread to pass
+    an intercepted call, and the scenario parks a helper thread in a stdio
+    lock while the handler spins waiting for it. That is not deterministic:
+    in CI (job 117257659823) nothing after the SEGV was printed and the
+    process did not exit, while local runs passed. On TSan the
+    write(2) header is still checked by test_crash_handler_time_zone_lock_held
+    and the watchdog exit by the other two watchdog tests.
     """
+    if _tsan_build():
+        print("SKIP: the stderr lock scenario is not deterministic under TSan's deferred signal delivery")
+        env.skip()
     with tempfile.TemporaryDirectory() as directory:
         child_env = _crash_shim_env(env, directory, shutil.which(MEMTIER_BINARY) or MEMTIER_BINARY)
         child_env["MEMTIER_TEST_LOCK_STDERR"] = "1"
         returncode, output, elapsed, _ = _crash_worker(env, child_env)
+        marker = _shim_marker(child_env)
+
+    env.assertContains("signal-stack", marker, message="the shim never saw the crash handler")
+    env.assertContains("stderr-locked", marker, message="the helper thread did not take the stderr lock")
 
     env.assertEqual(returncode, -signal.SIGALRM)
     env.assertIsNotNone(elapsed)
@@ -529,9 +576,8 @@ def test_crash_handler_header_survives_stderr_lock(env):
                "memtier_benchmark crashed by signal: 11",
                "Crashed running signal <SIGSEGV>",
                "Signal code:",
-               "Fault address:"]
-    if not _tsan_build():
-        markers.append("=== MEMTIER_BENCHMARK BUG REPORT INCOMPLETE")
+               "Fault address:",
+               "=== MEMTIER_BENCHMARK BUG REPORT INCOMPLETE"]
     missing = [m for m in markers if m not in output]
     env.assertEqual(missing, [], message="lines written with write(2) are missing")
     # The stack trace header is the first fprintf; it must not get through.

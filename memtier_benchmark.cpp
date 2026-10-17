@@ -477,7 +477,7 @@ static void crash_watchdog_handler(int sig)
     crash_line l;
     l.str("\n=== MEMTIER_BENCHMARK BUG REPORT INCOMPLETE: crash handler timed out ===\n");
     l.write_out();
-    signal(sig, SIG_DFL);
+    // SA_RESETHAND already restored SIG_DFL, so this ends the process now.
     raise(sig);
 }
 #endif
@@ -494,7 +494,10 @@ static void crash_handler(int sig, siginfo_t *info, void *secret)
     // after 5 s instead of leaving a half-written report indefinitely. The
     // original signal will be re-raised on a fresh sigaction below, but if
     // we never get there, SIGALRM provides the floor. The watchdog first
-    // writes a line saying the report is incomplete.
+    // writes a line saying the report is incomplete. A second crash with the
+    // same signal takes the default action (SA_RESETHAND). A crash by a
+    // different signal re-enters this handler and re-arms alarm(5), so death
+    // can take up to about 11 s in that case, which is still bounded.
 #ifndef MEMTIER_THREAD_SANITIZER
     struct sigaction alarm_act;
     sigemptyset(&alarm_act.sa_mask);
