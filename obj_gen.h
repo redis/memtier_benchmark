@@ -173,7 +173,9 @@ public:
     imported_keylist(const char *filename);
     ~imported_keylist();
 
-    bool read_keys(void);
+    // Read the whole file, stopping at the first malformed item. With
+    // keep_keys false the file is only validated and no keys are stored.
+    bool read_keys(bool keep_keys = true);
     unsigned int size();
     const char *get(unsigned int pos, unsigned int *len);
 };

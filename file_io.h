@@ -31,10 +31,12 @@ protected:
     const char *m_filename; /** name of file */
     FILE *m_file;           /** handle of open file */
 
-    unsigned int m_line; /** current line being read */
-    bool m_error;        /** read_item() hit a malformed item */
+    unsigned int m_line;  /** current line being read */
+    bool m_error;         /** read_item() hit a malformed item */
+    unsigned int m_items; /** items read since open_file() */
 
     char *read_string(unsigned int len, unsigned int alloc_len, unsigned int *actual_len);
+    memcache_item *bad_item(void);
 
 public:
     file_reader(const char *filename);
