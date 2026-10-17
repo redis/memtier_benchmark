@@ -34,7 +34,7 @@ _memtier_completions()
                    "--thread-conn-start-min-jitter-micros" "--thread-conn-start-max-jitter-micros"\
                    "--print-percentiles" "--progress-interval" "--uri" "--sni"\
                    "--cert" "--key" "--cacert" "--tls-protocols"\
-                   "-f" "-s" "-p" "-S" "-o" "-x" "-c" "-n" "-t" "-d" "-a" "-u")
+                   "-s" "-p" "-S" "-o" "-x" "-c" "-n" "-t" "-d" "-a" "-u")
 
   options_no_args=("--debug" "--show-config" "--hide-histogram" "--distinct-client-seed" "--randomize"\
                    "--random-data" "--data-verify" "--verify-only" "--generate-keys" "--key-stddev"\
