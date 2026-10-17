@@ -63,6 +63,7 @@ def _check(env, state, verified, failed, verify_only=True, extra=()):
     else:
         env.assertNotContains("keys failed verification", result.stderr)
         env.assertNotContains("no keys were verified", result.stderr)
+        env.assertNotContains("data verification did not complete", result.stderr)
 
 
 def test_verify_only_missing(env):
