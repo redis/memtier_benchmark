@@ -1,0 +1,53 @@
+name: Code Style
+
+on:
+  push:
+    branches: [master, main, '2.*']
+  pull_request:
+    branches: [master, main, '2.*']
+
+permissions:
+  contents: read
+
+jobs:
+  agent-parity:
+    name: Agent Configuration Parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: python3 utils/check_agent_parity.py
+
+  cpp-format-check:
+    name: C++ Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install clang-format
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format
+
+      - name: Check C++ formatting
+        run: |
+          # Find all C++ source files
+          CPP_FILES=$(find . -name "*.cpp" -o -name "*.h" | grep -v deps/ | grep -v autom4te.cache/ | sort)
+
+          # Check formatting (dry-run)
+          FAILED=0
+          for file in $CPP_FILES; do
+            if ! clang-format --dry-run --Werror "$file" 2>/dev/null; then
+              echo "::error file=$file::File needs formatting: $file"
+              FAILED=1
+            fi
+          done
+
+          if [ $FAILED -eq 1 ]; then
+            echo ""
+            echo "Some files need formatting. Run locally:"
+            echo "  make format"
+            exit 1
+          fi
+
+          echo "All C++ files are properly formatted!"
+

@@ -1,0 +1,24 @@
+Source: memtier-benchmark
+Section: admin
+Priority: optional
+Maintainer: Redis Ltd. <oss@redislabs.com>
+Build-Depends: debhelper-compat (= 10), dh-autoreconf, bash-completion, pkg-config, libevent-dev, libssl-dev, zlib1g-dev
+Standards-Version: 4.4.1
+Homepage: https://github.com/redis/memtier_benchmark
+
+Package: memtier-benchmark
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: NoSQL load generation and benchmark tool.
+ memtier_benchmark is a command line utility developed by Redis Labs
+ for load generation and bechmarking NoSQL key-value databases.
+ It offers the following:
+   * Support for both Redis and Memcache protocols (text and binary)
+   * Multi-threaded multi-client execution
+   * Multiple configuration options, including:
+   * Read:Write ratio
+   * Random and sequential key name pattern policies
+   * Random or ranged key expiration
+   * Redis cluster support
+   * TLS connections support
+   * and more...

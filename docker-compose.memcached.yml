@@ -1,0 +1,11 @@
+memtier_benchmark:
+  build: .
+  command: --protocol=memcache_text --server=memcached --port=11211 --generate-keys
+  links:
+    - memcached
+
+memcached:
+  image: memcached
+  command: --verbose
+  ports:
+    - "11211:11211"

@@ -24,3 +24,13 @@ columns contains a double quote, it is quoted (i.e., a single " is encoded as
 The data column may contain binary data, including non-ASCII characters, NULLs,
 CRs and LFs.
 
+Note: 
+  To avoid unnecessary error while passing file.
+    1. Add extra 4 bytes in nbytes
+    2. Add extra 2 bytes in nkey
+    
+  Example:
+    dumpflags, time, exptime, nbytes, nsuffix, it_flags, clsid, nkey, key, data
+    0, 0, 60, 19, 200, 0, 1, 11, 'doxrpshny', 'asdfghjklqwerty'
+    
+   

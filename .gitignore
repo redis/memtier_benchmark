@@ -2,20 +2,97 @@ aclocal.m4
 autom4te.cache
 config.guess
 config.h.in
+config.h.in~
 config.h
 config.sub
 configure
+configure~
+compile
 depcomp
 install-sh
+test-driver
 ltmain.sh
 m4
 Makefile.in
 missing
 *.o
-memtier_benchmark
+/memtier_benchmark
 .deps
 Makefile
 config.log
 config.status
 libtool
 stamp-h1
+version.h
+*.DS_Store
+.vscode/*
+.idea/*
+
+# Sibling VPATH build dirs used by the local build/test gate (§7.7)
+/build-prom/
+/build-noprom/
+/build-asan/
+/build-tsan/
+/.venv/
+
+# tls helper related files
+tests/tls/*
+
+# memtier outputs
+*.hgrm
+*.txt
+!/tests/test_requirements.txt
+__pycache__
+*.csv
+*.json
+
+# Vendored Redis commands.json snapshot (refreshed via `make commands-meta`)
+!deps/commands_json/*.json
+!deps/commands_json/REDIS_TAG.txt
+
+# Grafana dashboards are JSON by nature
+!grafana/dashboards/*.json
+
+# Code coverage with lcov/gcov
+*.gcno
+*.gcov
+*.gcda
+*.info
+/memtier_benchmark-*-coverage/
+
+# redis related
+*.rdb
+*.aof
+appendonlydir/
+*.conf
+
+tests/.env/
+
+# Unit-test harness (tests/unit/) build + automake check-driver artifacts
+/prometheus_metrics_test
+/hdr_histogram_test
+/cluster_transaction_test
+/cluster_hslot_test
+/rate_limiter_test
+/keylist_growth_test
+/retry_backoff_test
+/retry_drain_test
+/socket_options_test
+/run_stats_counters_test
+/file_io_test
+/run_stats_merge_test
+/crash_report_test
+/reconnect_siblings_test
+tests/unit/prometheus_metrics_test
+*.log
+*.trs
+tests/unit/.dirstamp
+
+# libFuzzer fuzz harness build artifacts and crash dumps
+/split_command_to_args_fuzz
+/monitor_input_fuzz
+/redis_protocol_fuzz
+crash-*
+leak-*
+timeout-*
+oom-*

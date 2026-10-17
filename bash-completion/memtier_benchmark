@@ -1,0 +1,146 @@
+#/usr/bin/env bash
+
+_memtier_look_for_element () {
+  local op prev="$1" cur="$2"
+  shift
+  shift
+
+  for op; do
+    if [[ "${op}" == "${prev}" ]];then
+      echo "${op}"
+      break
+    elif [[ "${cur}" == ${op}=* ]]; then
+      echo "${op}="
+      break
+    fi
+  done
+}
+
+_memtier_completions()
+{
+  options_no_comp=("--server" "--port" "--unix-socket" "--out-file" "--client-stats" "--run-count" "--clients"\
+                   "--requests" "--threads" "--test-time" "--ratio" "--pipeline" "--data-size" "--data-offset"\
+                   "--data-size-range" "--data-size-list" "--expiry-range" "--data-import" "--key-prefix"\
+                   "--key-minimum" "--key-maximum" "--reconnect-interval" "--multi-key-get" "--authenticate"\
+                   "--select-db" "--wait-ratio" "--num-slaves" "--wait-timeout" "--json-out-file"\
+                   "--command" "--command-ratio" "--scan-incremental-max-iterations"\
+                   "--clients-start" "--clients-step" "--step-duration"\
+                   "--statsd-host" "--statsd-port" "--statsd-prefix" "--statsd-run-label" "--graphite-port" "--prometheus-port" "--prometheus-bind-addr" "--prometheus-run-label" "--prometheus-latency-buckets"\
+                   "--monitor-input" "--hdr-file-prefix"\
+                   "--max-reconnect-attempts" "--reconnect-backoff-factor" "--connection-timeout"\
+                   "--connection-stage-timeout" "--cpu-warn-threshold"\
+                   "--max-retries" "--retry-backoff-ms" "--retry-backoff-factor" "--retry-on"\
+                   "--max-retry-queue" "--failed-keys-file"\
+                   "--thread-conn-start-min-jitter-micros" "--thread-conn-start-max-jitter-micros"\
+                   "--print-percentiles" "--uri" "--sni"\
+                   "--cert" "--key" "--cacert" "--tls-protocols"\
+                   "-s" "-p" "-S" "-o" "-x" "-c" "-n" "-t" "-d" "-a" "-u")
+
+  options_no_args=("--debug" "--show-config" "--hide-histogram" "--distinct-client-seed" "--randomize"\
+                   "--random-data" "--data-verify" "--verify-only" "--generate-keys" "--key-stddev"\
+                   "--key-median" "--key-zipf-exp" "--no-expiry" "--cluster-mode" "--scan-incremental-iteration"\
+                   "--print-all-runs" "--realtime-latencies" "--tls" "--tls-skip-verify" "--reconnect-on-error"\
+                   "--retry-on-error"\
+                   "--help" "--version"\
+                   "-D" "-R" "-h" "-v" "-4" "-6")
+
+  options_comp=("--protocol" "-P" "--key-pattern" "--data-size-pattern" "--command-key-pattern"\
+                "--monitor-pattern" "--command-stats-breakdown")
+
+  all_options="${options_no_comp[@]} ${options_no_args[@]} ${options_comp[@]}"
+
+  local prev
+  local cur
+  local cur_line=${COMP_LINE:0:${COMP_POINT}}
+  local args_array=(${cur_line})
+
+  if [[ "${cur_line}" =~ .*[[:space:]]$ ]]; then
+    cur=""
+    prev="${args_array[-1]}"
+  else
+    cur="${args_array[-1]}"
+    prev="${args_array[-2]}"
+  fi
+
+  # check if it's option without completion
+  local option=$(_memtier_look_for_element "${prev}" "" "${options_no_comp[@]}")
+  if [ -n "${option}" ]; then
+    option="no completion"
+  else
+    # check if it's option with completion
+    option=$(_memtier_look_for_element "${prev}" "${cur}" "${options_comp[@]}")
+  fi
+
+  case "${option}" in
+    "no completion")
+      return
+    ;;
+    "--protocol=")
+      cur=${cur#"--protocol="}
+    ;&
+    "-P")
+    ;&
+    "--protocol")
+      all_options="redis resp2 resp3 memcache_text memcache_binary"
+    ;;
+    "--data-size-pattern=")
+      cur=${cur#"--data-size-pattern="}
+    ;&
+    "--data-size-pattern")
+      all_options="R S"
+    ;;
+    "--command-key-pattern=")
+      cur=${cur#"--command-key-pattern="}
+    ;&
+    "--command-key-pattern")
+      all_options="G R S P"
+    ;;
+    "--monitor-pattern=")
+      cur=${cur#"--monitor-pattern="}
+    ;&
+    "--monitor-pattern")
+      all_options="S R"
+    ;;
+    "--command-stats-breakdown=")
+      cur=${cur#"--command-stats-breakdown="}
+    ;&
+    "--command-stats-breakdown")
+      all_options="command line"
+    ;;
+    "--command-miss-tracking=")
+      cur=${cur#"--command-miss-tracking="}
+    ;&
+    "--command-miss-tracking")
+      all_options="auto off"
+    ;;
+    "--key-pattern=")
+      cur=${cur#"--key-pattern="}
+    ;&
+    "--key-pattern")
+      if [[ -z "${cur}" ]]; then
+        COMPREPLY=( $( compgen -W "G R S P" ) )
+      else
+        if [[ "${cur}" =~ (G|R|S|P):(G|R|S)$ ]]; then
+          COMPREPLY="${cur: -1} "
+        elif [[ "${cur}" =~ (G|R|S|P):$ ]]; then
+          COMPREPLY=( $( compgen -W "G R S" ) )
+        elif [[ "${cur}" =~ (G|R|S|P)$ ]]; then
+          COMPREPLY="${cur}:"
+        fi
+      fi
+
+      return
+    ;;
+    *)
+    ;;
+  esac
+
+  COMPREPLY=( $( compgen -W "${all_options}" -- "${cur}" ) )
+  if [ -n "${COMPREPLY}" ];then
+    COMPREPLY="${COMPREPLY} "
+  fi
+
+  return
+}
+
+complete -o nospace -F _memtier_completions memtier_benchmark

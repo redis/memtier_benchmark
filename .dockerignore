@@ -1,0 +1,14 @@
+Dockerfile*
+**/Dockerfile*
+.gitignore
+**/.gitignore
+.gitattributes
+README*
+**/README*
+COPYING*
+**/COPYING*
+LICENSE*
+**/LICENSE*
+.github/*
+tests/*
+utils/*

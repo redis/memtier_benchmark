@@ -1,0 +1,1 @@
+SET k "ab\x00cd"

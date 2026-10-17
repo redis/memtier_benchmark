@@ -1,0 +1,39 @@
+{
+    "name": "memtier-benchmark-regression",
+    "configuration": { },
+    "targets": [
+        {
+            "name": "default-redis",
+            "binary": "redis-server",
+            "args": [ "--unixsocket", "/tmp/redis.sock" ]
+        }
+    ],
+    "benchmarks": [
+        { "name": "previous-default-tcp",
+          "configuration": {
+            "binary": "../memtier_benchmark.prev"
+          },
+          "args": []
+        },
+        { "name": "current-default-tcp",
+          "configuration": {
+            "binary": "../memtier_benchmark"
+          },
+          "args": []
+        },
+        { "name": "previous-default-unixsocket",
+          "configuration": {
+            "binary": "../memtier_benchmark.prev",
+            "explicit_connect_args": true
+          },
+          "args": [ "--unix-socket", "/tmp/redis.sock", "-t", "1" ]
+        },
+        { "name": "current-default-unixsocket",
+          "configuration": {
+            "binary": "../memtier_benchmark",
+            "explicit_connect_args": true
+          },
+          "args": [ "--unix-socket", "/tmp/redis.sock", "-t", "1" ]
+        }
+    ]
+}

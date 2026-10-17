@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2011-2017 Redis Labs Ltd.
+ * Copyright (C) 2011-2026 Redis Labs Ltd.
  *
  * This file is part of memtier_benchmark.
  *
@@ -16,15 +16,29 @@
  * along with memtier_benchmark.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+// Define _XOPEN_SOURCE before including system headers for ucontext.h on macOS
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 600
+#endif
+
+// _GNU_SOURCE exposes getrusage(RUSAGE_THREAD) on glibc (per-thread CPU
+// accounting). Harmless on musl/Alpine, where RUSAGE_THREAD is unconditional.
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
+
+#include "version.h"
 
 #include <pthread.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h> // For strcasecmp() on POSIX systems
 #include <stdarg.h>
 #include <limits.h>
 #include <getopt.h>
@@ -32,26 +46,692 @@
 #include <errno.h>
 #include <sys/time.h>
 #include <sys/resource.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#ifdef HAVE_EXECINFO_H
+#include <execinfo.h>
+#endif
+#include <ucontext.h>
+#include <time.h>
+#include <ctype.h>
+#include <sys/utsname.h>
+#include <dirent.h>
+#include <arpa/inet.h>  // inet_pton, ntohl/ntohs for prometheus-bind-addr parsing
+#include <netinet/in.h> // struct in_addr / in6_addr / IN6_IS_ADDR_LOOPBACK
+#include <event2/event.h>
+#include <event2/thread.h>
 
+#ifdef USE_TLS
+#include <openssl/crypto.h>
+#include <openssl/conf.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/rand.h>
+
+#define REDIS_TLS_PROTO_TLSv1 (1 << 0)
+#define REDIS_TLS_PROTO_TLSv1_1 (1 << 1)
+#define REDIS_TLS_PROTO_TLSv1_2 (1 << 2)
+#define REDIS_TLS_PROTO_TLSv1_3 (1 << 3)
+
+/* Use safe defaults */
+#ifdef TLS1_3_VERSION
+#define REDIS_TLS_PROTO_DEFAULT (REDIS_TLS_PROTO_TLSv1_2 | REDIS_TLS_PROTO_TLSv1_3)
+#else
+#define REDIS_TLS_PROTO_DEFAULT (REDIS_TLS_PROTO_TLSv1_2)
+#endif
+
+#if OPENSSL_VERSION_NUMBER >= 0x40000000L
+static bool bitmask_is_contiguous(unsigned int mask);
+#endif
+
+#endif
+
+#include <cmath>
+#include <cstring>
+#include <set>
 #include <stdexcept>
+#include <atomic>
+#include <algorithm>
+
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
 
 #include "client.h"
+#include "cluster_client.h"
 #include "JSON_handler.h"
+#include "utf8.h"
+#include "file_io.h"
 #include "obj_gen.h"
 #include "memtier_benchmark.h"
+#include "run_stats_types.h"
+#include "latency_percentiles.h"
+#include "retry_policy.h"
+#include "statsd.h"
+#include "crash_report.h"
+#include "prometheus_metrics.h"
+#include "prometheus_exporter.h"
 
-static int log_level = 0;
+
+int log_level = 0;
+
+// Return the basename of a file path (everything after the last '/' or '\').
+// Used to redact directory layout from JSON output (e.g. cert/key paths).
+static std::string basename_only(const char *p)
+{
+    if (!p || !*p) return "";
+    std::string s(p);
+    size_t i = s.find_last_of("/\\");
+    return (i == std::string::npos) ? s : s.substr(i + 1);
+}
+
+// Cluster hash tag that every key generated for a monitor-line argument
+// containing __key__ shares: prefix + --key-prefix + <number> + suffix, with
+// only the first __key__ replaced. Same rule as Redis: the text between the
+// first '{' and the first '}' after it, if not empty. Returns false when the
+// tag would include the generated number, or there is none, so the slot
+// varies from key to key.
+static bool monitor_key_arg_fixed_tag(const std::string &arg, const char *key_prefix, std::string *tag)
+{
+    size_t pos = arg.find(KEY_PLACEHOLDER);
+    std::string before = arg.substr(0, pos) + (key_prefix ? key_prefix : "");
+    std::string after = arg.substr(pos + strlen(KEY_PLACEHOLDER));
+    // A '{' before the number: its '}' must come before the number too.
+    // No '{' before it: the number has no braces, so look in the suffix.
+    const std::string &part = before.find('{') != std::string::npos ? before : after;
+    size_t open = part.find('{');
+    if (open == std::string::npos) return false;
+    size_t close = part.find('}', open + 1);
+    if (close == std::string::npos || close == open + 1) return false;
+    tag->assign(part, open + 1, close - open - 1);
+    return true;
+}
+
+// --cluster-mode supports only single-key commands (see the --command check
+// in main()). A __monitor_line@__ line is resolved per request and routed by
+// its first key, so a line with several __key__ arguments is accepted only
+// when every generated key shares one {hash tag}, which keeps them in one
+// slot. Otherwise Redis would answer CROSSSLOT for every such request.
+static bool check_cluster_monitor_lines(const struct monitor_command_list *monitor_commands, const char *key_prefix)
+{
+    for (size_t line = 0; line < monitor_commands->size(); line++) {
+        arbitrary_command cmd(monitor_commands->get_command(line).c_str());
+        if (!cmd.split_command_to_args()) continue; // skipped with a warning at run time
+        unsigned int keys = 0;
+        bool same_slot = true;
+        std::string first_tag;
+        for (size_t i = 1; i < cmd.command_args.size(); i++) {
+            const std::string &data = cmd.command_args[i].data;
+            if (data.find(KEY_PLACEHOLDER) == std::string::npos) continue;
+            std::string tag;
+            if (!monitor_key_arg_fixed_tag(data, key_prefix, &tag)) {
+                same_slot = false;
+            } else if (keys == 0) {
+                first_tag = tag;
+            } else if (tag != first_tag) {
+                same_slot = false;
+            }
+            keys++;
+        }
+        if (keys > 1 && !same_slot) {
+            benchmark_error_log("error: Cluster mode supports only single-key commands: monitor line %zu has %u "
+                                "__key__ arguments that can hash to different slots (give them one {hash tag}, "
+                                "e.g. {t}__key__): %s\n",
+                                line + 1, keys, cmd.command.c_str());
+            return false;
+        }
+    }
+    return true;
+}
+
+// Upper bound for --run-count.  main() allocates several per-run vectors
+// (run_stats, cmd_stats histograms, HDR histograms) that grow linearly with
+// run_count; values in the tens of thousands push tens of MiB of metadata
+// before a single op has been sent, and INT_MAX trivially OOMs the allocator
+// (issue #426).  1024 covers every realistic benchmarking use case (the
+// default is 1) while keeping pre-run allocations comfortably under 100 MiB
+// even on memory-constrained hosts.
+#define MAX_RUN_COUNT 1024
+
+// Global flag for signal handling: 0, or the number of the signal
+// (SIGINT / SIGTERM) that interrupted the run. Atomic, not a volatile
+// sig_atomic_t: the kernel may run the handler on a worker thread while the
+// main thread reads the flag.
+static std::atomic<int> g_interrupted(0);
+
+// Set when run_benchmark() aborts because --connection-stage-timeout
+// elapsed without any thread reaching steady state. Reset at the start of
+// every run (connection_stage_supervisor_reset()), so it describes the
+// current run only.
+static std::atomic<bool> g_connection_stage_aborted{false};
+
+// Set by run_benchmark() (main thread) together with
+// g_connection_stage_aborted, but never reset: with --run-count > 1, an abort
+// in any run, not only the last one, makes memtier exit 2. Atomic because
+// worker threads read it through failure_exit_code().
+static std::atomic<bool> g_any_run_connection_stage_aborted{false};
+
+// Set by run_benchmark() (main thread, after joining the workers) when any
+// worker thread ended on connection failures it could not recover from (or an
+// exception) instead of on the run's own stop condition (--test-time /
+// --requests). Such a run did not measure what was asked for; main() then
+// exits 1.
+static bool g_worker_failed = false;
+
+// Set (main thread only) when a requested output could not be opened or
+// written: --out-file, --json-out-file, stdout, the --hdr-file-prefix files,
+// the --client-stats CSVs or --failed-keys-file (e.g. a full disk). The
+// error has been printed; main() then exits 1.
+static bool g_output_failed = false;
+
+// main owns the JSON writer. Workers never write JSON, and main writes results
+// after joining them, so the exit callback sees a quiescent writer. Close only
+// content already emitted, including benchmark results if verification exits.
+static json_handler *g_json_out_file = NULL;
+
+static void close_json_out_file_at_exit(void)
+{
+    if (g_json_out_file != NULL) g_json_out_file->close();
+}
+
+// Forward declarations
+struct cg_thread;
+static void print_client_list(FILE *fp, int pid, const char *timestr);
+static void print_all_threads_stack_trace(FILE *fp, int pid, const char *timestr);
+
+// Global pointer to threads for crash handler access
+static std::vector<cg_thread *> *g_threads = NULL;
+
+#ifdef HAVE_EVHTTP
+// Ownership handle for the Prometheus exporter (PLAN.md section 3.1, Decisions
+// #2). Lives next to g_threads; cfg.prometheus aliases it. Keeping the global
+// reachable means an exporter deliberately leaked on an exit(1) path stays
+// LSan-reachable (no suppressions). NULL when the exporter is disabled.
+static prometheus_exporter *g_prom_exporter = NULL;
+#endif
+
+// ---------------------------------------------------------------------------
+// Connection-stage supervisor state (declarations in memtier_benchmark.h)
+// ---------------------------------------------------------------------------
+//
+// Worker threads call report_connection_stage_failure/success() lock-free
+// (except for the last-error string update, which uses a tiny mutex). The
+// main thread polls connection_stage_should_abort() once per second from
+// run_benchmark() while waiting for active_threads to drain.
+//
+// Lifetimes:
+//   - reset by connection_stage_supervisor_reset() at the start of every
+//     run_benchmark() invocation; --run-count > 1 must restart the policy
+//     because a previous run's success latch is meaningless for the next.
+//   - g_conn_stage_run_start tracks the time of that reset; we measure
+//     "elapsed in setup phase" from there, NOT from each individual
+//     failure, so a single late failure can still trigger the timeout.
+static std::atomic<bool> g_conn_stage_steady_state{false};
+static std::atomic<long> g_conn_stage_streak_start_sec{0}; // 0 = no failure yet
+static std::atomic<long> g_conn_stage_run_start_sec{0};
+static pthread_mutex_t g_conn_stage_err_mutex = PTHREAD_MUTEX_INITIALIZER;
+static std::string g_conn_stage_last_err; // guarded by g_conn_stage_err_mutex
+
+void connection_stage_supervisor_reset(void)
+{
+    g_conn_stage_steady_state.store(false, std::memory_order_release);
+    g_conn_stage_streak_start_sec.store(0, std::memory_order_release);
+    // Must reset g_connection_stage_aborted as well: with --run-count > 1, a
+    // run-1 abort would otherwise leave the flag latched into run 2,
+    // suppressing the worker-failure report in cg_thread_start(). The exit
+    // code uses g_any_run_connection_stage_aborted, which is not reset.
+    g_connection_stage_aborted.store(false, std::memory_order_release);
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    g_conn_stage_run_start_sec.store(now.tv_sec, std::memory_order_release);
+    pthread_mutex_lock(&g_conn_stage_err_mutex);
+    g_conn_stage_last_err.clear();
+    pthread_mutex_unlock(&g_conn_stage_err_mutex);
+}
+
+void report_connection_stage_failure(const char *err)
+{
+    // Once any thread has reached steady state we stop policing setup; a
+    // late "auth failed" log line during a normal --reconnect-on-error
+    // cycle must not bring the run down.
+    if (g_conn_stage_steady_state.load(std::memory_order_acquire)) return;
+
+    struct timeval now;
+    gettimeofday(&now, NULL);
+
+    // First failure in a streak: stamp the wall-clock start. Subsequent
+    // failures only update the last-error string. CAS on 0 keeps this
+    // race-free without a mutex.
+    long zero = 0;
+    g_conn_stage_streak_start_sec.compare_exchange_strong(zero, now.tv_sec, std::memory_order_acq_rel);
+
+    if (err != NULL && *err != '\0') {
+        pthread_mutex_lock(&g_conn_stage_err_mutex);
+        g_conn_stage_last_err.assign(err);
+        pthread_mutex_unlock(&g_conn_stage_err_mutex);
+    }
+}
+
+void report_connection_stage_success(void)
+{
+    // First call wins; subsequent calls are no-ops. We don't reset
+    // last_err — it's only read by the supervisor (which is now disarmed)
+    // and can be useful for post-mortem diagnostics.
+    bool expected = false;
+    if (g_conn_stage_steady_state.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        g_conn_stage_streak_start_sec.store(0, std::memory_order_release);
+    }
+}
+
+int failure_exit_code(void)
+{
+    return g_any_run_connection_stage_aborted.load(std::memory_order_acquire) ? 2 : 1;
+}
+
+bool connection_stage_steady_state_reached(void)
+{
+    return g_conn_stage_steady_state.load(std::memory_order_acquire);
+}
+
+bool connection_stage_should_abort(unsigned int timeout_secs, std::string *out_last_err, unsigned int *out_elapsed)
+{
+    if (timeout_secs == 0) return false; // operator opt-out
+    if (g_conn_stage_steady_state.load(std::memory_order_acquire)) return false;
+
+    struct timeval now;
+    gettimeofday(&now, NULL);
+
+    long streak_start = g_conn_stage_streak_start_sec.load(std::memory_order_acquire);
+    long run_start = g_conn_stage_run_start_sec.load(std::memory_order_acquire);
+
+    // Two trip conditions:
+    //   (a) a failure streak has been live for >= timeout_secs (covers
+    //       AUTH-fail / SELECT-fail / CLUSTER-SLOTS-fail / -ERR reconnect
+    //       loops),
+    //   (b) no failure has ever been observed but the run has been alive
+    //       for >= timeout_secs without anyone reaching steady state
+    //       (covers --wait-ratio 0:1 with no slaves — the connection
+    //       handshakes but the very first WAIT command never returns).
+    long elapsed_streak = (streak_start > 0) ? (now.tv_sec - streak_start) : 0;
+    long elapsed_run = (run_start > 0) ? (now.tv_sec - run_start) : 0;
+
+    bool trip_streak = (streak_start > 0 && elapsed_streak >= (long) timeout_secs);
+    bool trip_run = (run_start > 0 && elapsed_run >= (long) timeout_secs);
+    if (!trip_streak && !trip_run) return false;
+
+    if (out_elapsed != NULL) {
+        *out_elapsed = (unsigned int) (trip_streak ? elapsed_streak : elapsed_run);
+    }
+    if (out_last_err != NULL) {
+        pthread_mutex_lock(&g_conn_stage_err_mutex);
+        if (!g_conn_stage_last_err.empty()) {
+            *out_last_err = g_conn_stage_last_err;
+        } else {
+            out_last_err->assign("no response from server during setup");
+        }
+        pthread_mutex_unlock(&g_conn_stage_err_mutex);
+    }
+    return true;
+}
+
+// Per-thread alternate signal stack. Without this, SA_ONSTACK is a no-op
+// and a SIGSEGV caused by stack-overflow is unrecoverable (the handler
+// re-faults on the exhausted stack and produces no report at all).
+// 64 KiB is comfortably above SIGSTKSZ on every supported platform.
+//
+// The buffer lives in TLS (a static __thread array) rather than malloc so
+// LeakSanitizer doesn't flag it at clean exit and so the install path is
+// allocation-free — workers can call this from cg_thread_start without
+// allocating from the main heap. We also skip installation when something
+// upstream (e.g. ASan/LSan/UBSan's own runtime) has already registered an
+// alt stack for us; replacing theirs would break their crash reporting.
+#define MEMTIER_ALT_STACK_SIZE (64 * 1024)
+static __thread char tls_altstack_buf[MEMTIER_ALT_STACK_SIZE];
+static __thread bool tls_altstack_installed = false;
+
+static void install_alt_signal_stack(void)
+{
+    if (tls_altstack_installed) return;
+    stack_t existing;
+    // If a previous installer (sanitizer runtime, parent process, etc.)
+    // already registered a usable alt stack, leave it alone. Overwriting
+    // it discards the sanitizer's crash plumbing -- briefly tried gating
+    // on MEMTIER_ALT_STACK_SIZE here to enforce a larger floor, but that
+    // tripped every ASAN cell in CI because ASAN's own alt stack is below
+    // 64 KiB. Adopting an undersized stack risks our handler having less
+    // room (already a documented trade-off in #412 follow-ups); breaking
+    // the sanitizer is worse.
+    if (sigaltstack(NULL, &existing) == 0 && (existing.ss_flags & SS_DISABLE) == 0 && existing.ss_sp != NULL &&
+        existing.ss_size >= (size_t) MINSIGSTKSZ) {
+        tls_altstack_installed = true;
+        return;
+    }
+    stack_t ss;
+    ss.ss_sp = tls_altstack_buf;
+    ss.ss_flags = 0;
+    ss.ss_size = sizeof(tls_altstack_buf);
+    if (sigaltstack(&ss, NULL) == 0) {
+        tls_altstack_installed = true;
+    }
+}
+
+// CLOCK_MONOTONIC time of the first SIGINT/SIGTERM, in ms modulo 2^32, and
+// never 0: 0 means no signal yet. Differences are taken modulo 2^32 too, so
+// the wrap every ~49.7 days does not matter.
+static std::atomic<unsigned int> g_first_interrupt_ms(0);
+
+// The handler uses only int-sized atomics; that is async-signal-safe only
+// when they are lock-free.
+static_assert(ATOMIC_INT_LOCK_FREE == 2, "sigint_handler needs lock-free int atomics");
+
+// Signal handler for Ctrl+C (SIGINT) and SIGTERM. The first signal stops
+// the run gracefully. A signal at least 1 s later terminates at once, as a
+// way out of a stuck shutdown. Signals within that second are duplicates of
+// the same action and are ignored: Ctrl+C under `timeout` delivers SIGINT
+// twice (terminal and timeout), and a process-group kill does the same.
+static void sigint_handler(int signum)
+{
+    int saved_errno = errno;
+    struct timespec ts;
+    // clock_gettime() is async-signal-safe (POSIX.1-2008).
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    unsigned int now = (unsigned int) ts.tv_sec * 1000u + (unsigned int) (ts.tv_nsec / 1000000);
+    if (now == 0) now = 1;
+    unsigned int first = 0;
+    if (g_first_interrupt_ms.compare_exchange_strong(first, now)) {
+        g_interrupted = signum;
+    } else if (now - first >= 1000u) {
+        signal(signum, SIG_DFL);
+        raise(signum);
+    }
+    errno = saved_errno;
+}
+
+static const char *interrupt_source(void)
+{
+    return g_interrupted == SIGTERM ? "SIGTERM" : "user (Ctrl+C)";
+}
+
+// Offset of local time from UTC, in seconds, taken once at startup by
+// prewarm_crash_handler() with crash_utc_offset(). The crash handler cannot
+// call localtime(); see crash_report.h (#681).
+static long g_crash_utc_offset = 0;
+
+// Begin a report line: "[pid] timestr # ".
+static void crash_line_prefix(crash_line &l, int pid, const char *timestr)
+{
+    l.str("[");
+    l.num((long long) pid);
+    l.str("] ");
+    l.str(timestr);
+    l.str(" # ");
+}
+
+// ThreadSanitizer runs a handler for an asynchronous signal only when the
+// receiving thread is in, or leaves, an intercepted call. A thread stuck on
+// a futex or in a blocked write never does, so the watchdog handler would
+// never run and the process would hang. TSan builds keep SIG_DFL for
+// SIGALRM, which the kernel applies directly, and have no INCOMPLETE line.
+#if defined(__SANITIZE_THREAD__)
+#define MEMTIER_THREAD_SANITIZER 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define MEMTIER_THREAD_SANITIZER 1
+#endif
+#endif
+
+#ifndef MEMTIER_THREAD_SANITIZER
+// SIGALRM handler armed by crash_handler(): say why the report stops, then
+// end the process with the default SIGALRM action as before. The write can
+// block too (stderr is a full pipe or a stopped tty), so first re-arm the
+// alarm: SA_RESETHAND already restored SIG_DFL, and SA_NODEFER leaves
+// SIGALRM unblocked, so the second alarm kills the process 1 s later.
+static void crash_watchdog_handler(int sig)
+{
+    alarm(1);
+    crash_line l;
+    l.str("\n=== MEMTIER_BENCHMARK BUG REPORT INCOMPLETE: crash handler timed out ===\n");
+    l.write_out();
+    // SA_RESETHAND already restored SIG_DFL, so this ends the process now.
+    raise(sig);
+}
+#endif
+
+// Crash handler - prints stack trace and other debugging information
+static void crash_handler(int sig, siginfo_t *info, void *secret)
+{
+    (void) secret; // unused parameter
+    char timestr[64];
+    int pid = getpid();
+
+    // Watchdog: if the handler itself hangs (e.g. mid-print_client_list while
+    // iterating a torn vector under heap corruption), the process is killed
+    // after 5 s instead of leaving a half-written report indefinitely. The
+    // original signal will be re-raised on a fresh sigaction below, but if
+    // we never get there, SIGALRM provides the floor. The watchdog first
+    // writes a line saying the report is incomplete. A second crash with the
+    // same signal takes the default action (SA_RESETHAND). A crash by a
+    // different signal re-enters this handler and re-arms alarm(5), so death
+    // can take up to about 11 s in that case, which is still bounded.
+#ifndef MEMTIER_THREAD_SANITIZER
+    struct sigaction alarm_act;
+    sigemptyset(&alarm_act.sa_mask);
+    alarm_act.sa_flags = SA_ONSTACK | SA_NODEFER | SA_RESETHAND;
+    alarm_act.sa_handler = crash_watchdog_handler;
+    // SIGALRM may land on any thread, not only this one. That is fine: the
+    // watchdog only calls alarm, write and raise, which are safe on any
+    // thread, and SA_RESETHAND resets the disposition for the whole process.
+    sigaction(SIGALRM, &alarm_act, NULL);
+#endif
+    alarm(5);
+
+    // The header and signal details use only async-signal-safe calls
+    // (time, getpid, write), so they reach stderr even when the crash
+    // interrupted a thread holding the malloc, stdio or time zone lock.
+    crash_format_time(timestr, sizeof(timestr), (long long) time(NULL), g_crash_utc_offset);
+
+    const char *signal_name = "UNKNOWN";
+    switch (sig) {
+    case SIGSEGV:
+        signal_name = "SIGSEGV";
+        break;
+    case SIGBUS:
+        signal_name = "SIGBUS";
+        break;
+    case SIGFPE:
+        signal_name = "SIGFPE";
+        break;
+    case SIGILL:
+        signal_name = "SIGILL";
+        break;
+    case SIGABRT:
+        signal_name = "SIGABRT";
+        break;
+    }
+
+    crash_line l;
+    l.str("\n\n=== MEMTIER_BENCHMARK BUG REPORT START: Cut & paste starting from here ===\n");
+    l.write_out();
+    crash_line_prefix(l, pid, timestr);
+    l.str("memtier_benchmark crashed by signal: ");
+    l.num((long long) sig);
+    l.str("\n");
+    l.write_out();
+    crash_line_prefix(l, pid, timestr);
+    l.str("Crashed running signal <");
+    l.str(signal_name);
+    l.str(">\n");
+    l.write_out();
+    if (info) {
+        crash_line_prefix(l, pid, timestr);
+        l.str("Signal code: ");
+        l.num((long long) info->si_code);
+        l.str("\n");
+        l.write_out();
+        crash_line_prefix(l, pid, timestr);
+        l.str("Fault address: ");
+        if (info->si_addr == NULL) {
+            l.str("(nil)");
+        } else {
+            l.str("0x");
+            l.num((unsigned long long) (uintptr_t) info->si_addr, 16, 1);
+        }
+        l.str("\n");
+        l.write_out();
+    }
+
+    // Everything below is best effort and is NOT async-signal-safe; it comes
+    // after the essential lines above so a hang here still leaves them, and
+    // the watchdog ends a hang after 5 s:
+    // - backtrace() can take the loader lock (dl_iterate_phdr) while
+    //   unwinding; its first-use malloc/dlopen is done by prewarm.
+    // - fprintf(stderr) takes the stderr FILE lock. It is recursive, so it
+    //   only blocks while another thread is inside a stderr call.
+    // - print_client_list() reads the worker's client and connection
+    //   vectors without synchronization; a torn vector can fault or hang.
+    // uname(), getpid(), sigaction() and raise() are async-signal-safe, and
+    // event_get_version() only returns a constant string.
+
+    // Print stack trace for all threads
+    print_all_threads_stack_trace(stderr, getpid(), timestr);
+
+    // Print system information
+    fprintf(stderr, "\n[%d] %s # --- INFO OUTPUT\n", getpid(), timestr);
+
+    struct utsname name;
+    if (uname(&name) == 0) {
+        fprintf(stderr, "[%d] %s # os:%s %s %s\n", getpid(), timestr, name.sysname, name.release, name.machine);
+    }
+
+    fprintf(stderr, "[%d] %s # memtier_version:%s\n", getpid(), timestr, PACKAGE_VERSION);
+    fprintf(stderr, "[%d] %s # memtier_git_sha1:%s\n", getpid(), timestr, MEMTIER_GIT_SHA1);
+    fprintf(stderr, "[%d] %s # memtier_git_dirty:%s\n", getpid(), timestr, MEMTIER_GIT_DIRTY);
+
+#if defined(__x86_64__) || defined(_M_X64)
+    fprintf(stderr, "[%d] %s # arch_bits:64\n", getpid(), timestr);
+#elif defined(__i386__) || defined(_M_IX86)
+    fprintf(stderr, "[%d] %s # arch_bits:32\n", getpid(), timestr);
+#elif defined(__aarch64__)
+    fprintf(stderr, "[%d] %s # arch_bits:64\n", getpid(), timestr);
+#elif defined(__arm__)
+    fprintf(stderr, "[%d] %s # arch_bits:32\n", getpid(), timestr);
+#else
+    fprintf(stderr, "[%d] %s # arch_bits:unknown\n", getpid(), timestr);
+#endif
+
+#ifdef __GNUC__
+    fprintf(stderr, "[%d] %s # gcc_version:%d.%d.%d\n", getpid(), timestr, __GNUC__, __GNUC_MINOR__,
+            __GNUC_PATCHLEVEL__);
+#endif
+
+    fprintf(stderr, "[%d] %s # libevent_version:%s\n", getpid(), timestr, event_get_version());
+
+#ifdef USE_TLS
+    fprintf(stderr, "[%d] %s # openssl_version:%s\n", getpid(), timestr, OPENSSL_VERSION_TEXT);
+#endif
+
+    // Print client connection information
+    print_client_list(stderr, getpid(), timestr);
+
+    fprintf(stderr, "[%d] %s # For more information, please check the core dump if available.\n", getpid(), timestr);
+    fprintf(stderr, "[%d] %s # To enable core dumps: ulimit -c unlimited\n", getpid(), timestr);
+    fprintf(stderr, "[%d] %s # Core pattern: /proc/sys/kernel/core_pattern\n", getpid(), timestr);
+
+    fprintf(stderr, "\n=== MEMTIER_BENCHMARK BUG REPORT END. Make sure to include from START to END. ===\n\n");
+    fprintf(stderr, "       Please report this bug by opening an issue on github.com/redis/memtier_benchmark\n\n");
+
+    // Remove the handler and re-raise the signal to generate core dump
+    struct sigaction act;
+    sigemptyset(&act.sa_mask);
+    act.sa_flags = SA_NODEFER | SA_ONSTACK | SA_RESETHAND;
+    act.sa_handler = SIG_DFL;
+    sigaction(sig, &act, NULL);
+    raise(sig);
+}
+
+// Pre-warm the symbols the crash handler will need so the dynamic linker
+// has already done a lazy-bind (_dl_fixup) on them by the time a signal
+// fires. _dl_fixup is NOT async-signal-safe; calling an unresolved symbol
+// for the first time from inside the handler triggers it and frequently
+// re-crashes mid-report (this is what truncated the bug report attached
+// to issue #404). Cost: a few µs at startup.
+static void prewarm_crash_handler(void)
+{
+#ifdef HAVE_EXECINFO_H
+    void *trace[4];
+    int n = backtrace(trace, 4);
+    // /dev/null discards; we only care about resolving the symbol.
+    int devnull = open("/dev/null", O_WRONLY);
+    if (devnull >= 0) {
+        if (n > 0) backtrace_symbols_fd(trace, n, devnull);
+        close(devnull);
+    }
+#endif
+    // Force glibc stdio's first-use init + symbol bind for fprintf/vfprintf.
+    fprintf(stderr, "%s", "");
+    fflush(stderr);
+    // Resolve event_get_version too — used in the INFO section.
+    (void) event_get_version();
+
+    // The handler formats its timestamp by hand from this offset, and this
+    // first localtime_r() call also loads the time zone data.
+    g_crash_utc_offset = crash_utc_offset(time(NULL));
+}
+
+// Setup crash handlers
+static void setup_crash_handlers(void)
+{
+    // Install the per-thread alternate signal stack BEFORE registering the
+    // handler. Without sigaltstack(2) the SA_ONSTACK flag is silently inert
+    // and a stack-overflow SIGSEGV re-faults on the exhausted stack —
+    // producing no report at all. (Workers install their own alt stack on
+    // entry in cg_thread_start.)
+    install_alt_signal_stack();
+
+    // Pre-warm before we register the handler so the symbols we'll need
+    // are already bound when the signal lands.
+    prewarm_crash_handler();
+
+    struct sigaction act;
+
+    sigemptyset(&act.sa_mask);
+    act.sa_flags = SA_NODEFER | SA_ONSTACK | SA_RESETHAND | SA_SIGINFO;
+    act.sa_sigaction = crash_handler;
+
+    sigaction(SIGSEGV, &act, NULL);
+    sigaction(SIGBUS, &act, NULL);
+    sigaction(SIGFPE, &act, NULL);
+    sigaction(SIGILL, &act, NULL);
+    sigaction(SIGABRT, &act, NULL);
+    // SIGALRM is the crash handler's watchdog. SIG_DFL (terminate) is the
+    // baseline; crash_handler() installs crash_watchdog_handler, which
+    // prints an INCOMPLETE marker and falls back to SIG_DFL, before it calls
+    // alarm(5). Explicitly request SIG_DFL here so an inherited disposition
+    // cannot turn the watchdog off.
+    struct sigaction alarm_act;
+    sigemptyset(&alarm_act.sa_mask);
+    alarm_act.sa_flags = 0;
+    alarm_act.sa_handler = SIG_DFL;
+    sigaction(SIGALRM, &alarm_act, NULL);
+}
+
 void benchmark_log_file_line(int level, const char *filename, unsigned int line, const char *fmt, ...)
 {
-    if (level > log_level)
-        return;
-    
-    va_list args;    
+    if (level > log_level) return;
+
+    va_list args;
     char fmtbuf[1024];
 
-    snprintf(fmtbuf, sizeof(fmtbuf)-1, "%s:%u: ", filename, line);
-    strcat(fmtbuf, fmt);
-    
+    // Bound the concatenation so a future refactor that lets `fmt` reach this
+    // function from a user-controlled source can't overflow `fmtbuf`. Today
+    // every caller passes a literal, but the previous strcat() relied on that
+    // invariant silently.
+    int n = snprintf(fmtbuf, sizeof(fmtbuf), "%s:%u: ", filename, line);
+    if (n < 0) n = 0;
+    if ((size_t) n >= sizeof(fmtbuf)) n = (int) sizeof(fmtbuf) - 1;
+    snprintf(fmtbuf + n, sizeof(fmtbuf) - (size_t) n, "%s", fmt);
+
     va_start(args, fmt);
     vfprintf(stderr, fmtbuf, args);
     va_end(args);
@@ -59,8 +739,7 @@ void benchmark_log_file_line(int level, const char *filename, unsigned int line,
 
 void benchmark_log(int level, const char *fmt, ...)
 {
-    if (level > log_level)
-        return;
+    if (level > log_level) return;
 
     va_list args;
 
@@ -69,200 +748,908 @@ void benchmark_log(int level, const char *fmt, ...)
     va_end(args);
 }
 
+bool is_redis_protocol(enum PROTOCOL_TYPE type)
+{
+    return (type == PROTOCOL_REDIS_DEFAULT || type == PROTOCOL_RESP2 || type == PROTOCOL_RESP3);
+}
+
+static const char *get_protocol_name(enum PROTOCOL_TYPE type)
+{
+    if (type == PROTOCOL_REDIS_DEFAULT)
+        return "redis";
+    else if (type == PROTOCOL_RESP2)
+        return "resp2";
+    else if (type == PROTOCOL_RESP3)
+        return "resp3";
+    else if (type == PROTOCOL_MEMCACHE_TEXT)
+        return "memcache_text";
+    else if (type == PROTOCOL_MEMCACHE_BINARY)
+        return "memcache_binary";
+    else
+        return "none";
+}
+
+#ifdef HAVE_EVHTTP
+// Comma-joined "key=value" run labels in insertion order (PLAN.md section 5).
+// Unescaped: json_handler::write_obj escapes string values itself.
+static std::string prometheus_run_labels_str(struct benchmark_config *cfg)
+{
+    std::string s;
+    for (size_t i = 0; i < cfg->prometheus_run_labels.size(); i++) {
+        if (i > 0) s += ",";
+        s += cfg->prometheus_run_labels[i].first + "=" + cfg->prometheus_run_labels[i].second;
+    }
+    return s;
+}
+
+// "default" when no custom buckets were given, else %.12g comma-joined seconds
+// (same precision as format_le so parsed-float round-trips). PLAN.md section 5.
+static std::string prometheus_buckets_str(struct benchmark_config *cfg)
+{
+    if (cfg->prometheus_latency_buckets.empty()) return "default";
+    std::string s;
+    char buf[64];
+    for (size_t i = 0; i < cfg->prometheus_latency_buckets.size(); i++) {
+        if (i > 0) s += ",";
+        snprintf(buf, sizeof(buf), "%.12g", cfg->prometheus_latency_buckets[i]);
+        s += buf;
+    }
+    return s;
+}
+#endif // HAVE_EVHTTP
+
+// Secrets must not reach --show-config or --json-out-file (result files are
+// shared as CI artifacts). Keep the user name, which the redis and
+// memcache_binary authenticate() split off at the first ':', and replace the
+// password with "***": "user:pw" -> "user:***", "pw" -> "***".
+static std::string redact_credentials(const char *credentials)
+{
+    if (!credentials || !*credentials) return "";
+    const char *colon = strchr(credentials, ':');
+    if (!colon) return "***";
+    return std::string(credentials, colon - credentials + 1) + "***";
+}
+
+// End of the userinfo in a URI authority+path (the text after "scheme://"),
+// or NULL when there is none. The authority ends at a '/', '?' or '#'
+// (RFC 3986), so once credentials are present the search for '@' stops at
+// the first of those after the first '@': a later '@' in the db path, query
+// or fragment does not end the credentials, which would send them to another
+// host. It is the LAST '@' before that point, so a raw '@' in the password
+// works and no tail of it is taken for the host and echoed by --show-config
+// or a host/port error.
+// Ambiguous forms, kept as before for compatibility; parse_uri() warns about
+// them (a raw '/', '?' or '#' in the userinfo) and %2F, %3F, %23 and %40
+// spell them unambiguously (#732):
+// - A raw '/', '?' or '#' in the password works only when no '@' comes
+//   before it in the password: "u:a@b/c@host" is split as host "b".
+// - Without credentials, an '@' in the path still ends a "userinfo":
+//   "host:6379/1@other:6379" connects to "other", and "host:6379/1@" to the
+//   default server. Treating a '/', '?' or '#' before the first '@' as "no
+//   userinfo" would break a raw '/' in passwords.
+static const char *uri_userinfo_end(const char *s)
+{
+    const char *at = strchr(s, '@');
+    if (!at) return NULL;
+    const char *delim = strpbrk(at, "/?#");
+    const char *end = delim ? delim : at + strlen(at);
+    while (end > at && *(end - 1) != '@')
+        end--;
+    return end - 1;
+}
+
+// --uri with its userinfo password redacted: redis://user:pw@host:port/db ->
+// redis://user:***@host:port/db. Splits where parse_uri() does; it assumes a
+// URI parse_uri() has already validated (the no-"://" fallback is only a guard).
+static std::string redact_uri(const char *uri)
+{
+    if (!uri) return "";
+    std::string s(uri);
+    size_t start = s.find("://");
+    start = (start == std::string::npos) ? 0 : start + 3;
+    const char *at = uri_userinfo_end(s.c_str() + start);
+    if (!at) return s;
+    size_t at_pos = at - s.c_str();
+    return s.substr(0, start) + redact_credentials(s.substr(start, at_pos - start).c_str()) + s.substr(at_pos);
+}
 
 static void config_print(FILE *file, struct benchmark_config *cfg)
 {
     char tmpbuf[512];
-    
+
     fprintf(file,
-        "server = %s\n"
-        "port = %u\n"
-        "unix socket = %s\n"
-        "protocol = %s\n"
-        "out_file = %s\n"
-        "client_stats = %s\n"
-        "run_count = %u\n"
-        "debug = %u\n"
-        "requests = %u\n"
-        "clients = %u\n"
-        "threads = %u\n"
-        "test_time = %u\n"
-        "ratio = %u:%u\n"
-        "pipeline = %u\n"
-        "data_size = %u\n"
-        "data_offset = %u\n"
-        "random_data = %s\n"
-        "data_size_range = %u-%u\n"
-        "data_size_list = %s\n"
-        "data_size_pattern = %s\n"
-        "expiry_range = %u-%u\n"
-        "data_import = %s\n"
-        "data_verify = %s\n"
-        "verify_only = %s\n"
-        "generate_keys = %s\n"
-        "key_prefix = %s\n"
-        "key_minimum = %llu\n"
-        "key_maximum = %llu\n"
-        "key_pattern = %s\n"
-        "key_stddev = %f\n"
-        "key_median = %f\n"
-        "reconnect_interval = %u\n"
-        "multi_key_get = %u\n"
-        "authenticate = %s\n"
-        "select-db = %d\n"
-        "no-expiry = %s\n"
-        "wait-ratio = %u:%u\n"
-        "num-slaves = %u-%u\n"
-        "wait-timeout = %u-%u\n"
-        "json-out-file = %s\n",
-        cfg->server,
-        cfg->port,
-        cfg->unix_socket,
-        cfg->protocol,
-        cfg->out_file,
-        cfg->client_stats,	
-        cfg->run_count,
-        cfg->debug,
-        cfg->requests,
-        cfg->clients,
-        cfg->threads,
-        cfg->test_time,
-        cfg->ratio.a, cfg->ratio.b,
-        cfg->pipeline,
-        cfg->data_size,
-        cfg->data_offset,
-        cfg->random_data ? "yes" : "no",
-        cfg->data_size_range.min, cfg->data_size_range.max,
-        cfg->data_size_list.print(tmpbuf, sizeof(tmpbuf)-1),
-        cfg->data_size_pattern,
-        cfg->expiry_range.min, cfg->expiry_range.max,
-        cfg->data_import,
-        cfg->data_verify ? "yes" : "no",
-        cfg->verify_only ? "yes" : "no",
-        cfg->generate_keys ? "yes" : "no",
-        cfg->key_prefix,
-        cfg->key_minimum,
-        cfg->key_maximum,
-        cfg->key_pattern,
-        cfg->key_stddev,
-        cfg->key_median,
-        cfg->reconnect_interval,
-        cfg->multi_key_get,
-        cfg->authenticate ? cfg->authenticate : "",
-        cfg->select_db,
-        cfg->no_expiry ? "yes" : "no",
-        cfg->wait_ratio.a, cfg->wait_ratio.b,
-        cfg->num_slaves.min, cfg->num_slaves.max,
-        cfg->wait_timeout.min, cfg->wait_timeout.max,
-        cfg->json_out_file);
+            "server = %s\n"
+            "port = %u\n"
+            "uri = %s\n"
+            "unix socket = %s\n"
+            "address family = %s\n"
+            "protocol = %s\n"
+#ifdef USE_TLS
+            "tls = %s\n"
+            "cert = %s\n"
+            "key = %s\n"
+            "cacert = %s\n"
+            "tls_skip_verify = %s\n"
+            "sni = %s\n"
+#endif
+            "out_file = %s\n"
+            "client_stats = %s\n"
+            "run_count = %u\n"
+            "debug = %u\n"
+            "requests = %llu\n"
+            "rate_limit = %u\n"
+            "clients = %u\n"
+            "threads = %u\n"
+            "test_time = %u\n"
+            "ratio = %u:%u\n"
+            "pipeline = %u\n"
+            "transaction = %s\n"
+            "data_size = %u\n"
+            "data_offset = %u\n"
+            "random_data = %s\n"
+            "data_size_range = %u-%u\n"
+            "data_size_list = %s\n"
+            "data_size_pattern = %s\n"
+            "expiry_range = %u-%u\n"
+            "data_import = %s\n"
+            "data_verify = %s\n"
+            "verify_only = %s\n"
+            "generate_keys = %s\n"
+            "key_prefix = %s\n"
+            "key_minimum = %llu\n"
+            "key_maximum = %llu\n"
+            "key_pattern = %s\n"
+            "key_stddev = %f\n"
+            "key_median = %f\n"
+            "reconnect_interval = %u\n"
+            "retry_on_error = %s\n"
+            "max_retries = %d\n"
+            "retry_backoff_ms = %u\n"
+            "retry_backoff_factor = %f\n"
+            "retry_on = %s\n"
+            "max_retry_queue = %u\n"
+            "failed_keys_file = %s\n"
+            "connection_timeout = %u\n"
+            "connection_stage_timeout = %u\n"
+            "thread_conn_start_min_jitter_micros = %u\n"
+            "thread_conn_start_max_jitter_micros = %u\n"
+            "multi_key_get = %u\n"
+            "authenticate = %s\n"
+            "select-db = %d\n"
+            "no-expiry = %s\n"
+            "wait-ratio = %u:%u\n"
+            "num-slaves = %u-%u\n"
+            "wait-timeout = %u-%u\n"
+            "json-out-file = %s\n"
+            "print-all-runs = %s\n"
+#ifdef HAVE_EVHTTP
+            "prometheus-port = %d\n"
+            "prometheus-bind-addr = %s\n"
+            "prometheus-run-labels = %s\n"
+            "prometheus-latency-buckets = %s\n"
+#endif
+            ,
+            cfg->server, cfg->port, redact_uri(cfg->uri).c_str(), cfg->unix_socket,
+            cfg->resolution == AF_UNSPEC ? "Unspecified"
+            : cfg->resolution == AF_INET ? "AF_INET"
+                                         : "AF_INET6",
+            get_protocol_name(cfg->protocol),
+#ifdef USE_TLS
+            cfg->tls ? "yes" : "no", cfg->tls_cert, cfg->tls_key, cfg->tls_cacert, cfg->tls_skip_verify ? "yes" : "no",
+            cfg->tls_sni,
+#endif
+            cfg->out_file, cfg->client_stats, cfg->run_count, cfg->debug, cfg->requests, cfg->request_rate,
+            cfg->clients, cfg->threads, cfg->test_time, cfg->ratio.a, cfg->ratio.b, cfg->pipeline,
+            cfg->transaction ? "yes" : "no", cfg->data_size, cfg->data_offset, cfg->random_data ? "yes" : "no",
+            cfg->data_size_range.min, cfg->data_size_range.max, cfg->data_size_list.print(tmpbuf, sizeof(tmpbuf) - 1),
+            cfg->data_size_pattern, cfg->expiry_range.min, cfg->expiry_range.max, cfg->data_import,
+            cfg->data_verify ? "yes" : "no", cfg->verify_only ? "yes" : "no", cfg->generate_keys ? "yes" : "no",
+            cfg->key_prefix, cfg->key_minimum, cfg->key_maximum, cfg->key_pattern, cfg->key_stddev, cfg->key_median,
+            cfg->reconnect_interval, cfg->retry_on_error ? "yes" : "no", cfg->max_retries, cfg->retry_backoff_ms,
+            cfg->retry_backoff_factor, cfg->retry_on_filter ? cfg->retry_on_filter : "", cfg->max_retry_queue,
+            cfg->failed_keys_file ? cfg->failed_keys_file : "", cfg->connection_timeout, cfg->connection_stage_timeout,
+            cfg->thread_conn_start_min_jitter_micros, cfg->thread_conn_start_max_jitter_micros, cfg->multi_key_get,
+            redact_credentials(cfg->authenticate).c_str(), cfg->select_db, cfg->no_expiry ? "yes" : "no",
+            cfg->wait_ratio.a, cfg->wait_ratio.b, cfg->num_slaves.min, cfg->num_slaves.max, cfg->wait_timeout.min,
+            cfg->wait_timeout.max, cfg->json_out_file, cfg->print_all_runs ? "yes" : "no"
+#ifdef HAVE_EVHTTP
+            ,
+            cfg->prometheus_port, cfg->prometheus_bind_addr ? cfg->prometheus_bind_addr : "127.0.0.1",
+            prometheus_run_labels_str(cfg).c_str(), prometheus_buckets_str(cfg).c_str()
+#endif
+    );
+    fprintf(file,
+            "clients_start = %u\n"
+            "clients_step = %u\n"
+            "step_duration = %u\n"
+            "scan_incremental_max_iterations = %u\n"
+            "replica_clients = %u\n"
+            "replicas_per_shard = %u\n",
+            cfg->clients_start, cfg->clients_step, cfg->step_duration, cfg->scan_incremental_max_iterations,
+            cfg->replica_clients, cfg->replicas_per_shard);
 }
 
-static void config_print_to_json(json_handler * jsonhandler, struct benchmark_config *cfg)
+static void config_print_to_json(json_handler *jsonhandler, struct benchmark_config *cfg)
 {
     char tmpbuf[512];
-    
-    jsonhandler->open_nesting("configuration");  
-	
-    jsonhandler->write_obj("server"            ,"\"%s\"",      	cfg->server);
-    jsonhandler->write_obj("port"              ,"%u",          	cfg->port);
-    jsonhandler->write_obj("unix socket"       ,"\"%s\"",      	cfg->unix_socket);
-    jsonhandler->write_obj("protocol"          ,"\"%s\"",      	cfg->protocol);
-    jsonhandler->write_obj("out_file"          ,"\"%s\"",      	cfg->out_file);
-    jsonhandler->write_obj("client_stats"      ,"\"%s\"",      	cfg->client_stats);
-    jsonhandler->write_obj("run_count"         ,"%u",          	cfg->run_count);
-    jsonhandler->write_obj("debug"             ,"%u",          	cfg->debug);
-    jsonhandler->write_obj("requests"          ,"%u",          	cfg->requests);
-    jsonhandler->write_obj("clients"           ,"%u",          	cfg->clients);
-    jsonhandler->write_obj("threads"           ,"%u",          	cfg->threads);
-    jsonhandler->write_obj("test_time"         ,"%u",          	cfg->test_time);
-    jsonhandler->write_obj("ratio"             ,"\"%u:%u\"",   	cfg->ratio.a, cfg->ratio.b);
-    jsonhandler->write_obj("pipeline"          ,"%u",          	cfg->pipeline);
-    jsonhandler->write_obj("data_size"         ,"%u",          	cfg->data_size);
-    jsonhandler->write_obj("data_offset"       ,"%u",          	cfg->data_offset);
-    jsonhandler->write_obj("random_data"       ,"\"%s\"",      	cfg->random_data ? "true" : "false");
-    jsonhandler->write_obj("data_size_range"   ,"\"%u:%u\"",	cfg->data_size_range.min, cfg->data_size_range.max);
-    jsonhandler->write_obj("data_size_list"    ,"\"%s\"",   	cfg->data_size_list.print(tmpbuf, sizeof(tmpbuf)-1));
-    jsonhandler->write_obj("data_size_pattern" ,"\"%s\"", 		cfg->data_size_pattern);
-    jsonhandler->write_obj("expiry_range"      ,"\"%u:%u\"",   	cfg->expiry_range.min, cfg->expiry_range.max);
-    jsonhandler->write_obj("data_import"       ,"\"%s\"",       cfg->data_import);
-    jsonhandler->write_obj("data_verify"       ,"\"%s\"",       cfg->data_verify ? "true" : "false");
-    jsonhandler->write_obj("verify_only"       ,"\"%s\"",       cfg->verify_only ? "true" : "false");
-    jsonhandler->write_obj("generate_keys"     ,"\"%s\"",     	cfg->generate_keys ? "true" : "false");
-    jsonhandler->write_obj("key_prefix"        ,"\"%s\"",       cfg->key_prefix);
-    jsonhandler->write_obj("key_minimum"       ,"%11u",        	cfg->key_minimum);
-    jsonhandler->write_obj("key_maximum"       ,"%11u",        	cfg->key_maximum);
-    jsonhandler->write_obj("key_pattern"       ,"\"%s\"",       cfg->key_pattern);
-    jsonhandler->write_obj("key_stddev"        ,"%f",           cfg->key_stddev);
-    jsonhandler->write_obj("key_median"        ,"%f",           cfg->key_median);
-    jsonhandler->write_obj("reconnect_interval","%u",    		cfg->reconnect_interval);
-    jsonhandler->write_obj("multi_key_get"     ,"%u",         	cfg->multi_key_get);
-    jsonhandler->write_obj("authenticate"      ,"\"%s\"",      	cfg->authenticate ? cfg->authenticate : "");
-    jsonhandler->write_obj("select-db"         ,"%d",           cfg->select_db);
-    jsonhandler->write_obj("no-expiry"         ,"\"%s\"",       cfg->no_expiry ? "true" : "false");
-    jsonhandler->write_obj("wait-ratio"        ,"\"%u:%u\"",    cfg->wait_ratio.a, cfg->wait_ratio.b);
-    jsonhandler->write_obj("num-slaves"        ,"\"%u:%u\"",    cfg->num_slaves.min, cfg->num_slaves.max);
-    jsonhandler->write_obj("wait-timeout"      ,"\"%u-%u\"",   	cfg->wait_timeout.min, cfg->wait_timeout.max);
 
-	jsonhandler->close_nesting();
+    jsonhandler->open_nesting("configuration");
+
+    jsonhandler->write_obj("server", "\"%s\"", cfg->server);
+    jsonhandler->write_obj("port", "%u", cfg->port);
+    jsonhandler->write_obj("uri", "\"%s\"", redact_uri(cfg->uri).c_str());
+    jsonhandler->write_obj("unix socket", "\"%s\"", cfg->unix_socket);
+    jsonhandler->write_obj("address family", "\"%s\"",
+                           cfg->resolution == AF_UNSPEC ? "Unspecified"
+                           : cfg->resolution == AF_INET ? "AF_INET"
+                                                        : "AF_INET6");
+    jsonhandler->write_obj("protocol", "\"%s\"", get_protocol_name(cfg->protocol));
+    jsonhandler->write_obj("out_file", "\"%s\"", cfg->out_file);
+#ifdef USE_TLS
+    jsonhandler->write_obj("tls", "\"%s\"", cfg->tls ? "true" : "false");
+    jsonhandler->write_obj("cert", "\"%s\"", basename_only(cfg->tls_cert).c_str());
+    jsonhandler->write_obj("key", "\"%s\"", basename_only(cfg->tls_key).c_str());
+    jsonhandler->write_obj("cacert", "\"%s\"", basename_only(cfg->tls_cacert).c_str());
+    jsonhandler->write_obj("tls_skip_verify", "\"%s\"", cfg->tls_skip_verify ? "true" : "false");
+    jsonhandler->write_obj("sni", "\"%s\"", cfg->tls_sni);
+#endif
+    jsonhandler->write_obj("client_stats", "\"%s\"", cfg->client_stats);
+    jsonhandler->write_obj("run_count", "%u", cfg->run_count);
+    jsonhandler->write_obj("debug", "%u", cfg->debug);
+    jsonhandler->write_obj("requests", "%llu", cfg->requests);
+    jsonhandler->write_obj("rate_limit", "%u", cfg->request_rate);
+    jsonhandler->write_obj("clients", "%u", cfg->clients);
+    jsonhandler->write_obj("threads", "%u", cfg->threads);
+    jsonhandler->write_obj("test_time", "%u", cfg->test_time);
+    jsonhandler->write_obj("ratio", "\"%u:%u\"", cfg->ratio.a, cfg->ratio.b);
+    jsonhandler->write_obj("pipeline", "%u", cfg->pipeline);
+    jsonhandler->write_obj("transaction", "\"%s\"", cfg->transaction ? "true" : "false");
+    jsonhandler->write_obj("data_size", "%u", cfg->data_size);
+    jsonhandler->write_obj("data_offset", "%u", cfg->data_offset);
+    jsonhandler->write_obj("random_data", "\"%s\"", cfg->random_data ? "true" : "false");
+    jsonhandler->write_obj("data_size_range", "\"%u:%u\"", cfg->data_size_range.min, cfg->data_size_range.max);
+    jsonhandler->write_obj("data_size_list", "\"%s\"", cfg->data_size_list.print(tmpbuf, sizeof(tmpbuf) - 1));
+    jsonhandler->write_obj("data_size_pattern", "\"%s\"", cfg->data_size_pattern);
+    jsonhandler->write_obj("expiry_range", "\"%u:%u\"", cfg->expiry_range.min, cfg->expiry_range.max);
+    jsonhandler->write_obj("data_import", "\"%s\"", cfg->data_import);
+    jsonhandler->write_obj("data_verify", "\"%s\"", cfg->data_verify ? "true" : "false");
+    jsonhandler->write_obj("verify_only", "\"%s\"", cfg->verify_only ? "true" : "false");
+    jsonhandler->write_obj("generate_keys", "\"%s\"", cfg->generate_keys ? "true" : "false");
+    jsonhandler->write_obj("key_prefix", "\"%s\"", cfg->key_prefix);
+    jsonhandler->write_obj("key_minimum", "%11llu", cfg->key_minimum);
+    jsonhandler->write_obj("key_maximum", "%11llu", cfg->key_maximum);
+    jsonhandler->write_obj("key_pattern", "\"%s\"", cfg->key_pattern);
+    jsonhandler->write_obj("key_stddev", "%f", cfg->key_stddev);
+    jsonhandler->write_obj("key_median", "%f", cfg->key_median);
+    jsonhandler->write_obj("key_zipf_exp", "%f", cfg->key_zipf_exp);
+    jsonhandler->write_obj("reconnect_interval", "%u", cfg->reconnect_interval);
+    jsonhandler->write_obj("retry_on_error", "\"%s\"", cfg->retry_on_error ? "true" : "false");
+    jsonhandler->write_obj("max_retries", "%d", cfg->max_retries);
+    jsonhandler->write_obj("retry_backoff_ms", "%u", cfg->retry_backoff_ms);
+    jsonhandler->write_obj("retry_backoff_factor", "%f", cfg->retry_backoff_factor);
+    jsonhandler->write_obj("retry_on", "\"%s\"", cfg->retry_on_filter ? cfg->retry_on_filter : "");
+    jsonhandler->write_obj("max_retry_queue", "%u", cfg->max_retry_queue);
+    jsonhandler->write_obj("failed_keys_file", "\"%s\"", cfg->failed_keys_file ? cfg->failed_keys_file : "");
+    jsonhandler->write_obj("connection_timeout", "%u", cfg->connection_timeout);
+    jsonhandler->write_obj("connection_stage_timeout", "%u", cfg->connection_stage_timeout);
+    jsonhandler->write_obj("thread_conn_start_min_jitter_micros", "%u", cfg->thread_conn_start_min_jitter_micros);
+    jsonhandler->write_obj("thread_conn_start_max_jitter_micros", "%u", cfg->thread_conn_start_max_jitter_micros);
+    jsonhandler->write_obj("multi_key_get", "%u", cfg->multi_key_get);
+    jsonhandler->write_obj("authenticate", "\"%s\"", redact_credentials(cfg->authenticate).c_str());
+    jsonhandler->write_obj("select-db", "%d", cfg->select_db);
+    jsonhandler->write_obj("no-expiry", "\"%s\"", cfg->no_expiry ? "true" : "false");
+    jsonhandler->write_obj("wait-ratio", "\"%u:%u\"", cfg->wait_ratio.a, cfg->wait_ratio.b);
+    jsonhandler->write_obj("num-slaves", "\"%u:%u\"", cfg->num_slaves.min, cfg->num_slaves.max);
+    jsonhandler->write_obj("wait-timeout", "\"%u-%u\"", cfg->wait_timeout.min, cfg->wait_timeout.max);
+    jsonhandler->write_obj("print-all-runs", "\"%s\"", cfg->print_all_runs ? "true" : "false");
+    if (cfg->clients_start > 0) {
+        jsonhandler->write_obj("clients_start", "%u", cfg->clients_start);
+        jsonhandler->write_obj("clients_step", "%u", cfg->clients_step);
+        jsonhandler->write_obj("step_duration", "%u", cfg->step_duration);
+    }
+    if (cfg->scan_incremental_iteration)
+        jsonhandler->write_obj("scan_incremental_max_iterations", "%u", cfg->scan_incremental_max_iterations);
+
+    // Read-preference configuration
+    {
+        const char *rp_str = "primary";
+        switch (cfg->read_preference) {
+        case rp_secondary:
+            rp_str = "secondary";
+            break;
+        case rp_secondary_preferred:
+            rp_str = "secondaryPreferred";
+            break;
+        case rp_nearest:
+            rp_str = "nearest";
+            break;
+        default:
+            rp_str = "primary";
+            break;
+        }
+        jsonhandler->write_obj("read_preference", "\"%s\"", rp_str);
+
+        const char *rpf_str = "error";
+        switch (cfg->read_preference_fallback) {
+        case rpf_queue:
+            rpf_str = "queue";
+            break;
+        case rpf_primary:
+            rpf_str = "primary";
+            break;
+        default:
+            rpf_str = "error";
+            break;
+        }
+        jsonhandler->write_obj("read_preference_fallback", "\"%s\"", rpf_str);
+        jsonhandler->write_obj("replica_clients", "%u", cfg->replica_clients);
+        jsonhandler->write_obj("replicas_per_shard", "%u", cfg->replicas_per_shard);
+
+        // --read-server entries as a comma-separated "host:port,host:port,..."
+        // string. Matches the surrounding key=value style used for
+        // data_size_list / wait-ratio / etc. Empty when no replica endpoints
+        // were given.
+        std::string read_servers_str;
+        for (size_t i = 0; i < cfg->read_servers.size(); i++) {
+            if (i > 0) read_servers_str += ",";
+            char endpoint[256];
+            snprintf(endpoint, sizeof(endpoint), "%s:%u", cfg->read_servers[i].host.c_str(),
+                     (unsigned int) cfg->read_servers[i].port);
+            read_servers_str += endpoint;
+        }
+        jsonhandler->write_obj("read_servers", "\"%s\"", read_servers_str.c_str());
+    }
+
+#ifdef HAVE_EVHTTP
+    // Prometheus configuration (PLAN.md section 5). None of these are secrets.
+    // Run labels are free-form; write_obj escapes quoted string values.
+    jsonhandler->write_obj("prometheus-port", "%d", cfg->prometheus_port);
+    jsonhandler->write_obj("prometheus-bind-addr", "\"%s\"",
+                           cfg->prometheus_bind_addr ? cfg->prometheus_bind_addr : "127.0.0.1");
+    jsonhandler->write_obj("prometheus-run-labels", "\"%s\"", prometheus_run_labels_str(cfg).c_str());
+    jsonhandler->write_obj("prometheus-latency-buckets", "\"%s\"", prometheus_buckets_str(cfg).c_str());
+#endif
+
+    jsonhandler->close_nesting();
+}
+
+// Parse an unsigned decimal option value in [0,max].  Like strtoull(), leading
+// whitespace and a single '+' are accepted, so existing command lines keep
+// working.  A single '-' is accepted only when the value is zero ("-0",
+// "-00"), which strtoull() never wrapped; any other negative value is
+// rejected, since strtoull() would negate it and wrap "-1" or
+// "\n-18446744073709551000" into the valid range.
+// Empty input, trailing junk, ERANGE and values above max are rejected BEFORE
+// the caller narrows the result, so values above UINT_MAX cannot wrap modulo
+// 2^32.  If too_large is given, it is set when the value is a well-formed
+// number above max.
+static bool parse_unsigned(const char *s, unsigned long long max, unsigned long long *out, bool *too_large = NULL)
+{
+    if (too_large) *too_large = false;
+    if (s == NULL) return false;
+    while (isspace((unsigned char) *s))
+        s++;
+    bool negative = false;
+    if (*s == '+')
+        s++;
+    else if (*s == '-') {
+        negative = true;
+        s++;
+    }
+    if (!isdigit((unsigned char) *s)) return false;
+    char *endptr = NULL;
+    errno = 0;
+    unsigned long long v = strtoull(s, &endptr, 10);
+    if (*endptr != '\0') return false;
+    if (negative && (errno == ERANGE || v != 0)) return false;
+    if (errno == ERANGE || v > max) {
+        if (too_large) *too_large = true;
+        return false;
+    }
+    *out = v;
+    return true;
+}
+
+// Signed counterpart of parse_unsigned(), for options with a negative
+// sentinel (--max-retries -1).  Leading whitespace and one '+' or '-' are
+// accepted; empty input, trailing junk, ERANGE and values outside [min,max]
+// are rejected before the caller narrows the result.  If too_large is
+// given, it is set when the value is a well-formed number above max.
+// Like parse_unsigned(), "-0" is accepted: strtoll() reads it as 0.
+static bool parse_signed(const char *s, long long min, long long max, long long *out, bool *too_large = NULL)
+{
+    if (too_large) *too_large = false;
+    if (s == NULL) return false;
+    while (isspace((unsigned char) *s))
+        s++;
+    const char *digits = s;
+    if (*digits == '+' || *digits == '-') digits++;
+    if (!isdigit((unsigned char) *digits)) return false;
+    char *endptr = NULL;
+    errno = 0;
+    long long v = strtoll(s, &endptr, 10);
+    if (*endptr != '\0') return false;
+    if ((errno == ERANGE && v > 0) || (errno != ERANGE && v > max)) {
+        if (too_large) *too_large = true;
+        return false;
+    }
+    if (errno == ERANGE || v < min) return false;
+    *out = v;
+    return true;
+}
+
+// Parse a TCP/UDP port number: the whole string must be a decimal number in
+// [1,65535] (see parse_unsigned()). Shared by -p/--port, --statsd-port,
+// --graphite-port, the --uri port and --read-server HOST:PORT.
+static bool parse_port(const char *s, unsigned short *out)
+{
+    unsigned long long v;
+    if (!parse_unsigned(s, 65535, &v) || v < 1) return false;
+    *out = (unsigned short) v;
+    return true;
+}
+
+// Error for a count option (-n, -c, -t, --pipeline, ...) that parse_unsigned()
+// rejected (parsed == false) or that was zero: say why, so "-1", "5x",
+// "99999..." and "0" are not all reported as "must be greater than zero".
+// unit, if given, follows the maximum (" bytes (512 MiB)").
+static void count_option_error(const char *name, bool parsed, bool too_large, unsigned long long max,
+                               const char *unit = "")
+{
+    if (too_large)
+        fprintf(stderr, "error: %s must be <= %llu%s.\n", name, max, unit);
+    else if (parsed)
+        fprintf(stderr, "error: %s must be greater than zero.\n", name);
+    else
+        fprintf(stderr, "error: %s must be a positive integer.\n", name);
+}
+
+// Error for an option where 0 is a valid value (--data-offset, --select-db,
+// ...) that parse_unsigned() rejected.
+static void non_negative_option_error(const char *name, bool too_large, unsigned long long max)
+{
+    if (too_large)
+        fprintf(stderr, "error: %s must be <= %llu.\n", name, max);
+    else
+        fprintf(stderr, "error: %s must be a non-negative integer.\n", name);
+}
+
+static int hex_digit_value(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+// RFC 3986 percent-decoding of a --uri user name or password, as redis-cli -u
+// does. A '%' not followed by two hex digits is kept as a literal '%' with a
+// warning instead of an error: master took the userinfo verbatim, so a
+// password such as "100%" kept working. %00 is rejected, since the
+// credentials are passed on as a C string and would be cut short. Neither
+// message echoes the value. Returns false on error.
+static bool uri_percent_decode(const char *s, const char *what, std::string &out)
+{
+    bool literal_percent = false;
+    out.clear();
+    for (; *s; s++) {
+        int hi, lo;
+        if (*s == '%' && (hi = hex_digit_value(s[1])) >= 0 && (lo = hex_digit_value(s[2])) >= 0) {
+            if (hi == 0 && lo == 0) {
+                fprintf(stderr, "error: --uri %s contains %%00, which cannot be sent to the server.\n", what);
+                return false;
+            }
+            out += (char) (hi * 16 + lo);
+            s += 2;
+        } else {
+            if (*s == '%') literal_percent = true;
+            out += *s;
+        }
+    }
+    if (literal_percent) {
+        fprintf(stderr,
+                "warning: --uri %s has a '%%' not followed by two hex digits; it is kept as a literal '%%'. "
+                "Write it as %%25.\n",
+                what);
+    }
+    return true;
+}
+
+// Decode the --uri userinfo into the -a/--authenticate form ("user:password",
+// or "password"), splitting at the first raw ':' before decoding so that %3A
+// can carry a ':' in the password. authenticate() splits user and password at
+// the first ':', so a decoded ':' cannot be part of the user name; a password
+// with no user that decodes to a ':' gets a leading ':', which authenticate()
+// reads as "password only"; password_only tells the caller there was no
+// user name, so the memcache_binary USER:PASSWORD check still applies. The
+// decoded user name is printed by --show-config and the JSON, so control
+// bytes are rejected there (Redis rejects such user names anyway); the
+// password is never printed and AUTH is length-prefixed, so it may hold
+// them. Returns false on error.
+static bool uri_decode_userinfo(const char *userinfo, std::string &out, bool &password_only)
+{
+    if (strpbrk(userinfo, "/?#")) {
+        fprintf(stderr, "note: --uri credentials contain a raw '/', '?' or '#'; this is accepted, but if the "
+                        "password is not being recognised, percent-encode them (%%2F, %%3F, %%23). Without "
+                        "credentials, an '@' after a '/', '?' or '#' is read as the credentials separator.\n");
+    }
+    const char *colon = strchr(userinfo, ':');
+    password_only = !colon;
+    if (!colon) {
+        std::string password;
+        if (!uri_percent_decode(userinfo, "password", password)) return false;
+        out = strchr(password.c_str(), ':') ? ":" + password : password;
+        return true;
+    }
+    std::string user, password;
+    if (!uri_percent_decode(std::string(userinfo, colon - userinfo).c_str(), "user name", user) ||
+        !uri_percent_decode(colon + 1, "password", password))
+        return false;
+    if (user.find(':') != std::string::npos) {
+        fprintf(stderr, "error: --uri user name contains ':' (%%3A), which AUTH credentials cannot carry.\n");
+        return false;
+    }
+    for (size_t i = 0; i < user.size(); i++) {
+        unsigned char c = (unsigned char) user[i];
+        if (c < 0x20 || c == 0x7f) {
+            fprintf(stderr, "error: --uri user name contains a control character.\n");
+            return false;
+        }
+    }
+    out = user + ":" + password;
+    return true;
+}
+
+// Parse URI and populate config fields
+// Returns 0 on success, -1 on error
+static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string &uri_authenticate,
+                     std::string &uri_server, bool &uri_password_only)
+{
+    if (!uri || strlen(uri) == 0) {
+        fprintf(stderr, "error: empty URI provided.\n");
+        return -1;
+    }
+
+    // Make a copy to work with
+    char *uri_copy = strdup(uri);
+    if (!uri_copy) {
+        fprintf(stderr, "error: memory allocation failed.\n");
+        return -1;
+    }
+
+    char *ptr = uri_copy;
+
+    // Parse scheme
+    char *scheme_end = strstr(ptr, "://");
+    if (!scheme_end) {
+        fprintf(stderr, "error: invalid URI format, missing scheme.\n");
+        free(uri_copy);
+        return -1;
+    }
+
+    *scheme_end = '\0';
+    if (strcmp(ptr, "redis") == 0) {
+        // Regular Redis connection
+    } else if (strcmp(ptr, "rediss") == 0) {
+#ifdef USE_TLS
+        if (cfg->tls) {
+            fprintf(stderr, "warning: both URI and --tls specified, URI takes precedence.\n");
+        }
+        cfg->tls = true;
+#else
+        fprintf(stderr, "error: TLS not supported in this build.\n");
+        free(uri_copy);
+        return -1;
+#endif
+    } else {
+        fprintf(stderr, "error: unsupported URI scheme '%s'. Use 'redis' or 'rediss'.\n", ptr);
+        free(uri_copy);
+        return -1;
+    }
+
+    ptr = scheme_end + 3; // Skip "://"
+
+    // Parse user:password@host:port/db; see uri_userinfo_end() for where the
+    // userinfo ends (redact_uri() splits at the same place).
+    char *auth_end = (char *) uri_userinfo_end(ptr);
+    char *host_start = ptr;
+
+    if (auth_end) {
+        if (cfg->authenticate) {
+            fprintf(stderr, "warning: both URI and --authenticate specified, URI takes precedence.\n");
+        }
+        // Own URI credentials separately from the borrowed --authenticate
+        // argument. Only the userinfo is decoded: redis-cli -u decodes no
+        // other part, an IPv6 zone id ("[fe80::1%eth0]") passes through
+        // raw, and the port and db number are digits only.
+        *auth_end = '\0';
+        if (!uri_decode_userinfo(ptr, uri_authenticate, uri_password_only)) {
+            free(uri_copy);
+            return -1;
+        }
+        cfg->authenticate = uri_authenticate.c_str();
+        host_start = auth_end + 1;
+    }
+
+    // Parse host:port/db
+    char *db_start = strchr(host_start, '/');
+    if (db_start) {
+        *db_start = '\0';
+        db_start++;
+        if (strlen(db_start) > 0) {
+            // Same rule as --select-db: parse_unsigned() with an INT_MAX bound.
+            unsigned long long db;
+            if (!parse_unsigned(db_start, INT_MAX, &db)) {
+                fprintf(stderr, "error: invalid database number '%s'.\n", db_start);
+                free(uri_copy);
+                return -1;
+            }
+            if (cfg->select_db) {
+                fprintf(stderr, "warning: both URI and --select-db specified, URI takes precedence.\n");
+            }
+            cfg->select_db = (int) db;
+        }
+    }
+
+    // Parse host:port. An IPv6 host is bracketed ([::1]:6379, as accepted by
+    // redis-cli -u): the port separator is the ':' right after the ']'.
+    char *port_start;
+    if (*host_start == '[') {
+        char *bracket = strchr(host_start, ']');
+        if (!bracket || bracket == host_start + 1 || (bracket[1] != '\0' && bracket[1] != ':')) {
+            fprintf(stderr, "error: invalid IPv6 host '%s' in URI.\n", host_start);
+            free(uri_copy);
+            return -1;
+        }
+        *bracket = '\0';
+        port_start = bracket[1] == ':' ? bracket + 1 : NULL;
+        host_start++;
+    } else {
+        port_start = strchr(host_start, ':');
+    }
+    if (port_start) {
+        *port_start = '\0';
+        port_start++;
+        unsigned short port;
+        if (!parse_port(port_start, &port)) {
+            fprintf(stderr, "error: invalid port number '%s'.\n", port_start);
+            free(uri_copy);
+            return -1;
+        }
+        if (cfg->port) {
+            fprintf(stderr, "warning: both URI and --port specified, URI takes precedence.\n");
+        }
+        cfg->port = port;
+    }
+
+    // An empty host with no explicit --server/--unix-socket falls back to the
+    // default server, as before (parse_uri() runs before
+    // config_init_defaults(), so a non-NULL server or unix_socket here was
+    // given on the command line); say where the run goes. This includes a
+    // stray '@' after the path (redis://host:6379/1@), which reads as
+    // credentials "host:6379/1" with no host, as on master (#732).
+    if (strlen(host_start) == 0 && !cfg->server && !cfg->unix_socket) {
+        fprintf(stderr, "warning: --uri has no host; connecting to the default server localhost:%u.\n",
+                cfg->port ? cfg->port : 6379);
+    }
+
+    // Own URI hosts separately from a borrowed --server argument or the default.
+    if (strlen(host_start) > 0) {
+        if (cfg->server) {
+            fprintf(stderr, "warning: both URI and --host/--server specified, URI takes precedence.\n");
+        }
+        uri_server = host_start;
+        cfg->server = uri_server.c_str();
+    }
+
+    free(uri_copy);
+    return 0;
 }
 
 static void config_init_defaults(struct benchmark_config *cfg)
 {
-    if (!cfg->server && !cfg->unix_socket)
-        cfg->server = "localhost";
-    if (!cfg->port && !cfg->unix_socket)
-        cfg->port = 6379;
-    if (!cfg->protocol)
-        cfg->protocol = "redis";
-    if (!cfg->run_count)
-        cfg->run_count = 1;
-    if (!cfg->clients)
-        cfg->clients = 50;
-    if (!cfg->threads)
-        cfg->threads = 4;
-    if (!cfg->ratio.is_defined())
-        cfg->ratio = config_ratio("1:10");
-    if (!cfg->pipeline)
-        cfg->pipeline = 1;
+    cfg->mget_cache = NULL;
+    if (!cfg->server && !cfg->unix_socket) cfg->server = "localhost";
+    if (!cfg->port && !cfg->unix_socket) cfg->port = 6379;
+    if (!cfg->resolution) cfg->resolution = AF_UNSPEC;
+    if (!cfg->run_count) cfg->run_count = 1;
+    if (!cfg->clients) cfg->clients = 50;
+    if (!cfg->threads) cfg->threads = 4;
+    if (!cfg->ratio.is_defined()) cfg->ratio = config_ratio("1:10");
+    if (!cfg->pipeline) cfg->pipeline = 1;
     if (!cfg->data_size && !cfg->data_size_list.is_defined() && !cfg->data_size_range.is_defined() && !cfg->data_import)
         cfg->data_size = 32;
     if (cfg->generate_keys || !cfg->data_import) {
-        if (!cfg->key_prefix)
-            cfg->key_prefix = "memtier-";
-        if (!cfg->key_maximum)
-            cfg->key_maximum = 10000000;
+        if (!cfg->key_prefix) cfg->key_prefix = "memtier-";
+        if (!cfg->key_maximum) cfg->key_maximum = 10000000;
     }
-    if (!cfg->key_pattern)
-        cfg->key_pattern = "R:R";
-    if (!cfg->data_size_pattern)
-        cfg->data_size_pattern = "R";
-    if (cfg->requests == (unsigned int)-1) {
+    if (!cfg->key_pattern) cfg->key_pattern = "R:R";
+    if (!cfg->data_size_pattern) cfg->data_size_pattern = "R";
+    if (cfg->requests == (unsigned long long) -1) {
         cfg->requests = cfg->key_maximum - cfg->key_minimum;
-        if (strcmp(cfg->key_pattern, "P:P")==0)
-            cfg->requests = cfg->requests / (cfg->clients * cfg->threads) + 1;
-        printf("setting requests to %d\n", cfg->requests);
+        if (strcmp(cfg->key_pattern, "P:P") == 0) cfg->requests = cfg->requests / (cfg->clients * cfg->threads) + 1;
+        printf("setting requests to %llu\n", cfg->requests);
     }
-    if (!cfg->requests && !cfg->test_time)
-        cfg->requests = 10000;
+    if (!cfg->requests && !cfg->test_time) cfg->requests = 10000;
+    if (!cfg->hdr_prefix) cfg->hdr_prefix = "";
+    if (!cfg->print_percentiles.is_defined()) cfg->print_percentiles = config_quantiles("50,99,99.9");
+    if (!cfg->monitor_pattern) cfg->monitor_pattern = 'S';
+    if (cfg->miss_rate_threshold < 0.0) cfg->miss_rate_threshold = 0.01; // Default: warn above 1%
+    if (cfg->cpu_warn_threshold < 0.0) cfg->cpu_warn_threshold = 0.95;   // Default: warn above 95% of a core
+    // Default --connection-stage-timeout to 30 s; 0 means "operator disabled".
+    if (cfg->connection_stage_timeout == UINT_MAX) cfg->connection_stage_timeout = 30;
+
+    // StatsD defaults - port only matters if host is set
+    if (!cfg->statsd_port) cfg->statsd_port = 8125;
+    if (!cfg->statsd_prefix) cfg->statsd_prefix = "memtier";
+    if (!cfg->statsd_run_label) cfg->statsd_run_label = "default";
+    if (!cfg->graphite_port) cfg->graphite_port = 8080;
+
+        // Prometheus defaults - bind-addr only matters if --prometheus-port is set.
+        // NULL at parse time means "user didn't pass it" (so the W1 non-loopback
+        // warning never fires on the default); the loopback default is applied here,
+        // after parsing. PLAN.md section 5.
+#ifdef HAVE_EVHTTP
+    if (!cfg->prometheus_bind_addr) cfg->prometheus_bind_addr = "127.0.0.1";
+#endif
+
+#ifdef USE_TLS
+    if (!cfg->tls_protocols) cfg->tls_protocols = REDIS_TLS_PROTO_DEFAULT;
+#endif
 }
 
 static int generate_random_seed()
 {
-    int R;
-    FILE* f = fopen("/dev/random", "r");
-    if (f)
-    {
+    int R = 0;
+    FILE *f = fopen("/dev/random", "r");
+    if (f) {
         size_t ignore = fread(&R, sizeof(R), 1, f);
+        (void) ignore; // Suppress unused variable warning
         fclose(f);
-        ignore++;//ignore warning
     }
-    
-    return (int)time(NULL)^getpid()^R;
+
+    return (int) time(NULL) ^ getpid() ^ R;
 }
+
+static bool verify_cluster_option(struct benchmark_config *cfg)
+{
+    if (cfg->reconnect_interval) {
+        fprintf(stderr, "error: cluster mode dose not support reconnect-interval option.\n");
+        return false;
+    } else if (cfg->wait_ratio.is_defined()) {
+        fprintf(stderr, "error: cluster mode dose not support wait-ratio option.\n");
+        return false;
+    } else if (!is_redis_protocol(cfg->protocol)) {
+        fprintf(stderr, "error: cluster mode supported only in redis protocol.\n");
+        return false;
+    } else if (cfg->unix_socket) {
+        fprintf(stderr, "error: cluster mode dose not support unix-socket option.\n");
+        return false;
+    }
+
+    return true;
+}
+
+// Returns true when `token` is one of the placeholder tokens that
+// arbitrary-command parsing recognises (__key__, __data__, __monitor_line*__).
+// "__scan_cursor__" is not one: only memtier's own SCAN continuation has a
+// cursor slot, so a user token with that text is a literal (#663).
+// The first argv of --command must be a literal command name; allowing a
+// placeholder there is what triggers the runtime assert in protocol.cpp
+// ("first arg is not command name?"). We check at parse time so the user
+// gets a readable error instead of SIGABRT.
+static bool first_arg_is_placeholder(const std::string &token)
+{
+    // The runtime assert in protocol.cpp ("first arg is not command name?")
+    // fires on substring containment via memmem(), not exact equality, so
+    // a literal like `FOO__key__` or `setkey__key__` still SIGABRTs without
+    // this guard. Mirror the same substring contract here at parse time so
+    // the user gets a readable error instead of an abort.
+    if (token.find(KEY_PLACEHOLDER) != std::string::npos || token.find(DATA_PLACEHOLDER) != std::string::npos ||
+        token.find(MONITOR_RANDOM_PLACEHOLDER) != std::string::npos) {
+        return true;
+    }
+    // __monitor_lineN__ (any digits / @) -- the placeholder prefix is the
+    // recognised marker; same substring rule.
+    if (token.find(MONITOR_PLACEHOLDER_PREFIX) != std::string::npos) {
+        return true;
+    }
+    return false;
+}
+
+static bool verify_arbitrary_command_option(struct benchmark_config *cfg)
+{
+    if (cfg->key_pattern) {
+        fprintf(stderr,
+                "error: when using arbitrary command, key pattern is configured with --command-key-pattern option.\n");
+        return false;
+    } else if (cfg->ratio.is_defined()) {
+        fprintf(stderr, "error: when using arbitrary command, ratio is configured with --command-ratio option.\n");
+        return false;
+    }
+
+    // verify that when using Parallel key pattern, it's configured to all commands
+    size_t parallel_count = 0;
+    for (size_t i = 0; i < cfg->arbitrary_commands->size(); i++) {
+        arbitrary_command &cmd = cfg->arbitrary_commands->at(i);
+        if (cmd.key_pattern == 'P') {
+            parallel_count++;
+        }
+    }
+
+    if (parallel_count > 0 && parallel_count != cfg->arbitrary_commands->size()) {
+        fprintf(stderr, "error: parallel key-pattern must be configured to all commands.\n");
+        return false;
+    }
+
+    return true;
+}
+
+// Validation caps for size-related CLI options (Refs #426 phase 2b).
+//   PIPELINE_MAX:  upper bound on --pipeline.  A 1024-deep pipeline already
+//                  saturates most NICs; values beyond that almost always
+//                  reflect a typo (e.g. negative input cast to unsigned).
+//   DATA_SIZE_MAX: upper bound on --data-size (and per-entry size in
+//                  --data-size-list).  Matches Redis' default proto-max-bulk-len
+//                  (512 MiB), past which the server rejects the bulk anyway.
+//   MULTI_KEY_GET_MAX: upper bound on --multi-key-get, a memory sanity
+//                  limit.  Every client preallocates a keylist of
+//                  multi_key_get + 1 entries: 16 bytes of index plus 256 bytes
+//                  of key buffer each, about 4.3 GiB per client at this cap,
+//                  where the preallocated key buffer is just under 4 GiB.  The
+//                  sizes are size_t now, so nothing wraps above it; the cap is
+//                  where keylist's old 32-bit buffer size used to wrap, so every
+//                  value that ever worked still does.
+#define MEMTIER_PIPELINE_MAX 1024u
+#define MEMTIER_DATA_SIZE_MAX (512u * 1024u * 1024u)
+#define MEMTIER_MULTI_KEY_GET_MAX 16777214u
+//   DATA_OFFSET_MAX: upper bound on --data-offset (the SETRANGE/GETRANGE
+//                  offset), 2^29 - 1, which main() used to check after parsing.
+#define MEMTIER_DATA_OFFSET_MAX ((1u << 29) - 1)
+
+// Parse a backoff factor: the whole string must be a finite, representable
+// number >= 0.  Rejects empty input, trailing junk, nan/inf and ERANGE
+// overflow/underflow.  Shared by --reconnect-backoff-factor and
+// --retry-backoff-factor so the two flags accept the same inputs.
+static bool parse_backoff_factor(const char *s, double *out)
+{
+    char *endptr = NULL;
+    errno = 0;
+    double v = strtod(s, &endptr);
+    if (endptr == s || !endptr || *endptr != '\0' || errno == ERANGE || !std::isfinite(v) || v < 0.0) return false;
+    *out = v;
+    return true;
+}
+
+#ifdef HAVE_EVHTTP
+// True if a bracket-free numeric IPv4/IPv6 literal is a loopback address
+// (PLAN.md section 5, W1). IPv4 loopback = 127.0.0.0/8; IPv6 loopback = ::1.
+// 0.0.0.0 and :: are NOT loopback (they are wildcard binds). IPv4-mapped
+// ::ffff:127.0.0.1 is treated as loopback (accepted conservatism). The
+// fallback is false (fail-safe = warn) when the literal does not parse as
+// either family.
+static bool addr_is_loopback(const char *addr)
+{
+    if (addr == NULL) return false;
+    struct in_addr a4;
+    if (inet_pton(AF_INET, addr, &a4) == 1) {
+        return (ntohl(a4.s_addr) >> 24) == 127;
+    }
+    struct in6_addr a6;
+    if (inet_pton(AF_INET6, addr, &a6) == 1) {
+        if (IN6_IS_ADDR_LOOPBACK(&a6)) return true;
+        // IPv4-mapped ::ffff:127.x.x.x -> inspect the embedded v4 octet.
+        if (IN6_IS_ADDR_V4MAPPED(&a6)) return a6.s6_addr[12] == 127;
+        return false;
+    }
+    return false;
+}
+#endif
 
 static int config_parse_args(int argc, char *argv[], struct benchmark_config *cfg)
 {
-    enum extended_options {
+    enum extended_options
+    {
         o_test_time = 128,
         o_ratio,
         o_pipeline,
@@ -280,471 +1667,1754 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_key_pattern,
         o_key_stddev,
         o_key_median,
+        o_key_zipf_exp,
         o_show_config,
         o_hide_histogram,
+        o_print_percentiles,
+        o_print_all_runs,
+        o_realtime_latencies,
         o_distinct_client_seed,
         o_randomize,
         o_client_stats,
         o_reconnect_interval,
+        o_reconnect_on_error,
+        o_max_reconnect_attempts,
+        o_reconnect_backoff_factor,
+        o_retry_on_error,
+        o_max_retries,
+        o_retry_backoff_ms,
+        o_retry_backoff_factor,
+        o_retry_on,
+        o_max_retry_queue,
+        o_failed_keys_file,
+        o_connection_timeout,
+        o_connection_stage_timeout,
+        o_thread_conn_start_min_jitter_micros,
+        o_thread_conn_start_max_jitter_micros,
         o_generate_keys,
         o_multi_key_get,
         o_select_db,
         o_no_expiry,
         o_wait_ratio,
         o_num_slaves,
-        o_wait_timeout, 
-        o_json_out_file
+        o_wait_timeout,
+        o_json_out_file,
+        o_cluster_mode,
+        o_transaction,
+        o_command,
+        o_command_key_pattern,
+        o_command_ratio,
+        o_monitor_input,
+        o_monitor_pattern,
+        o_command_stats_breakdown,
+        o_command_miss_tracking,
+        o_miss_rate_threshold,
+        o_cpu_warn_threshold,
+        o_tls,
+        o_tls_cert,
+        o_tls_key,
+        o_tls_cacert,
+        o_tls_skip_verify,
+        o_tls_sni,
+        o_tls_protocols,
+        o_hdr_file_prefix,
+        o_rate_limiting,
+        o_uri,
+        o_statsd_host,
+        o_statsd_port,
+        o_statsd_prefix,
+        o_statsd_run_label,
+        o_graphite_port,
+        o_prometheus_port,
+        o_prometheus_bind_addr,
+        o_prometheus_run_label,
+        o_prometheus_latency_buckets,
+        o_scan_incremental_iteration,
+        o_scan_incremental_max_iterations,
+        o_clients_start,
+        o_clients_step,
+        o_step_duration,
+        o_read_preference,
+        o_read_server,
+        o_command_is_read,
+        o_replica_clients,
+        o_replicas_per_shard,
+        o_read_preference_fallback,
+        o_help
     };
-    
+
     static struct option long_options[] = {
-        { "server",                     1, 0, 's' },
-        { "port",                       1, 0, 'p' },
-        { "unix-socket",                1, 0, 'S' },
-        { "protocol",                   1, 0, 'P' },
-        { "out-file",                   1, 0, 'o' },
-        { "client-stats",               1, 0, o_client_stats },
-        { "run-count",                  1, 0, 'x' },
-        { "debug",                      0, 0, 'D' },
-        { "show-config",                0, 0, o_show_config },
-        { "hide-histogram",             0, 0, o_hide_histogram },
-        { "distinct-client-seed",       0, 0, o_distinct_client_seed },
-        { "randomize",                  0, 0, o_randomize },
-        { "requests",                   1, 0, 'n' },
-        { "clients",                    1, 0, 'c' },
-        { "threads",                    1, 0, 't' },        
-        { "test-time",                  1, 0, o_test_time },
-        { "ratio",                      1, 0, o_ratio },
-        { "pipeline",                   1, 0, o_pipeline },
-        { "data-size",                  1, 0, 'd' },
-        { "data-offset",                1, 0, o_data_offset },
-        { "random-data",                0, 0, 'R' },
-        { "data-size-range",            1, 0, o_data_size_range },
-        { "data-size-list",             1, 0, o_data_size_list },
-        { "data-size-pattern",          1, 0, o_data_size_pattern },
-        { "expiry-range",               1, 0, o_expiry_range },
-        { "data-import",                1, 0, o_data_import },
-        { "data-verify",                0, 0, o_data_verify },
-        { "verify-only",                0, 0, o_verify_only },
-        { "generate-keys",              0, 0, o_generate_keys },
-        { "key-prefix",                 1, 0, o_key_prefix },
-        { "key-minimum",                1, 0, o_key_minimum },
-        { "key-maximum",                1, 0, o_key_maximum },
-        { "key-pattern",                1, 0, o_key_pattern },
-        { "key-stddev",                 1, 0, o_key_stddev },
-        { "key-median",                 1, 0, o_key_median },
-        { "reconnect-interval",         1, 0, o_reconnect_interval },
-        { "multi-key-get",              1, 0, o_multi_key_get },
-        { "authenticate",               1, 0, 'a' },
-        { "select-db",                  1, 0, o_select_db },
-        { "no-expiry",                  0, 0, o_no_expiry },
-        { "wait-ratio",                 1, 0, o_wait_ratio },
-        { "num-slaves",                 1, 0, o_num_slaves },
-        { "wait-timeout",               1, 0, o_wait_timeout },
-        { "json-out-file",              1, 0, o_json_out_file },
-        { "help",                       0, 0, 'h' },
-        { "version",                    0, 0, 'v' },
-        { NULL,                         0, 0, 0 }
-    };
+        {"server", 1, 0, 's'},
+        {"host", 1, 0, 'h'},
+        {"port", 1, 0, 'p'},
+        {"unix-socket", 1, 0, 'S'},
+        {"ipv4", 0, 0, '4'},
+        {"ipv6", 0, 0, '6'},
+        {"protocol", 1, 0, 'P'},
+#ifdef USE_TLS
+        {"tls", 0, 0, o_tls},
+        {"cert", 1, 0, o_tls_cert},
+        {"key", 1, 0, o_tls_key},
+        {"cacert", 1, 0, o_tls_cacert},
+        {"tls-skip-verify", 0, 0, o_tls_skip_verify},
+        {"sni", 1, 0, o_tls_sni},
+        {"tls-protocols", 1, 0, o_tls_protocols},
+#endif
+        {"out-file", 1, 0, 'o'},
+        {"hdr-file-prefix", 1, 0, o_hdr_file_prefix},
+        {"client-stats", 1, 0, o_client_stats},
+        {"run-count", 1, 0, 'x'},
+        {"debug", 0, 0, 'D'},
+        {"show-config", 0, 0, o_show_config},
+        {"hide-histogram", 0, 0, o_hide_histogram},
+        {"print-percentiles", 1, 0, o_print_percentiles},
+        {"print-all-runs", 0, 0, o_print_all_runs},
+        {"realtime-latencies", 0, 0, o_realtime_latencies},
+        {"distinct-client-seed", 0, 0, o_distinct_client_seed},
+        {"randomize", 0, 0, o_randomize},
+        {"requests", 1, 0, 'n'},
+        {"clients", 1, 0, 'c'},
+        {"threads", 1, 0, 't'},
+        {"test-time", 1, 0, o_test_time},
+        {"ratio", 1, 0, o_ratio},
+        {"pipeline", 1, 0, o_pipeline},
+        {"data-size", 1, 0, 'd'},
+        {"data-offset", 1, 0, o_data_offset},
+        {"random-data", 0, 0, 'R'},
+        {"data-size-range", 1, 0, o_data_size_range},
+        {"data-size-list", 1, 0, o_data_size_list},
+        {"data-size-pattern", 1, 0, o_data_size_pattern},
+        {"expiry-range", 1, 0, o_expiry_range},
+        {"data-import", 1, 0, o_data_import},
+        {"data-verify", 0, 0, o_data_verify},
+        {"verify-only", 0, 0, o_verify_only},
+        {"generate-keys", 0, 0, o_generate_keys},
+        {"key-prefix", 1, 0, o_key_prefix},
+        {"key-minimum", 1, 0, o_key_minimum},
+        {"key-maximum", 1, 0, o_key_maximum},
+        {"key-pattern", 1, 0, o_key_pattern},
+        {"key-stddev", 1, 0, o_key_stddev},
+        {"key-median", 1, 0, o_key_median},
+        {"key-zipf-exp", 1, 0, o_key_zipf_exp},
+        {"reconnect-interval", 1, 0, o_reconnect_interval},
+        {"reconnect-on-error", 0, 0, o_reconnect_on_error},
+        {"max-reconnect-attempts", 1, 0, o_max_reconnect_attempts},
+        {"reconnect-backoff-factor", 1, 0, o_reconnect_backoff_factor},
+        {"retry-on-error", 0, 0, o_retry_on_error},
+        {"max-retries", 1, 0, o_max_retries},
+        {"retry-backoff-ms", 1, 0, o_retry_backoff_ms},
+        {"retry-backoff-factor", 1, 0, o_retry_backoff_factor},
+        {"retry-on", 1, 0, o_retry_on},
+        {"max-retry-queue", 1, 0, o_max_retry_queue},
+        {"failed-keys-file", 1, 0, o_failed_keys_file},
+        {"connection-timeout", 1, 0, o_connection_timeout},
+        {"connection-stage-timeout", 1, 0, o_connection_stage_timeout},
+        {"thread-conn-start-min-jitter-micros", 1, 0, o_thread_conn_start_min_jitter_micros},
+        {"thread-conn-start-max-jitter-micros", 1, 0, o_thread_conn_start_max_jitter_micros},
+        {"multi-key-get", 1, 0, o_multi_key_get},
+        {"authenticate", 1, 0, 'a'},
+        {"select-db", 1, 0, o_select_db},
+        {"no-expiry", 0, 0, o_no_expiry},
+        {"wait-ratio", 1, 0, o_wait_ratio},
+        {"num-slaves", 1, 0, o_num_slaves},
+        {"wait-timeout", 1, 0, o_wait_timeout},
+        {"json-out-file", 1, 0, o_json_out_file},
+        {"cluster-mode", 0, 0, o_cluster_mode},
+        {"transaction", 0, 0, o_transaction},
+        {"help", 0, 0, o_help},
+        {"version", 0, 0, 'v'},
+        {"command", 1, 0, o_command},
+        {"command-key-pattern", 1, 0, o_command_key_pattern},
+        {"command-ratio", 1, 0, o_command_ratio},
+        {"monitor-input", 1, 0, o_monitor_input},
+        {"monitor-pattern", 1, 0, o_monitor_pattern},
+        {"command-stats-breakdown", 1, 0, o_command_stats_breakdown},
+        {"command-miss-tracking", 1, 0, o_command_miss_tracking},
+        {"miss-rate-threshold", 1, 0, o_miss_rate_threshold},
+        {"cpu-warn-threshold", 1, 0, o_cpu_warn_threshold},
+        {"rate-limiting", 1, 0, o_rate_limiting},
+        {"uri", 1, 0, o_uri},
+        {"statsd-host", 1, 0, o_statsd_host},
+        {"statsd-port", 1, 0, o_statsd_port},
+        {"statsd-prefix", 1, 0, o_statsd_prefix},
+        {"statsd-run-label", 1, 0, o_statsd_run_label},
+        {"graphite-port", 1, 0, o_graphite_port},
+#ifdef HAVE_EVHTTP
+        {"prometheus-port", 1, 0, o_prometheus_port},
+        {"prometheus-bind-addr", 1, 0, o_prometheus_bind_addr},
+        {"prometheus-run-label", 1, 0, o_prometheus_run_label},
+        {"prometheus-latency-buckets", 1, 0, o_prometheus_latency_buckets},
+#endif
+        {"scan-incremental-iteration", 0, 0, o_scan_incremental_iteration},
+        {"scan-incremental-max-iterations", 1, 0, o_scan_incremental_max_iterations},
+        {"clients-start", 1, 0, o_clients_start},
+        {"clients-step", 1, 0, o_clients_step},
+        {"step-duration", 1, 0, o_step_duration},
+        {"read-preference", 1, 0, o_read_preference},
+        {"read-server", 1, 0, o_read_server},
+        {"command-is-read", 0, 0, o_command_is_read},
+        {"replica-clients", 1, 0, o_replica_clients},
+        {"replicas-per-shard", 1, 0, o_replicas_per_shard},
+        {"read-preference-fallback", 1, 0, o_read_preference_fallback},
+        {NULL, 0, 0, 0}};
 
     int option_index;
     int c;
     char *endptr;
-    while ((c = getopt_long(argc, argv, 
-                "s:S:p:P:o:x:DRn:c:t:d:a:h", long_options, &option_index)) != -1)
-    {
+    unsigned long long val;
+    while ((c = getopt_long(argc, argv, "vs:S:p:P:o:x:DRn:c:t:d:a:h:46u:", long_options, &option_index)) != -1) {
         switch (c) {
-                case 'h':
+        case o_help:
+            return -1;
+            break;
+        case 'v': {
+            // Print version information similar to Redis format
+            // First line: memtier_benchmark v=... sha=... bits=... libevent=... openssl=...
+            printf("memtier_benchmark v=%s sha=%s:%s", PACKAGE_VERSION, MEMTIER_GIT_SHA1, MEMTIER_GIT_DIRTY);
+
+            // Print architecture bits
+#if defined(__x86_64__) || defined(_M_X64) || defined(__aarch64__)
+            printf(" bits=64");
+#elif defined(__i386__) || defined(_M_IX86) || defined(__arm__)
+            printf(" bits=32");
+#else
+            printf(" bits=unknown");
+#endif
+
+            // Print libevent version
+            printf(" libevent=%s", event_get_version());
+
+            // Print OpenSSL version if TLS is enabled
+#ifdef USE_TLS
+            printf(" openssl=%s", OPENSSL_VERSION_TEXT);
+#endif
+
+            // Print Prometheus exporter availability (compiled in iff HAVE_EVHTTP)
+#ifdef HAVE_EVHTTP
+            printf(" prometheus=yes");
+#else
+            printf(" prometheus=no");
+#endif
+
+            printf("\n");
+
+            // Copyright and license info
+            printf("Copyright (C) 2011-2026 Redis Ltd.\n");
+            printf("This is free software.  You may redistribute copies of it under the terms of\n");
+            printf("the GNU General Public License <http://www.gnu.org/licenses/gpl.html>.\n");
+            printf("There is NO WARRANTY, to the extent permitted by law.\n");
+        }
+            exit(0);
+        case 's':
+        case 'h':
+            cfg->server = optarg;
+            break;
+        case 'S':
+            cfg->unix_socket = optarg;
+            break;
+        case 'p':
+            if (!parse_port(optarg, &cfg->port)) {
+                fprintf(stderr, "error: port must be a number in the range [1-65535].\n");
+                return -1;
+            }
+            break;
+        case '4':
+            cfg->resolution = AF_INET;
+            break;
+        case '6':
+            cfg->resolution = AF_INET6;
+            break;
+        case 'P':
+            if (strcmp(optarg, "redis") == 0) {
+                cfg->protocol = PROTOCOL_REDIS_DEFAULT;
+            } else if (strcmp(optarg, "resp2") == 0) {
+                cfg->protocol = PROTOCOL_RESP2;
+            } else if (strcmp(optarg, "resp3") == 0) {
+                cfg->protocol = PROTOCOL_RESP3;
+            } else if (strcmp(optarg, "memcache_text") == 0) {
+                cfg->protocol = PROTOCOL_MEMCACHE_TEXT;
+            } else if (strcmp(optarg, "memcache_binary") == 0) {
+                cfg->protocol = PROTOCOL_MEMCACHE_BINARY;
+            } else {
+                fprintf(stderr, "error: supported protocols are 'memcache_text', 'memcache_binary', 'redis', 'resp2' "
+                                "and resp3'.\n");
+                return -1;
+            }
+            break;
+        case 'o':
+            cfg->out_file = optarg;
+            break;
+        case o_hdr_file_prefix:
+            cfg->hdr_prefix = optarg;
+            break;
+        case o_client_stats:
+            cfg->client_stats = optarg;
+            break;
+        case 'x': {
+            // Parse via signed strtol so negative values do not silently wrap
+            // through the unsigned cast (e.g. -1 -> ~4.3B -> vector::reserve
+            // throwing std::bad_alloc).  Also cap at MAX_RUN_COUNT because the
+            // aggregated best/worst/average path in main() allocates several
+            // per-run vectors of run_stats / cmd_stats that grow linearly with
+            // run_count; values in the hundreds of millions are not a useful
+            // benchmark configuration and just OOM the allocator.
+            endptr = NULL;
+            errno = 0;
+            long parsed_run_count = strtol(optarg, &endptr, 10);
+            if (optarg[0] == '\0' || !endptr || *endptr != '\0' || errno == ERANGE) {
+                fprintf(stderr, "error: run count must be a positive integer.\n");
+                return -1;
+            }
+            if (parsed_run_count <= 0) {
+                fprintf(stderr, "error: run count must be greater than zero.\n");
+                return -1;
+            }
+            if (parsed_run_count > MAX_RUN_COUNT) {
+                fprintf(stderr, "error: run count must be <= %d (got %ld).\n", MAX_RUN_COUNT, parsed_run_count);
+                return -1;
+            }
+            cfg->run_count = (unsigned int) parsed_run_count;
+            break;
+        }
+        case 'D':
+            cfg->debug++;
+            break;
+        case o_show_config:
+            cfg->show_config++;
+            break;
+        case o_hide_histogram:
+            cfg->hide_histogram++;
+            break;
+        case o_print_percentiles:
+            cfg->print_percentiles = config_quantiles(optarg);
+            if (!cfg->print_percentiles.is_defined()) {
+                fprintf(stderr, "error: quantiles must be expressed as [0.0-100.0],[0.0-100.0](,...) .\n");
+                return -1;
+            }
+            break;
+        case o_print_all_runs:
+            cfg->print_all_runs = true;
+            break;
+        case o_realtime_latencies:
+            cfg->realtime_latencies = true;
+            break;
+        case o_distinct_client_seed:
+            cfg->distinct_client_seed++;
+            break;
+        case o_randomize:
+            srandom(generate_random_seed());
+            cfg->randomize = random();
+            break;
+        case 'n':
+            if (strcmp(optarg, "allkeys") == 0)
+                cfg->requests = -1;
+            else {
+                // ULLONG_MAX is the "allkeys" sentinel, so it is not a valid count.
+                bool too_large;
+                bool parsed = parse_unsigned(optarg, ULLONG_MAX - 1, &cfg->requests, &too_large);
+                if (!parsed || !cfg->requests) {
+                    count_option_error("requests", parsed, too_large, ULLONG_MAX - 1);
+                    return -1;
+                }
+                if (cfg->test_time) {
+                    fprintf(stderr, "error: --test-time and --requests are mutually exclusive.\n");
+                    return -1;
+                }
+            }
+            break;
+        case 'c': {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, UINT_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("clients", parsed, too_large, UINT_MAX);
+                return -1;
+            }
+            cfg->clients = (unsigned int) val;
+            break;
+        }
+        case 't': {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, UINT_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("threads", parsed, too_large, UINT_MAX);
+                return -1;
+            }
+            cfg->threads = (unsigned int) val;
+            break;
+        }
+        case o_test_time: {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, UINT_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("test time", parsed, too_large, UINT_MAX);
+                return -1;
+            }
+            cfg->test_time = (unsigned int) val;
+            if (cfg->requests) {
+                fprintf(stderr, "error: --test-time and --requests are mutually exclusive.\n");
+                return -1;
+            }
+            break;
+        }
+        case o_ratio:
+            cfg->ratio = config_ratio(optarg);
+            if (!cfg->ratio.is_defined()) {
+                fprintf(stderr, "error: ratio must be expressed as [0-n]:[0-n].\n");
+                return -1;
+            }
+            break;
+        case o_pipeline: {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, MEMTIER_PIPELINE_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("pipeline", parsed, too_large, MEMTIER_PIPELINE_MAX);
+                return -1;
+            }
+            cfg->pipeline = (unsigned int) val;
+            break;
+        }
+        case 'd': {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, MEMTIER_DATA_SIZE_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("data-size", parsed, too_large, MEMTIER_DATA_SIZE_MAX, " bytes (512 MiB)");
+                return -1;
+            }
+            cfg->data_size = (unsigned int) val;
+            break;
+        }
+        case 'R':
+            cfg->random_data = true;
+            break;
+        case o_data_offset: {
+            bool too_large;
+            if (!parse_unsigned(optarg, MEMTIER_DATA_OFFSET_MAX, &val, &too_large)) {
+                non_negative_option_error("data-offset", too_large, MEMTIER_DATA_OFFSET_MAX);
+                return -1;
+            }
+            cfg->data_offset = (unsigned int) val;
+            break;
+        }
+        case o_data_size_range:
+            cfg->data_size_range = config_range(optarg);
+            if (!cfg->data_size_range.is_defined() || cfg->data_size_range.min < 1) {
+                fprintf(stderr, "error: data-size-range must be expressed as [1-n]-[1-n].\n");
+                return -1;
+            }
+            break;
+        case o_data_size_list:
+            cfg->data_size_list = config_weight_list(optarg);
+            if (!cfg->data_size_list.is_defined()) {
+                fprintf(stderr, "error: data-size-list must be expressed as [size1:weight1],...[sizeN:weightN].\n");
+                return -1;
+            }
+            // Validate every entry in the list:
+            //   * size > 0   -- zero-size (e.g. "0:50") trips the
+            //                   value_len > 0 assert in protocol.cpp:309
+            //                   at the first SET (#426 item 9).
+            //   * size <= MEMTIER_DATA_SIZE_MAX (512 MiB matches Redis'
+            //                   default proto-max-bulk-len cap, see #428).
+            //   * weight > 0 -- zero-weight (e.g. "8:0") is silently
+            //                   skipped by the sampler and (if every
+            //                   entry has weight 0) loops forever picking
+            //                   nothing (#426 item 10, phase 3).
+            for (std::vector<config_weight_list::weight_item>::iterator it = cfg->data_size_list.item_list.begin();
+                 it != cfg->data_size_list.item_list.end(); ++it) {
+                if (it->size == 0) {
+                    fprintf(stderr,
+                            "error: data-size-list entries must have size > 0 "
+                            "(got 0 in '%s').\n",
+                            optarg);
+                    return -1;
+                }
+                if (it->size > MEMTIER_DATA_SIZE_MAX) {
+                    fprintf(stderr,
+                            "error: data-size-list entry size must be <= %u bytes "
+                            "(512 MiB), got %u.\n",
+                            MEMTIER_DATA_SIZE_MAX, it->size);
+                    return -1;
+                }
+                if (it->weight == 0) {
+                    fprintf(stderr,
+                            "error: data-size-list entries must have weight greater than zero "
+                            "(got size=%u weight=0).\n",
+                            it->size);
+                    return -1;
+                }
+            }
+            break;
+        case o_expiry_range:
+            cfg->expiry_range = config_range(optarg);
+            if (!cfg->expiry_range.is_defined()) {
+                fprintf(stderr, "error: expiry-range must be expressed as [0-n]-[1-n].\n");
+                return -1;
+            }
+            break;
+        case o_data_size_pattern:
+            cfg->data_size_pattern = optarg;
+            if (strlen(cfg->data_size_pattern) != 1 ||
+                (cfg->data_size_pattern[0] != 'R' && cfg->data_size_pattern[0] != 'S')) {
+                fprintf(stderr, "error: data-size-pattern must be either R or S.\n");
+                return -1;
+            }
+            break;
+        case o_data_import:
+            cfg->data_import = optarg;
+            break;
+        case o_data_verify:
+            cfg->data_verify = 1;
+            break;
+        case o_verify_only:
+            cfg->verify_only = 1;
+            cfg->data_verify = 1; // Implied
+            break;
+        case o_key_prefix:
+            cfg->key_prefix = optarg;
+            break;
+        case o_key_minimum: {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, ULLONG_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("key-minimum", parsed, too_large, ULLONG_MAX);
+                return -1;
+            }
+            cfg->key_minimum = val;
+            break;
+        }
+        case o_key_maximum: {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, ULLONG_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("key-maximum", parsed, too_large, ULLONG_MAX);
+                return -1;
+            }
+            cfg->key_maximum = val;
+            break;
+        }
+        case o_key_stddev:
+            endptr = NULL;
+            cfg->key_stddev = strtod(optarg, &endptr);
+            // Reject non-finite stddev (NaN, +/-inf): the Gaussian sampler's
+            // rejection loop would never produce an in-range key. Issue #426.
+            if (!endptr || *endptr != '\0' || !std::isfinite(cfg->key_stddev) || cfg->key_stddev <= 0) {
+                fprintf(stderr, "error: key-stddev must be a finite number greater than zero.\n");
+                return -1;
+            }
+            break;
+        case o_key_median:
+            endptr = NULL;
+            cfg->key_median = strtod(optarg, &endptr);
+            if (cfg->key_median <= 0 || !endptr || *endptr != '\0') {
+                fprintf(stderr, "error: key-median must be greater than zero.\n");
+                return -1;
+            }
+            break;
+        case o_key_zipf_exp:
+            endptr = NULL;
+            cfg->key_zipf_exp = strtod(optarg, &endptr);
+            if (cfg->key_zipf_exp <= 0 || cfg->key_zipf_exp >= 5 || !endptr || *endptr != '\0') {
+                fprintf(stderr, "error: key-zipf-exp must be within interval (0, 5).\n");
+                return -1;
+            }
+            break;
+        case o_key_pattern:
+            cfg->key_pattern = optarg;
+
+            if (strlen(cfg->key_pattern) != 3 || cfg->key_pattern[key_pattern_delimiter] != ':' ||
+                (cfg->key_pattern[key_pattern_set] != 'R' && cfg->key_pattern[key_pattern_set] != 'S' &&
+                 cfg->key_pattern[key_pattern_set] != 'G' && cfg->key_pattern[key_pattern_set] != 'Z' &&
+                 cfg->key_pattern[key_pattern_set] != 'P') ||
+                (cfg->key_pattern[key_pattern_get] != 'R' && cfg->key_pattern[key_pattern_get] != 'S' &&
+                 cfg->key_pattern[key_pattern_get] != 'G' && cfg->key_pattern[key_pattern_get] != 'Z' &&
+                 cfg->key_pattern[key_pattern_get] != 'P')) {
+                fprintf(stderr, "error: key-pattern must be in the format of [S/R/G/P/Z]:[S/R/G/P/Z].\n");
+                return -1;
+            }
+
+            if ((cfg->key_pattern[key_pattern_set] == 'P' || cfg->key_pattern[key_pattern_get] == 'P') &&
+                (cfg->key_pattern[key_pattern_set] != cfg->key_pattern[key_pattern_get])) {
+                fprintf(stderr, "error: parallel key-pattern must be configured for both SET and GET commands.\n");
+                return -1;
+            }
+            break;
+        case o_reconnect_interval: {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, UINT_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("reconnect-interval", parsed, too_large, UINT_MAX);
+                return -1;
+            }
+            cfg->reconnect_interval = (unsigned int) val;
+            break;
+        }
+        case o_reconnect_on_error:
+            cfg->reconnect_on_error = true;
+            break;
+        case o_max_reconnect_attempts:
+            if (!parse_unsigned(optarg, UINT_MAX, &val)) {
+                fprintf(stderr, "error: max-reconnect-attempts must be a valid number.\n");
+                return -1;
+            }
+            cfg->max_reconnect_attempts = (unsigned int) val;
+            break;
+        case o_reconnect_backoff_factor:
+            if (!parse_backoff_factor(optarg, &cfg->reconnect_backoff_factor)) {
+                fprintf(
+                    stderr,
+                    "error: reconnect-backoff-factor must be a finite, representable number >= 0 (0 = no backoff).\n");
+                return -1;
+            }
+            break;
+        case o_retry_on_error:
+            cfg->retry_on_error = true;
+            break;
+        case o_max_retries: {
+            long long parsed;
+            bool too_large;
+            if (!parse_signed(optarg, -1, INT_MAX, &parsed, &too_large)) {
+                if (too_large)
+                    fprintf(stderr, "error: max-retries must be <= %d.\n", INT_MAX);
+                else
+                    fprintf(stderr, "error: max-retries must be an integer >= -1 (-1 means unlimited).\n");
+                return -1;
+            }
+            cfg->max_retries = (int) parsed;
+            break;
+        }
+        case o_retry_backoff_ms:
+            if (!parse_unsigned(optarg, UINT_MAX, &val)) {
+                fprintf(stderr, "error: retry-backoff-ms must be a valid number.\n");
+                return -1;
+            }
+            cfg->retry_backoff_ms = (unsigned int) val;
+            break;
+        case o_retry_backoff_factor:
+            if (!parse_backoff_factor(optarg, &cfg->retry_backoff_factor)) {
+                fprintf(stderr, "error: retry-backoff-factor must be a finite, representable number >= 0 (0 = no "
+                                "exponential, constant backoff).\n");
+                return -1;
+            }
+            break;
+        case o_retry_on:
+            cfg->retry_on_filter = optarg;
+            break;
+        case o_max_retry_queue:
+            if (!parse_unsigned(optarg, UINT_MAX, &val)) {
+                fprintf(stderr, "error: max-retry-queue must be a valid number.\n");
+                return -1;
+            }
+            cfg->max_retry_queue = (unsigned int) val;
+            break;
+        case o_failed_keys_file:
+            if (!optarg || !*optarg) {
+                fprintf(stderr, "error: failed-keys-file requires a non-empty path.\n");
+                return -1;
+            }
+            cfg->failed_keys_file = optarg;
+            break;
+        case o_connection_timeout:
+            if (!parse_unsigned(optarg, UINT_MAX, &val)) {
+                fprintf(stderr, "error: connection-timeout must be a valid number.\n");
+                return -1;
+            }
+            cfg->connection_timeout = (unsigned int) val;
+            break;
+        case o_connection_stage_timeout:
+            // 0 is allowed and disables the supervisor (opt-out for users
+            // running long pre-warmed handshakes against slow servers).
+            // UINT_MAX is the "not set" sentinel (defaults to 30 s).
+            if (!parse_unsigned(optarg, UINT_MAX - 1, &val)) {
+                fprintf(stderr, "error: connection-stage-timeout must be a valid number (seconds, 0 disables).\n");
+                return -1;
+            }
+            cfg->connection_stage_timeout = (unsigned int) val;
+            break;
+        case o_thread_conn_start_min_jitter_micros: {
+            bool too_large;
+            if (!parse_unsigned(optarg, UINT_MAX, &val, &too_large)) {
+                non_negative_option_error("thread-conn-start-min-jitter-micros", too_large, UINT_MAX);
+                return -1;
+            }
+            cfg->thread_conn_start_min_jitter_micros = (unsigned int) val;
+            break;
+        }
+        case o_thread_conn_start_max_jitter_micros: {
+            bool too_large;
+            if (!parse_unsigned(optarg, UINT_MAX, &val, &too_large)) {
+                non_negative_option_error("thread-conn-start-max-jitter-micros", too_large, UINT_MAX);
+                return -1;
+            }
+            cfg->thread_conn_start_max_jitter_micros = (unsigned int) val;
+            break;
+        }
+        case o_generate_keys:
+            cfg->generate_keys = 1;
+            break;
+        case o_multi_key_get: {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, MEMTIER_MULTI_KEY_GET_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("multi-key-get", parsed, too_large, MEMTIER_MULTI_KEY_GET_MAX);
+                return -1;
+            }
+            cfg->multi_key_get = (int) val;
+            break;
+        }
+        case 'a':
+            cfg->authenticate = optarg;
+            break;
+        case 'u':
+        case o_uri:
+            cfg->uri = optarg;
+            break;
+        case o_select_db: {
+            bool too_large;
+            if (!parse_unsigned(optarg, INT_MAX, &val, &too_large)) {
+                non_negative_option_error("select-db", too_large, INT_MAX);
+                return -1;
+            }
+            cfg->select_db = (int) val;
+            break;
+        }
+        case o_no_expiry:
+            cfg->no_expiry = true;
+            break;
+        case o_wait_ratio:
+            cfg->wait_ratio = config_ratio(optarg);
+            if (!cfg->wait_ratio.is_defined()) {
+                fprintf(stderr, "error: wait-ratio must be expressed as [0-n]:[0-n].\n");
+                return -1;
+            }
+            break;
+        case o_num_slaves:
+            cfg->num_slaves = config_range(optarg);
+            if (!cfg->num_slaves.is_defined()) {
+                fprintf(stderr, "error: num-slaves must be expressed as [0-n]-[1-n].\n");
+                return -1;
+            }
+            break;
+        case o_wait_timeout:
+            cfg->wait_timeout = config_range(optarg);
+            if (!cfg->wait_timeout.is_defined()) {
+                fprintf(stderr, "error: wait-timeout must be expressed as [0-n]-[1-n].\n");
+                return -1;
+            }
+            break;
+        case o_json_out_file:
+            cfg->json_out_file = optarg;
+            break;
+        case o_cluster_mode:
+            cfg->cluster_mode = true;
+            break;
+        case o_transaction:
+            cfg->transaction = true;
+            break;
+        case o_command: {
+            // Check if this is a monitor placeholder
+            const char *cmd_str = optarg;
+            if (strcmp(cmd_str, MONITOR_RANDOM_PLACEHOLDER) == 0 ||
+                strncmp(cmd_str, MONITOR_PLACEHOLDER_PREFIX, strlen(MONITOR_PLACEHOLDER_PREFIX)) == 0) {
+                // This is a monitor placeholder, we'll expand it later after loading the file
+                arbitrary_command cmd(cmd_str);
+                cmd.split_command_to_args();
+                cfg->arbitrary_commands->add_command(cmd);
+            } else {
+                // Regular arbitrary command
+                arbitrary_command cmd(cmd_str);
+                if (cmd.split_command_to_args()) {
+                    // Parse-time validation: split_command_to_args() returns
+                    // true even on an empty or whitespace-only string (it
+                    // simply emits zero argv tokens). Without this guard
+                    // --command '' parses as a 0-arg command and the worker
+                    // loop spins forever (issue #426 item 13).
+                    if (cmd.command_args.empty()) {
+                        fprintf(stderr, "error: --command requires a non-empty command string.\n");
+                        return -1;
+                    }
+                    // The first argv must be a literal command name. A
+                    // placeholder there (e.g. --command __key__) trips the
+                    // assert in protocol.cpp:774 at runtime; reject it at
+                    // parse time so the user gets a readable error instead
+                    // of SIGABRT (issue #426 item 12).
+                    if (first_arg_is_placeholder(cmd.command_args[0].data)) {
+                        fprintf(stderr,
+                                "error: --command first token must be a literal command name, not the "
+                                "placeholder '%s'.\n",
+                                cmd.command_args[0].data.c_str());
+                        return -1;
+                    }
+                    // Resolve key positions and reply shape from the static
+                    // command_meta registry (vendored Redis commands.json).
+                    // Memcached / module / unknown commands return spec=null
+                    // and the call is a no-op.
+                    cmd.resolve_command_meta();
+                    cfg->arbitrary_commands->add_command(cmd);
+                } else {
+                    fprintf(stderr, "error: failed to parse arbitrary command.\n");
+                    return -1;
+                }
+            }
+            break;
+        }
+        case o_command_key_pattern: {
+            if (cfg->arbitrary_commands->size() == 0) {
+                fprintf(stderr, "error: no arbitrary command found.\n");
+                return -1;
+            }
+
+            // command configuration always applied on last configured command
+            arbitrary_command &cmd = cfg->arbitrary_commands->get_last_command();
+            if (!cmd.set_key_pattern(optarg)) {
+                fprintf(stderr, "error: key-pattern for command %s must be in the format of [S/R/Z/G/P].\n",
+                        cmd.command_name.c_str());
+                return -1;
+            }
+            break;
+        }
+        case o_command_ratio: {
+            if (cfg->arbitrary_commands->size() == 0) {
+                fprintf(stderr, "error: no arbitrary command found.\n");
+                return -1;
+            }
+
+            // command configuration always applied on last configured command
+            arbitrary_command &cmd = cfg->arbitrary_commands->get_last_command();
+            if (!cmd.set_ratio(optarg)) {
+                // set_ratio() rejects empty / negative / non-integer / zero
+                // input. Zero is the most user-confusing case (the worker
+                // loop spins forever picking nothing — issue #426 item 14)
+                // so call it out explicitly.
+                fprintf(stderr, "error: --command-ratio must be a positive integer (got '%s') for command %s.\n",
+                        optarg ? optarg : "", cmd.command_name.c_str());
+                return -1;
+            }
+            break;
+        }
+        case o_monitor_input:
+            cfg->monitor_input = optarg;
+            break;
+        case o_monitor_pattern: {
+            if (!optarg || strlen(optarg) != 1) {
+                fprintf(stderr,
+                        "error: monitor-pattern must be a single character: 'S' (sequential) or 'R' (random).\n");
+                return -1;
+            }
+            char pattern = toupper((unsigned char) optarg[0]);
+            if (pattern != 'S' && pattern != 'R') {
+                fprintf(stderr, "error: monitor-pattern must be 'S' (sequential) or 'R' (random).\n");
+                return -1;
+            }
+            cfg->monitor_pattern = pattern;
+            break;
+        }
+        case o_command_stats_breakdown: {
+            if (!optarg) {
+                fprintf(stderr, "error: command-stats-breakdown requires a value: 'command' or 'line'.\n");
+                return -1;
+            }
+            if (strcasecmp(optarg, "command") == 0) {
+                cfg->command_stats_by_type = true;
+            } else if (strcasecmp(optarg, "line") == 0) {
+                cfg->command_stats_by_type = false;
+            } else {
+                fprintf(stderr, "error: command-stats-breakdown must be 'command' or 'line'.\n");
+                return -1;
+            }
+            break;
+        }
+        case o_command_miss_tracking: {
+            if (!optarg) {
+                fprintf(stderr, "error: command-miss-tracking requires a value: 'auto' or 'off'.\n");
+                return -1;
+            }
+            if (strcasecmp(optarg, "auto") == 0) {
+                cfg->command_miss_tracking = true;
+            } else if (strcasecmp(optarg, "off") == 0) {
+                cfg->command_miss_tracking = false;
+            } else {
+                fprintf(stderr, "error: command-miss-tracking must be 'auto' or 'off'.\n");
+                return -1;
+            }
+            break;
+        }
+        case o_miss_rate_threshold: {
+            endptr = NULL;
+            double pct = strtod(optarg, &endptr);
+            if (endptr == optarg || !endptr || *endptr != '\0' || !std::isfinite(pct) || pct < 0.0 || pct > 100.0) {
+                fprintf(stderr, "error: --miss-rate-threshold must be a percentage between 0 and 100.\n");
+                return -1;
+            }
+            cfg->miss_rate_threshold = pct / 100.0;
+            break;
+        }
+        case o_cpu_warn_threshold: {
+            endptr = NULL;
+            double pct = strtod(optarg, &endptr);
+            if (endptr == optarg || !endptr || *endptr != '\0' || !std::isfinite(pct) || pct < 0.0 || pct > 100.0) {
+                fprintf(stderr, "error: --cpu-warn-threshold must be a percentage between 0 and 100.\n");
+                return -1;
+            }
+            cfg->cpu_warn_threshold = pct / 100.0;
+            break;
+        }
+        case o_rate_limiting: {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, UINT_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("rate-limiting", parsed, too_large, UINT_MAX);
+                return -1;
+            }
+            cfg->request_rate = (unsigned int) val;
+            break;
+        }
+#ifdef USE_TLS
+        case o_tls:
+            cfg->tls = true;
+            break;
+        case o_tls_cert:
+            cfg->tls_cert = optarg;
+            break;
+        case o_tls_key:
+            cfg->tls_key = optarg;
+            break;
+        case o_tls_cacert:
+            cfg->tls_cacert = optarg;
+            break;
+        case o_tls_skip_verify:
+            cfg->tls_skip_verify = true;
+            break;
+        case o_tls_sni:
+            cfg->tls_sni = optarg;
+            break;
+        case o_tls_protocols: {
+            const char *tls_delimiter = ",";
+            char *tls_token = std::strtok(optarg, tls_delimiter);
+            while (tls_token != NULL) {
+                if (!strcasecmp(tls_token, "tlsv1"))
+                    cfg->tls_protocols |= REDIS_TLS_PROTO_TLSv1;
+                else if (!strcasecmp(tls_token, "tlsv1.1"))
+                    cfg->tls_protocols |= REDIS_TLS_PROTO_TLSv1_1;
+                else if (!strcasecmp(tls_token, "tlsv1.2"))
+                    cfg->tls_protocols |= REDIS_TLS_PROTO_TLSv1_2;
+                else if (!strcasecmp(tls_token, "tlsv1.3")) {
+#ifdef TLS1_3_VERSION
+                    cfg->tls_protocols |= REDIS_TLS_PROTO_TLSv1_3;
+#else
+                    fprintf(stderr, "TLSv1.3 is specified in tls-protocols but not supported by OpenSSL.");
+                    return -1;
+#endif
+                } else {
+                    fprintf(stderr,
+                            "Invalid tls-protocols specified %s. "
+                            "Use a combination of 'TLSv1', 'TLSv1.1', 'TLSv1.2' and 'TLSv1.3'.",
+                            tls_token);
                     return -1;
                     break;
-                case 'v':
-                    puts(PACKAGE_STRING);
-                // FIXME!!
-                    puts("Copyright (C) 2011-2017 Redis Labs Ltd.");
-                    puts("This is free software.  You may redistribute copies of it under the terms of");
-                    puts("the GNU General Public License <http://www.gnu.org/licenses/gpl.html>.");
-                    puts("There is NO WARRANTY, to the extent permitted by law.");
-                    exit(0);
-                case 's':
-                    cfg->server = optarg;
-                    break;
-                case 'S':
-                    cfg->unix_socket = optarg;
-                    break;
-                case 'p':
-                    endptr = NULL;
-                    cfg->port = (unsigned short) strtoul(optarg, &endptr, 10);
-                    if (!cfg->port || cfg->port > 65535 || !endptr || *endptr != '\0') {
-                        fprintf(stderr, "error: port must be a number in the range [1-65535].\n");
-                        return -1;
-                    }
-                    break;
-                case 'P':
-                    if (strcmp(optarg, "memcache_text") &&
-                        strcmp(optarg, "memcache_binary") &&
-                        strcmp(optarg, "redis")) {
-                                fprintf(stderr, "error: supported protocols are 'memcache_text', 'memcache_binary' and 'redis'.\n");
-                                return -1;
-                    }
-                    cfg->protocol = optarg;
-                    break;
-                case 'o':
-                    cfg->out_file = optarg;
-                    break;
-                case o_client_stats:
-                    cfg->client_stats = optarg;
-                    break;
-                case 'x':
-                    endptr = NULL;
-                    cfg->run_count = (unsigned int) strtoul(optarg, &endptr, 10);
-                    if (!cfg->run_count || !endptr || *endptr != '\0') {
-                        fprintf(stderr, "error: run count must be greater than zero.\n");
-                        return -1;
-                    }
-                    break;
-                case 'D':
-                    cfg->debug++;
-                    break;
-                case o_show_config:
-                    cfg->show_config++;
-                    break;
-                case o_hide_histogram:
-                    cfg->hide_histogram++;
-                    break;
-                case o_distinct_client_seed:
-                    cfg->distinct_client_seed++;
-                    break;
-                case o_randomize:
-                    srandom(generate_random_seed());
-                    cfg->randomize = random();
-                    break;
-                case 'n':
-                    endptr = NULL;
-                    if (strcmp(optarg, "allkeys")==0)
-                        cfg->requests = -1;
-                    else {
-                        cfg->requests = (unsigned int) strtoul(optarg, &endptr, 10);
-                        if (!cfg->requests || !endptr || *endptr != '\0') {
-                            fprintf(stderr, "error: requests must be greater than zero.\n");
-                            return -1;
-                        }
-                        if (cfg->test_time) {
-                            fprintf(stderr, "error: --test-time and --requests are mutually exclusive.\n");
-                            return -1;
-                        }
-                    }
-                    break;
-                case 'c':
-                    endptr = NULL;
-                    cfg->clients = (unsigned int) strtoul(optarg, &endptr, 10);
-                    if (!cfg->clients || !endptr || *endptr != '\0') {
-                        fprintf(stderr, "error: clients must be greater than zero.\n");
-                        return -1;
-                    }
-                    break;
-                case 't':
-                    endptr = NULL;
-                    cfg->threads = (unsigned int) strtoul(optarg, &endptr, 10);
-                    if (!cfg->threads || !endptr || *endptr != '\0') {
-                        fprintf(stderr, "error: threads must be greater than zero.\n");
-                        return -1;
-                    }
-                    break;
-                case o_test_time:
-                    endptr = NULL;
-                    cfg->test_time = (unsigned int) strtoul(optarg, &endptr, 10);
-                    if (!cfg->test_time || !endptr || *endptr != '\0') {
-                        fprintf(stderr, "error: test time must be greater than zero.\n");
-                        return -1;
-                    }
-                    if (cfg->requests) {
-                        fprintf(stderr, "error: --test-time and --requests are mutually exclusive.\n");
-                        return -1;
-                    }
-                    break;
-                case o_ratio:
-                    cfg->ratio = config_ratio(optarg);
-                    if (!cfg->ratio.is_defined()) {
-                        fprintf(stderr, "error: ratio must be expressed as [0-n]:[0-n].\n");
-                        return -1;
-                    }
-                    break;
-                case o_pipeline:
-                    endptr = NULL;
-                    cfg->pipeline = (unsigned int) strtoul(optarg, &endptr, 10);
-                    if (!cfg->pipeline || !endptr || *endptr != '\0') {
-                        fprintf(stderr, "error: pipeline must be greater than zero.\n");
-                        return -1;
-                    }
-                    break;
-                case 'd':
-                    endptr = NULL;
-                    cfg->data_size = (unsigned int) strtoul(optarg, &endptr, 10);
-                    if (!cfg->data_size || !endptr || *endptr != '\0') {
-                        fprintf(stderr, "error: data-size must be greater than zero.\n");
-                        return -1;
-                    }
-                    break;
-                case 'R':
-                    cfg->random_data = true;
-                    break;
-                case o_data_offset:
-                    endptr = NULL;
-                    cfg->data_offset = (unsigned int) strtoul(optarg, &endptr, 10);
-                    if (!endptr || *endptr != '\0') {
-                        fprintf(stderr, "error: data-offset must be greater than or equal to zero.\n");
-                        return -1;
-                    }
-                    break;
-                case o_data_size_range:
-                    cfg->data_size_range = config_range(optarg);
-                    if (!cfg->data_size_range.is_defined() || cfg->data_size_range.min < 1) {
-                        fprintf(stderr, "error: data-size-range must be expressed as [1-n]-[1-n].\n");
-                        return -1;
-                    }
-                    break;
-                case o_data_size_list:
-                    cfg->data_size_list = config_weight_list(optarg);
-                    if (!cfg->data_size_list.is_defined()) {
-                        fprintf(stderr, "error: data-size-list must be expressed as [size1:weight1],...[sizeN:weightN].\n");
-                        return -1;
-                    }
-                    break;
-                case o_expiry_range:
-                    cfg->expiry_range = config_range(optarg);
-                    if (!cfg->expiry_range.is_defined()) {
-                        fprintf(stderr, "error: data-size-range must be expressed as [0-n]-[1-n].\n");
-                        return -1;
-                    }
-                    break;
-                case o_data_size_pattern:
-                    cfg->data_size_pattern = optarg;
-                    if (strlen(cfg->data_size_pattern) != 1 ||
-                        (cfg->data_size_pattern[0] != 'R' && cfg->data_size_pattern[0] != 'S')) {
-                            fprintf(stderr, "error: data-size-pattern must be either R or S.\n");
-                            return -1;
-                    }
-                    break;
-                case o_data_import:
-                    cfg->data_import = optarg;
-                    break;
-                case o_data_verify:
-                    cfg->data_verify = 1;
-                    break;
-                case o_verify_only:
-                    cfg->verify_only = 1;
-                    cfg->data_verify = 1;   // Implied
-                    break;
-                case o_key_prefix:
-                    cfg->key_prefix = optarg;
-                    break;
-                case o_key_minimum:
-                    endptr = NULL;
-                    cfg->key_minimum = strtoull(optarg, &endptr, 10);
-                    if (cfg->key_minimum < 1 || !endptr || *endptr != '\0') {
-                        fprintf(stderr, "error: key-minimum must be greater than zero.\n");
-                        return -1;
-                    }
-                    break;
-                case o_key_maximum:
-                    endptr = NULL;
-                    cfg->key_maximum = strtoull(optarg, &endptr, 10);
-                    if (cfg->key_maximum< 1 || !endptr || *endptr != '\0') {
-                        fprintf(stderr, "error: key-maximum must be greater than zero.\n");
-                        return -1;
-                    }
-                    break;
-                case o_key_stddev:
-                    endptr = NULL;
-                    cfg->key_stddev = (unsigned int) strtof(optarg, &endptr);
-                    if (cfg->key_stddev<= 0 || !endptr || *endptr != '\0') {
-                        fprintf(stderr, "error: key-stddev must be greater than zero.\n");
-                        return -1;
-                    }
-                    break;
-                case o_key_median:
-                    endptr = NULL;
-                    cfg->key_median = (unsigned int) strtof(optarg, &endptr);
-                    if (cfg->key_median<= 0 || !endptr || *endptr != '\0') {
-                        fprintf(stderr, "error: key-median must be greater than zero.\n");
-                        return -1;
-                    }
-                    break;
-                case o_key_pattern:
-                    cfg->key_pattern = optarg;
-                    if (strlen(cfg->key_pattern) != 3 || cfg->key_pattern[1] != ':' ||
-                        (cfg->key_pattern[0] != 'R' && cfg->key_pattern[0] != 'S' && cfg->key_pattern[0] != 'G' && cfg->key_pattern[0] != 'P') ||
-                        (cfg->key_pattern[2] != 'R' && cfg->key_pattern[2] != 'S' && cfg->key_pattern[2] != 'G' && cfg->key_pattern[2] != 'P')) {
-                            fprintf(stderr, "error: key-pattern must be in the format of [S/R/G]:[S/R/G].\n");
-                            return -1;
-                    }
-                    break;
-                case o_reconnect_interval:
-                    endptr = NULL;
-                    cfg->reconnect_interval = (unsigned int) strtoul(optarg, &endptr, 10);
-                    if (!cfg->reconnect_interval || !endptr || *endptr != '\0') {
-                        fprintf(stderr, "error: reconnect-interval must be greater than zero.\n");
-                        return -1;
-                    }
-                    break;
-                case o_generate_keys:
-                    cfg->generate_keys = 1;
-                    break;
-                case o_multi_key_get:
-                    endptr = NULL;
-                    cfg->multi_key_get = (unsigned int) strtoul(optarg, &endptr, 10);
-                    if (cfg->multi_key_get <= 0 || !endptr || *endptr != '\0') {
-                        fprintf(stderr, "error: multi-key-get must be greater than zero.\n");
-                        return -1;
-                    }
-                    break;
-                case 'a':
-                    cfg->authenticate = optarg;
-                    break;
-                case o_select_db:
-                    cfg->select_db = (int) strtoul(optarg, &endptr, 10);
-                    if (cfg->select_db < 0 || !endptr || *endptr != '\0') {
-                        fprintf(stderr, "error: select-db must be greater or equal zero.\n");
-                        return -1;
-                    }
-                    break;
-                case o_no_expiry:
-                    cfg->no_expiry = true;
-                    break;
-                case o_wait_ratio:
-                    cfg->wait_ratio = config_ratio(optarg);
-                    if (!cfg->wait_ratio.is_defined()) {
-                        fprintf(stderr, "error: wait-ratio must be expressed as [0-n]:[0-n].\n");
-                        return -1;
-                    }
-                    break;
-                case o_num_slaves:
-                    cfg->num_slaves = config_range(optarg);
-                    if (!cfg->num_slaves.is_defined()) {
-                        fprintf(stderr, "error: num-slaves must be expressed as [0-n]-[1-n].\n");
-                        return -1;
-                    }
-                    break;
-                case o_wait_timeout:
-                    cfg->wait_timeout = config_range(optarg);
-                    if (!cfg->wait_timeout.is_defined()) {
-                        fprintf(stderr, "error: wait-timeout must be expressed as [0-n]-[1-n].\n");
-                        return -1;
-                    }
-                    break;
-                case o_json_out_file:
-                    cfg->json_out_file = optarg;
-                    break;
-            default:
+                }
+                tls_token = std::strtok(NULL, tls_delimiter);
+            }
+// On OpenSSL 4.0+ the per-version SSL_OP_NO_TLSv1_x disable constants are
+// removed, so the gap-mask blocks in ssl_ctx_init compile to nothing.  A
+// non-contiguous selection (e.g. tlsv1,tlsv1.2) would silently enable the
+// intermediate version inside the envelope range.  Fail fast instead.
+#if OPENSSL_VERSION_NUMBER >= 0x40000000L
+            if (!bitmask_is_contiguous(cfg->tls_protocols)) {
+                fprintf(stderr, "error: --tls-protocols non-contiguous selection is not\n"
+                                "       supported on OpenSSL 4.0+ (per-version disable flags\n"
+                                "       were removed). Either specify a contiguous range or\n"
+                                "       build against OpenSSL <= 3.x.\n");
+                return -1;
+            }
+#endif
+            break;
+        }
+#endif
+        case o_statsd_host:
+            cfg->statsd_host = optarg;
+            break;
+        case o_statsd_port:
+            if (!parse_port(optarg, &cfg->statsd_port)) {
+                fprintf(stderr, "error: statsd-port must be a valid port number.\n");
+                return -1;
+            }
+            break;
+        case o_statsd_prefix:
+            cfg->statsd_prefix = optarg;
+            break;
+        case o_statsd_run_label:
+            cfg->statsd_run_label = optarg;
+            break;
+        case o_graphite_port:
+            if (!parse_port(optarg, &cfg->graphite_port)) {
+                fprintf(stderr, "error: graphite-port must be a valid port number.\n");
+                return -1;
+            }
+            break;
+#ifdef HAVE_EVHTTP
+        case o_prometheus_port: {
+            // Unlike --statsd-port this accepts 0. parse_unsigned() accepts
+            // leading whitespace and one '+', rejects negatives other than
+            // "-0", and bounds the
+            // value to [0,65535] BEFORE the narrowing cast (a cast would
+            // silently wrap 70000 -> 4464).
+            static const char *E1 = "error: prometheus-port must be a number in the range [0-65535] (0 = ephemeral).\n";
+            if (!parse_unsigned(optarg, 65535, &val)) {
+                fprintf(stderr, "%s", E1);
+                return -1;
+            }
+            cfg->prometheus_port = (int) val;
+            break;
+        }
+        case o_prometheus_bind_addr: {
+            // Numeric IPv4/IPv6 literals only; hostnames (incl. localhost)
+            // rejected (no DNS at startup). Bracketed IPv6 [::1] is accepted
+            // and stripped in place; brackets imply IPv6 ([1.2.3.4] rejected).
+            // PLAN.md section 5 / E2.
+            static const char *E2 = "error: prometheus-bind-addr must be a numeric IPv4 or IPv6 address "
+                                    "(e.g. 127.0.0.1, 0.0.0.0, ::1, ::); hostnames are not supported "
+                                    "(for localhost use 127.0.0.1 or ::1).\n";
+            if (!optarg || !*optarg) {
+                fprintf(stderr, "%s", E2);
+                return -1;
+            }
+            bool bracketed = (optarg[0] == '[');
+            // argv is modifiable (C11 5.1.2.2.1p2; --read-server precedent).
+            char *addr = optarg;
+            if (bracketed) {
+                char *close = strchr(addr, ']');
+                if (!close || *(close + 1) != '\0') { // require "[...]" with nothing after
+                    fprintf(stderr, "%s", E2);
                     return -1;
-                    break;
+                }
+                *close = '\0';
+                addr = addr + 1; // strip leading '['
+            }
+            struct in_addr a4;
+            struct in6_addr a6;
+            bool ok = false;
+            if (!bracketed && inet_pton(AF_INET, addr, &a4) == 1) ok = true; // v4 only if unbracketed
+            if (!ok && inet_pton(AF_INET6, addr, &a6) == 1) ok = true;       // v6 always tried
+            if (!ok) {
+                fprintf(stderr, "%s", E2);
+                return -1;
+            }
+            cfg->prometheus_bind_addr = addr; // bracket-free literal, points into argv
+            break;
+        }
+        case o_prometheus_run_label: {
+            if (!optarg) {
+                fprintf(stderr, "error: --prometheus-run-label expects KEY=VALUE.\n");
+                return -1;
+            }
+            const char *eq = strchr(optarg, '=');
+            if (eq == NULL) {
+                fprintf(stderr, "error: --prometheus-run-label expects KEY=VALUE.\n");
+                return -1;
+            }
+            std::string key(optarg, (size_t) (eq - optarg));
+            std::string value(eq + 1);
+            switch (prom::validate_prom_label_name(key)) {
+            case prom::LABEL_NAME_OK:
+                break;
+            case prom::LABEL_NAME_TOO_LONG:
+                fprintf(stderr, "error: --prometheus-run-label: label name exceeds 128 bytes.\n");
+                return -1;
+            case prom::LABEL_NAME_INVALID:
+                fprintf(stderr,
+                        "error: --prometheus-run-label: invalid label name '%s' "
+                        "(must match [a-zA-Z_][a-zA-Z0-9_]*).\n",
+                        key.c_str());
+                return -1;
+            case prom::LABEL_NAME_RESERVED_PREFIX:
+                fprintf(stderr,
+                        "error: --prometheus-run-label: label name '%s' is reserved "
+                        "(names beginning with __ are reserved for Prometheus internal use).\n",
+                        key.c_str());
+                return -1;
+            case prom::LABEL_NAME_RESERVED:
+                fprintf(stderr, "error: --prometheus-run-label: label name '%s' is reserved.\n", key.c_str());
+                return -1;
+            }
+            if (value.size() > 256) {
+                fprintf(stderr, "error: --prometheus-run-label: value for '%s' exceeds 256 bytes.\n", key.c_str());
+                return -1;
+            }
+            for (size_t i = 0; i < cfg->prometheus_run_labels.size(); i++) {
+                if (cfg->prometheus_run_labels[i].first == key) {
+                    fprintf(stderr, "error: --prometheus-run-label: duplicate label name '%s'.\n", key.c_str());
+                    return -1;
+                }
+            }
+            if (cfg->prometheus_run_labels.size() >= 16) {
+                fprintf(stderr, "error: --prometheus-run-label: too many labels (max 16).\n");
+                return -1;
+            }
+            if (utf8_sanitize(value.c_str()) != value) {
+                fprintf(stderr,
+                        "warning: --prometheus-run-label: value for '%s' is not valid UTF-8; "
+                        "invalid bytes are replaced with U+FFFD on /metrics.\n",
+                        key.c_str());
+            }
+            cfg->prometheus_run_labels.push_back(std::make_pair(key, value));
+            break;
+        }
+        case o_prometheus_latency_buckets: {
+            std::vector<double> parsed;
+            std::string err, warn;
+            if (!prom::parse_latency_buckets(optarg, parsed, err, warn)) {
+                fprintf(stderr, "%s\n", err.c_str());
+                return -1;
+            }
+            if (!warn.empty()) {
+                fprintf(stderr, "%s\n", warn.c_str());
+            }
+            cfg->prometheus_latency_buckets.swap(parsed); // last wins (cleared + refilled)
+            break;
+        }
+#endif // HAVE_EVHTTP
+        case o_scan_incremental_iteration:
+            cfg->scan_incremental_iteration = true;
+            break;
+        case o_scan_incremental_max_iterations: {
+            bool too_large;
+            if (!parse_unsigned(optarg, UINT_MAX, &val, &too_large)) {
+                non_negative_option_error("scan-incremental-max-iterations", too_large, UINT_MAX);
+                return -1;
+            }
+            cfg->scan_incremental_max_iterations = (unsigned int) val;
+            break;
+        }
+        case o_clients_start: {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, UINT_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("clients-start", parsed, too_large, UINT_MAX);
+                return -1;
+            }
+            cfg->clients_start = (unsigned int) val;
+            break;
+        }
+        case o_clients_step: {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, UINT_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("clients-step", parsed, too_large, UINT_MAX);
+                return -1;
+            }
+            cfg->clients_step = (unsigned int) val;
+            break;
+        }
+        case o_step_duration: {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, UINT_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("step-duration", parsed, too_large, UINT_MAX);
+                return -1;
+            }
+            cfg->step_duration = (unsigned int) val;
+            break;
+        }
+        case o_read_preference: {
+            if (!optarg) {
+                fprintf(stderr, "error: --read-preference requires a value.\n");
+                return -1;
+            }
+            if (strcasecmp(optarg, "primary") == 0) {
+                cfg->read_preference = rp_primary;
+            } else if (strcasecmp(optarg, "secondary") == 0) {
+                cfg->read_preference = rp_secondary;
+            } else if (strcasecmp(optarg, "secondaryPreferred") == 0) {
+                cfg->read_preference = rp_secondary_preferred;
+            } else if (strcasecmp(optarg, "nearest") == 0) {
+                cfg->read_preference = rp_nearest;
+            } else {
+                fprintf(stderr,
+                        "error: --read-preference must be one of: primary, secondary, "
+                        "secondaryPreferred, nearest (got '%s').\n",
+                        optarg);
+                return -1;
+            }
+            break;
+        }
+        case o_read_server: {
+            if (!optarg || !*optarg) {
+                fprintf(stderr, "error: --read-server requires a HOST:PORT argument.\n");
+                return -1;
+            }
+            // Parse HOST:PORT.  IPv6 addresses may be bracketed: [::1]:6380.
+            // Find the colon after any closing bracket.
+            const char *rsp = optarg;
+            const char *rscolon = NULL;
+            if (*rsp == '[') {
+                const char *bracket = strchr(rsp, ']');
+                if (!bracket) {
+                    fprintf(stderr, "error: --read-server: unterminated IPv6 bracket in '%s'.\n", optarg);
+                    return -1;
+                }
+                rscolon = strchr(bracket, ':');
+            } else {
+                rscolon = strrchr(rsp, ':');
+            }
+            if (!rscolon || rscolon == rsp || !*(rscolon + 1)) {
+                fprintf(stderr, "error: --read-server: expected HOST:PORT, got '%s'.\n", optarg);
+                return -1;
+            }
+            unsigned short rport;
+            if (!parse_port(rscolon + 1, &rport)) {
+                fprintf(stderr, "error: --read-server: invalid port in '%s'.\n", optarg);
+                return -1;
+            }
+            std::string rhost(rsp, (size_t) (rscolon - rsp));
+            // Strip IPv6 brackets from the stored hostname
+            if (!rhost.empty() && rhost[0] == '[' && rhost[rhost.size() - 1] == ']') {
+                rhost = rhost.substr(1, rhost.size() - 2);
+            }
+            cfg->read_servers.push_back(read_server_spec(rhost, rport));
+            break;
+        }
+        case o_command_is_read: {
+            if (!cfg->arbitrary_commands || cfg->arbitrary_commands->size() == 0) {
+                fprintf(stderr, "error: --command-is-read must follow a --command.\n");
+                return -1;
+            }
+            arbitrary_command &ircmd = cfg->arbitrary_commands->get_last_command();
+            ircmd.is_read_override = 1;
+            break;
+        }
+        case o_replica_clients: {
+            bool too_large;
+            if (!parse_unsigned(optarg, UINT_MAX, &val, &too_large)) {
+                non_negative_option_error("replica-clients", too_large, UINT_MAX);
+                return -1;
+            }
+            cfg->replica_clients = (unsigned int) val;
+            break;
+        }
+        case o_replicas_per_shard: {
+            bool too_large;
+            if (!parse_unsigned(optarg, UINT_MAX, &val, &too_large)) {
+                non_negative_option_error("replicas-per-shard", too_large, UINT_MAX);
+                return -1;
+            }
+            cfg->replicas_per_shard = (unsigned int) val;
+            break;
+        }
+        case o_read_preference_fallback: {
+            if (!optarg) {
+                fprintf(stderr, "error: --read-preference-fallback requires a value.\n");
+                return -1;
+            }
+            if (strcasecmp(optarg, "error") == 0) {
+                cfg->read_preference_fallback = rpf_error;
+            } else if (strcasecmp(optarg, "queue") == 0) {
+                cfg->read_preference_fallback = rpf_queue;
+            } else if (strcasecmp(optarg, "primary") == 0) {
+                cfg->read_preference_fallback = rpf_primary;
+            } else {
+                fprintf(stderr,
+                        "error: --read-preference-fallback must be one of: error, queue, primary "
+                        "(got '%s').\n",
+                        optarg);
+                return -1;
+            }
+            break;
+        }
+        default:
+            return -1;
+            break;
         }
     }
+
+    // Validate staircase options (partial - remaining validation after defaults)
+    {
+        bool has_start = cfg->clients_start > 0;
+        bool has_step = cfg->clients_step > 0;
+        bool has_dur = cfg->step_duration > 0;
+
+        if (has_start || has_step || has_dur) {
+            if (!has_start || !has_step || !has_dur) {
+                fprintf(
+                    stderr,
+                    "error: --clients-start, --clients-step, and --step-duration must all be specified together.\n");
+                return -1;
+            }
+            if (cfg->requests > 0) {
+                fprintf(stderr,
+                        "error: --requests cannot be used with client staircase mode. Use --test-time instead.\n");
+                return -1;
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Read-preference post-parse validation
+    // ---------------------------------------------------------------------------
+
+    // --transaction and non-primary read-preference are mutually exclusive:
+    // the transaction pin model assumes all commands in a rotation target
+    // the same (primary) shard connection; routing reads to replicas inside
+    // a MULTI/EXEC block would break the atomicity guarantee.
+    if (cfg->transaction && cfg->read_preference != rp_primary) {
+        fprintf(stderr, "error: --transaction and --read-preference != primary are mutually exclusive. "
+                        "MULTI/EXEC blocks must run on the same primary connection; routing reads "
+                        "to replicas would break the atomicity guarantee.\n");
+        return -1;
+    }
+
+    // Warn when --read-preference is set but has no routing effect:
+    // in standalone mode (no --cluster-mode) the flag only works when at
+    // least one --read-server is given.
+    if (cfg->read_preference != rp_primary && !cfg->cluster_mode && cfg->read_servers.empty()) {
+        fprintf(stderr, "warning: --read-preference has no effect in standalone mode without "
+                        "--read-server. Specify at least one replica endpoint with --read-server "
+                        "HOST:PORT or add --cluster-mode.\n");
+    }
+
+    // Warn when --replica-clients is set but the read-preference does not
+    // direct any traffic to replicas. With --read-preference=primary every
+    // read still goes to the primary regardless of how many replica clients
+    // are provisioned, so the extra connections sit idle and consume
+    // resources. Mirrors the no-routing-effect warning above.
+    if (cfg->replica_clients > 0 && cfg->read_preference == rp_primary) {
+        fprintf(stderr, "warning: --replica-clients has no effect when --read-preference=primary. "
+                        "Reads only flow to replicas under secondary, secondaryPreferred, or nearest.\n");
+    }
+
+    // --transaction needs at least one --command to operate on. In
+    // --cluster-mode it also pins each rotation to one shard connection; in
+    // standalone each client already has a single connection, so it only
+    // keeps every __key__ of a rotation on the same key and skips the rest
+    // of a MULTI block after a reconnect.
+    if (cfg->transaction && !cfg->arbitrary_commands->is_defined()) {
+        fprintf(stderr, "error: --transaction requires at least one --command.\n");
+        return -1;
+    }
+
+    if ((cfg->cluster_mode && !verify_cluster_option(cfg)) ||
+        (cfg->arbitrary_commands->is_defined() && !verify_arbitrary_command_option(cfg))) {
+        return -1;
+    }
+
+#ifdef HAVE_EVHTTP
+    // Prometheus post-parse tail (PLAN.md section 5). Runs once, before
+    // config_init_defaults, so a NULL bind-addr still means "unset" and the
+    // default 127.0.0.1 can never trip the W1 warning.
+    {
+        // (1) Dependency check (E12): any non-port prometheus flag requires
+        //     --prometheus-port. prometheus_port < 0 = flag absent.
+        if (cfg->prometheus_port < 0) {
+            const char *dep = NULL;
+            if (cfg->prometheus_bind_addr != NULL)
+                dep = "--prometheus-bind-addr";
+            else if (!cfg->prometheus_run_labels.empty())
+                dep = "--prometheus-run-label";
+            else if (!cfg->prometheus_latency_buckets.empty())
+                dep = "--prometheus-latency-buckets";
+            if (dep != NULL) {
+                fprintf(stderr, "error: %s requires --prometheus-port.\n", dep);
+                return -1;
+            }
+        }
+
+        // (2) One-shot non-loopback warning (W1) when an explicit bind-addr is
+        //     not a loopback address. The default is applied later, so only a
+        //     user-supplied bind-addr is checked here.
+        if (cfg->prometheus_port >= 0 && cfg->prometheus_bind_addr != NULL &&
+            !addr_is_loopback(cfg->prometheus_bind_addr)) {
+            fprintf(stderr,
+                    "warning: --prometheus-bind-addr=%s is not a loopback address; /metrics will be "
+                    "served as unauthenticated plaintext HTTP reachable from other hosts, and anyone "
+                    "who can connect can read benchmark metrics. Restrict access with a firewall or "
+                    "security group, or keep the default 127.0.0.1.\n",
+                    cfg->prometheus_bind_addr);
+        }
+    }
+#endif // HAVE_EVHTTP
 
     return 0;
 }
 
-void usage() {
-    fprintf(stdout, "Usage: memtier_benchmark [options]\n"
-            "A memcache/redis NoSQL traffic generator and performance benchmarking tool.\n"
-            "\n"
-            "Connection and General Options:\n"
-            "  -s, --server=ADDR              Server address (default: localhost)\n"
-            "  -p, --port=PORT                Server port (default: 6379)\n"
-            "  -S, --unix-socket=SOCKET       UNIX Domain socket name (default: none)\n"
-            "  -P, --protocol=PROTOCOL        Protocol to use (default: redis).  Other\n"
-            "                                 supported protocols are memcache_text,\n"
-            "                                 memcache_binary.\n"
-            "  -x, --run-count=NUMBER         Number of full-test iterations to perform\n"
-            "  -D, --debug                    Print debug output\n"
-            "      --client-stats=FILE        Produce per-client stats file\n"
-            "      --out-file=FILE            Name of output file (default: stdout)\n"
-            "      --json-out-file=FILE       Name of JSON output file, if not set, will not print to json\n"
-            "      --show-config              Print detailed configuration before running\n"
-            "      --hide-histogram           Don't print detailed latency histogram\n"
-            "      --help                     Display this help\n"
-            "      --version                  Display version information\n"
-            "\n"
-            "Test Options:\n"
-            "  -n, --requests=NUMBER          Number of total requests per client (default: 10000)\n"
-            "                                 use 'allkeys' to run on the entire key-range\n"
-            "  -c, --clients=NUMBER           Number of clients per thread (default: 50)\n"
-            "  -t, --threads=NUMBER           Number of threads (default: 4)\n"
-            "      --test-time=SECS           Number of seconds to run the test\n"
-            "      --ratio=RATIO              Set:Get ratio (default: 1:10)\n"
-            "      --pipeline=NUMBER          Number of concurrent pipelined requests (default: 1)\n"
-            "      --reconnect-interval=NUM   Number of requests after which re-connection is performed\n"
-            "      --multi-key-get=NUM        Enable multi-key get commands, up to NUM keys (default: 0)\n"
-            "  -a, --authenticate=CREDENTIALS Authenticate to redis using CREDENTIALS, which depending\n"
-            "                                 on the protocol can be PASSWORD or USER:PASSWORD.\n"
-            "      --select-db=DB             DB number to select, when testing a redis server\n"
-            "      --distinct-client-seed     Use a different random seed for each client\n"
-            "      --randomize                random seed based on timestamp (default is constant value)\n"
-            "\n"
-            "Object Options:\n"
-            "  -d  --data-size=SIZE           Object data size (default: 32)\n"
-            "      --data-offset=OFFSET       Actual size of value will be data-size + data-offset\n"
-            "                                 Will use SETRANGE / GETRANGE (default: 0)\n"
-            "  -R  --random-data              Indicate that data should be randomized\n"
-            "      --data-size-range=RANGE    Use random-sized items in the specified range (min-max)\n"
-            "      --data-size-list=LIST      Use sizes from weight list (size1:weight1,..sizeN:weightN)\n"
-            "      --data-size-pattern=R|S    Use together with data-size-range\n"
-            "                                 when set to R, a random size from the defined data sizes will be used,\n"
-            "                                 when set to S, the defined data sizes will be evenly distributed across\n"
-            "                                 the key range, see --key-maximum (default R)\n"
-            "      --expiry-range=RANGE       Use random expiry values from the specified range\n"
-            "\n"
-            "Imported Data Options:\n"
-            "      --data-import=FILE         Read object data from file\n"
-            "      --data-verify              Enable data verification when test is complete\n"
-            "      --verify-only              Only perform --data-verify, without any other test\n"
-            "      --generate-keys            Generate keys for imported objects\n"
-            "      --no-expiry                Ignore expiry information in imported data\n"
-            "\n"
-            "Key Options:\n"
-            "      --key-prefix=PREFIX        Prefix for keys (default: \"memtier-\")\n"
-            "      --key-minimum=NUMBER       Key ID minimum value (default: 0)\n"
-            "      --key-maximum=NUMBER       Key ID maximum value (default: 10000000)\n"
-            "      --key-pattern=PATTERN      Set:Get pattern (default: R:R)\n"
-            "                                 G for Gaussian distribution.\n"
-            "                                 R for uniform Random.\n"
-            "                                 S for Sequential.\n"
-            "                                 P for Parallel (Sequential were each client has a subset of the key-range).\n"
-            "      --key-stddev               The standard deviation used in the Gaussian distribution\n"
-            "                                 (default is key range / 6)\n"
-            "      --key-median               The median point used in the Gaussian distribution\n"
-            "                                 (default is the center of the key range)\n"
-            "\n"
-            "WAIT Options:\n"
-            "      --wait-ratio=RATIO         Set:Wait ratio (default is no WAIT commands - 1:0)\n"
-            "      --num-slaves=RANGE         WAIT for a random number of slaves in the specified range\n"
-            "      --wait-timeout=RANGE       WAIT for a random number of milliseconds in the specified range (normal \n"
-            "                                 distribution with the center in the middle of the range)"
-            "\n"
-            );
-    
+void usage()
+{
+    fprintf(
+        stdout,
+        "Usage: memtier_benchmark [options]\n"
+        "A memcache/redis NoSQL traffic generator and performance benchmarking tool.\n"
+        "\n"
+        "Connection and General Options:\n"
+        "  -h, --host=ADDR                Server address (default: localhost)\n"
+        "  -s, --server=ADDR              Same as --host\n"
+        "  -p, --port=PORT                Server port (default: 6379)\n"
+        "  -S, --unix-socket=SOCKET       UNIX Domain socket name (default: none)\n"
+        "                                Linux: @NAME selects an abstract socket\n"
+        "  -4, --ipv4                     Force IPv4 address resolution.\n"
+        "  -6  --ipv6                     Force IPv6 address resolution.\n"
+        "  -P, --protocol=PROTOCOL        Protocol to use (default: redis).\n"
+        "                                 other supported protocols are resp2, resp3, memcache_text and "
+        "memcache_binary.\n"
+        "                                 when using one of resp2 or resp3 the redis protocol version will be set via "
+        "HELLO command.\n"
+        "  -a, --authenticate=CREDENTIALS Authenticate using specified credentials.\n"
+        "                                 A simple password is used for memcache_text\n"
+        "                                 and Redis <= 5.x. <USER>:<PASSWORD> can be\n"
+        "                                 specified for memcache_binary or Redis 6.x\n"
+        "                                 or newer with ACL user support.\n"
+        "  -u, --uri=URI                  Server URI on format redis://user:password@host:port/dbnum\n"
+        "                                 User, password and dbnum are optional. For authentication\n"
+        "                                 without a username, use username 'default'. For TLS, use\n"
+        "                                 the scheme 'rediss'. Bracket IPv6 hosts: [::1]:6379.\n"
+        "                                 User and password are percent-decoded, as by\n"
+        "                                 redis-cli -u: write '@' as %%40, '/' as %%2F, '%%' as\n"
+        "                                 %%25 and, in the password, ':' as %%3A.\n"
+#ifdef USE_TLS
+        "      --tls                      Enable SSL/TLS transport security\n"
+        "      --cert=FILE                Use specified client certificate for TLS\n"
+        "      --key=FILE                 Use specified private key for TLS\n"
+        "      --cacert=FILE              Use specified CA certs bundle for TLS\n"
+        "      --tls-skip-verify          Skip verification of server certificate\n"
+        "      --tls-protocols            Specify the tls protocol version to use, comma delemited. Use a combination "
+        "of 'TLSv1', 'TLSv1.1', 'TLSv1.2' and 'TLSv1.3'.\n"
+        "      --sni=STRING               Add an SNI header\n"
+#endif
+        "  -x, --run-count=NUMBER         Number of full-test iterations to perform. Ctrl+C or SIGTERM\n"
+        "                                 ends the series after the current run\n"
+        "  -D, --debug                    Print debug output\n"
+        "      --cluster-mode             Run client in cluster mode\n"
+        "      --transaction              Treat one full rotation of --command entries as a transactional\n"
+        "                                 unit (e.g. WATCH/GET/MULTI/SETEX/EXEC/UNWATCH). Every __key__ in\n"
+        "                                 a rotation resolves to the same key (taken from the first keyed\n"
+        "                                 command's --command-key-pattern), so all keyed commands hit one\n"
+        "                                 key and one slot: the WATCH guards the key the SETEX writes and\n"
+        "                                 the unit runs without CROSSSLOT errors -- no hash-tag needed.\n"
+        "                                 This same-key behavior applies in every mode, so it also works\n"
+        "                                 against a single endpoint fronting a sharded backend (e.g. a\n"
+        "                                 Redis Enterprise proxy) where keyed commands must share a slot.\n"
+        "                                 In --cluster-mode it additionally pins the whole rotation to the\n"
+        "                                 owning shard connection so the keyless commands (MULTI/EXEC/\n"
+        "                                 UNWATCH) stay with the keyed ones. Caveat: keep the literal text\n"
+        "                                 around __key__ (including any {tag}) identical across keyed\n"
+        "                                 commands; differing affixes still hash to different slots.\n"
+        "                                 Requires at least one --command.\n"
+        "                                 --pipeline > 1 is supported: in --cluster-mode each rotation is\n"
+        "                                 sent contiguously on its pinned connection, so multiple whole\n"
+        "                                 transactions can be in flight without interleaving MULTI/EXEC.\n"
+        "                                 Note: a reconnect (e.g. --reconnect-on-error) loses the\n"
+        "                                 server-side WATCH/MULTI state. If it happens inside a MULTI\n"
+        "                                 block, the rest of that block, through its EXEC/DISCARD, is\n"
+        "                                 skipped and not counted, so the per-command counts no longer\n"
+        "                                 follow the command ratio. Replies already received for that\n"
+        "                                 block stay counted.\n"
+        "                                 --retry-on-error does not retry or replay --transaction\n"
+        "                                 commands.\n"
+        "  -h, --help                     Display this help\n"
+        "  -v, --version                  Display version information\n"
+        "\n"
+        "Results Output Options:\n"
+        "  -o, --out-file=FILE            Name of output file (default: stdout)\n"
+        "      --json-out-file=FILE       Name of JSON output file, if not set, will not print to json\n"
+        "      --client-stats=FILE        Produce per-client stats file\n"
+        "      --hdr-file-prefix=FILE     Prefix of HDR Latency Histogram output files, if not set, will not save "
+        "latency histogram files\n"
+        "      --show-config              Print detailed configuration before running\n"
+        "      --hide-histogram           Don't print detailed latency histogram\n"
+        "      --print-percentiles        Specify which percentiles info to print on the results table (by default "
+        "prints percentiles: 50,99,99.9)\n"
+        "      --print-all-runs           When performing multiple test iterations, print and save results for all "
+        "iterations\n"
+        "      --realtime-latencies       Replace the periodic single-line progress output with a per-tick block: "
+        "line 1 = throughput + miss ratio, then one or more latency lines carrying the percentiles configured by "
+        "--print-percentiles (immediate and overall, side-by-side). Redraws in place on a TTY; appends cleanly when "
+        "stderr is redirected to a file.\n"
+        "      --command-stats-breakdown=command|line\n"
+        "                                 How to group command statistics in the output (default: command)\n"
+        "                                 command: aggregate by command name (first word, e.g., SET, GET)\n"
+        "                                 line: show each command line separately\n"
+        "      --command-miss-tracking=auto|off\n"
+        "                                 Track per-key cache misses for arbitrary commands (default: auto)\n"
+        "                                 auto: enable for commands with known reply shape (GET, MGET, "
+        "HGET, HMGET, GETEX, EXISTS, ...)\n"
+        "                                 off:  disable; mb.json will not contain per-arbitrary-command "
+        "Hits/Misses fields\n"
+        "      --miss-rate-threshold=PERCENTAGE\n"
+        "                                 Warn when miss rate exceeds this percentage (default: 1.0).\n"
+        "                                 Accepts fractional values, e.g. 0.5 for half a percent.\n"
+        "                                 0 warns on any miss.\n"
+        "      --cpu-warn-threshold=PERCENTAGE\n"
+        "                                 Warn when a memtier worker thread's CPU exceeds this percentage of a\n"
+        "                                 core (default: 95.0), indicating memtier itself may be the bottleneck\n"
+        "                                 and results may be unreliable. 0 warns on any CPU usage.\n"
+        "      --statsd-host=HOST         StatsD server hostname to send real-time metrics (default: none, disabled)\n"
+        "      --statsd-port=PORT         StatsD server UDP port (default: 8125)\n"
+        "      --statsd-prefix=PREFIX     Prefix for StatsD metric names (default: memtier)\n"
+        "      --statsd-run-label=LABEL   Label for this benchmark run, used to distinguish runs in dashboards "
+        "(default: default)\n"
+        "      --graphite-port=PORT       Graphite HTTP port for event annotations (default: 8080 for host access; "
+        "use 80 when running inside the Docker network)\n"
+#ifdef HAVE_EVHTTP
+        "      --prometheus-port=PORT     Serve Prometheus metrics on this port at /metrics (default: disabled; "
+        "0 = ephemeral port)\n"
+        "      --prometheus-bind-addr=ADDR  Numeric IPv4/IPv6 address to bind the Prometheus exporter to "
+        "(default: 127.0.0.1; hostnames not supported)\n"
+        "      --prometheus-run-label=KEY=VALUE  Add a constant label to every Prometheus metric (repeatable; max 16)\n"
+        "      --prometheus-latency-buckets=LIST  Comma-separated, strictly ascending latency histogram bounds in "
+        "seconds (default: built-in 26-bound list). Bounds closer than 1%% of their value collapse to the same "
+        "histogram slot and are rejected\n"
+#endif
+        "\n"
+        "Test Options:\n"
+        "  -n, --requests=NUMBER          Number of total requests per client (default: 10000)\n"
+        "                                 use 'allkeys' to run on the entire key-range\n"
+        "      --rate-limiting=NUMBER     The max number of requests to make per second from an individual connection "
+        "(default is unlimited rate).\n"
+        "                                 If you use --rate-limiting and a very large rate is entered which cannot be "
+        "met, memtier will do as many requests as possible per second.\n"
+        "  -c, --clients=NUMBER           Number of clients per thread (default: 50)\n"
+        "  -t, --threads=NUMBER           Number of threads (default: 4)\n"
+        "      --test-time=SECS           Number of seconds to run the test. Replies to requests already sent\n"
+        "                                 are waited for at most 10 more seconds; requests still unanswered\n"
+        "                                 then are abandoned and counted as errors, and so are\n"
+        "                                 --retry-on-error retries still being resent.\n"
+        "      --clients-start=NUMBER     Starting number of clients per thread for staircase ramp-up.\n"
+        "                                 Must be less than --clients. Requires --clients-step and --step-duration.\n"
+        "      --clients-step=NUMBER      Number of clients to add per step in staircase ramp-up.\n"
+        "      --step-duration=SECS       Duration in seconds of each step before adding more clients.\n"
+        "      --ratio=RATIO              Set:Get ratio (default: 1:10)\n"
+        "      --pipeline=NUMBER          Number of concurrent pipelined requests (default: 1)\n"
+        "      --reconnect-interval=NUM   Number of requests after which re-connection is performed\n"
+        "      --reconnect-on-error       Enable automatic reconnection on connection errors (default: disabled).\n"
+        "                                 Without it, a lost connection ends its thread and the run exits 1.\n"
+        "      --max-reconnect-attempts=NUM Maximum number of reconnection attempts (default: 0, unlimited)\n"
+        "                                 Running out of attempts fails the run.\n"
+        "      --reconnect-backoff-factor=NUM Non-negative backoff factor for reconnection delays (default: 0, no "
+        "backoff)\n"
+        "                                 Zero keeps the delay at one second. Positive values multiply the\n"
+        "                                 delay on each attempt; values below 1 shrink it, but never\n"
+        "                                 below 0.1 seconds. The delay is capped at 60 seconds.\n"
+        "      --retry-on-error           Resend a request when the server returns a transient error or the\n"
+        "                                 connection drops mid-flight. Excludes permanent errors (WRONGTYPE,\n"
+        "                                 NOAUTH, NOPERM, syntax/argcount/unknown-command). Default: disabled.\n"
+        "                                 A retried request counts once toward --requests, when it succeeds\n"
+        "                                 or runs out of retries. --transaction commands are never retried\n"
+        "                                 or replayed.\n"
+        "      --max-retries=N            Maximum retries per request when --retry-on-error is set.\n"
+        "                                 -1 = unlimited (default), 0 = disable retries even with the master\n"
+        "                                 switch on, N>0 = bounded. MOVED/ASK redirects count toward this.\n"
+        "      --retry-backoff-ms=NUM     Delay between retries in milliseconds (default: 0, immediate).\n"
+        "      --retry-backoff-factor=NUM Multiply the delay by NUM on each retry of the same request:\n"
+        "                                 with NUM > 0 the Nth resend waits retry-backoff-ms * NUM^(N-1),\n"
+        "                                 at most 60 s or retry-backoff-ms if larger (default: 0,\n"
+        "                                 constant retry-backoff-ms). Values below 1 shrink it, but\n"
+        "                                 never below 100 ms or retry-backoff-ms if smaller.\n"
+        "      --retry-on=LIST            Restrict retries to error-status prefixes in this comma list\n"
+        "                                 (e.g. LOADING,BUSY,TRYAGAIN). Default: retry everything not\n"
+        "                                 classified as permanent.\n"
+        "      --max-retry-queue=NUM      Hard cap on per-connection retry queue depth. No new request is\n"
+        "                                 sent while queued retries plus requests in flight reach it (or\n"
+        "                                 --pipeline, if larger), so with NUM >= --pipeline a request that\n"
+        "                                 fails in flight always has room to retry.\n"
+        "                                 Default: 0 (auto = max(pipeline * 4, 64)).\n"
+        "      --failed-keys-file=PATH    Append every request that ultimately fails (retries exhausted or\n"
+        "                                 permanent error) as CSV: timestamp,command,key,status,retries.\n"
+        "                                 The key is the one sent, with any {tag} and prefix/suffix; a\n"
+        "                                 multi-key command (MGET, or several __key__ args) logs only its\n"
+        "                                 first key. key and status are quoted, with \" doubled,\n"
+        "                                 \\ written as \\\\ and non-printable bytes as \\xHH.\n"
+        "                                 Off by default. Exits 1 at startup if the file cannot be opened;\n"
+        "                                 a later write error stops logging and the run exits 1.\n"
+        "      --connection-timeout=SECS  Connection timeout in seconds, 0 to disable (default: 0)\n"
+        "      --connection-stage-timeout=SECS\n"
+        "                                 Abort with exit code 2 if no thread reaches steady state within\n"
+        "                                 SECS, or if connection-setup failures (AUTH / HELLO / SELECT /\n"
+        "                                 CLUSTER SLOTS / -ERR during initial probe) persist for SECS\n"
+        "                                 without a successful handshake. Bounds the *startup* phase;\n"
+        "                                 --test-time still bounds the steady-state run. Default: 30,\n"
+        "                                 0 disables the supervisor (at startup, a failed CLUSTER SLOTS\n"
+        "                                 is then retried every second). With --run-count, an abort in\n"
+        "                                 any run exits 2.\n"
+        "      --thread-conn-start-min-jitter-micros=NUM Minimum jitter in microseconds between connection creation "
+        "(default: 0)\n"
+        "      --thread-conn-start-max-jitter-micros=NUM Maximum jitter in microseconds between connection creation "
+        "(default: 0)\n"
+        "      --multi-key-get=NUM        Enable multi-key get commands, up to NUM keys (default: 0, max: 16777214).\n"
+        "                                 Each client preallocates about 272 bytes per key.\n"
+        "                                 In cluster mode, keys are probed from the key space so that all\n"
+        "                                 keys in one batch route to the same shard (no hash-tag prefix).\n"
+        "      --select-db=DB             DB number to select, when testing a redis server\n"
+        "      --distinct-client-seed     Use a different random seed for each client\n"
+        "      --randomize                random seed based on timestamp (default is constant value)\n"
+        "\n"
+        "Arbitrary command:\n"
+        "      --command=COMMAND          Specify a command to send in quotes.\n"
+        "                                 Each command that you specify is run with its ratio and key-pattern "
+        "options.\n"
+        "                                 For example: --command=\"set __key__ 5\" --command-ratio=2 "
+        "--command-key-pattern=G\n"
+        "                                 To use a generated key or object, enter:\n"
+        "                                   __key__: Use key generated from Key Options.\n"
+        "                                   __data__: Use data generated from Object Options.\n"
+        "                                     With --data-size-pattern=S, sized by the most recent __key__\n"
+        "                                     before it (minimum size if there is none).\n"
+        "      --command-ratio            The number of times the command is sent in sequence.(default: 1)\n"
+        "      --command-key-pattern      Key pattern for the command (default: R):\n"
+        "                                 G for Gaussian distribution.\n"
+        "                                 R for uniform Random.\n"
+        "                                 Z for zipf distribution (will limit keys to positive).\n"
+        "                                 S for Sequential.\n"
+        "                                 P for Parallel (Sequential were each client has a subset of the key-range).\n"
+        "      --monitor-input=FILE       Read commands from Redis MONITOR output file.\n"
+        "                                 Commands can be referenced as __monitor_line1__, __monitor_line2__, etc.\n"
+        "                                 Use __monitor_line@__ to select commands from the file.\n"
+        "                                 By default, selection is sequential; use --monitor-pattern=R for random.\n"
+        "                                 For example: --monitor-input=monitor.txt --command=\"__monitor_line1__\"\n"
+        "      --monitor-pattern=S|R      Pattern for selecting monitor commands (default: S for Sequential)\n"
+        "                                 S for Sequential selection.\n"
+        "                                 R for Random selection.\n"
+        "      --scan-incremental-iteration\n"
+        "                                 Enable cursor iteration for SCAN, SSCAN, HSCAN and ZSCAN.\n"
+        "                                 Use --command=\"SCAN 0 ...\" or --command=\"HSCAN key 0 ...\", etc.\n"
+        "                                 Automatically follows the cursor returned by each response.\n"
+        "                                 Sends the supplied command initially and updates its cursor until\n"
+        "                                 the cursor returns 0, then restarts. Requires --pipeline 1.\n"
+        "                                 Stats separate \"<COMMAND> 0\" from \"<COMMAND> <cursor>\".\n"
+        "                                 Collection keys and generated arguments stay fixed per cursor walk.\n"
+        "                                 Requires one --command and standalone Redis (no cluster mode).\n"
+        "      --scan-incremental-max-iterations=NUMBER\n"
+        "                                 Maximum number of continuations per cursor walk\n"
+        "                                 (default: 0, follow cursor until it returns 0).\n"
+        "      --command-is-read          Mark the preceding --command as a read operation for\n"
+        "                                 --read-preference routing (per-command override).\n"
+        "\n"
+        "Read Preference Options:\n"
+        "      --read-preference=MODE     Which node class receives read commands (default: primary).\n"
+        "                                 primary           - all reads go to the master/primary node\n"
+        "                                 secondary         - all reads go to replica nodes only\n"
+        "                                 secondaryPreferred - replicas preferred; fall back to primary\n"
+        "                                 nearest           - EWMA-based selection: seed cold replicas\n"
+        "                                                     round-robin until warm, then route reads\n"
+        "                                                     to the lowest-EWMA endpoint among warm\n"
+        "                                                     replicas (primary may participate if it\n"
+        "                                                     has accumulated samples)\n"
+        "      --read-server=HOST:PORT    Replica endpoint for standalone (non-cluster) mode.\n"
+        "                                 Repeatable; each occurrence adds one replica endpoint.\n"
+        "                                 IPv6 addresses may be given as [::1]:6380.\n"
+        "                                 NOTE: parsed but read dispatch is currently cluster-only;\n"
+        "                                 see README \"Read Preference\" section.\n"
+        "      --replica-clients=N        Connections per replica per client thread (default: 0 = inherit\n"
+        "                                 --clients) (parsed but not yet wired - see README\n"
+        "                                 \"Read Preference\" section).\n"
+        "      --replicas-per-shard=K     Cap on replicas used per shard (default: 0 = all) (parsed but\n"
+        "                                 not yet wired - see README \"Read Preference\" section).\n"
+        "      --read-preference-fallback=MODE\n"
+        "                                 What to do when the target node class is unavailable\n"
+        "                                 (default: error).\n"
+        "                                 error   - return an error\n"
+        "                                 queue   - (reserved; currently treated as 'error' - request\n"
+        "                                           queuing not yet implemented)\n"
+        "                                 primary - fall back silently to the primary\n"
+        "\n"
+        "Object Options:\n"
+        "  -d  --data-size=SIZE           Object data size in bytes (default: 32)\n"
+        "      --data-offset=OFFSET       Actual size of value will be data-size + data-offset\n"
+        "                                 Will use SETRANGE / GETRANGE (default: 0)\n"
+        "  -R  --random-data              Indicate that data should be randomized\n"
+        "      --data-size-range=RANGE    Use random-sized items in the specified range (min-max)\n"
+        "      --data-size-list=LIST      Use sizes from weight list (size1:weight1,..sizeN:weightN)\n"
+        "      --data-size-pattern=R|S    Use together with data-size-range\n"
+        "                                 when set to R, a random size from the defined data sizes will be used,\n"
+        "                                 when set to S, the defined data sizes will be evenly distributed across\n"
+        "                                 the key range, see --key-maximum (default R)\n"
+        "      --expiry-range=RANGE       Use random expiry values from the specified range\n"
+        "\n"
+        "Imported Data Options:\n"
+        "      --data-import=FILE         Read object data from file\n"
+        "      --data-verify              Enable data verification when test is complete\n"
+        "                                 (exit status 1 if verification fails, is incomplete,\n"
+        "                                 or verifies no key)\n"
+        "      --verify-only              Only perform --data-verify, without any other test\n"
+        "      --generate-keys            Generate keys for imported objects\n"
+        "      --no-expiry                Ignore expiry information in imported data\n"
+        "\n"
+        "Key Options:\n"
+        "      --key-prefix=PREFIX        Prefix for keys (default: \"memtier-\")\n"
+        "      --key-minimum=NUMBER       Key ID minimum value (default: 0)\n"
+        "      --key-maximum=NUMBER       Key ID maximum value (default: 10000000)\n"
+        "      --key-pattern=PATTERN      Set:Get pattern (default: R:R)\n"
+        "                                 G for Gaussian distribution.\n"
+        "                                 R for uniform Random.\n"
+        "                                 Z for zipf distribution (will limit keys to positive).\n"
+        "                                 S for Sequential.\n"
+        "                                 P for Parallel (Sequential were each client has a subset of the key-range).\n"
+        "      --key-stddev               The standard deviation used in the Gaussian distribution\n"
+        "                                 (default is key range / 6)\n"
+        "      --key-median               The median point used in the Gaussian distribution\n"
+        "                                 (default is the center of the key range)\n"
+        "      --key-zipf-exp             The exponent used in the zipf distribution, limit to (0, 5)\n"
+        "                                 Higher exponents result in higher concentration in top keys\n"
+        "                                 (default is 1, though any number >2 seems insane)\n"
+        "\n"
+        "WAIT Options:\n"
+        "      --wait-ratio=RATIO         Set:Wait ratio (default is no WAIT commands - 1:0)\n"
+        "      --num-slaves=RANGE         WAIT for a random number of slaves in the specified range\n"
+        "      --wait-timeout=RANGE       WAIT for a random number of milliseconds in the specified range (normal \n"
+        "                                 distribution with the center in the middle of the range)"
+        "\n");
+
     exit(2);
 }
 
-static void* cg_thread_start(void *t);
+static void *cg_thread_start(void *t);
 
-struct cg_thread {
+struct cg_thread
+{
     unsigned int m_thread_id;
-    benchmark_config* m_config;
-    object_generator* m_obj_gen;
-    client_group* m_cg;
-    abstract_protocol* m_protocol;
+    benchmark_config *m_config;
+    object_generator *m_obj_gen;
+    client_group *m_cg;
+    abstract_protocol *m_protocol;
     pthread_t m_thread;
-    bool m_finished;
-    
-    cg_thread(unsigned int id, benchmark_config* config, object_generator* obj_gen) :
-        m_thread_id(id), m_config(config), m_obj_gen(obj_gen), m_cg(NULL), m_protocol(NULL), m_finished(false)
+    std::atomic<bool> m_finished; // Atomic to prevent data race between worker thread write and main thread read
+    // Set by the worker, before m_finished, when some of its clients were cut
+    // off by connection failures it could not recover from (or it threw),
+    // rather than all ending on the run's stop condition. Read by the main
+    // thread only after join(). The worker is NOT re-run: a replacement
+    // client_group would start a fresh --test-time window and fresh stats,
+    // silently stretching the run and discarding what was measured.
+    bool m_failed;
+
+    // Per-thread CPU accounting via getrusage(RUSAGE_THREAD), captured inside
+    // the worker. m_cpu_*_usec_acc hold the worker's CPU time and
+    // m_wall_usec_acc the WALL time of the same interval, captured at the exact
+    // same points as the CPU snapshots, so cores_used = cpu/wall divides two
+    // values over the identical interval (no setup-vs-serving skew). Only read
+    // post-join (race-free).
+    struct rusage m_cpu_start_ru;   // CPU snapshot at the current segment's start
+    struct timeval m_wall_start_tv; // wall snapshot at the same point
+    unsigned long long m_cpu_user_usec_acc;
+    unsigned long long m_cpu_sys_usec_acc;
+    unsigned long long m_wall_usec_acc;
+    bool m_cpu_started; // m_cpu_start_ru/m_wall_start_tv valid for this segment
+    bool m_cpu_valid;   // getrusage(RUSAGE_THREAD) succeeded at least once
+
+    cg_thread(unsigned int id, benchmark_config *config, object_generator *obj_gen) :
+            m_thread_id(id),
+            m_config(config),
+            m_obj_gen(obj_gen),
+            m_cg(NULL),
+            m_protocol(NULL),
+            m_finished(false),
+            m_failed(false),
+            m_cpu_user_usec_acc(0),
+            m_cpu_sys_usec_acc(0),
+            m_wall_usec_acc(0),
+            m_cpu_started(false),
+            m_cpu_valid(false)
     {
         m_protocol = protocol_factory(m_config->protocol);
         assert(m_protocol != NULL);
-        
+
         m_cg = new client_group(m_config, m_protocol, m_obj_gen);
     }
-        
+
     ~cg_thread()
     {
         if (m_cg != NULL) {
@@ -757,232 +3427,2220 @@ struct cg_thread {
 
     int prepare(void)
     {
-        if (m_cg->create_clients(m_config->clients) < (int) m_config->clients)
-            return -1;
+        // Always create ALL clients upfront to avoid concurrent vector modification
+        if (m_cg->create_clients(m_config->clients) < (int) m_config->clients) return -1;
+
+        if (m_config->clients_start > 0) {
+            // Staircase mode: only connect the initial batch
+            return m_cg->prepare_count(m_config->clients_start);
+        }
         return m_cg->prepare();
     }
-    
-    int start(void)
-    {
-        return pthread_create(&m_thread, NULL, cg_thread_start, (void *)this);        
-    }
+
+    int start(void) { return pthread_create(&m_thread, NULL, cg_thread_start, (void *) this); }
 
     void join(void)
     {
-        int* retval;
+        int *retval;
         int ret;
 
-        ret = pthread_join(m_thread, (void **)&retval);
-        assert(ret == 0);        
+        ret = pthread_join(m_thread, (void **) &retval);
+        assert(ret == 0);
+        m_cg->mark_joined();
     }
-    
 };
 
-static void* cg_thread_start(void *t)
+// Cumulative CPU time (user+system, microseconds) consumed by an arbitrary
+// thread, read WITHOUT perturbing that thread. Used by the live per-second
+// sampler in the monitor loop. On Linux this is pthread_getcpuclockid +
+// clock_gettime (a per-thread CPU clock); on macOS it is Mach thread_info.
+// Returns 0 if the thread's CPU clock cannot be read (treated as no delta).
+static unsigned long long get_thread_cpu_usec(pthread_t thread)
 {
-    cg_thread* thread = (cg_thread*) t;
-    thread->m_cg->run();
+#ifdef __APPLE__
+    mach_port_t mt = pthread_mach_thread_np(thread);
+    thread_basic_info_data_t info;
+    mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+    if (thread_info(mt, THREAD_BASIC_INFO, (thread_info_t) &info, &count) != KERN_SUCCESS) return 0;
+    return (unsigned long long) info.user_time.seconds * 1000000ULL + info.user_time.microseconds +
+           (unsigned long long) info.system_time.seconds * 1000000ULL + info.system_time.microseconds;
+#else
+    clockid_t cid;
+    if (pthread_getcpuclockid(thread, &cid) != 0) return 0;
+    struct timespec ts;
+    if (clock_gettime(cid, &ts) != 0) return 0;
+    return (unsigned long long) ts.tv_sec * 1000000ULL + (unsigned long long) ts.tv_nsec / 1000ULL;
+#endif
+}
+
+// Fold this worker's CPU usage (getrusage delta) AND the wall time of the same
+// interval into its accumulators. Called from inside the worker on every exit
+// path, BEFORE m_finished is set, so the interval is accounted before the
+// monitor loop can observe completion. The wall bracket is captured at the same
+// two points as the CPU bracket so cores_used = cpu/wall covers one identical
+// interval.
+static void cg_thread_capture_cpu_end(cg_thread *thread)
+{
+#if defined(RUSAGE_THREAD)
+    if (!thread->m_cpu_started) return;
+    struct rusage end_ru;
+    struct timeval end_tv;
+    // Capture in the same order as the start snapshot (CPU then wall) so the
+    // wall window encloses the CPU window symmetrically.
+    int rc = getrusage(RUSAGE_THREAD, &end_ru);
+    gettimeofday(&end_tv, NULL);
+    if (rc == 0) {
+        // ts_diff(a, b) returns b - a in microseconds; rusage CPU time is
+        // monotonic per native thread, so each delta is >= 0.
+        thread->m_cpu_user_usec_acc += (unsigned long long) ts_diff(thread->m_cpu_start_ru.ru_utime, end_ru.ru_utime);
+        thread->m_cpu_sys_usec_acc += (unsigned long long) ts_diff(thread->m_cpu_start_ru.ru_stime, end_ru.ru_stime);
+    }
+    thread->m_wall_usec_acc += (unsigned long long) ts_diff(thread->m_wall_start_tv, end_tv);
+    thread->m_cpu_started = false;
+#else
+    (void) thread;
+#endif
+}
+
+// Advisory per-second CPU sampler driven from the monitor loop. Reads each
+// worker's CPU clock from the MAIN thread (no worker perturbation), converts the
+// delta to "% of a core" over the real wall window, emits a de-duped live
+// high-CPU warning (once per thread, on first crossing), tracks the peak
+// whole-process utilization, and appends a per-second snapshot to a history
+// vector. Finished workers are skipped so their pthread_t is never read while
+// joined.
+struct cpu_live_sampler
+{
+    std::vector<unsigned long long> thread_prev;
+    std::vector<bool> warned;
+    unsigned long long main_prev;
+    unsigned int second;
+    double peak_pct;
+    double warn_pct;
+    struct timeval prev_tv;
+
+    void init(const std::vector<cg_thread *> &threads, double warn_threshold_fraction)
+    {
+        thread_prev.assign(threads.size(), 0);
+        warned.assign(threads.size(), false);
+        for (size_t t = 0; t < threads.size(); t++)
+            thread_prev[t] = get_thread_cpu_usec(threads[t]->m_thread);
+        main_prev = get_thread_cpu_usec(pthread_self());
+        second = 0;
+        peak_pct = 0.0;
+        warn_pct = warn_threshold_fraction * 100.0;
+        gettimeofday(&prev_tv, NULL);
+    }
+
+    void tick(const std::vector<cg_thread *> &threads, std::vector<per_second_cpu_stats> &history)
+    {
+        second++;
+        struct timeval cur_tv;
+        gettimeofday(&cur_tv, NULL);
+        double wall_usec = (double) ts_diff(prev_tv, cur_tv);
+        if (wall_usec < 1.0) wall_usec = 1.0; // guard against division by zero
+
+        per_second_cpu_stats snap;
+        snap.m_second = second;
+
+        unsigned long long main_cur = get_thread_cpu_usec(pthread_self());
+        unsigned long long main_delta = (main_cur > main_prev) ? main_cur - main_prev : 0;
+        snap.m_main_thread_cpu_pct = (double) main_delta / wall_usec * 100.0;
+        main_prev = main_cur;
+
+        double whole_pct = snap.m_main_thread_cpu_pct;
+        for (size_t t = 0; t < threads.size(); t++) {
+            double pct = 0.0;
+            // Skip finished workers: a joined handle is unsafe to read.
+            if (!threads[t]->m_finished) {
+                unsigned long long cur = get_thread_cpu_usec(threads[t]->m_thread);
+                unsigned long long delta = (cur > thread_prev[t]) ? cur - thread_prev[t] : 0;
+                pct = (double) delta / wall_usec * 100.0;
+                thread_prev[t] = cur;
+            }
+            snap.m_thread_cpu_pct.push_back(pct);
+            whole_pct += pct;
+
+            if (pct > warn_pct && !warned[t]) {
+                fprintf(stderr,
+                        "\nwarning: high CPU on thread %u: %.1f%% of a core (threshold %.1f%%) - "
+                        "results may be unreliable\n",
+                        threads[t]->m_thread_id, pct, warn_pct);
+                warned[t] = true;
+            }
+        }
+        if (whole_pct > peak_pct) peak_pct = whole_pct;
+        prev_tv = cur_tv;
+        history.push_back(std::move(snap));
+    }
+};
+
+static void *cg_thread_start(void *t)
+{
+    cg_thread *thread = (cg_thread *) t;
+
+    // Each worker installs its own sigaltstack so a SIGSEGV caused by stack
+    // overflow on this thread (or any other handler entry) runs on a fresh
+    // stack rather than re-faulting on the exhausted one.
+    install_alt_signal_stack();
+
+    // Snapshot this worker's starting CPU time and wall time (per-thread) at
+    // the same instant.
+#if defined(RUSAGE_THREAD)
+    if (getrusage(RUSAGE_THREAD, &thread->m_cpu_start_ru) == 0) {
+        gettimeofday(&thread->m_wall_start_tv, NULL);
+        thread->m_cpu_started = true;
+        thread->m_cpu_valid = true;
+    }
+#endif
+
+    try {
+        thread->m_cg->run();
+
+        // A completed client stamps its end time when its stop condition is
+        // reached. Recovered connection errors do not invalidate that window.
+        // An unended client means incomplete work, but does not identify the
+        // cause: connection loss and an event loop with no pending events can
+        // both leave clients unfinished. Fail the run without restarting it.
+        //
+        // Ctrl+C and the connection-stage supervisor end the loop through
+        // client_group::interrupt(); the main thread stamps the end times
+        // after pthread_join(). Neither is a worker failure (the latter
+        // exits 2 itself).
+        if (!g_interrupted && !g_connection_stage_aborted.load(std::memory_order_acquire)) {
+            unsigned int unended = thread->m_cg->count_unended_clients();
+            if (unended > 0) {
+                benchmark_error_log("Thread %u: %u client(s) stopped before reaching their stop condition.\n",
+                                    thread->m_thread_id, unended);
+                thread->m_failed = true;
+            }
+            unsigned int failed = thread->m_cg->count_failed_clients();
+            if (failed > 0) {
+                benchmark_error_log("Thread %u: %u client(s) failed once the run was over (see errors above).\n",
+                                    thread->m_thread_id, failed);
+                thread->m_failed = true;
+            }
+        }
+    } catch (const std::exception &e) {
+        benchmark_error_log("Thread %u caught exception: %s\n", thread->m_thread_id, e.what());
+        if (!g_connection_stage_aborted.load(std::memory_order_acquire)) {
+            thread->m_failed = true;
+        }
+    } catch (...) {
+        benchmark_error_log("Thread %u caught unknown exception\n", thread->m_thread_id);
+        if (!g_connection_stage_aborted.load(std::memory_order_acquire)) {
+            thread->m_failed = true;
+        }
+    }
+
+    // Retain the measured window on every failure path, including exceptions:
+    // finalization stamps end times and commits each client's last partial bucket.
+    if (thread->m_failed) {
+        try {
+            thread->m_cg->finalize_all_clients();
+        } catch (...) {
+            // Finalization can allocate. If it fails too, do not merge or print
+            // unfinalized statistics, and do not throw across the pthread entry.
+            // Other workers may still be using globals and TLS libraries, so
+            // terminate without running process-wide destructors/atexit handlers.
+            benchmark_error_log("Thread %u: unable to finalize statistics; aborting benchmark.\n", thread->m_thread_id);
+            _Exit(EXIT_FAILURE);
+        }
+    }
+    cg_thread_capture_cpu_end(thread);
     thread->m_finished = true;
-    
+
     return t;
 }
 
-void size_to_str(unsigned long int size, char *buf, int buf_len)
+// Render an unsigned integer with thousands-grouping commas, e.g.
+// 1234567 -> "1,234,567". Falls back to bare digits if the destination
+// buffer is too small. Used by --realtime-latencies to make per-second
+// throughput readable at a glance.
+static void format_with_commas(unsigned long long int n, char *out, size_t sz)
 {
-    if (size >= 1024*1024*1024) {
-        snprintf(buf, buf_len, "%.2fGB", 
-            (float) size / (1024*1024*1024));
-    } else if (size >= 1024*1024) {
-        snprintf(buf, buf_len, "%.2fMB",
-            (float) size / (1024*1024));
-    } else {
-        snprintf(buf, buf_len, "%.2fKB",
-            (float) size / 1024);
-    }    
+    char raw[32];
+    snprintf(raw, sizeof(raw), "%llu", n);
+    size_t len = strlen(raw);
+    size_t commas = (len > 0) ? (len - 1) / 3 : 0;
+    if (len + commas + 1 > sz) {
+        snprintf(out, sz, "%llu", n);
+        return;
+    }
+    char *w = out + len + commas;
+    *w-- = '\0';
+    int dc = 0;
+    for (ssize_t r = (ssize_t) len - 1; r >= 0; r--) {
+        if (dc > 0 && dc % 3 == 0) *w-- = ',';
+        *w-- = raw[r];
+        dc++;
+    }
 }
 
-run_stats run_benchmark(int run_id, benchmark_config* cfg, object_generator* obj_gen)
+void size_to_str(unsigned long long int size, char *buf, int buf_len)
 {
+    if (size >= 1024 * 1024 * 1024) {
+        snprintf(buf, buf_len, "%.2fGB", (float) size / (1024 * 1024 * 1024));
+    } else if (size >= 1024 * 1024) {
+        snprintf(buf, buf_len, "%.2fMB", (float) size / (1024 * 1024));
+    } else {
+        snprintf(buf, buf_len, "%.2fKB", (float) size / 1024);
+    }
+}
+
+// Print client list for crash handler
+static void print_client_list(FILE *fp, int pid, const char *timestr)
+{
+    if (g_threads != NULL) {
+        fprintf(fp, "\n[%d] %s # --- CLIENT LIST OUTPUT\n", pid, timestr);
+
+        for (size_t t = 0; t < g_threads->size(); t++) {
+            cg_thread *thread = (*g_threads)[t];
+            if (thread && thread->m_cg) {
+                std::vector<client *> &clients = thread->m_cg->get_clients();
+
+                for (size_t c = 0; c < clients.size(); c++) {
+                    client *cl = clients[c];
+                    if (cl) {
+                        std::vector<shard_connection *> &connections = cl->get_connections();
+
+                        for (size_t conn_idx = 0; conn_idx < connections.size(); conn_idx++) {
+                            shard_connection *conn = connections[conn_idx];
+                            if (conn) {
+                                const char *state_str = "unknown";
+                                switch (conn->get_connection_state()) {
+                                case conn_disconnected:
+                                    state_str = "disconnected";
+                                    break;
+                                case conn_in_progress:
+                                    state_str = "connecting";
+                                    break;
+                                case conn_connected:
+                                    state_str = "connected";
+                                    break;
+                                }
+
+                                int local_port = conn->get_local_port();
+                                const char *last_cmd = conn->get_last_request_type();
+
+                                fprintf(fp,
+                                        "[%d] %s # thread=%zu client=%zu conn=%zu addr=%s:%s local_port=%d state=%s "
+                                        "pending=%d last_cmd=%s\n",
+                                        pid, timestr, t, c, conn_idx,
+                                        conn->get_address() ? conn->get_address() : "unknown",
+                                        conn->get_port() ? conn->get_port() : "unknown", local_port, state_str,
+                                        conn->get_pending_resp(), last_cmd);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Helper function to print stack trace for all threads
+static void print_all_threads_stack_trace(FILE *fp, int pid, const char *timestr)
+{
+    fprintf(fp, "\n[%d] %s # --- STACK TRACE (all threads)\n", pid, timestr);
+
+    // Get the current (crashing) thread ID
+    pthread_t current_thread = pthread_self();
+
+    // Print main/crashing thread first
+    fprintf(fp, "[%d] %s # Thread %lu (current/crashing thread):\n", pid, timestr, (unsigned long) current_thread);
+
+#ifdef HAVE_EXECINFO_H
+    void *trace[100];
+    int trace_size = backtrace(trace, 100);
+    // backtrace_symbols_fd is the documented async-signal-safe variant;
+    // backtrace_symbols (which mallocs) is NOT and can re-fault when the
+    // crashing thread holds the malloc arena lock or the heap is corrupt.
+    //
+    // Intentionally NO fflush(fp) before backtrace_symbols_fd: fflush
+    // takes the FILE*'s lock, which is itself NOT async-signal-safe (it
+    // can deadlock if the crashing thread already held that lock). The
+    // backtrace output goes via the raw fd (fileno(fp)) and bypasses
+    // stdio's user-space buffer, so any interleaving with previously
+    // fprintf'd lines is acceptable -- correctness over ordering.
+    if (trace_size > 1) {
+        backtrace_symbols_fd(trace + 1, trace_size - 1, fileno(fp));
+    }
+#else
+    fprintf(fp, "[%d] %s #   (backtrace not available on this platform)\n", pid, timestr);
+#endif
+
+    // Now print stack traces for worker threads if available
+    if (g_threads != NULL) {
+        for (size_t t = 0; t < g_threads->size(); t++) {
+            cg_thread *thread = (*g_threads)[t];
+            if (thread && thread->m_thread) {
+                pthread_t tid = thread->m_thread;
+
+                // Skip if this is the current thread (already printed)
+                if (pthread_equal(tid, current_thread)) {
+                    continue;
+                }
+
+                fprintf(fp, "[%d] %s # Thread %lu (worker thread %zu):\n", pid, timestr, (unsigned long) tid, t);
+                fprintf(fp, "[%d] %s #   (Note: Stack trace for non-crashing threads not available on this platform)\n",
+                        pid, timestr);
+            }
+        }
+    }
+}
+
+static void print_staircase_pattern(int run_id, benchmark_config *cfg)
+{
+    unsigned int num_steps = (cfg->clients - cfg->clients_start + cfg->clients_step - 1) / cfg->clients_step;
+    unsigned int min_duration = num_steps * cfg->step_duration;
+    unsigned int max_bar = cfg->clients;
+
+    fprintf(stderr, "[RUN #%u] Client staircase pattern (per thread x %u threads):\n", run_id, cfg->threads);
+
+    for (unsigned int step = 0; step <= num_steps; step++) {
+        unsigned int clients = cfg->clients_start + step * cfg->clients_step;
+        if (clients > cfg->clients) clients = cfg->clients;
+
+        unsigned int t_start = step * cfg->step_duration;
+
+        // Don't show steps that can't start within test_time
+        if (t_start >= cfg->test_time && step > 0) break;
+
+        unsigned int t_end;
+        bool is_last = (clients >= cfg->clients);
+        if (is_last)
+            t_end = cfg->test_time;
+        else
+            t_end = (step + 1) * cfg->step_duration;
+
+        // Cap t_end at test_time
+        if (t_end > cfg->test_time) t_end = cfg->test_time;
+
+        // Scale bar: 2 chars per unit, proportional to max
+        unsigned int bar_len = (clients * 20 + max_bar - 1) / max_bar;
+        if (bar_len < 1) bar_len = 1;
+
+        fprintf(stderr, "  Step %u: %3us - %3us : %3u clients  ", step, t_start, t_end, clients);
+        for (unsigned int b = 0; b < bar_len; b++)
+            fprintf(stderr, "\xe2\x96\x88"); // UTF-8 for full block character
+        if (is_last) fprintf(stderr, "  (max)");
+        fprintf(stderr, "\n");
+
+        if (is_last) break;
+    }
+
+    unsigned int total_max = cfg->clients * cfg->threads;
+    fprintf(stderr, "  Total max connections: %u x %u = %u\n", cfg->clients, cfg->threads, total_max);
+
+    if (cfg->test_time >= min_duration) {
+        fprintf(stderr, "  Minimum time to reach max: %us (test_time: %us OK)\n", min_duration, cfg->test_time);
+    } else {
+        fprintf(stderr, "  WARNING: test_time (%us) < time to reach max clients (%us), max will not be reached\n",
+                cfg->test_time, min_duration);
+    }
+    fprintf(stderr, "\n");
+}
+
+// One-producer-two-transports refactor (PLAN section 3.6c, Decisions #37):
+// the 1 Hz StatsD emit block, relocated verbatim out of run_benchmark()'s
+// progress loop into this file-static producer. It consumes a metrics_snapshot
+// (the one-producer POD from prometheus_metrics.h) so the Prometheus transport
+// can later share the exact same source. This is statsd-ONLY and lives OUTSIDE
+// any HAVE_EVHTTP guard. The byte-identical UDP wire is preserved: the snapshot
+// carries cur/avg_ops_sec et al. as `long` (cast at the fill site), so they
+// route through gauge(long long) ("%lld"|g) exactly as before, while progress_pct is
+// `double` (gauge(double), "%.6f"|g) and the latencies go through timing(double)
+// ("%.3f"|ms). The >0 send condition for connection_errors is unchanged.
+static void statsd_publish_tick(statsd_client *statsd, const metrics_snapshot &snap, bool has_samples,
+                                const std::vector<double> &quantiles, const std::vector<int64_t> &values)
+{
+    statsd->gauge("ops_sec", snap.cur_ops_sec);
+    statsd->gauge("ops_sec_avg", snap.avg_ops_sec);
+    statsd->gauge("bytes_sec", snap.cur_bytes_sec);
+    statsd->gauge("bytes_sec_avg", snap.avg_bytes_sec);
+    statsd->timing("latency_ms", snap.cur_latency_ms);
+    statsd->timing("latency_avg_ms", snap.avg_latency_ms);
+    statsd->gauge("connections", (long long) snap.connections);
+    statsd->gauge("progress_pct", snap.progress_pct);
+    if (snap.run_connection_errors > 0) {
+        statsd->gauge("connection_errors", (long long) snap.run_connection_errors);
+    }
+
+    // Send percentile metrics derived from the aggregated instantaneous
+    // histogram (allocated by the caller; shared with the TUI renderer when enabled).
+    if (has_samples) {
+        for (std::size_t i = 0; i < quantiles.size(); i++) {
+            double percentile = quantiles[i];
+            int64_t value = values[i];
+            double value_ms = value / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
+
+            // Format the metric name (e.g., "latency_p50", "latency_p99", "latency_p99_9",
+            // "latency_p99_99"). %.10g preserves up to 10 significant digits so deep-tail
+            // percentiles (99.99999, 99.999999) don't round to 100 and collide.
+            char metric_name[40];
+            char pct_str[24];
+            snprintf(pct_str, sizeof(pct_str), "%.10g", percentile);
+            for (char *p = pct_str; *p; p++) {
+                if (*p == '.') *p = '_';
+            }
+            snprintf(metric_name, sizeof(metric_name), "latency_p%s", pct_str);
+
+            statsd->gauge(metric_name, value_ms);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Prometheus producer helper island (PLAN.md section 3.4 / 3.6 / 3.7).
+//
+// All cfg->prometheus access is funnelled through these file-static helpers so
+// the run loop stays ifdef-free: with HAVE_EVHTTP off the #else branch defines
+// empty inline stubs (unnamed params, -Wall-silent) and the producer wiring
+// folds to nothing. All helpers run on the MAIN thread only.
+// ---------------------------------------------------------------------------
+#ifdef HAVE_EVHTTP
+
+// True when the exporter is active.
+static inline bool prom_enabled(benchmark_config *cfg)
+{
+    return cfg->prometheus != NULL;
+}
+
+// Read one client_group's live cumulative counters into a counter_set. These
+// are the TSan-documented benign-race scalar getters (client.h:282-292); safe
+// to sample at 1 Hz from the main thread. Bytes are the split rx/tx getters
+// (never summarize() — it double-counts arbitrary-command bytes). The arbitrary
+// hits/misses sum only the per-command scalar totals in run_stats
+// m_arbitrary_misses[] (never the per-key vectors the worker grow-resizes), so
+// they read race-free at the same off-worker point as the GET hits/misses; the
+// accessors live on client_group/run_stats rather than the client.h:282-292
+// flat-scalar block because the source lives in per-command run_stats state.
+static counter_set prom_read_cg_counters(client_group *cg)
+{
+    counter_set cs;
+    cs.v[MT_OPS] = cg->get_total_ops();
+    cs.v[MT_BYTES_TX] = cg->get_total_bytes_tx();
+    cs.v[MT_BYTES_RX] = cg->get_total_bytes_rx();
+    cs.v[MT_HITS] = cg->get_total_hits();
+    cs.v[MT_MISSES] = cg->get_total_misses();
+    cs.v[MT_ERRORS] = cg->get_total_errors();
+    cs.v[MT_CONN_ERRORS] = cg->get_total_connection_errors();
+    cs.v[MT_RETRY_ATTEMPTS] = cg->get_total_retry_attempts();
+    cs.v[MT_RETRIED_OPS] = cg->get_total_retried_ops();
+    cs.v[MT_ARBITRARY_HITS] = cg->get_total_arbitrary_hits();
+    cs.v[MT_ARBITRARY_MISSES] = cg->get_total_arbitrary_misses();
+    return cs;
+}
+
+// 1 Hz observe: feed every thread's live counters to the monotonic accumulator,
+// then fill the snapshot's cumulative counters from it (non-decreasing totals).
+static void prom_observe_and_fill(benchmark_config *cfg, std::vector<cg_thread *> &threads, metrics_snapshot &snap)
+{
+    monotonic_accumulator &accum = cfg->prometheus->accumulator();
+    for (size_t t = 0; t < threads.size(); t++) {
+        accum.observe_live(t, prom_read_cg_counters(threads[t]->m_cg));
+    }
+    accum.fill(snap.counters);
+}
+
+// Exact post-join fold of one thread's final totals into the accumulator basis,
+// BEFORE its client_group is destroyed at run end. Race-free.
+static void prom_fold_thread(benchmark_config *cfg, size_t t, client_group *cg)
+{
+    cfg->prometheus->accumulator().fold_final(t, prom_read_cg_counters(cg));
+}
+
+// Drain the latency samples of every second the clients completed since the
+// previous drain into the exporter's scratch tick histogram. Finished threads
+// are drained too (their last partial second is folded by set_end_time): the
+// drain is mutex-protected and every m_cg lives until after the run-end
+// publish. run_end (post-join only) also drains the live histograms.
+static hdr_histogram *prom_drain_latency(benchmark_config *cfg, std::vector<cg_thread *> &threads, bool run_end)
+{
+    hdr_histogram *tick = cfg->prometheus->tick_histogram();
+    hdr_reset(tick);
+    for (size_t t = 0; t < threads.size(); t++) {
+        threads[t]->m_cg->drain_prom_latency_histogram(tick, run_end);
+    }
+    return tick;
+}
+
+// 1 Hz publish: the fully-filled snapshot + the tick histogram drained by
+// prom_drain_latency. PLAN.md section 3.7.
+static void prom_publish_tick(benchmark_config *cfg, const metrics_snapshot &snap, const hdr_histogram *latency)
+{
+    cfg->prometheus->publish(snap, latency);
+}
+
+static void prom_publish_run_start(benchmark_config *cfg, uint32_t run_id)
+{
+    cfg->prometheus->publish_run_start(run_id, cfg->run_count);
+}
+
+// Post-join: drain every thread once more, including its live histogram. The
+// loop's last tick normally has drained everything already; this covers exits
+// that skip it or stop a worker mid-callback (Ctrl+C, the connection-stage
+// abort), so the run-end snapshot always counts every op.
+static void prom_publish_run_end(benchmark_config *cfg, uint32_t run_id, std::vector<cg_thread *> &threads)
+{
+    cfg->prometheus->publish_run_end(run_id, cfg->run_count, prom_drain_latency(cfg, threads, true));
+}
+
+#else // !HAVE_EVHTTP — empty stubs keep the run loop ifdef-free.
+
+static inline bool prom_enabled(benchmark_config *)
+{
+    return false;
+}
+static inline void prom_observe_and_fill(benchmark_config *, std::vector<cg_thread *> &, metrics_snapshot &) {}
+static inline void prom_fold_thread(benchmark_config *, size_t, client_group *) {}
+static inline hdr_histogram *prom_drain_latency(benchmark_config *, std::vector<cg_thread *> &, bool)
+{
+    return NULL;
+}
+static inline void prom_publish_tick(benchmark_config *, const metrics_snapshot &, const hdr_histogram *) {}
+static inline void prom_publish_run_start(benchmark_config *, uint32_t) {}
+static inline void prom_publish_run_end(benchmark_config *, uint32_t, std::vector<cg_thread *> &) {}
+
+#endif // HAVE_EVHTTP
+
+run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj_gen)
+{
+    // Expose the current run id so the cluster topology summary (printed from a
+    // worker thread once CLUSTER SLOTS commits) can label and gate itself.
+    cfg->current_run_id = (unsigned int) run_id;
+
     fprintf(stderr, "[RUN #%u] Preparing benchmark client...\n", run_id);
 
+    // Shared MGET slot cache: allocate fresh for this run so the lazy build
+    // inside build_mget_slot_cache() fires again (topology may have changed).
+    if (cfg->cluster_mode && cfg->multi_key_get > 0) {
+        delete cfg->mget_cache;
+        cfg->mget_cache = new mget_slot_cache();
+    }
+
     // prepare threads data
-    std::vector<cg_thread*> threads;
+    std::vector<cg_thread *> threads;
+    g_threads = &threads; // Set global pointer for crash handler
+
     for (unsigned int i = 0; i < cfg->threads; i++) {
-        cg_thread* t = new cg_thread(i, cfg, obj_gen);
+        cg_thread *t = new cg_thread(i, cfg, obj_gen);
         assert(t != NULL);
 
         if (t->prepare() < 0) {
             benchmark_error_log("error: failed to prepare thread %u for test.\n", i);
-            exit(1);
+            delete cfg->mget_cache;
+            cfg->mget_cache = NULL;
+            exit(failure_exit_code());
         }
         threads.push_back(t);
     }
 
-    // launch threads
-    fprintf(stderr, "[RUN #%u] Launching threads now...\n", run_id);
-    for (std::vector<cg_thread*>::iterator i = threads.begin(); i != threads.end(); i++) {
-        (*i)->start();
+    // Print staircase pattern if configured
+    if (cfg->clients_start > 0) {
+        print_staircase_pattern(run_id, cfg);
     }
 
-    unsigned long int prev_ops = 0;
-    unsigned long int prev_bytes = 0;
-    unsigned long int prev_duration = 0;
+    // Record benchmark start time (used for staircase global deadline)
+    gettimeofday(&cfg->benchmark_start_time, NULL);
+
+    // Arm the connection-stage supervisor. Must happen *before* threads
+    // start so the first failure timestamp is meaningful (some servers
+    // reply to AUTH on the same TCP RTT as the connect).
+    connection_stage_supervisor_reset();
+
+    // Snapshot the main thread's CPU time just before launching workers, so the
+    // whole-process CPU aggregate includes the orchestrator/sampler overhead.
+#if defined(RUSAGE_THREAD)
+    struct rusage main_cpu_start_ru;
+    bool main_cpu_valid = (getrusage(RUSAGE_THREAD, &main_cpu_start_ru) == 0);
+#endif
+
+    // launch threads
+    fprintf(stderr, "[RUN #%u] Launching threads now...\n", run_id);
+    for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
+        (*i)->start();
+    }
+    struct timeval launch_time;
+    gettimeofday(&launch_time, NULL);
+
+    // Send "run started" annotation to Graphite
+    if (cfg->statsd != NULL && cfg->statsd->is_enabled()) {
+        char event_data[256];
+        snprintf(event_data, sizeof(event_data) - 1, "threads=%u connections=%u run=%u", cfg->threads, cfg->clients,
+                 run_id);
+        cfg->statsd->event("Benchmark Started", event_data, "memtier,start");
+    }
+
+    // Prometheus run-start publish (PLAN section 3.6d): counters = carried
+    // accumulator totals, run_id/run_count set, all gauges/rates zero (live at
+    // the first 1 Hz tick). Mirrors statsd's zeroing convention.
+    if (prom_enabled(cfg)) prom_publish_run_start(cfg, run_id);
+
+    unsigned long long int prev_ops = 0;
+    unsigned long long int prev_bytes = 0;
+    unsigned long long int prev_duration = 0;
     double prev_latency = 0, cur_latency = 0;
-    unsigned long int cur_ops_sec = 0;
-    unsigned long int cur_bytes_sec = 0;
+    unsigned long long int cur_ops_sec = 0;
+    unsigned long long int cur_bytes_sec = 0;
+    unsigned long long int prev_hits = 0;
+    unsigned long long int prev_misses = 0;
+    unsigned long long int prev_aborts = 0;
+    unsigned long long int prev_errors = 0;
+    unsigned long long int prev_retry_attempts = 0;
+
+    // Detect once whether stderr is a real terminal. --realtime-latencies uses
+    // this to choose between in-place cursor-up redraw and plain-append output.
+    bool stderr_is_tty = isatty(fileno(stderr)) != 0;
+    bool first_rtl_frame = true;
+
+    // Cumulative latency histogram for --realtime-latencies "overall" percentiles.
+    // We hdr_add each tick's aggregated inst histogram into this so the percentiles
+    // shown in '(avg: X.XXX)' reflect the whole run, not just the last second.
+    hdr_histogram *rtl_totals_hist = NULL;
+    if (cfg->realtime_latencies) {
+        hdr_init(LATENCY_HDR_MIN_VALUE, LATENCY_HDR_SEC_MAX_VALUE, LATENCY_HDR_SEC_SIGDIGTS, &rtl_totals_hist);
+    }
+
+    // Keep query scratch across ticks and share instantaneous values with StatsD.
+    const std::vector<double> no_quantiles;
+    const bool live_percentiles_enabled = cfg->realtime_latencies || (cfg->statsd != NULL && cfg->statsd->is_enabled());
+    const std::vector<double> &live_quantiles =
+        live_percentiles_enabled ? cfg->print_percentiles.quantile_list : no_quantiles;
+    latency_percentiles inst_percentiles(live_quantiles);
+    latency_percentiles overall_percentiles(cfg->realtime_latencies ? live_quantiles : no_quantiles);
+
+    // Live (advisory) per-second CPU sampler. The main thread reads each worker's
+    // CPU clock without perturbing it, so this adds no overhead to the workers.
+    // Feeds the per-second JSON detail, the de-duped live high-CPU warning, and
+    // the peak-utilization figure.
+    std::vector<per_second_cpu_stats> cpu_history;
+    cpu_live_sampler cpu_sampler;
+    cpu_sampler.init(threads, cfg->cpu_warn_threshold);
 
     // provide some feedback...
+    // NOTE: Reading stats from worker threads without synchronization is a benign race.
+    // These stats are only for progress display and are approximate. Final results are
+    // collected after pthread_join() when all threads have finished (race-free).
     unsigned int active_threads = 0;
     do {
         active_threads = 0;
         sleep(1);
 
-        unsigned long int total_ops = 0;
-        unsigned long int total_bytes = 0;
-        unsigned long int duration = 0;
-        unsigned int thread_counter = 0; 
-        unsigned long int total_latency = 0;
-        
-        for (std::vector<cg_thread*>::iterator i = threads.begin(); i != threads.end(); i++) {
-            if (!(*i)->m_finished)
+        // Check for Ctrl+C interrupt
+        if (g_interrupted) {
+            // Wall time since the run started: the client durations stay 0
+            // for clients that have not connected yet.
+            struct timeval now;
+            gettimeofday(&now, NULL);
+            fprintf(stderr, "\n[RUN #%u] Interrupted by %s after %.1f secs, stopping threads...\n", run_id,
+                    interrupt_source(), (float) ts_diff(cfg->benchmark_start_time, now) / 1000000);
+            // Interrupt all threads (marks clients as interrupted and breaks event loops; the stats are
+            // finalized after the join)
+            for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
+                (*i)->m_cg->interrupt();
+            }
+            break;
+        }
+
+        // Phase 1 of #426: bound the startup phase.
+        //
+        // Workers report failures (AUTH / HELLO / SELECT / CLUSTER SLOTS /
+        // -ERR / parse-error during initial probe) and the first post-setup
+        // success into the supervisor. If neither has happened within
+        // --connection-stage-timeout seconds, abort the run rather than
+        // letting the reconnect / "stuck WAIT" loop ignore --test-time.
+        // 0 = supervisor disabled.
+        {
+            std::string last_err;
+            unsigned int elapsed = 0;
+            if (connection_stage_should_abort(cfg->connection_stage_timeout, &last_err, &elapsed)) {
+                fprintf(stderr,
+                        "\nmemtier_benchmark: aborting after %u seconds of connection-stage failures "
+                        "(last error: %s). See --connection-stage-timeout.\n",
+                        elapsed, last_err.c_str());
+                g_connection_stage_aborted.store(true, std::memory_order_release);
+                g_any_run_connection_stage_aborted.store(true, std::memory_order_release);
+                for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
+                    (*i)->m_cg->interrupt();
+                }
+                break;
+            }
+        }
+
+        unsigned long long int total_ops = 0;
+        unsigned long long int total_bytes = 0;
+        unsigned long long int duration = 0;
+        unsigned int thread_counter = 0;
+        double total_latency = 0;
+        unsigned long long int total_connection_errors = 0;
+        unsigned long long int total_hits = 0;
+        unsigned long long int total_misses = 0;
+        unsigned long long int total_aborts = 0;
+        unsigned long long int total_errors = 0;
+        unsigned long long int total_retry_attempts = 0;
+        unsigned long long int total_retried_ops = 0;
+
+        // Replies still pending well after --test-time (the server stopped
+        // replying) would otherwise keep the run waiting forever. Each client
+        // checks its own deadline (its own start, or the staircase start), so
+        // one that connected late is ended a tick or two later; this only says
+        // when to start asking.
+        bool end_stalled = false;
+        if (cfg->test_time > 0) {
+            struct timeval now;
+            gettimeofday(&now, NULL);
+            end_stalled =
+                ts_diff(launch_time, now) >= (long long) (cfg->test_time + TEST_TIME_DRAIN_GRACE_SECS) * 1000000;
+        }
+
+        for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
+            if (!(*i)->m_finished) {
                 active_threads++;
+                if (end_stalled) (*i)->m_cg->end_stalled_clients();
+            }
 
             total_ops += (*i)->m_cg->get_total_ops();
             total_bytes += (*i)->m_cg->get_total_bytes();
             total_latency += (*i)->m_cg->get_total_latency();
+            total_connection_errors += (*i)->m_cg->get_total_connection_errors();
+            if (cfg->retry_on_error) {
+                total_errors += (*i)->m_cg->get_total_errors();
+                total_retry_attempts += (*i)->m_cg->get_total_retry_attempts();
+                total_retried_ops += (*i)->m_cg->get_total_retried_ops();
+            }
+            if (cfg->realtime_latencies) {
+                // In --command (arbitrary) mode the SET/GET hit/miss counters
+                // stay zero, so pull the live miss/abort figures from the
+                // arbitrary-command counters instead. Aborts are the EXEC
+                // optimistic-lock subset of misses (see run_stats).
+                if (cfg->arbitrary_commands->is_defined()) {
+                    total_hits += (*i)->m_cg->get_total_arbitrary_hits();
+                    total_misses += (*i)->m_cg->get_total_arbitrary_misses();
+                    total_aborts += (*i)->m_cg->get_total_arbitrary_aborts();
+                } else {
+                    total_hits += (*i)->m_cg->get_total_hits();
+                    total_misses += (*i)->m_cg->get_total_misses();
+                }
+            }
             thread_counter++;
-            float factor = ((float)(thread_counter - 1) / thread_counter);
-            duration =  factor * duration +  (float)(*i)->m_cg->get_duration_usec() / thread_counter ;
+            float factor = ((float) (thread_counter - 1) / thread_counter);
+            duration = factor * duration + (float) (*i)->m_cg->get_duration_usec() / thread_counter;
         }
-        
-        unsigned long int cur_ops = total_ops-prev_ops;
-        unsigned long int cur_bytes = total_bytes-prev_bytes;
-        unsigned long int cur_duration = duration-prev_duration;
-        double cur_total_latency = total_latency-prev_latency;
+
+        unsigned long long int cur_ops = total_ops - prev_ops;
+        unsigned long long int cur_bytes = total_bytes - prev_bytes;
+        unsigned long long int cur_duration = duration - prev_duration;
+        double cur_total_latency = total_latency - prev_latency;
         prev_ops = total_ops;
         prev_bytes = total_bytes;
         prev_latency = total_latency;
         prev_duration = duration;
-        
-        unsigned long int ops_sec = 0;
-        unsigned long int bytes_sec = 0;
+
+        unsigned long long int ops_sec = 0;
+        unsigned long long int bytes_sec = 0;
         double avg_latency = 0;
         if (duration > 1) {
-            ops_sec = (long)( (double)total_ops / duration * 1000000);
-            bytes_sec = (long)( (double)total_bytes / duration * 1000000);
-            avg_latency = ((double) total_latency / 1000 / total_ops) ;
+            ops_sec = (unsigned long long) ((double) total_ops / duration * 1000000);
+            bytes_sec = (unsigned long long) ((double) total_bytes / duration * 1000000);
+            avg_latency = ((double) total_latency / 1000 / total_ops);
         }
         if (cur_duration > 1 && active_threads == cfg->threads) {
-            cur_ops_sec = (long)( (double)cur_ops / cur_duration * 1000000);
-            cur_bytes_sec = (long)( (double)cur_bytes / cur_duration * 1000000);
-            cur_latency = ((double) cur_total_latency / 1000 / cur_ops) ;
+            cur_ops_sec = (unsigned long long) ((double) cur_ops / cur_duration * 1000000);
+            cur_bytes_sec = (unsigned long long) ((double) cur_bytes / cur_duration * 1000000);
+            cur_latency = ((double) cur_total_latency / 1000 / cur_ops);
         }
 
         char bytes_str[40], cur_bytes_str[40];
-        size_to_str(bytes_sec, bytes_str, sizeof(bytes_str)-1);
-        size_to_str(cur_bytes_sec, cur_bytes_str, sizeof(cur_bytes_str)-1);
-        
+        size_to_str(bytes_sec, bytes_str, sizeof(bytes_str) - 1);
+        size_to_str(cur_bytes_sec, cur_bytes_str, sizeof(cur_bytes_str) - 1);
+
+        // Calculate current client count for display
+        unsigned int display_clients = cfg->clients;
+        if (cfg->clients_start > 0) {
+            struct timeval now;
+            gettimeofday(&now, NULL);
+            unsigned int elapsed_secs = ts_diff(cfg->benchmark_start_time, now) / 1000000;
+            unsigned int steps_done = elapsed_secs / cfg->step_duration;
+            // As in the JSON "Active Clients": only steps k with
+            // k * step_duration < test_time ever run.
+            if (cfg->test_time > 0 && steps_done > (cfg->test_time - 1) / cfg->step_duration)
+                steps_done = (cfg->test_time - 1) / cfg->step_duration;
+            display_clients = cfg->clients_start + steps_done * cfg->clients_step;
+            if (display_clients > cfg->clients) display_clients = cfg->clients;
+        }
+
         double progress = 0;
-        if(cfg->requests)
-            progress = 100.0 * total_ops / ((double)cfg->requests*cfg->clients*cfg->threads);
-        else
-            progress = 100.0 * (duration / 1000000.0)/cfg->test_time;
-        
-        fprintf(stderr, "[RUN #%u %.0f%%, %3u secs] %2u threads: %11lu ops, %7lu (avg: %7lu) ops/sec, %s/sec (avg: %s/sec), %5.2f (avg: %5.2f) msec latency\r",
-            run_id, progress, (unsigned int) (duration / 1000000), active_threads, total_ops, cur_ops_sec, ops_sec, cur_bytes_str, bytes_str, cur_latency, avg_latency);
+        if (cfg->requests)
+            progress = 100.0 * total_ops / ((double) cfg->requests * display_clients * cfg->threads);
+        else if (cfg->clients_start > 0) {
+            struct timeval now;
+            gettimeofday(&now, NULL);
+            double wall_elapsed = (now.tv_sec - cfg->benchmark_start_time.tv_sec) +
+                                  (now.tv_usec - cfg->benchmark_start_time.tv_usec) / 1000000.0;
+            progress = 100.0 * wall_elapsed / cfg->test_time;
+        } else
+            progress = 100.0 * (duration / 1000000.0) / cfg->test_time;
+
+        // Aggregate per-thread instantaneous latency histograms once if either
+        // --realtime-latencies or StatsD percentile export needs them. Owned and
+        // freed at the end of this iteration.
+        hdr_histogram *inst_hist_agg = NULL;
+        bool need_inst_hist = cfg->realtime_latencies || (cfg->statsd != NULL && cfg->statsd->is_enabled());
+        if (need_inst_hist) {
+            if (hdr_init(LATENCY_HDR_MIN_VALUE, LATENCY_HDR_SEC_MAX_VALUE, LATENCY_HDR_SEC_SIGDIGTS, &inst_hist_agg) ==
+                0) {
+                for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
+                    if (!(*i)->m_finished) {
+                        (*i)->m_cg->aggregate_inst_histogram(inst_hist_agg);
+                    }
+                }
+            }
+        }
+
+        bool inst_samples = inst_hist_agg != NULL && hdr_total_count(inst_hist_agg) > 0;
+        if (inst_samples) inst_percentiles.calculate(inst_hist_agg);
+        const std::vector<int64_t> &inst_values = inst_percentiles.values();
+
+        if (cfg->realtime_latencies) {
+            // Two-line, time-series-friendly block. On a TTY we move the cursor
+            // back up 2 lines so the block redraws in place; on a non-TTY (file
+            // capture / piped log) we just keep appending, which turns the
+            // stderr stream into a clean 2-rows-per-second time series.
+            char tag[40];
+            snprintf(tag, sizeof(tag), "[RUN #%u %3.0f%% %3lus]", run_id, progress,
+                     (unsigned long) (duration / 1000000));
+
+            char cur_ops_str[32], avg_ops_str[32];
+            format_with_commas(cur_ops_sec, cur_ops_str, sizeof(cur_ops_str));
+            format_with_commas(ops_sec, avg_ops_str, sizeof(avg_ops_str));
+
+            // Miss ratio: per-second (delta) and cumulative.
+            unsigned long long int cur_lookups = (total_hits - prev_hits) + (total_misses - prev_misses);
+            unsigned long long int tot_lookups = total_hits + total_misses;
+            char cur_miss_str[16], avg_miss_str[16];
+            if (cur_lookups > 0)
+                snprintf(cur_miss_str, sizeof(cur_miss_str), "%5.2f%%",
+                         100.0 * (double) (total_misses - prev_misses) / (double) cur_lookups);
+            else
+                snprintf(cur_miss_str, sizeof(cur_miss_str), "  -  ");
+            if (tot_lookups > 0)
+                snprintf(avg_miss_str, sizeof(avg_miss_str), "%5.2f%%",
+                         100.0 * (double) total_misses / (double) tot_lookups);
+            else
+                snprintf(avg_miss_str, sizeof(avg_miss_str), "  -  ");
+
+            // Abort ratio (--transaction only): EXEC optimistic-lock aborts as a
+            // share of the same lookup denominator. Aborts are a subset of misses,
+            // so abort% <= miss%. It's a blended live indicator across all
+            // arbitrary commands; the authoritative per-command abort rate is in
+            // the final table / "abort rate" warning.
+            char cur_abort_str[16], avg_abort_str[16];
+            if (cur_lookups > 0)
+                snprintf(cur_abort_str, sizeof(cur_abort_str), "%5.2f%%",
+                         100.0 * (double) (total_aborts - prev_aborts) / (double) cur_lookups);
+            else
+                snprintf(cur_abort_str, sizeof(cur_abort_str), "  -  ");
+            if (tot_lookups > 0)
+                snprintf(avg_abort_str, sizeof(avg_abort_str), "%5.2f%%",
+                         100.0 * (double) total_aborts / (double) tot_lookups);
+            else
+                snprintf(avg_abort_str, sizeof(avg_abort_str), "  -  ");
+
+            char line1[640];
+            int line1_used = 0;
+            if (total_connection_errors > 0) {
+                line1_used = snprintf(
+                    line1, sizeof(line1),
+                    "%s throughput %s (avg: %s) ops/sec   %s/sec (avg: %s/sec)   miss %s (avg: %s)   conn_err %llu",
+                    tag, cur_ops_str, avg_ops_str, cur_bytes_str, bytes_str, cur_miss_str, avg_miss_str,
+                    total_connection_errors);
+            } else {
+                line1_used =
+                    snprintf(line1, sizeof(line1),
+                             "%s throughput %s (avg: %s) ops/sec   %s/sec (avg: %s/sec)   miss %s (avg: %s)", tag,
+                             cur_ops_str, avg_ops_str, cur_bytes_str, bytes_str, cur_miss_str, avg_miss_str);
+            }
+            // Abort tail: only under --transaction so default arbitrary-command
+            // output is unchanged for existing log-scraping.
+            if (cfg->transaction && line1_used > 0 && (size_t) line1_used < sizeof(line1)) {
+                int n = snprintf(line1 + line1_used, sizeof(line1) - line1_used, "   abort %s (avg: %s)", cur_abort_str,
+                                 avg_abort_str);
+                if (n > 0) line1_used += n;
+            }
+            // Retry/error tail: only printed when --retry-on-error is enabled
+            // so existing CI / log-scraping is unaffected by default.
+            if (cfg->retry_on_error && line1_used > 0 && (size_t) line1_used < sizeof(line1)) {
+                unsigned long long int cur_errors = total_errors - prev_errors;
+                unsigned long long int cur_retries = total_retry_attempts - prev_retry_attempts;
+                snprintf(line1 + line1_used, sizeof(line1) - line1_used,
+                         "   errors %llu (+%llu)   retries %llu (+%llu)   retried_ops %llu", total_errors, cur_errors,
+                         total_retry_attempts, cur_retries, total_retried_ops);
+            }
+
+            // Accumulate this tick's instantaneous percentile samples into the
+            // run-lifetime histogram so '(avg: X.XXX)' on the latency line covers
+            // the whole run so far, not just the last second.
+            if (rtl_totals_hist != NULL && inst_hist_agg != NULL && hdr_total_count(inst_hist_agg) > 0) {
+                hdr_add(rtl_totals_hist, inst_hist_agg);
+            }
+
+            // Latency lines: per-configured-percentile "cur (avg: avg)", chunked
+            // to at most kPctPerLine entries per line so a long --print-percentiles
+            // list (e.g. 50,99,99.9,99.99,99.99999,99.999999) doesn't blow out the
+            // terminal. Line count is deterministic given the configured list,
+            // which keeps the in-place cursor-up redraw stable across ticks.
+            const std::vector<double> &quantiles = cfg->print_percentiles.quantile_list;
+            const size_t kPctPerLine = 3;
+            size_t num_latency_lines = quantiles.empty() ? 1 : ((quantiles.size() + kPctPerLine - 1) / kPctPerLine);
+            std::vector<std::string> lat_chunks(num_latency_lines);
+            bool any_samples = (rtl_totals_hist != NULL && hdr_total_count(rtl_totals_hist) > 0);
+            bool cur_samples = inst_samples;
+            const std::vector<int64_t> *overall_values =
+                any_samples ? &overall_percentiles.calculate(rtl_totals_hist) : NULL;
+            for (std::size_t i = 0; i < quantiles.size(); i++) {
+                char cur_p[16], avg_p[16];
+                if (cur_samples) {
+                    double ms = inst_values[i] / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
+                    snprintf(cur_p, sizeof(cur_p), "%6.3f", ms);
+                } else {
+                    snprintf(cur_p, sizeof(cur_p), "   -  ");
+                }
+                if (any_samples) {
+                    double ms = (*overall_values)[i] / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
+                    snprintf(avg_p, sizeof(avg_p), "%6.3f", ms);
+                } else {
+                    snprintf(avg_p, sizeof(avg_p), "   -  ");
+                }
+                char entry[96];
+                snprintf(entry, sizeof(entry), "  p%.10g %s (avg: %s)", quantiles[i], cur_p, avg_p);
+                lat_chunks[i / kPctPerLine] += entry;
+            }
+            if (quantiles.empty()) lat_chunks[0] = "  (no samples this tick)";
+
+            size_t total_lines = 1 + num_latency_lines;
+            // The ms unit applies to every value on the latency lines (both cur
+            // and avg are in milliseconds), so we always append it to the last
+            // chunk — even when the last tick had no fresh samples.
+            bool show_ms = cur_samples || any_samples;
+            if (stderr_is_tty && !first_rtl_frame) {
+                // Move cursor up the number of lines we last emitted, then
+                // overwrite each with \033[K to wipe residue from a wider frame.
+                fprintf(stderr, "\033[%zuA\r", total_lines);
+                fprintf(stderr, "%s\033[K\n", line1);
+                for (size_t k = 0; k < num_latency_lines; k++) {
+                    const char *unit_suffix = (k + 1 == num_latency_lines && show_ms) ? " ms" : "";
+                    fprintf(stderr, "%s latency%s%s\033[K\n", tag, lat_chunks[k].c_str(), unit_suffix);
+                }
+            } else {
+                fprintf(stderr, "%s\n", line1);
+                for (size_t k = 0; k < num_latency_lines; k++) {
+                    const char *unit_suffix = (k + 1 == num_latency_lines && show_ms) ? " ms" : "";
+                    fprintf(stderr, "%s latency%s%s\n", tag, lat_chunks[k].c_str(), unit_suffix);
+                }
+            }
+            first_rtl_frame = false;
+        } else if (total_connection_errors > 0) {
+            // Only show connection errors if there are any (backwards compatible output)
+            fprintf(stderr,
+                    "[RUN #%u %.0f%%, %3u secs] %2u threads %2u conns %llu conn errors: %11llu ops, %7llu (avg: %7llu) "
+                    "ops/sec, %s/sec (avg: %s/sec), %5.2f (avg: %5.2f) msec latency",
+                    run_id, progress, (unsigned int) (duration / 1000000), active_threads, display_clients,
+                    total_connection_errors, total_ops, cur_ops_sec, ops_sec, cur_bytes_str, bytes_str, cur_latency,
+                    avg_latency);
+            if (cfg->retry_on_error) {
+                fprintf(stderr, "   errors %llu (+%llu)   retries %llu (+%llu)   retried_ops %llu", total_errors,
+                        total_errors - prev_errors, total_retry_attempts, total_retry_attempts - prev_retry_attempts,
+                        total_retried_ops);
+            }
+            fprintf(stderr, "\r");
+        } else if (cfg->retry_on_error && (total_errors > 0 || total_retry_attempts > 0)) {
+            // Quick path when only request-level errors / retries are non-zero.
+            fprintf(stderr,
+                    "[RUN #%u %.0f%%, %3u secs] %2u threads %2u conns: %11llu ops, %7llu (avg: %7llu) ops/sec, %s/sec "
+                    "(avg: %s/sec), %5.2f (avg: %5.2f) msec latency   errors %llu (+%llu)   retries %llu (+%llu)   "
+                    "retried_ops %llu\r",
+                    run_id, progress, (unsigned int) (duration / 1000000), active_threads, display_clients, total_ops,
+                    cur_ops_sec, ops_sec, cur_bytes_str, bytes_str, cur_latency, avg_latency, total_errors,
+                    total_errors - prev_errors, total_retry_attempts, total_retry_attempts - prev_retry_attempts,
+                    total_retried_ops);
+        } else {
+            fprintf(stderr,
+                    "[RUN #%u %.0f%%, %3u secs] %2u threads %2u conns: %11llu ops, %7llu (avg: %7llu) ops/sec, %s/sec "
+                    "(avg: %s/sec), %5.2f (avg: %5.2f) msec latency\r",
+                    run_id, progress, (unsigned int) (duration / 1000000), active_threads, display_clients, total_ops,
+                    cur_ops_sec, ops_sec, cur_bytes_str, bytes_str, cur_latency, avg_latency);
+        }
+
+        prev_hits = total_hits;
+        prev_misses = total_misses;
+        prev_aborts = total_aborts;
+        prev_errors = total_errors;
+        prev_retry_attempts = total_retry_attempts;
+
+        // One-producer-two-transports (PLAN section 3.6c, Decisions #37): build
+        // the metrics_snapshot once from the same loop locals both transports
+        // read, then hand it to each enabled transport. The StatsD path reads
+        // only `connections` + the statsd-only fields and stays byte-identical;
+        // the Prometheus path fills the cumulative counters via the monotonic
+        // accumulator and publishes its own gated tick histogram.
+        bool statsd_on = (cfg->statsd != NULL && cfg->statsd->is_enabled());
+        if (statsd_on || prom_enabled(cfg)) {
+            metrics_snapshot snap;
+            memset(&snap, 0, sizeof(snap));
+            snap.run_id = run_id;
+            snap.run_count = cfg->run_count;
+            snap.active_threads = active_threads;
+            snap.connections = display_clients * active_threads; // :3227 parity, uint32 product
+            snap.progress_pct = progress;
+            snap.cur_ops_sec = (long long) cur_ops_sec;
+            snap.avg_ops_sec = (long long) ops_sec;
+            snap.cur_bytes_sec = (long long) cur_bytes_sec;
+            snap.avg_bytes_sec = (long long) bytes_sec;
+            snap.cur_latency_ms = cur_latency;
+            snap.avg_latency_ms = avg_latency;
+            snap.run_connection_errors = total_connection_errors; // RAW per-run (Decisions #11)
+            // Drain the latency histograms BEFORE reading the op counters: a
+            // second is folded (under the drain's mutex) only after its ops
+            // were counted, so memtier_latency_seconds_count never exceeds
+            // memtier_ops_total, even when a thread finishes or a connection
+            // rolls its second between the two reads.
+            hdr_histogram *prom_latency = prom_enabled(cfg) ? prom_drain_latency(cfg, threads, false) : NULL;
+            if (prom_enabled(cfg)) prom_observe_and_fill(cfg, threads, snap);
+            if (statsd_on) statsd_publish_tick(cfg->statsd, snap, inst_samples, live_quantiles, inst_values);
+            if (prom_enabled(cfg)) prom_publish_tick(cfg, snap, prom_latency); // PLAN 3.7
+        }
+
+        // Per-second CPU sampling (advisory).
+        cpu_sampler.tick(threads, cpu_history);
+
+        if (inst_hist_agg != NULL) hdr_close(inst_hist_agg);
     } while (active_threads > 0);
+
+    if (rtl_totals_hist != NULL) hdr_close(rtl_totals_hist);
+
+    // Send "run completed" annotation and zero out gauges so graphs drop to 0
+    if (cfg->statsd != NULL && cfg->statsd->is_enabled()) {
+        char event_data[64];
+        snprintf(event_data, sizeof(event_data) - 1, "run=%u", run_id);
+        cfg->statsd->event("Benchmark Completed", event_data, "memtier,end");
+
+        // Zero out gauges so the graph shows the run has ended
+        cfg->statsd->gauge("ops_sec", (long long) 0);
+        cfg->statsd->gauge("ops_sec_avg", (long long) 0);
+        cfg->statsd->gauge("bytes_sec", (long long) 0);
+        cfg->statsd->gauge("bytes_sec_avg", (long long) 0);
+        cfg->statsd->gauge("progress_pct", (long long) 0);
+    }
 
     fprintf(stderr, "\n\n");
 
     // join all threads back and unify stats
-    run_stats stats;
-    for (std::vector<cg_thread*>::iterator i = threads.begin(); i != threads.end(); i++) {
+    run_stats stats(cfg);
+
+    unsigned int failed_threads = 0;
+    unsigned int merge_iteration = 1;
+    for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
         (*i)->join();
-        (*i)->m_cg->merge_run_stats(&stats);
+        // After interrupt() (Ctrl+C, connection-stage abort): end the clients
+        // that were still running at the interrupt time. Done here, not in
+        // interrupt(), because the worker records into the same run_stats.
+        (*i)->m_cg->finalize_interrupted_clients();
+        if ((*i)->m_failed) failed_threads++;
+        (*i)->m_cg->merge_run_stats(&stats, merge_iteration);
+    }
+
+    // A failed worker stopped before the run's stop condition, so this run
+    // did not measure the requested window: its clients' durations differ from
+    // the others', and the merged duration and rates mix them. Say so, and fail
+    // the invocation (main() exits 1) rather than pass the numbers off as a
+    // normal result. --reconnect-on-error makes dropped connections part of
+    // the workload instead.
+    if (failed_threads > 0) {
+        fprintf(stderr,
+                "error: [RUN #%u] %u of %u thread(s) ended before the requested %s was reached (see errors "
+                "above); the results of this run are not valid.\n",
+                run_id, failed_threads, (unsigned int) threads.size(),
+                cfg->requests > 0 ? "request count" : "test time");
+        g_worker_failed = true;
+    }
+
+    // -----------------------------------------------------------------
+    // CPU utilization aggregate (memtier's own usage).
+    //
+    // Fold each worker's authoritative getrusage(RUSAGE_THREAD) totals (captured
+    // inside the worker) into the run_stats. Each worker's cores_used divides
+    // its CPU by ITS OWN wall bracket (captured at the same points as the CPU
+    // snapshots), so there is no setup-vs-serving skew. The whole-process
+    // aggregate divides total CPU (all workers + the main thread) by the longest summed active-serving wall time
+    // across workers, so the aggregate and per-thread figures stay consistent:
+    // the denominator is the window during which work actually happened, not the
+    // main thread's launch->join span which also covers idle teardown. Done
+    // here, post-join, so reads are race-free.
+    // -----------------------------------------------------------------
+    {
+        cpu_summary csum;
+        double worker_total_seconds = 0.0; // workers only, for the saturation %
+        double max_worker_wall = 0.0;
+        for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
+            cg_thread *t = *i;
+            per_thread_cpu_total pt;
+            pt.thread_id = t->m_thread_id;
+            pt.valid = t->m_cpu_valid;
+            pt.user_seconds = (double) t->m_cpu_user_usec_acc / 1e6;
+            pt.sys_seconds = (double) t->m_cpu_sys_usec_acc / 1e6;
+            pt.total_seconds = pt.user_seconds + pt.sys_seconds;
+            pt.wall_seconds = (double) t->m_wall_usec_acc / 1e6;
+            pt.cores_used = (pt.wall_seconds > 0.0) ? pt.total_seconds / pt.wall_seconds : 0.0;
+            stats.add_cpu_thread(pt);
+
+            if (pt.valid && pt.wall_seconds > 0.0) {
+                csum.user_seconds += pt.user_seconds;
+                csum.sys_seconds += pt.sys_seconds;
+                worker_total_seconds += pt.total_seconds;
+                csum.threads_counted++;
+                if (pt.wall_seconds > max_worker_wall) max_worker_wall = pt.wall_seconds;
+            }
+        }
+
+        // Add the main thread's own CPU (orchestrator/sampler overhead) to the
+        // whole-process totals, measured over the matching launch->here interval.
+#if defined(RUSAGE_THREAD)
+        if (main_cpu_valid) {
+            struct rusage main_end_ru;
+            if (getrusage(RUSAGE_THREAD, &main_end_ru) == 0) {
+                csum.user_seconds += (double) ts_diff(main_cpu_start_ru.ru_utime, main_end_ru.ru_utime) / 1e6;
+                csum.sys_seconds += (double) ts_diff(main_cpu_start_ru.ru_stime, main_end_ru.ru_stime) / 1e6;
+            }
+        }
+#endif
+
+        csum.total_seconds = csum.user_seconds + csum.sys_seconds;
+        csum.worker_total_seconds = worker_total_seconds;
+        csum.wall_seconds = max_worker_wall;
+        csum.peak_utilization_pct = cpu_sampler.peak_pct;
+        if (csum.threads_counted > 0 && csum.wall_seconds > 0.0) {
+            csum.cores_used = csum.total_seconds / csum.wall_seconds;
+            // Saturation % is based on WORKER cores only (main thread excluded),
+            // so a value near 100% means the worker threads are saturated and
+            // cannot exceed 100% from main-thread overhead alone.
+            csum.avg_utilization_pct = 100.0 * (worker_total_seconds / csum.wall_seconds) / csum.threads_counted;
+            csum.valid = true;
+        }
+        stats.set_cpu_summary(csum);
+        stats.set_cpu_stats(std::move(cpu_history));
+    }
+
+    // -----------------------------------------------------------------
+    // Read-preference observability snapshot.
+    //
+    // After threads have joined but before the worker structures are torn
+    // down, walk every client_group -> client -> shard_connection so the
+    // run_stats holds the per-endpoint EWMA + routed_ops + role + the
+    // per-command routing counters (cluster_client only). Once
+    // run_benchmark returns the worker pointers are gone, so this is the
+    // last chance to capture the state.
+    // -----------------------------------------------------------------
+    bool cluster_topology_captured = false;
+    for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
+        client_group *cg = (*i)->m_cg;
+        std::vector<client *> &clients = cg->get_clients();
+        for (size_t ci = 0; ci < clients.size(); ++ci) {
+            client *c = clients[ci];
+            if (c == NULL) continue;
+            const std::vector<shard_connection *> &conns = c->get_connections();
+            for (size_t k = 0; k < conns.size(); ++k) {
+                shard_connection *sc = conns[k];
+                if (sc == NULL) continue;
+                endpoint_snapshot snap;
+                {
+                    const char *addr = sc->get_address();
+                    const char *port = sc->get_port();
+                    char buf[256];
+                    snprintf(buf, sizeof(buf), "%s:%s", addr ? addr : "?", port ? port : "?");
+                    snap.addr = buf;
+                }
+                snap.role = sc->is_replica() ? "replica" : "primary";
+                snap.conn_id = (int) sc->get_id();
+                snap.routed_ops = sc->get_routed_ops();
+                snap.avg_latency_us = sc->get_latency_ewma_us();
+                snap.latency_samples = sc->get_latency_samples();
+                stats.absorb_endpoint(snap);
+            }
+            // Per-command Read-Routing counters live on cluster_client.
+            cluster_client *cc = dynamic_cast<cluster_client *>(c);
+            if (cc != NULL) {
+                // Capture the discovered topology once (identical across clients)
+                // from the same snapshot the startup line uses, so the results
+                // summary's endpoint/connection counts agree with it and exclude
+                // the bootstrap seed connection / dead sockets.
+                if (!cluster_topology_captured) {
+                    std::vector<cluster_endpoint_info> eps = cc->build_topology_snapshot();
+                    if (!eps.empty()) {
+                        size_t prim = 0, rep = 0;
+                        for (size_t e = 0; e < eps.size(); ++e) {
+                            if (eps[e].is_primary)
+                                prim++;
+                            else
+                                rep++;
+                        }
+                        stats.set_cluster_topology(eps.size(), prim, rep);
+                        cluster_topology_captured = true;
+                    }
+                }
+                const std::vector<cluster_client::read_routing_counters> &arr = cc->get_arbitrary_routing_counters();
+                for (size_t ai = 0; ai < arr.size(); ++ai) {
+                    stats.absorb_arbitrary_routing(ai, arr[ai].ops_from_primary, arr[ai].ops_from_replica);
+                }
+                const cluster_client::read_routing_counters &g = cc->get_get_routing_counters();
+                stats.absorb_builtin_get_routing(g.ops_from_primary, g.ops_from_replica);
+            }
+        }
+    }
+
+    // Prometheus post-join reconcile + run-end publish (PLAN section 3.6e):
+    // fold every thread's exact post-join totals into the accumulator basis
+    // (race-free; m_cg is still alive here, before the deletion loop below),
+    // then publish the run-end snapshot. This guarantees the run-end publish
+    // happens before teardown and the cumulative counters reflect the final,
+    // exact per-thread totals (never summarize() — rx/tx double-count trap).
+    if (prom_enabled(cfg)) {
+        for (size_t t = 0; t < threads.size(); t++) {
+            prom_fold_thread(cfg, t, threads[t]->m_cg);
+        }
+        prom_publish_run_end(cfg, run_id, threads);
     }
 
     // Do we need to produce client stats?
     if (cfg->client_stats != NULL) {
         unsigned int cg_id = 0;
+        unsigned int failures = 0;
         fprintf(stderr, "[RUN %u] Writing client stats files...\n", run_id);
-        for (std::vector<cg_thread*>::iterator i = threads.begin(); i != threads.end(); i++) {
+        for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
             char prefix[PATH_MAX];
 
-            snprintf(prefix, sizeof(prefix)-1, "%s-%u-%u", cfg->client_stats, run_id, cg_id++);
-            (*i)->m_cg->write_client_stats(prefix);
+            snprintf(prefix, sizeof(prefix) - 1, "%s-%u-%u", cfg->client_stats, run_id, cg_id++);
+            (*i)->m_cg->write_client_stats(prefix, &failures);
+        }
+        if (failures > 0) {
+            if (failures > 1)
+                fprintf(stderr, "error: %u more --client-stats files could not be written\n", failures - 1);
+            g_output_failed = true;
         }
     }
 
     // clean up all client_groups.  the main value of this is to be able to
     // properly look for leaks...
     while (threads.size() > 0) {
-        cg_thread* t = *threads.begin();
+        cg_thread *t = *threads.begin();
         threads.erase(threads.begin());
         delete t;
     }
-    
+
+    g_threads = NULL; // Clear global pointer
+
+    delete cfg->mget_cache;
+    cfg->mget_cache = NULL;
+
     return stats;
 }
 
+#ifdef USE_TLS
+
+// On OpenSSL 4.0+ the per-version SSL_OP_NO_TLSv1_x disable constants are
+// removed, so the gap-mask blocks in ssl_ctx_init compile to nothing.  A
+// non-contiguous --tls-protocols selection (e.g. tlsv1,tlsv1.2) would
+// silently enable the intermediate version inside the envelope range.
+// bitmask_is_contiguous() is used by the parser to fail fast in that case.
+#if OPENSSL_VERSION_NUMBER >= 0x40000000L
+// Returns true if the set bits in 'mask' form a contiguous run with no zero
+// gaps between the lowest and highest set bits.  A single set bit, or zero,
+// is trivially contiguous.
+// Examples (4-bit TLS protocol mask):
+//   0x4 (TLSv1.2 only)         -> contiguous
+//   0x6 (TLSv1.1 | TLSv1.2)   -> contiguous
+//   0x5 (TLSv1.0 | TLSv1.2)   -> NOT contiguous (TLSv1.1 gap)
+static bool bitmask_is_contiguous(unsigned int mask)
+{
+    if (mask == 0) return true;
+    // Fill every bit from the lowest set bit up to (and including) the highest
+    // set bit.  If the result equals the original mask the bits are contiguous.
+    unsigned int lowest = mask & (-mask);                    // isolate lowest set bit
+    unsigned int highest = 1u << (31 - __builtin_clz(mask)); // isolate highest
+    // Build fill: highest*2 - 1 clears everything above highest;
+    // subtracting lowest-1 clears everything below lowest.
+    unsigned int fill = (highest * 2 - 1) & ~(lowest - 1);
+    return mask == fill;
+}
+#endif /* OPENSSL_VERSION_NUMBER >= 0x40000000L */
+
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+// OpenSSL < 1.1.0 requires the application to register its own locking
+// callbacks for thread safety. Since 1.1.0 the library handles its own
+// internal locking and these APIs are no-ops; they are slated for removal
+// in OpenSSL 4.0 (see issue #387).
+static pthread_mutex_t *__openssl_locks;
+
+static void __openssl_locking_callback(int mode, int type, const char *file, int line)
+{
+    if (mode & CRYPTO_LOCK) {
+        pthread_mutex_lock(&(__openssl_locks[type]));
+    } else {
+        pthread_mutex_unlock(&(__openssl_locks[type]));
+    }
+}
+
+static unsigned long __openssl_thread_id(void)
+{
+    unsigned long id;
+
+    id = (unsigned long) pthread_self();
+    return id;
+}
+
+static void init_openssl_threads(void)
+{
+    int i;
+
+    __openssl_locks = (pthread_mutex_t *) malloc(CRYPTO_num_locks() * sizeof(pthread_mutex_t));
+    assert(__openssl_locks != NULL);
+
+    for (i = 0; i < CRYPTO_num_locks(); i++) {
+        pthread_mutex_init(&(__openssl_locks[i]), NULL);
+    }
+
+    CRYPTO_set_id_callback(__openssl_thread_id);
+    CRYPTO_set_locking_callback(__openssl_locking_callback);
+}
+
+static void cleanup_openssl_threads(void)
+{
+    int i;
+
+    CRYPTO_set_locking_callback(NULL);
+    for (i = 0; i < CRYPTO_num_locks(); i++) {
+        pthread_mutex_destroy(&(__openssl_locks[i]));
+    }
+    OPENSSL_free(__openssl_locks);
+}
+#endif
+
+static void init_openssl(void)
+{
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    SSL_library_init();
+    SSL_load_error_strings();
+#endif
+    if (!RAND_poll()) {
+        fprintf(stderr, "Failed to initialize OpenSSL random entropy.\n");
+        exit(1);
+    }
+
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    OPENSSL_config(NULL);
+    init_openssl_threads();
+#else
+    OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CONFIG, NULL);
+#endif
+}
+
+static void cleanup_openssl(void)
+{
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    cleanup_openssl_threads();
+#endif
+}
+
+#endif
+
+// --hdr-file-prefix and --client-stats files are only created when a run
+// ends. Check at startup that the directory they go into is a writable
+// directory (without creating anything), so a typo does not cost a whole run.
+// This is best-effort: access() uses the real UID, so as root or on an NFS
+// root_squash mount an unwritable directory can pass, and a full disk is only
+// seen at the end anyway. Exits 1 on failure.
+static void check_output_prefix_dir(const char *option, const char *prefix)
+{
+    std::string dir(prefix);
+    size_t slash = dir.rfind('/');
+    dir = slash == std::string::npos ? "." : (slash == 0 ? "/" : dir.substr(0, slash));
+    struct stat st;
+    int err = 0;
+    if (stat(dir.c_str(), &st) != 0) {
+        err = errno;
+    } else if (!S_ISDIR(st.st_mode)) {
+        err = ENOTDIR;
+    } else if (access(dir.c_str(), W_OK | X_OK) != 0) {
+        err = errno;
+    }
+    if (err != 0) {
+        fprintf(stderr, "error: cannot write %s directory %s: %s\n", option, dir.c_str(), strerror(err));
+        exit(1);
+    }
+}
+
+// Make sure fds 0, 1 and 2 are open before anything else opens a file.
+// If one of them was closed when memtier was started (e.g. `memtier >&-`),
+// the next open() gets that fd: --json-out-file or --out-file would become
+// fd 1 (or 2), and the text results (or the stderr log lines) would be
+// written into it. Reopen each closed fd on /dev/null instead, which keeps
+// the numbering safe. Returns a mask with bit (1 << fd) set for each fd that
+// was closed.
+static unsigned int reopen_closed_std_fds(void)
+{
+    unsigned int closed_mask = 0;
+    for (int fd = STDIN_FILENO; fd <= STDERR_FILENO; fd++) {
+        if (fcntl(fd, F_GETFD) != -1 || errno != EBADF) continue;
+        // open() returns the lowest free fd, which is this one, since the
+        // lower ones are open by now.
+        int nfd;
+        do {
+            nfd = open("/dev/null", O_RDWR);
+        } while (nfd < 0 && errno == EINTR);
+        if (nfd != fd) {
+            int err = nfd < 0 ? errno : EBADF;
+            // Report it only if stderr is open (it may be the closed fd).
+            if (fcntl(STDERR_FILENO, F_GETFD) != -1)
+                fprintf(stderr, "error: fd %d is closed and cannot be reopened on /dev/null: %s\n", fd, strerror(err));
+            exit(1);
+        }
+        closed_mask |= 1u << fd;
+    }
+    return closed_mask;
+}
+
+static const char *std_fd_name(int fd)
+{
+    return fd == STDIN_FILENO ? "stdin" : (fd == STDOUT_FILENO ? "stdout" : "stderr");
+}
+
+// True if path is exactly task_prefix + "<tid>" + fd_suffix, with <tid> all
+// digits: e.g. "/proc/123/task/" + "124" + "/fd/1", which /proc/thread-self/fd/1
+// resolves to.
+static bool is_task_fd_path(const std::string &path, const std::string &task_prefix, const std::string &fd_suffix)
+{
+    if (path.compare(0, task_prefix.size(), task_prefix) != 0) return false;
+    std::string rest = path.substr(task_prefix.size()); // "<tid>/fd/N"
+    size_t slash = rest.find('/');
+    if (slash == 0 || slash == std::string::npos || rest.substr(slash) != fd_suffix) return false;
+    for (size_t i = 0; i < slash; i++) {
+        if (!isdigit((unsigned char) rest[i])) return false;
+    }
+    return true;
+}
+
+// With fd 0-2 closed at startup and reopened on /dev/null, an output path
+// that goes through that fd (/dev/stdout, /dev/fd/1, /proc/self/fd/1, or a
+// symlink to one of them; likewise for stdin and stderr) now resolves to
+// /dev/null, and what is written there would be thrown away. Comparing
+// inodes cannot tell such a path from an explicit /dev/null (which is the
+// user's choice and must keep working), so follow the path one symlink at a
+// time and check whether it names this process's fd.
+static bool path_is_closed_fd(const char *path, int fd)
+{
+    char buf[64];
+    snprintf(buf, sizeof(buf), "/dev/%s", std_fd_name(fd));
+    const std::string dev_name(buf);
+    snprintf(buf, sizeof(buf), "/dev/fd/%d", fd);
+    const std::string dev_fd(buf);
+    snprintf(buf, sizeof(buf), "/fd/%d", fd);
+    const std::string fd_suffix(buf);
+    // /proc/self and /proc/thread-self resolve to /proc/<pid> and
+    // /proc/<pid>/task/<tid>. Another process's fd (e.g. /proc/1/fd/1 in a
+    // container) is a different file and is not matched.
+    snprintf(buf, sizeof(buf), "/proc/%d", (int) getpid());
+    const std::string own_proc(buf);
+    const std::string own_task = own_proc + "/task/";
+
+    std::string p(path);
+    for (int depth = 0; depth < 40; depth++) {
+        // Resolve the directory part only, so the last component is kept.
+        size_t slash = p.rfind('/');
+        std::string dir = slash == std::string::npos ? "." : (slash == 0 ? "/" : p.substr(0, slash));
+        std::string base = slash == std::string::npos ? p : p.substr(slash + 1);
+        // If realpath() or readlink() below fails for another reason
+        // (ENOENT, EACCES, ...), the path is treated as not naming a closed
+        // fd on purpose: the later open() then reports the real error.
+        char *rdir = realpath(dir.c_str(), NULL);
+        if (rdir == NULL) return false;
+        std::string resolved_dir(rdir);
+        free(rdir);
+        std::string full = (resolved_dir == "/" ? "" : resolved_dir) + "/" + base;
+
+        // /dev/stdout and /dev/fd/N are device nodes on macOS; on Linux
+        // /dev/fd resolves to /proc/<pid>/fd.
+        if (full == dev_name || full == dev_fd || full == own_proc + fd_suffix) return true;
+        if (is_task_fd_path(full, own_task, fd_suffix)) return true;
+
+        char target[PATH_MAX];
+        ssize_t n = readlink(full.c_str(), target, sizeof(target) - 1);
+        if (n < 0) return false; // not a symlink (EINVAL), or see above
+        target[n] = '\0';
+        p = target[0] == '/' ? std::string(target) : resolved_dir + "/" + target;
+    }
+    return false;
+}
 
 int main(int argc, char *argv[])
 {
-    struct benchmark_config cfg;
+    // Must run first, before any file or socket is opened.
+    unsigned int closed_std_fds = reopen_closed_std_fds();
 
-    memset(&cfg, 0, sizeof(struct benchmark_config));
+    // Enable libevent's pthreads bindings so event_base_loopbreak() /
+    // event_base_loopexit() called from the main thread reliably wake a
+    // worker thread that is blocked in epoll_wait() with no live events.
+    // Without this, an idle event base never notices a cross-thread break
+    // request and the parent's pthread_join() hangs after a
+    // --connection-stage-timeout abort (Phase 1 of #426) or a Ctrl+C.
+    // Must run before any event_base is created so the locking callbacks
+    // are installed for every subsequent base.
+    if (evthread_use_pthreads() < 0) {
+        fprintf(stderr, "warning: evthread_use_pthreads() failed; cross-thread loop wakeups may stall.\n");
+    }
+
+    // Install signal handler for Ctrl+C. SIGTERM (kill, timeout, docker stop,
+    // CI runners) takes the same graceful path, so results are printed and
+    // --json-out-file is closed as valid JSON instead of left truncated.
+    signal(SIGINT, sigint_handler);
+    signal(SIGTERM, sigint_handler);
+
+    // Ignore SIGPIPE so a peer-initiated TCP/TLS close mid-write returns
+    // EPIPE from send()/SSL_write() instead of killing the process. Without
+    // this, a single half-closed socket among hundreds can tear down the
+    // entire run with exit 141 before --reconnect-on-error / --retry-on-error
+    // get a chance to handle EPIPE. libevent's bufferevent uses MSG_NOSIGNAL
+    // on plain-TCP send(), but TLS writes via OpenSSL's SSL_write() do not
+    // (and ARM Linux ignores MSG_NOSIGNAL on writev in some configurations),
+    // so a process-wide SIG_IGN is the robust fix. See PERF-501 / GH #382.
+    signal(SIGPIPE, SIG_IGN);
+
+    // Install crash handlers for debugging
+    setup_crash_handlers();
+
+    // Enable core dumps
+    struct rlimit core_limit;
+    core_limit.rlim_cur = RLIM_INFINITY;
+    core_limit.rlim_max = RLIM_INFINITY;
+    if (setrlimit(RLIMIT_CORE, &core_limit) != 0) {
+        fprintf(stderr, "warning: failed to set core dump limit: %s\n", strerror(errno));
+        fprintf(stderr, "warning: core dumps may not be generated on crash\n");
+    }
+
+    // Keep URI storage alive for cfg and its workers; neither string changes after parsing.
+    std::string uri_authenticate;
+    std::string uri_server;
+    bool uri_password_only = false;
+    benchmark_config cfg = benchmark_config();
+    cfg.arbitrary_commands = new arbitrary_command_list();
+    cfg.monitor_commands = new monitor_command_list();
+    cfg.command_stats_by_type = true; // Default: aggregate by command type
+    // Retry default: -1 = unlimited (only consulted when --retry-on-error is set).
+    // 0 must remain a valid user-specified "disabled" value, so initialize the
+    // sentinel before parsing args.
+    cfg.max_retries = -1;
+    cfg.miss_rate_threshold = -1.0;   // sentinel; config_init_defaults replaces with 0.01
+    cfg.cpu_warn_threshold = -1.0;    // sentinel; config_init_defaults replaces with 0.95
+    cfg.command_miss_tracking = true; // Default: auto-track misses for known shapes
+    // Sentinel for --connection-stage-timeout: UINT_MAX means "operator did
+    // not specify"; config_init_defaults replaces with 30 s. We can't reuse 0
+    // as the unset marker because 0 is a valid user-specified "disable the
+    // supervisor entirely" value.
+    cfg.connection_stage_timeout = UINT_MAX;
+#ifdef HAVE_EVHTTP
+    // Prometheus port sentinel: -1 = flag absent (exporter disabled). 0 is a
+    // valid user value (ephemeral port), so it cannot be the unset marker.
+    cfg.prometheus_port = -1;
+#endif
+    cfg.prometheus = NULL;
+
     if (config_parse_args(argc, argv, &cfg) < 0) {
         usage();
     }
 
+    // An fd 0-2 was closed at startup and reopened on /dev/null (see
+    // reopen_closed_std_fds()). A path option that names that fd would now
+    // silently use /dev/null: an output file would be thrown away and an
+    // input file would read as empty. Fail right after option parsing,
+    // before any of these files is opened or read and before connecting.
+    if (closed_std_fds != 0) {
+        const struct
+        {
+            const char *opt;
+            const char *path;
+        } path_opts[] = {
+            {"--out-file", cfg.out_file},
+            {"--json-out-file", cfg.json_out_file},
+            {"--failed-keys-file", cfg.failed_keys_file},
+            {"--data-import", cfg.data_import},
+            {"--monitor-input", cfg.monitor_input},
+#ifdef USE_TLS
+            {"--cert", cfg.tls_cert},
+            {"--key", cfg.tls_key},
+            {"--cacert", cfg.tls_cacert},
+#endif
+        };
+        for (size_t i = 0; i < sizeof(path_opts) / sizeof(path_opts[0]); i++) {
+            for (int fd = STDIN_FILENO; path_opts[i].path != NULL && fd <= STDERR_FILENO; fd++) {
+                if ((closed_std_fds & (1u << fd)) && path_is_closed_fd(path_opts[i].path, fd)) {
+                    fprintf(stderr, "error: %s %s resolves to %s, which was closed at startup\n", path_opts[i].opt,
+                            path_opts[i].path, std_fd_name(fd));
+                    exit(1);
+                }
+            }
+        }
+    }
+
+    // Load monitor input file if specified
+    if (cfg.monitor_input) {
+        // Monitor input only works with Redis protocols
+        if (!is_redis_protocol(cfg.protocol)) {
+            fprintf(stderr, "error: --monitor-input is only supported with Redis protocols (redis, resp2, resp3).\n");
+            exit(1);
+        }
+
+        if (!cfg.monitor_commands->load_from_file(cfg.monitor_input)) {
+            exit(1);
+        }
+
+        if (cfg.arbitrary_commands->size() == 0) {
+            fprintf(stderr, "warning: --monitor-input specified but no --command was given; "
+                            "the monitor file will be ignored and a standard SET/GET benchmark will run.\n");
+        }
+
+        // Expand monitor placeholders in commands
+        for (unsigned int i = 0; i < cfg.arbitrary_commands->size(); i++) {
+            arbitrary_command &cmd = cfg.arbitrary_commands->at(i);
+
+            // Check if command is a random monitor placeholder
+            if (strcmp(cmd.command.c_str(), MONITOR_RANDOM_PLACEHOLDER) == 0) {
+                // Get unique command types from the monitor file
+                std::vector<std::string> unique_types = cfg.monitor_commands->get_unique_command_types();
+
+                if (unique_types.empty()) {
+                    fprintf(stderr, "error: no valid commands found in monitor input file\n");
+                    exit(1);
+                }
+
+                // The current command index is where we'll add the stats slots
+                // Add new arbitrary_command entries for each unique command type
+                size_t base_stats_index = cfg.arbitrary_commands->size();
+
+                for (const auto &cmd_type : unique_types) {
+                    // Create a placeholder command for stats tracking
+                    std::string placeholder = "MONITOR_" + cmd_type;
+                    arbitrary_command stats_cmd(placeholder.c_str());
+                    stats_cmd.command_name = cmd_type;
+                    stats_cmd.command_type = cmd_type;
+                    // Mark it as a stats-only slot (no actual command to send)
+                    stats_cmd.command_args.clear();
+                    stats_cmd.stats_only = true;
+                    // resolve_command_meta() returns early for empty argv, so look up
+                    // spec directly and stamp miss_tracking_enabled so runtime hit/miss
+                    // accounting actually fires for this slot.
+                    {
+                        using memtier::command_meta::ReplyShape;
+                        const memtier::command_meta::CommandSpec *cmd_spec =
+                            memtier::command_meta::lookup(cmd_type.c_str());
+                        stats_cmd.spec = cmd_spec;
+                        if (cmd_spec != nullptr) {
+                            switch (cmd_spec->reply_shape) {
+                            case ReplyShape::SingleNullBulk:
+                            case ReplyShape::ArrayPerElementNulls:
+                            case ReplyShape::EmptyCollection:
+                            case ReplyShape::IntegerMembership:
+                                stats_cmd.miss_tracking_enabled = true;
+                                break;
+                            default:
+                                stats_cmd.miss_tracking_enabled = false;
+                                break;
+                            }
+                        }
+                    }
+                    cfg.arbitrary_commands->add_command(stats_cmd);
+                }
+
+                // Set up the stats index mapping in monitor_command_list
+                cfg.monitor_commands->setup_stats_indices(base_stats_index);
+
+                // Re-get the reference since vector may have reallocated
+                arbitrary_command &placeholder_cmd = cfg.arbitrary_commands->at(i);
+
+                // Mark this command as random monitor type - will be expanded at runtime
+                placeholder_cmd.command_args.clear();
+                command_arg arg(MONITOR_RANDOM_PLACEHOLDER, strlen(MONITOR_RANDOM_PLACEHOLDER));
+                arg.type = monitor_random_type;
+                arg.monitor_index = 0; // 0 means random
+                placeholder_cmd.command_args.push_back(arg);
+                placeholder_cmd.command_name = "MONITOR_RANDOM";
+                placeholder_cmd.command_type = "MONITOR_RANDOM";
+                continue;
+            }
+
+            // Check if command is a specific monitor placeholder
+            // Expected format: __monitor_lineN__ where N is a 1-based index
+            const size_t prefix_len = sizeof(MONITOR_PLACEHOLDER_PREFIX) - 1; // compile-time constant
+            const size_t suffix_len = 2;                                      // "__"
+            size_t cmd_len = cmd.command.length();
+
+            // Check if command starts with monitor prefix
+            if (cmd_len >= prefix_len && strncmp(cmd.command.c_str(), MONITOR_PLACEHOLDER_PREFIX, prefix_len) == 0) {
+                // Validate full format: must end with __, have digits between prefix and suffix
+                bool valid = false;
+                long index = 0;
+
+                if (cmd_len > prefix_len + suffix_len && cmd.command[cmd_len - 2] == '_' &&
+                    cmd.command[cmd_len - 1] == '_') {
+                    // Extract the index from __monitor_lineN__
+                    const char *num_start = cmd.command.c_str() + prefix_len;
+                    char *endptr;
+                    index = strtol(num_start, &endptr, 10);
+
+                    // Valid if: consumed at least one digit, ends exactly at "__", index in range
+                    if (endptr != num_start && endptr == cmd.command.c_str() + cmd_len - suffix_len && index >= 1 &&
+                        (size_t) index <= cfg.monitor_commands->size()) {
+                        valid = true;
+                    }
+                }
+
+                if (!valid) {
+                    fprintf(stderr,
+                            "error: invalid monitor placeholder '%s' (valid range: __monitor_line1__ to "
+                            "__monitor_line%zu__ or __monitor_line@__)\n",
+                            cmd.command.c_str(), cfg.monitor_commands->size());
+                    exit(1);
+                }
+
+                // Replace command with the one from monitor file (0-based index)
+                const std::string &monitor_cmd = cfg.monitor_commands->get_command(index - 1);
+                cmd.command = monitor_cmd;
+                cmd.command_args.clear();
+
+                // Re-parse the command
+                if (!cmd.split_command_to_args()) {
+                    fprintf(stderr, "error: failed to parse monitor command: %s\n", monitor_cmd.c_str());
+                    exit(1);
+                }
+
+                // Update command name (first word of the command)
+                size_t pos = cmd.command.find(" ");
+                if (pos == std::string::npos) {
+                    pos = cmd.command.size();
+                }
+                cmd.command_name.assign(cmd.command.c_str(), pos);
+                // Remove quotes if present
+                if (cmd.command_name.length() > 0 && cmd.command_name[0] == '"') {
+                    cmd.command_name = cmd.command_name.substr(1);
+                }
+                if (cmd.command_name.length() > 0 && cmd.command_name[cmd.command_name.length() - 1] == '"') {
+                    cmd.command_name = cmd.command_name.substr(0, cmd.command_name.length() - 1);
+                }
+                std::transform(cmd.command_name.begin(), cmd.command_name.end(), cmd.command_name.begin(),
+                               [](unsigned char c) { return static_cast<char>(toupper(c)); });
+                // Set command_type for aggregation (base command without line number)
+                cmd.command_type = cmd.command_name;
+                // Append line number to display name for --command-stats-breakdown=line mode
+                cmd.command_name += " (Line " + std::to_string(index) + ")";
+                // Monitor-expanded command: resolve key positions / reply shape from
+                // the static command_meta registry. Skipped silently if memcached
+                // or unknown command.
+                cmd.resolve_command_meta();
+            }
+        }
+    }
+
+    // Apply the --command-miss-tracking=off override across the resolved command
+    // list. resolve_command_meta() defaults miss_tracking to on for known shapes;
+    // the explicit "off" CLI value clears it everywhere.
+    if (!cfg.command_miss_tracking) {
+        for (unsigned int i = 0; i < cfg.arbitrary_commands->size(); i++) {
+            cfg.arbitrary_commands->at(i).miss_tracking_enabled = false;
+        }
+    }
+
+    // Log resolved command metadata once per unique command type. Gated behind
+    // --debug to avoid startup noise in normal runs.
+    if (cfg.debug && cfg.arbitrary_commands->size() > 0) {
+        std::set<std::string> logged_types;
+        for (size_t i = 0; i < cfg.arbitrary_commands->size(); i++) {
+            const arbitrary_command &cmd = cfg.arbitrary_commands->at(i);
+            if (cmd.command_type == "MONITOR_RANDOM") continue;
+            if (!logged_types.insert(cmd.command_type).second) continue;
+            // stats-only slots (created for __monitor_line@__ expansion) don't go through
+            // resolve_command_meta(), so look up the spec directly from the command type.
+            const memtier::command_meta::CommandSpec *spec =
+                cmd.spec != nullptr ? cmd.spec : memtier::command_meta::lookup(cmd.command_type.c_str());
+            bool miss_tracking = cmd.miss_tracking_enabled;
+            if (cmd.stats_only && spec != nullptr) {
+                using memtier::command_meta::ReplyShape;
+                miss_tracking = cfg.command_miss_tracking && (spec->reply_shape == ReplyShape::SingleNullBulk ||
+                                                              spec->reply_shape == ReplyShape::ArrayPerElementNulls ||
+                                                              spec->reply_shape == ReplyShape::EmptyCollection ||
+                                                              spec->reply_shape == ReplyShape::IntegerMembership);
+            }
+            if (spec != nullptr) {
+                fprintf(stderr, "Command meta: %s reply_shape=%s key_specs=%u miss_tracking=%s\n",
+                        cmd.command_type.c_str(), memtier::command_meta::reply_shape_name(spec->reply_shape),
+                        spec->num_key_specs, miss_tracking ? "enabled" : "disabled");
+            } else {
+                fprintf(stderr, "Command meta: %s not found in static table, miss_tracking=disabled\n",
+                        cmd.command_type.c_str());
+            }
+        }
+    }
+
+    // Process URI if provided
+    if (cfg.uri) {
+        if (parse_uri(cfg.uri, &cfg, uri_authenticate, uri_server, uri_password_only) < 0) {
+            exit(1);
+        }
+
+        // Validate cluster mode constraints
+        if (cfg.cluster_mode && cfg.select_db > 0) {
+            fprintf(
+                stderr,
+                "error: database selection not supported in cluster mode. Redis Cluster only supports database 0.\n");
+            exit(1);
+        }
+    }
+
     config_init_defaults(&cfg);
+
+    // Reject Gaussian (G) key-pattern over a degenerate range. The sampler
+    // (gaussian_noise::gaussian_distribution_range) handles `min == max` by
+    // returning `min` directly, but the deeper hazard is the auto-computed
+    // median when `(max - min) < 2`:
+    //   median = (max - min) / 2.0 + min + 0.5
+    // For (min=1, max=2): median = 1/2.0 + 1 + 0.5 = 2.0, which trips
+    // `assert(median > min && median < max)` (2.0 < 2 is false) -> SIGABRT.
+    // The smallest range that auto-computes a strictly-inside median is
+    // (max - min) >= 2 (e.g. min=1, max=3 -> median=2.5). Reject anything
+    // tighter; bail before the assert.
+    //
+    // Note: also catch `key_maximum < key_minimum` explicitly because the
+    // unsigned subtraction below would wrap, falsely passing the >= 2 test.
+    if (cfg.key_pattern && (cfg.key_pattern[key_pattern_set] == 'G' || cfg.key_pattern[key_pattern_get] == 'G')) {
+        if (cfg.key_maximum < cfg.key_minimum || (cfg.key_maximum - cfg.key_minimum) < 2) {
+            fprintf(stderr,
+                    "error: key-pattern=G requires a key range spanning at least 3 keys "
+                    "(key-maximum - key-minimum >= 2) for the Gaussian sampler; got "
+                    "key-minimum=%llu key-maximum=%llu.\n",
+                    cfg.key_minimum, cfg.key_maximum);
+            exit(2);
+        }
+        // If the user supplied a non-zero median, it must land strictly inside
+        // (min, max) -- otherwise the sampler's `assert(median > min && median
+        // < max)` SIGABRTs. Default median=0 means "auto-compute" and (given
+        // the >= 2 range guard above) is always valid.
+        if (cfg.key_median != 0.0 &&
+            (cfg.key_median <= (double) cfg.key_minimum || cfg.key_median >= (double) cfg.key_maximum)) {
+            fprintf(stderr,
+                    "error: --key-median=%g must be strictly inside (key-minimum=%llu, key-maximum=%llu) "
+                    "for the Gaussian sampler.\n",
+                    cfg.key_median, cfg.key_minimum, cfg.key_maximum);
+            exit(2);
+        }
+    }
+
+    // Validate staircase options (after defaults are applied)
+    if (cfg.clients_start > 0) {
+        if (cfg.clients_start >= cfg.clients) {
+            fprintf(stderr, "error: --clients-start (%u) must be less than --clients (%u).\n", cfg.clients_start,
+                    cfg.clients);
+            exit(1);
+        }
+        if (!cfg.test_time) {
+            fprintf(stderr, "error: --test-time is required when using client staircase mode.\n");
+            exit(1);
+        }
+    }
+
+    // Validate jitter parameters
+    if (cfg.thread_conn_start_min_jitter_micros > cfg.thread_conn_start_max_jitter_micros) {
+        fprintf(stderr,
+                "error: thread-conn-start-min-jitter-micros (%u) cannot be greater than "
+                "thread-conn-start-max-jitter-micros (%u).\n",
+                cfg.thread_conn_start_min_jitter_micros, cfg.thread_conn_start_max_jitter_micros);
+        exit(1);
+    }
+
     log_level = cfg.debug;
+
+    // Validate and set up SCAN incremental iteration
+    if (cfg.scan_incremental_iteration) {
+        if (cfg.pipeline != 1) {
+            fprintf(stderr, "error: --scan-incremental-iteration requires --pipeline 1.\n");
+            exit(1);
+        }
+        if (!cfg.arbitrary_commands->is_defined()) {
+            fprintf(stderr,
+                    "error: --scan-incremental-iteration requires --command with SCAN, SSCAN, HSCAN or ZSCAN.\n");
+            exit(1);
+        }
+        if (cfg.cluster_mode) {
+            fprintf(stderr, "error: --scan-incremental-iteration is not supported in cluster mode.\n");
+            exit(1);
+        }
+
+        // A cursor chain belongs to exactly one command and one client connection.
+        size_t real_cmd_count = 0;
+        for (size_t i = 0; i < cfg.arbitrary_commands->size(); i++) {
+            if (!cfg.arbitrary_commands->at(i).stats_only) real_cmd_count++;
+        }
+        if (real_cmd_count != 1) {
+            fprintf(
+                stderr,
+                "error: --scan-incremental-iteration requires exactly one --command (SCAN, SSCAN, HSCAN or ZSCAN).\n");
+            exit(1);
+        }
+
+        arbitrary_command &scan_cmd = cfg.arbitrary_commands->at(0);
+        const std::string command_type = scan_cmd.command_type;
+        const bool keyspace_scan = strcasecmp(command_type.c_str(), "SCAN") == 0;
+        if (!keyspace_scan && strcasecmp(command_type.c_str(), "SSCAN") != 0 &&
+            strcasecmp(command_type.c_str(), "HSCAN") != 0 && strcasecmp(command_type.c_str(), "ZSCAN") != 0) {
+            fprintf(stderr, "error: --scan-incremental-iteration requires a SCAN, SSCAN, HSCAN or ZSCAN command.\n");
+            exit(1);
+        }
+        const size_t cursor_index = keyspace_scan ? 1 : 2;
+        if (scan_cmd.command_args.size() <= cursor_index) {
+            fprintf(stderr, "error: %s command requires %s cursor argument (e.g., '%s %s0').\n", command_type.c_str(),
+                    keyspace_scan ? "a" : "a key and a", command_type.c_str(), keyspace_scan ? "" : "key ");
+            exit(1);
+        }
+
+        // Copy parsed arguments so quoting, empty strings and binary escapes survive.
+        // Only the cursor changes; generated arguments are retained by each client.
+        cfg.scan_continuation_command = new arbitrary_command(scan_cmd);
+        // The separate formatting pass below classifies this as scan_cursor_type.
+        // The flag alone marks the cursor slot, whatever its text; the text is
+        // replaced only so --debug logs show the slot (a user-supplied
+        // "__scan_cursor__" never gets the flag and is sent as a constant).
+        cfg.scan_continuation_command->command_args[cursor_index].data = SCAN_CURSOR_PLACEHOLDER;
+        cfg.scan_continuation_command->command_args[cursor_index].scan_cursor = true;
+        cfg.scan_continuation_command->command_name = command_type + " <cursor>";
+        cfg.scan_continuation_command->command_type = command_type + " <cursor>";
+        scan_cmd.command_name = command_type + " 0";
+        scan_cmd.command_type = command_type + " 0";
+
+        // Index 1 tracks continuation statistics without entering the command rotation.
+        arbitrary_command stats_cmd(command_type.c_str());
+        stats_cmd.command_name = command_type + " <cursor>";
+        stats_cmd.command_type = command_type + " <cursor>";
+        stats_cmd.stats_only = true;
+        cfg.arbitrary_commands->add_command(stats_cmd);
+    }
+
+    // Initialize StatsD client if configured
+    cfg.statsd = NULL;
+    if (cfg.statsd_host != NULL) {
+        cfg.statsd = new statsd_client();
+        cfg.statsd->set_graphite_port(cfg.graphite_port);
+        if (!cfg.statsd->init(cfg.statsd_host, cfg.statsd_port, cfg.statsd_prefix, cfg.statsd_run_label)) {
+            fprintf(stderr, "warning: failed to initialize StatsD client, metrics will not be sent\n");
+            delete cfg.statsd;
+            cfg.statsd = NULL;
+        }
+    }
+
+#ifdef HAVE_EVHTTP
+    // Initialize the Prometheus exporter if configured (PLAN.md section 3.2).
+    // This is AFTER the statsd init block, after evthread_use_pthreads() and
+    // config_init_defaults(). Only when --prometheus-port was given (>= 0; the
+    // sentinel -1 means the flag was absent and the feature stays off). On
+    // start() failure the exporter is freed (delete + NULL) and the process
+    // exits 1 with one stderr line; start() already released any partial
+    // libevent state via free_libevent_state() before returning false.
+    if (cfg.prometheus_port >= 0) {
+        prometheus_exporter::options popts;
+        popts.bind_addr = cfg.prometheus_bind_addr ? cfg.prometheus_bind_addr : "127.0.0.1";
+        popts.port = cfg.prometheus_port;
+        popts.run_labels = cfg.prometheus_run_labels;
+        popts.latency_buckets = cfg.prometheus_latency_buckets;
+        popts.run_count = cfg.run_count;
+        popts.test_time = (int) cfg.test_time;
+        popts.n_threads = cfg.threads;
+        g_prom_exporter = new prometheus_exporter(popts);
+        if (!g_prom_exporter->start()) {
+            delete g_prom_exporter;
+            g_prom_exporter = NULL;
+            exit(1);
+        }
+        cfg.prometheus = g_prom_exporter;
+    }
+#endif
+
     if (cfg.show_config) {
         fprintf(stderr, "============== Configuration values: ==============\n");
-        config_print(stdout, &cfg);
+        config_print(stderr, &cfg);
         fprintf(stderr, "===================================================\n");
     }
-    //
-    // JSON file initiation
-    json_handler *jsonhandler = NULL;
-    if (cfg.json_out_file != NULL){
-        jsonhandler = new json_handler((const char *)cfg.json_out_file);
-        // We allways print the configuration to the JSON file      
-        config_print_to_json(jsonhandler,&cfg);
+
+    // if user configure arbitrary commands, format and prepare it
+    bool monitor_lines_checked = false;
+    for (unsigned int i = 0; i < cfg.arbitrary_commands->size(); i++) {
+        arbitrary_command &cmd = cfg.arbitrary_commands->at(i);
+
+        // Skip formatting for random monitor commands - they will be formatted at runtime
+        if (cmd.command_args.size() == 1 && cmd.command_args[0].type == monitor_random_type) {
+            if (cfg.cluster_mode && !monitor_lines_checked) {
+                if (!check_cluster_monitor_lines(cfg.monitor_commands, cfg.key_prefix)) exit(1);
+                monitor_lines_checked = true;
+            }
+            continue;
+        }
+
+        // Skip stats-only commands - they are not executed, just for stats tracking
+        if (cmd.stats_only) {
+            continue;
+        }
+
+        abstract_protocol *tmp_protocol = protocol_factory(cfg.protocol);
+        assert(tmp_protocol != NULL);
+
+        if (!tmp_protocol->format_arbitrary_command(cmd)) {
+            exit(1);
+        }
+
+        // Cluster mode supports only single-key commands
+        if (cfg.cluster_mode && cmd.keys_count > 1) {
+            benchmark_error_log("error: Cluster mode supports only single-key commands\n");
+            exit(1);
+        }
+        delete tmp_protocol;
     }
+
+    // Format the SCAN continuation command separately (not in the command list)
+    if (cfg.scan_continuation_command) {
+        abstract_protocol *tmp_protocol = protocol_factory(cfg.protocol);
+        assert(tmp_protocol != NULL);
+
+        if (!tmp_protocol->format_arbitrary_command(*cfg.scan_continuation_command)) {
+            fprintf(stderr, "error: failed to format SCAN continuation command.\n");
+            exit(1);
+        }
+        delete tmp_protocol;
+    }
+
+    // if user configured rate limiting, do some calculations
+    if (cfg.request_rate) {
+        /* Our event resolution is (at least) 50 events per second (event every >= 20 ml).
+         * When we calculate the number of request per interval, we are taking
+         * the upper bound and adjust the interval accordingly to get more accuracy */
+        // 64-bit: request_rate + 49 wraps to 0 for rates near UINT_MAX.
+        cfg.request_per_interval = (unsigned int) (((unsigned long long) cfg.request_rate + 50 - 1) / 50);
+        unsigned int events_per_second = cfg.request_rate / cfg.request_per_interval;
+        cfg.request_interval_microsecond = 1000000 / events_per_second;
+        benchmark_debug_log("Rate limiting configured to send %u requests per %u millisecond\n",
+                            cfg.request_per_interval, cfg.request_interval_microsecond / 1000);
+    }
+
+#ifdef USE_TLS
+    // Initialize OpenSSL only if we're really going to use it.
+    if (cfg.tls) {
+        init_openssl();
+
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+        cfg.openssl_ctx = SSL_CTX_new(SSLv23_client_method());
+#else
+        cfg.openssl_ctx = SSL_CTX_new(TLS_client_method());
+#endif
+        SSL_CTX_set_options(cfg.openssl_ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
+
+// Set the outer protocol envelope using min/max version (available since OpenSSL 1.1.0).
+// Then re-disable any gap protocols inside [min, max] that the user did not select.
+// The SSL_OP_NO_TLSv* constants are still present in OpenSSL 3.x but were removed in
+// OpenSSL 4.0, so each gap-mask call is wrapped in an #ifdef.  When a symbol is absent
+// the runtime cannot individually disable that version anyway, which aligns with
+// OpenSSL 4.0's intended deprecation policy.
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+        {
+            int min_ver = 0, max_ver = 0;
+            if (cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1)
+                min_ver = TLS1_VERSION;
+            else if (cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_1)
+                min_ver = TLS1_1_VERSION;
+            else if (cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_2)
+                min_ver = TLS1_2_VERSION;
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+            else if (cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_3)
+                min_ver = TLS1_3_VERSION;
+            if (cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_3)
+                max_ver = TLS1_3_VERSION;
+            else
+#endif
+                if (cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_2)
+                max_ver = TLS1_2_VERSION;
+            else if (cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_1)
+                max_ver = TLS1_1_VERSION;
+            else if (cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1)
+                max_ver = TLS1_VERSION;
+            if (min_ver) SSL_CTX_set_min_proto_version(cfg.openssl_ctx, min_ver);
+            if (max_ver) SSL_CTX_set_max_proto_version(cfg.openssl_ctx, max_ver);
+
+                // Gap-mask: explicitly disable any version inside [min,max] that the user
+                // omitted (e.g. --tls-protocols "tlsv1,tlsv1.2" must not allow tlsv1.1).
+                // Each #ifdef guard ensures the build succeeds on OpenSSL 4.0 where these
+                // constants have been removed.
+#ifdef SSL_OP_NO_TLSv1
+            if (!(cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1)) SSL_CTX_set_options(cfg.openssl_ctx, SSL_OP_NO_TLSv1);
+#endif
+#ifdef SSL_OP_NO_TLSv1_1
+            if (!(cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_1)) SSL_CTX_set_options(cfg.openssl_ctx, SSL_OP_NO_TLSv1_1);
+#endif
+#ifdef SSL_OP_NO_TLSv1_2
+            if (!(cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_2)) SSL_CTX_set_options(cfg.openssl_ctx, SSL_OP_NO_TLSv1_2);
+#endif
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L && defined(SSL_OP_NO_TLSv1_3)
+            if (!(cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_3)) SSL_CTX_set_options(cfg.openssl_ctx, SSL_OP_NO_TLSv1_3);
+#endif
+        }
+#else
+        if (!(cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1)) SSL_CTX_set_options(cfg.openssl_ctx, SSL_OP_NO_TLSv1);
+        if (!(cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_1)) SSL_CTX_set_options(cfg.openssl_ctx, SSL_OP_NO_TLSv1_1);
+        if (!(cfg.tls_protocols & REDIS_TLS_PROTO_TLSv1_2)) SSL_CTX_set_options(cfg.openssl_ctx, SSL_OP_NO_TLSv1_2);
+#endif
+
+        if (cfg.tls_cert) {
+            if (!SSL_CTX_use_certificate_chain_file(cfg.openssl_ctx, cfg.tls_cert)) {
+                ERR_print_errors_fp(stderr);
+                fprintf(stderr, "Error: Failed to load certificate file.\n");
+                exit(1);
+            }
+            if (!SSL_CTX_use_PrivateKey_file(cfg.openssl_ctx, cfg.tls_key ? cfg.tls_key : cfg.tls_cert,
+                                             SSL_FILETYPE_PEM)) {
+                ERR_print_errors_fp(stderr);
+                fprintf(stderr, "Error: Failed to load private key file.\n");
+                exit(1);
+            }
+        }
+        if (cfg.tls_cacert) {
+            if (!SSL_CTX_load_verify_locations(cfg.openssl_ctx, cfg.tls_cacert, NULL)) {
+                ERR_print_errors_fp(stderr);
+                fprintf(stderr, "Error: Failed to load CA certificate file.\n");
+                exit(1);
+            }
+        }
+        SSL_CTX_set_verify(cfg.openssl_ctx, cfg.tls_skip_verify ? SSL_VERIFY_NONE : SSL_VERIFY_PEER, NULL);
+    }
+#endif
 
     struct rlimit rlim;
     if (getrlimit(RLIMIT_NOFILE, &rlim) != 0) {
         benchmark_error_log("error: getrlimit failed: %s\n", strerror(errno));
-        // JSON closing
-        if (jsonhandler != NULL){
-            jsonhandler->write_error("error: getrlimit failed: %s", strerror(errno));
-            delete jsonhandler;
-        }
         exit(1);
     }
 
-    if (cfg.unix_socket != NULL &&
-        (cfg.server != NULL || cfg.port > 0)) {
+    if (cfg.unix_socket != NULL && (cfg.server != NULL || cfg.port > 0)) {
         benchmark_error_log("error: UNIX domain socket and TCP cannot be used together.\n");
-        // JSON closing
-        if (jsonhandler != NULL){
-            jsonhandler->write_error("error: UNIX domain socket and TCP cannot be used together");
-            delete jsonhandler;
-        }
         exit(1);
     }
 
     if (cfg.server != NULL && cfg.port > 0) {
         try {
-            cfg.server_addr = new server_addr(cfg.server, cfg.port);
-        } catch (std::runtime_error& e) {
-            benchmark_error_log("%s:%u: error: %s\n",
-                    cfg.server, cfg.port, e.what());
-            // JSON closing
-            if (jsonhandler != NULL){
-                jsonhandler->write_error("%s:%u: error: %s",cfg.server, cfg.port, e.what());
-                delete jsonhandler;
-            }
+            cfg.server_addr = new server_addr(cfg.server, cfg.port, cfg.resolution);
+        } catch (std::runtime_error &e) {
+            benchmark_error_log("%s:%u: error: %s\n", cfg.server, cfg.port, e.what());
             exit(1);
         }
     }
@@ -991,99 +5649,73 @@ int main(int argc, char *argv[])
     if (fds_needed > rlim.rlim_cur) {
         if (fds_needed > rlim.rlim_max && getuid() != 0) {
             benchmark_error_log("error: running the tool with this number of connections requires 'root' privilegs.\n");
-            // JSON closing
-            if (jsonhandler != NULL){
-                jsonhandler->write_error("error: running the tool with this number of connections requires 'root' privilegs");
-                delete jsonhandler;
-            }
             exit(1);
         }
         rlim.rlim_cur = rlim.rlim_max = fds_needed;
 
         if (setrlimit(RLIMIT_NOFILE, &rlim) != 0) {
             benchmark_error_log("error: setrlimit failed: %s\n", strerror(errno));
-            // JSON closing
-            if (jsonhandler != NULL){
-                jsonhandler->write_error("error: setrlimit failed: %s", strerror(errno));
-                delete jsonhandler;
-            }
             exit(1);
         }
     }
 
     // create and configure object generator
-    object_generator* obj_gen = NULL;
-    imported_keylist* keylist = NULL;
+    object_generator *obj_gen = NULL;
+    imported_keylist *keylist = NULL;
     if (!cfg.data_import) {
         if (cfg.data_verify) {
             fprintf(stderr, "error: use data-verify only with data-import\n");
-            // JSON closing
-            if (jsonhandler != NULL){
-                jsonhandler->write_error("error: use data-verify only with data-import");
-                delete jsonhandler;
-            }
             exit(1);
         }
         if (cfg.no_expiry) {
             fprintf(stderr, "error: use no-expiry only with data-import\n");
-            // JSON closing
-            if (jsonhandler != NULL){
-                jsonhandler->write_error("error: use no-expiry only with data-import");
-                delete jsonhandler;
-            }
             exit(1);
         }
-        
-        obj_gen = new object_generator();
+
+        if (cfg.arbitrary_commands->is_defined()) {
+            obj_gen = new object_generator(cfg.arbitrary_commands->size());
+        } else {
+            obj_gen = new object_generator();
+        }
         assert(obj_gen != NULL);
     } else {
+        // oss cluster API can't be enabled
+        if (cfg.cluster_mode) {
+            fprintf(stderr, "error: Cluster mode cannot be specified when importing.\n");
+            exit(1);
+        }
         // check paramters
-        if (cfg.data_size ||
-            cfg.data_size_list.is_defined() ||
-            cfg.data_size_range.is_defined()) {
+        if (cfg.data_size || cfg.data_size_list.is_defined() || cfg.data_size_range.is_defined()) {
             fprintf(stderr, "error: data size cannot be specified when importing.\n");
-            // JSON closing
-            if (jsonhandler != NULL){
-                jsonhandler->write_error("error: data size cannot be specified when importing");
-                delete jsonhandler;
-            }
             exit(1);
         }
 
         if (cfg.random_data) {
             fprintf(stderr, "error: random-data cannot be specified when importing.\n");
-            // JSON closing
-            if (jsonhandler != NULL){
-                jsonhandler->write_error("error: random-data cannot be specified when importing");
-                delete jsonhandler;
-            }
             exit(1);
         }
 
-        if (!cfg.generate_keys &&
-            (cfg.key_maximum || cfg.key_minimum || cfg.key_prefix)) {
-                fprintf(stderr, "error: use key-minimum, key-maximum and key-prefix only with generate-keys.\n");
-                // JSON closing
-                if (jsonhandler != NULL){
-                    jsonhandler->write_error("error: use key-minimum, key-maximum and key-prefix only with generate-keys");
-                    delete jsonhandler;
-                }
-                exit(1);
+        if (!cfg.generate_keys && (cfg.key_maximum || cfg.key_minimum || cfg.key_prefix)) {
+            fprintf(stderr, "error: use key-minimum, key-maximum and key-prefix only with generate-keys.\n");
+            exit(1);
         }
 
-        if (!cfg.generate_keys) {        
+        if (cfg.generate_keys) {
+            // Nothing else reads the file before the run starts; validate it
+            // now so a malformed or empty file fails before connecting.
+            imported_keylist check(cfg.data_import);
+            if (!check.read_keys(false)) {
+                fprintf(stderr, "error: %s: invalid --data-import file.\n", cfg.data_import);
+                exit(1);
+            }
+        } else {
             // read keys
             fprintf(stderr, "Reading keys from %s...", cfg.data_import);
             keylist = new imported_keylist(cfg.data_import);
             assert(keylist != NULL);
-            
+
             if (!keylist->read_keys()) {
                 fprintf(stderr, "\nerror: failed to read keys.\n");
-                // JSON closing
-                if (jsonhandler != NULL){
-                    jsonhandler->write_error("error: failed to read keys");
-                    delete jsonhandler;
-                }
                 exit(1);
             } else {
                 fprintf(stderr, " %u keys read.\n", keylist->size());
@@ -1093,44 +5725,44 @@ int main(int argc, char *argv[])
         obj_gen = new import_object_generator(cfg.data_import, keylist, cfg.no_expiry);
         assert(obj_gen != NULL);
 
-        if (dynamic_cast<import_object_generator*>(obj_gen)->open_file() != true) {
+        if (dynamic_cast<import_object_generator *>(obj_gen)->open_file() != true) {
             fprintf(stderr, "error: %s: failed to open.\n", cfg.data_import);
-            // JSON closing
-            if (jsonhandler != NULL){
-                jsonhandler->write_error("error: %s: failed to open", cfg.data_import);
-                delete jsonhandler;
-            }
             exit(1);
         }
     }
 
     if (cfg.authenticate) {
-        if (strcmp(cfg.protocol, "redis") != 0  &&
-            strcmp(cfg.protocol, "memcache_binary") != 0) {
-                fprintf(stderr, "error: authenticate can only be used with redis or memcache_binary.\n");
-                usage();
+        if (cfg.protocol == PROTOCOL_MEMCACHE_TEXT) {
+            fprintf(stderr, "error: authenticate can only be used with redis or memcache_binary.\n");
+            usage();
         }
-        if (strcmp(cfg.protocol, "memcache_binary") == 0 &&
-            strchr(cfg.authenticate, ':') == NULL) {
-                fprintf(stderr, "error: binary_memcache credentials must be in the form of USER:PASSWORD.\n");
-                usage();
+        // A password-only --uri may carry a decoded ':' (behind a leading ':'),
+        // but it still has no user name.
+        if (cfg.protocol == PROTOCOL_MEMCACHE_BINARY && (strchr(cfg.authenticate, ':') == NULL || uri_password_only)) {
+            fprintf(stderr, "error: binary_memcache credentials must be in the form of USER:PASSWORD.\n");
+            usage();
         }
     }
     if (!cfg.data_import) {
         obj_gen->set_random_data(cfg.random_data);
     }
 
-    if (cfg.select_db > 0 && strcmp(cfg.protocol, "redis")) {
+    if (cfg.select_db > 0 && !is_redis_protocol(cfg.protocol)) {
         fprintf(stderr, "error: select-db can only be used with redis protocol.\n");
         usage();
     }
+    if (cfg.multi_key_get > 0 && cfg.protocol == PROTOCOL_MEMCACHE_BINARY) {
+        fprintf(stderr, "error: --multi-key-get is not supported with memcache_binary.\n");
+        usage();
+    }
+    if (cfg.multi_key_get > 0 && cfg.arbitrary_commands->is_defined()) {
+        fprintf(stderr, "error: --multi-key-get cannot be combined with --command.\n");
+        usage();
+    }
     if (cfg.data_offset > 0) {
-        if (cfg.data_offset > (1<<29)-1) {
-            fprintf(stderr, "error: data-offset too long\n");
-            usage();
-        }
-        if (cfg.expiry_range.min || cfg.expiry_range.max || strcmp(cfg.protocol, "redis")) {
-            fprintf(stderr, "error: data-offset can only be used with redis protocol, and cannot be used with expiry\n");
+        if (cfg.expiry_range.min || cfg.expiry_range.max || !is_redis_protocol(cfg.protocol)) {
+            fprintf(stderr,
+                    "error: data-offset can only be used with redis protocol, and cannot be used with expiry\n");
             usage();
         }
     }
@@ -1153,17 +5785,17 @@ int main(int argc, char *argv[])
         fprintf(stderr, "error: data-size, data-size-list or data-size-range must be specified.\n");
         usage();
     }
-    
+
     if (!cfg.data_import || cfg.generate_keys) {
         obj_gen->set_key_prefix(cfg.key_prefix);
         obj_gen->set_key_range(cfg.key_minimum, cfg.key_maximum);
     }
-    if (cfg.key_stddev>0 || cfg.key_median>0) {
-        if (cfg.key_pattern[0]!='G' && cfg.key_pattern[2]!='G') {
+    if (cfg.key_stddev > 0 || cfg.key_median > 0) {
+        if (cfg.key_pattern[key_pattern_set] != 'G' && cfg.key_pattern[key_pattern_get] != 'G') {
             fprintf(stderr, "error: key-stddev and key-median are only allowed together with key-pattern set to G.\n");
             usage();
-        }   
-        if (cfg.key_median!=0 && (cfg.key_median<cfg.key_minimum || cfg.key_median>cfg.key_maximum)) {
+        }
+        if (cfg.key_median != 0 && (cfg.key_median < cfg.key_minimum || cfg.key_median > cfg.key_maximum)) {
             fprintf(stderr, "error: key-median must be between key-minimum and key-maximum.\n");
             usage();
         }
@@ -1171,56 +5803,238 @@ int main(int argc, char *argv[])
     }
     obj_gen->set_expiry_range(cfg.expiry_range.min, cfg.expiry_range.max);
 
-    // Prepare output file
-    FILE *outfile;
+    // Check if Zipfian distribution is needed for global key patterns or arbitrary commands
+    bool needs_zipfian = (cfg.key_pattern[key_pattern_set] == 'Z' || cfg.key_pattern[key_pattern_get] == 'Z');
+
+    // Also check if any arbitrary command uses Zipfian distribution
+    if (!needs_zipfian && cfg.arbitrary_commands->is_defined()) {
+        for (size_t i = 0; i < cfg.arbitrary_commands->size(); i++) {
+            if (cfg.arbitrary_commands->at(i).key_pattern == 'Z') {
+                needs_zipfian = true;
+                break;
+            }
+        }
+    }
+
+    if (needs_zipfian) {
+        if (cfg.key_zipf_exp == 0.0) {
+            // user can't specify 0.0, so 0.0 means unset
+            cfg.key_zipf_exp = 1.0;
+        }
+        obj_gen->set_key_zipf_distribution(cfg.key_zipf_exp);
+    }
+
+    // stdout was closed at startup and reopened on /dev/null, and the text
+    // results go to stdout unless --out-file is given: they would be lost.
+    // Fail here, after the option validation (so a bad option still reports
+    // its own error) and before connecting, as for an --out-file that cannot
+    // be opened below.
+    if ((closed_std_fds & (1u << STDOUT_FILENO)) && cfg.out_file == NULL) {
+        fprintf(stderr, "error: stdout was closed at startup, so the results would not be written; use --out-file\n");
+        exit(1);
+    }
+
+    // --verify-only writes no HDR or --client-stats files.
+    if (!cfg.verify_only) {
+        if (cfg.hdr_prefix[0] != '\0') check_output_prefix_dir("--hdr-file-prefix", cfg.hdr_prefix);
+        if (cfg.client_stats != NULL) check_output_prefix_dir("--client-stats", cfg.client_stats);
+    }
+
+    // Open the output files after option validation and data import, so a
+    // startup error leaves existing files untouched. Retry on EINTR, as
+    // json_handler does.
+    FILE *outfile = stdout;
+    if (cfg.out_file != NULL) {
+        int fd;
+        do {
+            fd = open(cfg.out_file, O_WRONLY | O_CREAT, 0666);
+        } while (fd < 0 && errno == EINTR);
+        if (fd < 0 || (outfile = fdopen(fd, "w")) == NULL) {
+            fprintf(stderr, "error: cannot open --out-file %s: %s\n", cfg.out_file, strerror(errno));
+            exit(1);
+        }
+    }
+
+    // A --failed-keys-file that cannot be opened (or whose header cannot be
+    // written) fails now, as --out-file does, rather than after a whole run
+    // whose log would be lost. --out-file is not truncated yet, and
+    // --json-out-file not opened. A path that names a closed fd 0-2 was
+    // rejected after option parsing, because it opens fine (on /dev/null)
+    // and the log would be lost without any message.
+    if (cfg.failed_keys_file && !global_failed_keys_logger().open(cfg.failed_keys_file)) {
+        exit(1);
+    }
+
+    // JSON file initiation
+    json_handler *jsonhandler = NULL;
+    if (cfg.json_out_file != NULL) {
+        jsonhandler = new json_handler((const char *) cfg.json_out_file);
+        // We always print the configuration to the JSON file
+        config_print_to_json(jsonhandler, &cfg);
+        if (atexit(close_json_out_file_at_exit) != 0) {
+            fprintf(stderr, "error: cannot register JSON output cleanup.\n");
+            delete jsonhandler;
+            exit(1);
+        }
+        g_json_out_file = jsonhandler;
+    }
+
     if (cfg.out_file != NULL) {
         fprintf(stderr, "Writing results to %s...\n", cfg.out_file);
-        outfile = fopen(cfg.out_file, "w");
-        if (!outfile) {
-            perror(cfg.out_file);
+        // --out-file was opened without O_TRUNC and is truncated only now that
+        // --json-out-file is open too, so an error opening either one leaves the
+        // other untouched. Only regular files can be truncated (not e.g.
+        // /dev/stdout or a FIFO).
+        struct stat st;
+        if (fstat(fileno(outfile), &st) == 0 && S_ISREG(st.st_mode) && ftruncate(fileno(outfile), 0) != 0) {
+            fprintf(stderr, "error: cannot truncate --out-file %s: %s\n", cfg.out_file, strerror(errno));
+            // The exit handler finishes the JSON nesting.
+            exit(1);
         }
     } else {
-        outfile = stdout;
+        fprintf(stderr, "Writing results to stdout\n");
     }
 
     if (!cfg.verify_only) {
         std::vector<run_stats> all_stats;
+        all_stats.reserve(cfg.run_count);
+
+        // Ctrl+C (or SIGTERM) ends the whole --run-count series, not only the current run:
+        // no later run starts. g_interrupted is checked before and after the
+        // settle pause, since the signal can arrive during it. The interrupted
+        // run itself is kept, marked Interrupted. Run 1 always runs, so
+        // all_stats is never empty.
         for (unsigned int run_id = 1; run_id <= cfg.run_count; run_id++) {
-            if (run_id > 1)
-                sleep(1);   // let connections settle
-            
+            if (run_id > 1) {
+                if (g_interrupted) break;
+                sleep(1); // let connections settle
+                if (g_interrupted) break;
+            }
+
             run_stats stats = run_benchmark(run_id, &cfg, obj_gen);
             all_stats.push_back(stats);
+            // Each writer prints its own error; write the remaining files anyway.
+            if (!stats.save_hdr_full_run(&cfg, run_id)) g_output_failed = true;
+            if (!stats.save_hdr_get_command(&cfg, run_id)) g_output_failed = true;
+            if (!stats.save_hdr_set_command(&cfg, run_id)) g_output_failed = true;
+            if (!stats.save_hdr_arbitrary_commands(&cfg, run_id)) g_output_failed = true;
+        }
+        const bool series_cut = all_stats.size() < cfg.run_count;
+        if (series_cut) {
+            fprintf(stderr, "Interrupted by %s, skipping the remaining runs (%zu of %u done).\n", interrupt_source(),
+                    all_stats.size(), cfg.run_count);
         }
         //
-        // Print some run information        
+        // Print some run information.
+        //
+        // In cluster mode, also surface the discovered endpoint count and the
+        // real total connection fan-out (threads x conns/thread x endpoints),
+        // plus the aggregate rate-limit target when --rate-limiting is set.
+        // Counts come from the topology snapshot captured at run end (same
+        // source as the startup "[RUN #N] Cluster topology" line), so the two
+        // agree. The aggregate rate target counts only request-generating
+        // connections (primaries always; replicas only when reads route to
+        // them), since idle replica connections never hit their rate limiter.
+        bool have_cluster_topo = false;
+        size_t c_endpoints = 0, c_primaries = 0, c_replicas = 0;
+        unsigned long long c_total_conns = 0, c_rate_aggregate = 0;
+        bool c_has_rate = false;
+        if (cfg.cluster_mode && !all_stats.empty()) {
+            const run_stats &topo = all_stats.back();
+            c_endpoints = topo.get_endpoint_count();
+            if (c_endpoints > 0) {
+                have_cluster_topo = true;
+                c_primaries = topo.get_primary_endpoint_count();
+                c_replicas = topo.get_replica_endpoint_count();
+                c_total_conns = (unsigned long long) cfg.threads * (unsigned long long) cfg.clients *
+                                (unsigned long long) c_endpoints;
+                if (cfg.request_rate > 0) {
+                    size_t traffic_eps = c_primaries + (cfg.read_preference != rp_primary ? c_replicas : 0);
+                    c_rate_aggregate = (unsigned long long) cfg.request_rate * (unsigned long long) cfg.threads *
+                                       (unsigned long long) cfg.clients * (unsigned long long) traffic_eps;
+                    c_has_rate = true;
+                }
+            }
+        }
+
         fprintf(outfile,
-               "%-9u Threads\n"
-               "%-9u Connections per thread\n"
-               "%-9u %s\n",
-               cfg.threads, cfg.clients, 
-               cfg.requests > 0 ? cfg.requests : cfg.test_time,
-               cfg.requests > 0 ? "Requests per thread"  : "Seconds");
-        if (jsonhandler != NULL){
+                "%-9u Threads\n"
+                "%-9u Connections per thread\n",
+                cfg.threads, cfg.clients);
+
+        if (have_cluster_topo) {
+            // With the --clients-start staircase ramp, cfg.clients is the peak
+            // (full-ramp) value, so total connections / rate are the target
+            // fan-out rather than the count necessarily opened; label it.
+            const char *ramp = (cfg.clients_start > 0) ? " at full ramp" : "";
+            if (c_replicas > 0)
+                fprintf(outfile, "%-9zu Cluster endpoints (%zu primaries, %zu replicas)\n", c_endpoints, c_primaries,
+                        c_replicas);
+            else
+                fprintf(outfile, "%-9zu Cluster endpoints (%zu primaries)\n", c_endpoints, c_primaries);
+            fprintf(outfile, "%-9llu Total connections%s (%u x %u x %zu)\n", c_total_conns, ramp, cfg.threads,
+                    cfg.clients, c_endpoints);
+            if (c_has_rate) fprintf(outfile, "%-9llu Aggregate rate-limit target (req/s)%s\n", c_rate_aggregate, ramp);
+        }
+
+        fprintf(outfile, "%-9llu %s\n", (unsigned long long) (cfg.requests > 0 ? cfg.requests : cfg.test_time),
+                cfg.requests > 0 ? "Requests per client" : "Seconds");
+        if (series_cut)
+            fprintf(outfile, "%-9zu Runs completed (of %u, interrupted)\n", all_stats.size(), cfg.run_count);
+
+        if (jsonhandler != NULL) {
             jsonhandler->open_nesting("run information");
-            jsonhandler->write_obj("Threads","%u",cfg.threads);
-            jsonhandler->write_obj("Connections per thread","%u",cfg.clients);
-            jsonhandler->write_obj(cfg.requests > 0 ? "Requests per thread"  : "Seconds","%u",
-                                   cfg.requests > 0 ? cfg.requests : cfg.test_time);
+            jsonhandler->write_obj("Threads", "%u", cfg.threads);
+            jsonhandler->write_obj("Connections per thread", "%u", cfg.clients);
+            if (have_cluster_topo) {
+                jsonhandler->write_obj("Cluster endpoints", "%zu", c_endpoints);
+                jsonhandler->write_obj("Cluster primary endpoints", "%zu", c_primaries);
+                jsonhandler->write_obj("Cluster replica endpoints", "%zu", c_replicas);
+                jsonhandler->write_obj("Total connections", "%llu", c_total_conns);
+                if (c_has_rate) jsonhandler->write_obj("Aggregate rate-limit target", "%llu", c_rate_aggregate);
+            }
+            jsonhandler->write_obj(cfg.requests > 0 ? "Requests per client" : "Seconds", "%llu",
+                                   cfg.requests > 0 ? cfg.requests : (unsigned long long) cfg.test_time);
+            jsonhandler->write_obj("Runs completed", "%zu", all_stats.size());
+            jsonhandler->write_obj("Format version", "%d", 2);
             jsonhandler->close_nesting();
         }
 
+#ifdef USE_TLS
+        // Record the negotiated TLS protocol/cipher (captured once on the first
+        // handshake during the run; config_print_to_json runs too early to know
+        // it). One object for the whole run, mirroring the single stderr line.
+        if (jsonhandler != NULL && cfg.tls && cfg.tls_negotiated_version != NULL) {
+            jsonhandler->open_nesting("TLS");
+            jsonhandler->write_obj("negotiated_version", "\"%s\"", cfg.tls_negotiated_version);
+            jsonhandler->write_obj("negotiated_cipher", "\"%s\"",
+                                   cfg.tls_negotiated_cipher ? cfg.tls_negotiated_cipher : "");
+            jsonhandler->close_nesting();
+        }
+#endif
+
         // If more than 1 run was used, compute best, worst and average
+        // Furthermore, if print_all_runs is enabled we save separate histograms per run.
+        // The section names follow --run-count, so JSON keys stay stable; their
+        // contents use only the runs that happened ("Runs completed" above).
         if (cfg.run_count > 1) {
-            unsigned int min_ops_sec = (unsigned int) -1;
-            unsigned int max_ops_sec = 0;
-            run_stats* worst = NULL;
-            run_stats* best = NULL;        
+            // User wants to see a separate histogram per run
+            if (cfg.print_all_runs) {
+                for (auto i = 0U; i < all_stats.size(); i++) {
+                    auto run_title = std::string("RUN #") + std::to_string(i + 1) + " RESULTS";
+                    all_stats[i].print(outfile, &cfg, run_title.c_str(), jsonhandler);
+                }
+            }
+            // User wants the best and worst
+            double min_ops_sec = 0;
+            double max_ops_sec = 0;
+            run_stats *worst = NULL;
+            run_stats *best = NULL;
             for (std::vector<run_stats>::iterator i = all_stats.begin(); i != all_stats.end(); i++) {
-                unsigned long usecs = i->get_duration_usec();
-                unsigned int ops_sec = (int)(((double)i->get_total_ops() / (usecs > 0 ? usecs : 1)) * 1000000);
+                unsigned long long usecs = i->get_duration_usec();
+                double ops_sec = usecs > 0 ? (double) i->get_total_ops() / usecs * 1000000 : 0.0;
                 if (ops_sec < min_ops_sec || worst == NULL) {
-                    min_ops_sec = ops_sec;                
+                    min_ops_sec = ops_sec;
                     worst = &(*i);
                 }
                 if (ops_sec > max_ops_sec || best == NULL) {
@@ -1228,23 +6042,27 @@ int main(int argc, char *argv[])
                     best = &(*i);
                 }
             }
-
             // Best results:
-            best->print(outfile, !cfg.hide_histogram, "BEST RUN RESULTS", jsonhandler);
+            best->print(outfile, &cfg, "BEST RUN RESULTS", jsonhandler);
             // worst results:
-            worst->print(outfile, !cfg.hide_histogram, "WORST RUN RESULTS", jsonhandler);
+            worst->print(outfile, &cfg, "WORST RUN RESULTS", jsonhandler);
             // average results:
-            run_stats average;
+            run_stats average(&cfg);
             average.aggregate_average(all_stats);
+            // Each run (and BEST/WORST, which are runs) keeps its own flag. The
+            // average is interrupted if any run was, or if Ctrl+C cut the
+            // series short, even between runs where no single run saw it.
+            if (series_cut) average.set_interrupted(true);
             char average_header[50];
-            sprintf(average_header,"AGGREGATED AVERAGE RESULTS (%u runs)", cfg.run_count);
-            average.print(outfile, !cfg.hide_histogram, average_header, jsonhandler);
+            snprintf(average_header, sizeof(average_header), "AGGREGATED AVERAGE RESULTS (%u runs)", cfg.run_count);
+            average.print(outfile, &cfg, average_header, jsonhandler);
         } else {
-            all_stats.begin()->print(outfile, !cfg.hide_histogram, "ALL STATS", jsonhandler);
+            all_stats.begin()->print(outfile, &cfg, "ALL STATS", jsonhandler);
         }
     }
 
     // If needed, data verification is done now...
+    bool verify_failed = false;
     if (cfg.data_verify) {
         struct event_base *verify_event_base = event_base_new();
         abstract_protocol *verify_protocol = protocol_factory(cfg.protocol);
@@ -1256,17 +6074,30 @@ int main(int argc, char *argv[])
         client->prepare();
         event_base_dispatch(verify_event_base);
 
-        fprintf(outfile, "Data verification completed:\n"
-                        "%-10llu keys verified successfuly.\n"
-                        "%-10llu keys failed.\n",
-                        client->get_verified_keys(),
-                        client->get_errors());
-        
-        if (jsonhandler != NULL){
+        fprintf(outfile,
+                "Data verification completed:\n"
+                "%-10llu keys verified successfuly.\n"
+                "%-10llu keys failed.\n",
+                client->get_verified_keys(), client->get_errors());
+
+        if (jsonhandler != NULL) {
             jsonhandler->open_nesting("client verifications results");
-            jsonhandler->write_obj("keys verified successfuly", "%-10llu",  client->get_verified_keys());
-            jsonhandler->write_obj("keys failed", "%-10llu",  client->get_errors());
+            jsonhandler->write_obj("keys verified successfuly", "%-10llu", client->get_verified_keys());
+            jsonhandler->write_obj("keys failed", "%-10llu", client->get_errors());
             jsonhandler->close_nesting();
+        }
+
+        const unsigned long long verified_keys = client->get_verified_keys();
+        const unsigned long long failed_keys = client->get_errors();
+        if (failed_keys > 0) {
+            fprintf(stderr, "error: %llu of %llu keys failed verification\n", failed_keys, verified_keys + failed_keys);
+            verify_failed = true;
+        } else if (verified_keys == 0) {
+            fprintf(stderr, "error: no keys were verified\n");
+            verify_failed = true;
+        } else if (!client->verification_complete()) {
+            fprintf(stderr, "error: data verification did not complete\n");
+            verify_failed = true;
         }
 
         // Clean up...
@@ -1275,14 +6106,118 @@ int main(int argc, char *argv[])
         event_base_free(verify_event_base);
     }
 
-    if (outfile != stdout) {
-        fclose(outfile);
+    // A results file that could not be written (disk full, quota, I/O error)
+    // fails the run, with one exception: stdout (or an --out-file that is
+    // stdout, e.g. /dev/stdout) on a pipe or socket whose reader went away,
+    // e.g. `| head`. That is the reader's choice, not a lost result.
+    // Keep this check after the last write to outfile.
+    int out_err = finish_output_file(outfile, false);
+    // Checked before fclose(), while the fd is still open.
+    bool reader_gone = out_err != 0 && stdout_reader_gone(outfile, out_err);
+    if (outfile != stdout && fclose(outfile) != 0 && out_err == 0) out_err = errno;
+    if (out_err != 0 && !reader_gone) {
+        if (outfile == stdout) {
+            fprintf(stderr, "error: failed writing results to stdout: %s\n", strerror(out_err));
+        } else {
+            fprintf(stderr, "error: failed writing --out-file %s: %s\n", cfg.out_file, strerror(out_err));
+        }
+        g_output_failed = true;
     }
 
-    // closing the JSON
-    if (jsonhandler != NULL) {delete jsonhandler;}
+    if (cfg.server_addr) {
+        delete cfg.server_addr;
+        cfg.server_addr = NULL;
+    }
+
+    if (jsonhandler != NULL) {
+        // Log message for saving JSON file
+        fprintf(stderr, "Saving JSON output file: %s\n", cfg.json_out_file);
+
+        // closing the JSON
+        int json_err = jsonhandler->close();
+        if (json_err != 0) {
+            fprintf(stderr, "error: failed writing --json-out-file %s: %s\n", cfg.json_out_file, strerror(json_err));
+            g_output_failed = true;
+        }
+        g_json_out_file = NULL;
+        delete jsonhandler;
+    }
+
+    // On this normal path all worker threads are joined, so nothing logs
+    // failed keys any more and the log can be closed and checked. A record
+    // that could not be written was reported when it happened. The early
+    // exit(failure_exit_code()) paths skip both the join and this close (see
+    // global_failed_keys_logger()).
+    if (cfg.failed_keys_file && global_failed_keys_logger().close() != 0) {
+        g_output_failed = true;
+    }
 
     delete obj_gen;
-    if (keylist != NULL)
-        delete keylist;
+    if (keylist != NULL) delete keylist;
+
+    if (cfg.scan_continuation_command != NULL) {
+        delete cfg.scan_continuation_command;
+        cfg.scan_continuation_command = NULL;
+    }
+
+    if (cfg.arbitrary_commands != NULL) {
+        delete cfg.arbitrary_commands;
+    }
+
+    if (cfg.monitor_commands != NULL) {
+        delete cfg.monitor_commands;
+    }
+
+    // Clean up StatsD client
+    if (cfg.statsd != NULL) {
+        cfg.statsd->close();
+        delete cfg.statsd;
+        cfg.statsd = NULL;
+    }
+
+#ifdef HAVE_EVHTTP
+    // Clean up the Prometheus exporter (PLAN.md section 3.2 join point). This is
+    // the first runtime exercise of the stop-event teardown protocol: wake the
+    // listener via the stop-event, join it, free libevent state. It must not
+    // hang. Done before the TLS cleanup, on every normal-exit path.
+    if (g_prom_exporter != NULL) {
+        g_prom_exporter->stop_and_join();
+        delete g_prom_exporter;
+        g_prom_exporter = NULL;
+        cfg.prometheus = NULL;
+    }
+#endif
+
+#ifdef USE_TLS
+    if (cfg.tls) {
+        if (cfg.openssl_ctx) {
+            SSL_CTX_free(cfg.openssl_ctx);
+            cfg.openssl_ctx = NULL;
+        }
+
+        cleanup_openssl();
+    }
+#endif
+
+    // Phase 1 of #426: propagate the connection-stage abort up to the shell.
+    // We still ran every teardown above (stats output, JSON, etc.) so the
+    // operator can read why the abort fired. exit(2) keeps the failure
+    // distinguishable from a successful test (0) and from --help (also 2 via
+    // usage(), but those exits happen before main reaches this point).
+    // With --run-count > 1 an abort in any run counts, and it takes
+    // precedence over a worker failure or output error (exit 1) in another
+    // run or in the same one.
+    if (g_any_run_connection_stage_aborted.load(std::memory_order_acquire)) {
+        return 2;
+    }
+    // A worker thread ended before the run's stop condition (see
+    // run_benchmark()); the results above do not cover the requested run.
+    if (g_worker_failed) {
+        return 1;
+    }
+    // An output could not be written, or data verification failed.
+    if (g_output_failed || verify_failed) {
+        return 1;
+    }
+    return 0;
 }

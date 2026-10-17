@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2011-2017 Redis Labs Ltd.
+ * Copyright (C) 2011-2026 Redis Labs Ltd.
  *
  * This file is part of memtier_benchmark.
  *
@@ -25,14 +25,15 @@
 
 #include "item.h"
 
-memcache_item::memcache_item(unsigned int dumpflags, time_t time,
-    time_t exptime,
-    unsigned short flags, 
-    unsigned int nsuffix,
-    unsigned int clsid) : 
-    m_dumpflags(dumpflags), m_time(time), m_exptime(exptime), 
-    m_flags(flags), m_nsuffix(nsuffix), m_clsid(clsid),
-    m_version(0)
+memcache_item::memcache_item(unsigned int dumpflags, time_t time, time_t exptime, unsigned short flags,
+                             unsigned int nsuffix, unsigned int clsid) :
+        m_dumpflags(dumpflags),
+        m_time(time),
+        m_exptime(exptime),
+        m_flags(flags),
+        m_nsuffix(nsuffix),
+        m_clsid(clsid),
+        m_version(0)
 {
     m_key = NULL;
     m_data = NULL;
@@ -40,21 +41,18 @@ memcache_item::memcache_item(unsigned int dumpflags, time_t time,
 
 memcache_item::~memcache_item()
 {
-    if (m_key != NULL)
-        free(m_key);
-    if (m_data != NULL)
-        free(m_data);
+    if (m_key != NULL) free(m_key);
+    if (m_data != NULL) free(m_data);
 }
 
 /** \brief set a memcache_item's key.
  * \param key pointer to malloc() allocated key data.
  * \param nkey length of key.
  */
- 
+
 void memcache_item::set_key(char *key, unsigned int nkey)
 {
-    if (m_key != NULL)
-        free(m_key);
+    if (m_key != NULL) free(m_key);
     m_nkey = nkey;
     m_key = key;
 }
@@ -63,16 +61,15 @@ void memcache_item::set_key(char *key, unsigned int nkey)
  * \param data pointer to malloc() allocated data.
  * \param nbytes length of data.
  */
- 
+
 void memcache_item::set_data(char *data, unsigned int nbytes)
 {
-    if (m_data != NULL)
-        free(m_data);
+    if (m_data != NULL) free(m_data);
     m_nbytes = nbytes;
     m_data = data;
 }
 
-char* memcache_item::get_key(void)
+char *memcache_item::get_key(void)
 {
     return m_key;
 }
@@ -82,7 +79,7 @@ unsigned int memcache_item::get_nkey(void)
     return m_nkey;
 }
 
-char* memcache_item::get_data(void)
+char *memcache_item::get_data(void)
 {
     return m_data;
 }
@@ -137,7 +134,7 @@ bool memcache_item::is_expired(void)
     return ((m_dumpflags & ITEM_DUMPFLAGS_EXPIRED) == ITEM_DUMPFLAGS_EXPIRED);
 }
 
-int memcache_item::operator<(const memcache_item& a)
+int memcache_item::operator<(const memcache_item &a)
 {
     if (this->m_time < a.m_time)
         return 1;
@@ -149,5 +146,3 @@ int memcache_item_ptr_cmp(memcache_item *a, memcache_item *b)
 {
     return (*a < *b);
 }
-
-

@@ -1,0 +1,11 @@
+memtier_benchmark:
+  build: .
+  command: --server=redis --generate-keys
+  links:
+    - redis
+
+redis:
+  image: redis
+  command: --maxmemory 64mb
+  ports:
+    - 6379:6379
