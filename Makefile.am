@@ -179,6 +179,14 @@ check_PROGRAMS += file_io_test
 file_io_test_SOURCES = tests/unit/file_io_test.cpp file_io.cpp file_io.h item.cpp item.h
 file_io_test_CPPFLAGS = -I$(srcdir)
 file_io_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+# Independent import readers, including copies of copies (#774).
+check_PROGRAMS += import_object_generator_test
+import_object_generator_test_SOURCES = tests/unit/import_object_generator_test.cpp \
+    obj_gen.cpp obj_gen.h file_io.cpp file_io.h item.cpp item.h \
+    config_types.cpp config_types.h command_meta.cpp command_meta.h
+import_object_generator_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
+import_object_generator_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+import_object_generator_test_LDADD = $(memtier_benchmark_LDADD)
 TESTS = $(check_PROGRAMS)
 
 # Keep the release amalgamation byte-identical to the recorded upstream asset.

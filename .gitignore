@@ -101,3 +101,5 @@ oom-*
 # Windows (MinGW) build outputs
 *.exe
 /.libs/
+
+/import_object_generator_test
