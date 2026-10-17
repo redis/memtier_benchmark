@@ -240,7 +240,7 @@ protected:
     bool retry_after_ask(unsigned int conn_id, request *req, protocol_response *response);
     // The primary connection to the node a -MOVED/-ASK reply names, or
     // UINT_MAX if there is none.
-    unsigned int redirect_target_conn(protocol_response *response);
+    unsigned int redirect_target_conn(unsigned int conn_id, protocol_response *response);
     // Queue the resend on connection `target` and count the retry.
     bool enqueue_redirect_retry(unsigned int target, request *req);
     // Terminal accounting for a MOVED/ASK request whose retry was refused
