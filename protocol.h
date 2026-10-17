@@ -275,6 +275,9 @@ public:
     virtual int write_command_get(const char *key, int key_len, unsigned int offset) = 0;
     virtual int write_command_multi_get(const keylist *keylist) = 0;
     virtual int write_command_wait(unsigned int num_slaves, unsigned int timeout) = 0;
+    // Raw retries bypass the command writers. Protocols that keep reply
+    // expectations must restore them in the same order as the resent bytes.
+    virtual void prepare_request_replay(bool is_get, unsigned int keys) {}
     virtual int parse_response() = 0;
 
     // handle arbitrary command

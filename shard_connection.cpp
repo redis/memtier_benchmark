@@ -1059,6 +1059,7 @@ void shard_connection::replay_request(request *req)
         push_req(new request(rt_asking, 0, NULL, 0));
     }
     evbuffer_add(out, req->m_serialized, req->m_serialized_len);
+    m_protocol->prepare_request_replay(req->m_type == rt_get, req->m_keys);
     gettimeofday(&req->m_sent_time, NULL);
     req->m_retries++;
     // Back in the pipeline: ownership returns to the normal flow.

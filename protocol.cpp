@@ -1311,6 +1311,10 @@ class memcache_meta_protocol : public memcache_text_protocol
 public:
     memcache_meta_protocol() {}
     virtual memcache_meta_protocol *clone(void) { return new memcache_meta_protocol(); }
+    virtual void prepare_request_replay(bool is_get, unsigned int keys)
+    {
+        m_expected_replies.push_back({is_get, is_get ? keys : 1});
+    }
     virtual void reset_state()
     {
         abstract_protocol::reset_state();

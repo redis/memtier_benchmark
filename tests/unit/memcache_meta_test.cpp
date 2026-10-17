@@ -97,6 +97,21 @@ static void framing_tests()
         evbuffer_add(f.input, header, strlen(header));
         check(f.protocol->parse_response() == 0, "INT_MAX value header remains valid and incomplete");
     }
+    {
+        fixture f(false);
+        f.issue(1);
+        f.protocol->reset_state();
+        f.protocol->prepare_request_replay(false, 1);
+        f.protocol->prepare_request_replay(true, 2);
+        f.issue(1);
+        const char *stream = "HD\r\nMN\r\nEN\r\nVA 1\r\nx\r\nMN\r\nEN\r\nMN\r\n";
+        evbuffer_add(f.input, stream, strlen(stream));
+        check(f.protocol->parse_response() == 1, "replayed SET retains kind");
+        check(f.protocol->parse_response() == 1, "replayed MGET retains key count");
+        check(f.protocol->get_response()->get_hits() == 1, "replayed MGET has one hit");
+        check(f.protocol->parse_response() == 1, "new GET follows replayed requests");
+        check(f.protocol->get_response()->get_hits() == 0, "new GET has no stale hit");
+    }
     for (const auto &item : invalid) {
         fixture f(false);
         f.issue(item.gets);
