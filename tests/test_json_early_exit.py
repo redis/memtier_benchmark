@@ -22,7 +22,7 @@ def _run(env, directory, args, **kwargs):
     endpoint = [] if "-S" in args else ["-s", "127.0.0.1", "-p", str(env.getMasterNodesList()[0]["port"])]
     result = subprocess.run(
         [MEMTIER_BINARY] + endpoint + ["-t", "1", "-c", "1",
-         "--requests=10", "--hide-histogram", "--json-out-file", path] + args,
+         "--requests=10", "--hide-histogram", "--debug", "--json-out-file", path] + args,
         capture_output=True, text=True, timeout=20, **kwargs)
     return result, path
 
@@ -35,7 +35,7 @@ def _configuration_only(env, result, path, diagnostic):
     env.assertEqual(list(document), ["configuration", "FATAL_ERROR"])
     env.assertEqual(document["FATAL_ERROR"], "Benchmark terminated before normal finalization")
     env.assertEqual(document["configuration"]["threads"], 1)
-    env.assertNotContains("Json file closed.", result.stderr)
+    env.assertEqual(result.stderr.count("Json file closed."), 1)
 
 
 def test_json_closed_on_thread_prepare_failure(env):
@@ -82,7 +82,6 @@ def test_json_closed_on_worker_reconnect_failure(env):
             env.assertFalse(peer.is_alive())
             env.assertEqual(errors, [])
         _configuration_only(env, result, path, "failed to reconnect.")
-
 
 
 def test_json_retains_results_when_verifier_prepare_fails(env):
