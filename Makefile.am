@@ -44,7 +44,7 @@ memtier_benchmark_CPPFLAGS = \
 	$(LIBCRYPTO_CFLAGS) \
 	$(LIBSSL_CFLAGS)
 memtier_benchmark_SOURCES = \
-	memtier_benchmark.cpp memtier_benchmark.h \
+	memtier_benchmark.cpp memtier_benchmark.h crash_report.h \
 	client.cpp client.h \
 	cluster_client.cpp cluster_client.h \
 	shard_connection.cpp shard_connection.h connections_manager.h \
@@ -79,7 +79,7 @@ memtier_benchmark_LDADD = \
 
 
 check_PROGRAMS = prometheus_metrics_test rate_limiter_test retry_backoff_test keylist_growth_test retry_drain_test socket_options_test hdr_histogram_test cluster_transaction_test \
-    cluster_hslot_test run_stats_counters_test run_stats_merge_test
+    cluster_hslot_test run_stats_counters_test run_stats_merge_test crash_report_test
 
 # The metrics test links only the pure layer (prometheus_metrics.{h,cpp}).
 # First `make check` program in the repo. The metrics layer is config-free and
@@ -150,6 +150,10 @@ run_stats_merge_test_SOURCES = tests/unit/run_stats_merge_test.cpp
 run_stats_merge_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
 run_stats_merge_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 run_stats_merge_test_LDADD = $(filter-out memtier_benchmark-memtier_benchmark.$(OBJEXT),$(memtier_benchmark_OBJECTS)) $(memtier_benchmark_LDADD)
+# Crash report timestamp formatting and UTC offset (#681), against libc.
+crash_report_test_SOURCES = tests/unit/crash_report_test.cpp crash_report.h
+crash_report_test_CPPFLAGS = -I$(srcdir)
+crash_report_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 TESTS = $(check_PROGRAMS)
 
 # Keep the release amalgamation byte-identical to the recorded upstream asset.

@@ -80,6 +80,7 @@ tests/.env/
 /socket_options_test
 /run_stats_counters_test
 /run_stats_merge_test
+/crash_report_test
 tests/unit/prometheus_metrics_test
 *.log
 *.trs

@@ -3,6 +3,11 @@ import time
 import signal
 import subprocess
 import os
+import ctypes
+import datetime
+import fcntl
+import platform
+import re
 import shlex
 import shutil
 import sys
@@ -195,22 +200,10 @@ def test_crash_handler_worker_thread(env):
 
         # Find worker threads by enumerating /proc/<pid>/task/
         # Retry a few times in case threads are still being created
-        task_dir = f"/proc/{proc.pid}/task"
         thread_ids = []
         max_retries = 10
         for retry in range(max_retries):
-            thread_ids = []
-            try:
-                for tid in os.listdir(task_dir):
-                    tid_int = int(tid)
-                    # Skip the main thread (same as process ID)
-                    if tid_int != proc.pid:
-                        thread_ids.append(tid_int)
-            except (OSError, ValueError) as e:
-                print(f"ERROR: Could not enumerate threads: {e}")
-                proc.kill()
-                proc.wait()
-                env.assertTrue(False, message=f"Could not enumerate threads: {e}")
+            thread_ids = _worker_tids(proc.pid)
 
             if len(thread_ids) > 0:
                 print(f"Found {len(thread_ids)} worker threads: {thread_ids}")
@@ -229,7 +222,7 @@ def test_crash_handler_worker_thread(env):
         # Send SEGV signal to the first worker thread
         target_tid = thread_ids[0]
         print(f"Sending SEGV signal to worker thread TID {target_tid} (main PID: {proc.pid})")
-        os.kill(target_tid, signal.SIGSEGV)
+        _signal_thread(proc.pid, target_tid, signal.SIGSEGV)
 
         # Wait for process to crash
         proc.wait(timeout=10)
@@ -297,6 +290,160 @@ def test_crash_handler_worker_thread(env):
 
 
 
+def _crash_shim_env(env, directory, binary):
+    """
+    Build tests/crash_handler_lock_injector.c and return a child environment
+    that preloads it, or skip the test when that cannot be done here.
+    """
+    compiler = shlex.split(os.environ.get("CC", "cc"))
+    if (sys.platform != "linux" or not compiler or not shutil.which(compiler[0])
+            or not shutil.which("ldd")):
+        print("SKIP: needs Linux, a C compiler and ldd")
+        env.skip()
+    try:
+        linked = subprocess.run(["ldd", binary], capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        print("SKIP: ldd timed out")
+        env.skip()
+    if linked.returncode != 0:
+        print(f"SKIP: ldd failed (static executable?): {linked.stderr.strip()}")
+        env.skip()
+    library = Path(directory) / "crash_lock.so"
+    try:
+        subprocess.run(compiler + ["-shared", "-fPIC",
+                                   str(Path(__file__).with_name("crash_handler_lock_injector.c")),
+                                   "-o", str(library), "-ldl", "-lpthread"],
+                       check=True, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        print("SKIP: compiling the preload shim timed out")
+        env.skip()
+    except subprocess.CalledProcessError as e:
+        print(f"SKIP: compiling the preload shim failed: {e.stderr.strip()}")
+        env.skip()
+    # Keep the sanitizer runtime first; its interceptors forward to the shim.
+    runtimes = [line.split()[2] for line in linked.stdout.splitlines()
+                if line.strip().startswith(("libasan.so", "libtsan.so", "libubsan.so"))
+                and "=>" in line and len(line.split()) >= 3]
+    preloads = runtimes + [str(library)]
+    if os.environ.get("LD_PRELOAD"):
+        preloads.append(os.environ["LD_PRELOAD"])
+    child_env = dict(os.environ, LD_PRELOAD=":".join(preloads))
+    child_env.pop("MEMTIER_TEST_BLOCK_BACKTRACE", None)
+    return child_env
+
+
+def _tsan_build():
+    """
+    True for a ThreadSanitizer build. Those keep SIG_DFL for the watchdog
+    (TSan would defer its handler forever), so they print no INCOMPLETE line.
+    """
+    try:
+        linked = subprocess.run(["ldd", shutil.which(MEMTIER_BINARY) or MEMTIER_BINARY],
+                                capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return "libtsan" in linked.stdout
+
+
+def _worker_tids(pid):
+    """
+    Threads of pid other than the main thread that can take SIGSEGV. This
+    leaves out helper threads that block every signal, such as the TSan
+    runtime's background thread and the preload shim's crash-shim thread;
+    a thread-directed SIGSEGV to one of those would stay pending forever.
+    """
+    tids = []
+    try:
+        names = os.listdir(f"/proc/{pid}/task")
+    except OSError:
+        return tids
+    for name in names:
+        tid = int(name)
+        if tid == pid:
+            continue
+        try:
+            with open(f"/proc/{pid}/task/{name}/status") as status:
+                blocked = next((int(line.split()[1], 16) for line in status
+                                if line.startswith("SigBlk:")), 0)
+        except OSError:
+            continue
+        if not blocked & (1 << (signal.SIGSEGV - 1)):
+            tids.append(tid)
+    return sorted(tids)
+
+
+_SYS_TGKILL = {"x86_64": 234, "aarch64": 131, "i686": 270, "armv7l": 268}
+
+
+def _signal_thread(pid, tid, sig):
+    """
+    Send sig to thread tid of process pid. os.kill(tid) is kill(2): it sends a
+    process-directed signal that any thread may take, so use tgkill(2) when
+    this architecture's syscall number is known.
+    """
+    number = _SYS_TGKILL.get(platform.machine())
+    if number is not None:
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.syscall(number, pid, tid, sig) == 0:
+            return
+        print(f"tgkill failed (errno {ctypes.get_errno()}), falling back to kill")
+    os.kill(tid, sig)
+
+
+def _crash_worker(env, child_env, stderr=None, wait_timeout=15, before_crash=None):
+    """
+    Run memtier with child_env, send SIGSEGV to a worker thread once it is
+    running, and return (exit status, output, seconds from SEGV to exit).
+    Output is stdout, plus stderr unless a stderr file object is given.
+    """
+    benchmark_specs = {"name": env.testName, "args": ['--pipeline=10']}
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=2, clients=2, requests=None, test_time=60)
+    add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+    directory = tempfile.mkdtemp()
+    config = RunConfig(directory, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    log_file = os.path.join(config.results_dir, "crash_output.log")
+    with open(log_file, 'w') as f:
+        proc = subprocess.Popen(benchmark.args, stdout=f,
+                                stderr=stderr if stderr is not None else subprocess.STDOUT,
+                                env=child_env)
+    elapsed = None
+    sent_at = None
+    try:
+        # Wait until the workers exist and have started sending traffic.
+        workers = lambda: _worker_tids(proc.pid)
+        for _ in range(50):
+            if proc.poll() is not None or workers():
+                break
+            time.sleep(0.1)
+        time.sleep(2)
+        worker_tids = workers() if proc.poll() is None else []
+        env.assertIsNone(proc.poll(), message="memtier_benchmark exited before the SEGV")
+        env.assertTrue(len(worker_tids) > 0, message="no worker threads found")
+        if before_crash is not None:
+            before_crash()
+        print(f"Sending SEGV to worker thread TID {worker_tids[0]} (main PID: {proc.pid})")
+        start = time.monotonic()
+        sent_at = datetime.datetime.now(datetime.timezone.utc)
+        _signal_thread(proc.pid, worker_tids[0], signal.SIGSEGV)
+        proc.wait(timeout=wait_timeout)
+        elapsed = time.monotonic() - start
+        print(f"Exit status {proc.returncode}, {elapsed:.1f} s after the SEGV")
+    except subprocess.TimeoutExpired:
+        env.assertTrue(False, message=f"Process did not exit within {wait_timeout} s of the SEGV")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    with open(log_file, 'r') as f:
+        output = f.read()
+    shutil.rmtree(directory, ignore_errors=True)
+    print(output[output.find("=== MEMTIER_BENCHMARK BUG REPORT"):])
+    return proc.returncode, output, elapsed, sent_at
+
+
 def test_crash_handler_time_zone_lock_held(env):
     """
     Issue #681: the crash handler called localtime(), which takes glibc's time
@@ -307,81 +454,128 @@ def test_crash_handler_time_zone_lock_held(env):
     are called from a signal handler, which reproduces that deadlock on every
     run. The report must still be complete.
     """
-    compiler = shlex.split(os.environ.get("CC", "cc"))
-    if (sys.platform != "linux" or not compiler or not shutil.which(compiler[0])
-            or not shutil.which("ldd")):
-        env.skip()
-        return
-    benchmark_specs = {"name": env.testName, "args": ['--pipeline=10']}
-    addTLSArgs(benchmark_specs, env)
-    config = get_default_memtier_config(threads=2, clients=2, requests=None, test_time=60)
-    add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
     with tempfile.TemporaryDirectory() as directory:
-        config = RunConfig(directory, env.testName, config, {})
-        ensure_clean_benchmark_folder(config.results_dir)
-        benchmark = Benchmark.from_json(config, benchmark_specs)
-        linked = subprocess.run(["ldd", benchmark.args[0]], capture_output=True, text=True, timeout=10)
-        if linked.returncode != 0:
-            env.skip()  # Static executables cannot use this interposition test.
-            return
-        library = Path(directory) / "tz_lock.so"
-        subprocess.run(compiler + ["-shared", "-fPIC",
-                                   str(Path(__file__).with_name("crash_handler_tz_lock_injector.c")),
-                                   "-o", str(library), "-ldl"],
-                       check=True, capture_output=True, timeout=30)
-        # Keep the sanitizer runtime first; its interceptors forward to the shim.
-        runtimes = [line.split()[2] for line in linked.stdout.splitlines()
-                    if line.strip().startswith(("libasan.so", "libtsan.so", "libubsan.so"))
-                    and "=>" in line and len(line.split()) >= 3]
-        preloads = runtimes + [str(library)]
-        if os.environ.get("LD_PRELOAD"):
-            preloads.append(os.environ["LD_PRELOAD"])
-        child_env = dict(os.environ, LD_PRELOAD=":".join(preloads))
+        child_env = _crash_shim_env(env, directory, shutil.which(MEMTIER_BINARY) or MEMTIER_BINARY)
+        # A fixed zone with a half-hour offset, as a POSIX TZ string so no
+        # zone data is needed: the header must show this local time.
+        child_env["TZ"] = "<+0530>-5:30"
+        returncode, output, _, sent_at = _crash_worker(env, child_env)
 
-        log_file = os.path.join(config.results_dir, "crash_output.log")
-        with open(log_file, 'w') as f:
-            proc = subprocess.Popen(benchmark.args, stdout=f, stderr=subprocess.STDOUT, env=child_env)
+    # The process must end by the crash signal, not by the SIGALRM watchdog.
+    env.assertEqual(returncode, -signal.SIGSEGV,
+                    message=f"exit status {returncode}; -{int(signal.SIGALRM)} means the watchdog killed a stuck handler")
+    markers = ("=== MEMTIER_BENCHMARK BUG REPORT START",
+               "memtier_benchmark crashed by signal: 11",
+               "Crashed running signal <SIGSEGV>",
+               "current/crashing thread",
+               "INFO OUTPUT",
+               "CLIENT LIST OUTPUT",
+               "=== MEMTIER_BENCHMARK BUG REPORT END")
+    missing = [m for m in markers if m not in output]
+    env.assertEqual(missing, [], message="crash report incomplete")
+    env.assertNotContains("BUG REPORT INCOMPLETE", output)
+
+    stamp = re.search(r"^\[\d+\] (\d\d \w{3} \d{4} \d\d:\d\d:\d\d) # memtier_benchmark crashed by signal", output, re.M)
+    env.assertIsNotNone(stamp, message="no timestamp on the crash header")
+    if stamp is not None and sent_at is not None:
+        expected = (sent_at + datetime.timedelta(hours=5, minutes=30)).replace(tzinfo=None)
+        shown = datetime.datetime.strptime(stamp.group(1), "%d %b %Y %H:%M:%S")
+        env.assertLess(abs((shown - expected).total_seconds()), 5,
+                       message=f"header time {shown}, expected about {expected} (UTC+05:30)")
+
+
+def test_crash_handler_watchdog_marks_incomplete_report(env):
+    """
+    When the best-effort part of the report hangs (here backtrace() blocks on
+    the signal stack), the SIGALRM watchdog must say the report is incomplete
+    and end the process about 5 s after the crash. The lines written before
+    the hang must be there. TSan builds end the same way without the line.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        child_env = _crash_shim_env(env, directory, shutil.which(MEMTIER_BINARY) or MEMTIER_BINARY)
+        child_env["MEMTIER_TEST_BLOCK_BACKTRACE"] = "1"
+        returncode, output, elapsed, _ = _crash_worker(env, child_env)
+
+    env.assertEqual(returncode, -signal.SIGALRM)
+    env.assertIsNotNone(elapsed)
+    if elapsed is not None:
+        env.assertLess(elapsed, 8, message=f"watchdog took {elapsed:.1f} s")
+    markers = ["=== MEMTIER_BENCHMARK BUG REPORT START", "memtier_benchmark crashed by signal: 11"]
+    if not _tsan_build():
+        markers.append("=== MEMTIER_BENCHMARK BUG REPORT INCOMPLETE")
+    for marker in markers:
+        env.assertContains(marker, output)
+    env.assertNotContains("=== MEMTIER_BENCHMARK BUG REPORT END", output)
+
+
+def test_crash_handler_header_survives_stderr_lock(env):
+    """
+    When another thread holds stderr's stdio lock, every fprintf(stderr) in
+    the crash handler blocks. The header lines are written with write(2) and
+    must still appear, and the watchdog must add the INCOMPLETE line and end
+    the process. The shim takes the lock from a helper thread when the crash
+    handler arms its alarm.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        child_env = _crash_shim_env(env, directory, shutil.which(MEMTIER_BINARY) or MEMTIER_BINARY)
+        child_env["MEMTIER_TEST_LOCK_STDERR"] = "1"
+        returncode, output, elapsed, _ = _crash_worker(env, child_env)
+
+    env.assertEqual(returncode, -signal.SIGALRM)
+    env.assertIsNotNone(elapsed)
+    if elapsed is not None:
+        env.assertLess(elapsed, 10, message=f"watchdog took {elapsed:.1f} s")
+    markers = ["=== MEMTIER_BENCHMARK BUG REPORT START",
+               "memtier_benchmark crashed by signal: 11",
+               "Crashed running signal <SIGSEGV>",
+               "Signal code:",
+               "Fault address:"]
+    if not _tsan_build():
+        markers.append("=== MEMTIER_BENCHMARK BUG REPORT INCOMPLETE")
+    missing = [m for m in markers if m not in output]
+    env.assertEqual(missing, [], message="lines written with write(2) are missing")
+    # The stack trace header is the first fprintf; it must not get through.
+    env.assertNotContains("--- STACK TRACE", output)
+
+
+def test_crash_handler_watchdog_blocked_stderr(env):
+    """
+    When stderr is a pipe that nobody drains, every write in the crash handler
+    blocks, including the watchdog's own INCOMPLETE line. The watchdog must
+    still end the process: it re-arms alarm(1) before writing, and the second
+    SIGALRM takes the default action.
+    """
+    if sys.platform != "linux" or not hasattr(fcntl, "F_SETPIPE_SZ"):
+        env.skip()
+    read_fd, write_fd = os.pipe()
+    fill_fd = None
+    try:
         try:
-            # Wait until the workers exist and have started sending traffic.
-            task_dir = f"/proc/{proc.pid}/task"
-            worker_tids = []
-            for _ in range(50):
-                if proc.poll() is not None:
-                    break
-                worker_tids = [int(t) for t in os.listdir(task_dir) if int(t) != proc.pid]
-                if worker_tids:
-                    break
-                time.sleep(0.1)
-            time.sleep(2)
-            env.assertIsNone(proc.poll(), message="memtier_benchmark exited before the SEGV")
-            env.assertTrue(len(worker_tids) > 0, message="no worker threads found")
-            print(f"Sending SEGV to worker thread TID {worker_tids[0]} (main PID: {proc.pid})")
-            os.kill(worker_tids[0], signal.SIGSEGV)
-            # A deadlocked handler is killed by its own alarm(5) watchdog.
-            proc.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-            env.assertTrue(False, message="Process did not exit after SEGV signal")
-        finally:
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait()
+            fcntl.fcntl(write_fd, fcntl.F_SETPIPE_SZ, 4096)
+        except OSError:
+            pass  # A larger pipe only means more bytes to fill below.
+        # A second open of the pipe gets its own file description, so making
+        # it non-blocking does not affect memtier's blocking stderr.
+        fill_fd = os.open(f"/proc/self/fd/{write_fd}", os.O_WRONLY | os.O_NONBLOCK)
 
-        with open(log_file, 'r') as f:
-            crash_output = f.read()
-        print(crash_output[crash_output.find("=== MEMTIER_BENCHMARK BUG REPORT"):])
+        def fill_pipe():
+            try:
+                while True:
+                    os.write(fill_fd, b"x" * 512)
+            except BlockingIOError:
+                pass
 
-        # The process must end by the crash signal, not by the SIGALRM watchdog.
-        env.assertEqual(proc.returncode, -signal.SIGSEGV,
-                        message=f"exit status {proc.returncode}; -{int(signal.SIGALRM)} means the watchdog killed a stuck handler")
-        markers = ("=== MEMTIER_BENCHMARK BUG REPORT START",
-                   "memtier_benchmark crashed by signal: 11",
-                   "Crashed running signal <SIGSEGV>",
-                   "current/crashing thread",
-                   "INFO OUTPUT",
-                   "CLIENT LIST OUTPUT",
-                   "=== MEMTIER_BENCHMARK BUG REPORT END")
-        missing = [m for m in markers if m not in crash_output]
-        env.assertEqual(missing, [], message="crash report incomplete")
-        env.assertNotContains("BUG REPORT INCOMPLETE", crash_output)
+        with os.fdopen(os.dup(write_fd), "wb") as stderr:
+            os.close(write_fd)
+            write_fd = None
+            returncode, output, elapsed, _ = _crash_worker(env, None, stderr=stderr, before_crash=fill_pipe)
+    finally:
+        for fd in (read_fd, write_fd, fill_fd):
+            if fd is not None:
+                os.close(fd)
+
+    env.assertEqual(returncode, -signal.SIGALRM,
+                    message=f"exit status {returncode}; the watchdog did not end a handler blocked on stderr")
+    env.assertIsNotNone(elapsed)
+    if elapsed is not None:
+        env.assertLess(elapsed, 9, message=f"watchdog took {elapsed:.1f} s")

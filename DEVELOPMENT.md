@@ -376,6 +376,22 @@ When a crash occurs, memtier_benchmark will automatically:
        Please report this bug by opening an issue on github.com/redis/memtier_benchmark
 ```
 
+The header lines (START, signal, signal code, fault address) are written with
+async-signal-safe calls only, so they appear even when the crash interrupted a
+thread holding the malloc, stdio or time zone lock. The rest of the report is
+best effort. If the handler gets stuck after the header, a watchdog ends the
+process with SIGALRM about 5 seconds after the crash, and the report ends
+with this line instead of the END marker:
+
+```
+=== MEMTIER_BENCHMARK BUG REPORT INCOMPLETE: crash handler timed out ===
+```
+
+If even that line cannot be written (for example, stderr is a pipe that nobody
+reads), the process still exits about a second later. In both cases the
+process ends by SIGALRM rather than the original signal, so no core dump is
+written.
+
 ### Testing the Crash Handler
 
 You can test the crash handler functionality by sending a signal to a running memtier_benchmark process:

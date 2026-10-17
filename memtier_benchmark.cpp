@@ -109,6 +109,7 @@ static bool bitmask_is_contiguous(unsigned int mask);
 #include "latency_percentiles.h"
 #include "retry_policy.h"
 #include "statsd.h"
+#include "crash_report.h"
 #include "prometheus_metrics.h"
 #include "prometheus_exporter.h"
 
@@ -437,103 +438,9 @@ static const char *interrupt_source(void)
 }
 
 // Offset of local time from UTC, in seconds, taken once at startup by
-// prewarm_crash_handler(). The crash handler cannot call localtime(): the
-// first call loads the time zone (malloc, fopen) and every call takes glibc's
-// time zone lock, so a crash that interrupts a thread holding the malloc or
-// time zone lock deadlocked the handler before it printed anything, until
-// alarm(5) killed the process silently (#681). A DST change during the run
-// makes the crash timestamp off by the DST shift; that is acceptable.
+// prewarm_crash_handler() with crash_utc_offset(). The crash handler cannot
+// call localtime(); see crash_report.h (#681).
 static long g_crash_utc_offset = 0;
-
-static const char *const crash_month_names[12] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                                                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-
-// A fixed-size line buffer the crash handler formats into and writes to
-// stderr with write(2). Only async-signal-safe operations: no stdio, no
-// malloc, no locale. Output that does not fit is truncated.
-struct crash_line
-{
-    char buf[256];
-    size_t len;
-    crash_line() : len(0) {}
-    void str(const char *s)
-    {
-        while (s != NULL && *s != '\0' && len < sizeof(buf))
-            buf[len++] = *s++;
-    }
-    void num(unsigned long long v, unsigned int base, int min_digits)
-    {
-        char tmp[32];
-        int n = 0;
-        do {
-            tmp[n++] = "0123456789abcdef"[v % base];
-            v /= base;
-        } while (v != 0 && n < (int) sizeof(tmp));
-        while (n < min_digits && n < (int) sizeof(tmp))
-            tmp[n++] = '0';
-        while (n > 0 && len < sizeof(buf))
-            buf[len++] = tmp[--n];
-    }
-    void num(long long v)
-    {
-        if (v < 0) {
-            str("-");
-            num(0ULL - (unsigned long long) v, 10, 1);
-        } else {
-            num((unsigned long long) v, 10, 1);
-        }
-    }
-    void write_out(void)
-    {
-        size_t off = 0;
-        while (off < len) {
-            ssize_t n = write(STDERR_FILENO, buf + off, len - off);
-            if (n < 0 && errno == EINTR) continue;
-            if (n <= 0) break;
-            off += (size_t) n;
-        }
-        len = 0;
-    }
-};
-
-// Format now + g_crash_utc_offset as "%d %b %Y %H:%M:%S" (the format the
-// report has always used) with integer arithmetic only. The date math is
-// Howard Hinnant's civil_from_days.
-static void format_crash_time(char *out, size_t out_len)
-{
-    long long t = (long long) time(NULL) + g_crash_utc_offset;
-    long long days = t / 86400;
-    long long secs = t % 86400;
-    if (secs < 0) {
-        secs += 86400;
-        days -= 1;
-    }
-    long long z = days + 719468;
-    long long era = (z >= 0 ? z : z - 146096) / 146097;
-    long long doe = z - era * 146097;
-    long long yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    long long doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    long long mp = (5 * doy + 2) / 153;
-    long long day = doy - (153 * mp + 2) / 5 + 1;
-    long long month = mp < 10 ? mp + 3 : mp - 9;
-    long long year = yoe + era * 400 + (month <= 2 ? 1 : 0);
-
-    crash_line l;
-    l.num((unsigned long long) day, 10, 2);
-    l.str(" ");
-    l.str(crash_month_names[month - 1]);
-    l.str(" ");
-    l.num(year);
-    l.str(" ");
-    l.num((unsigned long long) (secs / 3600), 10, 2);
-    l.str(":");
-    l.num((unsigned long long) (secs / 60 % 60), 10, 2);
-    l.str(":");
-    l.num((unsigned long long) (secs % 60), 10, 2);
-    size_t n = l.len < out_len - 1 ? l.len : out_len - 1;
-    memcpy(out, l.buf, n);
-    out[n] = '\0';
-}
 
 // Begin a report line: "[pid] timestr # ".
 static void crash_line_prefix(crash_line &l, int pid, const char *timestr)
@@ -545,16 +452,35 @@ static void crash_line_prefix(crash_line &l, int pid, const char *timestr)
     l.str(" # ");
 }
 
+// ThreadSanitizer runs a handler for an asynchronous signal only when the
+// receiving thread is in, or leaves, an intercepted call. A thread stuck on
+// a futex or in a blocked write never does, so the watchdog handler would
+// never run and the process would hang. TSan builds keep SIG_DFL for
+// SIGALRM, which the kernel applies directly, and have no INCOMPLETE line.
+#if defined(__SANITIZE_THREAD__)
+#define MEMTIER_THREAD_SANITIZER 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define MEMTIER_THREAD_SANITIZER 1
+#endif
+#endif
+
+#ifndef MEMTIER_THREAD_SANITIZER
 // SIGALRM handler armed by crash_handler(): say why the report stops, then
-// end the process with the default SIGALRM action as before.
+// end the process with the default SIGALRM action as before. The write can
+// block too (stderr is a full pipe or a stopped tty), so first re-arm the
+// alarm: SA_RESETHAND already restored SIG_DFL, and SA_NODEFER leaves
+// SIGALRM unblocked, so the second alarm kills the process 1 s later.
 static void crash_watchdog_handler(int sig)
 {
+    alarm(1);
     crash_line l;
-    l.str("\n=== MEMTIER_BENCHMARK BUG REPORT INCOMPLETE: crash handler timed out after 5 seconds ===\n");
+    l.str("\n=== MEMTIER_BENCHMARK BUG REPORT INCOMPLETE: crash handler timed out ===\n");
     l.write_out();
     signal(sig, SIG_DFL);
     raise(sig);
 }
+#endif
 
 // Crash handler - prints stack trace and other debugging information
 static void crash_handler(int sig, siginfo_t *info, void *secret)
@@ -569,17 +495,19 @@ static void crash_handler(int sig, siginfo_t *info, void *secret)
     // original signal will be re-raised on a fresh sigaction below, but if
     // we never get there, SIGALRM provides the floor. The watchdog first
     // writes a line saying the report is incomplete.
+#ifndef MEMTIER_THREAD_SANITIZER
     struct sigaction alarm_act;
     sigemptyset(&alarm_act.sa_mask);
-    alarm_act.sa_flags = SA_ONSTACK;
+    alarm_act.sa_flags = SA_ONSTACK | SA_NODEFER | SA_RESETHAND;
     alarm_act.sa_handler = crash_watchdog_handler;
     sigaction(SIGALRM, &alarm_act, NULL);
+#endif
     alarm(5);
 
     // The header and signal details use only async-signal-safe calls
     // (time, getpid, write), so they reach stderr even when the crash
     // interrupted a thread holding the malloc, stdio or time zone lock.
-    format_crash_time(timestr, sizeof(timestr));
+    crash_format_time(timestr, sizeof(timestr), (long long) time(NULL), g_crash_utc_offset);
 
     const char *signal_name = "UNKNOWN";
     switch (sig) {
@@ -723,20 +651,9 @@ static void prewarm_crash_handler(void)
     // Resolve event_get_version too — used in the INFO section.
     (void) event_get_version();
 
-    // The handler formats its timestamp by hand from this offset; see
-    // g_crash_utc_offset. tm_gmtoff is not in POSIX, so derive the offset
-    // from the local and UTC broken-down forms of the same instant.
-    time_t now = time(NULL);
-    struct tm lt, gt;
-    if (localtime_r(&now, &lt) != NULL && gmtime_r(&now, &gt) != NULL) {
-        long off = (lt.tm_hour - gt.tm_hour) * 3600L + (lt.tm_min - gt.tm_min) * 60L + (lt.tm_sec - gt.tm_sec);
-        if (lt.tm_year != gt.tm_year) {
-            off += (lt.tm_year > gt.tm_year ? 1 : -1) * 86400L;
-        } else {
-            off += (lt.tm_yday - gt.tm_yday) * 86400L;
-        }
-        g_crash_utc_offset = off;
-    }
+    // The handler formats its timestamp by hand from this offset, and this
+    // first localtime_r() call also loads the time zone data.
+    g_crash_utc_offset = crash_utc_offset(time(NULL));
 }
 
 // Setup crash handlers
@@ -764,10 +681,11 @@ static void setup_crash_handlers(void)
     sigaction(SIGFPE, &act, NULL);
     sigaction(SIGILL, &act, NULL);
     sigaction(SIGABRT, &act, NULL);
-    // SIGALRM is the handler's own watchdog; if alarm(5) fires we want the
-    // default action (terminate the process) rather than re-entering the
-    // handler. Explicitly request SIG_DFL so the user can't have overridden
-    // it inadvertently.
+    // SIGALRM is the crash handler's watchdog. SIG_DFL (terminate) is the
+    // baseline; crash_handler() installs crash_watchdog_handler, which
+    // prints an INCOMPLETE marker and falls back to SIG_DFL, before it calls
+    // alarm(5). Explicitly request SIG_DFL here so an inherited disposition
+    // cannot turn the watchdog off.
     struct sigaction alarm_act;
     sigemptyset(&alarm_act.sa_mask);
     alarm_act.sa_flags = 0;
