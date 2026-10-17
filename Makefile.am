@@ -79,7 +79,7 @@ memtier_benchmark_LDADD = \
 
 
 check_PROGRAMS = prometheus_metrics_test rate_limiter_test retry_backoff_test keylist_growth_test retry_drain_test socket_options_test hdr_histogram_test cluster_transaction_test \
-    cluster_hslot_test run_stats_counters_test run_stats_merge_test crash_report_test file_io_test
+    cluster_hslot_test run_stats_counters_test run_stats_merge_test crash_report_test
 
 # The metrics test links only the pure layer (prometheus_metrics.{h,cpp}).
 # First `make check` program in the repo. The metrics layer is config-free and
@@ -155,6 +155,7 @@ crash_report_test_SOURCES = tests/unit/crash_report_test.cpp crash_report.h
 crash_report_test_CPPFLAGS = -I$(srcdir)
 crash_report_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 # --data-import reader: errors, truncated last item, reopen (#766).
+check_PROGRAMS += file_io_test
 file_io_test_SOURCES = tests/unit/file_io_test.cpp file_io.cpp file_io.h item.cpp item.h
 file_io_test_CPPFLAGS = -I$(srcdir)
 file_io_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
