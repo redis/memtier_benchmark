@@ -1,7 +1,9 @@
 """Empty MOVED/ASK hosts inherit the replying connection, including non-seeds."""
 import csv
+import errno
 import json
 import os
+import socket
 import socketserver
 import subprocess
 import tempfile
@@ -148,9 +150,25 @@ def _check_redirect(env, redirect, empty, nonseed, read):
             env.assertEqual(list(csv.DictReader(stream)), [], message=label)
 
 
-def test_empty_redirect_host(env):
+def _check_redirect_cases(env, nonseed):
     for redirect in ("ASK", "MOVED"):
         for empty in (False, True):
-            for nonseed in (False, True):
-                for read in (False, True):
-                    _check_redirect(env, redirect, empty, nonseed, read)
+            for read in (False, True):
+                _check_redirect(env, redirect, empty, nonseed, read)
+
+
+def test_empty_redirect_host(env):
+    _check_redirect_cases(env, nonseed=False)
+
+
+def test_empty_redirect_host_uses_nonseed_sender(env):
+    # Some platforms require explicitly configuring this loopback alias.
+    # Only these cases need it; retain all seed cases on those platforms.
+    try:
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.2", 0))
+    except OSError as error:
+        if error.errno in (errno.EADDRNOTAVAIL, errno.EAFNOSUPPORT, 10049):
+            env.skip()
+        raise
+    _check_redirect_cases(env, nonseed=True)
