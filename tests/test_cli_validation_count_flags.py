@@ -696,16 +696,24 @@ def test_uri_database_number(env):
         return _run_memtier(["--uri=redis://127.0.0.1:1/" + path, "-n", "1", "-c", "1", "-t", "1", "--show-config"])
 
     for path, db in (("0", "0"), ("7", "7"), ("+3", "3"), (" 5", "5"), ("-0", "0"), ("-00", "0"),
-                     (INT_MAX, INT_MAX), ("", "0")):
+                     (INT_MAX, INT_MAX)):
         result = run(path)
         label = "--uri .../{!r}".format(path)
         env.assertFalse("invalid database number" in result.stderr, message=label + ": " + result.stderr)
         env.assertTrue("select-db = {}\n".format(db) in result.stderr, message=label + ": " + result.stderr)
     for path in ("-1", "-2147483648", "2147483648", "4294967296", "4294967297", "6442450943",
-                 "99999999999999999999999", "-99999999999999999999999", "abc", "1x", "1 ", "+-1", "- 1", "++1",
+                 "99999999999999999999999", "-99999999999999999999999",
+                 # (int) strtol() wrapped these into db 1 and db 0.
+                 "-4294967295", "-4294967296",
+                 # strtoull() would negate these into db 1 and db 2147483647.
+                 "-18446744073709551615", "-18446744071562067969", "abc", "1x", "1 ", "+-1", "- 1", "++1",
                  " ", "0x10"):
         result = run(path)
         label = "--uri .../{!r}".format(path)
         env.assertNotEqual(result.returncode, 0, message=label + ": " + result.stderr)
         env.assertTrue("error: invalid database number '{}'.".format(path) in result.stderr,
                        message=label + ": " + result.stderr)
+    # An empty path selects no database, so the --select-db value is kept.
+    result = _run_memtier(["--select-db=3", "--uri=redis://127.0.0.1:1/", "-n", "1", "-c", "1", "-t", "1",
+                           "--show-config"])
+    env.assertTrue("select-db = 3\n" in result.stderr, message="empty path: " + result.stderr)

@@ -1267,8 +1267,7 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
         *db_start = '\0';
         db_start++;
         if (strlen(db_start) > 0) {
-            // Same rule as --select-db: (int) strtol() turned 4294967297
-            // into db 1 and 4294967296 into db 0.
+            // Same rule as --select-db: parse_unsigned() with an INT_MAX bound.
             unsigned long long db;
             if (!parse_unsigned(db_start, INT_MAX, &db)) {
                 fprintf(stderr, "error: invalid database number '%s'.\n", db_start);
