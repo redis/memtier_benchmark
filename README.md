@@ -418,6 +418,16 @@ running against a Redis Cluster with replicas.  Four modes are available:
   until warm, then reads are routed to the lowest-EWMA endpoint among
   warm replicas (primary may participate once it has accumulated samples).
 
+Replica setup rejection (AUTH, SELECT or HELLO) has a separate policy from
+routing around an unavailable node. Under `primary`, a rejected replica is
+closed and left closed because it is not needed. With `--reconnect-on-error`,
+`secondaryPreferred` also closes such a replica without redialing it or
+failing the run; reads can fall back to the primary. Without that flag,
+`secondaryPreferred` keeps the existing setup-failure handling. `secondary`
+and `nearest` do not use this optional-replica exception: although routing
+may allow a primary fallback, an unrecovered setup rejection can still fail
+the run. Ordinary connection losses continue to follow the reconnect policy.
+
 When the target node class is unavailable, the fallback is controlled by
 `--read-preference-fallback`:
 
@@ -487,9 +497,10 @@ run's stop condition:
   than the deadline, whatever the backoff delay, and the report's duration and
   throughput cover `--test-time`, not the time spent waiting for a failed
   reconnect.
-  - A server that rejected a setup step (AUTH, SELECT, HELLO) since the
-    connection's last reply fails the run instead (exit code 1), as when the
-    setup keeps failing at the deadline.
+  - A required connection whose setup step (AUTH, SELECT, HELLO) was rejected
+    since its last reply fails the run instead (exit code 1), as when setup
+    keeps failing at the deadline. The optional-replica exceptions are
+    described under Read Preference above.
   - A connection that a live server drops around the deadline is still
     reconnected once, so requests held for replay are resent; if that
     reconnect fails or is dropped again, the run ends. So a peer that accepts
@@ -500,7 +511,9 @@ run's stop condition:
     over, a refresh still redials it; if that dial fails, the connection is
     left closed and the requests it held count as errors.
   - A client that never got a reply before the server went away did no work:
-    it stops at the deadline too, but fails the run (exit code 1). One whose
+    it stops at the deadline too, but fails the run (exit code 1), even if
+    other clients on its thread completed requests. This includes a client
+    prevented from starting by repeated TLS-handshake failures. One whose
     first connection only completes after the deadline (e.g. a server killing
     connections before their first reply) is timed from the start of the run,
     so it ends at its first reply instead of running a whole `--test-time`.
