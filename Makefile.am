@@ -19,6 +19,7 @@ AUTOMAKE_OPTIONS = foreign 1.9 subdir-objects
 CODE_COVERAGE_IGNORE_PATTERN='*/deps/hdr_histogram/*' '*/tests/*'
 
 EXTRA_DIST = README.md COPYING version.sh \
+	tests/check_version_build.py \
 	scripts/fetch_commands_meta.sh \
 	scripts/gen_command_meta.py \
 	deps/commands_json/REDIS_TAG.txt \
@@ -28,8 +29,17 @@ EXTRA_DIST = README.md COPYING version.sh \
 BUILT_SOURCES = version.h
 CLEANFILES = version.h
 
-version.h:
-	$(SHELL) $(srcdir)/version.sh
+# HEAD and tracked-file state can change without touching a build input.
+# version.sh preserves the header timestamp when its contents are unchanged.
+.PHONY: FORCE_VERSION
+FORCE_VERSION:
+
+version.h: $(srcdir)/version.sh FORCE_VERSION
+	$(SHELL) $(srcdir)/version.sh "$(srcdir)"
+
+# BUILT_SOURCES covers aggregate targets; direct binary/object targets need
+# these dependencies too, including their first parallel build.
+memtier_benchmark-memtier_benchmark.$(OBJEXT) memtier_benchmark-prometheus_exporter.$(OBJEXT): version.h
 
 bin_PROGRAMS = memtier_benchmark
 if INSTALL_BASH_COMPLETION

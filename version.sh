@@ -3,18 +3,36 @@
 
 GIT_SHA1="00000000"
 GIT_DIRTY="0"
+srcdir=${1:-$(dirname "$0")}
 
-# Check if we're in a git repository
-if command -v git >/dev/null 2>&1 && [ -d .git ] || git rev-parse --git-dir > /dev/null 2>&1; then
-    # Get the short SHA1
-    GIT_SHA1=$(git rev-parse --short=8 HEAD 2>/dev/null || echo "00000000")
-    
-    # Check if working directory is dirty
-    git diff-index --quiet HEAD -- 2>/dev/null
-    if [ $? -ne 0 ]; then
-        GIT_DIRTY="1"
+metadata_error() {
+    echo "warning: cannot read Git metadata from $srcdir; using unknown provenance. Check repository access/ownership." >&2
+    GIT_SHA1="00000000"
+    GIT_DIRTY="0"
+}
+
+# Use the source checkout, not an unrelated out-of-tree build directory.
+# A source archive unpacked inside another repository must not inherit its SHA.
+if command -v git >/dev/null 2>&1; then
+    if git -C "$srcdir" ls-files --error-unmatch -- version.sh >/dev/null 2>&1; then
+        if GIT_SHA1=$(git -C "$srcdir" rev-parse --short=8 HEAD 2>/dev/null); then
+            git -C "$srcdir" diff-index --quiet HEAD -- 2>/dev/null
+            case $? in
+                0) GIT_DIRTY="0" ;;
+                1) GIT_DIRTY="1" ;;
+                *) metadata_error ;;
+            esac
+        else
+            metadata_error
+        fi
     else
-        GIT_DIRTY="0"
+        git_status=$?
+        # A real checkout may be unreadable under a different install user.
+        # Warn instead of retaining possibly stale metadata or failing a
+        # previously supported build. Untracked archives (status 1) are normal.
+        if [ "$git_status" -ne 1 ] && [ -e "$srcdir/.git" ]; then
+            metadata_error
+        fi
     fi
 fi
 

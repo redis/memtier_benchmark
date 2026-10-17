@@ -238,11 +238,13 @@ Patch releases live on a release branch (e.g. `2.3` for the 2.3.x line). The flo
 `configure.ac + memtier_benchmark.1` as a single `Release <version>` commit.
 Watch out for:
 
-- **Stale `version.h` corrupts the man page.** The Makefile rule
-  `version.h: $(SHELL) $(srcdir)/version.sh` has **no dependencies**, so once
-  `version.h` exists `make` won't re-run `version.sh`. The script then bakes an
-  outdated git SHA into `memtier_benchmark.1` via `help2man`. **Always
-  `rm -f version.h` before running the script** so the SHA matches HEAD.
+- **Version metadata follows the source checkout.** The build rechecks Git
+  metadata on every invocation and updates `version.h` only when it changes.
+  Older branches with the dependencyless header rule still require removing
+  `version.h` before running this script, or `help2man` can embed a stale SHA.
+  A Git metadata error warns and uses unknown provenance; correct repository
+  access/ownership to recover the SHA. Installation also rechecks metadata and
+  can rebuild its consumers if the SHA, dirty state or Git access changed.
 - **No branch sanity check.** The script doesn't verify the current branch.
   Confirm `git branch --show-current` matches the intended release branch
   before running.
