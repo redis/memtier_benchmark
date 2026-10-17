@@ -35,6 +35,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <climits>
+#include <cmath>
 #include <algorithm>
 
 #include "config_types.h"
@@ -97,7 +98,7 @@ config_quantiles::config_quantiles(const char *str)
         double quantile;
         char *p = NULL;
         quantile = strtod(str, &p);
-        if (!p || (*p != ',' && *p != '\0')) {
+        if (p == str || !std::isfinite(quantile) || quantile < 0.0 || quantile > 100.0 || (*p != ',' && *p != '\0')) {
             quantile_list.clear();
             return;
         }

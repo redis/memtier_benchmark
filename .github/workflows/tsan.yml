@@ -66,6 +66,10 @@ jobs:
         ldd ./memtier_benchmark | grep tsan
         echo "✓ ThreadSanitizer is linked"
 
+    # A linked runtime alone does not prove C translation units were instrumented.
+    - name: Verify HDR C instrumentation
+      run: nm -u deps/hdr_histogram/memtier_benchmark-hdr_histogram.o | grep -E '__tsan_(read|write)'
+
     - name: Upload build artifact
       uses: actions/upload-artifact@v5
       with:

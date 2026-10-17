@@ -717,3 +717,22 @@ def test_uri_database_number(env):
     result = _run_memtier(["--select-db=3", "--uri=redis://127.0.0.1:1/", "-n", "1", "-c", "1", "-t", "1",
                            "--show-config"])
     env.assertTrue("select-db = 3\n" in result.stderr, message="empty path: " + result.stderr)
+
+
+def test_print_percentiles_validation(env):
+    """Reject unsafe histogram quantiles during argument parsing, before I/O."""
+    prefix = ["--server=127.0.0.1", "--port=1"]
+    invalid = ("nan", "-nan", "+nan", "nan(payload)", "inf", "-inf", "+inf",
+               "infinity", "-1e300", "1e300", "-1e999", "1e999", "-0.1", "100.1", "101", "",
+               ",", ",50", "50,,99", "garbage", "50,nan,99", "50,-inf", "50,101")
+    for value in invalid:
+        result = _run_memtier(prefix + ["--print-percentiles=" + value, "--version"])
+        env.assertNotEqual(result.returncode, 0, message=repr(value))
+        env.assertContains("error: quantiles must be expressed as", result.stderr)
+    # Preserve valid boundaries, order, duplicates and existing strtod syntax.
+    # A final comma was already accepted and is independent of numeric safety.
+    valid = ("0", "100", "-0", "-0.0", "+50", " 50", "5e1", "0x1p5", "50,",
+             "100,0,99.999999,50,50,0.001", "0,50,99,99.9,100")
+    for value in valid:
+        result = _run_memtier(prefix + ["--print-percentiles=" + value, "--version"])
+        env.assertEqual(result.returncode, 0, message=repr(value) + ": " + result.stderr)

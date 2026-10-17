@@ -20,6 +20,7 @@
 #define MEMTIER_LATENCY_PERCENTILES_H
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <numeric>
 #include <vector>
@@ -27,28 +28,27 @@
 
 // Batch a configured percentile list while preserving the scalar query's
 // ordering, p0 and empty-histogram behavior. Reuse one instance between ticks;
-// calculate() does not allocate. The caller owns a stable histogram snapshot.
+// calculate() does not allocate. Inputs must be finite and in [0, 100], as
+// validated by config_quantiles. The caller owns a stable histogram snapshot.
 class latency_percentiles
 {
     std::vector<double> m_sorted_quantiles;
     std::vector<size_t> m_order;
     std::vector<int64_t> m_sorted_values;
     std::vector<int64_t> m_values;
-    bool m_finite;
 
 public:
     explicit latency_percentiles(const std::vector<double> &quantiles) :
             m_sorted_quantiles(quantiles),
             m_order(quantiles.size()),
             m_sorted_values(quantiles.size()),
-            m_values(quantiles.size()),
-            m_finite(true)
+            m_values(quantiles.size())
     {
         std::iota(m_order.begin(), m_order.end(), 0);
-        for (double p : quantiles)
-            m_finite = m_finite && std::isfinite(p);
-        // Keep legacy scalar handling of non-finite inputs; never sort NaNs.
-        if (!m_finite) return;
+        for (double p : quantiles) {
+            assert(std::isfinite(p) && p >= 0.0 && p <= 100.0);
+            (void) p; // Keep NDEBUG builds warning-free.
+        }
         std::stable_sort(m_order.begin(), m_order.end(),
                          [&quantiles](size_t a, size_t b) { return quantiles[a] < quantiles[b]; });
         for (size_t i = 0; i < m_order.size(); ++i)
@@ -62,7 +62,7 @@ public:
         if (m_values.empty()) return m_values;
         // Upstream batch queries return rank placeholders on an empty histogram,
         // unlike scalar queries. Preserve existing live/final output semantics.
-        if (!m_finite || hdr_total_count(histogram) == 0) {
+        if (hdr_total_count(histogram) == 0) {
             for (size_t i = 0; i < m_order.size(); ++i)
                 m_values[m_order[i]] = hdr_value_at_percentile(histogram, m_sorted_quantiles[i]);
             return m_values;
