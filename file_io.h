@@ -32,6 +32,7 @@ protected:
     FILE *m_file;           /** handle of open file */
 
     unsigned int m_line; /** current line being read */
+    bool m_error;        /** read_item() hit a malformed item */
 
     char *read_string(unsigned int len, unsigned int alloc_len, unsigned int *actual_len);
 
@@ -42,6 +43,8 @@ public:
 
     bool open_file(void);
     bool is_eof(void);
+    bool has_error(void) const { return m_error; }
+    const char *get_filename(void) const { return m_filename; }
     memcache_item *read_item(void);
 };
 

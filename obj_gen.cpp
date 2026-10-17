@@ -535,18 +535,22 @@ bool imported_keylist::read_keys(void)
     file_reader f(m_filename);
 
     if (!f.open_file()) return false;
-    while (!f.is_eof()) {
-        memcache_item *i = f.read_item();
+    // read_item() returns NULL both at the end of the file and on a malformed
+    // item, and it does not skip past the bad input. Stop at the first NULL.
+    memcache_item *i;
+    while ((i = f.read_item()) != NULL) {
+        key *k = (key *) malloc(i->get_nkey() + sizeof(key) + 1);
+        assert(k != NULL);
+        k->key_len = i->get_nkey();
+        memcpy(k->key_data, i->get_key(), i->get_nkey());
+        delete i;
 
-        if (i != NULL) {
-            key *k = (key *) malloc(i->get_nkey() + sizeof(key) + 1);
-            assert(k != NULL);
-            k->key_len = i->get_nkey();
-            memcpy(k->key_data, i->get_key(), i->get_nkey());
-            delete i;
-
-            m_keys.push_back(k);
-        }
+        m_keys.push_back(k);
+    }
+    if (f.has_error()) return false;
+    if (m_keys.empty()) {
+        fprintf(stderr, "%s: no items found.\n", m_filename);
+        return false;
     }
 
     return true;
@@ -602,6 +606,24 @@ import_object_generator::import_object_generator(const import_object_generator &
 
 bool import_object_generator::open_file(void)
 {
+    // Without an imported key list (--generate-keys) nothing has read the
+    // file yet. Validate it here, at startup, so a malformed or empty file
+    // fails now and not in read_next_item() after the run has started.
+    if (m_keys == NULL) {
+        file_reader check(m_reader);
+        if (!check.open_file()) return false;
+        unsigned int count = 0;
+        memcache_item *i;
+        while ((i = check.read_item()) != NULL) {
+            delete i;
+            count++;
+        }
+        if (check.has_error()) return false;
+        if (count == 0) {
+            fprintf(stderr, "%s: no items found.\n", m_reader.get_filename());
+            return false;
+        }
+    }
     m_reader_opened = true;
     return m_reader.open_file();
 }
