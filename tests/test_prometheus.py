@@ -31,6 +31,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.request
 
 from include import (
     MEMTIER_BINARY,
@@ -521,6 +522,58 @@ def test_F8_run_label_propagation_and_escaping(env):
         env.assertContains('a\\"b\\\\c', r.body)
     finally:
         _kill(proc)
+
+
+# ---------------------------------------------------------------------------
+# F8b -- run-label values that are not valid UTF-8 (#753)
+# ---------------------------------------------------------------------------
+def test_F8b_run_label_invalid_utf8(env):
+    """The exposition advertises charset=utf-8, so the raw body must decode as
+    strict UTF-8: an invalid byte in a --prometheus-run-label value becomes
+    U+FFFD, and a valid UTF-8 value is emitted byte-identical.
+
+    prom_scrape() decodes with errors="replace", which would hide raw invalid
+    bytes, so this test reads the body as bytes.
+    """
+    rd = _new_results_dir()
+    proc, out_path, err_path = _popen_memtier(
+        env,
+        ["--test-time=4", "--prometheus-port=0",
+         b"--prometheus-run-label=env=x\xffy",
+         b"--prometheus-run-label=ok=caf\xc3\xa9 \xe2\x82\xac"],
+        rd,
+    )
+    try:
+        url = wait_for_prometheus_url(out_path, timeout=20)
+        env.assertFalse(url is None, message="no announce line")
+        time.sleep(1.0)
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            ctype = resp.headers.get("Content-Type", "")
+            raw = resp.read()
+        env.assertContains("charset=utf-8", ctype)
+        env.assertEqual(raw.count(b"\xff"), 0, message="raw 0xff byte in /metrics")
+        try:
+            body = raw.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as e:
+            env.assertTrue(False, message="/metrics is not valid UTF-8: {}".format(e))
+            return
+        # the valid UTF-8 value is passed through byte-identical
+        env.assertContains(b'ok="caf\xc3\xa9 \xe2\x82\xac"', raw)
+        env.assertContains(b'env="x\xef\xbf\xbdy"', raw)
+        parsed = prom_parse(body)
+        env.assertTrue(len(parsed) > 0, message="empty scrape")
+        for name, samples in parsed.items():
+            for s in samples:
+                env.assertEqual(s.labels.get("env"), "x\ufffdy",
+                                message="{} env label: {!r}".format(name, s.labels.get("env")))
+                env.assertEqual(s.labels.get("ok"), "caf\u00e9 \u20ac",
+                                message="{} ok label: {!r}".format(name, s.labels.get("ok")))
+        _promtool_validate(env, body, os.path.join(rd, "scrape_utf8.txt"))
+    finally:
+        _kill(proc)
+    err = _drain(err_path)
+    env.assertContains("value for 'env' is not valid UTF-8", err)
+    env.assertNotContains("value for 'ok'", err)
 
 
 # ---------------------------------------------------------------------------

@@ -50,7 +50,7 @@ memtier_benchmark_SOURCES = \
 	shard_connection.cpp shard_connection.h connections_manager.h \
 	run_stats_types.cpp run_stats_types.h latency_percentiles.h \
 	run_stats.cpp run_stats.h latency_histogram.h \
-	JSON_handler.cpp JSON_handler.h \
+	JSON_handler.cpp JSON_handler.h utf8.cpp utf8.h \
 	protocol.cpp protocol.h keylist_growth.h libmemcached_protocol/binary.h libmemcached_protocol/vbucket.h \
 	obj_gen.cpp obj_gen.h \
 	item.cpp item.h \
@@ -81,14 +81,14 @@ memtier_benchmark_LDADD = \
 check_PROGRAMS = prometheus_metrics_test rate_limiter_test retry_backoff_test keylist_growth_test retry_drain_test socket_options_test hdr_histogram_test cluster_transaction_test \
     cluster_hslot_test run_stats_counters_test run_stats_merge_test crash_report_test
 
-# The metrics test links only the pure layer (prometheus_metrics.{h,cpp}).
+# The metrics test links only the pure layer (prometheus_metrics.{h,cpp}, utf8.{h,cpp}).
 # First `make check` program in the repo. The metrics layer is config-free and
 # libevent-free (Decisions #52 purity contract), so this links only the metrics
 # layer + hdr_histogram (a leaf dep). No $(LIBEVENT_CFLAGS) by design (hygiene
 # only; purity is enforced by the S10 grep audit). -I$(srcdir) is required for
 # VPATH builds.
 prometheus_metrics_test_SOURCES = tests/unit/prometheus_metrics_test.cpp \
-    prometheus_metrics.cpp prometheus_metrics.h latency_histogram.h \
+    prometheus_metrics.cpp prometheus_metrics.h utf8.cpp utf8.h latency_histogram.h \
     deps/hdr_histogram/hdr_histogram.c deps/hdr_histogram/hdr_histogram.h
 prometheus_metrics_test_CPPFLAGS = -I$(srcdir)
 prometheus_metrics_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g

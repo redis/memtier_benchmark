@@ -32,6 +32,7 @@
 #include <errno.h>
 
 #include "prometheus_metrics.h"
+#include "utf8.h"
 #include "deps/hdr_histogram/hdr_histogram.h"
 
 void monotonic_accumulator::fill(uint64_t out[MT_NUM_COUNTERS]) const
@@ -157,12 +158,16 @@ std::string format_le(int64_t bound_us)
     return std::string(buf);
 }
 
+// The text exposition format is UTF-8 (the response advertises
+// charset=utf-8), so invalid UTF-8 in a value, for example a
+// --prometheus-run-label value, is replaced by U+FFFD before escaping.
 std::string escape_label_value(const std::string &s)
 {
+    const std::string valid = utf8_sanitize(s.c_str());
     std::string out;
-    out.reserve(s.size() + 8);
-    for (size_t i = 0; i < s.size(); i++) {
-        char c = s[i];
+    out.reserve(valid.size() + 8);
+    for (size_t i = 0; i < valid.size(); i++) {
+        char c = valid[i];
         switch (c) {
         case '\\':
             out += "\\\\";

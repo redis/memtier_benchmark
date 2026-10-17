@@ -24,13 +24,7 @@
 #include <stdarg.h>
 #include <list>
 #include <string>
-
-// Copy of str with each invalid UTF-8 sequence (truncated, overlong,
-// surrogate, above U+10FFFF) replaced by U+FFFD. JSON text must be UTF-8, so
-// every string written to the JSON file goes through it; callers that dedup
-// JSON keys apply it first, so keys that only differ in invalid bytes stay
-// distinct.
-std::string utf8_sanitize(const char *str);
+#include "utf8.h"
 
 // enum for holding type of nesting
 typedef enum

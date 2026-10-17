@@ -274,6 +274,13 @@ static void U4()
     // escaping
     CHECK(escape_label_value("a\"b\\c") == "a\\\"b\\\\c", "U4: escape_label_value backslash+quote");
     CHECK(escape_label_value("a\nb") == "a\\nb", "U4: escape_label_value newline");
+    // #753: the exposition is UTF-8, so invalid bytes become U+FFFD; valid
+    // UTF-8 is unchanged and escaping still applies around the replacement.
+    CHECK(escape_label_value("x\xffy") == "x\xEF\xBF\xBDy", "U4: escape_label_value invalid byte -> U+FFFD");
+    CHECK(escape_label_value("caf\xC3\xA9 \xE2\x82\xAC") == "caf\xC3\xA9 \xE2\x82\xAC",
+          "U4: escape_label_value valid UTF-8 unchanged");
+    CHECK(escape_label_value("\"\xC3\\") == "\\\"\xEF\xBF\xBD\\\\",
+          "U4: escape_label_value truncated sequence + escapes");
     CHECK(escape_help("a\\b\nc") == "a\\\\b\\nc", "U4: escape_help backslash+newline");
     CHECK(escape_help("a\"b") == "a\"b", "U4: escape_help leaves quotes");
 

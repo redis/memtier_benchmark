@@ -2639,6 +2639,12 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 fprintf(stderr, "error: --prometheus-run-label: too many labels (max 16).\n");
                 return -1;
             }
+            if (utf8_sanitize(value.c_str()) != value) {
+                fprintf(stderr,
+                        "warning: --prometheus-run-label: value for '%s' is not valid UTF-8; "
+                        "invalid bytes are replaced with U+FFFD on /metrics.\n",
+                        key.c_str());
+            }
             cfg->prometheus_run_labels.push_back(std::make_pair(key, value));
             break;
         }
