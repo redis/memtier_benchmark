@@ -225,9 +225,9 @@ static bool g_worker_failed = false;
 // error has been printed; main() then exits 1.
 static bool g_output_failed = false;
 
-// main owns the JSON writer. Workers never write JSON, and main only writes
-// results after joining them, so an exit() from preparation or a worker can
-// safely finish the configuration without publishing partial stats.
+// main owns the JSON writer. Workers never write JSON, and main writes results
+// after joining them, so the exit callback sees a quiescent writer. Close only
+// content already emitted, including benchmark results if verification exits.
 static json_handler *g_json_out_file = NULL;
 
 static void close_json_out_file_at_exit(void)

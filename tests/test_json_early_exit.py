@@ -2,6 +2,7 @@
 
 The Unix socket peers exercise synchronous connect/reconnect failures even in
 TLS and cluster CI cells: these tests deliberately use standalone plaintext.
+The allocation-failure cases stop before connection setup.
 """
 import json
 import os
