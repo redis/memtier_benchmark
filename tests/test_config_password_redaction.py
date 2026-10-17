@@ -124,9 +124,26 @@ def _run(env, target_args, workdir, expect_ok=True):
         env.assertEqual(proc.returncode, 0, message="memtier failed:\n" + stderr[-2000:])
         with open(json_path) as f:
             raw_json = f.read()
-    else:
+    elif expect_ok is False:
         env.assertEqual(proc.returncode, 1, message="expected a URI error (rc 1):\n" + stderr[-2000:])
+    # expect_ok=None: the exit code is not checked (only the printed config is).
     return raw_json, stdout, stderr
+
+
+# A port in the range reserved for these tests, assumed closed; a host-less
+# --uri whose fallback would otherwise hit localhost:6379 is pointed here.
+_CLOSED_PORT = 19799
+
+
+def _closed_port(env):
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.settimeout(1)
+        if probe.connect_ex(("127.0.0.1", _CLOSED_PORT)) == 0:
+            env.skip()  # something listens there; the expectations below would not hold
+    finally:
+        probe.close()
+    return _CLOSED_PORT
 
 
 def _show_config_value(stderr, key):
@@ -321,16 +338,18 @@ def test_config_uri_password_with_slash_without_host_warns(env):
     _check_default_server_warning(env, stderr, port)
 
 
-def test_config_uri_password_with_slash_nothing_after_at_rejected(env):
-    """redis://u:a/b@ (nothing after the '@') has the same shape as a stray
-    '@' after a path (redis://host:6379/1@) and cannot be told apart from it
-    without percent-encoding (#732), so it is rejected rather than run
-    against the default server."""
-    with tempfile.TemporaryDirectory() as workdir:
-        _raw, stdout, stderr = _run(env, ["--uri", "redis://default:a/{}@".format(_CANARY)], workdir,
-                                    expect_ok=False)
-    env.assertContains("missing host in URI", stderr)
-    env.assertFalse(_CANARY in stdout + stderr)
+def test_config_uri_password_with_slash_nothing_after_at_warns(env):
+    """redis://u:a/b@ (nothing after the '@') falls back to the default server
+    with the host-less warning, like every other host-less form, as on master.
+    It has the same shape as a stray '@' after a path; telling them apart is
+    #732's. -p points the default server at the target, so the run
+    authenticates with the "a/<canary>" password and is redacted."""
+    host, port = _target(env)
+    env.assertContains(host, _LOOPBACK)
+    password = "a/" + _CANARY
+    stderr = _check(env, password, ["-p", str(port), "--uri", "redis://default:{}@".format(password)],
+                    "redis://default:***@", "default:***", [_CANARY])
+    _check_default_server_warning(env, stderr, port)
 
 
 def test_config_uri_without_host_or_credentials_warns(env):
@@ -381,30 +400,29 @@ def test_config_uri_at_in_path_without_credentials_known_limit(env):
 
     Without credentials, an '@' in the db path still ends a "userinfo":
     redis://host:port/1@other:port is read as credentials "host:port/1" for
-    host "other". Treating a '/' before the first '@' as "no userinfo"
-    would break a raw '/' in passwords, which master supports. The value is
-    redacted like any credential. With nothing after the '@', the '/' in the
-    "credentials" shows the '@' was a stray one after the path, so the URI is
-    rejected ("missing host in URI") rather than run against the default
-    server.
+    host "other", and redis://host:port/1@ as those credentials with no host,
+    which falls back to the default server with the host-less warning.
+    Treating a '/' before the first '@' as "no userinfo" would break a raw
+    '/' in passwords, which master supports. The value is redacted like any
+    credential. Only the printed configuration is checked; the connection
+    goes to a closed port.
     """
     host, port = _target(env)
-    closed = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    closed.bind(("127.0.0.1", 0))
-    other_port = closed.getsockname()[1]
-    closed.close()  # nothing listens there: the connect is refused at once
-    uri = "redis://{}:{}/1@127.0.0.1:{}".format(host, port, other_port)
+    closed = _closed_port(env)
+    uri = "redis://{}:{}/1@127.0.0.1:{}".format(host, port, closed)
     with tempfile.TemporaryDirectory() as workdir:
-        _raw, _stdout, stderr = _run(env, ["--uri", uri], workdir, expect_ok=False)
+        _raw, _stdout, stderr = _run(env, ["--uri", uri], workdir, expect_ok=None)
     env.assertEqual(_show_config_value(stderr, "server"), "127.0.0.1")
-    env.assertEqual(_show_config_value(stderr, "port"), str(other_port))
+    env.assertEqual(_show_config_value(stderr, "port"), str(closed))
     env.assertEqual(_show_config_value(stderr, "authenticate"), "{}:***".format(host))
-    env.assertEqual(_show_config_value(stderr, "uri"), "redis://{}:***@127.0.0.1:{}".format(host, other_port))
+    env.assertEqual(_show_config_value(stderr, "uri"), "redis://{}:***@127.0.0.1:{}".format(host, closed))
 
+    # -p keeps the default-server fallback off localhost:6379.
     with tempfile.TemporaryDirectory() as workdir:
-        _raw, _stdout, stderr = _run(env, ["--uri", "redis://{}:{}/1@".format(host, port)], workdir,
-                                     expect_ok=False)
-    env.assertContains("missing host in URI", stderr)
+        _raw, _stdout, stderr = _run(env, ["-p", str(closed), "--uri", "redis://{}:{}/1@".format(host, port)],
+                                     workdir, expect_ok=None)
+    _check_default_server_warning(env, stderr, closed)
+    env.assertEqual(_show_config_value(stderr, "authenticate"), "{}:***".format(host))
 
 
 def test_config_uri_without_credentials(env):

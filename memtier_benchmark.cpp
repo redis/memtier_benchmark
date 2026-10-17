@@ -710,8 +710,9 @@ static std::string redact_credentials(const char *credentials)
 // - A raw '/', '?' or '#' in the password works only when no '@' comes
 //   before it in the password: "u:a@b/c@host" is split as host "b".
 // - Without credentials, an '@' in the path still ends a "userinfo":
-//   "host:6379/1@other:6379" connects to "other". Treating a '/', '?' or '#'
-//   before the first '@' as "no userinfo" would break a raw '/' in passwords.
+//   "host:6379/1@other:6379" connects to "other", and "host:6379/1@" to the
+//   default server. Treating a '/', '?' or '#' before the first '@' as "no
+//   userinfo" would break a raw '/' in passwords.
 static const char *uri_userinfo_end(const char *s)
 {
     const char *at = strchr(s, '@');
@@ -1091,7 +1092,6 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
     // Parse user:password@host:port/db; see uri_userinfo_end() for where the
     // userinfo ends (redact_uri() splits at the same place).
     char *auth_end = (char *) uri_userinfo_end(ptr);
-    bool nothing_after_at = false;
     char *host_start = ptr;
 
     if (auth_end) {
@@ -1099,7 +1099,6 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
             fprintf(stderr, "warning: both URI and --authenticate specified, URI takes precedence.\n");
         }
         // Own URI credentials separately from the borrowed --authenticate argument.
-        nothing_after_at = auth_end[1] == '\0';
         *auth_end = '\0';
         uri_authenticate = ptr;
         cfg->authenticate = uri_authenticate.c_str();
@@ -1160,18 +1159,10 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
     // An empty host with no explicit --server/--unix-socket falls back to the
     // default server, as before (parse_uri() runs before
     // config_init_defaults(), so a non-NULL server or unix_socket here was
-    // given on the command line); say where the run goes. The one exception
-    // is the shape of a stray '@' after the path, redis://host:6379/1@:
-    // nothing at all after the '@' and a '/', '?' or '#' in the "credentials".
-    // That is rejected rather than benchmark the default server. A password
-    // with a raw '/' is ambiguous only in that same shape (redis://u:a/b@);
-    // redis://u:a/b@:6379 has a port after the '@' and falls back as usual.
+    // given on the command line); say where the run goes. This includes a
+    // stray '@' after the path (redis://host:6379/1@), which reads as
+    // credentials "host:6379/1" with no host, as on master (#732).
     if (strlen(host_start) == 0 && !cfg->server && !cfg->unix_socket) {
-        if (nothing_after_at && strpbrk(uri_authenticate.c_str(), "/?#")) {
-            fprintf(stderr, "error: missing host in URI.\n");
-            free(uri_copy);
-            return -1;
-        }
         fprintf(stderr, "warning: --uri has no host; connecting to the default server localhost:%u.\n",
                 cfg->port ? cfg->port : 6379);
     }
