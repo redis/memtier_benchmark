@@ -32,9 +32,9 @@ _memtier_completions()
                    "--max-retries" "--retry-backoff-ms" "--retry-backoff-factor" "--retry-on"\
                    "--max-retry-queue" "--failed-keys-file"\
                    "--thread-conn-start-min-jitter-micros" "--thread-conn-start-max-jitter-micros"\
-                   "--print-percentiles" "--uri" "--sni"\
+                   "--print-percentiles" "--print-frequency" "--uri" "--sni"\
                    "--cert" "--key" "--cacert" "--tls-protocols"\
-                   "-s" "-p" "-S" "-o" "-x" "-c" "-n" "-t" "-d" "-a" "-u")
+                   "-f" "-s" "-p" "-S" "-o" "-x" "-c" "-n" "-t" "-d" "-a" "-u")
 
   options_no_args=("--debug" "--show-config" "--hide-histogram" "--distinct-client-seed" "--randomize"\
                    "--random-data" "--data-verify" "--verify-only" "--generate-keys" "--key-stddev"\

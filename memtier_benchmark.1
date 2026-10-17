@@ -131,6 +131,11 @@ Print detailed configuration before running
 \fB\-\-hide\-histogram\fR
 Don't print detailed latency histogram
 .TP
+\fB\-f\fR, \fB\-\-print-frequency\fR=\fI\,SECONDS\/\fR
+Progress display interval in positive whole seconds (default: 1).
+A final progress update is printed on normal completion. Errors, supervision, and metric sampling keep their existing cadence.
+Instantaneous rates describe the most recent sample, not the entire display interval.
+.TP
 \fB\-\-print\-percentiles\fR
 Specify which percentiles info to print on the results table (by default prints percentiles: 50,99,99.9)
 .TP
