@@ -46,20 +46,25 @@
 #include <assert.h>
 #include <errno.h>
 #include <sys/time.h>
+#ifndef _WIN32
 #include <sys/resource.h>
+#endif
 #include <signal.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #ifdef HAVE_EXECINFO_H
 #include <execinfo.h>
 #endif
+#ifndef _WIN32
 #include <ucontext.h>
+#endif
 #include <time.h>
 #include <ctype.h>
+#ifndef _WIN32
 #include <sys/utsname.h>
+#endif
 #include <dirent.h>
-#include <arpa/inet.h>  // inet_pton, ntohl/ntohs for prometheus-bind-addr parsing
-#include <netinet/in.h> // struct in_addr / in6_addr / IN6_IS_ADDR_LOOPBACK
+#include "platform_compat.h"
 #include <event2/event.h>
 #include <event2/thread.h>
 
@@ -97,6 +102,45 @@ static bool bitmask_is_contiguous(unsigned int mask);
 
 #ifdef __APPLE__
 #include <mach/mach.h>
+#endif
+
+#ifdef _WIN32
+// Windows has no getrusage(). Emulate the one call this file makes,
+// getrusage(RUSAGE_THREAD), with GetThreadTimes(). The values are scheduler
+// accounted, so they advance in clock ticks (~15.6 ms), not continuously.
+#define RUSAGE_THREAD 1
+
+struct rusage
+{
+    struct timeval ru_utime;
+    struct timeval ru_stime;
+};
+
+// FILETIME durations are in 100 ns units.
+static unsigned long long filetime_to_usec(const FILETIME &ft)
+{
+    return (((unsigned long long) ft.dwHighDateTime << 32) | ft.dwLowDateTime) / 10;
+}
+
+static int getrusage(int who, struct rusage *ru)
+{
+    if (who != RUSAGE_THREAD) {
+        errno = EINVAL;
+        return -1;
+    }
+    FILETIME creation_time, exit_time, kernel_time, user_time;
+    if (!GetThreadTimes(GetCurrentThread(), &creation_time, &exit_time, &kernel_time, &user_time)) {
+        errno = EINVAL;
+        return -1;
+    }
+    unsigned long long user_usec = filetime_to_usec(user_time);
+    unsigned long long kernel_usec = filetime_to_usec(kernel_time);
+    ru->ru_utime.tv_sec = (long) (user_usec / 1000000);
+    ru->ru_utime.tv_usec = (long) (user_usec % 1000000);
+    ru->ru_stime.tv_sec = (long) (kernel_usec / 1000000);
+    ru->ru_stime.tv_usec = (long) (kernel_usec % 1000000);
+    return 0;
+}
 #endif
 
 #include "client.h"
@@ -390,6 +434,7 @@ bool connection_stage_should_abort(unsigned int timeout_secs, std::string *out_l
 // allocating from the main heap. We also skip installation when something
 // upstream (e.g. ASan/LSan/UBSan's own runtime) has already registered an
 // alt stack for us; replacing theirs would break their crash reporting.
+#ifndef _WIN32
 #define MEMTIER_ALT_STACK_SIZE (64 * 1024)
 static __thread char tls_altstack_buf[MEMTIER_ALT_STACK_SIZE];
 static __thread bool tls_altstack_installed = false;
@@ -419,6 +464,9 @@ static void install_alt_signal_stack(void)
         tls_altstack_installed = true;
     }
 }
+#else
+static void install_alt_signal_stack(void) {}
+#endif
 
 // CLOCK_MONOTONIC time of the first SIGINT/SIGTERM, in ms modulo 2^32, and
 // never 0: 0 means no signal yet. Differences are taken modulo 2^32 too, so
@@ -452,15 +500,91 @@ static void sigint_handler(int signum)
     errno = saved_errno;
 }
 
+// Report tail shared by the POSIX signal handler and the Windows exception
+// filter: system and version information, the client list and the closing
+// banner.
+static void print_crash_report_tail(const char *timestr)
+{
+    // Print system information
+    fprintf(stderr, "\n[%d] %s # --- INFO OUTPUT\n", getpid(), timestr);
+
+#ifdef _WIN32
+    // RtlGetVersion, unlike GetVersionEx, is not subject to manifest-based
+    // version lying.
+    typedef LONG(WINAPI * rtl_get_version_fn)(PRTL_OSVERSIONINFOW);
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    rtl_get_version_fn rtl_get_version = ntdll ? (rtl_get_version_fn) GetProcAddress(ntdll, "RtlGetVersion") : NULL;
+    RTL_OSVERSIONINFOW os_version;
+    memset(&os_version, 0, sizeof(os_version));
+    os_version.dwOSVersionInfoSize = sizeof(os_version);
+    if (rtl_get_version != NULL && rtl_get_version(&os_version) == 0) {
+        fprintf(stderr, "[%d] %s # os:Windows %lu.%lu.%lu\n", getpid(), timestr, os_version.dwMajorVersion,
+                os_version.dwMinorVersion, os_version.dwBuildNumber);
+    }
+#else
+    struct utsname name;
+    if (uname(&name) == 0) {
+        fprintf(stderr, "[%d] %s # os:%s %s %s\n", getpid(), timestr, name.sysname, name.release, name.machine);
+    }
+#endif
+
+    fprintf(stderr, "[%d] %s # memtier_version:%s\n", getpid(), timestr, PACKAGE_VERSION);
+    fprintf(stderr, "[%d] %s # memtier_git_sha1:%s\n", getpid(), timestr, MEMTIER_GIT_SHA1);
+    fprintf(stderr, "[%d] %s # memtier_git_dirty:%s\n", getpid(), timestr, MEMTIER_GIT_DIRTY);
+
+#if defined(__x86_64__) || defined(_M_X64)
+    fprintf(stderr, "[%d] %s # arch_bits:64\n", getpid(), timestr);
+#elif defined(__i386__) || defined(_M_IX86)
+    fprintf(stderr, "[%d] %s # arch_bits:32\n", getpid(), timestr);
+#elif defined(__aarch64__)
+    fprintf(stderr, "[%d] %s # arch_bits:64\n", getpid(), timestr);
+#elif defined(__arm__)
+    fprintf(stderr, "[%d] %s # arch_bits:32\n", getpid(), timestr);
+#else
+    fprintf(stderr, "[%d] %s # arch_bits:unknown\n", getpid(), timestr);
+#endif
+
+#ifdef __GNUC__
+    fprintf(stderr, "[%d] %s # gcc_version:%d.%d.%d\n", getpid(), timestr, __GNUC__, __GNUC_MINOR__,
+            __GNUC_PATCHLEVEL__);
+#endif
+
+    fprintf(stderr, "[%d] %s # libevent_version:%s\n", getpid(), timestr, event_get_version());
+
+#ifdef USE_TLS
+    fprintf(stderr, "[%d] %s # openssl_version:%s\n", getpid(), timestr, OPENSSL_VERSION_TEXT);
+#endif
+
+    // Print client connection information
+    print_client_list(stderr, getpid(), timestr);
+
+#ifdef _WIN32
+    fprintf(stderr, "[%d] %s # For more information, please check the crash dump if available.\n", getpid(), timestr);
+    fprintf(stderr, "[%d] %s # To enable crash dumps, configure Windows Error Reporting LocalDumps:\n", getpid(),
+            timestr);
+    fprintf(stderr, "[%d] %s # HKLM\\SOFTWARE\\Microsoft\\Windows\\Windows Error Reporting\\LocalDumps\n", getpid(),
+            timestr);
+#else
+    fprintf(stderr, "[%d] %s # For more information, please check the core dump if available.\n", getpid(), timestr);
+    fprintf(stderr, "[%d] %s # To enable core dumps: ulimit -c unlimited\n", getpid(), timestr);
+    fprintf(stderr, "[%d] %s # Core pattern: /proc/sys/kernel/core_pattern\n", getpid(), timestr);
+#endif
+
+    fprintf(stderr, "\n=== MEMTIER_BENCHMARK BUG REPORT END. Make sure to include from START to END. ===\n\n");
+    fprintf(stderr, "       Please report this bug by opening an issue on github.com/redis/memtier_benchmark\n\n");
+}
+
 static const char *interrupt_source(void)
 {
     return g_interrupted == SIGTERM ? "SIGTERM" : "user (Ctrl+C)";
 }
 
 // Offset of local time from UTC, in seconds, taken once at startup by
-// prewarm_crash_handler() with crash_utc_offset(). The crash handler cannot
+// crash-handler setup with crash_utc_offset(). The crash handlers cannot
 // call localtime(); see crash_report.h (#681).
 static long g_crash_utc_offset = 0;
+
+#ifndef _WIN32
 
 // Begin a report line: "[pid] timestr # ".
 static void crash_line_prefix(crash_line &l, int pid, const char *timestr)
@@ -600,50 +724,7 @@ static void crash_handler(int sig, siginfo_t *info, void *secret)
     // Print stack trace for all threads
     print_all_threads_stack_trace(stderr, getpid(), timestr);
 
-    // Print system information
-    fprintf(stderr, "\n[%d] %s # --- INFO OUTPUT\n", getpid(), timestr);
-
-    struct utsname name;
-    if (uname(&name) == 0) {
-        fprintf(stderr, "[%d] %s # os:%s %s %s\n", getpid(), timestr, name.sysname, name.release, name.machine);
-    }
-
-    fprintf(stderr, "[%d] %s # memtier_version:%s\n", getpid(), timestr, PACKAGE_VERSION);
-    fprintf(stderr, "[%d] %s # memtier_git_sha1:%s\n", getpid(), timestr, MEMTIER_GIT_SHA1);
-    fprintf(stderr, "[%d] %s # memtier_git_dirty:%s\n", getpid(), timestr, MEMTIER_GIT_DIRTY);
-
-#if defined(__x86_64__) || defined(_M_X64)
-    fprintf(stderr, "[%d] %s # arch_bits:64\n", getpid(), timestr);
-#elif defined(__i386__) || defined(_M_IX86)
-    fprintf(stderr, "[%d] %s # arch_bits:32\n", getpid(), timestr);
-#elif defined(__aarch64__)
-    fprintf(stderr, "[%d] %s # arch_bits:64\n", getpid(), timestr);
-#elif defined(__arm__)
-    fprintf(stderr, "[%d] %s # arch_bits:32\n", getpid(), timestr);
-#else
-    fprintf(stderr, "[%d] %s # arch_bits:unknown\n", getpid(), timestr);
-#endif
-
-#ifdef __GNUC__
-    fprintf(stderr, "[%d] %s # gcc_version:%d.%d.%d\n", getpid(), timestr, __GNUC__, __GNUC_MINOR__,
-            __GNUC_PATCHLEVEL__);
-#endif
-
-    fprintf(stderr, "[%d] %s # libevent_version:%s\n", getpid(), timestr, event_get_version());
-
-#ifdef USE_TLS
-    fprintf(stderr, "[%d] %s # openssl_version:%s\n", getpid(), timestr, OPENSSL_VERSION_TEXT);
-#endif
-
-    // Print client connection information
-    print_client_list(stderr, getpid(), timestr);
-
-    fprintf(stderr, "[%d] %s # For more information, please check the core dump if available.\n", getpid(), timestr);
-    fprintf(stderr, "[%d] %s # To enable core dumps: ulimit -c unlimited\n", getpid(), timestr);
-    fprintf(stderr, "[%d] %s # Core pattern: /proc/sys/kernel/core_pattern\n", getpid(), timestr);
-
-    fprintf(stderr, "\n=== MEMTIER_BENCHMARK BUG REPORT END. Make sure to include from START to END. ===\n\n");
-    fprintf(stderr, "       Please report this bug by opening an issue on github.com/redis/memtier_benchmark\n\n");
+    print_crash_report_tail(timestr);
 
     // Remove the handler and re-raise the signal to generate core dump
     struct sigaction act;
@@ -719,6 +800,40 @@ static void setup_crash_handlers(void)
     alarm_act.sa_handler = SIG_DFL;
     sigaction(SIGALRM, &alarm_act, NULL);
 }
+#else
+// Best-effort crash report for unhandled SEH exceptions (access violation,
+// illegal instruction, ...). abort() and assert() failures do not reach it.
+static LONG WINAPI crash_exception_filter(EXCEPTION_POINTERS *info)
+{
+    // One report per process: a fault inside this filter, or a second
+    // crashing thread, must not re-enter it.
+    static volatile LONG reporting = 0;
+    if (InterlockedExchange(&reporting, 1) != 0) return EXCEPTION_CONTINUE_SEARCH;
+
+    char timestr[64];
+    crash_format_time(timestr, sizeof(timestr), (long long) time(NULL), g_crash_utc_offset);
+
+    const EXCEPTION_RECORD *rec = info->ExceptionRecord;
+    fprintf(stderr, "\n\n=== MEMTIER_BENCHMARK BUG REPORT START: Cut & paste starting from here ===\n");
+    fprintf(stderr, "[%d] %s # memtier_benchmark crashed by unhandled exception\n", getpid(), timestr);
+    fprintf(stderr, "[%d] %s # Crashed running exception <0x%08lx>\n", getpid(), timestr, rec->ExceptionCode);
+    fprintf(stderr, "[%d] %s # Fault address: %p\n", getpid(), timestr, rec->ExceptionAddress);
+    if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2) {
+        fprintf(stderr, "[%d] %s # Access violation: %s address %p\n", getpid(), timestr,
+                rec->ExceptionInformation[0] == 0 ? "reading" : "writing", (void *) rec->ExceptionInformation[1]);
+    }
+
+    print_all_threads_stack_trace(stderr, getpid(), timestr);
+    print_crash_report_tail(timestr);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void setup_crash_handlers(void)
+{
+    g_crash_utc_offset = crash_utc_offset(time(NULL));
+    SetUnhandledExceptionFilter(crash_exception_filter);
+}
+#endif
 
 void benchmark_log_file_line(int level, const char *filename, unsigned int line, const char *fmt, ...)
 {
@@ -1921,8 +2036,13 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             cfg->server = optarg;
             break;
         case 'S':
+#ifdef _WIN32
+            fprintf(stderr, "error: --unix-socket is not supported on Windows.\n");
+            return -1;
+#else
             cfg->unix_socket = optarg;
             break;
+#endif
         case 'p':
             if (!parse_port(optarg, &cfg->port)) {
                 fprintf(stderr, "error: port must be a number in the range [1-65535].\n");
@@ -2025,8 +2145,12 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             cfg->distinct_client_seed++;
             break;
         case o_randomize:
+#ifdef _WIN32
+            cfg->randomize = (int) (generate_random_seed() & 0x7fffffff);
+#else
             srandom(generate_random_seed());
             cfg->randomize = random();
+#endif
             break;
         case 'n':
             if (strcmp(optarg, "allkeys") == 0)
@@ -3074,7 +3198,7 @@ void usage()
         "  -h, --host=ADDR                Server address (default: localhost)\n"
         "  -s, --server=ADDR              Same as --host\n"
         "  -p, --port=PORT                Server port (default: 6379)\n"
-        "  -S, --unix-socket=SOCKET       UNIX Domain socket name (default: none)\n"
+        "  -S, --unix-socket=SOCKET       UNIX Domain socket name, POSIX only (default: none)\n"
         "                                Linux: @NAME selects an abstract socket\n"
         "  -4, --ipv4                     Force IPv4 address resolution.\n"
         "  -6  --ipv6                     Force IPv6 address resolution.\n"
@@ -3491,7 +3615,8 @@ struct cg_thread
 // Cumulative CPU time (user+system, microseconds) consumed by an arbitrary
 // thread, read WITHOUT perturbing that thread. Used by the live per-second
 // sampler in the monitor loop. On Linux this is pthread_getcpuclockid +
-// clock_gettime (a per-thread CPU clock); on macOS it is Mach thread_info.
+// clock_gettime (a per-thread CPU clock); on macOS it is Mach thread_info; on
+// Windows it is GetThreadTimes().
 // Returns 0 if the thread's CPU clock cannot be read (treated as no delta).
 static unsigned long long get_thread_cpu_usec(pthread_t thread)
 {
@@ -3502,6 +3627,11 @@ static unsigned long long get_thread_cpu_usec(pthread_t thread)
     if (thread_info(mt, THREAD_BASIC_INFO, (thread_info_t) &info, &count) != KERN_SUCCESS) return 0;
     return (unsigned long long) info.user_time.seconds * 1000000ULL + info.user_time.microseconds +
            (unsigned long long) info.system_time.seconds * 1000000ULL + info.system_time.microseconds;
+#elif defined(_WIN32)
+    FILETIME creation_time, exit_time, kernel_time, user_time;
+    if (!GetThreadTimes((HANDLE) pthread_gethandle(thread), &creation_time, &exit_time, &kernel_time, &user_time))
+        return 0;
+    return filetime_to_usec(kernel_time) + filetime_to_usec(user_time);
 #else
     clockid_t cid;
     if (pthread_getcpuclockid(thread, &cid) != 0) return 0;
@@ -3803,6 +3933,15 @@ static void print_all_threads_stack_trace(FILE *fp, int pid, const char *timestr
     // fprintf'd lines is acceptable -- correctness over ordering.
     if (trace_size > 1) {
         backtrace_symbols_fd(trace + 1, trace_size - 1, fileno(fp));
+    }
+#elif defined(_WIN32)
+    // Raw return addresses only. Subtract the image base printed first to get
+    // an RVA, add the PE ImageBase and resolve with addr2line against the exe.
+    void *frames[62];
+    USHORT frame_count = CaptureStackBackTrace(0, 62, frames, NULL);
+    fprintf(fp, "[%d] %s #   image base: %p\n", pid, timestr, (void *) GetModuleHandleA(NULL));
+    for (USHORT i = 0; i < frame_count; i++) {
+        fprintf(fp, "[%d] %s #   %p\n", pid, timestr, frames[i]);
     }
 #else
     fprintf(fp, "[%d] %s #   (backtrace not available on this platform)\n", pid, timestr);
@@ -4908,15 +5047,27 @@ static void cleanup_openssl(void)
 static void check_output_prefix_dir(const char *option, const char *prefix)
 {
     std::string dir(prefix);
+#ifdef _WIN32
+    size_t slash = dir.find_last_of("/\\");
+    // Keep a separator only for a root; UCRT stat rejects trailing separators
+    // on ordinary directories.
+    bool root = slash == 0 || (slash == 2 && dir[1] == ':');
+    dir = slash == std::string::npos ? "." : dir.substr(0, slash + (root ? 1 : 0));
+#else
     size_t slash = dir.rfind('/');
     dir = slash == std::string::npos ? "." : (slash == 0 ? "/" : dir.substr(0, slash));
+#endif
     struct stat st;
     int err = 0;
     if (stat(dir.c_str(), &st) != 0) {
         err = errno;
     } else if (!S_ISDIR(st.st_mode)) {
         err = ENOTDIR;
+#ifdef _WIN32
+    } else if (access(dir.c_str(), W_OK) != 0) {
+#else
     } else if (access(dir.c_str(), W_OK | X_OK) != 0) {
+#endif
         err = errno;
     }
     if (err != 0) {
@@ -4932,26 +5083,62 @@ static void check_output_prefix_dir(const char *option, const char *prefix)
 // written into it. Reopen each closed fd on /dev/null instead, which keeps
 // the numbering safe. Returns a mask with bit (1 << fd) set for each fd that
 // was closed.
+#ifdef _WIN32
+// Probing a closed CRT descriptor otherwise invokes UCRT's default invalid-
+// parameter handler. Restore it before startup creates any worker threads.
+static void closed_fd_invalid_parameter(const wchar_t *, const wchar_t *, const wchar_t *, unsigned int, uintptr_t) {}
+#endif
+
 static unsigned int reopen_closed_std_fds(void)
 {
+#ifdef _WIN32
+    _invalid_parameter_handler previous_handler = _set_invalid_parameter_handler(closed_fd_invalid_parameter);
+#endif
     unsigned int closed_mask = 0;
     for (int fd = STDIN_FILENO; fd <= STDERR_FILENO; fd++) {
+#ifdef _WIN32
+        if (_get_osfhandle(fd) != -1 && _get_osfhandle(fd) != -2) continue;
+#else
         if (fcntl(fd, F_GETFD) != -1 || errno != EBADF) continue;
+#endif
         // open() returns the lowest free fd, which is this one, since the
         // lower ones are open by now.
         int nfd;
         do {
+#ifdef _WIN32
+            nfd = open("NUL", O_RDWR);
+#else
             nfd = open("/dev/null", O_RDWR);
+#endif
         } while (nfd < 0 && errno == EINTR);
+#ifdef _WIN32
+        // A detached process can have an allocated CRT descriptor whose OS
+        // handle is -2. open() then chooses another slot; duplicate onto the
+        // original descriptor rather than assuming the lowest slot was free.
+        if (nfd >= 0 && nfd != fd) {
+            int result = _dup2(nfd, fd);
+            int err = errno;
+            close(nfd);
+            nfd = result == 0 ? fd : -1;
+            errno = err;
+        }
+#endif
         if (nfd != fd) {
             int err = nfd < 0 ? errno : EBADF;
             // Report it only if stderr is open (it may be the closed fd).
+#ifdef _WIN32
+            if (_get_osfhandle(STDERR_FILENO) != -1 && _get_osfhandle(STDERR_FILENO) != -2)
+#else
             if (fcntl(STDERR_FILENO, F_GETFD) != -1)
+#endif
                 fprintf(stderr, "error: fd %d is closed and cannot be reopened on /dev/null: %s\n", fd, strerror(err));
             exit(1);
         }
         closed_mask |= 1u << fd;
     }
+#ifdef _WIN32
+    _set_invalid_parameter_handler(previous_handler);
+#endif
     return closed_mask;
 }
 
@@ -4963,6 +5150,7 @@ static const char *std_fd_name(int fd)
 // True if path is exactly task_prefix + "<tid>" + fd_suffix, with <tid> all
 // digits: e.g. "/proc/123/task/" + "124" + "/fd/1", which /proc/thread-self/fd/1
 // resolves to.
+#ifndef _WIN32
 static bool is_task_fd_path(const std::string &path, const std::string &task_prefix, const std::string &fd_suffix)
 {
     if (path.compare(0, task_prefix.size(), task_prefix) != 0) return false;
@@ -5027,11 +5215,27 @@ static bool path_is_closed_fd(const char *path, int fd)
     return false;
 }
 
+#else
+static bool path_is_closed_fd(const char *, int)
+{
+    return false;
+}
+#endif
+
 int main(int argc, char *argv[])
 {
     // Must run first, before any file or socket is opened.
     unsigned int closed_std_fds = reopen_closed_std_fds();
 
+#ifdef _WIN32
+    WSADATA winsock_data;
+    int wsa_error = WSAStartup(MAKEWORD(2, 2), &winsock_data);
+    if (wsa_error != 0) {
+        fprintf(stderr, "error: WSAStartup failed: %d\n", wsa_error);
+        return 1;
+    }
+    // Winsock remains initialized until process exit; process teardown releases it.
+#endif
     // Enable libevent's pthreads bindings so event_base_loopbreak() /
     // event_base_loopexit() called from the main thread reliably wake a
     // worker thread that is blocked in epoll_wait() with no live events.
@@ -5040,9 +5244,15 @@ int main(int argc, char *argv[])
     // --connection-stage-timeout abort (Phase 1 of #426) or a Ctrl+C.
     // Must run before any event_base is created so the locking callbacks
     // are installed for every subsequent base.
+#ifdef _WIN32
+    if (evthread_use_windows_threads() < 0) {
+        fprintf(stderr, "warning: evthread_use_windows_threads() failed; cross-thread loop wakeups may stall.\n");
+    }
+#else
     if (evthread_use_pthreads() < 0) {
         fprintf(stderr, "warning: evthread_use_pthreads() failed; cross-thread loop wakeups may stall.\n");
     }
+#endif
 
     // Install signal handler for Ctrl+C. SIGTERM (kill, timeout, docker stop,
     // CI runners) takes the same graceful path, so results are printed and
@@ -5058,12 +5268,15 @@ int main(int argc, char *argv[])
     // on plain-TCP send(), but TLS writes via OpenSSL's SSL_write() do not
     // (and ARM Linux ignores MSG_NOSIGNAL on writev in some configurations),
     // so a process-wide SIG_IGN is the robust fix. See PERF-501 / GH #382.
+#ifdef SIGPIPE
     signal(SIGPIPE, SIG_IGN);
+#endif
 
     // Install crash handlers for debugging
     setup_crash_handlers();
 
     // Enable core dumps
+#ifndef _WIN32
     struct rlimit core_limit;
     core_limit.rlim_cur = RLIM_INFINITY;
     core_limit.rlim_max = RLIM_INFINITY;
@@ -5071,6 +5284,7 @@ int main(int argc, char *argv[])
         fprintf(stderr, "warning: failed to set core dump limit: %s\n", strerror(errno));
         fprintf(stderr, "warning: core dumps may not be generated on crash\n");
     }
+#endif
 
     // Keep URI storage alive for cfg and its workers; neither string changes after parsing.
     std::string uri_authenticate;
@@ -5670,11 +5884,13 @@ int main(int argc, char *argv[])
     }
 #endif
 
+#ifndef _WIN32
     struct rlimit rlim;
     if (getrlimit(RLIMIT_NOFILE, &rlim) != 0) {
         benchmark_error_log("error: getrlimit failed: %s\n", strerror(errno));
         exit(1);
     }
+#endif
 
     if (cfg.unix_socket != NULL && (cfg.server != NULL || cfg.port > 0)) {
         benchmark_error_log("error: UNIX domain socket and TCP cannot be used together.\n");
@@ -5690,6 +5906,7 @@ int main(int argc, char *argv[])
         }
     }
 
+#ifndef _WIN32
     unsigned int fds_needed = (cfg.threads * cfg.clients) + (cfg.threads * 10) + 10;
     if (fds_needed > rlim.rlim_cur) {
         if (fds_needed > rlim.rlim_max && getuid() != 0) {
@@ -5703,6 +5920,7 @@ int main(int argc, char *argv[])
             exit(1);
         }
     }
+#endif
 
     // create and configure object generator
     object_generator *obj_gen = NULL;

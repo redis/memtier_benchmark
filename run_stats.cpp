@@ -35,6 +35,7 @@
 #endif
 
 #include "run_stats.h"
+#include "platform_compat.h"
 #include "latency_percentiles.h"
 #include "latency_histogram.h"
 #include "file_io.h"
@@ -808,10 +809,12 @@ bool run_stats::save_hdr_log_format(struct hdr_histogram *hdr, char *filename, c
     if (hdr_total_count(hdr) > 0) {
         // Prepare output file
         FILE *hdr_outfile;
-        struct timespec start_timespec;
-        struct timespec end_timespec;
-        TIMEVAL_TO_TIMESPEC(&m_start_time, &start_timespec);
-        TIMEVAL_TO_TIMESPEC(&m_end_time, &end_timespec);
+        hdr_timespec start_timespec;
+        hdr_timespec end_timespec;
+        start_timespec.tv_sec = m_start_time.tv_sec;
+        start_timespec.tv_nsec = m_start_time.tv_usec * 1000;
+        end_timespec.tv_sec = m_end_time.tv_sec;
+        end_timespec.tv_nsec = m_end_time.tv_usec * 1000;
         hdr_outfile = open_option_file("--hdr-file-prefix", filename);
         if (!hdr_outfile) {
             return false;
@@ -2110,7 +2113,7 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
 
     // Whole-process CPU aggregate (memtier's own utilization). Emitted as a
     // sibling of "Runtime" so the existing Runtime schema is untouched. Only
-    // present when per-thread CPU accounting succeeded (Linux RUSAGE_THREAD).
+    // present when per-thread CPU accounting succeeded (Linux RUSAGE_THREAD, Windows GetThreadTimes).
     if (jsonhandler != NULL && m_cpu_summary.valid) {
         jsonhandler->open_nesting("CPU");
         jsonhandler->write_obj("cpu_user_seconds", "%.3f", m_cpu_summary.user_seconds);
@@ -2701,7 +2704,7 @@ void run_stats::print(FILE *out, benchmark_config *config, const char *header /*
 
     // CPU utilization summary for memtier itself. Goes to stderr (like the
     // miss-rate warning above) so it never corrupts piped / redirected table
-    // output. Only the authoritative getrusage-based aggregate is shown here.
+    // output. Only the authoritative per-thread-CPU-accounting aggregate is shown here.
     if (m_cpu_summary.valid) {
         fprintf(stderr,
                 "\n"

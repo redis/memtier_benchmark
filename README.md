@@ -105,7 +105,7 @@ brew install memtier_benchmark
 
 ### Installing from source
 
-For detailed instructions on building from source, running tests, and using sanitizers for development, see [DEVELOPMENT.md](DEVELOPMENT.md).
+For detailed instructions on building from source, running tests, and using sanitizers for development, see [DEVELOPMENT.md](DEVELOPMENT.md). To build natively on Windows with MSYS2 / MinGW-w64, see [Windows (MSYS2 / MinGW-w64)](DEVELOPMENT.md#windows-msys2--mingw-w64) in that document.
 
 ## Using Docker
 

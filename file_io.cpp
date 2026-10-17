@@ -24,7 +24,12 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+#else
 #include <poll.h>
+#endif
 #include <sys/stat.h>
 #include "file_io.h"
 
@@ -48,6 +53,13 @@ bool stdout_reader_gone(FILE *fp, int err)
 {
     if (err != EPIPE && err != ECONNRESET && err != EIO) return false;
     int fd = fileno(fp);
+#ifdef _WIN32
+    HANDLE handle = (HANDLE) _get_osfhandle(fd);
+    HANDLE output = (HANDLE) _get_osfhandle(fileno(stdout));
+    // Named output files must keep reporting failures. A broken stdout pipe
+    // is the Windows equivalent of a reader closing an output pipeline.
+    return handle != INVALID_HANDLE_VALUE && handle == output && GetFileType(handle) == FILE_TYPE_PIPE;
+#else
     struct stat st, out_st;
     if (fstat(fd, &st) != 0 || !(S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode))) return false;
     if (fp != stdout &&
@@ -59,6 +71,7 @@ bool stdout_reader_gone(FILE *fp, int err)
     pfd.events = POLLOUT;
     pfd.revents = 0;
     return poll(&pfd, 1, 0) == 1 && (pfd.revents & (POLLERR | POLLHUP)) != 0;
+#endif
 }
 
 int close_output_file(FILE *fp)
@@ -128,7 +141,7 @@ bool file_reader::open_file(void)
     m_line = 2;
     m_error = false;
     m_items = 0;
-    m_file = fopen(m_filename, "r");
+    m_file = fopen(m_filename, "rb");
     if (!m_file) {
         perror(m_filename);
         return false;
@@ -418,7 +431,7 @@ file_writer::~file_writer()
 
 bool file_writer::open_file(void)
 {
-    m_file = fopen(m_filename, "w");
+    m_file = fopen(m_filename, "wb");
     if (m_file == NULL) {
         perror(m_filename);
         return false;

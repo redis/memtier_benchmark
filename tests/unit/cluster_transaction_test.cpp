@@ -26,9 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
+#include "platform_compat.h"
 #include <string>
 #include <event2/buffer.h>
 #include "cluster_client.h"
@@ -250,8 +248,8 @@ static void check_repin_routes_to_staged_owner(unsigned long long first_key)
 
     // A listening socket keeps the dial to the second shard pending; the
     // event loop never runs, so the connection stays conn_in_progress.
-    int listener = socket(AF_INET, SOCK_STREAM, 0);
-    check(listener >= 0, "listener socket");
+    evutil_socket_t listener = socket(AF_INET, SOCK_STREAM, 0);
+    check(listener != EVUTIL_INVALID_SOCKET, "listener socket");
     sockaddr_in address = {};
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -302,11 +300,15 @@ static void check_repin_routes_to_staged_owner(unsigned long long first_key)
     evbuffer_free(input);
     evbuffer_free(output);
     delete protocol;
-    close(listener);
+    evutil_closesocket(listener);
 }
 
 int main()
 {
+#ifdef _WIN32
+    WSADATA data;
+    check(WSAStartup(MAKEWORD(2, 2), &data) == 0, "Winsock startup");
+#endif
     check_pin_release(1);
     check_pin_release(1221322);
     check_repin_routes_to_staged_owner(1);

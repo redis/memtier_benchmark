@@ -30,9 +30,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-#ifdef HAVE_SYS_SOCKET_H
-#include <sys/socket.h>
-#endif
 #ifdef HAVE_NETINET_TCP_H
 #include <netinet/tcp.h>
 #endif
@@ -47,7 +44,7 @@
 #include <math.h>
 #include <algorithm>
 #include <sstream>
-#include <arpa/inet.h>
+#include "platform_compat.h"
 
 #include "client.h"
 #include "cluster_client.h"
@@ -352,7 +349,7 @@ bool client::finished(void)
             // up to 1 s early when it started late in a second.
             struct timeval now, elapsed;
             gettimeofday(&now, NULL);
-            timersub(&now, &m_config->benchmark_start_time, &elapsed);
+            evutil_timersub(&now, &m_config->benchmark_start_time, &elapsed);
             if (elapsed.tv_sec >= (time_t) m_config->test_time) return true;
         } else {
             if (m_stats.get_duration() >= m_config->test_time) return true;
@@ -1517,10 +1514,11 @@ void client_group::setup_staircase_timer(void)
     // The step timer is persistent, so once the clients stop at the deadline
     // it alone would keep event_base_dispatch() running until its next tick
     // (up to step_duration past --test-time). Remove it at the deadline.
-    struct timeval now, elapsed, deadline = {(time_t) m_config->test_time, 0}, remaining = {0, 0};
+    struct timeval now, elapsed, deadline = {0, 0}, remaining = {0, 0};
+    deadline.tv_sec = m_config->test_time;
     gettimeofday(&now, NULL);
-    timersub(&now, &m_config->benchmark_start_time, &elapsed);
-    if (timercmp(&elapsed, &deadline, <)) timersub(&deadline, &elapsed, &remaining);
+    evutil_timersub(&now, &m_config->benchmark_start_time, &elapsed);
+    if (timercmp(&elapsed, &deadline, <)) evutil_timersub(&deadline, &elapsed, &remaining);
     m_staircase_deadline_timer = event_new(m_base, -1, 0, staircase_deadline_cb, (void *) this);
     if (m_staircase_deadline_timer == NULL) {
         // The step timer still stops itself at its first tick past the deadline.
@@ -1546,7 +1544,7 @@ void client_group::handle_staircase_step(void)
     if (m_config->test_time > 0) {
         struct timeval now, elapsed;
         gettimeofday(&now, NULL);
-        timersub(&now, &m_config->benchmark_start_time, &elapsed);
+        evutil_timersub(&now, &m_config->benchmark_start_time, &elapsed);
         if ((unsigned long long) m_staircase_steps * m_config->step_duration >= m_config->test_time ||
             elapsed.tv_sec >= (time_t) m_config->test_time) {
             remove_staircase_timer();

@@ -23,10 +23,9 @@
 #include <climits>
 #include <queue>
 #include <string>
-#include <netdb.h>
-#include <sys/socket.h>
-#include <sys/un.h>
+#include "platform_compat.h"
 #include <event2/event.h>
+#include <event2/util.h>
 #include <event2/buffer.h>
 #include <event2/bufferevent.h>
 
@@ -387,8 +386,12 @@ private:
     // when neither is on.
     bool wants_request_key() const { return m_config->retry_on_error || m_config->failed_keys_file; }
 
-    void setup_event(int sockfd);
-    int setup_socket(struct connect_info *addr);
+#ifdef _WIN32
+    static void deferred_connect_error_handler(evutil_socket_t, short, void *);
+    void cancel_deferred_connect_error();
+#endif
+    void setup_event(evutil_socket_t sockfd);
+    evutil_socket_t setup_socket(struct connect_info *addr);
     void set_readable_id();
 
     bool is_conn_setup_done();
@@ -526,6 +529,9 @@ private:
     // Connection timeout tracking
     struct event *m_connection_timeout_timer;
     struct event *m_unix_connect_timer;
+#ifdef _WIN32
+    struct event *m_deferred_connect_error;
+#endif
 
     // Retry plumbing.
     //   m_retry_queue       requests waiting for backoff before resending

@@ -29,9 +29,8 @@
 #include <string.h>
 #include <errno.h>
 
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
+#include "platform_compat.h"
+#include <event2/util.h>
 
 #include <event2/event.h>
 #include <event2/http.h>
@@ -196,7 +195,7 @@ bool prometheus_exporter::start()
     m_bound = evhttp_bind_socket_with_handle(m_http, m_opts.bind_addr.c_str(), (ev_uint16_t) m_opts.port);
     if (m_bound == NULL) {
         fprintf(stderr, "error: prometheus exporter: failed to bind %s:%d: %s\n", m_opts.bind_addr.c_str(), m_opts.port,
-                strerror(errno));
+                evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR()));
         free_libevent_state();
         return false;
     }
@@ -208,7 +207,8 @@ bool prometheus_exporter::start()
         socklen_t slen = sizeof(ss);
         memset(&ss, 0, sizeof(ss));
         if (getsockname(fd, (struct sockaddr *) &ss, &slen) != 0) {
-            fprintf(stderr, "error: prometheus exporter: getsockname failed: %s\n", strerror(errno));
+            fprintf(stderr, "error: prometheus exporter: getsockname failed: %s\n",
+                    evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR()));
             free_libevent_state();
             return false;
         }

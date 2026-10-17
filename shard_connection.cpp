@@ -23,17 +23,12 @@
 #ifdef HAVE_SYS_TYPES_H
 #include <sys/types.h>
 #endif
-#ifdef HAVE_FCNTL_H
-#include <fcntl.h>
-#endif
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include "platform_compat.h"
 #include <time.h>
-#ifdef HAVE_SYS_SOCKET_H
-#include <sys/socket.h>
-#endif
 #ifdef HAVE_NETINET_TCP_H
 #include <netinet/tcp.h>
 #endif
@@ -314,6 +309,9 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_slots_retried_after_run_over(false),
         m_connection_timeout_timer(NULL),
         m_unix_connect_timer(NULL),
+#ifdef _WIN32
+        m_deferred_connect_error(NULL),
+#endif
         m_retry_queue(NULL),
         m_replay_queue(NULL),
         m_retry_drain_timer(NULL),
@@ -366,6 +364,9 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
 
 shard_connection::~shard_connection()
 {
+#ifdef _WIN32
+    cancel_deferred_connect_error();
+#endif
     if (m_address != NULL) {
         free(m_address);
         m_address = NULL;
@@ -467,8 +468,31 @@ shard_connection::~shard_connection()
     }
 }
 
-void shard_connection::setup_event(int sockfd)
+#ifdef _WIN32
+void shard_connection::cancel_deferred_connect_error()
 {
+    if (m_deferred_connect_error != NULL) {
+        event_free(m_deferred_connect_error);
+        m_deferred_connect_error = NULL;
+    }
+}
+
+void shard_connection::deferred_connect_error_handler(evutil_socket_t, short, void *ctx)
+{
+    shard_connection *connection = static_cast<shard_connection *>(ctx);
+    connection->cancel_deferred_connect_error();
+    // Teardown and unrelated Winsock calls can replace the thread's error.
+    // Restore the original refused result immediately before its callback.
+    WSASetLastError(WSAECONNREFUSED);
+    cluster_client_event_handler(connection->m_bev, BEV_EVENT_ERROR, connection);
+}
+#endif
+
+void shard_connection::setup_event(evutil_socket_t sockfd)
+{
+#ifdef _WIN32
+    cancel_deferred_connect_error();
+#endif
     if (m_bev) {
         bufferevent_free(m_bev);
     }
@@ -500,9 +524,9 @@ void shard_connection::setup_event(int sockfd)
     m_protocol->set_buffers(bufferevent_get_input(m_bev), bufferevent_get_output(m_bev));
 }
 
-int shard_connection::setup_socket(struct connect_info *addr)
+evutil_socket_t shard_connection::setup_socket(struct connect_info *addr)
 {
-    int sockfd;
+    evutil_socket_t sockfd;
 
     if (m_unix_sockaddr != NULL) {
         if (m_unix_sockaddrlen == 0) {
@@ -523,7 +547,7 @@ int shard_connection::setup_socket(struct connect_info *addr)
 
 
         const int enabled = 1;
-        int error = setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled));
+        int error = setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, (const char *) &enabled, sizeof(enabled));
         assert(error == 0);
 
         /*
@@ -534,22 +558,61 @@ int shard_connection::setup_socket(struct connect_info *addr)
         struct linger ling;
         ling.l_onoff = 1;  // Enable SO_LINGER
         ling.l_linger = 0; // Discard any unsent data and close immediately
-        error = setsockopt(sockfd, SOL_SOCKET, SO_LINGER, (void *) &ling, sizeof(ling));
+        error = setsockopt(sockfd, SOL_SOCKET, SO_LINGER, (const char *) &ling, sizeof(ling));
         assert(error == 0);
 
-        error = setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
+        error = setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, (const char *) &enabled, sizeof(enabled));
         assert(error == 0);
     }
 
     // set non-blocking behavior
-    int flags;
-    if ((flags = fcntl(sockfd, F_GETFL, 0)) < 0 || fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) < 0) {
-        close(sockfd);
+    if (evutil_make_socket_nonblocking(sockfd) < 0) {
+        evutil_closesocket(sockfd);
         return -1;
     }
 
     return sockfd;
 }
+
+#ifdef _WIN32
+// bufferevent_socket_connect() with an address calls connect() and, on the
+// expected WSAEWOULDBLOCK, getsockopt(SO_ERROR) to look for an immediate error.
+// While a connect is in flight that getsockopt() blocks for 10-15 ms (even on
+// loopback), and since all connections are opened one after another before the
+// benchmark starts, setup time grows with threads * clients. Issue the
+// non-blocking connect() here and give libevent the in-flight socket (NULL
+// address), which then waits for the socket to become writable exactly as it
+// does after its own WSAEWOULDBLOCK; failures are reported through the event
+// callback as before. Refusal is deferred separately below. For any other
+// immediate hard error, return
+// -1 without calling connect() a second time (as bufferevent_socket_connect()
+// with an address would); the caller reports the Winsock error, which is left
+// in place for it to read.
+static int bufferevent_connect_nonblocking(struct bufferevent *bev, evutil_socket_t sockfd, const struct sockaddr *sa,
+                                           int socklen)
+{
+    // The unit fixture injects synchronous Winsock outcomes into this call.
+#ifndef MEMTIER_TEST_CONNECT
+    int result = ::connect(sockfd, sa, socklen);
+#else
+    int result = MEMTIER_TEST_CONNECT(sockfd, sa, socklen);
+#endif
+    if (result == 0) {
+        return bufferevent_socket_connect(bev, NULL, 0);
+    }
+
+    // The errors libevent treats as "connect in progress" on Windows.
+    int err = WSAGetLastError();
+    // libevent defers a synchronous refusal to its error callback, returning
+    // success to the caller. Preserve that distinction from other hard errors.
+    if (err == WSAECONNREFUSED) return 1;
+    if (err == WSAEWOULDBLOCK || err == WSAEINTR || err == WSAEINPROGRESS || err == WSAEINVAL) {
+        return bufferevent_socket_connect(bev, NULL, 0);
+    }
+
+    return -1;
+}
+#endif
 
 int shard_connection::connect(struct connect_info *addr)
 {
@@ -575,9 +638,9 @@ int shard_connection::connect(struct connect_info *addr)
     m_multi_open = false;
 
     // setup socket
-    int sockfd = setup_socket(addr);
+    evutil_socket_t sockfd = setup_socket(addr);
     if (sockfd < 0) {
-        fprintf(stderr, "Failed to setup socket: %s\n", strerror(errno));
+        fprintf(stderr, "Failed to setup socket: %s\n", evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR()));
         return -1;
     }
 
@@ -590,12 +653,34 @@ int shard_connection::connect(struct connect_info *addr)
     // call connect
     m_connection_state = conn_in_progress;
 
-    if (bufferevent_socket_connect(m_bev, m_unix_sockaddr ? (struct sockaddr *) m_unix_sockaddr : addr->ci_addr,
-                                   m_unix_sockaddr ? m_unix_sockaddrlen : addr->ci_addrlen) == -1) {
-        const int error = errno;
+    const struct sockaddr *sa = m_unix_sockaddr ? (struct sockaddr *) m_unix_sockaddr : addr->ci_addr;
+    int socklen = m_unix_sockaddr ? m_unix_sockaddrlen : addr->ci_addrlen;
+#ifdef _WIN32
+    int ret = bufferevent_connect_nonblocking(m_bev, sockfd, sa, socklen);
+    if (ret == 1) {
+        // Do not enter the error callback during client preparation. This
+        // connection owns the queued event so disconnect/destruction cancels
+        // it, including the TLS bufferevent and its SSL ownership. event_new /
+        // event_active work with the existing libevent 2.0.10 minimum.
+        bufferevent_disable(m_bev, EV_READ | EV_WRITE);
+        m_deferred_connect_error = event_new(m_event_base, -1, 0, deferred_connect_error_handler, this);
+        if (m_deferred_connect_error == NULL) {
+            WSASetLastError(WSAENOBUFS);
+            ret = -1;
+        } else {
+            event_active(m_deferred_connect_error, EV_TIMEOUT, 0);
+            ret = 0;
+        }
+    }
+#else
+    int ret = bufferevent_socket_connect(m_bev, sa, socklen);
+#endif
+    if (ret == -1) {
+        const int error = EVUTIL_SOCKET_ERROR();
         // A full Unix listener backlog returns EAGAIN without starting a
         // connection. Wait between attempts so the worker and supervisor can
         // still run. TCP EINPROGRESS is already handled by libevent.
+#ifndef _WIN32
         if (m_unix_sockaddr != NULL && (error == EAGAIN || error == EWOULDBLOCK)) {
             // In particular, the SSL bufferevent must not try its handshake
             // on an unconnected, writable socket while the backlog is full.
@@ -610,9 +695,11 @@ int shard_connection::connect(struct connect_info *addr)
                 benchmark_error_log("error: failed to schedule Unix socket connect retry\n");
                 return -1;
             }
-        } else {
+        } else
+#endif
+        {
             disconnect();
-            benchmark_error_log("connect failed, error = %s\n", strerror(error));
+            benchmark_error_log("connect failed, error = %s\n", evutil_socket_error_to_string(error));
             return -1;
         }
     }
@@ -680,6 +767,9 @@ static void log_abandoned_request(const request *req, const char *reason)
 
 void shard_connection::disconnect()
 {
+#ifdef _WIN32
+    cancel_deferred_connect_error();
+#endif
     if (m_bev) {
         bufferevent_free(m_bev);
         m_bev = NULL;
@@ -866,7 +956,7 @@ int shard_connection::get_local_port()
         return -1;
     }
 
-    int fd = bufferevent_getfd(m_bev);
+    evutil_socket_t fd = bufferevent_getfd(m_bev);
     if (fd < 0) {
         return -1;
     }
@@ -1085,7 +1175,7 @@ bool shard_connection::enqueue_retry(request *req)
     struct timeval delay;
     delay.tv_sec = (long) (ms / 1000.0);
     delay.tv_usec = (long) ((ms - delay.tv_sec * 1000.0) * 1000.0);
-    timeradd(&now, &delay, &req->m_retry_due);
+    evutil_timeradd(&now, &delay, &req->m_retry_due);
 
     bool had_queued = !m_retry_queue->empty();
     req->m_claimed_by_retry = true;
@@ -1114,7 +1204,7 @@ bool shard_connection::enqueue_retry(request *req)
 void shard_connection::arm_retry_drain_timer(const struct timeval &due, const struct timeval &now)
 {
     struct timeval delay = {0, 0};
-    if (timercmp(&due, &now, >)) timersub(&due, &now, &delay);
+    if (timercmp(&due, &now, >)) evutil_timersub(&due, &now, &delay);
     m_retry_timer_due = due;
     // Replaces the timeout if the timer is already pending.
     event_add(m_retry_drain_timer, &delay);
@@ -1162,7 +1252,7 @@ void shard_connection::handle_retry_drain_event()
     struct timeval now, horizon;
     struct timeval slack = {0, 1000};
     retry_clock_now(&now);
-    timeradd(&now, &slack, &horizon);
+    evutil_timeradd(&now, &slack, &horizon);
     bool have_next = false;
     struct timeval next = {0, 0};
     for (size_t n = m_retry_queue->size(); n > 0 && !m_retry_queue->empty(); n--) {
@@ -1910,8 +2000,9 @@ void shard_connection::handle_event(short events)
             if (m_request_rate_phase_pending) {
                 first_interval_microsecond += m_request_rate_phase_microsecond;
             }
-            struct timeval interval = {(time_t) (first_interval_microsecond / 1000000U),
-                                       (suseconds_t) (first_interval_microsecond % 1000000U)};
+            struct timeval interval;
+            interval.tv_sec = first_interval_microsecond / 1000000U;
+            interval.tv_usec = first_interval_microsecond % 1000000U;
             m_request_per_cur_interval = m_config->request_per_interval;
             m_event_timer = event_new(m_event_base, -1, EV_PERSIST, cluster_client_timer_handler, (void *) this);
             event_add(m_event_timer, &interval);
@@ -1938,8 +2029,8 @@ void shard_connection::handle_event(short events)
             benchmark_error_log("TLS connection error: %s\n", ERR_reason_error_string(sslerr));
         }
 #endif
-        if (!ssl_error && errno) {
-            benchmark_error_log("Connection error: %s\n", strerror(errno));
+        if (!ssl_error && EVUTIL_SOCKET_ERROR()) {
+            benchmark_error_log("Connection error: %s\n", evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR()));
         }
 
         attempt_reconnect("Connection error");
@@ -1958,8 +2049,9 @@ void shard_connection::handle_timer_event(void)
     // The first timeout includes this connection's phase. Switch to the common
     // refill interval after it fires so the phase remains stable thereafter.
     if (m_request_rate_phase_pending) {
-        struct timeval interval = {(time_t) (m_config->request_interval_microsecond / 1000000U),
-                                   (suseconds_t) (m_config->request_interval_microsecond % 1000000U)};
+        struct timeval interval;
+        interval.tv_sec = m_config->request_interval_microsecond / 1000000U;
+        interval.tv_usec = m_config->request_interval_microsecond % 1000000U;
         m_request_rate_phase_pending = false;
         event_del(m_event_timer);
         event_add(m_event_timer, &interval);
@@ -2183,7 +2275,7 @@ bool shard_connection::run_deadline_passed(void)
     struct timeval deadline, now, slack = {0, 1000};
     if (!run_deadline(&deadline)) return false;
     gettimeofday(&now, NULL);
-    timeradd(&now, &slack, &now);
+    evutil_timeradd(&now, &slack, &now);
     return !timercmp(&now, &deadline, <);
 }
 

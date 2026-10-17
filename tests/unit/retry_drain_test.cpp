@@ -26,8 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/un.h>
+#include "platform_compat.h"
 #include <unistd.h>
 #include <string>
 #include <event2/event.h>
@@ -76,13 +75,33 @@ static request *retry_request(const char *command, unsigned int retries)
 // out once the connection is set up, not after the later retry's backoff.
 static void test_overdue_retry_sent_after_connect(const char *path)
 {
-    int listener = socket(AF_UNIX, SOCK_STREAM, 0);
+#ifndef _WIN32
+    evutil_socket_t listener = socket(AF_UNIX, SOCK_STREAM, 0);
     sockaddr_un address = {};
     address.sun_family = AF_UNIX;
     snprintf(address.sun_path, sizeof(address.sun_path), "%s", path);
     check(listener >= 0 && bind(listener, (sockaddr *) &address, sizeof(address)) == 0 && listen(listener, 4) == 0,
           "listener");
 
+    connect_info endpoint = {};
+
+#else
+    evutil_socket_t listener = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in address = {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t address_len = sizeof(address);
+    check(listener >= 0 && bind(listener, (sockaddr *) &address, sizeof(address)) == 0 && listen(listener, 4) == 0 &&
+              getsockname(listener, (sockaddr *) &address, &address_len) == 0,
+          "loopback listener");
+    connect_info endpoint = {};
+    endpoint.ci_family = AF_INET;
+    endpoint.ci_socktype = SOCK_STREAM;
+    endpoint.ci_protocol = IPPROTO_TCP;
+    endpoint.ci_addr = (sockaddr *) &address;
+    endpoint.ci_addrlen = address_len;
+
+#endif
     arbitrary_command_list commands;
     benchmark_config config = {};
     config.arbitrary_commands = &commands;
@@ -115,16 +134,16 @@ static void test_overdue_retry_sent_after_connect(const char *path)
         // Third resend of another request: due in 20 ms * 10^3 = 20 s.
         check(connection.enqueue_retry(retry_request("*1\r\n$6\r\nSECOND\r\n", 3)), "second retry queued");
 
-        connect_info unused = {};
-        check(connection.connect(&unused) == 0, "connect");
-        int peer = accept(listener, NULL, NULL);
+        connection.set_address_port("127.0.0.1", "0");
+        check(connection.connect(&endpoint) == 0, "connect");
+        evutil_socket_t peer = accept(listener, NULL, NULL);
         check(peer >= 0, "accept");
-        fcntl(peer, F_SETFL, O_NONBLOCK);
+        evutil_make_socket_nonblocking(peer);
         std::string received;
         for (int i = 0; i < 50 && received.find("FIRST") == std::string::npos; i++) {
             event_base_loop(base, EVLOOP_NONBLOCK);
             char buf[256];
-            ssize_t n = read(peer, buf, sizeof(buf));
+            int n = recv(peer, buf, sizeof(buf), 0);
             if (n > 0) received.append(buf, n);
             usleep(10000);
         }
@@ -133,16 +152,23 @@ static void test_overdue_retry_sent_after_connect(const char *path)
         check(received.find("SECOND") == std::string::npos, "later retry still waits for its own backoff");
         connection.disconnect();
         event_base_loop(base, EVLOOP_NONBLOCK);
-        if (peer >= 0) close(peer);
+        if (peer >= 0) evutil_closesocket(peer);
     }
     delete protocol;
     event_base_free(base);
-    close(listener);
+    evutil_closesocket(listener);
+#ifndef _WIN32
     unlink(path);
+#endif
 }
 
 int main()
 {
+#ifdef _WIN32
+    WSADATA data;
+    check(WSAStartup(MAKEWORD(2, 2), &data) == 0, "Winsock startup");
+    test_overdue_retry_sent_after_connect(NULL);
+#else
     char directory[] = "/tmp/memtier-retry-drain-XXXXXX";
     if (mkdtemp(directory) == NULL) {
         perror("mkdtemp");
@@ -151,6 +177,7 @@ int main()
     std::string path = std::string(directory) + "/socket";
     test_overdue_retry_sent_after_connect(path.c_str());
     rmdir(directory);
+#endif
     if (failures != 0) {
         fprintf(stderr, "%d retry drain check(s) failed\n", failures);
         return 1;

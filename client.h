@@ -21,9 +21,7 @@
 
 #include <stdlib.h>
 #include <stdio.h>
-#include <netdb.h>
-#include <sys/socket.h>
-#include <sys/un.h>
+#include "platform_compat.h"
 #include <vector>
 #include <queue>
 #include <atomic>

@@ -22,6 +22,7 @@ AC_CONFIG_HEADER([config.h])
 AM_INIT_AUTOMAKE
 AM_SILENT_RULES([yes])
 AC_CONFIG_MACRO_DIR([m4])
+AC_CANONICAL_HOST
 
 # Python is only required for the maintainer-only `make commands-meta` target.
 # Resolve to ":" (the no-op shell builtin) when absent so end-user builds keep
@@ -38,6 +39,15 @@ CXXFLAGS="-O2 -g -Wall -Werror=vla -std=c++11 $CXXFLAGS"
 # must come before AX_CODE_COVERAGE, which reads $GCC.
 AC_PROG_CC
 AC_PROG_CXX
+
+# MinGW builds use Winsock and libevent's Windows thread backend.
+AS_CASE([$host_os],
+  [mingw*], [
+    CPPFLAGS="$CPPFLAGS -D_WIN32_WINNT=0x0A00 -DWIN32_LEAN_AND_MEAN -DNOMINMAX -D__USE_MINGW_ANSI_STDIO=1"
+    LIBS="$LIBS -lws2_32"
+    memtier_windows=yes
+  ], [memtier_windows=no])
+AM_CONDITIONAL([MEMTIER_WINDOWS], [test "x$memtier_windows" = "xyes"])
 
 # Coverage
 AX_CODE_COVERAGE
@@ -149,10 +159,17 @@ PKG_CHECK_MODULES(LIBEVENT,
 # epoll_wait(), so an idle worker hangs after a cross-thread shutdown
 # request (Phase 1 of #426 / Ctrl+C). The pthreads bindings ship as a
 # separate .so since libevent 2.0, so we have to depend on it explicitly.
-PKG_CHECK_MODULES(LIBEVENT_PTHREADS,
-    [libevent_pthreads >= 2.0.10],
-    AC_SUBST(LIBEVENT_PTHREADS_CFLAGS) AC_SUBST(LIBEVENT_PTHREADS_LIBS)
-)
+AS_IF([test "x$memtier_windows" = "xyes"], [
+       LIBEVENT_PTHREADS_CFLAGS=""
+       LIBEVENT_PTHREADS_LIBS=""
+       AC_SUBST(LIBEVENT_PTHREADS_CFLAGS)
+       AC_SUBST(LIBEVENT_PTHREADS_LIBS)
+       ], [
+       PKG_CHECK_MODULES(LIBEVENT_PTHREADS,
+           [libevent_pthreads >= 2.0.10],
+           AC_SUBST(LIBEVENT_PTHREADS_CFLAGS) AC_SUBST(LIBEVENT_PTHREADS_LIBS)
+       )
+       ])
 
 # Prometheus exporter (evhttp) is optional, default ON. PKG check = non-fatal hygiene;
 # the LINK test is the real gate (bare AC_CHECK_HEADERS mis-detects on keg-only Homebrew

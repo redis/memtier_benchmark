@@ -25,6 +25,20 @@
 #include <time.h>
 
 #include "crash_report.h"
+#ifdef _WIN32
+static struct tm *gmtime_r(const time_t *t, struct tm *out)
+{
+    return gmtime_s(out, t) == 0 ? out : NULL;
+}
+static struct tm *localtime_r(const time_t *t, struct tm *out)
+{
+    return localtime_s(out, t) == 0 ? out : NULL;
+}
+static int setenv(const char *key, const char *value, int)
+{
+    return _putenv_s(key, value);
+}
+#endif
 
 static int failures = 0;
 static long skipped = 0;
@@ -34,6 +48,9 @@ static long skipped = 0;
 // reference outside that range; crash_format_time() itself uses long long.
 static bool fits_time_t(long long v)
 {
+#ifdef _WIN32
+    if (v < 0) return false;
+#endif
     return (long long) (time_t) v == v;
 }
 
@@ -127,6 +144,15 @@ int main(void)
     const long long jan = 1768478400; // 2026-01-15 12:00:00 UTC
     const long long jul = 1784116800; // 2026-07-15 12:00:00 UTC
     check_zone("UTC0", jan, 0);
+#ifdef _WIN32
+    // UCRT accepts std offset [dst], without POSIX bracket names or rules.
+    check_zone("IST-5:30", jan, 19800);
+    check_zone("NST3:30", jan, -12600);
+    check_zone("EST5EDT", jan, -18000);
+    check_zone("EST5EDT", jul, -14400);
+    check_zone("EAT-14", 1767182400, 50400);
+    check_zone("WAT12", 1767229200, -43200);
+#else
     check_zone("<+0530>-5:30", jan, 19800);
     check_zone("<-0330>3:30", jan, -12600);
     check_zone("<+14>-14", jan, 50400);
@@ -136,6 +162,8 @@ int main(void)
     // Local date differs from the UTC date, on both sides of a year end.
     check_zone("<+14>-14", 1767182400, 50400); // 2025-12-31 12:00 UTC is 2026-01-01 local
     check_zone("<-12>12", 1767229200, -43200); // 2026-01-01 01:00 UTC is 2025-12-31 local
+
+#endif
 
     if (failures != 0) {
         fprintf(stderr, "%d crash report test(s) failed\n", failures);

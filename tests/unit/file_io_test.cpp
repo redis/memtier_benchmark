@@ -23,6 +23,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <string>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #include "file_io.h"
 
@@ -42,7 +45,7 @@ static const char good2[] = "0, 0, 0, 5, 0, 0, 0, 3, \"k02\", \"def\"\n";
 
 static void write_file(const char *path, const char *body)
 {
-    FILE *f = fopen(path, "w");
+    FILE *f = fopen(path, "wb");
     if (f == NULL) {
         perror(path);
         exit(2);
@@ -66,6 +69,11 @@ static unsigned int drain(file_reader &r)
 
 int main(void)
 {
+#ifdef _WIN32
+    char dir[MAX_PATH], path[MAX_PATH];
+    CHECK(GetTempPathA(sizeof(dir), dir) != 0);
+    CHECK(GetTempFileNameA(dir, "mti", 0, path) != 0);
+#else
     char path[] = "/tmp/memtier-file-io-test-XXXXXX";
     int fd = mkstemp(path);
     if (fd < 0) {
@@ -73,6 +81,7 @@ int main(void)
         return 2;
     }
     close(fd);
+#endif
 
     file_reader r(path);
     std::string body;

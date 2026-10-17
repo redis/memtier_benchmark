@@ -46,6 +46,7 @@ memtier_benchmark_CPPFLAGS = \
 	$(LIBCRYPTO_CFLAGS) \
 	$(LIBSSL_CFLAGS)
 memtier_benchmark_SOURCES = \
+	platform_compat.h \
 	memtier_benchmark.cpp memtier_benchmark.h crash_report.h \
 	client.cpp client.h \
 	cluster_client.cpp cluster_client.h \
@@ -80,8 +81,8 @@ memtier_benchmark_LDADD = \
 	$(LIBSSL_LIBS)
 
 
-check_PROGRAMS = prometheus_metrics_test rate_limiter_test retry_backoff_test keylist_growth_test retry_drain_test socket_options_test hdr_histogram_test cluster_transaction_test \
-    cluster_hslot_test run_stats_counters_test run_stats_merge_test crash_report_test reconnect_siblings_test memcache_meta_test
+check_PROGRAMS = prometheus_metrics_test rate_limiter_test retry_backoff_test keylist_growth_test hdr_histogram_test cluster_transaction_test \
+    cluster_hslot_test run_stats_counters_test run_stats_merge_test crash_report_test socket_options_test retry_drain_test reconnect_siblings_test memcache_meta_test
 
 # The metrics test links only the pure layer (prometheus_metrics.{h,cpp}, utf8.{h,cpp}).
 # First `make check` program in the repo. The metrics layer is config-free and
@@ -94,6 +95,11 @@ prometheus_metrics_test_SOURCES = tests/unit/prometheus_metrics_test.cpp \
     deps/hdr_histogram/hdr_histogram.c deps/hdr_histogram/hdr_histogram.h
 prometheus_metrics_test_CPPFLAGS = -I$(srcdir)
 prometheus_metrics_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+if MEMTIER_WINDOWS
+# mingw-w64 provides rand_r() only as a macro over rand() (the seed is ignored),
+# and only under this feature macro. That is enough for this test's use of it.
+prometheus_metrics_test_CPPFLAGS += -D_POSIX_THREAD_SAFE_FUNCTIONS
+endif
 
 memcache_meta_test_SOURCES = tests/unit/memcache_meta_test.cpp protocol.cpp protocol.h
 memcache_meta_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)

@@ -299,8 +299,8 @@ public:
 
     // ---------------------------------------------------------------------
     // CPU utilization of memtier itself (the load generator).
-    //   m_cpu_summary  - authoritative whole-run aggregate (getrusage-based)
-    //   m_cpu_threads  - authoritative per-worker totals (getrusage-based)
+    //   m_cpu_summary  - authoritative whole-run aggregate (per-thread CPU accounting)
+    //   m_cpu_threads  - authoritative per-worker totals (per-thread CPU accounting)
     //   m_cpu_stats    - advisory per-second per-thread sampler detail
     // All three are populated by run_benchmark() after the join loop and
     // consumed by print()/print_json(). They survive the copyable run_stats

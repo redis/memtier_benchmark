@@ -88,7 +88,11 @@ struct crash_line
 static inline long crash_utc_offset(time_t now)
 {
     struct tm lt, gt;
+#ifdef _WIN32
+    if (localtime_s(&lt, &now) != 0 || gmtime_s(&gt, &now) != 0) return 0;
+#else
     if (localtime_r(&now, &lt) == NULL || gmtime_r(&now, &gt) == NULL) return 0;
+#endif
     long off = (lt.tm_hour - gt.tm_hour) * 3600L + (lt.tm_min - gt.tm_min) * 60L + (lt.tm_sec - gt.tm_sec);
     if (lt.tm_year != gt.tm_year) {
         off += (lt.tm_year > gt.tm_year ? 1 : -1) * 86400L;
