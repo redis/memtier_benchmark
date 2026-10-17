@@ -1,0 +1,67 @@
+# clang-format configuration for memtier_benchmark
+# Based on analysis of existing code style
+
+BasedOnStyle: LLVM
+
+# C++ standard: keep Cpp03 so nested templates use "> >" (not ">>"),
+# which is required for the macOS C++03-compatible build.
+Standard: Cpp03
+
+# Indentation
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ContinuationIndentWidth: 4
+AccessModifierOffset: -4
+
+# Brace style: opening brace on new line for functions, same line for control structures
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterClass: true
+  AfterControlStatement: Never
+  AfterEnum: true
+  AfterFunction: true
+  AfterNamespace: true
+  AfterStruct: true
+  AfterUnion: true
+  BeforeCatch: false
+  BeforeElse: false
+  IndentBraces: false
+
+# Constructor initializer lists - colon on same line, break after colon
+BreakConstructorInitializers: AfterColon
+ConstructorInitializerIndentWidth: 8
+PackConstructorInitializers: NextLine
+
+# Line width
+ColumnLimit: 120
+
+# Pointer/reference alignment - space before * (Right alignment)
+PointerAlignment: Right
+ReferenceAlignment: Right
+
+# Spaces
+SpaceAfterCStyleCast: true
+SpaceBeforeAssignmentOperators: true
+SpaceBeforeParens: ControlStatements
+SpacesInAngles: Never
+SpacesInParentheses: false
+
+# IMPORTANT: Do not sort includes - breaks build due to header dependencies
+IncludeBlocks: Preserve
+SortIncludes: Never
+
+# Short statements
+AllowShortBlocksOnASingleLine: Empty
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: false
+
+# Other
+AlignTrailingComments: true
+AlwaysBreakAfterReturnType: None
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 2
+SpaceBeforeCpp11BracedList: false
+Cpp11BracedListStyle: true
+

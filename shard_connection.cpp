@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2011-2017 Redis Labs Ltd.
+ * Copyright (C) 2011-2026 Redis Labs Ltd.
  *
  * This file is part of memtier_benchmark.
  *
@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <time.h>
 #ifdef HAVE_SYS_SOCKET_H
 #include <sys/socket.h>
 #endif
@@ -48,84 +49,272 @@
 #include "obj_gen.h"
 #include "memtier_benchmark.h"
 #include "connections_manager.h"
+#include "client.h"
+#include "retry_policy.h"
+#include "retry_backoff.h"
 #include "event2/bufferevent.h"
 
+// Maximum reconnect delay enforced after every exponential-backoff
+// multiplication (retry_backoff.h has the one for --retry-on-error).
+// Without a cap, a factor of 2.0 and --max-reconnect-attempts=0 (unlimited)
+// causes the delay to double on every attempt: after ~30 doublings the next
+// scheduled reconnect fires in ~34 years. event_add() silently absorbs
+// that value, making the benchmark go effectively dark instead of surfacing the
+// underlying failure.  60 s is a practical upper bound: tight enough to remain
+// responsive, large enough to avoid thundering-herd reconnect storms.
+static const double MEMTIER_BACKOFF_CAP_SEC = 60.0;
+
+// Minimum reconnect delay enforced after every backoff multiplication. A
+// --reconnect-backoff-factor below 1 shrinks the delay on each attempt; with no
+// floor it reaches 0 s after a few attempts and a dead server is reconnected in
+// a tight loop (hundreds of thousands of attempts and log lines per second).
+// 100 ms still reconnects quickly while bounding each connection to ~10
+// attempts per second. Factor 0 does not multiply, so it keeps the constant
+// 1 s delay; a tiny positive factor settles at this floor instead.
+static const double MEMTIER_RECONNECT_MIN_DELAY_SEC = 0.1;
+
+// Workload requests count toward the client's generated/processed totals and
+// per-endpoint routed ops; connection-setup requests do not. A switch, so a
+// new request_type must be classified here.
+static bool is_workload_request(request_type type)
+{
+    switch (type) {
+    case rt_get:
+    case rt_set:
+    case rt_wait:
+    case rt_arbitrary:
+        return true;
+    case rt_unknown:
+    case rt_auth:
+    case rt_select_db:
+    case rt_cluster_slots:
+    case rt_hello:
+    case rt_readonly:
+    case rt_discard:
+    case rt_asking:
+        break;
+    }
+    return false;
+}
+
 #ifdef USE_TLS
+#include <mutex>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include "event2/bufferevent_ssl.h"
 #endif
 
+void cluster_client_timer_handler(evutil_socket_t fd, short what, void *ctx)
+{
+    shard_connection *sc = (shard_connection *) ctx;
+    assert(sc != NULL);
+    sc->handle_timer_event();
+}
+
+void cluster_client_reconnect_timer_handler(evutil_socket_t fd, short what, void *ctx)
+{
+    shard_connection *sc = (shard_connection *) ctx;
+    assert(sc != NULL);
+    sc->handle_reconnect_timer_event();
+}
+
+void deferred_fill_pipeline_cb(evutil_socket_t, short, void *ctx)
+{
+    static_cast<shard_connection *>(ctx)->fill_pipeline();
+}
+
+void cluster_slots_retry_cb(evutil_socket_t, short, void *ctx)
+{
+    static_cast<shard_connection *>(ctx)->handle_cluster_slots_retry_event();
+}
+
+void setup_rejected_check_cb(evutil_socket_t, short, void *ctx)
+{
+    static_cast<shard_connection *>(ctx)->handle_setup_rejected_check_event();
+}
+
+void cluster_client_connection_timeout_handler(evutil_socket_t fd, short what, void *ctx)
+{
+    shard_connection *sc = (shard_connection *) ctx;
+    assert(sc != NULL);
+    sc->handle_connection_timeout_event();
+}
+
+// Retry due times use the monotonic clock, like libevent's timers, so a
+// wall-clock step cannot hold queued retries back or resend them early.
+static void retry_clock_now(struct timeval *tv)
+{
+    struct timespec mono;
+    if (clock_gettime(CLOCK_MONOTONIC, &mono) == 0) {
+        tv->tv_sec = mono.tv_sec;
+        tv->tv_usec = mono.tv_nsec / 1000;
+    } else {
+        gettimeofday(tv, NULL);
+    }
+}
+
+void cluster_client_retry_drain_handler(evutil_socket_t fd, short what, void *ctx)
+{
+    shard_connection *sc = (shard_connection *) ctx;
+    assert(sc != NULL);
+    sc->handle_retry_drain_event();
+}
+
 void cluster_client_read_handler(bufferevent *bev, void *ctx)
 {
     shard_connection *sc = (shard_connection *) ctx;
     assert(sc != NULL);
-
     sc->process_response();
 }
 
 void cluster_client_event_handler(bufferevent *bev, short events, void *ctx)
 {
     shard_connection *sc = (shard_connection *) ctx;
-
     assert(sc != NULL);
     sc->handle_event(events);
 }
 
-request::request(request_type type, unsigned int size, struct timeval* sent_time, unsigned int keys)
-        : m_type(type), m_size(size), m_keys(keys)
+request::request(request_type type, unsigned int size, struct timeval *sent_time, unsigned int keys) :
+        m_type(type),
+        m_size(size),
+        m_keys(keys),
+        m_retries(0),
+        m_claimed_by_retry(false),
+        m_asking(false),
+        m_serialized(NULL),
+        m_serialized_len(0),
+        m_key(NULL),
+        m_key_len(0)
 {
     if (sent_time != NULL)
         m_sent_time = *sent_time;
     else {
         gettimeofday(&m_sent_time, NULL);
     }
+    m_first_sent_time = m_sent_time;
+    timerclear(&m_retry_due);
 }
 
-arbitrary_request::arbitrary_request(size_t request_index, request_type type,
-                                     unsigned int size, struct timeval* sent_time) :
-        request(type, size, sent_time, 1),
-        index(request_index) {
-}
-
-verify_request::verify_request(request_type type,
-                               unsigned int size,
-                               struct timeval* sent_time,
-                               unsigned int keys,
-                               const char *key,
-                               unsigned int key_len,
-                               const char *value,
-                               unsigned int value_len) :
-        request(type, size, sent_time, keys),
-        m_key(NULL), m_key_len(0),
-        m_value(NULL), m_value_len(0)
+request::~request(void)
 {
-    m_key_len = key_len;
-    m_key = (char *)malloc(key_len);
-    memcpy(m_key, key, m_key_len);
+    if (m_serialized) {
+        free(m_serialized);
+        m_serialized = NULL;
+        m_serialized_len = 0;
+    }
+    if (m_key) {
+        free(m_key);
+        m_key = NULL;
+        m_key_len = 0;
+    }
+}
 
+void request::set_serialized(const char *data, size_t len)
+{
+    if (m_serialized) {
+        free(m_serialized);
+        m_serialized = NULL;
+        m_serialized_len = 0;
+    }
+    if (!data || len == 0) return;
+    m_serialized = (char *) malloc(len);
+    if (!m_serialized) return; // best-effort capture; replay just won't work
+    memcpy(m_serialized, data, len);
+    m_serialized_len = len;
+}
+
+void request::set_key_for_log(const char *key, unsigned int key_len)
+{
+    if (m_key) {
+        free(m_key);
+        m_key = NULL;
+        m_key_len = 0;
+    }
+    if (!key || key_len == 0) return;
+    m_key = (char *) malloc(key_len);
+    if (!m_key) return;
+    memcpy(m_key, key, key_len);
+    m_key_len = key_len;
+}
+
+arbitrary_request::arbitrary_request(size_t request_index, request_type type, unsigned int size,
+                                     struct timeval *sent_time, const arbitrary_command *cmd_meta) :
+        request(type, size, sent_time,
+                // m_keys is the number of expected key buckets. Prefer the
+                // spec-resolved positions when available so per-key totals match
+                // what the parser will see; otherwise fall back to the user's
+                // __key__ placeholder count, then 1 as a conservative default.
+                (cmd_meta != NULL && !cmd_meta->spec_key_positions.empty())
+                    ? (unsigned int) cmd_meta->spec_key_positions.size()
+                : (cmd_meta != NULL && cmd_meta->keys_count > 0) ? cmd_meta->keys_count
+                                                                 : 1),
+        index(request_index),
+        m_cmd_meta(cmd_meta)
+{
+}
+
+verify_request::verify_request(request_type type, unsigned int size, struct timeval *sent_time, unsigned int keys,
+                               const char *key, unsigned int key_len, const char *value, unsigned int value_len) :
+        request(type, size, sent_time, keys), m_value(NULL), m_value_len(0)
+{
+    // base class holds the key for both verification + failed-keys logging.
+    set_key_for_log(key, key_len);
     m_value_len = value_len;
-    m_value = (char *)malloc(value_len);
+    m_value = (char *) malloc(value_len);
     memcpy(m_value, value, m_value_len);
 }
 
 verify_request::~verify_request(void)
 {
-    if (m_key != NULL) {
-        free((void *) m_key);
-        m_key = NULL;
-    }
     if (m_value != NULL) {
         free((void *) m_value);
         m_value = NULL;
     }
 }
 
-shard_connection::shard_connection(unsigned int id, connections_manager* conns_man, benchmark_config* config,
-                                   struct event_base* event_base, abstract_protocol* abs_protocol) :
-        m_address(NULL), m_port(NULL), m_unix_sockaddr(NULL),
-        m_bev(NULL), m_pending_resp(0), m_connection_state(conn_disconnected),
-        m_authentication(auth_done), m_db_selection(select_done), m_cluster_slots(slots_done) {
+shard_connection::shard_connection(unsigned int id, connections_manager *conns_man, benchmark_config *config,
+                                   struct event_base *event_base, abstract_protocol *abs_protocol,
+                                   unsigned int request_rate_phase_microsecond) :
+        m_address(NULL),
+        m_port(NULL),
+        m_unix_sockaddr(NULL),
+        m_bev(NULL),
+        m_event_timer(NULL),
+        m_request_per_cur_interval(0),
+        m_request_rate_phase_microsecond(request_rate_phase_microsecond),
+        m_request_rate_phase_pending(request_rate_phase_microsecond > 0),
+        m_pending_resp(0),
+        m_last_pushed_req_type(-1),
+        m_connection_state(conn_disconnected),
+        m_role(role_primary),
+        m_hello(setup_done),
+        m_authentication(setup_done),
+        m_db_selection(setup_done),
+        m_cluster_slots(setup_done),
+        m_readonly_state(setup_done),
+        m_multi_open(false),
+        m_reconnect_attempts(0),
+        m_current_backoff_delay(1.0),
+        m_reconnect_timer(NULL),
+        m_reconnecting(false),
+        m_setup_rejected(false),
+        m_setup_rejected_replica(false),
+        m_setup_rejected_context(NULL),
+        m_thread_end_reason(NULL),
+        m_connect_failed(false),
+        m_dropped_after_run_over(false),
+        m_setup_failed_since_reply(false),
+        m_slots_rejected(false),
+        m_slots_retried_after_run_over(false),
+        m_connection_timeout_timer(NULL),
+        m_retry_queue(NULL),
+        m_replay_queue(NULL),
+        m_retry_drain_timer(NULL),
+        m_deferred_fill_timer(NULL),
+        m_cluster_slots_retry_timer(NULL),
+        m_setup_rejected_timer(NULL),
+        m_bev_paused(false)
+{
     m_id = id;
     m_conns_manager = conns_man;
     m_config = config;
@@ -136,8 +325,8 @@ shard_connection::shard_connection(unsigned int id, connections_manager* conns_m
         assert(m_unix_sockaddr != NULL);
 
         m_unix_sockaddr->sun_family = AF_UNIX;
-        strncpy(m_unix_sockaddr->sun_path, m_config->unix_socket, sizeof(m_unix_sockaddr->sun_path)-1);
-        m_unix_sockaddr->sun_path[sizeof(m_unix_sockaddr->sun_path)-1] = '\0';
+        strncpy(m_unix_sockaddr->sun_path, m_config->unix_socket, sizeof(m_unix_sockaddr->sun_path) - 1);
+        m_unix_sockaddr->sun_path[sizeof(m_unix_sockaddr->sun_path) - 1] = '\0';
     }
 
     m_protocol = abs_protocol->clone();
@@ -145,9 +334,16 @@ shard_connection::shard_connection(unsigned int id, connections_manager* conns_m
 
     m_pipeline = new std::queue<request *>;
     assert(m_pipeline != NULL);
+
+    if (m_config->retry_on_error) {
+        m_retry_queue = new std::queue<request *>;
+        m_replay_queue = new std::queue<request *>;
+    }
+    timerclear(&m_retry_timer_due);
 }
 
-shard_connection::~shard_connection() {
+shard_connection::~shard_connection()
+{
     if (m_address != NULL) {
         free(m_address);
         m_address = NULL;
@@ -168,21 +364,91 @@ shard_connection::~shard_connection() {
         m_bev = NULL;
     }
 
+    if (m_event_timer != NULL) {
+        event_free(m_event_timer);
+        m_event_timer = NULL;
+    }
+
+    if (m_reconnect_timer != NULL) {
+        event_free(m_reconnect_timer);
+        m_reconnect_timer = NULL;
+    }
+
+    if (m_connection_timeout_timer != NULL) {
+        event_free(m_connection_timeout_timer);
+        m_connection_timeout_timer = NULL;
+    }
+
     if (m_protocol != NULL) {
         delete m_protocol;
         m_protocol = NULL;
     }
 
     if (m_pipeline != NULL) {
+        // Free any requests still in flight. A normally-completed run drains the
+        // pipeline before teardown, but an early teardown (Ctrl+C,
+        // --connection-stage-timeout abort, or the --test-time backstop tearing
+        // down a wedged connection -- e.g. replaying a monitor command that
+        // never gets a reply) leaves queued request objects behind. Deleting the
+        // queue without draining it leaks them; LeakSanitizer flags it (the
+        // Monitor-Input Fuzz exit=42 reports). Mirrors the retry/replay queues
+        // below.
+        while (!m_pipeline->empty()) {
+            delete m_pipeline->front();
+            m_pipeline->pop();
+        }
         delete m_pipeline;
         m_pipeline = NULL;
     }
+
+    if (m_retry_drain_timer != NULL) {
+        event_free(m_retry_drain_timer);
+        m_retry_drain_timer = NULL;
+    }
+
+    if (m_deferred_fill_timer != NULL) {
+        event_free(m_deferred_fill_timer);
+        m_deferred_fill_timer = NULL;
+    }
+
+    if (m_cluster_slots_retry_timer != NULL) {
+        event_free(m_cluster_slots_retry_timer);
+        m_cluster_slots_retry_timer = NULL;
+    }
+
+    if (m_setup_rejected_timer != NULL) {
+        event_free(m_setup_rejected_timer);
+        m_setup_rejected_timer = NULL;
+    }
+
+    if (m_retry_queue != NULL) {
+        while (!m_retry_queue->empty()) {
+            delete m_retry_queue->front();
+            m_retry_queue->pop();
+        }
+        delete m_retry_queue;
+        m_retry_queue = NULL;
+    }
+
+    if (m_replay_queue != NULL) {
+        while (!m_replay_queue->empty()) {
+            delete m_replay_queue->front();
+            m_replay_queue->pop();
+        }
+        delete m_replay_queue;
+        m_replay_queue = NULL;
+    }
 }
 
-void shard_connection::setup_event(int sockfd) {
+void shard_connection::setup_event(int sockfd)
+{
     if (m_bev) {
         bufferevent_free(m_bev);
     }
+    // Fresh bufferevent below starts enabled by default (after we call
+    // bufferevent_enable in handle_event on BEV_EVENT_CONNECTED); reset the
+    // pause flag so we don't carry stale state from a prior socket.
+    m_bev_paused = false;
 
 #ifdef USE_TLS
     if (m_config->openssl_ctx) {
@@ -190,11 +456,11 @@ void shard_connection::setup_event(int sockfd) {
         assert(ctx != NULL);
 
         if (m_config->tls_sni) {
-          SSL_set_tlsext_host_name(ctx, m_config->tls_sni);
+            SSL_set_tlsext_host_name(ctx, m_config->tls_sni);
         }
 
-        m_bev = bufferevent_openssl_socket_new(m_event_base,
-                sockfd, ctx, BUFFEREVENT_SSL_CONNECTING, BEV_OPT_CLOSE_ON_FREE);
+        m_bev = bufferevent_openssl_socket_new(m_event_base, sockfd, ctx, BUFFEREVENT_SSL_CONNECTING,
+                                               BEV_OPT_CLOSE_ON_FREE);
     } else {
 #endif
         m_bev = bufferevent_socket_new(m_event_base, sockfd, BEV_OPT_CLOSE_ON_FREE);
@@ -203,13 +469,12 @@ void shard_connection::setup_event(int sockfd) {
 #endif
 
     assert(m_bev != NULL);
-    bufferevent_setcb(m_bev, cluster_client_read_handler,
-        NULL, cluster_client_event_handler, (void *)this);
+    bufferevent_setcb(m_bev, cluster_client_read_handler, NULL, cluster_client_event_handler, (void *) this);
     m_protocol->set_buffers(bufferevent_get_input(m_bev), bufferevent_get_output(m_bev));
 }
 
-int shard_connection::setup_socket(struct connect_info* addr) {
-    int flags;
+int shard_connection::setup_socket(struct connect_info *addr)
+{
     int sockfd;
 
     if (m_unix_sockaddr != NULL) {
@@ -224,23 +489,29 @@ int shard_connection::setup_socket(struct connect_info* addr) {
             return -1;
         }
 
-        // configure socket behavior
-        struct linger ling = {0, 0};
-        int flags = 1;
-        int error = setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, (void *) &flags, sizeof(flags));
+
+        const int enabled = 1;
+        int error = setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled));
         assert(error == 0);
 
+        /*
+         * Configure socket behavior:
+         * If l_onoff is non-zero and l_linger is zero:
+         *   The socket will discard any unsent data and the close() call will return immediately.
+         */
+        struct linger ling;
+        ling.l_onoff = 1;  // Enable SO_LINGER
+        ling.l_linger = 0; // Discard any unsent data and close immediately
         error = setsockopt(sockfd, SOL_SOCKET, SO_LINGER, (void *) &ling, sizeof(ling));
         assert(error == 0);
 
-        error = setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, (void *) &flags, sizeof(flags));
+        error = setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
         assert(error == 0);
     }
 
     // set non-blocking behavior
-    flags = 1;
-    if ((flags = fcntl(sockfd, F_GETFL, 0)) < 0 ||
-        fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) < 0) {
+    int flags;
+    if ((flags = fcntl(sockfd, F_GETFL, 0)) < 0 || fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) < 0) {
         close(sockfd);
         return -1;
     }
@@ -248,15 +519,33 @@ int shard_connection::setup_socket(struct connect_info* addr) {
     return sockfd;
 }
 
-int shard_connection::connect(struct connect_info* addr) {
+int shard_connection::connect(struct connect_info *addr)
+{
+    // Belt-and-suspenders: disconnect() already calls reset_state(), but if
+    // this object was constructed and never went through a disconnect (very
+    // first connect on a fresh shard_connection) we still want a clean
+    // parser cursor. Cheap and idempotent.
+    if (m_protocol != NULL) {
+        m_protocol->reset_state();
+    }
+
     // set required setup commands
-    m_authentication = m_config->authenticate ? auth_none : auth_done;
-    m_db_selection = m_config->select_db ? select_none : select_done;
+    m_authentication = m_config->authenticate ? setup_none : setup_done;
+    m_db_selection = m_config->select_db ? setup_none : setup_done;
+    m_hello = (m_config->protocol == PROTOCOL_RESP2 || m_config->protocol == PROTOCOL_RESP3) ? setup_none : setup_done;
+    // Replica connections need READONLY before they will serve user reads;
+    // cluster mode only (standalone replicas need a different ladder per P2
+    // design brief). Re-armed on every reconnect because the flag is
+    // connection-scoped on the server.
+    m_readonly_state = (m_role == role_replica && m_config->cluster_mode && is_redis_protocol(m_config->protocol))
+                           ? setup_none
+                           : setup_done;
+    m_multi_open = false;
 
     // setup socket
     int sockfd = setup_socket(addr);
     if (sockfd < 0) {
-        fprintf(stderr, "Failed to setup socket: %s", strerror(errno));
+        fprintf(stderr, "Failed to setup socket: %s\n", strerror(errno));
         return -1;
     }
 
@@ -269,33 +558,200 @@ int shard_connection::connect(struct connect_info* addr) {
     // call connect
     m_connection_state = conn_in_progress;
 
-    if (bufferevent_socket_connect(m_bev,
-                  m_unix_sockaddr ? (struct sockaddr *) m_unix_sockaddr : addr->ci_addr,
-                  m_unix_sockaddr ? sizeof(struct sockaddr_un) : addr->ci_addrlen) == -1) {
+    if (bufferevent_socket_connect(m_bev, m_unix_sockaddr ? (struct sockaddr *) m_unix_sockaddr : addr->ci_addr,
+                                   m_unix_sockaddr ? sizeof(struct sockaddr_un) : addr->ci_addrlen) == -1) {
         disconnect();
 
         benchmark_error_log("connect failed, error = %s\n", strerror(errno));
         return -1;
     }
 
+    // A pending reconnect is moot once something else (e.g. a shard's
+    // reconnect() reconnecting the main connection) connects this
+    // connection; left armed, it would keep m_reconnecting set and ignore
+    // errors on the live connection. Cancel it only now, so a socket setup
+    // failure above still leaves it to retry. A failed
+    // bufferevent_socket_connect() already cancelled it in disconnect(); its
+    // caller has to schedule the retry.
+    if (m_reconnect_timer != NULL) {
+        event_free(m_reconnect_timer);
+        m_reconnect_timer = NULL;
+    }
+    m_reconnecting = false;
+    m_setup_rejected = false;
+
+    // Start connection timeout timer (only if enabled)
+    if (m_config->connection_timeout > 0) {
+        struct timeval timeout;
+        timeout.tv_sec = m_config->connection_timeout;
+        timeout.tv_usec = 0;
+
+        m_connection_timeout_timer =
+            event_new(m_event_base, -1, 0, cluster_client_connection_timeout_handler, (void *) this);
+        event_add(m_connection_timeout_timer, &timeout);
+    }
+
     return 0;
 }
 
-void shard_connection::disconnect() {
-    if (m_bev) {
-        bufferevent_free(m_bev);
-    }
-    m_bev = NULL;
-
-    m_connection_state = conn_disconnected;
-
-    // by default no need to send any setup request
-    m_authentication = auth_done;
-    m_db_selection = select_done;
-    m_cluster_slots = slots_done;
+// Log a request memtier gives up on, without a reply, to --failed-keys-file.
+static void log_abandoned_request(const request *req, const char *reason)
+{
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    global_failed_keys_logger().log_failure(now, "REPLAY", req->m_key, req->m_key_len, reason, req->m_retries);
 }
 
-void shard_connection::set_address_port(const char* address, const char* port) {
+void shard_connection::disconnect()
+{
+    if (m_bev) {
+        bufferevent_free(m_bev);
+        m_bev = NULL;
+    }
+    // After free, any future bufferevent starts in the default (enabled) state.
+    m_bev_paused = false;
+
+    if (m_event_timer != NULL) {
+        event_free(m_event_timer);
+        m_event_timer = NULL;
+    }
+
+    if (m_reconnect_timer != NULL) {
+        event_free(m_reconnect_timer);
+        m_reconnect_timer = NULL;
+    }
+
+    if (m_connection_timeout_timer != NULL) {
+        event_free(m_connection_timeout_timer);
+        m_connection_timeout_timer = NULL;
+    }
+
+    // Drain pipeline. With --retry-on-error, move in-flight requests into the
+    // replay queue so they get resent after reconnect. Otherwise, discard them.
+    // Discarded workload requests will never be processed, so uncount them
+    // from the client's generated total; leaving them counted holds the
+    // pipeline (--reconnect-interval, cluster in-flight budget) and stalls
+    // --requests runs once the connection comes back. Requests held for retry
+    // are not counted as processed until their final outcome, so every
+    // workload request dropped here is uncounted the same way.
+    //
+    // --transaction requests are dropped too: the server discards the MULTI
+    // with the socket, so replaying the rest of a block would run its
+    // commands outside any transaction and its EXEC would fail.
+    //
+    // Under --retry-on-error a dropped request is one memtier gave up on, so
+    // it also counts as an error, like every other request that is never
+    // resent (abandoned); without it, dropping in-flight requests on a
+    // disconnect is the expected behaviour.
+    unsigned long long dropped = 0;
+    unsigned long long abandoned = 0;
+    if (m_config->retry_on_error && m_replay_queue != NULL && !m_config->transaction) {
+        while (m_pending_resp) {
+            request *req = pop_req();
+            // Only setup commands have no serialized capture (we never attempt
+            // capture for those) — drop those.
+            if (!is_workload_request(req->m_type)) {
+                delete req;
+                continue;
+            }
+            if (req->m_serialized && req->m_serialized_len > 0) {
+                m_replay_queue->push(req);
+            } else {
+                log_abandoned_request(req, "not-replayable");
+                abandoned++;
+                delete req;
+            }
+        }
+        // Also rescue requests sitting in the per-connection retry queue
+        // (waiting for a backoff timer to fire). Without this, the backoff
+        // timer's connection check (handle_retry_drain_event) would silently
+        // leave them stranded after reconnect.
+        if (m_retry_queue != NULL) {
+            while (!m_retry_queue->empty()) {
+                request *req = m_retry_queue->front();
+                m_retry_queue->pop();
+                if (req->m_serialized && req->m_serialized_len > 0) {
+                    m_replay_queue->push(req);
+                } else {
+                    // Not expected: enqueue_retry() only accepts requests
+                    // with captured bytes. It cannot be resent: abandon it.
+                    log_abandoned_request(req, "not-replayable");
+                    abandoned++;
+                    delete req;
+                }
+            }
+        }
+        // Cancel any pending drain timer — it has nothing to drain now and
+        // will be re-armed after reconnect by drain_replay_queue_after_reconnect.
+        if (m_retry_drain_timer != NULL && evtimer_pending(m_retry_drain_timer, NULL)) {
+            evtimer_del(m_retry_drain_timer);
+        }
+    } else {
+        while (m_pending_resp) {
+            request *req = pop_req();
+            if (is_workload_request(req->m_type)) {
+                if (m_config->retry_on_error && m_config->transaction) {
+                    abandoned++;
+                    log_abandoned_request(req, "transaction-not-replayed");
+                } else {
+                    dropped++;
+                }
+            }
+            delete req;
+        }
+    }
+    if (dropped) m_conns_manager->dec_reqs_generated(dropped);
+    if (abandoned) m_conns_manager->abandon_requests(abandoned);
+
+    if (m_deferred_fill_timer != NULL && evtimer_pending(m_deferred_fill_timer, NULL)) {
+        evtimer_del(m_deferred_fill_timer);
+    }
+    if (m_cluster_slots_retry_timer != NULL && evtimer_pending(m_cluster_slots_retry_timer, NULL)) {
+        evtimer_del(m_cluster_slots_retry_timer);
+    }
+    if (m_setup_rejected_timer != NULL && evtimer_pending(m_setup_rejected_timer, NULL)) {
+        evtimer_del(m_setup_rejected_timer);
+    }
+    m_setup_rejected_context = NULL;
+
+    m_connection_state = conn_disconnected;
+    m_disconnect_count++;
+
+    // Reset rate limiting state during disconnection
+    m_request_per_cur_interval = 0;
+
+    // Clear the reconnect-in-progress flag. If a teardown races a pending
+    // reconnect timer (the timer was freed above), leaving m_reconnecting
+    // true would make every future attempt_reconnect call no-op silently.
+    m_reconnecting = false;
+    m_setup_rejected = false;
+
+    // by default no need to send any setup request
+    m_authentication = setup_done;
+    m_db_selection = setup_done;
+    m_cluster_slots = setup_done;
+    m_hello = setup_done;
+    m_readonly_state = setup_done;
+    m_multi_open = false;
+
+    // Drop any partial RESP parser state. A TCP RST received mid-bulk
+    // (especially while draining a RESP3 push frame) would otherwise leave
+    // m_response_state / m_total_bulks_count / m_push / m_attribute /
+    // m_bulk_len at intermediate values, and the next reconnect's first
+    // bytes would parse under stale cursor state. The setup ladder above
+    // is already reset; this finishes the job for the protocol layer.
+    if (m_protocol != NULL) {
+        m_protocol->reset_state();
+    }
+    // Notify only after routing can observe this connection as disconnected.
+    m_conns_manager->handle_connection_disconnect(m_id);
+    // A replica that was not ready for reads held peers in hold_pipeline();
+    // disconnected, it no longer does.
+    if (m_role == role_replica) wake_peers();
+}
+
+void shard_connection::set_address_port(const char *address, const char *port)
+{
     if (m_address != NULL) {
         free(m_address);
     }
@@ -307,7 +763,8 @@ void shard_connection::set_address_port(const char* address, const char* port) {
     m_port = strdup(port);
 }
 
-void shard_connection::set_readable_id() {
+void shard_connection::set_readable_id()
+{
     if (m_unix_sockaddr != NULL) {
         m_readable_id.assign(m_config->unix_socket);
     } else {
@@ -317,55 +774,588 @@ void shard_connection::set_readable_id() {
     }
 }
 
-const char* shard_connection::get_readable_id() {
+const char *shard_connection::get_readable_id()
+{
     return m_readable_id.c_str();
 }
 
-request* shard_connection::pop_req() {
-    request* req = m_pipeline->front();
+int shard_connection::get_local_port()
+{
+    if (!m_bev) {
+        return -1;
+    }
+
+    int fd = bufferevent_getfd(m_bev);
+    if (fd < 0) {
+        return -1;
+    }
+
+    struct sockaddr_storage local_addr;
+    socklen_t addr_len = sizeof(local_addr);
+
+    if (getsockname(fd, (struct sockaddr *) &local_addr, &addr_len) != 0) {
+        return -1;
+    }
+
+    if (local_addr.ss_family == AF_INET) {
+        struct sockaddr_in *addr_in = (struct sockaddr_in *) &local_addr;
+        return ntohs(addr_in->sin_port);
+    } else if (local_addr.ss_family == AF_INET6) {
+        struct sockaddr_in6 *addr_in6 = (struct sockaddr_in6 *) &local_addr;
+        return ntohs(addr_in6->sin6_port);
+    }
+
+    return -1;
+}
+
+const char *shard_connection::get_last_request_type()
+{
+    // Read the cached most-recently-pushed type set by push_req(). Called from
+    // the crash-handler signal context on a foreign (main) thread, racing with
+    // the connection's worker thread; std::atomic<int> with relaxed ordering
+    // gives TSAN a clean happens-before edge and is signal-safe because the
+    // load is lock-free on every supported platform. We never deref the
+    // queue's request* (which a worker thread might be popping/freeing
+    // concurrently).
+    int t = m_last_pushed_req_type.load(std::memory_order_relaxed);
+    switch (t) {
+    case rt_set:
+        return "SET";
+    case rt_get:
+        return "GET";
+    case rt_wait:
+        return "WAIT";
+    case rt_arbitrary:
+        return "ARBITRARY";
+    case rt_auth:
+        return "AUTH";
+    case rt_select_db:
+        return "SELECT";
+    case rt_cluster_slots:
+        return "CLUSTER_SLOTS";
+    case rt_hello:
+        return "HELLO";
+    case rt_readonly:
+        return "READONLY";
+    case rt_discard:
+        return "DISCARD";
+    case rt_asking:
+        return "ASKING";
+    default:
+        return "none";
+    }
+}
+
+request *shard_connection::pop_req()
+{
+    request *req = m_pipeline->front();
     m_pipeline->pop();
 
-    m_pending_resp--;
-    assert(m_pending_resp >= 0);
+    // Worker-thread mutation; relaxed is sufficient because all mutations
+    // happen on the connection's owning event-loop thread. The signal-handler
+    // reader uses an atomic load purely to establish a TSAN happens-before
+    // edge for the foreign-thread read.
+    m_pending_resp.fetch_sub(1, std::memory_order_relaxed);
+    assert(m_pending_resp.load(std::memory_order_relaxed) >= 0);
 
     return req;
 }
 
-void shard_connection::push_req(request* req) {
+void shard_connection::push_req(request *req)
+{
     m_pipeline->push(req);
-    m_pending_resp++;
+    // Worker-thread mutation (see pop_req comment).
+    m_pending_resp.fetch_add(1, std::memory_order_relaxed);
+    // Snapshot the type for the crash handler (which can't safely deref the
+    // queue front without racing with worker-thread pops/destructors).
+    m_last_pushed_req_type.store((int) req->m_type, std::memory_order_relaxed);
+    // Per-endpoint routed_ops: count anything that's not a connection-setup
+    // request. This is the canonical "how many user-level requests did we
+    // route here" tally used by the "Endpoints" array in mb.json.
+    if (is_workload_request(req->m_type)) m_routed_ops++;
+    // ASKING only prefixes a resend, which takes its own token.
+    if (m_config->request_rate && req->m_type != rt_asking) {
+        // Handle race condition during reconnection - don't assert if interval is 0
+        if (m_request_per_cur_interval > 0) {
+            m_request_per_cur_interval--;
+        } else {
+            // Rate limit exceeded, but don't crash - just log debug info
+            benchmark_debug_log("Rate limit interval exhausted during request push (connection %u)\n", m_id);
+        }
+    }
 }
 
-bool shard_connection::is_conn_setup_done() {
-    return m_authentication == auth_done &&
-           m_db_selection == select_done &&
-           m_cluster_slots == slots_done;
+void shard_connection::capture_serialized_bytes(size_t before_pos, request *req)
+{
+    // --transaction requests are never resent (see enqueue_retry), so skip the copy.
+    if (!m_config->retry_on_error || m_config->transaction || !m_bev || !req) return;
+
+    struct evbuffer *out = bufferevent_get_output(m_bev);
+    size_t after_pos = evbuffer_get_length(out);
+    if (after_pos <= before_pos) return;
+    size_t len = after_pos - before_pos;
+
+    char *buf = (char *) malloc(len);
+    if (!buf) {
+        benchmark_debug_log("retry: failed to allocate %zu bytes for capture (conn %u)\n", len, m_id);
+        return;
+    }
+
+    struct evbuffer_ptr p;
+    if (evbuffer_ptr_set(out, &p, before_pos, EVBUFFER_PTR_SET) != 0) {
+        free(buf);
+        return;
+    }
+
+    struct evbuffer_iovec vecs[8];
+    int n = evbuffer_peek(out, (ev_ssize_t) len, &p, vecs, 8);
+    if (n < 0) {
+        free(buf);
+        return;
+    }
+    if (n > 8) {
+        struct evbuffer_iovec *dyn = (struct evbuffer_iovec *) malloc((size_t) n * sizeof(*dyn));
+        if (!dyn) {
+            free(buf);
+            return;
+        }
+        int n2 = evbuffer_peek(out, (ev_ssize_t) len, &p, dyn, n);
+        if (n2 == n) {
+            size_t off = 0;
+            for (int i = 0; i < n2 && off < len; i++) {
+                size_t take = dyn[i].iov_len;
+                if (off + take > len) take = len - off;
+                memcpy(buf + off, dyn[i].iov_base, take);
+                off += take;
+            }
+            req->m_serialized = buf;
+            req->m_serialized_len = len;
+            buf = NULL; // ownership transferred
+        }
+        free(dyn);
+        if (buf) free(buf);
+        return;
+    }
+
+    size_t off = 0;
+    for (int i = 0; i < n && off < len; i++) {
+        size_t take = vecs[i].iov_len;
+        if (off + take > len) take = len - off;
+        memcpy(buf + off, vecs[i].iov_base, take);
+        off += take;
+    }
+    req->m_serialized = buf;
+    req->m_serialized_len = len;
 }
 
-void shard_connection::send_conn_setup_commands(struct timeval timestamp) {
-    if (m_authentication == auth_none) {
+size_t shard_connection::retry_queue_cap() const
+{
+    size_t cap = m_config->max_retry_queue;
+    if (cap == 0) {
+        // Auto cap: pipeline * 4, floor of 64.
+        cap = (size_t) m_config->pipeline * 4;
+        if (cap < 64) cap = 64;
+    }
+    return cap;
+}
+
+bool shard_connection::retry_queue_full() const
+{
+    if (!m_retry_queue) return false;
+    return m_retry_queue->size() >= retry_queue_cap();
+}
+
+bool shard_connection::retry_queue_holds_new_work() const
+{
+    if (!m_retry_queue) return false;
+    // Every request in flight may come back as a retryable error and need a
+    // slot, so count them with the queued retries. A --max-retry-queue below
+    // --pipeline still allows a full pipeline, or requests in flight alone
+    // would cut it on a healthy server; requests in flight beyond the cap
+    // then have no guaranteed slot.
+    size_t cap = retry_queue_cap();
+    if (cap < m_config->pipeline) cap = m_config->pipeline;
+    return m_retry_queue->size() + m_pipeline->size() >= cap;
+}
+
+bool shard_connection::enqueue_retry(request *req)
+{
+    // --transaction requests are never retried: a command resent on its own
+    // lands outside its MULTI block or in a later one, and an EXEC resent
+    // after its MULTI is gone fails with "EXEC without MULTI" forever.
+    if (!m_config->retry_on_error || m_config->transaction || !m_retry_queue) return false;
+    if (!req || !req->m_serialized || req->m_serialized_len == 0) return false;
+
+    // Honor max_retries (always counts; MOVED/ASK count too).
+    if (m_config->max_retries >= 0 && (int) req->m_retries >= m_config->max_retries) {
+        return false;
+    }
+
+    if (retry_queue_full()) {
+        // Caller treats this as terminal: log + finalize.
+        return false;
+    }
+
+    // Each request waits its own backoff, from its own resend count, however
+    // many other requests are queued on this connection.
+    struct timeval now;
+    retry_clock_now(&now);
+    double ms = retry_backoff_delay_ms(m_config->retry_backoff_ms, m_config->retry_backoff_factor, req->m_retries);
+    struct timeval delay;
+    delay.tv_sec = (long) (ms / 1000.0);
+    delay.tv_usec = (long) ((ms - delay.tv_sec * 1000.0) * 1000.0);
+    timeradd(&now, &delay, &req->m_retry_due);
+
+    bool had_queued = !m_retry_queue->empty();
+    req->m_claimed_by_retry = true;
+    m_retry_queue->push(req);
+
+    // One timer per connection, armed for the earliest due time in the queue.
+    // With zero backoff we still go through the timer with a 0 ms delay to
+    // keep the ordering predictable and the libevent integration simple.
+    if (m_retry_drain_timer == NULL) {
+        m_retry_drain_timer = event_new(m_event_base, -1, 0, cluster_client_retry_drain_handler, (void *) this);
+    }
+    if (m_retry_drain_timer != NULL) {
+        bool pending = evtimer_pending(m_retry_drain_timer, NULL);
+        struct timeval due = req->m_retry_due;
+        // An idle timer with requests queued fired while the connection could
+        // not send, and m_retry_timer_due is still their earliest due time:
+        // keep it, so they go out as soon as the connection can send rather
+        // than after this request's backoff.
+        if (!pending && had_queued && timercmp(&m_retry_timer_due, &due, <)) due = m_retry_timer_due;
+        if (!pending || timercmp(&due, &m_retry_timer_due, <)) arm_retry_drain_timer(due, now);
+    }
+
+    return true;
+}
+
+void shard_connection::arm_retry_drain_timer(const struct timeval &due, const struct timeval &now)
+{
+    struct timeval delay = {0, 0};
+    if (timercmp(&due, &now, >)) timersub(&due, &now, &delay);
+    m_retry_timer_due = due;
+    // Replaces the timeout if the timer is already pending.
+    event_add(m_retry_drain_timer, &delay);
+}
+
+void shard_connection::replay_request(request *req)
+{
+    if (!req || !req->m_serialized || !m_bev) return;
+    // fill_pipeline pauses an idle connection, e.g. once the last request of
+    // a --requests run is out and only this retry is left to answer.
+    if (m_bev_paused) {
+        bufferevent_enable(m_bev, EV_READ | EV_WRITE);
+        m_bev_paused = false;
+    }
+    struct evbuffer *out = bufferevent_get_output(m_bev);
+    if (req->m_asking) {
+        // ASKING applies to the next command only, so write it right before
+        // the resent bytes. Its reply is consumed like other setup replies.
+        // The flag stays set: a resend after a reconnect needs ASKING again.
+        // Routing the request by the slot map clears it.
+        static const char ASKING_CMD[] = "*1\r\n$6\r\nASKING\r\n";
+        evbuffer_add(out, ASKING_CMD, sizeof(ASKING_CMD) - 1);
+        push_req(new request(rt_asking, 0, NULL, 0));
+    }
+    evbuffer_add(out, req->m_serialized, req->m_serialized_len);
+    gettimeofday(&req->m_sent_time, NULL);
+    req->m_retries++;
+    // Back in the pipeline: ownership returns to the normal flow.
+    req->m_claimed_by_retry = false;
+    push_req(req);
+}
+
+void shard_connection::handle_retry_drain_event()
+{
+    if (!m_retry_queue || m_retry_queue->empty()) return;
+    // Only drain if the connection is actually usable.
+    if (m_connection_state != conn_connected || !m_bev) {
+        // Will retry once we reconnect (handled by drain_replay_queue_after_reconnect).
+        return;
+    }
+    // Resend the requests whose backoff is over, in queue order, and keep the
+    // rest queued in order. The 1 ms slack only saves a timer wakeup for a
+    // request due right after the timer fires.
+    struct timeval now, horizon;
+    struct timeval slack = {0, 1000};
+    retry_clock_now(&now);
+    timeradd(&now, &slack, &horizon);
+    bool have_next = false;
+    struct timeval next = {0, 0};
+    for (size_t n = m_retry_queue->size(); n > 0 && !m_retry_queue->empty(); n--) {
+        request *req = m_retry_queue->front();
+        m_retry_queue->pop();
+        if (!timercmp(&req->m_retry_due, &horizon, >)) {
+            replay_request(req);
+            continue;
+        }
+        m_retry_queue->push(req);
+        if (!have_next || timercmp(&req->m_retry_due, &next, <)) {
+            next = req->m_retry_due;
+            have_next = true;
+        }
+    }
+    if (have_next && m_retry_drain_timer != NULL) arm_retry_drain_timer(next, now);
+}
+
+void shard_connection::drain_replay_queue_after_reconnect()
+{
+    if (!m_replay_queue) return;
+    // Replayed requests are not yet counted as processed; uncount the ones
+    // dropped here so they don't hold the pipeline or a --requests run, and
+    // count them as errors: they never get a reply.
+    unsigned long long dropped = 0;
+    while (!m_replay_queue->empty()) {
+        request *req = m_replay_queue->front();
+        m_replay_queue->pop();
+        // Each replay counts toward max_retries.
+        if (m_config->max_retries >= 0 && (int) req->m_retries >= m_config->max_retries) {
+            struct timeval now;
+            gettimeofday(&now, NULL);
+            global_failed_keys_logger().log_failure(now, "REPLAY", req->m_key, req->m_key_len, "connection-dropped",
+                                                    req->m_retries);
+            dropped++;
+            delete req;
+            continue;
+        }
+        if (!req->m_serialized || req->m_serialized_len == 0) {
+            // Can't replay — capture failed earlier. Drop with a log line.
+            struct timeval now;
+            gettimeofday(&now, NULL);
+            global_failed_keys_logger().log_failure(now, "REPLAY", req->m_key, req->m_key_len,
+                                                    "no-captured-bytes-for-replay", req->m_retries);
+            dropped++;
+            delete req;
+            continue;
+        }
+        replay_request(req);
+    }
+    if (dropped) m_conns_manager->abandon_requests(dropped);
+}
+
+unsigned int shard_connection::drop_pending_requests()
+{
+    unsigned int dropped = 0;
+    while (m_pending_resp) {
+        request *req = pop_req();
+        if (is_workload_request(req->m_type)) {
+            struct timeval now;
+            gettimeofday(&now, NULL);
+            global_failed_keys_logger().log_failure(now, request_type_to_name(req->m_type), req->m_key, req->m_key_len,
+                                                    "no-reply-after-test-time", req->m_retries);
+            dropped++;
+        }
+        delete req;
+    }
+    if (dropped) m_conns_manager->abandon_requests(dropped);
+    return dropped;
+}
+
+request *shard_connection::pop_replay_request()
+{
+    // disconnect() moves the retry queue into the replay queue, but take
+    // from both so nothing is left behind whatever the connection state.
+    std::queue<request *> *queues[] = {m_replay_queue, m_retry_queue};
+    for (size_t i = 0; i < sizeof(queues) / sizeof(queues[0]); i++) {
+        if (queues[i] != NULL && !queues[i]->empty()) {
+            request *req = queues[i]->front();
+            queues[i]->pop();
+            return req;
+        }
+    }
+    return NULL;
+}
+
+unsigned long long shard_connection::abandon_replay_requests(const char *reason)
+{
+    unsigned long long abandoned = 0;
+    request *req;
+    while ((req = pop_replay_request()) != NULL) {
+        log_abandoned_request(req, reason);
+        abandoned++;
+        delete req;
+    }
+    if (abandoned) m_conns_manager->abandon_requests(abandoned);
+    return abandoned;
+}
+
+void shard_connection::adopt_replay_request(request *req)
+{
+    // Requests are only held for resend with --retry-on-error, which gives
+    // every connection a replay queue.
+    assert(m_replay_queue != NULL);
+    m_replay_queue->push(req);
+    // Don't resend from here: this runs inside a CLUSTER SLOTS reply handler,
+    // possibly this connection's own. fill_pipeline() resends it once the
+    // connection is connected and set up. One that isn't connected yet
+    // resends it when it connects, as after any reconnect.
+    schedule_fill();
+}
+
+bool shard_connection::is_conn_setup_done()
+{
+    return m_authentication == setup_done && m_db_selection == setup_done && m_cluster_slots == setup_done &&
+           m_hello == setup_done && m_readonly_state == setup_done;
+}
+
+bool shard_connection::setup_held_for_transaction()
+{
+    // Sent inside the MULTI, CLUSTER SLOTS would only be queued (#569).
+    return m_multi_open && cluster_slots_refresh_pending() && m_conns_manager->is_transaction_pinned(m_id);
+}
+
+bool shard_connection::peer_client_has_any_setup_in_progress() const
+{
+    // Walk every shard_connection on the same client. A peer "is mid-setup"
+    // if it is either climbing the setup ladder (conn_in_progress) OR
+    // already TCP-connected but not yet ready for reads (HELLO/CLUSTER
+    // SLOTS/READONLY pending). Dead/disconnected peers don't count — they
+    // either gave up too, or they're racing us toward their own terminal
+    // exit. Reconnect-pending peers (conn_disconnected but with
+    // m_reconnect_attempts > 0 and m_reconnecting true) also count because
+    // their timer is armed and they may yet rejoin the setup ladder.
+    if (m_conns_manager == NULL) return false;
+    const std::vector<shard_connection *> &peers = m_conns_manager->get_connections();
+    for (size_t i = 0; i < peers.size(); i++) {
+        const shard_connection *peer = peers[i];
+        if (peer == NULL || peer == this) continue;
+        const enum connection_state st = peer->m_connection_state;
+        if (st == conn_in_progress) {
+            return true;
+        }
+        if (st == conn_connected && !peer->is_ready_for_reads()) {
+            return true;
+        }
+        if (st == conn_disconnected && peer->m_reconnecting) {
+            // Peer has a reconnect timer armed; treat as in-flight.
+            return true;
+        }
+    }
+    return false;
+}
+
+void shard_connection::send_conn_setup_commands(struct timeval timestamp)
+{
+    if (m_authentication == setup_none) {
         benchmark_debug_log("sending authentication command.\n");
         m_protocol->authenticate(m_config->authenticate);
         push_req(new request(rt_auth, 0, &timestamp, 0));
-        m_authentication = auth_sent;
+        m_authentication = setup_sent;
     }
 
-    if (m_db_selection == select_none) {
+    if (m_db_selection == setup_none) {
         benchmark_debug_log("sending db selection command.\n");
         m_protocol->select_db(m_config->select_db);
         push_req(new request(rt_select_db, 0, &timestamp, 0));
-        m_db_selection = select_sent;
+        m_db_selection = setup_sent;
     }
 
-    if (m_cluster_slots == slots_none) {
+    if (m_hello == setup_none) {
+        benchmark_debug_log("sending HELLO command.\n");
+        m_protocol->configure_protocol(m_config->protocol);
+        push_req(new request(rt_hello, 0, &timestamp, 0));
+        m_hello = setup_sent;
+    }
+
+    // READONLY: replica connections only (cluster mode). Sent after AUTH/SELECT/
+    // HELLO so any earlier failure is surfaced first, and before CLUSTER SLOTS
+    // so the slot-discovery command itself is allowed (the server otherwise
+    // rejects user-visible traffic on a replica connection that hasn't opted
+    // into reads).
+    if (m_readonly_state == setup_none) {
+        benchmark_debug_log("sending READONLY command (replica connection).\n");
+        // Use bufferevent_write rather than going through protocol::write_command_readonly
+        // which adds to the bufferevent's output evbuffer directly. For a connection whose
+        // FD was attached to the bufferevent via bufferevent_socket_new + a subsequent
+        // bufferevent_socket_connect (the path A1 uses for replicas discovered through
+        // CLUSTER SLOTS), the evbuffer notify callback does not re-arm EPOLLOUT on the
+        // first user-level send, so the bytes sit in the output buffer forever and the
+        // connect-callback handle_event path has no chance to flush them. bufferevent_write
+        // routes through bufferevent_trigger_nolock_ which forces the EPOLLOUT registration.
+        // Primaries don't hit this because all setup states default to setup_done, so
+        // send_conn_setup_commands is a no-op for them.
+        static const char READONLY_CMD[] = "*1\r\n$8\r\nREADONLY\r\n";
+        bufferevent_write(m_bev, READONLY_CMD, sizeof(READONLY_CMD) - 1);
+        push_req(new request(rt_readonly, 0, &timestamp, 0));
+        m_readonly_state = setup_sent;
+    }
+
+    if (m_cluster_slots == setup_none) {
+        // Inside an open MULTI the server would queue CLUSTER SLOTS and
+        // answer +QUEUED, which the reply handler can only treat as a failed
+        // refresh (#569). fill_pipeline() defers the refresh while this
+        // connection still drives the pinned --transaction rotation, and a
+        // MOVED/ASK inside the MULTI keeps the pin, so a well-formed rotation
+        // (MULTI ... EXEC/DISCARD) never gets here with a MULTI open. A
+        // rotation that opens a MULTI and never closes it does, for example
+        // --command=MULTI --command="SET __key__ __data__" with no EXEC: the
+        // MULTI stays open after the rotation wraps and pins another shard,
+        // and the next refresh on this connection (a MOVED, or a shard
+        // reconnect re-arming the main connection) would wedge on +QUEUED.
+        // Discard that abandoned MULTI first.
+        if (m_multi_open) {
+            benchmark_debug_log("sending DISCARD to close an abandoned MULTI before CLUSTER SLOTS.\n");
+            static const char DISCARD_CMD[] = "*1\r\n$7\r\nDISCARD\r\n";
+            bufferevent_write(m_bev, DISCARD_CMD, sizeof(DISCARD_CMD) - 1);
+            push_req(new request(rt_discard, 0, &timestamp, 0));
+            m_multi_open = false;
+        }
+
         benchmark_debug_log("sending cluster slots command.\n");
 
         // in case we send CLUSTER SLOTS command, we need to keep the response to parse it
         m_protocol->set_keep_value(true);
         m_protocol->write_command_cluster_slots();
         push_req(new request(rt_cluster_slots, 0, &timestamp, 0));
-        m_cluster_slots = slots_sent;
+        m_cluster_slots = setup_sent;
     }
+}
+
+// Called by cluster_client::handle_cluster_slots when a live CLUSTER SLOTS
+// refresh promotes an already-connected primary to a replica (role flip).
+// Re-arms the READONLY ladder and sends the wire command immediately so the
+// connection becomes eligible for reads without a full reconnect.
+void shard_connection::rearm_readonly()
+{
+    // Only cluster-mode Redis replica connections need READONLY.
+    if (m_role != role_replica || !m_config->cluster_mode || !is_redis_protocol(m_config->protocol)) return;
+    // Skip if the connection is not yet fully up; connect() will arm the
+    // ladder through the normal path.
+    if (m_connection_state != conn_connected) return;
+    // Skip if READONLY was already sent or acknowledged (e.g. a second refresh
+    // that sees the same replica twice).
+    if (m_readonly_state != setup_done) return;
+
+    benchmark_debug_log("rearm_readonly: re-sending READONLY on live role-flip connection.\n");
+
+    // Re-arm the ladder so is_conn_setup_done() returns false and
+    // fill_pipeline holds new user traffic until the ACK arrives.
+    m_readonly_state = setup_none;
+
+    struct timeval now;
+    gettimeofday(&now, NULL);
+
+    // Under --read-preference=secondary, primary connections get paused via
+    // bufferevent_disable(EV_READ | EV_WRITE) by fill_pipeline once they have
+    // no work. On a role flip primary->replica, bufferevent_write below would
+    // force EPOLLOUT but EV_READ would stay disabled; the +OK reply would
+    // land in the kernel buffer with no readcb to consume it, m_readonly_state
+    // would stay at setup_sent, is_conn_setup_done() would never return true,
+    // and the connection would deadlock for reads. Re-enable I/O and clear
+    // the paused flag, matching the BEV_EVENT_CONNECTED handler and
+    // schedule_fill paths.
+    if (m_bev_paused) {
+        bufferevent_enable(m_bev, EV_READ | EV_WRITE);
+        m_bev_paused = false;
+    }
+
+    // Send the READONLY bytes via bufferevent_write (same path as the normal
+    // ladder in send_conn_setup_commands) to force EPOLLOUT registration.
+    static const char READONLY_CMD[] = "*1\r\n$8\r\nREADONLY\r\n";
+    bufferevent_write(m_bev, READONLY_CMD, sizeof(READONLY_CMD) - 1);
+    push_req(new request(rt_readonly, 0, &now, 0));
+    m_readonly_state = setup_sent;
 }
 
 void shard_connection::process_response(void)
@@ -376,85 +1366,300 @@ void shard_connection::process_response(void)
     struct timeval now;
     gettimeofday(&now, NULL);
 
+    const unsigned long disconnect_count = m_disconnect_count;
+
     while ((ret = m_protocol->parse_response()) > 0) {
         bool error = false;
         protocol_response *r = m_protocol->get_response();
 
-        request* req = pop_req();
-
-        if (req->m_type == rt_auth) {
+        request *req = pop_req();
+        switch (req->m_type) {
+        case rt_auth:
             if (r->is_error()) {
                 benchmark_error_log("error: authentication failed [%s]\n", r->get_status());
+                {
+                    // Forward the server-side status to the connection-stage
+                    // supervisor so --connection-stage-timeout has actionable
+                    // context to surface (e.g. "called without any password
+                    // configured for the default user.").
+                    char buf[256];
+                    snprintf(buf, sizeof(buf), "AUTH failed: %s", r->get_status() ? r->get_status() : "");
+                    report_connection_stage_failure(buf);
+                }
+                reconnect_after_setup_error("AUTH error");
                 error = true;
             } else {
-                m_authentication = auth_done;
+                m_authentication = setup_done;
                 benchmark_debug_log("authentication successful.\n");
             }
-        } else if (req->m_type == rt_select_db) {
+            break;
+        case rt_select_db:
             if (strcmp(r->get_status(), "+OK") != 0) {
                 benchmark_error_log("database selection failed.\n");
+                {
+                    char buf[256];
+                    snprintf(buf, sizeof(buf), "SELECT failed: %s", r->get_status() ? r->get_status() : "");
+                    report_connection_stage_failure(buf);
+                }
+                reconnect_after_setup_error("SELECT error");
                 error = true;
             } else {
                 benchmark_debug_log("database selection successful.\n");
-                m_db_selection = select_done;
+                m_db_selection = setup_done;
             }
-        } else if (req->m_type == rt_cluster_slots) {
+            break;
+        case rt_cluster_slots:
             if (r->get_mbulk_value() == NULL || r->get_mbulk_value()->mbulks_elements.size() == 0) {
                 benchmark_error_log("cluster slot failed.\n");
+                report_connection_stage_failure("CLUSTER SLOTS failed (server returned empty or non-cluster reply; "
+                                                "is the server actually cluster-enabled?)");
+                // As after a parsed reply: once the slot map is in, data
+                // replies on this connection must not be copied as values.
+                m_protocol->set_keep_value(false);
+                retry_cluster_slots_after_error();
                 error = true;
             } else {
-                // parse response
-                m_conns_manager->handle_cluster_slots(r);
+                // Parse the reply. handle_cluster_slots returns true only when
+                // at least one valid shard parsed and the new topology was
+                // committed; on a malformed / all-skipped reply it returns
+                // false and the prior topology (empty on bootstrap) is left
+                // in place.
+                //
+                // When the build is rejected we MUST NOT advance
+                // m_cluster_slots to setup_done. Doing so would let the worker
+                // enter steady-state routing with an empty topology
+                // (m_shard_groups empty on bootstrap), and every slot lookup
+                // would return UINT_MAX. Leave m_cluster_slots at its prior
+                // value (setup_sent during the bootstrap ladder), and ask
+                // again as for an empty reply (retry_cluster_slots_after_error).
+                // The write-side hold_pipeline spin guard added in the previous
+                // commit still prevents fill_pipeline from busy-spinning if
+                // the worker somehow reaches steady-state with an empty
+                // topology via a different code path.
+
+                // handle_cluster_slots() can change this connection's role
+                // (a promoted replica becomes a primary).
+                const bool was_replica = m_role == role_replica;
+                bool committed = m_conns_manager->handle_cluster_slots(r);
                 m_protocol->set_keep_value(false);
 
-                m_cluster_slots = slots_done;
-                benchmark_debug_log("cluster slot command successful\n");
+                if (committed) {
+                    m_cluster_slots = setup_done;
+                    benchmark_debug_log("cluster slot command successful\n");
+                    // A replica refreshing its slot map is not ready for
+                    // reads, so hold_pipeline() holds peers while it runs.
+                    // It is ready again now: wake them, as READONLY does.
+                    if (was_replica) wake_peers();
+                } else {
+                    benchmark_debug_log("cluster slot reply rejected; leaving m_cluster_slots unchanged\n");
+                    // Surface the rejection to the connection-stage supervisor,
+                    // as AUTH / SELECT / HELLO / READONLY rejections are above,
+                    // so --connection-stage-timeout bounds a node that keeps
+                    // rejecting the map at startup. Then handle it like an
+                    // empty reply: ask again, reconnect, or end the thread.
+                    report_connection_stage_failure("CLUSTER SLOTS reply rejected (every shard malformed)");
+                    retry_cluster_slots_after_error();
+                    error = true;
+                }
             }
-        } else {
-            benchmark_debug_log("server %s: handled response (first line): %s, %d hits, %d misses\n",
-                                get_readable_id(),
-                                r->get_status(),
-                                r->get_hits(),
-                                req->m_keys - r->get_hits());
+            break;
+        case rt_discard:
+            // Closes a MULTI abandoned by its rotation; the reply carries no
+            // workload outcome. An error only means there was nothing left
+            // to discard, which is harmless.
+            benchmark_debug_log("DISCARD reply: %s\n", r->get_status() ? r->get_status() : "");
+            break;
+        case rt_asking:
+            // Precedes a request resent after -ASK; the reply carries no
+            // workload outcome, and that request's own reply is accounted.
+            benchmark_debug_log("ASKING reply: %s\n", r->get_status() ? r->get_status() : "");
+            break;
+        case rt_hello:
+            if (r->is_error()) {
+                benchmark_error_log("error: HELLO failed [%s]\n", r->get_status());
+                {
+                    char buf[256];
+                    snprintf(buf, sizeof(buf), "HELLO failed: %s", r->get_status() ? r->get_status() : "");
+                    report_connection_stage_failure(buf);
+                }
+                reconnect_after_setup_error("HELLO error");
+                error = true;
+            } else {
+                m_hello = setup_done;
+                benchmark_debug_log("HELLO successful.\n");
+            }
+            break;
+        case rt_readonly:
+            if (r->is_error()) {
+                benchmark_error_log("error: READONLY failed [%s]\n", r->get_status());
+                {
+                    char buf[256];
+                    snprintf(buf, sizeof(buf), "READONLY failed: %s", r->get_status() ? r->get_status() : "");
+                    report_connection_stage_failure(buf);
+                }
+                // READONLY recovery policy:
+                //
+                // * --reconnect-on-error ON: schedule a backoff-armed
+                //   reconnect so the setup state machine re-arms from
+                //   scratch. attempt_reconnect() tears down the
+                //   bufferevent + state and reschedules connect() on the
+                //   standard --max-reconnect-attempts / backoff ladder.
+                //
+                // * --reconnect-on-error OFF (default): bare disconnect()
+                //   (idle the replica connection) and rely on the next
+                //   CLUSTER SLOTS refresh (driven by any peer) to revive it.
+                //   Unconditionally calling attempt_reconnect() here would
+                //   fall through to the supervisor-trip arm and call
+                //   event_base_loopbreak(), so a single transient
+                //   -NOREPLICATION would kill the entire worker thread. The
+                //   peer-wake loop below covers both branches so the
+                //   bootstrap "no live replica yet" gate releases.
+                if (m_config->reconnect_on_error) {
+                    attempt_reconnect("READONLY error");
+                } else {
+                    // Count it, as attempt_reconnect does, so the OFF path
+                    // is observable: without this, --reconnect-on-error=off
+                    // READONLY errors would silently idle the replica with
+                    // no signal in the connection-error counter.
+                    disconnect_after_error();
+                }
+                // Wake peer connections (the primary may be parked in the
+                // "no live replica yet" gate); mirror the success arm so a
+                // stalled READONLY does not deadlock the bootstrap. In the
+                // disconnect-only path this is the only mechanism by which
+                // the failed replica gets re-evaluated — a peer's next
+                // CLUSTER SLOTS refresh will rebuild topology and may
+                // re-bring this replica online.
+                // disconnect() wakes them too, but attempt_reconnect() returns
+                // without disconnecting when m_reconnecting is already set.
+                if (m_role == role_replica) wake_peers();
+                error = true;
+            } else {
+                m_readonly_state = setup_done;
+                benchmark_debug_log("READONLY successful.\n");
+                // Wake any peer connection that may have been holding for
+                // a live replica. The bootstrap primary conn will be sitting
+                // in hold_pipeline's "no live replica yet" gate; nudge it.
+                if (m_role == role_replica) wake_peers();
+            }
+            break;
+        default:
+            benchmark_debug_log("server %s: handled response (first line): %s, %d hits, %d misses\n", get_readable_id(),
+                                r->get_status(), r->get_hits(), req->m_keys - r->get_hits());
 
             m_conns_manager->handle_response(m_id, now, req, r);
-            m_conns_manager->inc_reqs_processed();
-            responses_handled = true;
+            m_conns_manager->inc_reqs_answered();
+            // Any workload reply, even an error, shows the connection serves
+            // requests again: a setup rejected before it no longer counts.
+            m_setup_failed_since_reply = false;
+            // A request claimed for retry is still outstanding: it is counted
+            // as processed once, when its final attempt completes. Only counted
+            // responses move processed, so only they can reach a
+            // --reconnect-interval boundary below.
+            if (!req->m_claimed_by_retry) {
+                m_conns_manager->inc_reqs_processed();
+                responses_handled = true;
+            }
+            // First *successful* post-setup response observed: tell the
+            // supervisor we reached steady state. Idempotent.
+            //
+            // We deliberately do NOT count error responses as steady state
+            // — a -ERR can fire on the very first request (e.g. the
+            // 'invalid bulk length' loop from #426 #8) and then close the
+            // connection, dropping the worker into an infinite reconnect
+            // loop that the supervisor would otherwise be disarmed against.
+            if (!r->is_error()) {
+                report_connection_stage_success();
+                // Steady state reached: reset the per-connection reconnect
+                // attempts counter now (not at BEV_EVENT_CONNECTED). The
+                // READONLY-error reconnect storm completes TCP before the
+                // -NOREPLICATION lands, so resetting on connect would
+                // defeat --max-reconnect-attempts; resetting here ties the
+                // counter to setup-ladder lifetime instead. Idempotent —
+                // subsequent successful responses just re-assign 0.
+                if (m_reconnect_attempts > 0) {
+                    benchmark_error_log("Reconnection successful after %u attempts.\n", m_reconnect_attempts);
+                }
+                m_reconnect_attempts = 0;
+            } else {
+                // Forward the error so a later abort can attribute it.
+                char buf[256];
+                snprintf(buf, sizeof(buf), "server error: %s", r->get_status() ? r->get_status() : "");
+                report_connection_stage_failure(buf);
+            }
+            break;
         }
-        delete req;
+        // The retry path may have claimed ownership of req for resend; in that
+        // case the retry queue / replay path is responsible for freeing it.
+        if (!req->m_claimed_by_retry) {
+            delete req;
+        }
         if (error) {
             return;
+        }
+        // A handler tore this connection down, e.g. a CLUSTER SLOTS reply
+        // that left it with no slots retired it. disconnect() already
+        // emptied the pipeline (requeueing or uncounting the requests), so
+        // the replies still buffered have no request to match: stop here.
+        if (m_disconnect_count != disconnect_count) {
+            break;
         }
     }
 
     if (ret == -1) {
         benchmark_error_log("error: response parsing failed.\n");
+        // A parser failure during the initial probe (e.g. talking memcache_text
+        // to a Redis server, or memcache_binary to redis) puts the worker
+        // into an unrecoverable spin: the bytes never align, the response
+        // never completes, and we never call inc_reqs_processed(). Report it
+        // as a connection-stage failure so the supervisor bounds the spin.
+        // Once steady state is reached this is a no-op; the --test-time wall-clock
+        // backstop in run_benchmark() bounds it in that case (see
+        // memtier_benchmark.cpp).
+        report_connection_stage_failure("response parsing failed (protocol mismatch?)");
     }
 
     if (m_config->reconnect_interval > 0 && responses_handled) {
-        if ((m_conns_manager->get_reqs_processed() % m_config->reconnect_interval) == 0) {
+        if ((m_config->requests != m_conns_manager->get_reqs_processed()) &&
+            ((m_conns_manager->get_reqs_processed() % m_config->reconnect_interval) == 0)) {
             assert(m_pipeline->size() == 0);
-            benchmark_debug_log("reconnecting, m_reqs_processed = %u\n", m_conns_manager->get_reqs_processed());
+            benchmark_debug_log("reconnecting, m_reqs_processed = %llu\n", m_conns_manager->get_reqs_processed());
 
             // client manage connection & disconnection of shard
             m_conns_manager->disconnect();
             ret = m_conns_manager->connect();
-            assert(ret == 0);
-
+            if (ret != 0) {
+                benchmark_error_log("failed to reconnect.\n");
+                exit(failure_exit_code());
+            }
             return;
         }
     }
 
-    if (m_conns_manager->finished()) {
+    fill_pipeline();
+
+    // End the run's stats only once no reply is pending: run_stats files
+    // replies that come after set_end_time() in a bucket that is never
+    // reported, and reports the end bucket again if they start a new second.
+    // This happens when the deadline passes during a reconnect: the requests
+    // resent after the setup ladder are answered after its replies.
+    if (m_conns_manager->finished() && m_conns_manager->all_connections_idle()) {
         m_conns_manager->set_end_time();
-        bufferevent_disable(m_bev, EV_WRITE|EV_READ);
-    } else {
-        fill_pipeline();
     }
 }
 
-void shard_connection::process_first_request() {
-    m_conns_manager->set_start_time();
+void shard_connection::process_first_request()
+{
+    // A client whose first connection completes only after the run is over
+    // (it was dropped before its first reply, e.g. by a server killing
+    // connections, and reconnected at the deadline) is timed from the
+    // benchmark's start, like the run: started now, it would run a whole
+    // --test-time after the deadline. It ends at its first reply.
+    if (stops_at_deadline() && run_is_over()) {
+        static_cast<client *>(m_conns_manager)->set_start_time_at(&m_config->benchmark_start_time);
+    } else {
+        m_conns_manager->set_start_time();
+    }
     fill_pipeline();
 }
 
@@ -463,24 +1668,101 @@ void shard_connection::fill_pipeline(void)
     struct timeval now;
     gettimeofday(&now, NULL);
 
-    while (!m_conns_manager->finished() && m_pipeline->size() < m_config->pipeline) {
-        if (!is_conn_setup_done()) {
+    // Re-enable I/O in case a prior idle period disabled the bufferevent
+    // (e.g. a --transaction non-pin connection that was held by hold_pipeline).
+    // Gate on m_bev_paused so this lock-taking libevent call only fires when
+    // we actually need to undo a prior pause -- fill_pipeline runs per
+    // response received, so an unconditional enable here showed up as a ~4%
+    // ops/sec regression in the canonical SET/GET micro-bench.
+    if (m_bev != NULL && m_bev_paused && get_connection_state() == conn_connected) {
+        bufferevent_enable(m_bev, EV_READ | EV_WRITE);
+        m_bev_paused = false;
+    }
+
+    // Resend requests that survived a disconnect, or were handed over from a
+    // connection retired by a slot map refresh (adopt_replay_request), ahead
+    // of fresh work. A new connection has no AUTH/SELECT/HELLO/READONLY
+    // state yet, and the server runs commands in order, so send the setup
+    // ladder first and resend once its replies are in. This is done even if
+    // the run is finished: a connection's own resends get their replies.
+    // (Requests still held on a peer that is not connected when the run
+    // ends are not resent.)
+    //
+    // While the --transaction hold keeps CLUSTER SLOTS back, fall through:
+    // the rotation must reach its EXEC/DISCARD first. Only requests handed
+    // over to a live connection can meet it, since a reconnect clears
+    // m_multi_open.
+    if (m_replay_queue != NULL && !m_replay_queue->empty() && get_connection_state() == conn_connected) {
+        if (is_conn_setup_done()) {
+            drain_replay_queue_after_reconnect();
+        } else if (!setup_held_for_transaction()) {
+            send_conn_setup_commands(now);
+            return;
+        }
+    }
+    // Retries queued on this connection while it was connecting or waiting
+    // to reconnect (an -ASK retry to the importing node, retry_after_ask)
+    // found it unusable when their drain timer fired, and nothing re-arms
+    // it. Send them once the setup ladder is done.
+    if (m_retry_queue != NULL && !m_retry_queue->empty() && get_connection_state() == conn_connected &&
+        is_conn_setup_done() && (m_retry_drain_timer == NULL || !evtimer_pending(m_retry_drain_timer, NULL))) {
+        handle_retry_drain_event();
+    }
+
+    // Setup commands go out even when the pipeline is full, and after the
+    // run has finished while responses are still pending. Retries are
+    // resent beyond --pipeline and, after a MOVED, keep going to the node
+    // the stale slot map names until a CLUSTER SLOTS refresh lands, so
+    // holding the refresh back would loop on MOVED forever.
+    while (!m_conns_manager->finished() || (!is_conn_setup_done() && get_pending_resp() > 0)) {
+        // A CLUSTER SLOTS refresh requested while this connection drives
+        // the pinned --transaction rotation inside an open MULTI waits for
+        // the rotation's EXEC/DISCARD: sent now it would only be queued.
+        if (!is_conn_setup_done() && !setup_held_for_transaction()) {
             send_conn_setup_commands(now);
             return;
         }
 
+        if (m_conns_manager->finished() || m_pipeline->size() >= m_config->pipeline) {
+            break;
+        }
+
         // don't exceed requests
         if (m_conns_manager->hold_pipeline(m_id)) {
-            // if we are still connected, disable any event
-            if (get_connection_state() == conn_connected) {
-                bufferevent_disable(m_bev, EV_WRITE|EV_READ);
-            }
-
             break;
+        }
+
+        // Hold new work while the queued retries and the requests in flight
+        // fill the retry queue's cap, so a request that fails in flight
+        // finds room for its retry instead of failing with its retries left.
+        // fill_pipeline runs again as replies come in.
+        if (retry_queue_holds_new_work()) {
+            break;
+        }
+
+        // that's enough, we reached the rate limit
+        if (m_config->request_rate && m_request_per_cur_interval == 0) {
+            // return and skip on update events
+            return;
         }
 
         // client manage requests logic
         m_conns_manager->create_request(now, m_id);
+    }
+
+    // Check if done: no pending responses and output buffer empty
+    if (m_bev != NULL) {
+        if ((m_pending_resp == 0) && (evbuffer_get_length(bufferevent_get_output(m_bev)) == 0)) {
+            benchmark_debug_log("%s Done, no requests to send no response to wait for\n", get_readable_id());
+
+            if (m_conns_manager->finished() && m_conns_manager->all_connections_idle()) {
+                m_conns_manager->set_end_time();
+                m_conns_manager->disconnect_all();
+            } else if (!m_config->request_rate) {
+                bufferevent_disable(m_bev, EV_WRITE | EV_READ);
+                m_bev_paused = true;
+            }
+        }
     }
 }
 
@@ -492,9 +1774,70 @@ void shard_connection::handle_event(short events)
 
     if ((get_connection_state() == conn_in_progress) && (events & BEV_EVENT_CONNECTED)) {
         m_connection_state = conn_connected;
-        bufferevent_enable(m_bev, EV_READ|EV_WRITE);
+        bufferevent_enable(m_bev, EV_READ | EV_WRITE);
+        m_bev_paused = false;
 
-        if (!m_conns_manager->get_reqs_processed()) {
+#ifdef USE_TLS
+        // Log the negotiated TLS version and cipher exactly once for the whole
+        // run (not per connection/thread/shard) on the first completed handshake.
+        // All connections share one SSL_CTX and hit the same server config, so
+        // one line is representative. std::call_once makes this thread-safe
+        // across the per-thread event loops.
+        if (m_config->openssl_ctx != NULL && m_bev != NULL) {
+            static std::once_flag tls_info_logged;
+            std::call_once(tls_info_logged, [this]() {
+                SSL *ssl = bufferevent_openssl_get_ssl(m_bev);
+                if (ssl != NULL) {
+                    // SSL_get_version/SSL_get_cipher return stable static strings;
+                    // safe to stash on the (shared) config for the JSON output.
+                    m_config->tls_negotiated_version = SSL_get_version(ssl);
+                    m_config->tls_negotiated_cipher = SSL_get_cipher(ssl);
+                    fprintf(stderr, "TLS connection established: protocol %s, cipher %s\n",
+                            m_config->tls_negotiated_version, m_config->tls_negotiated_cipher);
+                }
+            });
+        }
+#endif
+
+        // Cancel connection timeout timer on successful connection
+        if (m_connection_timeout_timer != NULL) {
+            event_free(m_connection_timeout_timer);
+            m_connection_timeout_timer = NULL;
+        }
+
+        // Log progress on successful TCP connect, but do NOT reset the
+        // attempts counter here. The READONLY-error reconnect storm always
+        // completes TCP before -NOREPLICATION arrives — resetting on every
+        // BEV_EVENT_CONNECTED defeated --max-reconnect-attempts and produced
+        // an unbounded spin loop. The counter is now reset only when the
+        // setup ladder reaches steady state (see the rt_get/rt_arbitrary
+        // success branch in handle_response). Clear m_reconnecting and the
+        // backoff delay here so the next backoff schedule starts fresh if
+        // the setup ladder fails again before steady state.
+        if (m_reconnect_attempts > 0) {
+            benchmark_debug_log("TCP connection established (attempt %u); awaiting setup-ladder success.\n",
+                                m_reconnect_attempts);
+        }
+        m_current_backoff_delay = 1.0;
+        m_reconnecting = false;
+        m_connect_failed = false;
+
+        /* Set timer for request rate (create or recreate after reconnect) */
+        if (m_config->request_rate && m_event_timer == NULL) {
+            unsigned int first_interval_microsecond = m_config->request_interval_microsecond;
+            if (m_request_rate_phase_pending) {
+                first_interval_microsecond += m_request_rate_phase_microsecond;
+            }
+            struct timeval interval = {(time_t) (first_interval_microsecond / 1000000U),
+                                       (suseconds_t) (first_interval_microsecond % 1000000U)};
+            m_request_per_cur_interval = m_config->request_per_interval;
+            m_event_timer = event_new(m_event_base, -1, EV_PERSIST, cluster_client_timer_handler, (void *) this);
+            event_add(m_event_timer, &interval);
+        }
+
+        // Any response, even one being retried, means the run has started:
+        // a reconnect after it must not restart the clock.
+        if (!m_conns_manager->get_reqs_answered()) {
             process_first_request();
         } else {
             benchmark_debug_log("reconnection complete, proceeding with test\n");
@@ -510,85 +1853,757 @@ void shard_connection::handle_event(short events)
         unsigned long sslerr;
         while ((sslerr = bufferevent_get_openssl_error(m_bev))) {
             ssl_error = true;
-            benchmark_error_log("TLS connection error: %s\n",
-                    ERR_reason_error_string(sslerr));
+            benchmark_error_log("TLS connection error: %s\n", ERR_reason_error_string(sslerr));
         }
 #endif
         if (!ssl_error && errno) {
             benchmark_error_log("Connection error: %s\n", strerror(errno));
         }
-        disconnect();
 
+        attempt_reconnect("Connection error");
         return;
     }
 
     if (events & BEV_EVENT_EOF) {
         benchmark_error_log("connection dropped.\n");
-        disconnect();
-
+        attempt_reconnect("Connection dropped");
         return;
     }
 }
 
-void shard_connection::send_wait_command(struct timeval* sent_time,
-                                         unsigned int num_slaves, unsigned int timeout) {
+void shard_connection::handle_timer_event(void)
+{
+    // The first timeout includes this connection's phase. Switch to the common
+    // refill interval after it fires so the phase remains stable thereafter.
+    if (m_request_rate_phase_pending) {
+        struct timeval interval = {(time_t) (m_config->request_interval_microsecond / 1000000U),
+                                   (suseconds_t) (m_config->request_interval_microsecond % 1000000U)};
+        m_request_rate_phase_pending = false;
+        event_del(m_event_timer);
+        event_add(m_event_timer, &interval);
+    }
+
+    m_request_per_cur_interval = m_config->request_per_interval;
+
+    if (m_conns_manager->finished() && m_conns_manager->all_connections_idle()) {
+        m_conns_manager->set_end_time();
+        m_conns_manager->disconnect_all();
+        return;
+    }
+
+    m_conns_manager->handle_rate_limit_refill(m_id);
+    fill_pipeline();
+}
+
+bool shard_connection::has_request_rate_budget() const
+{
+    return !m_config->request_rate || m_request_per_cur_interval > 0;
+}
+
+void shard_connection::wake_peers(void)
+{
+    for (size_t i = 0; i < m_conns_manager->get_connections().size(); i++) {
+        shard_connection *peer = m_conns_manager->get_connections()[i];
+        if (peer != this && peer->get_connection_state() == conn_connected) {
+            peer->schedule_fill();
+        }
+    }
+}
+
+void shard_connection::schedule_fill(void)
+{
+    if (m_connection_state != conn_connected || m_bev == NULL) {
+        return;
+    }
+    // Re-enable I/O in case fill_pipeline silenced this connection while it
+    // was blocked by transaction-mode hold_pipeline.
+    bufferevent_enable(m_bev, EV_READ | EV_WRITE);
+    m_bev_paused = false;
+    if (m_deferred_fill_timer == NULL) {
+        m_deferred_fill_timer = event_new(m_event_base, -1, 0, deferred_fill_pipeline_cb, this);
+        if (m_deferred_fill_timer == NULL) {
+            return;
+        }
+    }
+    if (!evtimer_pending(m_deferred_fill_timer, NULL)) {
+        struct timeval zero = {0, 0};
+        event_add(m_deferred_fill_timer, &zero);
+    }
+}
+
+// Every dropped connection and failed connect counts as a connection error.
+// This also moves the run's clock, which finished() reads.
+void shard_connection::count_connection_error(void)
+{
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    static_cast<client *>(m_conns_manager)->get_stats()->update_connection_error(&now);
+}
+
+// Count a connection error and disconnect, without reconnecting.
+void shard_connection::disconnect_after_error()
+{
+    count_connection_error();
+    disconnect();
+}
+
+// Disconnect and end this thread: run_benchmark() then fails the run. It is
+// not restarted.
+void shard_connection::end_thread(const char *reason, const char *thread_end_reason)
+{
+    benchmark_error_log("%s, ending this thread.\n", reason);
+    disconnect();
+    // Nothing will resend the requests held for it now: client_group::run()
+    // abandons them, and those of the other connections on this thread,
+    // once the loop returns.
+    set_thread_end_reason(thread_end_reason);
+    event_base_loopbreak(m_event_base);
+}
+
+void shard_connection::attempt_reconnect(const char *error_context)
+{
+    count_connection_error();
+
+    // A connection that never completed (refused, timed out, TLS handshake
+    // failed) is a failed connect; one that was up is a drop.
+    if (!m_reconnecting) {
+        m_connect_failed = m_connection_state != conn_connected;
+        // Once the run is over, a drop gets one reconnect, to resend the
+        // requests held for replay. A peer that accepts and then closes every
+        // connection (a proxy with a dead backend, a TLS terminator, maxclients)
+        // would otherwise be reconnected at once, forever: treat a second drop
+        // like a failed connect. (A client that never got a reply and connects
+        // after the run is over is timed from the benchmark's start, so it
+        // does not run a whole --test-time after it: process_first_request().)
+        if (!m_connect_failed && run_is_over()) {
+            if (m_dropped_after_run_over) m_connect_failed = true;
+            m_dropped_after_run_over = true;
+        }
+    }
+    if (m_config->reconnect_on_error && !m_reconnecting && stop_reconnecting_if_run_over()) {
+        return;
+    }
+
+    // Attempt reconnection if enabled and not already reconnecting
+    if (m_config->reconnect_on_error && !m_reconnecting &&
+        (m_config->max_reconnect_attempts == 0 || m_reconnect_attempts < m_config->max_reconnect_attempts)) {
+        disconnect();
+        // Snapshot the backoff delay before the multiplication so we can
+        // restore it cleanly if event_new fails below.
+        const double prev_backoff_delay = m_current_backoff_delay;
+        m_reconnect_attempts++;
+        if (m_config->reconnect_backoff_factor > 0.0) {
+            m_current_backoff_delay *= m_config->reconnect_backoff_factor;
+            if (m_current_backoff_delay > MEMTIER_BACKOFF_CAP_SEC) m_current_backoff_delay = MEMTIER_BACKOFF_CAP_SEC;
+            if (m_current_backoff_delay < MEMTIER_RECONNECT_MIN_DELAY_SEC)
+                m_current_backoff_delay = MEMTIER_RECONNECT_MIN_DELAY_SEC;
+        }
+
+        const double delay_sec = next_reconnect_delay();
+        if (m_config->max_reconnect_attempts == 0) {
+            benchmark_error_log("%s, attempting reconnection %u (unlimited) in %.2f seconds...\n", error_context,
+                                m_reconnect_attempts, delay_sec);
+        } else {
+            benchmark_error_log("%s, attempting reconnection %u/%u in %.2f seconds...\n", error_context,
+                                m_reconnect_attempts, m_config->max_reconnect_attempts, delay_sec);
+        }
+        warn_reconnecting_indefinitely();
+
+        // Schedule reconnection attempt
+        struct timeval delay;
+        delay.tv_sec = (long) delay_sec;
+        delay.tv_usec = (long) ((delay_sec - delay.tv_sec) * 1000000);
+
+        m_reconnect_timer = event_new(m_event_base, -1, 0, cluster_client_reconnect_timer_handler, (void *) this);
+        if (m_reconnect_timer == NULL) {
+            benchmark_error_log("error: event_new failed in attempt_reconnect\n");
+            // Roll back the bookkeeping so the next attempt does not
+            // count an attempt that never armed, and leave m_reconnecting
+            // false so a subsequent error can re-enter this path. Break
+            // out of the event loop — there is no way to recover this
+            // connection without a working libevent timer.
+            if (m_reconnect_attempts > 0) m_reconnect_attempts--;
+            m_current_backoff_delay = prev_backoff_delay;
+            event_base_loopbreak(m_event_base);
+            return;
+        }
+        event_add(m_reconnect_timer, &delay);
+        m_reconnecting = true;
+    } else if (m_config->reconnect_on_error && m_reconnecting) {
+        // A reconnect is already pending for this connection. The event loop
+        // can deliver multiple connection-error callbacks per dead connection
+        // (e.g. an EOF followed by stray TLS read errors during a node
+        // failover storm), and every one of them lands here while the first
+        // one's reconnect timer is still pending.
+        //
+        // Treat the duplicates as no-ops — the in-flight reconnect will run
+        // and decide what to do. Tearing the thread down here would mean a
+        // single dead connection always kills the whole benchmark thread
+        // under realistic failover conditions, regardless of how high
+        // --max-reconnect-attempts is set.
+        return;
+    } else {
+        // Without --reconnect-on-error no attempt was made: don't report a
+        // maximum that was never configured.
+        char reason[256];
+        if (m_config->reconnect_on_error) {
+            snprintf(reason, sizeof(reason), "Maximum reconnection attempts (%u) exceeded for %s",
+                     m_config->max_reconnect_attempts, error_context);
+        } else {
+            snprintf(reason, sizeof(reason), "%s and --reconnect-on-error is not set", error_context);
+        }
+        // Under --read-preference != primary, ONE dead replica should not
+        // tear down the whole worker thread while sibling connections are
+        // still mid-setup-ladder on the surviving primary/replicas. The
+        // RESP3 setup ladder (HELLO 3 ack + READONLY ack) is heavy enough
+        // that a Connection-refused storm from the shut-down replica races
+        // ahead of those acks; if we loopbreak here, the peers never finish
+        // setup and zero GETs ever fly. Fall back to the cluster_client
+        // routing path which already gates on is_ready_for_reads() and
+        // handles dead-conn cases via the bootstrap-warming hold.
+        if (m_config->read_preference != rp_primary && peer_client_has_any_setup_in_progress()) {
+            benchmark_error_log("%s; leaving conn %u dead and continuing while peers are still mid-setup.\n", reason,
+                                m_id);
+            disconnect();
+            return;
+        }
+        end_thread(reason,
+                   m_config->reconnect_on_error ? "max-reconnect-attempts-exceeded" : "connection-lost-no-reconnect");
+    }
+}
+
+// The --test-time deadline. A client that has started (a response was
+// answered) is timed from its own start (in staircase mode the benchmark's).
+// A client that has not, while another connection has reached steady state
+// (so --connection-stage-timeout no longer bounds the run), is timed from the
+// benchmark's start. False without --test-time, or before any connection
+// reached steady state: that startup phase is bounded by
+// --connection-stage-timeout instead.
+bool shard_connection::run_deadline(struct timeval *deadline)
+{
+    if (m_config->test_time == 0) return false;
+    if (m_conns_manager->get_reqs_answered()) {
+        *deadline = static_cast<client *>(m_conns_manager)->get_stats()->get_start_time();
+    } else if (connection_stage_steady_state_reached()) {
+        *deadline = m_config->benchmark_start_time;
+    } else {
+        return false;
+    }
+    deadline->tv_sec += m_config->test_time;
+    return true;
+}
+
+// Within 1 ms of the deadline counts as passed: the reconnect timer armed for
+// it runs on libevent's monotonic clock and can fire a hair early by this wall
+// clock, which would otherwise re-arm near-zero delays until it catches up.
+bool shard_connection::run_deadline_passed(void)
+{
+    struct timeval deadline, now, slack = {0, 1000};
+    if (!run_deadline(&deadline)) return false;
+    gettimeofday(&now, NULL);
+    timeradd(&now, &slack, &now);
+    return !timercmp(&now, &deadline, <);
+}
+
+// Whether the run's stop condition is reached: --requests done or the
+// --test-time deadline passed (see run_deadline(), which also covers a client
+// that never started). finished() reads the run's clock, which only moves
+// with stats updates. For a started client only unlimited reconnects add the
+// wall-clock check; bounded reconnects retain the stats-clock stop condition.
+// A never-started client still uses the benchmark deadline, as on master.
+bool shard_connection::run_is_over(void)
+{
+    if (m_conns_manager->get_reqs_answered()) {
+        if (m_conns_manager->finished()) return true;
+        if (!stops_at_deadline()) return false;
+    }
+    return run_deadline_passed();
+}
+
+// The delay before the next reconnect attempt: the backoff delay, but no later
+// than the --test-time deadline. A long backoff armed just before the deadline
+// would otherwise keep the run going for up to MEMTIER_BACKOFF_CAP_SEC past it.
+double shard_connection::next_reconnect_delay(void)
+{
+    double delay = m_current_backoff_delay;
+    struct timeval deadline, now;
+    // Only with unlimited attempts: a finite --max-reconnect-attempts keeps
+    // its backoff schedule, which bounds the run as before (#656).
+    if (stops_at_deadline() && run_deadline(&deadline)) {
+        gettimeofday(&now, NULL);
+        double left = (deadline.tv_sec - now.tv_sec) + (deadline.tv_usec - now.tv_usec) / 1000000.0;
+        if (left < 0) left = 0;
+        if (left < delay) delay = left;
+    }
+    return delay;
+}
+
+// A connect failed and the run is over (--test-time deadline passed, or
+// --requests done): stop reconnecting and end the client, as when the deadline
+// passes with all connections up. With unlimited --max-reconnect-attempts and
+// a server that stays down, the thread would otherwise never end: finished()
+// is only checked when requests are sent or answered. A run whose server
+// rejected a setup step since the last workload reply fails instead (#630).
+// With a finite --max-reconnect-attempts none of this applies: the attempts
+// bound the run, and running out of them fails it, as before.
+//
+// The first drop of an established connection after the run is over is still
+// reconnected, so a live server that closes a connection around the deadline
+// gets the requests held for replay resent; the reconnect is due at once (see
+// next_reconnect_delay()), and if it fails or drops again the run ends here
+// (see attempt_reconnect()). In cluster mode only the main connection
+// reconnects this way: another shard's is reconnected by a slot map refresh,
+// which still redials it once the run is over; if that dial fails, it is left
+// closed (cluster_client::connect_shard_connection()) and what it held counts
+// as errors.
+//
+// A rejected setup step is left to handle_reconnect_timer_event(). A started
+// client's stats end at the deadline, not at the failed connect, so the
+// duration and throughput reflect --test-time. Requests held for replay are
+// counted as errors by disconnect_all().
+bool shard_connection::stop_reconnecting_if_run_over(void)
+{
+    if (!stops_at_deadline()) return false;
+    if (m_setup_rejected || !m_connect_failed || !run_is_over()) return false;
+    disconnect();
+    if (m_setup_failed_since_reply) {
+        // The server rejected a setup step since the last reply, then went
+        // away: fail the run as for a rejected setup (#630), not end it.
+        benchmark_error_log("Connection setup failed earlier and the run is over, not reconnecting.\n");
+        end_client_after_run(false);
+        return true;
+    }
+    benchmark_error_log("Connection failed and the run is over, not reconnecting.\n");
+    end_client_after_run(true);
+    return true;
+}
+
+// Once the run is over and this connection is done: if the client's other
+// connections are done too (siblings_done()), end the client. With end_stats,
+// a started client's stats end at the deadline (or now, if --requests ended
+// the run); without, the run fails: the client is left unended and marked
+// failed (client::fail_run()). disconnect_all() counts requests held for replay as errors.
+void shard_connection::end_client_after_run(bool end_stats)
+{
+    // Without end_stats the run failed: record it, as a busy sibling may still
+    // end the client normally.
+    if (!end_stats) static_cast<client *>(m_conns_manager)->fail_run();
+    if (!siblings_done()) return;
+    // A client that never started has no stats to end.
+    if (end_stats && m_conns_manager->get_reqs_answered()) {
+        client *c = static_cast<client *>(m_conns_manager);
+        struct timeval deadline, now;
+        gettimeofday(&now, NULL);
+        if (run_deadline(&deadline) && timercmp(&deadline, &now, <)) {
+            c->set_end_time_at(&deadline);
+        } else {
+            c->set_end_time();
+        }
+    }
+    m_conns_manager->disconnect_all();
+}
+
+// Whether this client's other connections are done too, so it can be ended:
+// none has a reply pending, a reconnect pending, or requests held for replay
+// on a live connection. all_connections_idle() only checks the first: a
+// sibling (e.g. another cluster shard) whose own reconnect is due would be
+// torn down, and the requests it was to resend abandoned. Such a sibling ends
+// the client itself, on its last reply or through this check when its connect
+// fails. A disconnected sibling with no reconnect pending will never resend
+// what it holds, so it does not keep the client going. A connected sibling's
+// retry queue (--retry-on-error backoff) is not checked either: if the client
+// ends first, those requests are counted as abandoned by disconnect_all().
+bool shard_connection::siblings_done(void)
+{
+    std::vector<shard_connection *> &conns = m_conns_manager->get_connections();
+    for (unsigned int i = 0; i < conns.size(); i++) {
+        shard_connection *sc = conns[i];
+        if (sc == NULL || sc == this) continue;
+        if (sc->get_pending_resp() > 0 || sc->is_reconnect_pending()) return false;
+        if (sc->get_connection_state() != conn_disconnected && sc->has_requests_to_replay()) return false;
+    }
+    return true;
+}
+
+// With unlimited --max-reconnect-attempts, a --requests run waits for the
+// server for as long as it takes. Say so once, after 10 failed attempts, so a
+// server that is gone for good can be told from slow progress. Only --requests runs: a
+// --test-time run (the two are mutually exclusive) is ended at its deadline by
+// stop_reconnecting_if_run_over().
+void shard_connection::warn_reconnecting_indefinitely(void)
+{
+    // Once per process, by whichever connection gets there first: every
+    // connection of every client would otherwise repeat it.
+    static const unsigned int warn_after = 10;
+    static std::atomic<bool> warned(false);
+    if (m_config->max_reconnect_attempts == 0 && m_config->requests > 0 && m_reconnect_attempts >= warn_after &&
+        !warned.exchange(true)) {
+        benchmark_error_log("warning: server still unreachable after %u reconnection attempts; with unlimited "
+                            "--max-reconnect-attempts the run waits for it until --requests completes.\n",
+                            m_reconnect_attempts);
+    }
+}
+
+// A setup step (AUTH/SELECT/HELLO) was rejected. No workload request is sent
+// before setup completes, so a connection left open with a rejected setup
+// would stall for good, and keep its client from ending (#737).
+// - A replica connection under --read-preference primary is not needed: keyed
+//   requests go to the primaries, and so do the keyless ones the replica
+//   connection would have sent. Close it with a warning, and leave it closed
+//   (also with --reconnect-on-error): a slot map refresh does not redial it as
+//   a replica. It is not counted as a connection error, since memtier chose
+//   to drop it and the run is complete.
+// - With --reconnect-on-error, handle it like a dropped connection, so
+//   --max-reconnect-attempts bounds it.
+// - Otherwise, once the run has reached steady state, end this thread, so
+//   the run fails. Unlike a dropped connection, this does not wait for peers
+//   still in their setup: the server rejected this one, and it stays needed.
+//   Before steady state the rejection is a startup failure that
+//   --connection-stage-timeout ends. That timeout is disarmed when any
+//   connection, on any thread, reaches steady state, so check again every
+//   second rather than wait to be told from another thread.
+// An empty or error CLUSTER SLOTS reply takes the --reconnect-on-error path
+// too (setup_step false): it is retried the same way, but it is not a rejected
+// setup step, so it does not mark m_setup_failed_since_reply (a node with no
+// slots yet that then goes away is a server that is gone).
+void shard_connection::reconnect_after_setup_error(const char *error_context, bool setup_step)
+{
+    // Redialing an unneeded replica would only be rejected again, about once
+    // a second, and once the run is over the rejection would fail a run that
+    // the primaries served in full (#656).
+    // With --reconnect-on-error, the same holds under secondaryPreferred: the
+    // reads fall back to the primaries. Without it, #750 keeps that replica,
+    // so --connection-stage-timeout reports the misconfiguration at startup.
+    const bool optional_replica = m_config->read_preference == rp_primary ||
+                                  (m_config->read_preference == rp_secondary_preferred && m_config->reconnect_on_error);
+    if (setup_step && m_role == role_replica && optional_replica) {
+        benchmark_error_log("warning: %s on replica connection %s; it is not needed under --read-preference "
+                            "%s, closing it.\n",
+                            error_context, get_readable_id(),
+                            m_config->read_preference == rp_primary ? "primary" : "secondaryPreferred");
+        disconnect();
+        m_setup_rejected_replica = true;
+        return;
+    }
+    if (m_config->reconnect_on_error) {
+        // Set before attempt_reconnect() so it leaves a rejected setup to the
+        // check in handle_reconnect_timer_event(), which fails the run. The
+        // rejection arrives on an established connection, but a second drop
+        // after the run is over counts as a failed connect (see
+        // attempt_reconnect()), which stop_reconnecting_if_run_over() would
+        // otherwise end normally.
+        m_setup_rejected = true;
+        m_slots_rejected = !setup_step;
+        if (setup_step) m_setup_failed_since_reply = true;
+        attempt_reconnect(error_context);
+        m_setup_rejected = m_reconnecting;
+        return;
+    }
+    m_setup_rejected_context = error_context;
+    handle_setup_rejected_check_event();
+}
+
+void shard_connection::handle_setup_rejected_check_event()
+{
+    if (m_setup_rejected_context == NULL || get_connection_state() != conn_connected) return;
+    if (connection_stage_steady_state_reached() || m_conns_manager->get_reqs_answered()) {
+        char reason[256];
+        snprintf(reason, sizeof(reason), "%s and --reconnect-on-error is not set", m_setup_rejected_context);
+        count_connection_error();
+        end_thread(reason, "connection-lost-no-reconnect");
+        return;
+    }
+    if (m_setup_rejected_timer == NULL) {
+        m_setup_rejected_timer = event_new(m_event_base, -1, 0, setup_rejected_check_cb, this);
+    }
+    struct timeval delay = {1, 0};
+    if (m_setup_rejected_timer == NULL || event_add(m_setup_rejected_timer, &delay) != 0) {
+        benchmark_error_log("error: failed to arm the timer in handle_setup_rejected_check_event\n");
+        event_base_loopbreak(m_event_base);
+    }
+}
+
+// A CLUSTER SLOTS reply was empty, an error, or had no valid shard, e.g. from
+// a node that owns no slots yet. No workload request is sent on this
+// connection until a refresh succeeds, so it must not be left waiting.
+// - With --reconnect-on-error, reconnect, so --max-reconnect-attempts bounds
+//   the retries and they stop once the run is over.
+// - Otherwise, once this client has had a reply, handle it like a dropped
+//   connection: end this thread, so the run fails.
+// - Otherwise (this client has not started), ask again after a second, so a
+//   node that has no slots yet can converge. Before any connection reached
+//   steady state, --connection-stage-timeout bounds the retries. After that
+//   it is disarmed, so they stop at the run's --test-time deadline
+//   (run_is_over()), or at once with --requests, which has no deadline.
+void shard_connection::retry_cluster_slots_after_error()
+{
+    if (m_config->reconnect_on_error) {
+        reconnect_after_setup_error("CLUSTER SLOTS error", false);
+        return;
+    }
+    if (m_conns_manager->get_reqs_answered() || run_is_over() ||
+        (m_config->test_time == 0 && connection_stage_steady_state_reached())) {
+        attempt_reconnect("CLUSTER SLOTS error");
+        return;
+    }
+
+    if (m_cluster_slots_retry_timer == NULL) {
+        m_cluster_slots_retry_timer = event_new(m_event_base, -1, 0, cluster_slots_retry_cb, this);
+        if (m_cluster_slots_retry_timer == NULL) {
+            benchmark_error_log("error: event_new failed in retry_cluster_slots_after_error\n");
+            event_base_loopbreak(m_event_base);
+            return;
+        }
+    }
+    struct timeval delay = {1, 0};
+    event_add(m_cluster_slots_retry_timer, &delay);
+}
+
+void shard_connection::handle_cluster_slots_retry_event()
+{
+    // m_cluster_slots stays setup_sent while the retry waits, so nothing else
+    // sends the request early. A disconnect in the meantime cancels the timer.
+    if (m_cluster_slots != setup_sent) return;
+    // The run ended while this client was still waiting for a slot map. It
+    // never sent a request: fail the run instead of letting it count as
+    // finished.
+    if (!m_conns_manager->get_reqs_answered() &&
+        (run_is_over() || (connection_stage_steady_state_reached() && m_conns_manager->finished()))) {
+        attempt_reconnect("CLUSTER SLOTS error");
+        return;
+    }
+    m_cluster_slots = setup_none;
+    // The run has not started: don't charge the time spent waiting for the
+    // slot map to --test-time or to the throughput figures. Once any
+    // connection of this client has had a reply, the run's clock is running
+    // and must not be moved.
+    if (!m_conns_manager->get_reqs_answered()) {
+        m_conns_manager->set_start_time();
+    }
+    fill_pipeline();
+}
+
+void shard_connection::handle_reconnect_timer_event()
+{
+    // Clean up the timer
+    if (m_reconnect_timer != NULL) {
+        event_free(m_reconnect_timer);
+        m_reconnect_timer = NULL;
+    }
+
+    m_reconnecting = false;
+
+    // The server rejected a setup step on the last connection and the run's
+    // time is up: stop retrying. With unlimited attempts the setup would keep
+    // failing and the thread would never end. The client is left unended, so
+    // the run fails as incomplete. This applies even with requests held for
+    // replay: they are only resent after a setup that keeps failing.
+    // disconnect_all() counts them as errors.
+    const bool setup_rejected = m_setup_rejected;
+    m_setup_rejected = false;
+    if (setup_rejected && run_is_over()) {
+        // An empty or error CLUSTER SLOTS reply gets one refresh after the run
+        // is over: its retry is due at the deadline (next_reconnect_delay()),
+        // and a one-off error just before it must not fail a run that master
+        // ends normally. One that persists fails the run (#667). Only for a
+        // client that has started: one that never did would start its clock
+        // after the deadline once the refresh succeeds; it fails the run.
+        if (m_slots_rejected && !m_slots_retried_after_run_over && m_conns_manager->get_reqs_answered()) {
+            m_slots_retried_after_run_over = true;
+        } else {
+            benchmark_error_log("Connection setup failed and the run is over, not reconnecting.\n");
+            end_client_after_run(false);
+            return;
+        }
+    }
+
+    // The timer was armed to fire no later than the --test-time deadline
+    // (next_reconnect_delay()). If the last connect failed and the run is
+    // over, do not try again.
+    if (!setup_rejected && stop_reconnecting_if_run_over()) {
+        return;
+    }
+
+    // Attempt to reconnect
+    int ret = m_conns_manager->reconnect(m_id);
+    if (ret < 0) {
+        // The connect failed before reaching the event loop (e.g. a unix
+        // socket whose server is gone), so no connection event counts it.
+        // Count it as attempt_reconnect() does for every other failed
+        // connect. If the run is over, stop here rather than arm a timer
+        // whose check above would stop it at once.
+        count_connection_error();
+        m_connect_failed = true;
+        if (stop_reconnecting_if_run_over()) {
+            return;
+        }
+        // Reconnection failed, try again if we haven't exceeded max attempts
+        if (m_config->max_reconnect_attempts == 0 || m_reconnect_attempts < m_config->max_reconnect_attempts) {
+            const double prev_backoff_delay = m_current_backoff_delay;
+            m_reconnect_attempts++;
+            if (m_config->reconnect_backoff_factor > 0.0) {
+                m_current_backoff_delay *= m_config->reconnect_backoff_factor;
+                if (m_current_backoff_delay > MEMTIER_BACKOFF_CAP_SEC)
+                    m_current_backoff_delay = MEMTIER_BACKOFF_CAP_SEC;
+                if (m_current_backoff_delay < MEMTIER_RECONNECT_MIN_DELAY_SEC)
+                    m_current_backoff_delay = MEMTIER_RECONNECT_MIN_DELAY_SEC;
+            }
+
+            const double delay_sec = next_reconnect_delay();
+            benchmark_error_log("Reconnection attempt %u failed, retrying in %.2f seconds...\n", m_reconnect_attempts,
+                                delay_sec);
+            warn_reconnecting_indefinitely();
+
+            // Schedule next reconnection attempt
+            struct timeval delay;
+            delay.tv_sec = (long) delay_sec;
+            delay.tv_usec = (long) ((delay_sec - delay.tv_sec) * 1000000);
+
+            m_reconnect_timer = event_new(m_event_base, -1, 0, cluster_client_reconnect_timer_handler, (void *) this);
+            if (m_reconnect_timer == NULL) {
+                benchmark_error_log("error: event_new failed in handle_reconnect_timer_event retry path\n");
+                // Roll back the bookkeeping so the next attempt does not
+                // count an attempt that never armed, and leave m_reconnecting
+                // false so a subsequent error can re-enter this path. Break
+                // out of the event loop -- there is no way to recover this
+                // connection without a working libevent timer.
+                if (m_reconnect_attempts > 0) m_reconnect_attempts--;
+                m_current_backoff_delay = prev_backoff_delay;
+                event_base_loopbreak(m_event_base);
+                return;
+            }
+            event_add(m_reconnect_timer, &delay);
+            m_reconnecting = true;
+        } else {
+            // Mirror attempt_reconnect's terminal-else policy: under
+            // --read-preference != primary, do not tear down the worker
+            // thread if any sibling connection is still climbing its setup
+            // ladder. The cluster_client routing path will skip this dead
+            // connection via is_ready_for_reads() and route around it.
+            if (m_config->read_preference != rp_primary && peer_client_has_any_setup_in_progress()) {
+                benchmark_error_log("Maximum reconnection attempts (%u) exceeded on conn %u; peers still mid-setup, "
+                                    "leaving connection dead and continuing.\n",
+                                    m_config->max_reconnect_attempts, m_id);
+                // disconnect() already ran when the prior attempt failed;
+                // m_connection_state is conn_disconnected and routing will
+                // skip it. Just return — no loopbreak, no further retries.
+                return;
+            }
+            benchmark_error_log("Maximum reconnection attempts (%u) exceeded, ending this thread.\n",
+                                m_config->max_reconnect_attempts);
+            // Only armed by attempt_reconnect() under --reconnect-on-error.
+            set_thread_end_reason("max-reconnect-attempts-exceeded");
+            // Break the event loop: the thread ends and run_benchmark() fails
+            // the run. It is not restarted. No state reset needed here: the
+            // thread is finished and the shard_connection object destroyed
+            // before any field could be read again.
+            event_base_loopbreak(m_event_base);
+        }
+    } else if (ret > 0) {
+        benchmark_error_log("Reconnection attempt %u: requested a cluster slot map refresh to reconnect.\n",
+                            m_reconnect_attempts);
+    } else {
+        // The connect has only been started: "Reconnection successful" is
+        // logged once the setup ladder completes and the first response
+        // arrives (process_response), together with the reset of
+        // m_reconnect_attempts. Resetting here would mask
+        // --max-reconnect-attempts when TCP connects but a setup step fails
+        // every time (READONLY errors, AUTH after a password change).
+        benchmark_debug_log("Reconnection attempt %u: connecting.\n", m_reconnect_attempts);
+    }
+}
+
+void shard_connection::handle_connection_timeout_event()
+{
+    // Clean up the timer
+    if (m_connection_timeout_timer != NULL) {
+        event_free(m_connection_timeout_timer);
+        m_connection_timeout_timer = NULL;
+    }
+
+    benchmark_error_log("Connection timeout after %u seconds.\n", m_config->connection_timeout);
+    attempt_reconnect("Connection timeout");
+}
+
+void shard_connection::send_wait_command(struct timeval *sent_time, unsigned int num_slaves, unsigned int timeout)
+{
     int cmd_size = 0;
 
     benchmark_debug_log("WAIT num_slaves=%u timeout=%u\n", num_slaves, timeout);
 
+    size_t before = (m_bev && m_config->retry_on_error) ? evbuffer_get_length(bufferevent_get_output(m_bev)) : 0;
     cmd_size = m_protocol->write_command_wait(num_slaves, timeout);
-    push_req(new request(rt_wait, cmd_size, sent_time, 0));
+    request *req = new request(rt_wait, cmd_size, sent_time, 0);
+    if (m_config->retry_on_error) capture_serialized_bytes(before, req);
+    push_req(req);
 }
 
-void shard_connection::send_set_command(struct timeval* sent_time, const char *key, int key_len,
-                                        const char *value, int value_len, int expiry, unsigned int offset) {
+void shard_connection::send_set_command(struct timeval *sent_time, const char *key, int key_len, const char *value,
+                                        int value_len, int expiry, unsigned int offset)
+{
     int cmd_size = 0;
 
-    benchmark_debug_log("server %s: SET key=[%.*s] value_len=%u expiry=%u\n",
-                        get_readable_id(), key_len, key, value_len, expiry);
+    benchmark_debug_log("server %s: SET key=[%.*s] value_len=%u expiry=%u\n", get_readable_id(), key_len, key,
+                        value_len, expiry);
 
-    cmd_size = m_protocol->write_command_set(key, key_len, value, value_len,
-                                             expiry, offset);
+    size_t before = (m_bev && m_config->retry_on_error) ? evbuffer_get_length(bufferevent_get_output(m_bev)) : 0;
+    cmd_size = m_protocol->write_command_set(key, key_len, value, value_len, expiry, offset);
 
-    push_req(new request(rt_set, cmd_size, sent_time, 1));
+    request *req = new request(rt_set, cmd_size, sent_time, 1);
+    if (m_config->retry_on_error) capture_serialized_bytes(before, req);
+    if (wants_request_key() && key_len > 0) req->set_key_for_log(key, (unsigned int) key_len);
+    push_req(req);
 }
 
-void shard_connection::send_get_command(struct timeval* sent_time,
-                                        const char *key, int key_len, unsigned int offset) {
+
+void shard_connection::send_get_command(struct timeval *sent_time, const char *key, int key_len, unsigned int offset)
+{
     int cmd_size = 0;
 
     benchmark_debug_log("server %s: GET key=[%.*s]\n", get_readable_id(), key_len, key);
+    size_t before = (m_bev && m_config->retry_on_error) ? evbuffer_get_length(bufferevent_get_output(m_bev)) : 0;
     cmd_size = m_protocol->write_command_get(key, key_len, offset);
 
-    push_req(new request(rt_get, cmd_size, sent_time, 1));
+    request *req = new request(rt_get, cmd_size, sent_time, 1);
+    if (m_config->retry_on_error) capture_serialized_bytes(before, req);
+    if (wants_request_key() && key_len > 0) req->set_key_for_log(key, (unsigned int) key_len);
+    push_req(req);
 }
 
-void shard_connection::send_mget_command(struct timeval* sent_time, const keylist* key_list) {
+void shard_connection::send_mget_command(struct timeval *sent_time, const keylist *key_list)
+{
     int cmd_size = 0;
 
     const char *first_key, *last_key;
     unsigned int first_key_len, last_key_len;
     first_key = key_list->get_key(0, &first_key_len);
-    last_key = key_list->get_key(key_list->get_keys_count()-1, &last_key_len);
+    last_key = key_list->get_key(key_list->get_keys_count() - 1, &last_key_len);
 
-    benchmark_debug_log("MGET %d keys [%.*s] .. [%.*s]\n",
-                        key_list->get_keys_count(), first_key_len, first_key, last_key_len, last_key);
+    benchmark_debug_log("MGET %d keys [%.*s] .. [%.*s]\n", key_list->get_keys_count(), first_key_len, first_key,
+                        last_key_len, last_key);
 
+    size_t before = (m_bev && m_config->retry_on_error) ? evbuffer_get_length(bufferevent_get_output(m_bev)) : 0;
     cmd_size = m_protocol->write_command_multi_get(key_list);
-
-    push_req(new request(rt_get, cmd_size, sent_time, key_list->get_keys_count()));
+    request *req = new request(rt_get, cmd_size, sent_time, key_list->get_keys_count());
+    if (m_config->retry_on_error) capture_serialized_bytes(before, req);
+    // Log the first key only — MGET keys are listed in the same record.
+    if (wants_request_key() && first_key_len > 0) req->set_key_for_log(first_key, first_key_len);
+    push_req(req);
 }
 
-void shard_connection::send_verify_get_command(struct timeval* sent_time, const char *key, int key_len,
-                                               const char *value, int value_len, int expiry, unsigned int offset) {
+void shard_connection::send_verify_get_command(struct timeval *sent_time, const char *key, int key_len,
+                                               const char *value, int value_len, unsigned int offset)
+{
     int cmd_size = 0;
 
-    benchmark_debug_log("GET key=[%.*s] value_len=%u expiry=%u\n",
-                        key_len, key, value_len, expiry);
+    benchmark_debug_log("Verify GET key=[%.*s] value_len=%u\n", key_len, key, value_len);
 
+    size_t before = (m_bev && m_config->retry_on_error) ? evbuffer_get_length(bufferevent_get_output(m_bev)) : 0;
     cmd_size = m_protocol->write_command_get(key, key_len, offset);
-
-    push_req(new verify_request(rt_get, cmd_size, sent_time, 1, key, key_len, value, value_len));
+    verify_request *vr = new verify_request(rt_get, cmd_size, sent_time, 1, key, key_len, value, value_len);
+    // verify_request constructor already stored the key via base set_key_for_log.
+    if (m_config->retry_on_error) capture_serialized_bytes(before, vr);
+    push_req(vr);
 }
 
 /*
@@ -601,7 +2616,8 @@ void shard_connection::send_verify_get_command(struct timeval* sent_time, const 
  * all the command sent
  */
 
-int shard_connection::send_arbitrary_command(const command_arg *arg) {
+int shard_connection::send_arbitrary_command(const command_arg *arg)
+{
     int cmd_size = 0;
 
     cmd_size = m_protocol->write_arbitrary_command(arg);
@@ -609,13 +2625,18 @@ int shard_connection::send_arbitrary_command(const command_arg *arg) {
     return cmd_size;
 }
 
-int shard_connection::send_arbitrary_command(const command_arg *arg, const char *val, int val_len) {
+int shard_connection::send_arbitrary_command(const command_arg *arg, const char *val, int val_len)
+{
     int cmd_size = 0;
 
     if (arg->type == key_type) {
-        benchmark_debug_log("key: value[%.*s]\n",  val_len, val);
+        benchmark_debug_log("key=[%.*s]\n", val_len, val);
+        // Like MGET, keep only the first key of a multi-key command.
+        if (wants_request_key() && m_arbitrary_log_key.empty()) m_arbitrary_log_key.assign(val, val_len);
+    } else if (arg->type == scan_cursor_type) {
+        benchmark_debug_log("scan_cursor=[%.*s]\n", val_len, val);
     } else {
-        benchmark_debug_log("data: value_len=%u\n",  val_len);
+        benchmark_debug_log("value_len=%u\n", val_len);
     }
 
     cmd_size = m_protocol->write_arbitrary_command(val, val_len);
@@ -623,6 +2644,39 @@ int shard_connection::send_arbitrary_command(const command_arg *arg, const char 
     return cmd_size;
 }
 
-void shard_connection::send_arbitrary_command_end(size_t command_index, struct timeval* sent_time, int cmd_size) {
-    push_req(new arbitrary_request(command_index, rt_arbitrary, cmd_size, sent_time));
+void shard_connection::set_arbitrary_command_key(const char *key, unsigned int key_len)
+{
+    if (wants_request_key() && key_len > 0 && m_arbitrary_log_key.empty()) m_arbitrary_log_key.assign(key, key_len);
+}
+
+void shard_connection::send_arbitrary_command_end(size_t command_index, struct timeval *sent_time, int cmd_size)
+{
+    // Look up the source command's metadata so the reply handler can route
+    // per-key miss accounting. Safe to be NULL (we tolerate it downstream).
+    const arbitrary_command *meta = NULL;
+    if (m_config && m_config->arbitrary_commands && command_index < m_config->arbitrary_commands->size()) {
+        meta = &m_config->arbitrary_commands->at(command_index);
+    }
+    // Only --transaction keeps a MULTI block on one connection.
+    if (m_config->transaction && meta != NULL) {
+        if (meta->multi_effect == multi_effect_opens) {
+            m_multi_open = true;
+        } else if (meta->multi_effect == multi_effect_closes) {
+            m_multi_open = false;
+        }
+    }
+    arbitrary_request *req = new arbitrary_request(command_index, rt_arbitrary, cmd_size, sent_time, meta);
+    if (!m_arbitrary_log_key.empty()) {
+        req->set_key_for_log(m_arbitrary_log_key.data(), (unsigned int) m_arbitrary_log_key.size());
+        m_arbitrary_log_key.clear();
+    }
+    if (m_config->retry_on_error && m_bev && cmd_size > 0) {
+        // Bytes were written across N calls to send_arbitrary_command; use
+        // cmd_size to recover the start offset.
+        size_t after = evbuffer_get_length(bufferevent_get_output(m_bev));
+        if (after >= (size_t) cmd_size) {
+            capture_serialized_bytes(after - (size_t) cmd_size, req);
+        }
+    }
+    push_req(req);
 }

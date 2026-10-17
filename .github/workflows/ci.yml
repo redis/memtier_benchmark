@@ -1,115 +1,746 @@
 name: CI
 
-on: [push, pull_request]
+# CI testing includes:
+# - Debian versions: 11 (bullseye), 12 (bookworm), 13 (trixie), sid (unstable)
+# - Various smoke test images (configurable via repository variables)
+# - TLS and no-TLS builds
+# - Code coverage and static analysis
+#
+# Action-version audit (2026-06-02): all actions/@vN references in this repo were
+# verified live against GitHub release APIs. Every major version tag referenced
+# (checkout@v5/v6, upload-artifact@v5, download-artifact@v5/v8, setup-python@v6,
+# softprops/action-gh-release@v3) exists in the real release history.
+# Review 10's "fabricated versions" claim was based on stale training data.
+
+on:
+  push:
+    branches: [master, main, '2.*']
+  pull_request:
+    branches: [master, main, '2.*']
+
+permissions:
+  contents: read
 
 jobs:
-  build-ubuntu:
+  prefix-install-distcheck:
+    runs-on: ubuntu-latest
+    name: Non-root prefix install and distcheck
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install build dependencies and bash-completion metadata
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y build-essential autoconf automake pkg-config \
+          libevent-dev libssl-dev zlib1g-dev bash-completion
+    - name: Check completion options and non-root installation
+      run: |
+        test "$(id -u)" -ne 0
+        pkg-config --exists bash-completion
+        autoreconf -ivf
+        for invalid in '' relative/path; do
+          if ./configure --with-bash-completion-dir="$invalid" > configure-invalid.log 2>&1; then
+            echo "configure accepted invalid completion directory: '$invalid'" >&2
+            exit 1
+          fi
+          grep -F 'requires an absolute, non-empty directory' configure-invalid.log
+        done
+        ./configure --prefix="$RUNNER_TEMP/memtier-prefix"
+        make -j2
+        make install
+        test -f "$RUNNER_TEMP/memtier-prefix/share/bash-completion/completions/memtier_benchmark"
+        make uninstall
+        test ! -e "$RUNNER_TEMP/memtier-prefix/share/bash-completion/completions/memtier_benchmark"
+    - name: Check distribution with the default completion directory
+      run: make -j2 distcheck
+
+  smoketest-build-distros:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      ARCH: amd64
+      # required by ubuntu:bionic
+      # https://github.blog/changelog/2024-03-07-github-actions-all-actions-will-run-on-node20-instead-of-node16-by-default/
+      ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+      DEBIAN_FRONTEND: noninteractive
     strategy:
       matrix:
-        platform: [ubuntu-latest,ubuntu-16.04]
-    runs-on: ${{ matrix.platform }}
+        image: ${{ fromJSON(vars.SMOKE_TEST_IMAGES) }}
+    container: ${{ matrix.image }}
+    name: Build ${{ matrix.image }}
     steps:
-    - uses: actions/checkout@v2
+    - name: Use the final Bullseye security snapshot
+      if: matrix.image == 'debian:bullseye'
+      # Post-EOL security package removals: https://bugs.debian.org/1147093
+      # Keep signature verification; only this immutable snapshot ignores expiry.
+      run: |
+        sed -i \
+          -e '/bullseye-security/s|http://deb.debian.org/debian-security|http://snapshot.debian.org/archive/debian-security/20260903T220410Z|' \
+          -e '/bullseye-security/s|^deb |deb [check-valid-until=no] |' /etc/apt/sources.list
+        grep -Eq '^deb \[check-valid-until=no\] http://snapshot\.debian\.org/archive/debian-security/20260903T220410Z bullseye-security([[:space:]]|$)' /etc/apt/sources.list || {
+          echo 'Bullseye security snapshot source was not configured' >&2
+          exit 1
+        }
+
+    - name: Checkout Code for ubuntu:bionic
+      if: matrix.image == 'ubuntu:bionic'
+      uses: actions/checkout@v6
+
+    - name: Checkout Code for other versions
+      if: matrix.image != 'ubuntu:bionic'
+      uses: actions/checkout@v6
+
+    - name: Install dependencies
+      run: |
+        apt-get -qq update -y
+        apt-get install -y \
+        build-essential autoconf automake libevent-dev \
+        pkg-config zlib1g-dev libssl-dev libboost-all-dev cmake flex
+
+    - name: Build
+      run: autoreconf -ivf && ./configure && make -j
+
+    - name: Verify version, libevent, openssl
+      run: |
+        ./memtier_benchmark --version
+        ldd ./memtier_benchmark | grep libevent
+        ldd ./memtier_benchmark | grep ssl
+
+  test-debian-versions:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    strategy:
+      matrix:
+        debian_version:
+          - "debian:bullseye"    # Debian 11 (oldoldstable)
+          - "debian:bookworm"    # Debian 12 (oldstable)
+          - "debian:trixie"      # Debian 13 (stable)
+          - "debian:sid"         # Debian unstable
+    container: ${{ matrix.debian_version }}
+    name: Test ${{ matrix.debian_version }}
+    steps:
+    - name: Use the final Bullseye security snapshot
+      if: matrix.debian_version == 'debian:bullseye'
+      # Post-EOL security package removals: https://bugs.debian.org/1147093
+      # Keep signature verification; only this immutable snapshot ignores expiry.
+      run: |
+        sed -i \
+          -e '/bullseye-security/s|http://deb.debian.org/debian-security|http://snapshot.debian.org/archive/debian-security/20260903T220410Z|' \
+          -e '/bullseye-security/s|^deb |deb [check-valid-until=no] |' /etc/apt/sources.list
+        grep -Eq '^deb \[check-valid-until=no\] http://snapshot\.debian\.org/archive/debian-security/20260903T220410Z bullseye-security([[:space:]]|$)' /etc/apt/sources.list || {
+          echo 'Bullseye security snapshot source was not configured' >&2
+          exit 1
+        }
+
+    - name: Install git and basic tools
+      run: |
+        apt-get update -qq
+        apt-get install -y git ca-certificates
+
+    - name: Checkout code
+      uses: actions/checkout@v6
+
+    - name: Install build dependencies
+      run: |
+        apt-get update -qq
+        apt-get install -y \
+          build-essential \
+          autoconf \
+          automake \
+          pkg-config \
+          libevent-dev \
+          zlib1g-dev \
+          libssl-dev
+
+    - name: Build
+      run: autoreconf -ivf && ./configure && make -j
+
+    - name: Verify version, libevent, openssl
+      run: |
+        ./memtier_benchmark --version
+        ldd ./memtier_benchmark | grep libevent
+        ldd ./memtier_benchmark | grep ssl
+
+  build-notls:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
     - name: Install dependencies
       run: |
         sudo apt-get -qq update
-        sudo apt-get install autoconf automake pkg-config libevent-dev libpcre3-dev libssl-dev
+        sudo apt-get install lcov autoconf automake pkg-config libevent-dev
+
+    - name: Build without TLS (prometheus default-on)
+      run: autoreconf -ivf && ./configure --disable-tls && make -j
+
+    - name: Verify version, libevent, prometheus enabled
+      run: |
+        ./memtier_benchmark --version
+        ./memtier_benchmark --version | grep -q 'prometheus=yes'
+        ldd ./memtier_benchmark | grep libevent
+        grep -q '#define HAVE_EVHTTP 1' config.h
+
+    - name: Unit tests (prometheus enabled)
+      run: make check
+
+    - name: Build without TLS and without Prometheus
+      run: make distclean && ./configure --disable-tls --disable-prometheus && make -j
+
+    - name: Verify prometheus compiled out
+      run: |
+        ./memtier_benchmark --version
+        ./memtier_benchmark --version | grep -q 'prometheus=no'
+        grep -q '/\* #undef HAVE_EVHTTP \*/' config.h
+        # The flag must be unrecognized in the disabled flavor (rc 2 + getopt
+        # message). 'if cmd; then' swallows the exit code, so capture it.
+        set +e
+        ./memtier_benchmark --prometheus-port=9221 >notls.out 2>&1
+        rc=$?
+        set -e
+        test "$rc" -eq 2
+        grep -q "unrecognized option '--prometheus-port" notls.out
+
+    - name: Unit tests (prometheus disabled)
+      run: make check
+
+    - name: Deterministic socket option regression
+      # Keep normal builds unchanged; only this extra test compilation gets
+      # zero initialization so the original uninitialized argument fails reliably.
+      run: |
+        make -W tests/unit/socket_options_test.cpp socket_options_test SOCKET_TEST_EXTRA_CXXFLAGS=-ftrivial-auto-var-init=zero
+        ./socket_options_test
+
+  build-ubuntu-latest:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install dependencies
+      run: |
+        sudo apt-get -qq update
+        sudo apt-get install lcov autoconf automake pkg-config libevent-dev
+
+    - name: Build without TLS
+      run: autoreconf -ivf && ./configure --disable-tls && make -j
+
+    - name: Verify version, libevent, openssl
+      run: |
+        ./memtier_benchmark --version
+        ldd ./memtier_benchmark | grep libevent
+
+  build-ubuntu:
+    strategy:
+      matrix:
+        platform: [ubuntu-22.04]
+    runs-on: ${{ matrix.platform }}
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install dependencies
+      run: |
+        sudo apt-get -qq update
+        sudo apt-get install lcov autoconf automake pkg-config libevent-dev libssl-dev
+
     - name: Build
-      run: autoreconf -ivf && ./configure && make
+      # for coverage reports we need to use Ubuntu 22.04 or lower
+      # (given Ubuntu 24.04 uses lcov >= 2.0 which is not support on autoconf still)
+      run: autoreconf -ivf && ./configure --enable-code-coverage && make -j
+
+    - name: Upload build artifact
+      uses: actions/upload-artifact@v5
+      with:
+        name: memtier-build-${{ matrix.platform }}
+        path: |
+          memtier_benchmark
+        retention-days: 1
+
+  test-ubuntu:
+    needs: build-ubuntu
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ubuntu-22.04]
+        test-config:
+          - name: "Single Endpoint: TCP Plaintext"
+            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "0", VERBOSE: "1", PARALLELISM: "2" }
+            tls: false
+          - name: "Single Endpoint: TCP TLS"
+            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", VERBOSE: "1", PARALLELISM: "2" }
+            tls: true
+          - name: "OSS TCP TLS v1.2"
+            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", TLS_PROTOCOLS: "TLSv1.2", VERBOSE: "1", PARALLELISM: "2" }
+            tls: true
+          - name: "OSS TCP TLS v1.3"
+            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", TLS_PROTOCOLS: "TLSv1.3", VERBOSE: "1", PARALLELISM: "2" }
+            tls: true
+          - name: "OSS-CLUSTER API: TCP Plaintext"
+            env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", VERBOSE: "1", PARALLELISM: "2" }
+            tls: false
+          - name: "OSS-CLUSTER API: TCP TLS"
+            env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", TLS: "1", VERBOSE: "1", PARALLELISM: "2" }
+            tls: true
+          - name: "OSS-CLUSTER API 49 shards: TCP TLS"
+            env: { RLTEST_DEBUG: "1", LOG_LEVEL: "notice", OSS_STANDALONE: "0", OSS_CLUSTER: "1", TLS: "1", VERBOSE: "1", SHARDS: "49", TEST: "tests_oss_simple_flow:test_rate_limited_completion_no_hang" }
+            tls: true
+          - name: "OSS-CLUSTER API 99 shards: TCP TLS"
+            env: { RLTEST_DEBUG: "1", LOG_LEVEL: "notice", OSS_STANDALONE: "0", OSS_CLUSTER: "1", TLS: "1", VERBOSE: "1", SHARDS: "99", TEST: "tests_oss_simple_flow:test_rate_limited_completion_no_hang" }
+            tls: true
+          # Also runs test_cluster_command_key_affixes.py, whose
+          # --read-preference=secondary key-routing case needs replicas.
+          - name: "OSS-CLUSTER + replicas: read-preference (modes)"
+            env: { LOG_LEVEL: "notice", OSS_STANDALONE: "0", OSS_CLUSTER: "0",
+                   OSS_CLUSTER_REPLICAS: "1", TLS: "0", VERBOSE: "1", SHARDS: "3", PARALLELISM: "2",
+                   TEST: "test_read_preference_modes.py test_cluster_command_key_affixes.py" }
+            tls: false
+          - name: "OSS-CLUSTER + replicas: read-preference (failover)"
+            env: { LOG_LEVEL: "notice", OSS_STANDALONE: "0", OSS_CLUSTER: "0",
+                   OSS_CLUSTER_REPLICAS: "1", TLS: "0", VERBOSE: "1", SHARDS: "3", PARALLELISM: "2",
+                   TEST: "test_read_preference_failover.py" }
+            tls: false
+          - name: "OSS-CLUSTER + replicas: primary failover with retries"
+            env: { LOG_LEVEL: "notice", OSS_STANDALONE: "0", OSS_CLUSTER: "0",
+                   OSS_CLUSTER_REPLICAS: "1", TLS: "0", VERBOSE: "1", SHARDS: "3",
+                   TEST: "test_cluster_failover_retry.py" }
+            tls: false
+          - name: "OSS-CLUSTER + replicas: read-preference (mget)"
+            env: { LOG_LEVEL: "notice", OSS_STANDALONE: "0", OSS_CLUSTER: "0",
+                   OSS_CLUSTER_REPLICAS: "1", TLS: "0", VERBOSE: "1", SHARDS: "3", PARALLELISM: "2",
+                   TEST: "test_read_preference_mget.py" }
+            tls: false
+          - name: "OSS-CLUSTER + replicas: read-preference (transaction)"
+            env: { LOG_LEVEL: "notice", OSS_STANDALONE: "0", OSS_CLUSTER: "0",
+                   OSS_CLUSTER_REPLICAS: "1", TLS: "0", VERBOSE: "1", SHARDS: "3", PARALLELISM: "2",
+                   TEST: "test_read_preference_transaction.py" }
+            tls: false
+          - name: "OSS-CLUSTER + replicas: read-preference RESP3"
+            env: { LOG_LEVEL: "notice", OSS_STANDALONE: "0", OSS_CLUSTER: "0",
+                   OSS_CLUSTER_REPLICAS: "1", TLS: "0", VERBOSE: "1", SHARDS: "3", PARALLELISM: "2",
+                   TEST: "test_read_preference_resp3.py" }
+            tls: false
+    runs-on: ${{ matrix.platform }}
+    name: Test ${{ matrix.test-config.name }}
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Download build artifact
+      uses: actions/download-artifact@v8
+      with:
+        name: memtier-build-${{ matrix.platform }}
+
+    - name: Restore executable permissions
+      run: chmod +x memtier_benchmark
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get -qq update
+        sudo apt-get install lcov autoconf automake pkg-config libevent-dev libssl-dev
+
     - name: Setup Python
-      uses: actions/setup-python@v1
+      uses: actions/setup-python@v6
       with:
-        python-version: '3.6'
+        python-version: '3.10'
+        architecture: x64
 
-    - name: Cache pip
-      uses: actions/cache@v1
-      with:
-        path: ~/.cache/pip # This path is specific to Ubuntu
-        # Look to see if there is a cache hit for the corresponding requirements file
-        key: ${{ runner.os }}-pip-${{ hashFiles('tests/test_requirements.txt') }}
-        restore-keys: |
-          ${{ runner.os }}-pip-
-          ${{ runner.os }}-
     - name: Install Python dependencies
-      run: pip install -r tests/test_requirements.txt
+      run: pip install -r ./tests/test_requirements.txt
 
-    - name: Cache Redis
-      id: cache-redis
-      uses: actions/cache@v1
+    - name: Install Redis
+      run: |
+        curl -fsSL https://packages.redis.io/gpg | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
+        echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/redis.list
+        sudo apt-get -qq update
+        sudo apt-get install redis
+        sudo service redis-server stop
+
+    - name: Increase connection limit
+      run: |
+        sudo sysctl -w net.ipv4.tcp_fin_timeout=10
+        sudo sysctl -w net.ipv4.tcp_tw_reuse=1
+        ulimit -n 40960
+
+    - name: Generate TLS test certificates
+      if: matrix.test-config.tls
+      run: |
+          ./tests/gen-test-certs.sh
+
+    - name: Run tests
+      # The standalone and main cluster cells run the whole suite, so the
+      # standalone cells use PARALLELISM=2 like the cluster ones; the limit
+      # (shared by all cells) leaves headroom for slow runners. See #679.
+      timeout-minutes: 40
+      env: ${{ matrix.test-config.env }}
+      run: |
+        ./tests/run_tests.sh
+
+  test-statsd:
+    needs: build-ubuntu
+    runs-on: ubuntu-22.04
+    name: "StatsD: docker-compose Integration"
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Download build artifact
+      uses: actions/download-artifact@v8
       with:
-        path: /home/runner/work/memtier_benchmark/memtier_benchmark/redis
-        key: ${{ runner.os }}-redis
+        name: memtier-build-ubuntu-22.04
 
-    - name: Install Redis Server test dependencies
-      if: steps.cache-redis.outputs.cache-hit != 'true'
-      run: |
-        git clone git://github.com/antirez/redis.git --branch unstable
-        cd redis
-        make BUILD_TLS=yes
-        ./utils/gen-test-certs.sh
-        ./src/redis-server --version
-        cd ..
+    - name: Restore executable permissions
+      run: chmod +x memtier_benchmark
 
-    - name: Test OSS TCP
-      run: |
-        cd tests 
-        MEMTIER_BINARY=./../memtier_benchmark \
-        python3 -m RLTest \
-        --env oss -v --clear-logs \
-        --oss-redis-path ../redis/src/redis-server
-        cd ..
+    - name: Start monitoring stack
+      run: docker compose -f docker-compose.statsd.yml up -d
 
-    - name: Test OSS TCP TLS
-      if: matrix.platform == 'ubuntu-latest'
+    - name: Install runtime dependencies
       run: |
-        cd tests
-        TLS_CERT=../redis/tests/tls/redis.crt \
-        TLS_KEY=../redis/tests/tls/redis.key \
-        TLS_CACERT=../redis/tests/tls/ca.crt \
-        MEMTIER_BINARY=../memtier_benchmark \
-        python3 -m RLTest \
-          --env oss -v --clear-logs \
-          --oss-redis-path ../redis/src/redis-server \
-          --tls-cert-file ../redis/tests/tls/redis.crt \
-          --tls-key-file ../redis/tests/tls/redis.key \
-          --tls-ca-cert-file ../redis/tests/tls/ca.crt \
-          --tls
-        cd ..
+        sudo apt-get -qq update
+        sudo apt-get install -y libevent-dev libssl-dev
 
-    - name: Test OSS-CLUSTER TCP
-      run: |
-        cd tests 
-        MEMTIER_BINARY=./../memtier_benchmark \
-        python3 -m RLTest \
-        --env oss-cluster -v --clear-logs --shards-count 3 \
-        --oss-redis-path ../redis/src/redis-server
-        cd ..
+    - name: Setup Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.10'
+        architecture: x64
 
-    - name: Test OSS-CLUSTER TCP TLS
-      if: matrix.platform == 'ubuntu-latest'
+    - name: Install Python dependencies
+      run: pip install -r ./tests/test_requirements.txt
+
+    - name: Install Redis
       run: |
-        cd tests
-        TLS_CERT=../redis/tests/tls/redis.crt \
-        TLS_KEY=../redis/tests/tls/redis.key \
-        TLS_CACERT=../redis/tests/tls/ca.crt \
-        MEMTIER_BINARY=../memtier_benchmark \
-        python3 -m RLTest \
-          --env oss-cluster --shards-count 3 -v --clear-logs \
-          --oss-redis-path ../redis/src/redis-server \
-          --tls-cert-file ../redis/tests/tls/redis.crt \
-          --tls-key-file ../redis/tests/tls/redis.key \
-          --tls-ca-cert-file ../redis/tests/tls/ca.crt \
-          --tls
-        cd ..
+        curl -fsSL https://packages.redis.io/gpg | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
+        echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/redis.list
+        sudo apt-get -qq update
+        sudo apt-get install redis
+        sudo service redis-server stop
+
+    - name: Wait for Graphite to be ready
+      run: |
+        for i in $(seq 1 30); do
+          if curl -sf http://localhost:8080/render > /dev/null; then
+            echo "Graphite ready"
+            exit 0
+          fi
+          echo "Waiting for Graphite ($i/30)..." && sleep 2
+        done
+        echo "Graphite not ready after 60s" && exit 1
+
+    - name: Run StatsD tests
+      timeout-minutes: 5
+      env:
+        OSS_STANDALONE: "1"
+        STATSD_HOST: "localhost"
+        VERBOSE: "1"
+        TEST: "test_statsd"
+      run: |
+        ./tests/run_tests.sh
+
+    - name: Teardown monitoring stack
+      if: always()
+      run: docker compose -f docker-compose.statsd.yml down -v
+
+  coverage-ubuntu:
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get -qq update
+        sudo apt-get install lcov autoconf automake pkg-config libevent-dev libssl-dev
+
+    - name: Build with coverage
+      # for coverage reports we need to use Ubuntu 22.04 or lower
+      # (given Ubuntu 24.04 uses lcov >= 2.0 which is not supported on autoconf still)
+      run: autoreconf -ivf && ./configure --enable-code-coverage && make -j
+
+    - name: Run unit tests
+      # Unit tests reuse the instrumented objects and must link the gcov runtime.
+      run: make check
+
+    - name: Setup Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.10'
+        architecture: x64
+
+    - name: Install Python dependencies
+      run: pip install -r ./tests/test_requirements.txt
+
+    - name: Install Redis
+      run: |
+        curl -fsSL https://packages.redis.io/gpg | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
+        echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/redis.list
+        sudo apt-get -qq update
+        sudo apt-get install redis
+        sudo service redis-server stop
+
+    - name: Increase connection limit
+      run: |
+        sudo sysctl -w net.ipv4.tcp_fin_timeout=10
+        sudo sysctl -w net.ipv4.tcp_tw_reuse=1
+        ulimit -n 40960
+
+    - name: Run tests for coverage
+      # Kept serial so coverage data is collected exactly as before; see #679.
+      timeout-minutes: 40
+      env:
+        OSS_STANDALONE: "1"
+        OSS_CLUSTER: "0"
+        TLS: "0"
+        VERBOSE: "1"
+      run: |
+        ./tests/run_tests.sh
+
+    - name: Capture code coverage
+      timeout-minutes: 6
+      run: |
+        make code-coverage-capture
+        bash <(curl -s https://codecov.io/bash) -f memtier_benchmark-*-coverage.info || echo "Codecov did not collect coverage reports"
+
+  build-alpine:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        alpine_version:
+          - "alpine:3.17"
+          - "alpine:3.18"
+          - "alpine:3.19"
+          - "alpine:3.20"
+          - "alpine:3.21"
+          - "alpine:latest"
+    container: ${{ matrix.alpine_version }}
+    name: Build ${{ matrix.alpine_version }}
+    steps:
+    - name: Install git
+      run: apk add --no-cache git
+
+    - name: Checkout code
+      uses: actions/checkout@v6
+
+    - name: Install build dependencies
+      run: |
+        apk add --no-cache \
+          make g++ autoconf automake pkgconfig \
+          libevent-dev zlib-dev openssl-dev
+
+    - name: Build
+      run: |
+        autoreconf -ivf
+        ./configure 2> configure.err || { cat configure.err >&2; exit 1; }
+        cat configure.err >&2
+        make -j
+
+    # This image has no libtool. An unexpanded macro (LT_INIT before #640) is
+    # left as a literal line in configure, which only prints "LT_INIT: not
+    # found" (busybox sh; bash says "command not found") and still exits 0.
+    - name: Check configure has no unexpanded macros
+      run: |
+        if grep -nE '^[[:space:]]*LT_[A-Z_]+' configure; then
+          echo "configure contains unexpanded libtool macros" >&2; exit 1
+        fi
+        if grep -nE '^\./configure: (line [0-9]+: )?[^ ]+: (command )?not found' configure.err; then
+          echo "configure ran an unknown command" >&2; exit 1
+        fi
+
+    - name: Verify version
+      run: ./memtier_benchmark --version
 
   build-macos:
     strategy:
       matrix:
-        platform: [macos-latest]
-    runs-on: ${{ matrix.platform }}
+        # Every cell builds libevent from source against the cell's OpenSSL.
+        # Homebrew's libevent links whichever OpenSSL its current revision
+        # uses (openssl@3 or openssl@4, depending on the runner's Homebrew
+        # snapshot), and mixing OpenSSL versions in one process crashes TLS
+        # (#674).
+        openssl: ["3.0", "3", "4"]
+    runs-on: macos-latest
     steps:
-    - uses: actions/checkout@v1
+    - uses: actions/checkout@v6
     - name: Install dependencies
-      run: brew install autoconf automake libtool libevent pkg-config openssl@1.1
+      run: brew install autoconf automake pkg-config openssl@${{ matrix.openssl }}
+    - name: Build libevent against the selected OpenSSL
+      run: bash scripts/build-macos-libevent.sh "$(brew --prefix openssl@${{ matrix.openssl }})"
     - name: Build
-      run: autoreconf -ivf && PKG_CONFIG_PATH=/usr/local/opt/openssl@1.1/lib/pkgconfig ./configure && make
+      run: |
+        autoreconf -ivf
+        PKG_CONFIG_PATH="$RUNNER_TEMP/libevent-memtier/lib/pkgconfig:$(brew --prefix openssl@${{ matrix.openssl }})/lib/pkgconfig" ./configure
+        make
+    # Run before the tests: a libevent linked against another OpenSSL
+    # crashes the TLS unit tests instead of failing with a clear message.
+    - name: Verify version, libevent, openssl
+      run: |
+        ./memtier_benchmark --version
+        bash scripts/check-macos-tls-links.sh "$(brew --prefix openssl@${{ matrix.openssl }})"
+    - name: Unit tests
+      run: |
+        if ! make check; then
+          cat test-suite.log
+          exit 1
+        fi
+
+  # The DEVELOPMENT.md path: Homebrew libevent with whichever OpenSSL it
+  # depends on, so the pairing follows Homebrew automatically.
+  build-macos-homebrew-libevent:
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install dependencies
+      run: |
+        brew install autoconf automake pkg-config libevent
+        ssl="$(brew deps libevent | grep '^openssl@' | head -n 1)"
+        test -n "$ssl" || { echo "brew deps libevent lists no openssl@*" >&2; exit 1; }
+        brew install "$ssl"
+        echo "SSL_PREFIX=$(brew --prefix "$ssl")" >> "$GITHUB_ENV"
+        echo "Homebrew libevent depends on $ssl"
+    - name: Build
+      run: |
+        autoreconf -ivf
+        PKG_CONFIG_PATH="$SSL_PREFIX/lib/pkgconfig" ./configure
+        make
+    - name: Verify version, libevent, openssl
+      run: |
+        ./memtier_benchmark --version
+        bash scripts/check-macos-tls-links.sh "$SSL_PREFIX" "$(brew --prefix libevent)"
+    - name: Unit tests
+      run: |
+        if ! make check; then
+          cat test-suite.log
+          exit 1
+        fi
+
+  # macos-13 has been retired as of December 2025, so use macos-14
+  # macos-14 details: https://github.com/actions/runner-images/blob/main/images/macos/macos-14-Readme.md
+  build-macos-openssl-1-1:
+    runs-on: macos-14
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install dependencies
+      run: brew install autoconf automake pkg-config openssl@1.1
+    - name: Build libevent against the selected OpenSSL
+      run: bash scripts/build-macos-libevent.sh "$(brew --prefix openssl@1.1)"
+    - name: Build
+      run: |
+        autoreconf -ivf
+        PKG_CONFIG_PATH="$RUNNER_TEMP/libevent-memtier/lib/pkgconfig:$(brew --prefix openssl@1.1)/lib/pkgconfig" ./configure
+        make
+    - name: Verify version, libevent, openssl
+      run: |
+        ./memtier_benchmark --version
+        bash scripts/check-macos-tls-links.sh "$(brew --prefix openssl@1.1)"
+    - name: Unit tests
+      run: |
+        if ! make check; then
+          cat test-suite.log
+          exit 1
+        fi
+
+  build-macos-openssl-1-0-2:
+    runs-on: macos-14
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install dependencies
+      run: brew install autoconf automake pkg-config
+    - name: Install openssl v1.0.2
+      run: brew install rbenv/tap/openssl@1.0
+    # Retain the already-tested legacy libevent version; upgrading it is separate.
+    - name: Build libevent against openssl v1.0.2
+      # Homebrew's libevent uses OpenSSL 3; mixing it with 1.0.2 selects
+      # incompatible headers and loads two SSL ABIs into the same process.
+      run: |
+        legacy_ssl_prefix="$(brew --prefix openssl@1.0)"
+        cd "$RUNNER_TEMP"
+        curl -fsSL --retry 3 -O https://github.com/libevent/libevent/releases/download/release-2.1.12-stable/libevent-2.1.12-stable.tar.gz
+        echo '92e6de1be9ec176428fd2367677e61ceffc2ee1cb119035037a27d346b0403bb  libevent-2.1.12-stable.tar.gz' | shasum -a 256 -c -
+        tar -xzf libevent-2.1.12-stable.tar.gz
+        cd libevent-2.1.12-stable
+        PKG_CONFIG_PATH="$legacy_ssl_prefix/lib/pkgconfig" \
+          CPPFLAGS="-I$legacy_ssl_prefix/include" LDFLAGS="-L$legacy_ssl_prefix/lib" \
+          ./configure --prefix="$RUNNER_TEMP/libevent-openssl-1.0" --disable-samples --disable-libevent-regress
+        make -j3
+        make install
+    - name: Build
+      run: |
+        autoreconf -ivf
+        PKG_CONFIG_PATH="$RUNNER_TEMP/libevent-openssl-1.0/lib/pkgconfig:$(brew --prefix openssl@1.0)/lib/pkgconfig" ./configure
+        make
+    - name: Verify version, libevent, openssl
+      run: |
+        set -euo pipefail
+        ./memtier_benchmark --version | grep 'OpenSSL 1.0.2'
+        binary_links="$(otool -L ./memtier_benchmark)"
+        printf '%s\n' "$binary_links" | grep '/libssl\.1\.0\.0\.dylib '
+        bash scripts/check-macos-tls-links.sh "$(brew --prefix openssl@1.0)" "$RUNNER_TEMP/libevent-openssl-1.0"
+        otool -L "$RUNNER_TEMP/libevent-openssl-1.0/lib/libevent_openssl.dylib" | grep 'libssl.1.0.0'
+    - name: Unit tests
+      run: |
+        if ! make check; then
+          cat test-suite.log
+          exit 1
+        fi
+
+  promtool-lint:
+    runs-on: ubuntu-latest
+    name: "Prometheus: promtool /metrics lint"
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install dependencies
+      run: |
+        sudo apt-get -qq update
+        sudo apt-get install -y autoconf automake pkg-config libevent-dev libssl-dev redis-server
+        sudo service redis-server stop || true
+
+    - name: Build (prometheus default-on)
+      run: autoreconf -ivf && ./configure && make -j"$(nproc)"
+
+    - name: Install promtool (sha256-pinned release tarball)
+      run: |
+        set -euo pipefail
+        PROM_VERSION=2.53.2
+        PROM_TARBALL="prometheus-${PROM_VERSION}.linux-amd64.tar.gz"
+        PROM_SHA256=60c126740c9cf1206b1e72150dd17914f1c3309bb7dc78a31d4670197ed4fa69
+        curl -fsSLO "https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/${PROM_TARBALL}"
+        echo "${PROM_SHA256}  ${PROM_TARBALL}" | sha256sum -c -
+        tar -xzf "${PROM_TARBALL}"
+        sudo install -m 0755 "prometheus-${PROM_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
+        promtool --version
+
+    - name: Scrape /metrics from a live run and lint it
+      run: |
+        set -euo pipefail
+        redis-server --port 6399 --save '' --daemonize yes
+        for i in $(seq 1 30); do redis-cli -p 6399 ping >/dev/null 2>&1 && break; sleep 0.2; done
+        # scrape_and_lint OUT [memtier args...]
+        scrape_and_lint() {
+          local out_file="$1"; shift
+          ./memtier_benchmark -s 127.0.0.1 -p 6399 --test-time=8 --prometheus-port=0 "$@" \
+            >mb.out 2>mb.err &
+          local MBPID=$!
+          local URL=""
+          for i in $(seq 1 100); do
+            URL=$(grep -oP 'listening on \Khttp://[^ ]+/metrics' mb.out || true)
+            [ -n "$URL" ] && break
+            sleep 0.1
+          done
+          [ -n "$URL" ] || { echo "no announce line"; cat mb.out mb.err; exit 1; }
+          sleep 1
+          curl -fsS "$URL" > "$out_file"
+          wait "$MBPID"
+          # rc != 0 OR any output = failure (PLAN.md §7.4e)
+          local out
+          out=$(promtool check metrics < "$out_file" 2>&1) || { echo "promtool rc != 0 ($out_file)"; echo "$out"; exit 1; }
+          if [ -n "$out" ]; then echo "promtool produced output (lint warnings) ($out_file):"; echo "$out"; exit 1; fi
+          echo "promtool check metrics: clean ($out_file)"
+        }
+        scrape_and_lint prom_scrape.txt
+        # #753: a run-label value with an invalid UTF-8 byte must be sanitized.
+        scrape_and_lint prom_scrape_utf8.txt "--prometheus-run-label=env=x"$'\xff'"y" \
+          "--prometheus-run-label=ok=caf"$'\xc3\xa9'
+        grep -q 'env="x'$'\xef\xbf\xbd''y"' prom_scrape_utf8.txt || { echo "U+FFFD missing"; exit 1; }
+
+    - name: Upload scraped exposition
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: prom_scrape
+        path: |
+          prom_scrape.txt
+          prom_scrape_utf8.txt

@@ -1,0 +1,1104 @@
+"""
+Regression tests for issue #389 / `--transaction`.
+
+Background: in `--cluster-mode`, memtier routes each `--command` by hashing
+the first key argument, so the keyless transaction-lifecycle commands
+(`MULTI`, `EXEC`, `UNWATCH`) end up on a different shard connection than the
+keyed commands they wrap, breaking transaction state. The `--transaction`
+flag pins one full rotation of `--command` entries to a single shard
+connection (the slot owner of the first keyed command in the rotation) so
+that a `WATCH`/`MULTI`/.../`EXEC` block stays together on one connection.
+
+These tests run only against the OSS-CLUSTER environment; they assert that
+memtier exits cleanly and that memtier's own stderr (where Redis error
+responses are echoed via benchmark_error_log) never contains a
+broken-transaction error (`unwatch inside MULTI`, `EXEC without MULTI`,
+`MULTI calls can not be nested`, `EXECABORT`).
+"""
+
+import json
+import os
+import subprocess
+import tempfile
+import time
+
+from include import (
+    add_required_env_arguments,
+    addTLSArgs,
+    debugPrintMemtierOnError,
+    ensure_clean_benchmark_folder,
+    get_default_memtier_config,
+)
+from mb import Benchmark, RunConfig
+from redis.cluster import key_slot
+
+# Server-side error fragments that indicate the transaction state machine
+# has been torn between two connections — the exact symptoms from #389.
+TRANSACTION_BREAKAGE_PATTERNS = [
+    "unwatch inside MULTI",
+    "EXEC without MULTI",
+    "MULTI calls can not be nested",
+    "EXECABORT",
+    "DISCARD without MULTI",
+]
+
+# Cluster rejects a multi-key access whose keys don't all hash to one slot.
+# With --transaction every __key__ in a rotation must resolve to the SAME key,
+# so a WATCH/GET/SETEX rotation stays single-slot even without a hash tag.
+CROSSSLOT_PATTERN = "CROSSSLOT"
+
+
+def _read_stderr(run_config):
+    path = "{0}/mb.stderr".format(run_config.results_dir)
+    if not os.path.isfile(path):
+        return ""
+    with open(path) as f:
+        return f.read()
+
+
+def _read_stdout(run_config):
+    path = "{0}/mb.stdout".format(run_config.results_dir)
+    if not os.path.isfile(path):
+        return ""
+    with open(path) as f:
+        return f.read()
+
+
+def _assert_no_transaction_breakage(env, stderr_text):
+    for needle in TRANSACTION_BREAKAGE_PATTERNS:
+        env.assertTrue(
+            needle not in stderr_text,
+            message="server-side transaction error '{}' present — keyless "
+                    "commands appear to have been routed to a different "
+                    "shard connection than the keyed ones".format(needle),
+        )
+
+
+def _run_transaction_workload(env, extra_command_args, threads=2, clients=4,
+                              requests=500):
+    """Common helper: run a short --transaction workload and return
+    (memtier_ok, run_config, stderr_text)."""
+    benchmark_specs = {"name": env.testName, "args": ["--transaction"]}
+    addTLSArgs(benchmark_specs, env)
+    benchmark_specs["args"].extend(extra_command_args)
+
+    config = get_default_memtier_config(threads=threads, clients=clients,
+                                        requests=requests)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    test_dir = tempfile.mkdtemp()
+    run_config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(run_config.results_dir)
+
+    benchmark = Benchmark.from_json(run_config, benchmark_specs)
+    ok = benchmark.run()
+    return ok, run_config, _read_stderr(run_config)
+
+
+def test_transaction_watch_multi_exec_unwatch(env):
+    """The exact failure mode from #389: WATCH/GET/MULTI/SET/EXEC/UNWATCH
+    with hash-tagged keys. Must succeed end-to-end with zero server-side
+    transaction errors."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    # Hash-tag forces every key to the same slot. With --transaction we also
+    # pin all the keyless commands (MULTI/EXEC/UNWATCH) to that slot's shard.
+    cmds = [
+        '--command=WATCH {tx}-__key__',
+        '--command=GET   {tx}-__key__',
+        '--command=MULTI',
+        '--command=SET   {tx}-__key__ __data__',
+        '--command=EXEC',
+        '--command=UNWATCH',
+    ]
+    ok, run_config, stderr = _run_transaction_workload(env, cmds)
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier_benchmark exited non-zero")
+        _assert_no_transaction_breakage(env, stderr)
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_minimal_multi_exec(env):
+    """Smaller surface: just MULTI / SET / EXEC. Validates the pin-on-first-
+    keyed-command path with no preceding WATCH."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    cmds = [
+        '--command=MULTI',
+        '--command=SET   {mx}-__key__ __data__',
+        '--command=INCR  {mx}-counter',
+        '--command=EXEC',
+    ]
+    ok, run_config, stderr = _run_transaction_workload(env, cmds)
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok)
+        _assert_no_transaction_breakage(env, stderr)
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_with_discard(env):
+    """DISCARD is also a keyless transaction terminator and must follow the
+    same pinning as EXEC."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    cmds = [
+        '--command=MULTI',
+        '--command=SET   {dx}-__key__ __data__',
+        '--command=DISCARD',
+    ]
+    ok, run_config, stderr = _run_transaction_workload(env, cmds)
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok)
+        _assert_no_transaction_breakage(env, stderr)
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_in_standalone_runs_clean(env):
+    """In standalone, --transaction does not pin (there is only one
+    connection), but it must still run cleanly with no server-side
+    transaction breakage."""
+    if env.isCluster():
+        env.skip()
+        return
+
+    # No hash tag needed here — there's only one shard.
+    cmds = [
+        '--command=MULTI',
+        '--command=SET   __key__ __data__',
+        '--command=INCR  counter',
+        '--command=EXEC',
+    ]
+    ok, run_config, stderr = _run_transaction_workload(env, cmds)
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier_benchmark exited non-zero")
+        _assert_no_transaction_breakage(env, stderr)
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_standalone_same_key_per_rotation(env):
+    """--transaction must collapse every __key__ in a rotation to one key even
+    WITHOUT --cluster-mode, so a single endpoint fronting a sharded backend
+    (e.g. a Redis Enterprise proxy) never sees a cross-slot WATCH/MULTI/EXEC.
+
+    Verified the slot-independent way: SET 'aa' then APPEND 'bb' on a bare
+    __key__ in one MULTI/EXEC. If both commands share the rotation's key every
+    populated key holds 'aabb'; if they drew independent keys (the pre-change
+    standalone behavior) we'd see stray 'aa' / 'bb' values."""
+    if env.isCluster():
+        env.skip()
+        return
+
+    conn = env.getConnection()
+    conn.flushall()
+
+    cmds = [
+        '--command=MULTI',
+        '--command=SET    __key__ aa',
+        '--command=APPEND __key__ bb',
+        '--command=EXEC',
+        '--command-key-pattern=R',
+        '--key-prefix=sk-',
+        '--key-minimum=1',
+        '--key-maximum=30',
+    ]
+    ok, run_config, stderr = _run_transaction_workload(
+        env, cmds, threads=2, clients=2, requests=400)
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier_benchmark exited non-zero")
+        _assert_no_transaction_breakage(env, stderr)
+
+        total_keys = 0
+        for key in conn.scan_iter(match="sk-*"):
+            total_keys += 1
+            value = conn.execute_command("GET", key)
+            env.assertEqual(
+                value, b"aabb",
+                message="key {!r} holds {!r}, expected 'aabb' — standalone "
+                        "--transaction did not reuse one key per "
+                        "rotation".format(key, value))
+        env.assertGreater(
+            total_keys, 0,
+            message="no sk-* keys written; transaction produced no side effects")
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_requires_command(env):
+    """--transaction with no --command must be rejected (any env)."""
+    import subprocess
+    from include import MEMTIER_BINARY
+
+    master_nodes_list = env.getMasterNodesList()
+    port = master_nodes_list[0]["port"]
+    args = [
+        MEMTIER_BINARY,
+        "-s", "127.0.0.1", "-p", str(port),
+        "-t", "1", "-c", "1", "--requests", "1",
+        "--transaction",
+    ]
+    if env.isCluster():
+        args.append("--cluster-mode")
+    if hasattr(env, "envRunner") and env.envRunner is not None:
+        if getattr(env.envRunner, "useTLS", False):
+            args.append("--tls")
+
+    proc = subprocess.run(args, capture_output=True, timeout=15)
+    env.assertNotEqual(
+        proc.returncode, 0,
+        message="--transaction without --command should fail validation")
+    env.assertTrue(
+        b"--transaction requires" in proc.stderr,
+        message="expected stderr to mention requirement on --command; "
+                "got: {!r}".format(proc.stderr[:400]))
+
+
+# ---------------------------------------------------------------------------
+# Ingestion + slot-coverage tests
+#
+# The five tests above only check the absence of server-side transaction
+# errors. The tests below take it further: they flush the cluster, run a
+# write workload through MULTI/EXEC, then inspect the cluster to confirm
+# that
+#   1. the actual write side-effects landed in Redis (ingestion happened),
+#   2. they landed on the SLOT OWNER of the chosen hash tag and nowhere
+#      else (pin correctness),
+#   3. multiple distinct keys were touched within that slot (not just one
+#      key getting overwritten),
+#   4. memtier can correctly target hash tags whose slots span every shard
+#      of the cluster (general routing, not hardcoded to shard 0).
+# ---------------------------------------------------------------------------
+
+def _master_conns_by_port(env):
+    """Return {port:int -> Redis connection} for every master in the
+    cluster. Keying by port avoids the pitfall that two distinct Redis
+    client instances pointing at the same server don't compare/hash as
+    equal."""
+    return {
+        int(conn.connection_pool.connection_kwargs["port"]): conn
+        for conn in env.getOSSMasterNodesConnectionList()
+    }
+
+
+def _flush_cluster(env):
+    for conn in env.getOSSMasterNodesConnectionList():
+        conn.execute_command("FLUSHALL")
+
+
+def _dbsize_per_shard(env):
+    """Map of port:int -> integer DBSIZE."""
+    return {port: int(conn.execute_command("DBSIZE"))
+            for port, conn in _master_conns_by_port(env).items()}
+
+
+def _owning_port(env, hash_tag):
+    """Return the port of the master that owns the slot for the given hash
+    tag, using CLUSTER SLOTS as the source of truth (so the test stays
+    correct under any shard count or non-default slot layout)."""
+    slot = key_slot(hash_tag.encode())
+    any_master = next(iter(env.getOSSMasterNodesConnectionList()))
+    slots_view = any_master.execute_command("CLUSTER", "SLOTS")
+    for entry in slots_view:
+        slot_start, slot_end = int(entry[0]), int(entry[1])
+        if slot_start <= slot <= slot_end:
+            owner_port = int(entry[2][1])
+            return owner_port
+    raise AssertionError(
+        "no master found for slot {} of hash tag {!r}".format(slot, hash_tag))
+
+
+def _pick_hash_tags_one_per_shard(env, candidates=None):
+    """Return [(hash_tag, owner_port)] with one short hash tag per master
+    shard, each tag chosen so its slot is owned by a distinct master."""
+    if candidates is None:
+        # Compact, distinct hash tags that span the typical 3-shard split
+        # 0-5461 / 5462-10923 / 10924-16383. The pool is intentionally
+        # larger so the helper still finds one per shard under alternate
+        # cluster layouts.
+        candidates = ['b', 'c', 'a', 'f', 'g', 'd', 'j', 'k', 'h']
+    master_count = len(env.getOSSMasterNodesConnectionList())
+    seen = set()
+    chosen = []
+    for tag in candidates:
+        port = _owning_port(env, tag)
+        if port in seen:
+            continue
+        seen.add(port)
+        chosen.append((tag, port))
+        if len(seen) == master_count:
+            break
+    env.assertEqual(
+        len(chosen), master_count,
+        message="couldn't find a hash-tag tag per shard (got {} for {} "
+                "shards). Extend the candidate list.".format(
+                    len(chosen), master_count))
+    return chosen
+
+
+def _run_ingestion(env, hash_tag, requests, threads=1, clients=1,
+                   key_max=None):
+    """Run a --transaction MULTI/SET/EXEC workload that writes
+    `{tag}-key-<n>` keys. Returns (ok, run_config, stderr_text)."""
+    if key_max is None:
+        # Default: cover the request count so every request can land on a
+        # distinct key value (--key-pattern=R picks randomly, so duplicates
+        # are fine — the cluster-side count check uses set semantics).
+        key_max = requests
+    cmds = [
+        '--command=MULTI',
+        '--command=SET {' + hash_tag + '}-key-__key__ memtier-ingest-data',
+        '--command=EXEC',
+        '--key-minimum=1',
+        '--key-maximum={}'.format(key_max),
+    ]
+    return _run_transaction_workload(env, cmds, threads=threads,
+                                     clients=clients, requests=requests)
+
+
+def test_transaction_ingestion_lands_on_pinned_shard(env):
+    """Ingestion through MULTI/EXEC must (a) actually write keys to Redis,
+    (b) put every key on the slot owner of the hash tag, (c) leave the
+    other shards empty, and (d) touch more than one distinct key value
+    inside the slot."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    _flush_cluster(env)
+    hash_tag = 'ing'
+    requests = 200
+    ok, run_config, stderr = _run_ingestion(env, hash_tag, requests=requests,
+                                            key_max=50)
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier_benchmark exited non-zero")
+        _assert_no_transaction_breakage(env, stderr)
+
+        sizes = _dbsize_per_shard(env)
+        owner_port = _owning_port(env, hash_tag)
+        owner_size = sizes[owner_port]
+
+        # (a) ingestion happened: at least one key landed.
+        env.assertGreater(
+            owner_size, 0,
+            message="no keys landed on the slot owner of {{{}}} (port {}); "
+                    "the transaction pin is broken".format(
+                        hash_tag, owner_port))
+
+        # (d) multiple distinct keys touched — we expect close to key_max
+        # unique keys for requests=200, key_max=50, --key-pattern=R.
+        # Allow some slack for unlikely RNG collisions; require at least
+        # half the range to be exercised.
+        env.assertGreater(
+            owner_size, 25,
+            message="only {} distinct keys present on owner — expected the "
+                    "rotation to touch most of key_max=50 unique keys".format(
+                        owner_size))
+
+        # (b)+(c) every other shard is empty: no MOVED leakage, no
+        # cross-shard writes from misrouted SETs.
+        for port, sz in sizes.items():
+            if port == owner_port:
+                continue
+            env.assertEqual(
+                sz, 0,
+                message="non-owner shard on port {} unexpectedly has {} "
+                        "keys — keyed commands escaped the pin".format(
+                            port, sz))
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_routes_correctly_for_every_shard(env):
+    """--transaction must work for *any* slot, not just the slot that
+    happens to hash to shard 0. For each shard in the cluster, pick a hash
+    tag whose slot Redis assigns to that shard, run a small ingestion,
+    and verify the keys land exclusively on the expected shard."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    tags_per_shard = _pick_hash_tags_one_per_shard(env)
+
+    for hash_tag, expected_port in tags_per_shard:
+        _flush_cluster(env)
+        ok, run_config, stderr = _run_ingestion(env, hash_tag, requests=60,
+                                                key_max=20)
+
+        failed = env.getNumberOfFailedAssertion()
+        try:
+            env.assertTrue(
+                ok,
+                message="memtier exited non-zero for hash tag '{}' (expected "
+                        "owner on port {})".format(hash_tag, expected_port))
+            _assert_no_transaction_breakage(env, stderr)
+
+            sizes = _dbsize_per_shard(env)
+            env.assertGreater(
+                sizes[expected_port], 0,
+                message="hash tag '{}' produced no keys on its owner port "
+                        "{} — slot routing broken for this shard".format(
+                            hash_tag, expected_port))
+            for port, sz in sizes.items():
+                if port == expected_port:
+                    continue
+                env.assertEqual(
+                    sz, 0,
+                    message="hash tag '{}' (owner port {}) leaked {} keys "
+                            "onto port {}".format(hash_tag, expected_port,
+                                                  sz, port))
+        finally:
+            if env.getNumberOfFailedAssertion() > failed:
+                debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_sequential_ingestion_full_population(env):
+    """Sequential key pattern over a large range must land every key in
+    the cluster exactly once. With --transaction MULTI/SET/EXEC,
+    --key-pattern=S, --key-minimum=1 --key-maximum=N and --requests=N on
+    a single client/single thread, memtier walks the key range in order:
+    keys 1..N are each written exactly once, so the cluster ends up with
+    DBSIZE == N keys all on the slot owner of the hash tag.
+
+    This is the strict regression check the issue #389 repro really
+    needs — the looser ingestion test above only verifies that ~half
+    of a small range was touched; this one pins down the exact count
+    against a large range, catching off-by-one and silently-dropped-
+    transactions regressions.
+    """
+    if not env.isCluster():
+        env.skip()
+        return
+
+    _flush_cluster(env)
+    hash_tag = 'seq'
+    # Keep this large enough to exercise the pin across many rotations
+    # but small enough that CI doesn't time out (memtier on a local
+    # 3-shard cluster does roughly ~20-40k req/sec for a 3-command
+    # MULTI/SET/EXEC rotation, so 100k unique keys completes well under
+    # a minute even under sanitizers).
+    #
+    # --requests counts every individual command, not rotations. The
+    # rotation is 3 commands (MULTI / SET / EXEC), so to actually emit N
+    # SET commands and hit every value in --key-pattern=S range 1..N, we
+    # need --requests = 3*N.
+    n = 100000
+
+    cmds = [
+        '--command=MULTI',
+        '--command=SET {' + hash_tag + '}-key-__key__ memtier-seq-data',
+        '--command-key-pattern=S',  # must follow --command=SET so it applies to SET, not EXEC
+        '--command=EXEC',
+        '--key-prefix=',            # empty prefix so keys are bare integers: {seq}-key-1, {seq}-key-2, …
+        '--key-minimum=1',
+        '--key-maximum={}'.format(n),
+    ]
+    ok, run_config, stderr = _run_transaction_workload(
+        env, cmds, threads=1, clients=1, requests=3 * n)
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier_benchmark exited non-zero")
+        _assert_no_transaction_breakage(env, stderr)
+
+        sizes = _dbsize_per_shard(env)
+        owner_port = _owning_port(env, hash_tag)
+
+        # Exact match: every requested key value 1..n was written once.
+        env.assertEqual(
+            sizes[owner_port], n,
+            message="expected DBSIZE={} on owner port {} after sequential "
+                    "ingestion, got {}".format(n, owner_port,
+                                               sizes[owner_port]))
+
+        # And every other shard is still empty.
+        for port, sz in sizes.items():
+            if port == owner_port:
+                continue
+            env.assertEqual(
+                sz, 0,
+                message="non-owner shard on port {} has {} keys after "
+                        "single-slot sequential ingestion".format(port, sz))
+
+        # Sanity-check the actual key/value of a few entries to make sure
+        # we wrote the expected payload (not just empty placeholders or
+        # MULTI-discarded keys). Use direct GETs against the owning
+        # master.
+        owner_conn = next(c for c in env.getOSSMasterNodesConnectionList()
+                          if int(c.connection_pool.connection_kwargs[
+                              "port"]) == owner_port)
+        for key_idx in (1, n // 2, n):
+            key = "{{{}}}-key-{}".format(hash_tag, key_idx)
+            value = owner_conn.execute_command("GET", key)
+            env.assertEqual(
+                value, b"memtier-seq-data",
+                message="GET {!r} on port {} returned {!r}, expected "
+                        "'memtier-seq-data' — transaction commit may have "
+                        "been silently dropped".format(
+                            key, owner_port, value))
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_appears_in_config_and_json_output(env):
+    """--transaction must be reflected in both the printed config (stderr)
+    and the JSON output file so tooling that parses memtier output can
+    detect the mode without re-parsing the command line."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    cmds = [
+        '--show-config',
+        '--command=MULTI',
+        '--command=SET {cfg}-__key__ __data__',
+        '--command=EXEC',
+        '--command-key-pattern=R',
+    ]
+    ok, run_config, stderr = _run_transaction_workload(env, cmds, requests=60)
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier_benchmark exited non-zero")
+
+        # Printed config block (emitted to stderr via --show-config) must
+        # contain "transaction = yes".
+        env.assertTrue(
+            "transaction = yes" in stderr,
+            message="'transaction = yes' not found in memtier stderr config block; "
+                    "got stderr excerpt: {!r}".format(stderr[:600]))
+
+        # JSON output file must have configuration.transaction == "true".
+        json_path = os.path.join(run_config.results_dir, "mb.json")
+        env.assertTrue(
+            os.path.isfile(json_path),
+            message="mb.json not found at {}".format(json_path))
+        with open(json_path) as f:
+            doc = json.load(f)
+        cfg_section = doc.get("configuration", {})
+        env.assertEqual(
+            cfg_section.get("transaction"), "true",
+            message="JSON configuration.transaction expected 'true', got {!r}".format(
+                cfg_section.get("transaction")))
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_same_key_no_hash_tag_no_crossslot(env):
+    """The exact issue repro: WATCH/GET/MULTI/SETEX/EXEC/UNWATCH where each
+    keyed command uses a bare __key__ with NO hash tag and --command-key-
+    pattern=R. Because --transaction now reuses one key for the whole
+    rotation, all three keyed commands hit a single slot, so the cluster
+    must NOT raise CROSSSLOT and the transaction must stay intact."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    # No hash tag, random key pattern: pre-change this would have generated a
+    # different key per command and the WATCH/MULTI/EXEC unit would be torn
+    # across slots (CROSSSLOT / MOVED).
+    _flush_cluster(env)
+    cmds = [
+        '--command=WATCH __key__',
+        '--command=GET   __key__',
+        '--command=MULTI',
+        '--command=SETEX __key__ 7200 __data__',
+        '--command=EXEC',
+        '--command=UNWATCH',
+        '--command-key-pattern=R',
+        '--key-minimum=1',
+        '--key-maximum=1000',
+    ]
+    ok, run_config, stderr = _run_transaction_workload(env, cmds)
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier_benchmark exited non-zero")
+        _assert_no_transaction_breakage(env, stderr)
+        env.assertTrue(
+            CROSSSLOT_PATTERN not in stderr,
+            message="CROSSSLOT error present — keyed commands in the rotation "
+                    "resolved to different keys/slots instead of sharing one")
+        # Liveness floor: the SETEX inside the transaction must actually have
+        # committed keys. Without this a regression that silently emits no
+        # keyed writes (clean stderr, exit 0) would pass the checks above.
+        total = sum(_dbsize_per_shard(env).values())
+        env.assertGreater(
+            total, 0,
+            message="no keys committed by the SETEX — the transaction "
+                    "produced no side effects")
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_same_key_reused_within_rotation(env):
+    """A SET then an APPEND in the same MULTI/EXEC rotation, both on a bare
+    __key__ with no hash tag, must land on the SAME key. We SET 'aa' then
+    APPEND 'bb'; if both commands share one key every populated key ends up
+    'aabb'. This distinguishes same-key reuse from a dropped/misrouted first
+    command: if the SET were dropped or hit a different key, APPEND-on-missing
+    would leave 'bb' instead of 'aabb'. And if the two commands resolved to
+    different keys with no hash tag they'd hash to different slots and the
+    cluster would reject the transaction with CROSSSLOT."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    _flush_cluster(env)
+    cmds = [
+        '--command=MULTI',
+        '--command=SET    __key__ aa',
+        '--command=APPEND __key__ bb',
+        '--command=EXEC',
+        '--command-key-pattern=R',
+        '--key-prefix=rk-',
+        '--key-minimum=1',
+        '--key-maximum=40',
+    ]
+    ok, run_config, stderr = _run_transaction_workload(
+        env, cmds, threads=1, clients=1, requests=400)
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier_benchmark exited non-zero")
+        _assert_no_transaction_breakage(env, stderr)
+        env.assertTrue(
+            CROSSSLOT_PATTERN not in stderr,
+            message="CROSSSLOT error present — the SET and APPEND in a "
+                    "rotation resolved to different keys")
+
+        # Every populated key across all shards must hold 'aabb', proving the
+        # SET and the APPEND in each rotation targeted the same key (a dropped
+        # or misrouted SET would leave 'bb').
+        total_keys = 0
+        for conn in env.getOSSMasterNodesConnectionList():
+            for key in conn.scan_iter(match="rk-*"):
+                total_keys += 1
+                value = conn.execute_command("GET", key)
+                env.assertEqual(
+                    value, b"aabb",
+                    message="key {!r} holds {!r}, expected 'aabb' — the SET "
+                            "and APPEND in the rotation did not share a "
+                            "key".format(key, value))
+        env.assertGreater(
+            total_keys, 0,
+            message="no rk-* keys were written; the transaction produced no "
+                    "side effects")
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_abort_column_and_warning(env):
+    """Under --transaction the stats output must break EXEC optimistic-lock
+    aborts out into their own 'Aborts/sec' column (table + JSON), and the
+    miss-rate warning for EXEC must say 'abort rate', never 'miss rate'.
+
+    A narrow key range with several contending clients makes concurrent
+    rotations watch+write the same key, so some EXECs abort and the abort
+    columns/warning are exercised with non-zero values."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    test_dir = tempfile.mkdtemp()
+    benchmark_specs = {"name": env.testName, "args": ["--transaction"]}
+    addTLSArgs(benchmark_specs, env)
+    benchmark_specs["args"].extend([
+        # Hash-tag prefix keeps every key in one slot (no cross-slot pin churn),
+        # and a narrow key range makes concurrent rotations watch+write the same
+        # key -> EXEC optimistic-lock aborts.
+        '--command=WATCH __key__',
+        '--command=GET   __key__',
+        '--command=MULTI',
+        '--command=SETEX __key__ 600 __data__',
+        '--command=EXEC',
+        '--command=UNWATCH',
+        '--command-key-pattern=R',
+        '--key-prefix={abrt}-',
+        '--key-minimum=1',
+        '--key-maximum=5',
+    ])
+
+    config = get_default_memtier_config(threads=4, clients=4, requests=500)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    run_config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(run_config.results_dir)
+    benchmark = Benchmark.from_json(run_config, benchmark_specs)
+    ok = benchmark.run()
+
+    stdout = _read_stdout(run_config)
+    stderr = _read_stderr(run_config)
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier_benchmark exited non-zero")
+        _assert_no_transaction_breakage(env, stderr)
+
+        # Table must carry the Aborts/sec column under --transaction.
+        env.assertTrue(
+            "Aborts/sec" in stdout,
+            message="'Aborts/sec' column missing from --transaction output")
+
+        # EXEC's miss-rate warning, if any, must be phrased as an abort.
+        env.assertTrue(
+            "EXEC miss rate" not in stderr,
+            message="EXEC reported as 'miss rate'; should be 'abort rate'")
+
+        # JSON: the Execs command block and Totals must expose Aborts/sec.
+        json_path = os.path.join(run_config.results_dir, "mb.json")
+        with open(json_path) as f:
+            doc = json.load(f)
+
+        def _find(node, key):
+            if isinstance(node, dict):
+                if key in node:
+                    return node[key]
+                for v in node.values():
+                    r = _find(v, key)
+                    if r is not None:
+                        return r
+            return None
+
+        execs = _find(doc, "Execs")
+        env.assertTrue(execs is not None, message="no Execs block in JSON")
+        env.assertTrue(
+            "Aborts/sec" in execs,
+            message="Execs JSON block missing 'Aborts/sec': {}".format(
+                list(execs.keys())))
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_keyless_only_rotation(env):
+    """A rotation whose only commands are keyless (MULTI + EXEC with no
+    keyed command inside) must complete without hanging or asserting.
+
+    Without a keyed command the lookahead falls back to the current
+    connection for the pin and never generates a staged key. All non-pin
+    connections get schedule_fill() wakeups on every rotation boundary but
+    are immediately re-blocked by hold_pipeline(). This exercises the
+    liveness of that fast-block/wake path."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    cmds = [
+        '--command=MULTI',
+        '--command=EXEC',
+    ]
+    ok, run_config, stderr = _run_transaction_workload(env, cmds,
+                                                       threads=2, clients=2,
+                                                       requests=200)
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier_benchmark exited non-zero (possible hang or crash)")
+        _assert_no_transaction_breakage(env, stderr)
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def _run_with_shard_kills(env, commands, test_time=8, pipeline=1,
+                          threads=1, clients=1, extra_args=()):
+    """Run a --transaction rotation with --reconnect-on-error while
+    repeatedly killing one non-main shard's
+    client connections. Returns (rc, kills, stderr, run_config); rc is None
+    when memtier hung past --test-time + 30s."""
+    benchmark_specs = {"name": env.testName, "args": ["--transaction"]}
+    addTLSArgs(benchmark_specs, env)
+    # Entries starting with "--" are passed as is, so a per-command option
+    # such as --command-key-pattern can follow the command it applies to.
+    benchmark_specs["args"].extend([c if c.startswith('--') else '--command=' + c
+                                    for c in commands])
+    benchmark_specs["args"].extend(['--pipeline={}'.format(pipeline),
+                                    '--reconnect-on-error'])
+    benchmark_specs["args"].extend(extra_args)
+    config = get_default_memtier_config(threads=threads, clients=clients, requests=None,
+                                        test_time=test_time)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    test_dir = tempfile.mkdtemp()
+    run_config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(run_config.results_dir)
+    benchmark = Benchmark.from_json(run_config, benchmark_specs)
+
+    # Any shard but the main one: memtier's main connection goes to the
+    # first node, and its refreshes are what must not land inside a MULTI.
+    main_port = int(master_nodes_list[0]['port'])
+    victim = next(conn for port, conn in sorted(_master_conns_by_port(env).items())
+                  if port != main_port)
+
+    stdout_path = os.path.join(run_config.results_dir, "mb.stdout")
+    stderr_path = os.path.join(run_config.results_dir, "mb.stderr")
+    kills = 0
+    with open(stdout_path, "w") as stdout_f, open(stderr_path, "w") as stderr_f:
+        proc = subprocess.Popen(benchmark.args, stdout=stdout_f,
+                                stderr=stderr_f, cwd=run_config.results_dir)
+        try:
+            time.sleep(1)
+            deadline = time.time() + test_time - 2
+            while time.time() < deadline and proc.poll() is None:
+                try:
+                    kills += victim.execute_command("CLIENT", "KILL", "TYPE", "normal")
+                except Exception as e:
+                    env.debugPrint("CLIENT KILL failed: {}".format(e), True)
+                time.sleep(0.5)
+            try:
+                rc = proc.wait(timeout=test_time + 30)
+            except subprocess.TimeoutExpired:
+                rc = None
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+    return rc, kills, _read_stderr(run_config), run_config
+
+
+def _reset_discard_calls(env):
+    # CONFIG RESETSTAT also clears the errorstats that _error_count() reads.
+    for conn in env.getOSSMasterNodesConnectionList():
+        conn.execute_command("CONFIG", "RESETSTAT")
+
+
+def _discard_calls(env):
+    total = 0
+    for conn in env.getOSSMasterNodesConnectionList():
+        stats = conn.info("commandstats")
+        total += int(stats.get("cmdstat_discard", {}).get("calls", 0))
+    return total
+
+
+def _main_shard_hash_tag(env):
+    """A hash tag whose slot the main node (memtier's -p) owns."""
+    main_port = int(env.getMasterNodesList()[0]['port'])
+    for tag in ['b', 'c', 'a', 'f', 'g', 'd', 'j', 'k', 'h']:
+        if _owning_port(env, tag) == main_port:
+            return tag
+    raise AssertionError("no candidate hash tag lives on the main node")
+
+
+def _sequential_key_holes(env):
+    """Number of key indexes missing between the lowest and highest
+    memtier-<n> key in the cluster."""
+    indexes = sorted(int(key.decode().split('-', 1)[1])
+                     for conn in env.getOSSMasterNodesConnectionList()
+                     for key in conn.scan_iter(match='memtier-*', count=1000))
+    if not indexes:
+        return 0
+    return indexes[-1] - indexes[0] + 1 - len(indexes)
+
+
+def _error_count(env, error):
+    total = 0
+    for conn in env.getOSSMasterNodesConnectionList():
+        stats = conn.info("errorstats")
+        total += int(stats.get("errorstat_" + error, {}).get("count", 0))
+    return total
+
+
+def test_transaction_connection_kills_do_not_hang(env):
+    """Regression for #569: a CLUSTER SLOTS refresh must never be written on
+    a connection with an open MULTI. The server queues it (+QUEUED), the
+    reply handler treats that as a failed refresh, the connection never
+    finishes setup and the run hangs past --test-time.
+
+    Every key lives on the main node, so the main connection drives every
+    rotation and is inside a MULTI most of the time. Each kill of another
+    shard's connections makes cluster_client::reconnect() request a slot map
+    refresh on that main connection, which must wait for the rotation's
+    EXEC."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    _reset_discard_calls(env)
+    tag = _main_shard_hash_tag(env)
+    rc, kills, stderr, run_config = _run_with_shard_kills(
+        env, ['MULTI', 'SET {' + tag + '}__key__ __data__', 'EXEC'])
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(kills > 0, message="no connection was killed")
+        env.assertTrue(rc is not None,
+                       message="memtier_benchmark hung past --test-time")
+        env.assertEqual(rc, 0)
+        env.assertTrue("cluster slot failed" not in stderr,
+                       message="CLUSTER SLOTS was sent inside an open MULTI")
+        # The kills must have made the main connection refresh the slot map
+        # mid-run, otherwise this run proved nothing.
+        env.assertTrue("requested a cluster slot map refresh" in stderr,
+                       message="no reconnect slot map refresh was provoked")
+        # A rotation that closes its MULTI never needs the abandoned-MULTI
+        # DISCARD: the refresh waits for the rotation's EXEC instead. Sent
+        # inside the MULTI, the refresh would DISCARD it, and the rotation's
+        # EXEC would then fail with "EXEC without MULTI".
+        env.assertEqual(_discard_calls(env), 0)
+        env.assertEqual(_error_count(env, "ERR"), 0)
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_abandoned_multi_is_discarded_before_refresh(env):
+    """#569: a rotation that opens a MULTI and never closes it leaves that
+    MULTI open once the rotation wraps and pins another shard. A slot map
+    refresh later due on that connection must DISCARD it first: written
+    inside the MULTI, CLUSTER SLOTS is only queued and the run hangs."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    _reset_discard_calls(env)
+    rc, kills, stderr, run_config = _run_with_shard_kills(
+        env, ['MULTI', 'SET __key__ __data__'])
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(kills > 0, message="no connection was killed")
+        env.assertTrue(rc is not None,
+                       message="memtier_benchmark hung past --test-time")
+        env.assertEqual(rc, 0)
+        env.assertTrue("cluster slot failed" not in stderr,
+                       message="CLUSTER SLOTS was sent inside an open MULTI")
+        # memtier is the only client sending DISCARD, so this proves the
+        # fallback ran rather than the refresh path never being reached.
+        env.assertTrue(_discard_calls(env) > 0,
+                       message="no abandoned MULTI was discarded")
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_pipelined_connection_kills_preserve_key_pool(env):
+    """#580: an unsent lookahead key must not enter the routed command queue
+    when a pipelined transaction loses its pin."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    rc, kills, stderr, run_config = _run_with_shard_kills(
+        env, ['MULTI', 'SET __key__ __data__', 'EXEC'],
+        pipeline=16, clients=2)
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(kills > 0, message="no connection was killed")
+        env.assertTrue(rc is not None,
+                       message="memtier_benchmark hung past --test-time")
+        env.assertEqual(rc, 0)
+        env.assertTrue("caught exception" not in stderr,
+                       message="worker threw after transaction pin release")
+        env.assertTrue("vector::_M_range_check" not in stderr,
+                       message="staged key was interpreted as a command index")
+        with open(os.path.join(run_config.results_dir, "mb.json")) as f:
+            stats = json.load(f)['ALL STATS']
+        for command in ('Multis', 'Sets', 'Execs'):
+            env.assertTrue(stats[command]['Count'] > 0,
+                           message="no {} completed".format(command))
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_waits_for_reconnecting_key_owner(env):
+    """A rotation whose key belongs to a shard that is reconnecting must wait
+    for that shard. Pinned to any other shard, the keyed command gets -MOVED
+    and the server answers the rotation's EXEC with EXECABORT."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    _reset_discard_calls(env)
+    _flush_cluster(env)
+    pipeline = 1
+    rc, kills, stderr, run_config = _run_with_shard_kills(
+        env, ['MULTI', 'SET __key__ __data__', '--command-key-pattern=S', 'EXEC'],
+        pipeline=pipeline, extra_args=['--key-minimum=1', '--key-maximum=100000000'])
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(kills > 0, message="no connection was killed")
+        env.assertTrue(rc is not None,
+                       message="memtier_benchmark hung past --test-time")
+        env.assertEqual(rc, 0)
+        env.assertTrue("requested a cluster slot map refresh" in stderr,
+                       message="the killed shard was never reconnected")
+        # Holding the rotation keeps its key: only transactions in flight on
+        # a killed connection may leave a hole in the sequential range.
+        holes = _sequential_key_holes(env)
+        env.assertTrue(holes <= kills * pipeline,
+                       message="{} holes in the sequential key range for {} "
+                               "killed connections".format(holes, kills))
+        # The topology never changes, so the right shard never answers MOVED.
+        env.assertEqual(_error_count(env, "MOVED"), 0)
+        env.assertEqual(_error_count(env, "EXECABORT"), 0)
+        with open(os.path.join(run_config.results_dir, "mb.json")) as f:
+            stats = json.load(f)['ALL STATS']
+        env.assertTrue(stats['Execs']['Count'] > 0, message="no EXEC completed")
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_lost_multi_is_not_continued(env):
+    """Once the connection holding a rotation's MULTI drops it (the
+    connection is killed and reconnects, or the pin moves to another shard),
+    the rest of that block must not be sent: outside the MULTI its SET runs
+    untransacted and its EXEC fails with "EXEC without MULTI"."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    _reset_discard_calls(env)
+    rc, kills, stderr, run_config = _run_with_shard_kills(
+        env, ['MULTI', 'SET __key__ __data__', 'EXEC'],
+        pipeline=8, threads=2, clients=4)
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(kills > 0, message="no connection was killed")
+        env.assertTrue(rc is not None,
+                       message="memtier_benchmark hung past --test-time")
+        env.assertEqual(rc, 0)
+        env.assertTrue("EXEC without MULTI" not in stderr,
+                       message="an EXEC was sent without its MULTI")
+        # memtier is the only client, so any -ERR reply is one of its own.
+        env.assertEqual(_error_count(env, "ERR"), 0)
+        with open(os.path.join(run_config.results_dir, "mb.json")) as f:
+            stats = json.load(f)['ALL STATS']
+        env.assertTrue(stats['Execs']['Count'] > 0, message="no EXEC completed")
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2011-2017 Redis Labs Ltd.
+ * Copyright (C) 2011-2026 Redis Labs Ltd.
  *
  * This file is part of memtier_benchmark.
  *
@@ -21,46 +21,62 @@
 
 #include <stdlib.h>
 #include <stdio.h>
+#include <atomic>
 #include <map>
 #include <vector>
 #include <string>
+#include <pthread.h>
+
+// Mutex wrapper with correct copy/move semantics: copies always initialize a
+// fresh mutex rather than duplicating mutex state (which is undefined behavior).
+// This allows run_stats to remain copyable without a hand-written copy constructor.
+struct reinit_mutex_t
+{
+    mutable pthread_mutex_t mtx;
+    reinit_mutex_t() { pthread_mutex_init(&mtx, NULL); }
+    ~reinit_mutex_t() { pthread_mutex_destroy(&mtx); }
+    reinit_mutex_t(const reinit_mutex_t &) { pthread_mutex_init(&mtx, NULL); }
+    reinit_mutex_t &operator=(const reinit_mutex_t &) { return *this; }
+};
 
 #include "memtier_benchmark.h"
 #include "run_stats_types.h"
 #include "JSON_handler.h"
+#include "deps/hdr_histogram/hdr_histogram.h"
+#include "deps/hdr_histogram/hdr_histogram_log.h"
 
-
-typedef std::map<float, int> latency_map;
-typedef std::map<float, int>::iterator latency_map_itr;
-typedef std::map<float, int>::const_iterator latency_map_itr_const;
 
 inline long long int ts_diff(struct timeval a, struct timeval b)
 {
-    unsigned long long aval = a.tv_sec * 1000000 + a.tv_usec;
-    unsigned long long bval = b.tv_sec * 1000000 + b.tv_usec;
+    long long aval = (long long) a.tv_sec * 1000000 + a.tv_usec;
+    long long bval = (long long) b.tv_sec * 1000000 + b.tv_usec;
 
     return bval - aval;
 }
 
-enum tabel_el_type {
+enum tabel_el_type
+{
     string_el,
     double_el
 };
 
-struct table_el {
+struct table_el
+{
     tabel_el_type type;
     std::string format;
     std::string str_value;
-    double  double_value;
+    double double_value;
 
-    table_el* init_str(std::string fmt, std::string val) {
+    table_el *init_str(std::string fmt, std::string val)
+    {
         type = string_el;
         format = fmt;
         str_value = val;
         return this;
     }
 
-    table_el* init_double(std::string fmt, double val) {
+    table_el *init_double(std::string fmt, double val)
+    {
         type = double_el;
         format = fmt;
         double_value = val;
@@ -68,7 +84,8 @@ struct table_el {
     }
 };
 
-struct table_column {
+struct table_column
+{
     table_column() {}
     table_column(unsigned int col_size) : column_size(col_size) {}
 
@@ -76,94 +93,369 @@ struct table_column {
     std::vector<table_el> elements;
 };
 
-class output_table {
+class output_table
+{
 private:
     std::vector<table_column> columns;
 
 public:
-    void print_header(FILE *out, const char * header);
-    void add_column(table_column& col);
-    void print(FILE *out, const char * header);
+    void print_header(FILE *out, const char *header);
+    void add_column(table_column &col);
+    void print(FILE *out, const char *header);
 };
 
-class run_stats {
-protected:
+// Per-endpoint snapshot (one entry per shard_connection at run end). Built
+// in main thread after threads.join() but before the thread / client groups
+// are destroyed, then merged into run_stats so it survives to JSON time.
+struct endpoint_snapshot
+{
+    std::string addr;              // host:port
+    std::string role;              // "primary" | "replica" | ""
+    int conn_id;                   // shard_connection's vector index (NOT a stable
+                                   // cluster shard identity); -1 when unknown
+    unsigned long long routed_ops; // user-level requests sent on this conn
+    double avg_latency_us;         // EWMA in microseconds (0.0 when no samples)
+    unsigned int latency_samples;  // 0 when never warm
+    // Per-endpoint MOVED/ASK and connection-error counters are NOT emitted
+    // here; they live in the top-level cluster_summary aggregate.
+    endpoint_snapshot() : conn_id(-1), routed_ops(0), avg_latency_us(0.0), latency_samples(0) {}
+};
 
-    friend bool one_second_stats_predicate(const one_second_stats& a, const one_second_stats& b);
+// Aggregated --read-preference routing counters (Ops from Primary / Ops from
+// Replica). One entry per arbitrary-command index, plus a built-in GET slot.
+// Merged across clients in main thread.
+struct read_routing_summary
+{
+    unsigned long long ops_from_primary;
+    unsigned long long ops_from_replica;
+    read_routing_summary() : ops_from_primary(0), ops_from_replica(0) {}
+};
+
+// Structure to hold aggregated stats by command type
+struct aggregated_command_type_stats
+{
+    std::string command_type;                        // e.g., "SET", "GET"
+    totals_cmd stats;                                // aggregated totals
+    safe_hdr_histogram latency_hist;                 // merged histogram
+    std::vector<size_t> command_indices;             // indices of commands with this type
+    std::vector<one_sec_cmd_stats> per_second_stats; // aggregated per-second stats for JSON time series
+    unsigned long long total_hits;
+    unsigned long long total_misses;
+    aggregated_command_type_stats() : total_hits(0), total_misses(0) {}
+};
+
+class run_stats
+{
+protected:
+    friend bool one_second_stats_predicate(const one_second_stats &a, const one_second_stats &b);
 
     benchmark_config *m_config;
 
     struct timeval m_start_time;
     struct timeval m_end_time;
+    // Atomic flag set after m_start_time is fully written; guards cross-thread reads.
+    // std::atomic is not copyable, but run_stats needs to be (stored in std::vector).
+    // Copies occur only after threads join, so relaxed copy semantics are safe.
+    struct copyable_atomic_bool
+    {
+        std::atomic<bool> flag;
+        copyable_atomic_bool(bool v = false) : flag(v) {}
+        copyable_atomic_bool(const copyable_atomic_bool &o) : flag(o.flag.load(std::memory_order_relaxed)) {}
+        copyable_atomic_bool &operator=(const copyable_atomic_bool &o)
+        {
+            flag.store(o.flag.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            return *this;
+        }
+    } m_started;
+    // Set by client_group::interrupt() on the main thread, possibly while the
+    // worker reads it (client_group::run()).
+    copyable_atomic_bool m_interrupted;
+    // Workload requests abandoned because no reply came within
+    // TEST_TIME_DRAIN_GRACE_SECS after --test-time ended.
+    unsigned long long int m_unanswered_requests;
+    // Number of runs aggregate_average() averaged into this object; 0 for a
+    // real run. m_start_time / m_end_time then span the SUMMED duration of
+    // the runs, and the counts stay summed (see aggregate_average()), so
+    // print_json() divides them by it when it writes them.
+    size_t m_averaged_runs;
 
     totals m_totals;
 
-    std::vector<one_second_stats> m_stats;
+    std::list<one_second_stats> m_stats;
+    std::vector<double> quantiles_list;
+    // Scratch shared by this client's sequential per-command summaries. Never stored in history.
+    std::vector<int64_t> m_quantile_values;
+
+    // current second stats ( appended to m_stats and reset every second )
     one_second_stats m_cur_stats;
 
-    latency_map m_get_latency_map;
-    latency_map m_set_latency_map;
-    latency_map m_wait_latency_map;
-    std::vector<latency_map> m_ar_commands_latency_maps;
+    safe_hdr_histogram m_get_latency_histogram;
+    safe_hdr_histogram m_set_latency_histogram;
+    safe_hdr_histogram m_wait_latency_histogram;
+    std::vector<safe_hdr_histogram> m_ar_commands_latency_histograms;
+    safe_hdr_histogram m_totals_latency_histogram;
 
-    void roll_cur_stats(struct timeval* ts);
+    // instantaneous command stats ( used in the per second latencies )
+    safe_hdr_histogram inst_m_get_latency_histogram;
+    safe_hdr_histogram inst_m_set_latency_histogram;
+    safe_hdr_histogram inst_m_wait_latency_histogram;
+    std::vector<safe_hdr_histogram> inst_m_ar_commands_latency_histograms;
+    safe_hdr_histogram inst_m_totals_latency_histogram;
+
+    // Protects inst_m_totals_latency_histogram against concurrent reset/aggregation reads.
+    // Worker threads use memtier_record_latency_atomic() for lock-free writes;
+    // this mutex serializes hdr_reset and hdr_add from the main thread.
+    reinit_mutex_t m_inst_histogram_mutex;
+
+    // Completed seconds of inst_m_totals_latency_histogram not yet drained by
+    // the Prometheus exporter. The worker folds each second into it just before
+    // the per-second reset (only when the exporter is enabled), and the main
+    // thread drains it (add + reset) in drain_prom_latency_histogram. Both sides
+    // hold m_inst_histogram_mutex, so every sample is exported exactly once.
+    safe_hdr_histogram m_prom_pending_latency_histogram;
+
+    // Cumulative hits/misses bookkeeping for arbitrary commands. Indexed by
+    // arbitrary command index. Per-key vectors are sized to the spec-resolved
+    // key count for that command (or 1 when the command has no spec key
+    // positions); empty otherwise.
+    struct arbitrary_misses_total
+    {
+        unsigned long long total_hits;
+        unsigned long long total_misses;
+        std::vector<unsigned long long> per_key_hits;
+        std::vector<unsigned long long> per_key_misses;
+        arbitrary_misses_total() : total_hits(0), total_misses(0) {}
+    };
+    std::vector<arbitrary_misses_total> m_arbitrary_misses;
+
+    void roll_cur_stats(struct timeval *ts);
 
 public:
     run_stats(benchmark_config *config);
     void setup_arbitrary_commands(size_t n_arbitrary_commands);
-    void set_start_time(struct timeval* start_time);
-    void set_end_time(struct timeval* end_time);
+    void set_start_time(struct timeval *start_time);
+    void set_end_time(struct timeval *end_time);
+    struct timeval get_start_time(void) const { return m_start_time; }
+    void set_interrupted(bool interrupted) { m_interrupted.flag.store(interrupted, std::memory_order_relaxed); }
+    bool get_interrupted() const { return m_interrupted.flag.load(std::memory_order_relaxed); }
+    void add_unanswered_requests(unsigned long long int n) { m_unanswered_requests += n; }
+    unsigned long long int get_unanswered_requests() const { return m_unanswered_requests; }
 
-    void update_get_op(struct timeval* ts, unsigned int bytes, unsigned int latency, unsigned int hits, unsigned int misses);
-    void update_set_op(struct timeval* ts, unsigned int bytes, unsigned int latency);
+    void update_get_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency,
+                       unsigned int hits, unsigned int misses);
+    void update_set_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency);
+    void update_connection_error(struct timeval *ts);
 
-    void update_moved_get_op(struct timeval* ts, unsigned int bytes, unsigned int latency);
-    void update_moved_set_op(struct timeval* ts, unsigned int bytes, unsigned int latency);
+    // Retry/error counters. Bumped by client::handle_response on the retry
+    // path. Lock-free relaxed bumps on a per-thread instance; aggregated when
+    // run_stats are merged across threads.
+    void inc_retry_attempt() { m_totals.m_retry_attempts++; }
+    void inc_retried_op() { m_totals.m_retried_ops++; }
+    void inc_error(unsigned long long int count = 1) { m_totals.m_errors += count; }
 
-    void update_ask_get_op(struct timeval* ts, unsigned int bytes, unsigned int latency);
-    void update_ask_set_op(struct timeval* ts, unsigned int bytes, unsigned int latency);
+    unsigned long long int get_total_retry_attempts() const { return m_totals.m_retry_attempts; }
+    unsigned long long int get_total_retried_ops() const { return m_totals.m_retried_ops; }
+    unsigned long long int get_total_errors() const { return m_totals.m_errors; }
 
-    void update_wait_op(struct timeval* ts, unsigned int latency);
-    void update_arbitrary_op(struct timeval *ts, unsigned int bytes,
-                             unsigned int latency, size_t arbitrary_index);
+    // A retried redirect is an event, not a completed operation. Only terminal
+    // responses contribute bytes, latency samples and operation counts.
+    void update_moved_get_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency,
+                             bool completed);
+    void update_moved_set_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency,
+                             bool completed);
+    void update_moved_arbitrary_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx,
+                                   unsigned int latency, size_t arbitrary_index, bool completed);
 
-    void aggregate_average(const std::vector<run_stats>& all_stats);
-    void summarize(totals& result) const;
-    void merge(const run_stats& other, int iteration);
-    void save_csv_one_sec(FILE *f,
-                          unsigned long int& total_get_ops,
-                          unsigned long int& total_set_ops,
-                          unsigned long int& total_wait_ops);
+    void update_ask_get_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency,
+                           bool completed);
+    void update_ask_set_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency,
+                           bool completed);
+    void update_ask_arbitrary_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency,
+                                 size_t arbitrary_index, bool completed);
+
+    void update_wait_op(struct timeval *ts, unsigned int latency);
+    void update_arbitrary_op(struct timeval *ts, unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency,
+                             size_t arbitrary_index);
+
+    // Records hits/misses for a single arbitrary-command response. Aggregates
+    // are mirrored into the per-second m_ar_commands slot (the existing 5-arg
+    // update_op overload) so per-second JSON time series and the global
+    // Hits/sec, Misses/sec totals stay in sync. The per_key_hit vector size
+    // must equal num_key_buckets for that command (one entry per spec key
+    // position; values are 1=hit, 0=miss). Safe to call with an empty vector
+    // when shape doesn't carry per-position info.
+    void update_arbitrary_op_misses(size_t arbitrary_index, unsigned int hits, unsigned int misses,
+                                    const std::vector<bool> &per_key_hit);
+
+    // ---------------------------------------------------------------------
+    // Read-preference observability (Step 2f).
+    // Snapshot the per-endpoint state at run end so the JSON dump can reflect
+    // it after the worker threads are gone. Both fields are populated by
+    // run_benchmark() right after the join loop; print_json() consumes them.
+    // ---------------------------------------------------------------------
+    std::vector<endpoint_snapshot> m_endpoint_snapshots;
+    std::vector<read_routing_summary> m_arbitrary_read_routing; // per arbitrary-cmd index
+    read_routing_summary m_get_read_routing;                    // built-in GET aggregate
+
+    // ---------------------------------------------------------------------
+    // CPU utilization of memtier itself (the load generator).
+    //   m_cpu_summary  - authoritative whole-run aggregate (getrusage-based)
+    //   m_cpu_threads  - authoritative per-worker totals (getrusage-based)
+    //   m_cpu_stats    - advisory per-second per-thread sampler detail
+    // All three are populated by run_benchmark() after the join loop and
+    // consumed by print()/print_json(). They survive the copyable run_stats
+    // (POD doubles + vectors) and are intentionally NOT routed through the
+    // per-client merge()/totals path: per-thread CPU is folded exactly once
+    // from cg_thread, not summed across the N per-client run_stats.
+    // ---------------------------------------------------------------------
+    cpu_summary m_cpu_summary;
+    std::vector<per_thread_cpu_total> m_cpu_threads;
+    std::vector<per_second_cpu_stats> m_cpu_stats;
+
+    void set_cpu_summary(const cpu_summary &s) { m_cpu_summary = s; }
+    void add_cpu_thread(const per_thread_cpu_total &t) { m_cpu_threads.push_back(t); }
+    void set_cpu_stats(std::vector<per_second_cpu_stats> s) { m_cpu_stats = std::move(s); }
+    const cpu_summary &get_cpu_summary() const { return m_cpu_summary; }
+
+    // Aggregator: fold the per-endpoint snapshot from one client's
+    // shard_connections into m_endpoint_snapshots. Entries are coalesced by
+    // (addr, role) so the JSON is at most O(distinct endpoints) regardless
+    // of thread count. Latency is op-weighted average across threads.
+    void absorb_endpoint(const endpoint_snapshot &snap);
+    // Aggregator for read-routing counters.
+    void absorb_arbitrary_routing(size_t arbitrary_index, unsigned long long primary, unsigned long long replica);
+    void absorb_builtin_get_routing(unsigned long long primary, unsigned long long replica);
+
+    // Cluster topology counts captured once at run end from a cluster_client's
+    // build_topology_snapshot() (group-member endpoints only). Counting from
+    // the committed shard groups -- rather than from m_endpoint_snapshots, which
+    // also absorbs the bootstrap seed connection and any transient/dead sockets
+    // -- means the results summary agrees exactly with the one-shot startup
+    // "[RUN #N] Cluster topology" line (same snapshot source). 0 when not in
+    // cluster mode or no topology ever committed.
+    size_t m_cluster_endpoints;
+    size_t m_cluster_primaries;
+    size_t m_cluster_replicas;
+    void set_cluster_topology(size_t total, size_t primaries, size_t replicas)
+    {
+        m_cluster_endpoints = total;
+        m_cluster_primaries = primaries;
+        m_cluster_replicas = replicas;
+    }
+    size_t get_endpoint_count() const { return m_cluster_endpoints; }
+    size_t get_primary_endpoint_count() const { return m_cluster_primaries; }
+    size_t get_replica_endpoint_count() const { return m_cluster_replicas; }
+
+    void aggregate_average(const std::vector<run_stats> &all_stats);
+    void summarize(totals &result) const;
+    void summarize_current_second(void);
+    void merge(const run_stats &other, int iteration);
+    std::vector<one_sec_cmd_stats> get_one_sec_cmd_stats_get();
+    std::vector<one_sec_cmd_stats> get_one_sec_cmd_stats_set();
+    std::vector<one_sec_cmd_stats> get_one_sec_cmd_stats_wait();
+    std::vector<one_sec_cmd_stats> get_one_sec_cmd_stats_totals();
+    std::vector<one_sec_cmd_stats> get_one_sec_cmd_stats_arbitrary_command(unsigned int pos);
+    std::vector<unsigned int> get_one_sec_cmd_stats_timestamp();
+    void save_csv_one_sec(FILE *f, unsigned long long int &total_get_ops, unsigned long long int &total_set_ops,
+                          unsigned long long int &total_wait_ops);
+
+    // Safely copy instantaneous total latency histogram into target under mutex.
+    // Use this instead of a raw pointer getter to avoid data races with worker threads.
+    void copy_inst_histogram(hdr_histogram *target) const;
+
+    // Move the latency samples of every second completed since the previous
+    // call into target (Prometheus exporter, main thread). Lags the live
+    // second by up to one second; the final partial second is folded by
+    // set_end_time(). With run_end (post-join only) it also moves what is
+    // left in the live histogram (ops recorded after the client's
+    // set_end_time()). After the run-end drain every op has been drained.
+    void drain_prom_latency_histogram(hdr_histogram *target, bool run_end);
     void save_csv_one_sec_cluster(FILE *f);
     void save_csv_set_get_commands(FILE *f, bool cluster_mode);
-    void save_csv_arbitrary_commands_one_sec(FILE *f,
-                                             arbitrary_command_list& command_list,
-                                             std::vector<unsigned long int>& total_arbitrary_commands_ops);
-    void save_csv_arbitrary_commands(FILE *f, arbitrary_command_list& command_list);
+    void save_csv_arbitrary_commands_one_sec(FILE *f, arbitrary_command_list &command_list,
+                                             std::vector<unsigned long long int> &total_arbitrary_commands_ops);
+    void save_csv_arbitrary_commands(FILE *f, arbitrary_command_list &command_list);
+    bool save_hdr_percentiles_print_format(struct hdr_histogram *hdr, char *filename);
+    bool save_hdr_log_format(struct hdr_histogram *hdr, char *filename, char *header);
+    bool save_hdr_full_run(benchmark_config *config, int run_number);
+    bool save_hdr_set_command(benchmark_config *config, int run_number);
+    bool save_hdr_get_command(benchmark_config *config, int run_number);
+    bool save_hdr_arbitrary_commands(benchmark_config *config, int run_number);
 
-    bool save_csv(const char *filename, benchmark_config *config);
+    // Returns false if the file could not be opened or written; prints why
+    // only if report_error.
+    bool save_csv(const char *filename, benchmark_config *config, bool report_error);
     void debug_dump(void);
 
     // function to handle the results output
     bool print_arbitrary_commands_results();
-    void print_type_column(output_table &table, arbitrary_command_list& command_list);
-    void print_ops_sec_column(output_table &table);
-    void print_hits_sec_column(output_table &table);
-    void print_missess_sec_column(output_table &table);
-    void print_moved_sec_column(output_table &table);
-    void print_ask_sec_column(output_table &table);
-    void print_latency_column(output_table &table);
-    void print_kb_sec_column(output_table &table);
-    void print_json(json_handler *jsonhandler, arbitrary_command_list& command_list, bool cluster_mode);
-    void print_histogram(FILE *out, json_handler* jsonhandler, arbitrary_command_list& command_list);
-    void print(FILE *file, benchmark_config *config,
-               const char* header = NULL, json_handler* jsonhandler = NULL);
+
+    // Build aggregated stats by command type (e.g., SET, GET) from per-command stats
+    std::vector<aggregated_command_type_stats> build_aggregated_command_stats(arbitrary_command_list &command_list);
+
+    void print_type_column(output_table &table, arbitrary_command_list &command_list,
+                           const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
+    void print_ops_sec_column(output_table &table,
+                              const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
+    void print_hits_sec_column(output_table &table,
+                               const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
+    void print_missess_sec_column(output_table &table,
+                                  const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
+    // Aborts/sec column, shown only under --transaction. Reports the EXEC
+    // optimistic-lock abort rate (the abort-semantics subset of misses).
+    void print_aborts_sec_column(output_table &table,
+                                 const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
+    void print_moved_sec_column(output_table &table,
+                                const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
+    void print_ask_sec_column(output_table &table,
+                              const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
+    void print_avg_latency_column(output_table &table,
+                                  const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
+    void print_quantile_latency_columns(output_table &table, const std::vector<double> &quantiles,
+                                        const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
+    void print_kb_sec_column(output_table &table,
+                             const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
+    void print_json(json_handler *jsonhandler, arbitrary_command_list &command_list, bool cluster_mode,
+                    const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
+    void print_histogram(FILE *out, json_handler *jsonhandler, arbitrary_command_list &command_list,
+                         const std::vector<aggregated_command_type_stats> *aggregated = nullptr);
+    void print(FILE *file, benchmark_config *config, const char *header = NULL, json_handler *jsonhandler = NULL);
 
     unsigned int get_duration(void);
-    unsigned long int get_duration_usec(void);
-    unsigned long int get_total_bytes(void);
-    unsigned long int get_total_ops(void);
-    unsigned long int get_total_latency(void);
+    unsigned long long int get_duration_usec(void);
+    unsigned long long int get_total_bytes(void);
+    // rx/tx split of get_total_bytes(); same benign-race pattern. The Prometheus
+    // exporter needs the split (memtier_received_bytes_total /
+    // memtier_sent_bytes_total); never source bytes from summarize().
+    unsigned long long int get_total_bytes_rx(void);
+    unsigned long long int get_total_bytes_tx(void);
+    unsigned long long int get_total_ops(void);
+    double get_total_latency(void);
+    unsigned long long int get_total_connection_errors(void);
+
+    // Cumulative hits/misses on GET ops since the run started. Reads scalar
+    // counters in m_totals incremented per-op by the owning worker. Same
+    // benign-race pattern as get_total_ops()/get_total_bytes() — used only
+    // for live progress display.
+    unsigned long long int get_total_hits(void);
+    unsigned long long int get_total_misses(void);
+
+    // Aggregate hits/misses across arbitrary (--command) miss-trackable commands.
+    // Sums only the per-command scalar totals in m_arbitrary_misses[] (assigned
+    // once in setup_arbitrary_commands), never the per-key vectors which the
+    // worker grow-resizes; safe to sample off-worker at 1 Hz like get_total_hits.
+    // unsigned long long because the source fields are 64-bit (run_stats.h
+    // arbitrary_misses_total) and can exceed 32 bits on long runs.
+    unsigned long long get_total_arbitrary_hits(void);
+    unsigned long long get_total_arbitrary_misses(void);
+    // Subset of arbitrary misses that are transaction aborts (EXEC null reply).
+    // Display-only reinterpretation of the miss counter; see is_abort_command_type.
+    unsigned long long get_total_arbitrary_aborts(void);
+    static bool is_abort_command_type(const std::string &command_type);
+
+    // Returns true if set_start_time() was called, indicating the client
+    // produced (or was ready to produce) meaningful stats data.
+    bool has_started(void) const { return m_started.flag.load(std::memory_order_acquire); }
 };
 
-#endif //MEMTIER_BENCHMARK_RUN_STATS_H
+#endif // MEMTIER_BENCHMARK_RUN_STATS_H

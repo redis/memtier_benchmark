@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2011-2017 Redis Labs Ltd.
+ * Copyright (C) 2011-2026 Redis Labs Ltd.
  *
  * This file is part of memtier_benchmark.
  *
@@ -19,114 +19,296 @@
 #ifndef MEMTIER_BENCHMARK_RUN_STATS_TYPES_H
 #define MEMTIER_BENCHMARK_RUN_STATS_TYPES_H
 
+#define LATENCY_HDR_MIN_VALUE 10
+#define LATENCY_HDR_MAX_VALUE 6000000000##LL
+#define LATENCY_HDR_SIGDIGTS 3
+#define LATENCY_HDR_SEC_MIN_VALUE 10
+#define LATENCY_HDR_SEC_MAX_VALUE 600000000##LL
+#define LATENCY_HDR_SEC_SIGDIGTS 2
+#define LATENCY_HDR_RESULTS_MULTIPLIER 1000
+#define LATENCY_HDR_GRANULARITY 10
+
+#include "deps/hdr_histogram/hdr_histogram.h"
 #include "memtier_benchmark.h"
 
-class one_sec_cmd_stats {
+// A wrapper around hdr_histogram that handles allocation, deallocation
+// and deep copy.
+//
+// TODO: In the future we may want to consider extending this wrapper
+// further to expose all hdr functions as native methods and avoid the
+// casting operator completely.
+class safe_hdr_histogram
+{
+    hdr_histogram *m_hdr;
+
 public:
-    unsigned long int m_bytes;
-    unsigned long int m_ops;
-    unsigned int m_hits;
-    unsigned int m_misses;
-    unsigned int m_moved;
-    unsigned int m_ask;
-    unsigned long long int m_total_latency;
-    void reset();
-    void merge(const one_sec_cmd_stats& other);
-    void update_op(unsigned int bytes, unsigned int latency);
-    void update_op(unsigned int bytes, unsigned int latency, unsigned int hits, unsigned int misses);
-    void update_moved_op(unsigned int bytes, unsigned int latency);
-    void update_ask_op(unsigned int bytes, unsigned int latency);
+    safe_hdr_histogram()
+    {
+        hdr_init(LATENCY_HDR_MIN_VALUE,     // Minimum value
+                 LATENCY_HDR_SEC_MAX_VALUE, // Maximum value
+                 LATENCY_HDR_SEC_SIGDIGTS,  // Number of significant figures
+                 &m_hdr);
+    }
+
+    virtual ~safe_hdr_histogram() { hdr_close(m_hdr); }
+
+    safe_hdr_histogram(const safe_hdr_histogram &other)
+    {
+        hdr_init(LATENCY_HDR_MIN_VALUE,     // Minimum value
+                 LATENCY_HDR_SEC_MAX_VALUE, // Maximum value
+                 LATENCY_HDR_SEC_SIGDIGTS,  // Number of significant figures
+                 &m_hdr);
+        hdr_add(m_hdr, other.m_hdr);
+    }
+
+    safe_hdr_histogram &operator=(const safe_hdr_histogram &other)
+    {
+        if (this != &other) {
+            hdr_reset(m_hdr);
+            hdr_add(m_hdr, other.m_hdr);
+        }
+        return *this;
+    }
+
+    // Cast safe_hdr_historgram to hdr_histogram to make it transparent
+    operator hdr_histogram *() const { return m_hdr; }
 };
 
-class one_second_stats; // forward deceleration
-
-class ar_one_sec_cmd_stats {
+class one_sec_cmd_stats
+{
 public:
-    ar_one_sec_cmd_stats() {;}
+    unsigned long long int m_bytes_rx;
+    unsigned long long int m_bytes_tx;
+    unsigned long long int m_ops;
+    unsigned long long int m_hits;
+    unsigned long long int m_misses;
+    unsigned long long int m_moved;
+    unsigned long long int m_ask;
+    unsigned long long int m_total_latency;
+    std::vector<double> summarized_quantile_values;
+    double m_avg_latency;
+    double m_min_latency;
+    double m_max_latency;
+    one_sec_cmd_stats();
+    void reset();
+    void merge(const one_sec_cmd_stats &other);
+    /**
+     * Summarizes quantiles from the given histogram.
+     *
+     * @param histogram The histogram from which quantile values are extracted.
+     * @param sorted_quantiles A sorted (ascending order) vector of quantiles for which values will be computed.
+     *                         The caller must ensure the vector is sorted from smallest to largest.
+     * @param values Reusable scratch, shared across a client's sequential command summaries.
+     *               Batch p0/empty semantics are retained for existing per-second history.
+     */
+    void summarize_quantiles(const hdr_histogram *histogram, const std::vector<double> &sorted_quantiles,
+                             std::vector<int64_t> &values);
+    void update_op(unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency);
+    void update_op(unsigned int bytes_rx, unsigned int bytes_tx, unsigned int latency, unsigned int hits,
+                   unsigned int misses);
+};
+
+class one_second_stats; // forward declaration
+
+class ar_one_sec_cmd_stats
+{
+public:
+    ar_one_sec_cmd_stats() { ; }
     void setup(size_t n_arbitrary_commands);
     void reset();
-    void merge(const ar_one_sec_cmd_stats& other);
-    unsigned long int ops();
-    unsigned long int bytes();
+    void merge(const ar_one_sec_cmd_stats &other);
+    unsigned long long int ops();
+    unsigned long long int bytes_rx();
+    unsigned long long int bytes_tx();
     unsigned long long int total_latency();
     size_t size() const;
-    one_sec_cmd_stats& at(std::size_t idx) { return m_commands.at(idx); }
-    const one_sec_cmd_stats& at(std::size_t idx) const { return m_commands.at(idx); }
+    one_sec_cmd_stats &at(std::size_t idx) { return m_commands.at(idx); }
+    const one_sec_cmd_stats &at(std::size_t idx) const { return m_commands.at(idx); }
 
     // array subscript operator
-    one_sec_cmd_stats& operator[](std::size_t idx) { return m_commands[idx]; }
-    const one_sec_cmd_stats& operator[](std::size_t idx) const { return m_commands[idx]; }
+    one_sec_cmd_stats &operator[](std::size_t idx) { return m_commands[idx]; }
+    const one_sec_cmd_stats &operator[](std::size_t idx) const { return m_commands[idx]; }
 
     std::vector<one_sec_cmd_stats> m_commands;
 };
 
-class one_second_stats {
+class one_second_stats
+{
 public:
-    unsigned int m_second;        // from start of test
+    unsigned int m_second; // from start of test
     one_sec_cmd_stats m_set_cmd;
     one_sec_cmd_stats m_get_cmd;
     one_sec_cmd_stats m_wait_cmd;
+    one_sec_cmd_stats m_total_cmd;
     ar_one_sec_cmd_stats m_ar_commands;
-
+    unsigned int m_connection_errors;
     one_second_stats(unsigned int second);
     void setup_arbitrary_commands(size_t n_arbitrary_commands);
     void reset(unsigned int second);
-    void merge(const one_second_stats& other);
+    void summarize();
+    void merge(const one_second_stats &other);
 };
 
-class totals_cmd {
+// Per-second, per-thread CPU utilization snapshot produced by the live
+// (advisory) sampler in run_benchmark's monitor loop. m_main_thread_cpu_pct
+// and each m_thread_cpu_pct entry are "% of a single core" for that 1s window
+// (so a fully-busy worker reads ~100.0). Used for the per-second JSON detail
+// and the live one-shot high-CPU warning. Trivially copyable.
+struct per_second_cpu_stats
+{
+    unsigned int m_second;
+    double m_main_thread_cpu_pct;
+    std::vector<double> m_thread_cpu_pct;
+    per_second_cpu_stats() : m_second(0), m_main_thread_cpu_pct(0.0) {}
+};
+
+// Authoritative per-worker CPU total for the whole run, derived from
+// getrusage(RUSAGE_THREAD) deltas captured inside the worker (accumulated
+// across restarts). Seconds are wall-independent CPU time; cores_used is
+// total_seconds / wall_seconds (i.e. average busy cores for this thread).
+struct per_thread_cpu_total
+{
+    unsigned int thread_id;
+    double user_seconds;
+    double sys_seconds;
+    double total_seconds;
+    double wall_seconds;
+    double cores_used;
+    bool valid; // false => getrusage unavailable/failed; excluded from sums
+    per_thread_cpu_total() :
+            thread_id(0),
+            user_seconds(0.0),
+            sys_seconds(0.0),
+            total_seconds(0.0),
+            wall_seconds(0.0),
+            cores_used(0.0),
+            valid(false)
+    {
+    }
+};
+
+// Whole-process CPU aggregate for the run: sum of every worker (plus the main
+// thread) folded once from the per-thread totals after join. avg_utilization_pct
+// is normalized to the worker-thread count, so 100% means "all worker threads
+// were saturated". peak_utilization_pct is the highest single-second whole-process
+// utilization observed by the live sampler.
+struct cpu_summary
+{
+    double user_seconds;
+    double sys_seconds;
+    double total_seconds;        // whole process: workers + main thread
+    double worker_total_seconds; // workers only; basis for avg_utilization_pct
+    double wall_seconds;
+    double cores_used;
+    double avg_utilization_pct;
+    double peak_utilization_pct;
+    unsigned int threads_counted; // number of valid worker threads in the sums
+    bool valid;
+    cpu_summary() :
+            user_seconds(0.0),
+            sys_seconds(0.0),
+            total_seconds(0.0),
+            worker_total_seconds(0.0),
+            wall_seconds(0.0),
+            cores_used(0.0),
+            avg_utilization_pct(0.0),
+            peak_utilization_pct(0.0),
+            threads_counted(0),
+            valid(false)
+    {
+    }
+};
+
+class totals_cmd
+{
 public:
     double m_ops_sec;
     double m_bytes_sec;
+    double m_bytes_sec_rx;
+    double m_bytes_sec_tx;
     double m_moved_sec;
     double m_ask_sec;
     double m_latency;
-    unsigned long int m_ops;
+    unsigned long long int m_total_latency;
+    unsigned long long int m_ops;
     totals_cmd();
-    void add(const totals_cmd& other);
+    void add(const totals_cmd &other);
     void aggregate_average(size_t stats_size);
-    void summarize(const one_sec_cmd_stats& other, unsigned long test_duration_usec);
+    void summarize(const one_sec_cmd_stats &other, unsigned long long test_duration_usec);
 };
 
-class ar_totals_cmd {
+class ar_totals_cmd
+{
 public:
-    ar_totals_cmd() {;}
+    ar_totals_cmd() { ; }
     void setup(size_t n_arbitrary_commands);
-    void add(const ar_totals_cmd& other);
+    void add(const ar_totals_cmd &other);
     void aggregate_average(size_t stats_size);
-    void summarize(const ar_one_sec_cmd_stats& other, unsigned long test_duration_usec);
+    void summarize(const ar_one_sec_cmd_stats &other, unsigned long long test_duration_usec);
     size_t size() const;
 
-    totals_cmd& at(std::size_t idx) { return m_commands.at(idx); }
-    const totals_cmd& at(std::size_t idx) const { return m_commands.at(idx); }
+    totals_cmd &at(std::size_t idx) { return m_commands.at(idx); }
+    const totals_cmd &at(std::size_t idx) const { return m_commands.at(idx); }
 
     // array subscript operator
-    totals_cmd& operator[](std::size_t idx) { return m_commands[idx]; }
-    const totals_cmd& operator[](std::size_t idx) const { return m_commands[idx]; }
+    totals_cmd &operator[](std::size_t idx) { return m_commands[idx]; }
+    const totals_cmd &operator[](std::size_t idx) const { return m_commands[idx]; }
 
     std::vector<totals_cmd> m_commands;
 };
 
-class totals {
+class totals
+{
 public:
     totals_cmd m_set_cmd;
     totals_cmd m_get_cmd;
     totals_cmd m_wait_cmd;
+    totals_cmd m_total_cmd;
     ar_totals_cmd m_ar_commands;
+    safe_hdr_histogram latency_histogram;
     double m_ops_sec;
     double m_bytes_sec;
+    double m_bytes_sec_rx;
+    double m_bytes_sec_tx;
     double m_hits_sec;
     double m_misses_sec;
     double m_moved_sec;
     double m_ask_sec;
     double m_latency;
-    unsigned long int m_bytes;
-    unsigned long int m_ops;
+    unsigned long long int m_total_latency;
+    // number of bytes received
+    unsigned long long int m_bytes_rx;
+    // number of bytes sent
+    unsigned long long int m_bytes_tx;
+    unsigned long long int m_ops;
+    // Lock-free running totals for live progress display. Workers bump these
+    // from update_op() without synchronization; the main thread reads via
+    // get_total_hits()/get_total_misses(). Same benign-race pattern as m_ops.
+    unsigned long long int m_hits;
+    unsigned long long int m_misses;
+    unsigned long long int m_connection_errors;
+    double m_connection_errors_sec;
+    // Retry/error counters. Same benign-race pattern as m_ops: incremented
+    // lock-free by workers, read from the main thread for progress display.
+    //   m_retry_attempts   total number of resends across all requests
+    //   m_retried_ops      number of distinct requests that needed at least
+    //                      one retry (regardless of final outcome)
+    //   m_errors           number of requests that ultimately failed (retries
+    //                      exhausted, permanent error, or given up on without
+    //                      a reply under --retry-on-error). Excludes
+    //                      connection errors which already have their own
+    //                      counter.
+    unsigned long long int m_retry_attempts;
+    unsigned long long int m_retried_ops;
+    unsigned long long int m_errors;
     totals();
     void setup_arbitrary_commands(size_t n_arbitrary_commands);
-    void add(const totals& other);
-    void update_op(unsigned long int bytes, double latency);
+    void add(const totals &other);
+    void update_op(unsigned long long int bytes_rx, unsigned long long int bytes_tx, unsigned int latency);
+    void update_op(unsigned long long int bytes_rx, unsigned long long int bytes_tx, unsigned int latency,
+                   unsigned int hits, unsigned int misses);
+    void update_connection_error();
 };
 
 
-#endif //MEMTIER_BENCHMARK_RUN_STATS_TYPES_H
+#endif // MEMTIER_BENCHMARK_RUN_STATS_TYPES_H

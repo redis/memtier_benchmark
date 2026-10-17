@@ -1,0 +1,255 @@
+name: Build and Publish to APT
+
+# The set of codenames built and published to the APT repo (packages.redis.io/deb)
+# is driven by the repository variables, NOT by this file:
+#   vars.BUILD_DISTS   - Debian/Ubuntu codenames, one published --codename per entry.
+#                        Expected: focal, jammy, noble, resolute (Ubuntu 20.04/
+#                        22.04/24.04/26.04) + bullseye, bookworm, trixie
+#                        (Debian 11/12/13).
+#   vars.BUILD_ARCHS   - i386, amd64, arm64, armhf.
+#   vars.BUILD_EXCLUDE - dist/arch pairs to skip (Ubuntu dropped i386, so every
+#                        Ubuntu codename excludes it).
+#   vars.SMOKE_TEST_IMAGES - Docker images used to install-test the built .debs.
+# Adding a new distro (e.g. Debian 13 trixie / Ubuntu 26.04 resolute) means adding
+# its codename to BUILD_DISTS and a matching image to SMOKE_TEST_IMAGES; for a new
+# Ubuntu codename also add a {dist,arch:i386} entry to BUILD_EXCLUDE.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag name for testing (e.g., 2.1.2)"
+        required: true
+        default: ""
+      build_dists:
+        description: "Distributions to build for (comma-separated, e.g., focal,jammy,noble,resolute,bookworm,trixie)"
+        required: false
+        default: "focal,jammy,noble,resolute,bookworm,trixie"
+      smoke_test_images:
+        description: "Docker images for smoke testing (comma-separated, e.g., ubuntu:24.04,ubuntu:26.04,debian:12,debian:13)"
+        required: false
+        default: "ubuntu:24.04,ubuntu:26.04,debian:12,debian:13"
+      build_runner:
+        description: "os in which build steps run on"
+        required: false
+        default: "ubuntu-22.04"
+        type: string
+permissions:
+  contents: write  # Required for creating releases and uploading assets
+  actions: read
+jobs:
+  build-source-package:
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    strategy:
+      matrix:
+        dist: ${{ fromJSON(vars.BUILD_DISTS) }}
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        path: repo
+    - name: Copy source code to build dir
+      run: |
+        mkdir -p sources
+        rsync -a --exclude='.git' repo/ sources/
+    - name: Validate configure.ac version matches GitHub Release (only on release)
+      if: github.event.release.tag_name != ''
+      env:
+        VERSION: ${{ github.event.release.tag_name }}
+      run: |
+        # Extract the current version from configure.ac
+        CURRENT_VERSION=$(awk -F'[(),]' '/AC_INIT/ {print $3}' sources/configure.ac | tr -d ' ')
+
+        echo "Current configure.ac version: $CURRENT_VERSION"
+        echo "GitHub Release version: $VERSION"
+
+        # Check if versions match
+        if [ "$CURRENT_VERSION" != "$VERSION" ]; then
+          echo "❌ Version mismatch! configure.ac: $CURRENT_VERSION, GitHub Release: $VERSION"
+          exit 1  # Fail the build
+        else
+          echo "Version match. Proceeding with the build."
+        fi
+    - name: Install dependencies
+      run: |
+          sudo apt-get update && \
+          sudo apt-get install \
+            build-essential autoconf automake libevent-dev \
+            pkg-config zlib1g-dev libssl-dev libboost-all-dev cmake flex \
+            debhelper dput
+    - name: Create changelog
+      env:
+        VERSION: ${{ github.event.inputs.tag_name || github.event.release.tag_name }}
+        DIST: ${{ matrix.dist }}
+      run: |
+        mkdir -p sources/debian
+        if [ "${{ github.event_name }}" = "release" ]; then
+          RELEASE_URL=": ${{ github.event.release.html_url }}"
+        else
+          RELEASE_URL=""
+        fi
+        (echo "memtier-benchmark ($VERSION~$DIST) $DIST; urgency=medium"
+         echo ""
+         echo "  * Release $VERSION$RELEASE_URL"
+         echo ""
+         echo " -- Redis Team <oss@redis.com>  $(date -R)") > sources/debian/changelog
+    - name: Build source package
+      run: |
+          cd sources && dpkg-buildpackage -S
+    - name: Upload source package artifact
+      uses: actions/upload-artifact@v5
+      with:
+        name: source-${{ matrix.dist }}
+        path: |
+            *.debian.tar.*
+            *.dsc
+            memtier-benchmark_*.tar.*
+
+  build-binary-package:
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    environment: build
+    strategy:
+      matrix:
+        dist: ${{ fromJSON(vars.BUILD_DISTS) }}
+        arch: ${{ fromJSON(vars.BUILD_ARCHS) }}
+        exclude: ${{ fromJSON(vars.BUILD_EXCLUDE) }}
+    needs: build-source-package
+    steps:
+    - uses: actions/checkout@v6
+    - name: Determine build architecture
+      run: |
+          if [ ${{ matrix.arch }} = "i386" ]; then
+              BUILD_ARCH=i386
+          else
+              BUILD_ARCH=amd64
+          fi
+          echo "BUILD_ARCH=${BUILD_ARCH}" >> $GITHUB_ENV
+    - name: Setup APT Signing key
+      run: |
+          mkdir -m 0700 -p ~/.gnupg
+          echo "$APT_SIGNING_KEY" | gpg --import
+      env:
+        APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+    - name: Install dependencies
+      run: |
+          sudo apt-get update && \
+          sudo apt-get install \
+            sbuild debhelper
+          sudo sbuild-adduser $USER
+    - name: Prepare sbuild environment
+      # ports.ubuntu.com (armhf/arm64) is unreachable from Azure-hosted runners, so
+      # point the ports mirror at the Azure mirror; amd64/i386 use the Azure archive
+      # mirror too. `sudo env VAR=...` passes the overrides through the sudo boundary.
+      run: |
+        sudo env \
+          UBUNTU_ARCHIVE_MIRROR=http://azure.archive.ubuntu.com/ubuntu \
+          UBUNTU_PORTS_MIRROR=http://azure.ports.ubuntu.com/ubuntu-ports \
+          ./debian/setup_sbuild.sh ${{ matrix.dist }} ${{ env.BUILD_ARCH }}
+    - name: Get source package
+      uses: actions/download-artifact@v5
+      with:
+        name: source-${{ matrix.dist }}
+    - name: Build binary package
+      run: |
+          sudo sbuild \
+            --nolog \
+            --host ${{ matrix.arch }} \
+            --build ${{ env.BUILD_ARCH }} \
+            --dist ${{ matrix.dist }} *.dsc
+    - name: Upload binary package artifact
+      uses: actions/upload-artifact@v5
+      with:
+        name: binary-${{ matrix.dist }}-${{ matrix.arch }}
+        path: |
+          *.deb
+    - name: Upload as release assets
+      # we don't upload on workflow dispatch
+      if: github.event_name == 'release'
+      uses: softprops/action-gh-release@v3
+      with:
+        files: |
+          *.deb
+
+  smoke-test-packages:
+    runs-on: ubuntu-22.04
+    needs: build-binary-package
+    env:
+      ARCH: amd64
+    strategy:
+      matrix:
+        image: ${{ fromJSON(vars.SMOKE_TEST_IMAGES) }}
+    container: ${{ matrix.image }}
+    steps:
+    - name: Extract BUILD_ARCH from matrix.image
+      run: |
+        BUILD_ARCH=$(echo ${{ matrix.image }} | cut -d: -f2)
+        if [ -z "$BUILD_ARCH" ]; then
+          echo "Error: Failed to extract BUILD_ARCH from matrix.image" >&2
+          exit 1
+        fi
+        echo "BUILD_ARCH=$BUILD_ARCH" >> $GITHUB_ENV
+    - name: Get binary packages
+      uses: actions/download-artifact@v5
+      with:
+        name: binary-${{ env.BUILD_ARCH }}-${{ env.ARCH }}
+        path: binary-${{ env.BUILD_ARCH }}-${{ env.ARCH }}
+    - name: Install packages
+      run: |
+        apt-get update
+        cd binary-${{ env.BUILD_ARCH }}-${{ env.ARCH }} && apt install --yes ./*.deb
+
+  publish-to-apt:
+    env:
+      DEB_S3_VERSION: "0.11.3"
+    runs-on: ubuntu-22.04
+    environment: build
+    needs: smoke-test-packages
+    steps:
+    - name: Setup APT Signing key
+      run: |
+          mkdir -m 0700 -p ~/.gnupg
+          echo "$APT_SIGNING_KEY" | gpg --import
+      env:
+        APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+    - name: Get binary packages
+      uses: actions/download-artifact@v5
+    - name: Setup ruby
+      uses: ruby/setup-ruby@v1
+      with:
+          ruby-version: "2.7"
+    - name: Install deb-s3
+      run: |
+          curl -sLO https://github.com/deb-s3/deb-s3/releases/download/${{ env.DEB_S3_VERSION }}/deb-s3-${{ env.DEB_S3_VERSION }}.gem
+          gem install deb-s3-${{ env.DEB_S3_VERSION }}.gem
+    - name: Quick hack to deal with duplicate _all packages
+      run: |
+        # Quick hack to deal with duplicate _all packages
+        rm -f binary-*-i386/*_all.deb
+    - name: List all packages to be uploaded
+      run: |
+        for dir in binary-*; do \
+            dist=$(echo $dir | cut -d- -f 2) ; \
+            ls -lha $dir/*.deb ; \
+        done
+    - name: Upload packages
+      # We stop here on the workflow dispatch smoke tests and on the preleases
+      if: github.event_name == 'release' && github.event.release.prerelease == false
+      run: |
+        for dir in binary-*; do \
+            dist=$(echo $dir | cut -d- -f 2) ; \
+            deb-s3 upload \
+                --bucket ${{ secrets.APT_S3_BUCKET }} \
+                --s3-region ${{ secrets.APT_S3_REGION }} \
+                --codename $dist \
+                --preserve-versions \
+                --fail-if-exists \
+                --sign \
+                --prefix deb \
+                $dir/*.deb ; \
+        done
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.APT_S3_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.APT_S3_SECRET_ACCESS_KEY }}

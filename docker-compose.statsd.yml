@@ -1,0 +1,50 @@
+# Docker Compose for memtier_benchmark StatsD metrics visualization
+# Usage: docker-compose -f docker-compose.statsd.yml up -d
+#
+# This sets up:
+# - Graphite with StatsD receiver on UDP port 8125
+# - Grafana on HTTP port 3000 (admin/admin)
+#
+# Then run memtier_benchmark with:
+#   ./memtier_benchmark -s <redis-host> --statsd-host=localhost --statsd-port=8125
+
+services:
+  graphite:
+    image: graphiteapp/graphite-statsd:1.1.10-5
+    container_name: memtier-graphite
+    ports:
+      - "8080:80"           # Graphite web UI
+      - "2003:2003"         # Carbon line receiver
+      - "2004:2004"         # Carbon pickle receiver
+      - "8125:8125/udp"     # StatsD UDP receiver
+      - "8126:8126"         # StatsD management
+    volumes:
+      - graphite-data:/opt/graphite/storage
+      - ./graphite/statsd-config.js:/opt/statsd/config/udp.js:ro
+      - ./graphite/storage-schemas.conf:/opt/graphite/conf/storage-schemas.conf:ro
+    environment:
+      - GRAPHITE_WSGI_PROCESSES=1
+      - GRAPHITE_WSGI_THREADS=1
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.2.3
+    container_name: memtier-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_DASHBOARDS_MIN_REFRESH_INTERVAL=1s
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    depends_on:
+      - graphite
+    restart: unless-stopped
+
+volumes:
+  graphite-data:
+  grafana-data:
