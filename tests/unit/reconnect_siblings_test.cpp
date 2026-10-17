@@ -223,6 +223,38 @@ int main()
         config.max_reconnect_attempts = 0;
         check(first.run_is_over(), "unlimited reconnects check a started client's wall-clock deadline");
     }
+    // A rejected sibling can be disconnected with no retry pending (for
+    // example after a failed dial during a slot refresh). Another connection
+    // ending the client must preserve the required sibling's setup failure,
+    // both on a normal end and when stats are capped at the deadline.
+    const enum read_pref_mode modes[] = {rp_primary, rp_secondary_preferred, rp_secondary};
+    for (unsigned int mode = 0; mode < sizeof(modes) / sizeof(modes[0]); ++mode) {
+        for (unsigned int at_deadline = 0; at_deadline < 2; ++at_deadline) {
+            config.read_preference = modes[mode];
+            object_generator generator;
+            generator.set_data_size_fixed(1);
+            two_connection_client manager(base, &config, protocol, &generator);
+            shard_connection &first = *manager.get_connections()[0];
+            shard_connection &second = *manager.get_connections()[1];
+            manager.mark_started(&config.benchmark_start_time);
+            second.set_role(role_replica);
+            second.reconnect_after_setup_error("AUTH error");
+            const bool required = modes[mode] == rp_secondary;
+            check(second.setup_failed_since_reply() == required, "only a required replica retains the setup failure");
+            check(!manager.run_failed(), "the sibling has not ended the run yet");
+            second.disconnect();
+            check(first.siblings_done(), "the rejected sibling has no retry or reply pending");
+            if (at_deadline) {
+                first.end_client_after_run(true);
+                check(manager.get_stats()->get_duration_usec() == config.test_time * 1000000ULL,
+                      "the reconnect end caps stats at the deadline");
+            } else {
+                manager.set_end_time();
+            }
+            check(manager.end_time_set(), "the client was finalized");
+            check(manager.run_failed() == required, "both finalization paths preserve required replica setup failure");
+        }
+    }
     delete protocol;
     event_base_free(base);
     if (failures != 0) {
