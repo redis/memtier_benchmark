@@ -254,6 +254,56 @@ def get_cluster_replica_connections(env):
     return conns
 
 
+def harness_client_ids(connections):
+    """Per connection, the IDs of the clients already on that server.
+
+    Take it before starting memtier: every client that shows up later and is
+    not one of these is memtier's, so the kills below leave the harness's own
+    connections (RLTest's, redis-py's pool) alone and count only memtier's.
+    """
+    harness = []
+    for conn in connections:
+        ids = set(int(c["id"]) for c in conn.client_list())
+        ids.add(int(conn.client_id()))
+        harness.append(ids)
+    return harness
+
+
+def memtier_client_ids(connections, harness):
+    """Per connection, the IDs of memtier's clients (see harness_client_ids)."""
+    found = []
+    for conn, ids in zip(connections, harness):
+        try:
+            found.append([int(c["id"]) for c in conn.client_list() if int(c["id"]) not in ids])
+        except Exception:
+            found.append([])
+    return found
+
+
+def wait_for_memtier_clients(connections, harness, proc, timeout=30.0):
+    """Poll until memtier has a client on some server; False if proc exits first."""
+    deadline = time.time() + timeout
+    while time.time() < deadline and proc.poll() is None:
+        if any(memtier_client_ids(connections, harness)):
+            return True
+        time.sleep(0.001)
+    return False
+
+
+def kill_memtier_clients(connections, harness, limit=None):
+    """CLIENT KILL memtier's clients; returns how many were killed."""
+    killed = 0
+    for conn, ids in zip(connections, memtier_client_ids(connections, harness)):
+        for client_id in ids:
+            if limit is not None and killed >= limit:
+                return killed
+            try:
+                killed += int(conn.execute_command("CLIENT", "KILL", "ID", client_id, "SKIPME", "yes"))
+            except Exception:
+                pass  # already gone
+    return killed
+
+
 def reset_commandstats(connections):
     """CONFIG RESETSTAT on each connection.  Use to baseline before a run."""
     for c in connections:
