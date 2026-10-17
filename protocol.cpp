@@ -1294,11 +1294,12 @@ int memcache_text_protocol::write_arbitrary_command(const char *val, int val_len
 //   mg <k> v\r\nmn\r\n                  ->  VA <n>\r\n<data>\r\nMN\r\n  (or EN\r\nMN\r\n)
 //   <pipelined mg ...> mn\r\n            ->  ...VA/EN..., MN  (mn is the natural terminator)
 //
-// This makes parse_response uniform: it always reads sections until it sees
-// `MN`. An ordered queue checks each reply's kind and section count without
-// a mutable write-side mode that would misattribute mixed pipelined replies.
-// The wire cost is 4 request + 4 response bytes per command;
-// its relative bandwidth and processing overhead depend on the workload.
+// The ordered expectation queue validates reply kinds and exact section counts;
+// MN then marks the end of each logical request, including errors and multi-get.
+// Keeping this boundary uniform is a deliberate wire-format choice, not a
+// requirement of the queue. Single-key operations could omit mn in another mode.
+// Each logical operation includes one extra server command and 4 request +
+// 4 response bytes; its processing overhead depends on the workload.
 class memcache_meta_protocol : public memcache_text_protocol
 {
     struct expected_reply

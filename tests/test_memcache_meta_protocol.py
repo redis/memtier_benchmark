@@ -359,10 +359,6 @@ class MetaProtocolTests(unittest.TestCase):
 
     # ---- write_command_get + parse_response (VA hit, EN miss) ----
     def test_get_hits_and_misses(self):
-        # Pre-load 5 keys so half the GETs hit, half miss.
-        for i in range(1, 6):
-            self.server.kv[f"hit:{i}"] = b"abcd"
-
         # Drive memtier with GETs against keys "missme:1..50" -> all misses (EN).
         proc = _run_memtier(
             ["--ratio=0:1", "--key-pattern=P:P", "--key-prefix=missme:",
