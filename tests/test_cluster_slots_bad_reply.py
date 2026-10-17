@@ -25,8 +25,8 @@ class _Node(socketserver.ThreadingTCPServer):
     def __init__(self, bad_slots_replies, moved_after=0, bad_reply=b"*0\r\n", replica=None, readonly_delay=0,
                  first_good=False, bad_delay=0, auth_error=None, auth_error_with_next=False, select_error=None,
                  moved_every=0, auth_reject_first=0, first_data_delay=0, gone_after_bad=False, bad_for=None,
-                 drop_after=0, reject_auth=0):
-        super().__init__(("127.0.0.1", 0), _Handler)
+                 drop_after=0, reject_auth=0, host="127.0.0.1"):
+        super().__init__((host, 0), _Handler)
         self.lock = threading.Lock()
         # CLUSTER SLOTS requests answered with bad_reply: the ones after the
         # first if moved_after or first_good is set, otherwise the first ones.
@@ -73,6 +73,7 @@ class _Node(socketserver.ThreadingTCPServer):
         # a node waits before answering READONLY.
         self.replica = replica
         self.readonly_delay = readonly_delay
+        self.readonly_requests = 0
         self.slots_requests = 0
         self.data_requests = 0
         self.errors = []
@@ -140,6 +141,8 @@ class _Handler(socketserver.StreamRequestHandler):
                         rejected = node.auth_requests == node.reject_auth
                     reply = b"-WRONGPASS invalid username-password pair\r\n" if rejected else b"+OK\r\n"
                 elif verb == b"READONLY":
+                    with node.lock:
+                        node.readonly_requests += 1
                     time.sleep(node.readonly_delay)
                     reply = b"+OK\r\n"
                 elif verb in (b"SET", b"GET"):
@@ -153,7 +156,7 @@ class _Handler(socketserver.StreamRequestHandler):
                         time.sleep(node.first_data_delay)
                     if moved:
                         target = node.moved_to or node
-                        reply = "-MOVED 0 127.0.0.1:{}\r\n".format(target.server_address[1]).encode()
+                        reply = "-MOVED 0 {}:{}\r\n".format(*target.server_address).encode()
                     else:
                         reply = b"+OK\r\n" if verb == b"SET" else b"$-1\r\n"
                 else:

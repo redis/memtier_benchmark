@@ -1612,7 +1612,7 @@ void shard_connection::process_response(void)
                 // handle_cluster_slots() can change this connection's role
                 // (a promoted replica becomes a primary).
                 const bool was_replica = m_role == role_replica;
-                bool committed = m_conns_manager->handle_cluster_slots(r);
+                bool committed = m_conns_manager->handle_cluster_slots(m_id, r);
                 m_protocol->set_keep_value(false);
 
                 if (committed) {
