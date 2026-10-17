@@ -802,7 +802,9 @@ static std::string redact_credentials(const char *credentials)
 // host. It is the LAST '@' before that point, so a raw '@' in the password
 // works and no tail of it is taken for the host and echoed by --show-config
 // or a host/port error.
-// Known limits, both as before, until #732's percent-encoding:
+// Ambiguous forms, kept as before for compatibility; parse_uri() warns about
+// them (a raw '/', '?' or '#' in the userinfo) and %2F, %3F, %23 and %40
+// spell them unambiguously (#732):
 // - A raw '/', '?' or '#' in the password works only when no '@' comes
 //   before it in the password: "u:a@b/c@host" is split as host "b".
 // - Without credentials, an '@' in the path still ends a "userinfo":
@@ -1196,6 +1198,78 @@ static void non_negative_option_error(const char *name, bool too_large, unsigned
         fprintf(stderr, "error: %s must be a non-negative integer.\n", name);
 }
 
+static int hex_digit_value(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+// RFC 3986 percent-decoding of a --uri user name or password, as redis-cli -u
+// does. A '%' not followed by two hex digits is kept as a literal '%' with a
+// warning instead of an error: master took the userinfo verbatim, so a
+// password such as "100%" kept working. %00 is rejected, since the
+// credentials are passed on as a C string and would be cut short. Neither
+// message echoes the value. Returns false on error.
+static bool uri_percent_decode(const char *s, const char *what, std::string &out)
+{
+    bool literal_percent = false;
+    out.clear();
+    for (; *s; s++) {
+        int hi, lo;
+        if (*s == '%' && (hi = hex_digit_value(s[1])) >= 0 && (lo = hex_digit_value(s[2])) >= 0) {
+            if (hi == 0 && lo == 0) {
+                fprintf(stderr, "error: --uri %s contains %%00, which cannot be sent to the server.\n", what);
+                return false;
+            }
+            out += (char) (hi * 16 + lo);
+            s += 2;
+        } else {
+            if (*s == '%') literal_percent = true;
+            out += *s;
+        }
+    }
+    if (literal_percent) {
+        fprintf(stderr,
+                "warning: --uri %s has a '%%' not followed by two hex digits; it is kept as a literal '%%'. "
+                "Write it as %%25.\n",
+                what);
+    }
+    return true;
+}
+
+// Decode the --uri userinfo into the -a/--authenticate form ("user:password",
+// or "password"), splitting at the first raw ':' before decoding so that %3A
+// can carry a ':' in the password. authenticate() splits user and password at
+// the first ':', so a decoded ':' cannot be part of the user name; a password
+// with no user that decodes to a ':' gets a leading ':', which authenticate()
+// reads as "password only". Returns false on error.
+static bool uri_decode_userinfo(const char *userinfo, std::string &out)
+{
+    if (strpbrk(userinfo, "/?#")) {
+        fprintf(stderr, "warning: --uri credentials contain a raw '/', '?' or '#'; they are read as part of the "
+                        "credentials. Percent-encode them (%%2F, %%3F, %%23) to avoid ambiguity with the path.\n");
+    }
+    const char *colon = strchr(userinfo, ':');
+    if (!colon) {
+        std::string password;
+        if (!uri_percent_decode(userinfo, "password", password)) return false;
+        out = strchr(password.c_str(), ':') ? ":" + password : password;
+        return true;
+    }
+    std::string user, password;
+    if (!uri_percent_decode(std::string(userinfo, colon - userinfo).c_str(), "user name", user) ||
+        !uri_percent_decode(colon + 1, "password", password))
+        return false;
+    if (user.find(':') != std::string::npos) {
+        fprintf(stderr, "error: --uri user name contains ':' (%%3A), which AUTH credentials cannot carry.\n");
+        return false;
+    }
+    out = user + ":" + password;
+    return true;
+}
+
 // Parse URI and populate config fields
 // Returns 0 on success, -1 on error
 static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string &uri_authenticate,
@@ -1254,9 +1328,15 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
         if (cfg->authenticate) {
             fprintf(stderr, "warning: both URI and --authenticate specified, URI takes precedence.\n");
         }
-        // Own URI credentials separately from the borrowed --authenticate argument.
+        // Own URI credentials separately from the borrowed --authenticate
+        // argument. Only the userinfo is decoded: redis-cli -u decodes no
+        // other part, an IPv6 zone id ("[fe80::1%eth0]") passes through
+        // raw, and the port and db number are digits only.
         *auth_end = '\0';
-        uri_authenticate = ptr;
+        if (!uri_decode_userinfo(ptr, uri_authenticate)) {
+            free(uri_copy);
+            return -1;
+        }
         cfg->authenticate = uri_authenticate.c_str();
         host_start = auth_end + 1;
     }
@@ -2946,6 +3026,9 @@ void usage()
         "                                 User, password and dbnum are optional. For authentication\n"
         "                                 without a username, use username 'default'. For TLS, use\n"
         "                                 the scheme 'rediss'. Bracket IPv6 hosts: [::1]:6379.\n"
+        "                                 User and password are percent-decoded, as by\n"
+        "                                 redis-cli -u: write '@' as %%40, ':' as %%3A, '/' as %%2F\n"
+        "                                 and '%%' as %%25.\n"
 #ifdef USE_TLS
         "      --tls                      Enable SSL/TLS transport security\n"
         "      --cert=FILE                Use specified client certificate for TLS\n"
