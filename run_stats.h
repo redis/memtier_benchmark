@@ -173,6 +173,11 @@ protected:
     // Workload requests abandoned because no reply came within
     // TEST_TIME_DRAIN_GRACE_SECS after --test-time ended.
     unsigned long long int m_unanswered_requests;
+    // Number of runs aggregate_average() averaged into this object; 0 for a
+    // real run. m_start_time / m_end_time then span the SUMMED duration of
+    // the runs, and the hit/miss counts stay summed (see aggregate_average()),
+    // so print_json() divides them by it with per_run().
+    size_t m_averaged_runs;
 
     totals m_totals;
 
@@ -342,6 +347,9 @@ public:
     size_t get_replica_endpoint_count() const { return m_cluster_replicas; }
 
     void aggregate_average(const std::vector<run_stats> &all_stats);
+    // A count summed over the averaged runs, as a per-run mean (rounded);
+    // the count itself for a real run.
+    unsigned long long int per_run(unsigned long long int sum) const;
     void summarize(totals &result) const;
     void summarize_current_second(void);
     void merge(const run_stats &other, int iteration);

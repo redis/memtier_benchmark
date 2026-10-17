@@ -71,9 +71,9 @@ def _latency_bounds(derived, count):
     average truncated to an integer, for low counts too.
 
     AGGREGATED AVERAGE RESULTS is the exception: its averages are unweighted
-    means of the per-run averages, while Count and Accumulated are sums, so
-    the invariant holds there only when every run has the same count (as with
-    --requests). See #671.
+    means of the per-run averages, while Count and Accumulated are per-run
+    means of the totals (#703), so the invariant holds there only when every
+    run has the same count (as with --requests). See #671.
     """
     below = max(ABS_TOLERANCE_MS, REL_TOLERANCE * derived)
     return below, max(below, 1.0 / count + AVG_PRINT_ROUNDING_MS)
@@ -815,6 +815,27 @@ def _assert_aggregated_totals_are_run_mean(env, results, run_count, fields):
                     f"per-run values {values} ({expected:.4f})")
 
 
+def _assert_aggregated_counts_are_run_mean(env, results, run_count, section,
+                                           fields, slack=1.5):
+    """Issue #703: each AGGREGATED count in results[...][section][field] must
+    be the mean of the per-run counts, not their sum (needs --print-all-runs).
+    The per-run values are printed rounded, so allow `slack`."""
+    agg_key = _aggregated_key(env, results)
+    runs = [results.get(f"RUN #{i} RESULTS") for i in range(1, run_count + 1)]
+    env.assertTrue(all(runs),
+                   message=f"Expected RUN #1..#{run_count} RESULTS sections")
+    if not all(runs):
+        return
+    for field in fields:
+        values = [float(run[section][field]) for run in runs]
+        expected = sum(values) / run_count
+        actual = float(results[agg_key][section][field])
+        env.assertLessEqual(
+            abs(actual - expected), slack,
+            message=f"{agg_key}: {section} '{field}' ({actual}) != mean of the "
+                    f"per-run values {values} ({expected:.4f})")
+
+
 def _assert_aggregated_totals_rx_tx(env, results, run_count):
     """Issue #577: the AGGREGATED Totals RX/TX split must be non-zero, match
     the per-command rows, add up to the combined KB/sec and be the mean of
@@ -933,6 +954,74 @@ def test_json_aggregated_connection_errors_sec(env):
                                   "CLIENT KILL loop")
         _assert_aggregated_totals_are_run_mean(
             env, results, run_count, ("Connection Errors/sec",))
+        # Issue #703: the count was the sum of the per-run counts.
+        _assert_aggregated_counts_are_run_mean(
+            env, results, run_count, "Totals", ("Connection Errors",))
+    finally:
+        if env.getNumberOfFailedAssertion() > failed_asserts:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_json_aggregated_duration_and_counts_are_run_mean(env):
+    """Issue #703: the AGGREGATED AVERAGE Runtime said Start time 0 and a
+    Total duration (and Finish time) equal to the SUM of the run durations,
+    and its Count / Accumulated Latency were sums too, while the rates and
+    latencies next to them are per-run means. Every value of the section must
+    be the per-run mean: a --test-time run lasts test_time, and so must the
+    average run."""
+    run_count = 3
+    test_time = 2
+    test_dir = tempfile.mkdtemp()
+    benchmark, run_config = _build_benchmark(
+        env, test_dir,
+        extra_args=[f"--run-count={run_count}", "--print-all-runs",
+                    "--ratio=1:4"],
+        threads=2, clients=2, test_time=test_time)
+    ok = benchmark.run()
+    failed_asserts = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier_benchmark exited non-zero")
+        results = _read_json(run_config, env)
+        agg_key = _aggregated_key(env, results)
+        runs = [results.get(f"RUN #{i} RESULTS")
+                for i in range(1, run_count + 1)]
+        env.assertTrue(all(runs),
+                       message=f"Expected RUN #1..#{run_count} RESULTS")
+        if not all(runs):
+            return
+        runtime = results[agg_key]["Runtime"]
+        durations = [run["Runtime"]["Total duration"] for run in runs]
+        duration = runtime["Total duration"]
+        # Each run's duration is printed truncated to the ms, so their mean
+        # can be up to 1 ms off the mean of the exact durations.
+        env.assertLessEqual(
+            abs(duration - sum(durations) / run_count), 1.5,
+            message=f"{agg_key}: Total duration {duration} ms is not the mean "
+                    f"of the run durations {durations}; {runtime}")
+        env.assertLessEqual(
+            abs(duration - test_time * 1000), 200,
+            message=f"{agg_key}: Total duration {duration} ms is not about "
+                    f"--test-time {test_time} s; {runtime}")
+        # Start time is a real timestamp, the start of the first run, and the
+        # section stays self-consistent: Finish - Start == Total duration.
+        env.assertEqual(
+            runtime["Start time"], runs[0]["Runtime"]["Start time"],
+            message=f"{agg_key}: Start time is not the first run's; {runtime}")
+        env.assertEqual(
+            runtime["Finish time"] - runtime["Start time"], duration,
+            message=f"{agg_key}: Finish - Start != Total duration; {runtime}")
+        for section in ("Totals", "Sets", "Gets"):
+            _assert_aggregated_counts_are_run_mean(
+                env, results, run_count, section,
+                ("Count", "Accumulated Latency"))
+        if all("CPU" in run for run in runs) and "CPU" in results[agg_key]:
+            for field in ("cpu_total_seconds", "cpu_wall_seconds"):
+                values = [float(run["CPU"][field]) for run in runs]
+                actual = float(results[agg_key]["CPU"][field])
+                env.assertLessEqual(
+                    abs(actual - sum(values) / run_count), 0.002,
+                    message=f"{agg_key}: CPU '{field}' ({actual}) is not the "
+                            f"mean of {values}")
     finally:
         if env.getNumberOfFailedAssertion() > failed_asserts:
             debugPrintMemtierOnError(run_config, env)

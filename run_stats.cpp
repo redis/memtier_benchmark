@@ -130,6 +130,7 @@ run_stats::run_stats(benchmark_config *config) :
         m_config(config),
         m_interrupted(false),
         m_unanswered_requests(0),
+        m_averaged_runs(0),
         m_totals(),
         m_cur_stats(0),
         m_cluster_endpoints(0),
@@ -1054,9 +1055,17 @@ bool one_second_stats_predicate(const one_second_stats &a, const one_second_stat
     return a.m_second < b.m_second;
 }
 
+unsigned long long int run_stats::per_run(unsigned long long int sum) const
+{
+    if (m_averaged_runs <= 1) return sum;
+    return (sum + m_averaged_runs / 2) / m_averaged_runs;
+}
+
 void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
 {
     unsigned long long total_duration_usec = 0;
+    bool have_start = false;
+    struct timeval first_start = {};
 
     for (std::vector<run_stats>::const_iterator i = all_stats.begin(); i != all_stats.end(); i++) {
         totals i_totals;
@@ -1108,7 +1117,14 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
             }
         }
 
-        total_duration_usec += ts_diff(i->m_start_time, i->m_end_time);
+        // A run that never started has no times. It still counts as one of
+        // the runs, with a zero duration, like its zero Ops/sec does.
+        if (i->has_started()) {
+            const long long run_usec = ts_diff(i->m_start_time, i->m_end_time);
+            if (run_usec > 0) total_duration_usec += run_usec;
+            if (!have_start || timercmp(&i->m_start_time, &first_start, <)) first_start = i->m_start_time;
+            have_start = true;
+        }
 
         // Like merge(): the average is interrupted if any of its runs was.
         if (i->get_interrupted()) set_interrupted(true);
@@ -1130,20 +1146,36 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
     m_totals.m_connection_errors_sec /= all_stats.size();
     m_totals.m_latency /= all_stats.size();
 
-    // m_arbitrary_misses now holds the SUMMED hit/miss counts across all runs,
-    // and the synthetic duration below is the SUMMED run duration. The rate the
-    // print paths compute, count / ts_diff(m_start_time, m_end_time), is then the
-    // exact time-weighted average Σhits / Σduration — mathematically equal to
-    // dividing both the count and the duration by N, but without the integer
-    // truncation that dividing the unsigned counts by N would introduce (which
-    // could otherwise zero out small miss counts and suppress the miss-rate
-    // warning). Counts are left summed deliberately: the JSON "Per-Key Misses"
-    // section reports cumulative Total Hits/Misses across the runs.
-    if (!all_stats.empty() && total_duration_usec > 0) {
-        m_start_time.tv_sec = 0;
-        m_start_time.tv_usec = 0;
-        m_end_time.tv_sec = (time_t) (total_duration_usec / 1000000);
-        m_end_time.tv_usec = (suseconds_t) (total_duration_usec % 1000000);
+    // Every value in the AVERAGE section is a per-run mean (#703): the rates
+    // and latencies above, and the counts below, which totals::add() summed.
+    // Hits and misses (m_hits / m_misses, m_arbitrary_misses) stay summed
+    // here: the print paths divide them by the summed duration set below,
+    // count / ts_diff(m_start_time, m_end_time), which is the exact
+    // time-weighted average rate Σhits / Σduration, without the integer
+    // truncation that dividing small miss counts by N would introduce. The
+    // printed counts and duration go through per_run().
+    m_averaged_runs = all_stats.size();
+    if (m_averaged_runs > 1) {
+        m_totals.m_ops = per_run(m_totals.m_ops);
+        m_totals.m_total_latency = per_run(m_totals.m_total_latency);
+        m_totals.m_bytes_rx = per_run(m_totals.m_bytes_rx);
+        m_totals.m_bytes_tx = per_run(m_totals.m_bytes_tx);
+        m_totals.m_connection_errors = per_run(m_totals.m_connection_errors);
+        m_totals.m_retry_attempts = per_run(m_totals.m_retry_attempts);
+        m_totals.m_retried_ops = per_run(m_totals.m_retried_ops);
+        m_totals.m_errors = per_run(m_totals.m_errors);
+        m_unanswered_requests = per_run(m_unanswered_requests);
+    }
+
+    // Start at the first run's start, and span the summed run duration; the
+    // JSON Runtime prints the mean duration from it (print_json()).
+    if (have_start && total_duration_usec > 0) {
+        const unsigned long long start_usec =
+            (unsigned long long) first_start.tv_sec * 1000000 + (unsigned long long) first_start.tv_usec;
+        const unsigned long long end_usec = start_usec + total_duration_usec;
+        m_start_time = first_start;
+        m_end_time.tv_sec = (time_t) (end_usec / 1000000);
+        m_end_time.tv_usec = (suseconds_t) (end_usec % 1000000);
     }
 
     // Combine the whole-process CPU aggregate across runs: sum CPU-seconds and
@@ -1176,6 +1208,13 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
             max_threads_counted > 0
                 ? 100.0 * (agg_cpu.worker_total_seconds / agg_cpu.wall_seconds) / max_threads_counted
                 : 0.0;
+        // Report the CPU and wall seconds per run, like the other counts;
+        // the ratios above are unchanged by it.
+        agg_cpu.user_seconds /= cpu_runs;
+        agg_cpu.sys_seconds /= cpu_runs;
+        agg_cpu.total_seconds /= cpu_runs;
+        agg_cpu.worker_total_seconds /= cpu_runs;
+        agg_cpu.wall_seconds /= cpu_runs;
         agg_cpu.valid = true;
         m_cpu_summary = agg_cpu;
     }
@@ -2031,8 +2070,14 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
 {
     if (jsonhandler != NULL) { // Added for double verification in case someone accidently send NULL.
         jsonhandler->open_nesting("Runtime");
-        const long long start_time_ms = ((long long) m_start_time.tv_sec * 1000000 + m_start_time.tv_usec) / 1000;
-        const long long end_time_ms = ((long long) m_end_time.tv_sec * 1000000 + m_end_time.tv_usec) / 1000;
+        const long long start_usec = (long long) m_start_time.tv_sec * 1000000 + m_start_time.tv_usec;
+        const long long start_time_ms = start_usec / 1000;
+        // For an AVERAGE, the start is the first run's start and the duration
+        // the mean run duration.
+        const long long end_usec = m_averaged_runs > 1
+                                       ? start_usec + (long long) per_run(ts_diff(m_start_time, m_end_time))
+                                       : (long long) m_end_time.tv_sec * 1000000 + m_end_time.tv_usec;
+        const long long end_time_ms = end_usec / 1000;
         jsonhandler->write_obj("Start time", "%lld", start_time_ms);
         jsonhandler->write_obj("Finish time", "%lld", end_time_ms);
         jsonhandler->write_obj("Total duration", "%lld", end_time_ms - start_time_ms);
@@ -2162,14 +2207,14 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
                 if (t.per_key_hits.empty()) continue;
                 if (i >= command_list.size()) continue;
                 jsonhandler->open_nesting(keys[i].c_str());
-                jsonhandler->write_obj("Total Hits", "%llu", t.total_hits);
-                jsonhandler->write_obj("Total Misses", "%llu", t.total_misses);
+                jsonhandler->write_obj("Total Hits", "%llu", per_run(t.total_hits));
+                jsonhandler->write_obj("Total Misses", "%llu", per_run(t.total_misses));
                 for (size_t k = 0; k < t.per_key_hits.size(); ++k) {
                     char label[32];
                     snprintf(label, sizeof(label), "key[%zu] Hits", k);
-                    jsonhandler->write_obj(label, "%llu", t.per_key_hits[k]);
+                    jsonhandler->write_obj(label, "%llu", per_run(t.per_key_hits[k]));
                     snprintf(label, sizeof(label), "key[%zu] Misses", k);
-                    jsonhandler->write_obj(label, "%llu", t.per_key_misses[k]);
+                    jsonhandler->write_obj(label, "%llu", per_run(t.per_key_misses[k]));
                 }
                 jsonhandler->close_nesting();
             }

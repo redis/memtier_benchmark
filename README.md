@@ -250,6 +250,18 @@ for retry are not resent, are counted as errors and written to
 test time ended`. They are not part of `"Unanswered requests"`, which only
 counts requests that were waiting for a reply.
 
+### Repeated runs (`--run-count`)
+
+With `--run-count N`, memtier reports the best and the worst run (by
+Ops/sec), and an `AGGREGATED AVERAGE RESULTS (N runs)` section in which
+every value is the mean over the runs: rates, latencies, `Count`,
+`Accumulated Latency`, `Connection Errors`, `Unanswered requests`, the
+`Per-Key Misses` counts and the `CPU` seconds. Its `Runtime` `Total duration`
+is the mean run duration, `Start time` is the start of the first run, and
+`Finish time` is `Start time` plus `Total duration`. Percentiles come from the
+latency histograms of all the runs merged together, so the section's
+`Histogram log format` holds the samples of all N runs (N times its `Count`).
+
 ### Interrupting a run
 
 Ctrl+C (SIGINT) and SIGTERM (sent by `kill`, `timeout`, `docker stop`,

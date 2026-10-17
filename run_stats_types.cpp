@@ -248,6 +248,11 @@ void totals_cmd::aggregate_average(size_t stats_size)
     m_bytes_sec_rx /= stats_size;
     m_bytes_sec_tx /= stats_size;
     m_latency /= stats_size;
+    // The counts too, rounded: every value of an average section is per run.
+    if (stats_size > 0) {
+        m_total_latency = (m_total_latency + stats_size / 2) / stats_size;
+        m_ops = (m_ops + stats_size / 2) / stats_size;
+    }
 }
 
 void totals_cmd::summarize(const one_sec_cmd_stats &other, unsigned long long test_duration_usec)

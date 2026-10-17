@@ -210,18 +210,20 @@ def test_aggregated_average_totals_histogram(env):
         with open(os.path.join(config.results_dir, "mb.stdout")) as source:
             lines = source.read().splitlines()
 
-        def decode(section, name):
+        def decode(section, name, runs=1):
             stats = results[section][name]
             encoded = stats["Percentile Latencies"]["Histogram log format"]["Compressed Histogram"]
             count, raw = _decode_v2(encoded)
-            env.assertEqual(count, stats["Count"])
+            # The AVERAGE histogram holds the samples of every run, while its
+            # Count is the per-run mean (#703).
+            env.assertEqual(count, runs * stats["Count"])
             return _v2_counts(raw)
 
         average = "AGGREGATED AVERAGE RESULTS (2 runs)"
         totals = results[average]["Totals"]
-        env.assertEqual(totals["Count"], 2 * 4000)
-        decoded = decode(average, "Totals")
-        env.assertEqual(decoded, _merge_counts(decode(average, "Sets"), decode(average, "Gets")))
+        env.assertEqual(totals["Count"], 4000)
+        decoded = decode(average, "Totals", 2)
+        env.assertEqual(decoded, _merge_counts(decode(average, "Sets", 2), decode(average, "Gets", 2)))
         env.assertEqual(decoded, _merge_counts(decode("RUN #1 RESULTS", "Totals"),
                                                decode("RUN #2 RESULTS", "Totals")))
 
