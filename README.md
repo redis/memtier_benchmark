@@ -193,6 +193,8 @@ For example, if you run:
 $ memtier_benchmark --command="SET foo __data__" --command="SET bar __data__" --command="GET foo"
 ```
 
+(`SET foo __data__` has no `__key__`, so under `--data-size-pattern=S` its value always gets the minimum size: each `__data__` is sized by the most recent `__key__` before it in the command.)
+
 With the default `command` breakdown, you'll see aggregated stats for "Sets" and "Gets". With `--command-stats-breakdown=line`, you'll see separate rows for each command line.
 
 JSON object keys must be unique, so when several command lines share a name their per-line JSON entries are numbered in output-row order (`--command` order for user lines), e.g. `"Sets #1"`, `"Sets #2"`, and `"SET #1"`, `"SET #2"` for the latency histograms and `Per-Key Misses`. The per-command `--hdr-file-prefix` files use a shell-safe `_N` suffix instead (e.g. `<prefix>_GET_1_command_run_1.hgrm`, `<prefix>_GET_2_command_run_1.hgrm`), so they do not overwrite each other. Names that appear only once keep their plain key (`"Gets"`) and file name.

@@ -141,6 +141,7 @@ struct command_arg
             type(undefined_type),
             data(arg, arg_len),
             monitor_index(0),
+            data_key_index(0),
             has_key_affixes(false),
             resolved(false),
             scan_cursor(false)
@@ -151,6 +152,10 @@ struct command_arg
     std::string data;
     // For monitor_type, stores the index (1-based)
     size_t monitor_index;
+    // __monitor_line@__ only: index of the most recent generated __key__
+    // before this argument (0 if none), which sizes a __data__ here under
+    // --data-size-pattern=S. Set by client::resolve_monitor_placeholders().
+    unsigned long long data_key_index;
     // the prefix and suffix strings are used for mixed key placeholder storing of substrings
     std::string data_prefix;
     std::string data_suffix;

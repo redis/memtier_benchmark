@@ -3130,6 +3130,8 @@ void usage()
         "                                 To use a generated key or object, enter:\n"
         "                                   __key__: Use key generated from Key Options.\n"
         "                                   __data__: Use data generated from Object Options.\n"
+        "                                     With --data-size-pattern=S, sized by the most recent __key__\n"
+        "                                     before it (minimum size if there is none).\n"
         "      --command-ratio            The number of times the command is sent in sequence.(default: 1)\n"
         "      --command-key-pattern      Key pattern for the command (default: R):\n"
         "                                 G for Gaussian distribution.\n"

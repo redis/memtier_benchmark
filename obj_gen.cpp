@@ -481,7 +481,14 @@ const char *object_generator::get_value(unsigned long long key_index, unsigned i
         new_size = m_data_size.size_fixed;
     } else if (m_data_size_type == data_size_range) {
         if (m_data_size_pattern && *m_data_size_pattern == 'S') {
-            double a = (key_index - m_key_min) / static_cast<double>(m_key_max - m_key_min);
+            // Clamp into the key range: an index below m_key_min would wrap
+            // the unsigned subtraction, and a single-key range would divide
+            // 0 by 0. Either way the out-of-range double would then be
+            // converted to unsigned int (undefined behaviour).
+            if (key_index < m_key_min) key_index = m_key_min;
+            if (key_index > m_key_max) key_index = m_key_max;
+            double a = 0;
+            if (m_key_max > m_key_min) a = (key_index - m_key_min) / static_cast<double>(m_key_max - m_key_min);
             new_size = (m_data_size.size_range.size_max - m_data_size.size_range.size_min) * a +
                        m_data_size.size_range.size_min;
         } else {

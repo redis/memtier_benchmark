@@ -497,18 +497,25 @@ get_key_response client::get_key_for_conn(unsigned int command_index, unsigned i
 // A bare __data__ (other than as the first argument) is left for
 // format_arbitrary_command() to mark data_type: write_monitor_command_args()
 // writes the value at send time, without copying it into the command.
+// Each __data__ is sized under --data-size-pattern=S by the most recent
+// __key__ before it, as in create_arbitrary_request().
 void client::resolve_monitor_placeholders(arbitrary_command &cmd, unsigned int command_index, unsigned int conn_id)
 {
+    // 0 until the first __key__: get_value() clamps it to --key-minimum.
+    unsigned long long last_key_index = 0;
     // Argument 0 is the command name.
     for (size_t i = 1; i < cmd.command_args.size(); i++) {
         command_arg &arg = cmd.command_args[i];
         size_t pos = arg.data.find(KEY_PLACEHOLDER);
         if (pos == std::string::npos) {
+            arg.data_key_index = last_key_index;
             // The first argument is what cluster mode routes by, so a bare
-            // __data__ there is filled in now rather than at send time.
+            // __data__ there is filled in now rather than at send time. No
+            // __key__ precedes it, so it gets the minimum size under
+            // --data-size-pattern=S (the index 0 is clamped to --key-minimum).
             if (i == 1 && arg.data == DATA_PLACEHOLDER) {
                 unsigned int value_len;
-                const char *value = m_obj_gen->get_value(0, &value_len);
+                const char *value = m_obj_gen->get_value(last_key_index, &value_len);
                 assert(value != NULL);
                 assert(value_len > 0);
                 arg.data.assign(value, value_len);
@@ -516,14 +523,13 @@ void client::resolve_monitor_placeholders(arbitrary_command &cmd, unsigned int c
             }
             continue;
         }
-        // get_key_for_conn() requires the out-param; the key itself is read
-        // back from m_obj_gen, so the index is not needed here.
         unsigned long long key_index;
         // Base-class lookup: cluster_client routes by the resolved key
         // afterwards, so its per-shard key pool must not be used here.
         get_key_response res = client::get_key_for_conn(command_index, conn_id, &key_index);
         assert(res == available_for_conn);
         (void) res;
+        last_key_index = key_index;
         arg.data.replace(pos, strlen(KEY_PLACEHOLDER), m_obj_gen->get_key(), m_obj_gen->get_key_len());
         arg.resolved = true;
     }
@@ -542,7 +548,7 @@ int client::write_monitor_command_args(const arbitrary_command &cmd, unsigned in
             cmd_size += m_connections[conn_id]->send_arbitrary_command(arg);
         } else if (arg->type == data_type) {
             unsigned int value_len;
-            const char *value = m_obj_gen->get_value(0, &value_len);
+            const char *value = m_obj_gen->get_value(arg->data_key_index, &value_len);
             assert(value != NULL);
             assert(value_len > 0);
             cmd_size += m_connections[conn_id]->send_arbitrary_command(arg, value, value_len);
@@ -615,6 +621,10 @@ bool client::create_arbitrary_request(unsigned int command_index, struct timeval
 
     // Normal arbitrary command handling
     const bool scan_incremental_iteration = m_config->scan_incremental_iteration;
+    // Key index of the last __key__ sent, which sizes a following __data__
+    // under --data-size-pattern=S the way create_set_request() does. With no
+    // preceding __key__, get_value() clamps 0 to --key-minimum.
+    unsigned long long data_key_index = 0;
     for (unsigned int i = 0; i < cmd.command_args.size(); i++) {
         const command_arg *arg = &cmd.command_args[i];
         if (arg->type == const_type) {
@@ -633,11 +643,13 @@ bool client::create_arbitrary_request(unsigned int command_index, struct timeval
                 // Same rotation as the cached key: regenerate the identical key
                 // string without advancing the per-iter key cursor.
                 m_obj_gen->generate_key(m_txn_rotation_key_index);
+                data_key_index = m_txn_rotation_key_index;
             } else {
                 unsigned long long key_index;
                 get_key_response res = get_key_for_conn(command_index, conn_id, &key_index);
                 /* If key not available for this connection, we have a bug of sending partial request */
                 assert(res == available_for_conn);
+                data_key_index = key_index;
                 if (txn_reuse) {
                     // First keyed command of the rotation: adopt this key for
                     // the rest of the rotation.
@@ -697,7 +709,7 @@ bool client::create_arbitrary_request(unsigned int command_index, struct timeval
             }
         } else if (arg->type == data_type) {
             unsigned int value_len;
-            const char *value = m_obj_gen->get_value(0, &value_len);
+            const char *value = m_obj_gen->get_value(data_key_index, &value_len);
 
             assert(value != NULL);
             assert(value_len > 0);
