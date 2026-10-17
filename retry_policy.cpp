@@ -260,6 +260,8 @@ void failed_keys_logger::log_failure(const struct timeval &ts, const char *comma
 
 failed_keys_logger &global_failed_keys_logger()
 {
-    static failed_keys_logger inst;
-    return inst;
+    // Never destroyed: main() closes it, and a worker thread may still log
+    // while exit() runs the static destructors (the mutex would be gone).
+    static failed_keys_logger *inst = new failed_keys_logger;
+    return *inst;
 }

@@ -264,7 +264,8 @@ Default: 0 (auto = max(pipeline * 4, 64)).
 \fB\-\-failed\-keys\-file\fR=\fI\,PATH\/\fR
 Append every request that ultimately fails (retries exhausted or
 permanent error) as CSV: timestamp,command,key,status,retries.
-Off by default. The benchmark continues if the file is unwritable.
+Off by default. Exits 1 at startup if the file cannot be opened;
+a later write error stops logging and the run exits 1.
 .TP
 \fB\-\-connection\-timeout\fR=\fI\,SECS\/\fR
 Connection timeout in seconds, 0 to disable (default: 0)

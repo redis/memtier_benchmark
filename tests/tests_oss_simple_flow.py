@@ -2044,7 +2044,6 @@ def test_connection_stage_abort_keeps_rc_2_on_write_error(env):
     env.assertContains("error: failed writing --out-file /dev/full: No space left on device", stderr)
 
 
-
 def _symlink_to_dev_full(directory, names):
     """Make each of names in directory a symlink to /dev/full; return their paths."""
     paths = [os.path.join(directory, name) for name in names]
@@ -2073,6 +2072,62 @@ def test_hdr_file_write_error(env):
             env.assertContains("error: failed writing --hdr-file-prefix file {}: ".format(path), stderr)
         for name in ['h_SET_command_run_1.hgrm', 'h_GET_command_run_1.txt']:
             env.assertGreater(os.path.getsize(os.path.join(hdr_dir, name)), 0)
+
+
+def _check_one_hdr_file_fails(env, extra_args, name):
+    """Only the HDR file name fails (a /dev/full symlink); the run must still exit 1."""
+    with tempfile.TemporaryDirectory() as hdr_dir:
+        prefix = os.path.join(hdr_dir, 'h')
+        path, = _symlink_to_dev_full(hdr_dir, [name])
+        rc, stderr = _run_with_unwritable_output(env, ['--hdr-file-prefix', prefix] + extra_args,
+                                                 subprocess.DEVNULL)
+        env.assertEqual(rc, 1, message=name + ': ' + stderr)
+        env.assertEqual(stderr.count("error: failed writing --hdr-file-prefix file"), 1, message=stderr)
+        env.assertContains("error: failed writing --hdr-file-prefix file {}: ".format(path), stderr)
+
+
+# One test per HDR writer, failing exactly one file at a time: the .txt
+# (first) and the .hgrm (second) file of each writer must both fail the run.
+
+def test_hdr_full_run_file_write_error(env):
+    """Only one full-run HDR file fails: the run exits 1 (#744)."""
+    if not os.path.exists('/dev/full'):
+        env.skip()
+        return
+    for name in ['h_FULL_RUN_1.txt', 'h_FULL_RUN_1.hgrm']:
+        _check_one_hdr_file_fails(env, [], name)
+
+
+def test_hdr_set_command_file_write_error(env):
+    """Only one SET HDR file fails: the run exits 1 (#744)."""
+    if not os.path.exists('/dev/full'):
+        env.skip()
+        return
+    for name in ['h_SET_command_run_1.txt', 'h_SET_command_run_1.hgrm']:
+        _check_one_hdr_file_fails(env, [], name)
+
+
+def test_hdr_get_command_file_write_error(env):
+    """Only one GET HDR file fails: the run exits 1 (#744)."""
+    if not os.path.exists('/dev/full'):
+        env.skip()
+        return
+    for name in ['h_GET_command_run_1.txt', 'h_GET_command_run_1.hgrm']:
+        _check_one_hdr_file_fails(env, [], name)
+
+
+def test_hdr_arbitrary_command_file_write_error(env):
+    """Only one HDR file of a --command fails: the run exits 1 (#744).
+
+    The second command's files are used, so a failure that a later
+    command's success would hide is caught too.
+    """
+    if not os.path.exists('/dev/full'):
+        env.skip()
+        return
+    commands = ['--command', 'SET __key__ __data__', '--command', 'GET __key__']
+    for name in ['h_SET_command_run_1.txt', 'h_GET_command_run_1.txt', 'h_GET_command_run_1.hgrm']:
+        _check_one_hdr_file_fails(env, commands, name)
 
 
 def test_client_stats_write_error(env):
@@ -2159,12 +2214,38 @@ def test_failed_keys_file_write_error(env):
     env.assertNotContains("Preparing benchmark client", stderr)
 
 
+def _file_size_limit_allowed(limit):
+    """True if this process may raise its own RLIMIT_FSIZE soft limit to limit."""
+    hard = resource.getrlimit(resource.RLIMIT_FSIZE)[1]
+    return hard == resource.RLIM_INFINITY or hard >= limit
+
+
 def _limit_file_size(limit):
     """preexec_fn: cap the size of regular files the child writes; a write past it fails with EFBIG."""
     def apply():
         signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
         resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
     return apply
+
+
+def _check_failed_keys_record_write_error(env, extra_args):
+    limit = 1 << 20
+    if not _file_size_limit_allowed(limit):
+        env.skip()
+        return
+    with tempfile.TemporaryDirectory() as log_dir:
+        path = os.path.join(log_dir, 'failed-keys.csv')
+        with open(path, 'w') as f:
+            f.write('timestamp,command,key,status,retries\n')
+            f.write('#' * (limit - f.tell() - 1) + '\n')
+        rc, stderr = _run_with_oom_sets(env, ['--failed-keys-file', path] + extra_args,
+                                        preexec_fn=_limit_file_size(limit))
+        env.assertEqual(rc, 1, message=stderr)
+        env.assertContains("Preparing benchmark client", stderr)
+        env.assertContains("error: failed writing --failed-keys-file {}: File too large; logging disabled."
+                           .format(path), stderr)
+        env.assertEqual(stderr.count("error: failed writing --failed-keys-file"), 1, message=stderr)
+        env.assertEqual(os.path.getsize(path), limit)
 
 
 def test_failed_keys_file_record_write_error(env):
@@ -2174,19 +2255,12 @@ def test_failed_keys_file_record_write_error(env):
     works and every record fails with EFBIG. The other files stay far below
     the limit. The run goes on without the log.
     """
-    limit = 1 << 20
-    with tempfile.TemporaryDirectory() as log_dir:
-        path = os.path.join(log_dir, 'failed-keys.csv')
-        with open(path, 'w') as f:
-            f.write('timestamp,command,key,status,retries\n')
-            f.write('#' * (limit - f.tell() - 1) + '\n')
-        rc, stderr = _run_with_oom_sets(env, ['--failed-keys-file', path], preexec_fn=_limit_file_size(limit))
-        env.assertEqual(rc, 1, message=stderr)
-        env.assertContains("Preparing benchmark client", stderr)
-        env.assertContains("error: failed writing --failed-keys-file {}: File too large; logging disabled."
-                           .format(path), stderr)
-        env.assertEqual(stderr.count("error: failed writing --failed-keys-file"), 1, message=stderr)
-        env.assertEqual(os.path.getsize(path), limit)
+    _check_failed_keys_record_write_error(env, [])
+
+
+def test_failed_keys_file_record_write_error_threads(env):
+    """Same, with 16 connections over 4 threads logging through the shared logger (#744)."""
+    _check_failed_keys_record_write_error(env, ['--threads', '4', '--clients', '4'])
 
 
 def test_failed_keys_file_stdout_reader_gone(env):

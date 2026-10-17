@@ -374,7 +374,7 @@ public:
     unsigned int count_unended_clients(void);
     void end_stalled_clients(void);
 
-    bool write_client_stats(const char *prefix, unsigned int *failures);
+    void write_client_stats(const char *prefix, unsigned int *failures);
 
     struct event_base *get_event_base(void) { return m_base; }
     benchmark_config *get_config(void) { return m_config; }
