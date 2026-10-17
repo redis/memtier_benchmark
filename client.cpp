@@ -1299,6 +1299,16 @@ void verify_client::handle_response(unsigned int conn_id, struct timeval timesta
     }
 }
 
+bool verify_client::verification_complete() const
+{
+    // GET/MGET/WAIT positions issue no verification request, but still count
+    // toward the generated request budget.
+    // Each SET position issues one verification GET; retries must end in a
+    // matching or failed reply before the pass can be considered complete.
+    return m_config->requests > 0 && m_reqs_generated >= m_config->requests &&
+           m_verified_keys + m_errors == m_tot_set_ops;
+}
+
 bool verify_client::finished(void)
 {
     if (m_finished) return true;

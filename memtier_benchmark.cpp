@@ -6064,6 +6064,9 @@ int main(int argc, char *argv[])
         } else if (verified_keys == 0) {
             fprintf(stderr, "error: no keys were verified\n");
             verify_failed = true;
+        } else if (!client->verification_complete()) {
+            fprintf(stderr, "error: data verification did not complete\n");
+            verify_failed = true;
         }
 
         // Clean up...
@@ -6180,7 +6183,7 @@ int main(int argc, char *argv[])
     if (g_worker_failed) {
         return 1;
     }
-    // An output could not be written (see g_output_failed).
+    // An output could not be written, or data verification failed.
     if (g_output_failed || verify_failed) {
         return 1;
     }

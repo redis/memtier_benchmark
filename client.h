@@ -316,6 +316,7 @@ protected:
                                  protocol_response *response);
 
 public:
+    bool verification_complete() const;
     verify_client(struct event_base *event_base, benchmark_config *config, abstract_protocol *protocol,
                   object_generator *obj_gen);
     unsigned long long int get_verified_keys(void);

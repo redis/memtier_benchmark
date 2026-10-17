@@ -385,9 +385,13 @@ If any checked key is missing, has the wrong value, or returns an error,
 memtier prints `error: N of M keys failed verification` and exits with status
 **1**. A pass that verifies no key (for example, because the server is
 unreachable) prints `error: no keys were verified` and also exits with **1**.
-Successful verification exits with **0**, unless another run or output error
-occurred. A benchmark connection-stage abort still takes precedence and exits
-with **2**. Import and verification remain unsupported in cluster mode.
+A connection lost after some successful replies also exits with **1** if the
+verification pass did not complete. Successful verification exits with **0**,
+unless another run or output error occurred. A benchmark connection-stage abort
+still takes precedence and exits with **2**. Import and verification remain
+unsupported in cluster mode.
+Imported keys that expire before verification count as missing; use
+`--no-expiry` to ignore expiry times in the import file when that is intended.
 
 ### Closed stdin, stdout or stderr
 

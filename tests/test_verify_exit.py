@@ -4,6 +4,7 @@ import os
 import socket
 import subprocess
 import tempfile
+import threading
 
 from include import MEMTIER_BINARY, addTLSArgs
 
@@ -38,6 +39,8 @@ def _run(env, state, verify_only=True, extra=(), port=None):
             if password:
                 args.extend(["-a", password])
             addTLSArgs({"args": args}, env)
+            if "--unix-socket" in extra:
+                del args[1:5]  # --server/--port conflict with the explicit socket.
             args.extend(extra)
             result = subprocess.run(args, capture_output=True, text=True, timeout=20)
             with open(output) as f:
@@ -79,12 +82,23 @@ def test_verify_only_success(env):
 
 
 def test_data_verify_success(env):
+    # The benchmark first writes the missing keys, then verifies them.
     _check(env, "missing", 2, 0, verify_only=False)
 
 
 def test_data_verify_error_reply(env):
     # SETRANGE and GETRANGE both fail on the list; the other key verifies.
     _check(env, "wrongtype", 1, 1, verify_only=False, extra=("--data-offset=1",))
+
+
+def test_verify_only_wraps_import(env):
+    _check(env, "correct", 5, 0, extra=("-n", "5"))
+
+
+def test_verify_only_default_ratio(env):
+    # Only SET positions issue verification GETs; skipped GET positions still
+    # consume the request budget. The pass must not require five replies.
+    _check(env, "correct", 1, 0, extra=("--ratio=1:10", "-n", "5"))
 
 
 def test_verify_only_no_replies(env):
@@ -100,3 +114,52 @@ def test_verify_only_no_replies(env):
     env.assertEqual(counts["keys failed"], 0)
     env.assertEqual(result.returncode, 1, message=result.stderr)
     env.assertContains("error: no keys were verified", result.stderr)
+
+
+def test_verify_only_partial_disconnect(env):
+    if env.isCluster() or env.useTLS:
+        env.skip()  # This scripted peer speaks plaintext RESP on a Unix socket.
+        return
+    with tempfile.TemporaryDirectory() as directory, socket.socket(socket.AF_UNIX) as server:
+        path = os.path.join(directory, "peer.sock")
+        server.bind(path)
+        server.listen(1)
+        server.settimeout(10)
+        errors = []
+
+        def respond():
+            try:
+                with server.accept()[0] as conn:
+                    conn.settimeout(10)
+                    with conn.makefile("rb") as stream:
+                        gets = 0
+                        while True:
+                            line = stream.readline()
+                            if not line:
+                                return
+                            args = []
+                            for _ in range(int(line[1:])):
+                                size = int(stream.readline()[1:])
+                                args.append(stream.read(size + 2)[:-2])
+                            if args[0].upper() == b"GET":
+                                gets += 1
+                                if gets == 2:
+                                    return  # Drop after one successful verification.
+                                conn.sendall(b"$3\r\nabc\r\n")
+                            else:
+                                conn.sendall(b"+OK\r\n")
+            except Exception as error:
+                errors.append(repr(error))
+
+        thread = threading.Thread(target=respond, daemon=True)
+        thread.start()
+        try:
+            result, counts = _run(env, "correct", extra=("--unix-socket", path))
+        finally:
+            thread.join(timeout=12)
+        env.assertFalse(thread.is_alive())
+        env.assertEqual(errors, [])
+        env.assertEqual(counts["keys verified successfuly"], 1)
+        env.assertEqual(counts["keys failed"], 0)
+        env.assertEqual(result.returncode, 1, message=result.stderr)
+        env.assertContains("error: data verification did not complete", result.stderr)
