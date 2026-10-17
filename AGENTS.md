@@ -2,6 +2,22 @@
 
 This document provides guidance for AI agents working with the memtier_benchmark codebase.
 
+## Claude and Codex interoperability
+
+`AGENTS.md` is the shared guide; `CLAUDE.md` links to this file so both agents load
+identical instructions. Skills are maintained under `.claude/skills/` and exposed
+to Codex through `.agents/skills`, which links to the same directory. Keep each
+skill's references and scripts beside its `SKILL.md` so both clients resolve them.
+
+Use `/adversarial-review` or `/memtier-maintainer-review` in Claude, and
+`$adversarial-review` or `$memtier-maintainer-review` in Codex. Both entry points
+load the same workflow. Add new skills to the shared directory, not a separate copy.
+
+This repository does not require an MCP server. Personal or parent-workspace MCP
+connections are configured separately in each client; do not commit credentials or
+machine-specific server settings here. Run `python3 utils/check_agent_parity.py`
+after changing agent instructions or skills to verify the shared entry points.
+
 ## Project Overview
 
 memtier_benchmark is a high-performance load generation and benchmarking tool for NoSQL databases (Redis and Memcached) developed by Redis. It is written in C++ and uses libevent for async I/O.
