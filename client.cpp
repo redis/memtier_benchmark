@@ -439,8 +439,7 @@ bool client::abandon_unanswered_requests(unsigned long long *unanswered, unsigne
     // The run measured --test-time, not the grace period spent waiting.
     struct timeval end_time = m_stats.get_start_time();
     end_time.tv_sec += m_config->test_time;
-    m_stats.set_end_time(&end_time);
-    m_end_set = true;
+    set_end_time_at(&end_time);
     // The caller reports the requests held for retry with the others.
     *held += disconnect_and_abandon_held();
     return true;
@@ -454,8 +453,9 @@ void client::set_end_time_at(struct timeval *end_time)
         // A connection whose setup the server rejected since its last reply
         // (a required replica, say) and that never recovered fails the run
         // (#630), also when another connection ends the client first. Apply
-        // this both at a normal end and when a failed connect caps the stats
-        // at the deadline: which connection ends first is only timing.
+        // this at a normal end and when a failed connect or drain-grace expiry
+        // caps the stats at the deadline: which connection ends first is only
+        // timing.
         for (unsigned int i = 0; i < m_connections.size(); i++) {
             shard_connection *sc = m_connections[i];
             if (sc != NULL && sc->stops_at_deadline() && sc->setup_failed_since_reply()) m_run_failed = true;

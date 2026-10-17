@@ -226,10 +226,14 @@ int main()
     // A rejected sibling can be disconnected with no retry pending (for
     // example after a failed dial during a slot refresh). Another connection
     // ending the client must preserve the required sibling's setup failure,
-    // both on a normal end and when stats are capped at the deadline.
+    // on normal completion, a failed connect, and drain-grace expiry.
+    config.retry_on_error = true;
+    config.max_retry_queue = 10;
+    config.max_retries = 5;
+    config.retry_backoff_ms = 100;
     const enum read_pref_mode modes[] = {rp_primary, rp_secondary_preferred, rp_secondary};
     for (unsigned int mode = 0; mode < sizeof(modes) / sizeof(modes[0]); ++mode) {
-        for (unsigned int at_deadline = 0; at_deadline < 2; ++at_deadline) {
+        for (unsigned int end_path = 0; end_path < 3; ++end_path) {
             config.read_preference = modes[mode];
             object_generator generator;
             generator.set_data_size_fixed(1);
@@ -244,15 +248,30 @@ int main()
             check(!manager.run_failed(), "the sibling has not ended the run yet");
             second.disconnect();
             check(first.siblings_done(), "the rejected sibling has no retry or reply pending");
-            if (at_deadline) {
-                first.end_client_after_run(true);
-                check(manager.get_stats()->get_duration_usec() == config.test_time * 1000000ULL,
-                      "the reconnect end caps stats at the deadline");
-            } else {
+            if (end_path == 0) {
                 manager.set_end_time();
+            } else if (end_path == 1) {
+                first.end_client_after_run(true);
+            } else {
+                struct timeval old_start = config.benchmark_start_time;
+                old_start.tv_sec -= 30;
+                manager.mark_started(&old_start);
+                request *req = new request(rt_set, 0, NULL, 1);
+                req->m_serialized = strdup("*1\r\n$4\r\nPING\r\n");
+                req->m_serialized_len = strlen(req->m_serialized);
+                bool queued = first.enqueue_retry(req);
+                check(queued, "a held retry keeps the client waiting through drain grace");
+                if (!queued) delete req;
+                unsigned long long unanswered = 0, held = 0;
+                check(manager.abandon_unanswered_requests(&unanswered, &held), "drain grace expires");
+                check(held == 1 && unanswered == 0, "the held retry is accounted once at drain grace");
+            }
+            if (end_path != 0) {
+                check(manager.get_stats()->get_duration_usec() == config.test_time * 1000000ULL,
+                      "reconnect and drain-grace endings cap stats at the deadline");
             }
             check(manager.end_time_set(), "the client was finalized");
-            check(manager.run_failed() == required, "both finalization paths preserve required replica setup failure");
+            check(manager.run_failed() == required, "all completion paths preserve required replica setup failure");
         }
     }
     delete protocol;
