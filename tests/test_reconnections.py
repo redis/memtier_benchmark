@@ -12,6 +12,14 @@ from include import *
 from mb import Benchmark, RunConfig
 
 
+def _add_auth_args(benchmark_specs, env):
+    """--authenticate with the env's password (e.g. --oss_password), so
+    memtier's clients get a session the kills below can target."""
+    password = env.getOSSMasterNodesConnectionList()[0].connection_pool.connection_kwargs.get("password")
+    if password:
+        benchmark_specs["args"].append("--authenticate=" + password)
+
+
 def _run_with_memtier_kills(env, benchmark, config, conns, waves, timeout=60):
     """Run memtier and kill its connections in `waves` waves.
 
@@ -87,6 +95,7 @@ def test_reconnect_on_connection_kill(env):
         ],
     }
     addTLSArgs(benchmark_specs, env)
+    _add_auth_args(benchmark_specs, env)
 
     config = get_default_memtier_config(threads=2, clients=2, requests=20000)
     master_nodes_list = env.getMasterNodesList()
@@ -157,6 +166,7 @@ def test_reconnect_cluster_mode_no_assertion(env):
         ],
     }
     addTLSArgs(benchmark_specs, env)
+    _add_auth_args(benchmark_specs, env)
 
     config = get_default_memtier_config(threads=4, clients=2, requests=None, test_time=10)
     master_nodes_list = env.getMasterNodesList()
@@ -271,6 +281,7 @@ def test_reconnect_unlimited_no_spurious_thread_restart(env):
         ],
     }
     addTLSArgs(benchmark_specs, env)
+    _add_auth_args(benchmark_specs, env)
 
     config = get_default_memtier_config(threads=2, clients=2, requests=20000)
     master_nodes_list = env.getMasterNodesList()
@@ -327,6 +338,7 @@ def test_reconnect_disabled_by_default(env):
         ],
     }
     addTLSArgs(benchmark_specs, env)
+    _add_auth_args(benchmark_specs, env)
 
     config = get_default_memtier_config(threads=1, clients=1, requests=100000)
     master_nodes_list = env.getMasterNodesList()
