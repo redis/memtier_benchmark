@@ -757,23 +757,23 @@ void run_stats::save_csv_arbitrary_commands(FILE *f, arbitrary_command_list &com
     }
 }
 
-// Opens an output file for writing. On failure prints the error, naming the
-// option the file belongs to, and returns NULL.
-static FILE *open_option_file(const char *option, const char *filename)
+// Opens an output file for writing. On failure prints the error (if report),
+// naming the option the file belongs to, and returns NULL.
+static FILE *open_option_file(const char *option, const char *filename, bool report = true)
 {
     FILE *f = fopen(filename, "w");
-    if (!f) fprintf(stderr, "error: cannot open %s file %s: %s\n", option, filename, strerror(errno));
+    if (!f && report) fprintf(stderr, "error: cannot open %s file %s: %s\n", option, filename, strerror(errno));
     return f;
 }
 
 // Flushes, checks and closes an output file opened by open_option_file().
-// Returns false, after printing the error, if any write to it failed (e.g.
-// a full disk); main() then exits 1, as for --out-file.
-static bool close_option_file(FILE *f, const char *option, const char *filename)
+// Returns false, after printing the error (if report), if any write to it
+// failed (e.g. a full disk); main() then exits 1, as for --out-file.
+static bool close_option_file(FILE *f, const char *option, const char *filename, bool report = true)
 {
     int err = close_output_file(f);
     if (err != 0) {
-        fprintf(stderr, "error: failed writing %s file %s: %s\n", option, filename, strerror(err));
+        if (report) fprintf(stderr, "error: failed writing %s file %s: %s\n", option, filename, strerror(err));
         return false;
     }
     return true;
@@ -1041,9 +1041,9 @@ bool run_stats::save_hdr_arbitrary_commands(benchmark_config *config, int run_nu
     return ok;
 }
 
-bool run_stats::save_csv(const char *filename, benchmark_config *config)
+bool run_stats::save_csv(const char *filename, benchmark_config *config, bool report_error)
 {
-    FILE *f = open_option_file("--client-stats", filename);
+    FILE *f = open_option_file("--client-stats", filename, report_error);
     if (!f) return false;
 
     if (print_arbitrary_commands_results()) {
@@ -1052,7 +1052,7 @@ bool run_stats::save_csv(const char *filename, benchmark_config *config)
         save_csv_set_get_commands(f, config->cluster_mode);
     }
 
-    return close_option_file(f, "--client-stats", filename);
+    return close_option_file(f, "--client-stats", filename, report_error);
 }
 
 void run_stats::debug_dump(void)

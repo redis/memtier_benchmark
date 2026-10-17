@@ -132,9 +132,8 @@ bool failed_keys_logger::open(const char *path)
     }
     m_fp = fopen(path, "a");
     if (!m_fp) {
-        // The run goes on, but close() reports the error and main() exits 1.
         m_err = errno;
-        fprintf(stderr, "error: cannot open --failed-keys-file %s: %s; logging disabled.\n", path, strerror(m_err));
+        fprintf(stderr, "error: cannot open --failed-keys-file %s: %s\n", path, strerror(m_err));
         m_disabled = true;
         pthread_mutex_unlock(&m_mtx);
         return false;
@@ -147,10 +146,19 @@ bool failed_keys_logger::open(const char *path)
     if (pos == 0) {
         fprintf(m_fp, "timestamp,command,key,status,retries\n");
     }
+    // A header that cannot be written (e.g. a full disk) fails like the open.
     int err = finish_output_file(m_fp, false);
-    if (err != 0) write_failed_locked(err);
+    if (err != 0 && !stdout_reader_gone(m_fp, err)) {
+        m_err = err;
+        fprintf(stderr, "error: failed writing --failed-keys-file %s: %s\n", path, strerror(err));
+    }
+    if (err != 0) {
+        m_disabled = true;
+        fclose(m_fp);
+        m_fp = NULL;
+    }
     pthread_mutex_unlock(&m_mtx);
-    return err == 0;
+    return m_err == 0;
 }
 
 // Called with m_mtx held when a write (or the flush that performs it) failed,
@@ -239,6 +247,7 @@ void failed_keys_logger::log_failure(const struct timeval &ts, const char *comma
     const std::string keyfield = csv_escape(key ? key : "", key ? key_len : 0);
     const std::string statusfield = csv_escape(status ? status : "", status ? (unsigned int) strlen(status) : 0);
 
+    errno = 0;
     int rc = fprintf(m_fp, "%s,%s,%s,%s,%u\n", tsbuf, command ? command : "UNKNOWN", keyfield.c_str(),
                      statusfield.c_str(), retries);
     // Flush per-record so a crash doesn't lose the trailing window. Failed

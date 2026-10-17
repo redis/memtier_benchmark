@@ -382,7 +382,9 @@ public:
     bool save_hdr_get_command(benchmark_config *config, int run_number);
     bool save_hdr_arbitrary_commands(benchmark_config *config, int run_number);
 
-    bool save_csv(const char *filename, benchmark_config *config);
+    // Returns false if the file could not be opened or written; prints why
+    // only if report_error.
+    bool save_csv(const char *filename, benchmark_config *config, bool report_error = true);
     void debug_dump(void);
 
     // function to handle the results output

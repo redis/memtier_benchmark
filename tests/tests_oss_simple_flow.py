@@ -9,6 +9,7 @@ import os
 import fcntl
 import socket
 import struct
+import resource
 from include import *
 from mb import Benchmark, RunConfig
 
@@ -1924,7 +1925,7 @@ def test_startup_error_keeps_output_files_data_import(env):
 
 
 def _start_memtier(env, work_dir, extra_args, stdout, drop_default_out_file=False, prefix=None, requests=10,
-                   test_time=None):
+                   test_time=None, preexec_fn=None):
     """Start a short benchmark whose output goes to extra_args/stdout; return the Popen.
 
     The results and memtier's stderr (work_dir/memtier.stderr) go under
@@ -1950,7 +1951,7 @@ def _start_memtier(env, work_dir, extra_args, stdout, drop_default_out_file=Fals
         proc_env = dict(os.environ)
         proc_env['ASAN_OPTIONS'] = (proc_env.get('ASAN_OPTIONS', '') + ':verify_asan_link_order=0').lstrip(':')
     with open(_memtier_stderr_path(work_dir), 'wb') as stderr:
-        return subprocess.Popen(args, stdout=stdout, stderr=stderr, env=proc_env)
+        return subprocess.Popen(args, stdout=stdout, stderr=stderr, env=proc_env, preexec_fn=preexec_fn)
 
 
 def _memtier_stderr_path(work_dir):
@@ -2088,25 +2089,66 @@ def test_client_stats_write_error(env):
                            stderr)
 
 
-def _run_with_oom_sets(env, extra_args, closed_stdout_pipe=False):
+def test_hdr_file_prefix_missing_directory(env):
+    """--hdr-file-prefix files that cannot be opened fail the run (#744).
+
+    They are only created when the run ends, so this is reported then.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        prefix = os.path.join(tmp_dir, 'missing', 'h')
+        rc, stderr = _run_with_unwritable_output(env, ['--hdr-file-prefix', prefix], subprocess.DEVNULL)
+        env.assertEqual(rc, 1, message=stderr)
+        env.assertContains("error: cannot open --hdr-file-prefix file {}_FULL_RUN_1.txt: No such file or directory"
+                           .format(prefix), stderr)
+
+
+def test_client_stats_missing_directory(env):
+    """--client-stats CSVs that cannot be opened fail the run, reported once (#744).
+
+    Only the first file is named, then the count of the others.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        prefix = os.path.join(tmp_dir, 'missing', 'cs')
+        rc, stderr = _run_with_unwritable_output(env, ['--client-stats', prefix, '--clients', '3'],
+                                                 subprocess.DEVNULL)
+        env.assertEqual(rc, 1, message=stderr)
+        env.assertContains("error: cannot open --client-stats file {}-1-0-0.csv: No such file or directory"
+                           .format(prefix), stderr)
+        env.assertEqual(stderr.count("error: cannot open --client-stats file"), 1, message=stderr)
+        env.assertContains("error: 2 more --client-stats files could not be written", stderr)
+
+
+def _run_with_oom_sets(env, extra_args, closed_stdout_pipe=False, **kwargs):
     """Run SETs that all fail with -OOM, so each one is logged to --failed-keys-file."""
     conns = env.getOSSMasterNodesConnectionList()
+    saved = [conn.execute_command('CONFIG', 'GET', 'maxmemory')[1] for conn in conns]
     for conn in conns:
         conn.execute_command('CONFIG', 'SET', 'maxmemory', '1')
     try:
         if closed_stdout_pipe:
             return _closed_pipe_run(env, ['--ratio', '1:0'] + extra_args)
-        return _run_with_unwritable_output(env, ['--ratio', '1:0'] + extra_args, subprocess.DEVNULL)
+        return _run_with_unwritable_output(env, ['--ratio', '1:0'] + extra_args, subprocess.DEVNULL, **kwargs)
     finally:
-        for conn in conns:
-            conn.execute_command('CONFIG', 'SET', 'maxmemory', '0')
+        for conn, value in zip(conns, saved):
+            conn.execute_command('CONFIG', 'SET', 'maxmemory', value)
+
+
+def test_failed_keys_file_missing_directory(env):
+    """A --failed-keys-file that cannot be opened fails at startup (#744), like --out-file."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        path = os.path.join(tmp_dir, 'missing', 'failed-keys.csv')
+        rc, stderr = _run_with_unwritable_output(env, ['--failed-keys-file', path], subprocess.DEVNULL)
+        env.assertEqual(rc, 1, message=stderr)
+        env.assertContains("error: cannot open --failed-keys-file {}: No such file or directory".format(path),
+                           stderr)
+        env.assertNotContains("Preparing benchmark client", stderr)
 
 
 def test_failed_keys_file_write_error(env):
-    """A --failed-keys-file that cannot be written fails the run (#744).
+    """A --failed-keys-file whose header cannot be written fails at startup (#744).
 
-    The records were flushed, but the failed flush was not checked, so no
-    record reached the file and memtier exited 0 without a message.
+    The flush was not checked, so nothing reached the file and memtier
+    exited 0 without a message.
     """
     if not os.path.exists('/dev/full'):
         env.skip()
@@ -2114,6 +2156,37 @@ def test_failed_keys_file_write_error(env):
     rc, stderr = _run_with_oom_sets(env, ['--failed-keys-file', '/dev/full'])
     env.assertEqual(rc, 1, message=stderr)
     env.assertContains("error: failed writing --failed-keys-file /dev/full: No space left on device", stderr)
+    env.assertNotContains("Preparing benchmark client", stderr)
+
+
+def _limit_file_size(limit):
+    """preexec_fn: cap the size of regular files the child writes; a write past it fails with EFBIG."""
+    def apply():
+        signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
+    return apply
+
+
+def test_failed_keys_file_record_write_error(env):
+    """A failed-keys record that cannot be written fails the run at the end (#744).
+
+    The log already holds its header and is at RLIMIT_FSIZE, so opening it
+    works and every record fails with EFBIG. The other files stay far below
+    the limit. The run goes on without the log.
+    """
+    limit = 1 << 20
+    with tempfile.TemporaryDirectory() as log_dir:
+        path = os.path.join(log_dir, 'failed-keys.csv')
+        with open(path, 'w') as f:
+            f.write('timestamp,command,key,status,retries\n')
+            f.write('#' * (limit - f.tell() - 1) + '\n')
+        rc, stderr = _run_with_oom_sets(env, ['--failed-keys-file', path], preexec_fn=_limit_file_size(limit))
+        env.assertEqual(rc, 1, message=stderr)
+        env.assertContains("Preparing benchmark client", stderr)
+        env.assertContains("error: failed writing --failed-keys-file {}: File too large; logging disabled."
+                           .format(path), stderr)
+        env.assertEqual(stderr.count("error: failed writing --failed-keys-file"), 1, message=stderr)
+        env.assertEqual(os.path.getsize(path), limit)
 
 
 def test_failed_keys_file_stdout_reader_gone(env):
@@ -2125,6 +2198,7 @@ def test_failed_keys_file_stdout_reader_gone(env):
     env.assertEqual(rc, 0, message=stderr)
     env.assertNotContains("--failed-keys-file", stderr)
 
+
 def test_failed_keys_file_written(env):
     """The same -OOM run with a writable --failed-keys-file logs every key and exits 0."""
     with tempfile.TemporaryDirectory() as log_dir:
@@ -2135,6 +2209,7 @@ def test_failed_keys_file_written(env):
             lines = f.read().splitlines()
         env.assertEqual(lines[0], 'timestamp,command,key,status,retries')
         env.assertEqual(len(lines), 11, message=stderr)
+
 
 def test_out_file_fifo_reader_exits_is_an_error(env):
     """An --out-file FIFO whose reader exits fails the run (#719).

@@ -4590,12 +4590,18 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     // Do we need to produce client stats?
     if (cfg->client_stats != NULL) {
         unsigned int cg_id = 0;
+        unsigned int failures = 0;
         fprintf(stderr, "[RUN %u] Writing client stats files...\n", run_id);
         for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
             char prefix[PATH_MAX];
 
             snprintf(prefix, sizeof(prefix) - 1, "%s-%u-%u", cfg->client_stats, run_id, cg_id++);
-            if (!(*i)->m_cg->write_client_stats(prefix)) g_output_failed = true;
+            (*i)->m_cg->write_client_stats(prefix, &failures);
+        }
+        if (failures > 0) {
+            if (failures > 1)
+                fprintf(stderr, "error: %u more --client-stats files could not be written\n", failures - 1);
+            g_output_failed = true;
         }
     }
 
@@ -5184,16 +5190,6 @@ int main(int argc, char *argv[])
         }
     }
 
-    // Open the failed-keys log if requested. A path that cannot be opened is
-    // reported but doesn't abort the benchmark; like a write error on the log,
-    // it makes memtier exit 1 at the end (see g_output_failed). A path that
-    // names a closed fd 0-2 was rejected after option parsing instead, because
-    // it opens fine (on /dev/null) and the log would be lost without any
-    // message.
-    if (cfg.failed_keys_file) {
-        global_failed_keys_logger().open(cfg.failed_keys_file);
-    }
-
     // Validate staircase options (after defaults are applied)
     if (cfg.clients_start > 0) {
         if (cfg.clients_start >= cfg.clients) {
@@ -5691,6 +5687,16 @@ int main(int argc, char *argv[])
         }
     }
 
+    // A --failed-keys-file that cannot be opened (or whose header cannot be
+    // written) fails now, as --out-file does, rather than after a whole run
+    // whose log would be lost. --out-file is not truncated yet, and
+    // --json-out-file not opened. A path that names a closed fd 0-2 was
+    // rejected after option parsing, because it opens fine (on /dev/null)
+    // and the log would be lost without any message.
+    if (cfg.failed_keys_file && !global_failed_keys_logger().open(cfg.failed_keys_file)) {
+        exit(1);
+    }
+
     // JSON file initiation
     json_handler *jsonhandler = NULL;
     if (cfg.json_out_file != NULL) {
@@ -5950,7 +5956,7 @@ int main(int argc, char *argv[])
     }
 
     // All worker threads are joined, so nothing logs failed keys any more.
-    // A log that could not be opened or written was reported when it happened.
+    // A record that could not be written was reported when it happened.
     if (cfg.failed_keys_file && global_failed_keys_logger().close() != 0) {
         g_output_failed = true;
     }

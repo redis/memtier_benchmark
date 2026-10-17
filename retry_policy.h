@@ -51,8 +51,9 @@ public:
     failed_keys_logger();
     ~failed_keys_logger();
 
-    // Open the log file. Idempotent. Returns true on success; on failure logs
-    // an error to stderr once and the instance becomes a no-op.
+    // Open the log file and write the CSV header to a new file. Idempotent.
+    // Returns true on success; on failure (open or header write) logs an
+    // error to stderr once and the instance becomes a no-op.
     bool open(const char *path);
     // Close the log file. Returns the errno of the first failure to open or
     // write it (reported on stderr when it happened), or 0 if there was none.

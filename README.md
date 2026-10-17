@@ -333,14 +333,25 @@ reader is still there (for example a full non-blocking pipe) still fails the
 run. Any other `--out-file` (for example a FIFO whose reader exits) and
 `--json-out-file` always fail the run when a write fails.
 
-The same rule covers the other output files: the HDR histogram files
-(`--hdr-file-prefix`), the `--client-stats` CSV files and
-`--failed-keys-file`. If one of them cannot be opened or written, memtier
-prints `error: cannot open --hdr-file-prefix file PATH: REASON` or `error:
-failed writing --client-stats file PATH: REASON` (or `--failed-keys-file
-PATH`), still writes the other files, and exits with status **1**. The run
-itself is not cut short: a `--failed-keys-file` that fails stops logging
-(`logging disabled`) and the benchmark goes on.
+The same rule covers the other output files:
+
+- `--failed-keys-file` is opened at startup, after option validation and
+  before connecting. If it cannot be opened, or its CSV header cannot be
+  written, memtier prints `error: cannot open --failed-keys-file PATH:
+  REASON` (or `failed writing`) and exits with status **1** right away, as
+  for `--out-file`. If a record cannot be written during the run, memtier
+  prints `error: failed writing --failed-keys-file PATH: REASON; logging
+  disabled.`, the benchmark goes on without the log, and memtier exits
+  with **1** at the end. A `--failed-keys-file` on stdout whose reader
+  went away (for example `/dev/stdout` and `| head`) only stops logging.
+- The HDR histogram files (`--hdr-file-prefix`) and the `--client-stats`
+  CSV files are only created when a run ends, so they cannot be checked at
+  startup. If one cannot be opened or written, memtier prints `error:
+  cannot open --hdr-file-prefix file PATH: REASON` or `error: failed
+  writing --client-stats file PATH: REASON`, still writes the other files,
+  and exits with **1**. For `--client-stats` only the first failing file of
+  a run is named, followed by `error: N more --client-stats files could not
+  be written`.
 
 A stdout that was already closed when memtier started is handled separately,
 see [Closed stdin, stdout or stderr](#closed-stdin-stdout-or-stderr).
