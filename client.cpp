@@ -399,6 +399,11 @@ void client::set_end_time_interrupted(struct timeval *end_time)
     // interrupt ended may have started after the interrupt time.
     struct timeval start_time = m_stats.get_start_time();
     if (m_stats.has_started() && timercmp(end_time, &start_time, <)) end_time = &start_time;
+    // Interrupting the drain after a timed run must not include the drain
+    // in its throughput denominator, just as normal deadline finalization.
+    struct timeval deadline = start_time;
+    deadline.tv_sec += m_config->test_time;
+    if (m_stats.has_started() && m_config->test_time > 0 && timercmp(end_time, &deadline, >)) end_time = &deadline;
     m_stats.set_end_time(end_time);
     m_end_set = true;
 }
