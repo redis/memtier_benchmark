@@ -402,8 +402,13 @@ void client::set_end_time_interrupted(struct timeval *end_time)
     // Interrupting the drain after a timed run must not include the drain
     // in its throughput denominator, just as normal deadline finalization.
     struct timeval deadline = start_time;
-    deadline.tv_sec += m_config->test_time;
-    if (m_stats.has_started() && m_config->test_time > 0 && timercmp(end_time, &deadline, >)) end_time = &deadline;
+    if (m_stats.has_started() && m_config->test_time > 0 &&
+        ts_diff(start_time, *end_time) > (long long) m_config->test_time * 1000000) {
+        // Only construct a deadline within the captured time interval. A large
+        // test time can otherwise overflow Winsock's 32-bit timeval seconds.
+        deadline.tv_sec = (long long) start_time.tv_sec + m_config->test_time;
+        end_time = &deadline;
+    }
     m_stats.set_end_time(end_time);
     m_end_set = true;
 }

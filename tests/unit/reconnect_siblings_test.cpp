@@ -21,6 +21,7 @@
 #endif
 
 #include <assert.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -224,6 +225,17 @@ static void test_interrupted_deadline()
         manager.set_end_time_interrupted(&late);
         check(manager.get_stats()->get_duration_usec() == 2000000, "staircase uses the shared benchmark deadline");
         config.clients_start = 0;
+    }
+    {
+        config.test_time = UINT_MAX;
+        struct timeval recent_start = {1792300000, 750000};
+        struct timeval early = {1792300001, 250000};
+        object_generator generator;
+        client manager(base, &config, protocol, &generator);
+        manager.set_start_time_at(&recent_start);
+        manager.set_end_time_interrupted(&early);
+        check(manager.get_stats()->get_duration_usec() == 500000,
+              "large test time does not overflow a 32-bit timeval deadline on an early interrupt");
     }
     {
         config.test_time = 0;
