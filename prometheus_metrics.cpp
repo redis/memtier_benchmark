@@ -90,8 +90,9 @@ static const metric_def kMetricDefs[] = {
      "Total key lookups on arbitrary (--command) miss-trackable commands that did not find the key (a multi-key "
      "command such as HMGET contributes one increment per element), aggregated across all configured arbitrary "
      "commands. GET-command misses are reported separately by memtier_misses_total."},
-    {"memtier_connections", MT_TYPE_GAUGE, "Client connections currently open."},
-    {"memtier_threads", MT_TYPE_GAUGE, "Worker threads currently active."},
+    {"memtier_connections", MT_TYPE_GAUGE,
+     "Configured clients in unfinished worker threads, using the scheduled client count in staircase mode."},
+    {"memtier_threads", MT_TYPE_GAUGE, "Worker threads that have not finished."},
     {"memtier_run", MT_TYPE_GAUGE, "Current run number, 1-based; 0 before the first run starts."},
     {"memtier_configured_runs", MT_TYPE_GAUGE, "Configured number of runs (--run-count)."},
     {"memtier_config_test_time_seconds", MT_TYPE_GAUGE,
