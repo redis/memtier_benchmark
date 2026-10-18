@@ -3362,6 +3362,8 @@ void usage()
         "      --max-retries=N            Maximum retries per request when --retry-on-error is set.\n"
         "                                 -1 = unlimited (default), 0 = disable retries even with the master\n"
         "                                 switch on, N>0 = bounded. MOVED/ASK redirects count toward this.\n"
+        "                                 Unlimited retries with --requests may run indefinitely; use a\n"
+        "                                 finite limit or --test-time to bound repeated rejections.\n"
         "      --retry-backoff-ms=NUM     Delay between retries in milliseconds (default: 0, immediate).\n"
         "      --retry-backoff-factor=NUM Multiply the delay by NUM on each retry of the same request:\n"
         "                                 with NUM > 0 the Nth resend waits retry-backoff-ms * NUM^(N-1),\n"

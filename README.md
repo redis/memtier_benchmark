@@ -262,6 +262,12 @@ for retry are not resent, are counted as errors and written to
 test time ended`. They are not part of `"Unanswered requests"`, which only
 counts requests that were waiting for a reply.
 
+With a request-count workload (`--requests`), unlimited retries can run
+indefinitely if the server keeps rejecting every attempt. A valid workload
+error reply counts as connection progress, so `--connection-stage-timeout`
+does not bound these retries. Use a finite `--max-retries` or `--test-time`
+to bound such a workload; requests still count only on success or exhaustion.
+
 ### Repeated runs (`--run-count`)
 
 With `--run-count N`, memtier reports the best and the worst run (by
