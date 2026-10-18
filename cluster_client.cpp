@@ -889,8 +889,28 @@ void cluster_client::print_topology_summary() const
     pthread_mutex_unlock(&s_mtx);
 }
 
-bool cluster_client::handle_cluster_slots(protocol_response *r)
+// Redis specifies the replying connection's host for NULL endpoints; empty
+// endpoints may use the same fallback. "?" instead means an unknown hostname.
+static bool cluster_slots_host(const bulk_el *host, const std::string &sender_host, std::string &address)
 {
+    if (host->is_resp3_null || host->value_len == 0) {
+        address = sender_host;
+        return !address.empty();
+    }
+    if (memchr(host->value, '\0', host->value_len) != NULL || (host->value_len == 1 && host->value[0] == '?'))
+        return false;
+    address.assign(host->value, host->value_len);
+    return true;
+}
+
+bool cluster_client::handle_cluster_slots(unsigned int conn_id, protocol_response *r)
+{
+    if (conn_id >= m_connections.size()) return false;
+    // Parsing can reconnect/readdress this connection. Own the sender host
+    // before any topology mutation, and retain each tuple's advertised port.
+    const char *sender_address = m_connections[conn_id]->get_address();
+    const std::string sender_host = sender_address ? sender_address : "";
+
     /*
      * temporary array to test if some of the connections are left with no
      * slots, and need to be closed.
@@ -973,12 +993,11 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
             continue;
         bulk_el *pa = pn->mbulks_elements[0]->as_bulk();
         bulk_el *pp = pn->mbulks_elements[1]->as_bulk();
-        if (pa->value_len == 0 || pp->value_len == 0) continue;
-        if (memchr(pa->value, '\0', pa->value_len) != NULL) continue;
+        std::string p_addr;
+        if (!cluster_slots_host(pa, sender_host, p_addr) || pp->value_len == 0) continue;
         // pp->value points at the bulk header (':' integer-reply prefix);
         // value+1 / value_len-1 strips it, matching the primary-port copy
         // at lines 754-757.
-        std::string p_addr((const char *) pa->value, pa->value_len);
         std::string p_port((const char *) pp->value + 1, pp->value_len - 1);
         advertised_primary_endpoints.push_back(std::make_pair(p_addr, p_port));
     }
@@ -1028,23 +1047,14 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
             continue;
         }
 
-        // hostname/ip + port: reject zero-length bulks (memcpy(..., NULL+1, 0)
-        // is technically UB; embedded NULs would also alias other addrs in
-        // strcmp-based lookup).
         bulk_el *mbulk_addr_el = node->mbulks_elements[0]->as_bulk();
         bulk_el *mbulk_port_el = node->mbulks_elements[1]->as_bulk();
-        if (mbulk_addr_el->value_len == 0 || mbulk_port_el->value_len == 0) {
-            benchmark_error_log("warning: CLUSTER SLOTS: shard %u empty host/port; skipping\n", i);
+        std::string primary_host;
+        if (!cluster_slots_host(mbulk_addr_el, sender_host, primary_host) || mbulk_port_el->value_len == 0) {
+            benchmark_error_log("warning: CLUSTER SLOTS: shard %u invalid host/port; skipping\n", i);
             continue;
         }
-        if (memchr(mbulk_addr_el->value, '\0', mbulk_addr_el->value_len) != NULL) {
-            benchmark_error_log("warning: CLUSTER SLOTS: shard %u host contains NUL; skipping\n", i);
-            continue;
-        }
-
-        char *addr = (char *) malloc(mbulk_addr_el->value_len + 1);
-        memcpy(addr, mbulk_addr_el->value, mbulk_addr_el->value_len);
-        addr[mbulk_addr_el->value_len] = '\0';
+        char *addr = strdup(primary_host.c_str());
 
         // value points at the bulk header byte (':' for integer reply) and
         // value_len is the strdup'd length INCLUDING that prefix. value+1
@@ -1139,20 +1149,13 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
             }
             bulk_el *r_addr_el = replica_node->mbulks_elements[0]->as_bulk();
             bulk_el *r_port_el = replica_node->mbulks_elements[1]->as_bulk();
-            if (r_addr_el->value_len == 0 || r_port_el->value_len == 0) {
-                benchmark_error_log("warning: CLUSTER SLOTS: shard %u replica %u empty host/port; skipping\n", i,
+            std::string replica_host;
+            if (!cluster_slots_host(r_addr_el, sender_host, replica_host) || r_port_el->value_len == 0) {
+                benchmark_error_log("warning: CLUSTER SLOTS: shard %u replica %u invalid host/port; skipping\n", i,
                                     n - 3);
                 continue;
             }
-            if (memchr(r_addr_el->value, '\0', r_addr_el->value_len) != NULL) {
-                benchmark_error_log("warning: CLUSTER SLOTS: shard %u replica %u host contains NUL; skipping\n", i,
-                                    n - 3);
-                continue;
-            }
-
-            char *r_addr = (char *) malloc(r_addr_el->value_len + 1);
-            memcpy(r_addr, r_addr_el->value, r_addr_el->value_len);
-            r_addr[r_addr_el->value_len] = '\0';
+            char *r_addr = strdup(replica_host.c_str());
 
             // Same +1 prefix accounting as the primary port copy above:
             // value_len includes the ':' bulk header, so the digit run is
