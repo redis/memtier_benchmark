@@ -617,6 +617,7 @@ import_object_generator::import_object_generator(const import_object_generator &
         m_keys(from.m_keys),
         m_reader(from.m_reader),
         m_cur_item(NULL),
+        m_reader_opened(from.m_reader_opened),
         m_no_expiry(from.m_no_expiry)
 {
     if (m_keys != NULL) {
