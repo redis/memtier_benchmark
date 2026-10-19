@@ -484,7 +484,8 @@ jobs:
 
     - name: Run tests for coverage
       # Kept serial so coverage data is collected exactly as before; see #679.
-      timeout-minutes: 40
+      # The expanded suite exceeds 40 minutes on coverage-instrumented builds.
+      timeout-minutes: 60
       env:
         OSS_STANDALONE: "1"
         OSS_CLUSTER: "0"
