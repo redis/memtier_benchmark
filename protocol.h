@@ -255,6 +255,7 @@ public:
     virtual abstract_protocol *clone(void) = 0;
     void set_buffers(struct evbuffer *read_buf, struct evbuffer *write_buf);
     void set_keep_value(bool flag);
+    bool get_keep_value() const { return m_keep_value; }
     void set_track_elem_misses(bool flag);
 
     // Drop any partial-parse state that would otherwise survive a
