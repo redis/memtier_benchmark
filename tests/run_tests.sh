@@ -22,12 +22,17 @@ help() {
 		                         sets --shards-count to SHARDS).  Used by the
 		                         read-preference CI matrix cell.
 		TLS=0|1                  Run tests with TLS enabled
+		UNIX=0|1                 Run standalone tests over Unix sockets (no TLS/cluster).
+		                         Logs and temporary files use a short directory under
+		                         /tmp; its path is printed and retained for diagnostics.
 		SHARDS=n                 Number of shards (default: 3)
 		STRESS=0|1               Override default test set with tests/test_sanitizer_stress.py
 		                         (large data, long monitor lines, reconnect churn, --debug paths).
 		                         Used by the sanitizer workflows' STRESS matrix axis (issue #411).
 
 		REDIS_SERVER=path   Location of redis-server
+		REDIS_PORT=n        Override the RLTest base port
+		REDIS_PASSWORD=str  Password for RLTest Redis servers (tests must pass it to clients)
 		MEMTIER_BINARY=path Location of the memtier_benchmark binary to test
 		                    (default: the in-tree build at the repo root)
 		VERBOSE=1           Print commands
@@ -61,9 +66,12 @@ run_tests() {
 
 	cd $ROOT/tests
 
+	local connection_args=()
+	[[ -n "$REDIS_PORT" ]] && connection_args+=(-p "$REDIS_PORT")
+	[[ -n "$REDIS_PASSWORD" ]] && connection_args+=(--oss_password "$REDIS_PASSWORD")
 	local E=0
 	{
-		$OP python3 -m RLTest $RLTEST_ARGS
+		$OP python3 -m RLTest $RLTEST_ARGS "${connection_args[@]}"
 		((E |= $?))
 	} || true
 
@@ -85,6 +93,12 @@ OSS_CLUSTER_REPLICAS=${OSS_CLUSTER_REPLICAS:-0}
 SHARDS=${SHARDS:-3}
 TEST=${TEST:-""}
 STRESS=${STRESS:-0}
+UNIX=${UNIX:-0}
+
+if [[ $UNIX == 1 && ( $OSS_STANDALONE != 1 || $TLS == 1 || $OSS_CLUSTER == 1 || $OSS_CLUSTER_REPLICAS == 1 ) ]]; then
+	echo "UNIX=1 requires standalone mode without TLS or cluster tests" >&2
+	exit 2
+fi
 
 # STRESS=1 overrides the default test set with the sanitizer stress suite
 # (tests/test_sanitizer_stress.py), which exercises large data sizes, long
@@ -112,6 +126,15 @@ fi
 [[ -n "$PARALLELISM" ]] && RLTEST_ARGS+=" --parallelism $PARALLELISM"
 [[ $VERBOSE == 1 ]] && RLTEST_ARGS+=" -v"
 [[ $TLS == 1 ]] && RLTEST_ARGS+=" --tls-cert-file $TLS_CERT --tls-key-file $TLS_KEY --tls-ca-cert-file $TLS_CACERT --tls"
+
+if [[ $UNIX == 1 ]]; then
+	# RLTest places its socket under --log-dir. Checkout/TMPDIR paths can exceed
+	# sockaddr_un.sun_path, even though the benchmark accepts Unix sockets.
+	UNIX_LOG_DIR=$(mktemp -d /tmp/memtier-unix.XXXXXX) || exit 1
+	export TMPDIR=$UNIX_LOG_DIR
+	RLTEST_ARGS+=" --unix --log-dir $UNIX_LOG_DIR"
+	echo "Unix-socket test logs: $UNIX_LOG_DIR"
+fi
 
 LOG_LEVEL=${LOG_LEVEL:-notice}
 RLTEST_ARGS+=" --log-level $LOG_LEVEL"

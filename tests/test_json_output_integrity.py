@@ -11,13 +11,15 @@ plausible-looking but wrong value. The invariant we check here is:
 
     Latency ~= Accumulated Latency / Count
 
-for every section that exposes those fields (Sets, Gets, Totals, BEST/WORST/
-AGGREGATED, and the per-second time-series buckets).
+for single-run exact-sum sections and their time-series buckets. Aggregate
+means use a separate oracle built from the individual runs; grouped arbitrary
+command HDR means need histogram-based checks instead.
 
 Run:
     TEST=test_json_output_integrity.py OSS_STANDALONE=1 ./tests/run_tests.sh
 """
 import json
+from decimal import Decimal
 import os
 import shutil
 import subprocess
@@ -36,139 +38,165 @@ from include import (
 from mb import Benchmark, RunConfig
 
 
-# Tolerance for comparing an average latency with Accumulated / Count.
-# "Accumulated Latency" is emitted with %lld (whole ms, truncated) and the
-# averages with %.3f. Below Accumulated/Count we allow only a static slack,
-# the larger of 0.01 ms and 2%. Above it we also allow the truncation and
-# rounding bound computed in _latency_bounds().
-ABS_TOLERANCE_MS = 0.01
-REL_TOLERANCE = 0.02
-# "Average Latency" is printed with %.3f, so it is rounded by up to 0.0005 ms.
-AVG_PRINT_ROUNDING_MS = 0.0005
+def _printed_average_us(env, label, average):
+    """Read a %.3f millisecond mean without binary-float subtraction slack."""
+    value = Decimal(str(average)) * 1000
+    valid = value.is_finite() and value >= 0 and value == value.to_integral_value()
+    env.assertTrue(valid, message=f"{label}: invalid printed millisecond average {average}")
+    return int(value) if valid else None
 
 
-def _latency_bounds(derived, count):
-    """Return (below, above): how far, in ms, a correct average may sit
-    below or above Accumulated/Count.
+def _average_sum_interval(count, average_us, integer_mean):
+    """Possible integer-us sums for a printed mean, including printf ties."""
+    if integer_mean:
+        # totals_cmd::summarize first divides the sum by Count in integer us.
+        return count * average_us, count * (average_us + 1) - 1
+    # Totals and buckets divide in double before %.3f rounding. Include both
+    # exact half-way endpoints rather than depending on printf's tie direction.
+    twice_lower = count * (2 * average_us - 1)
+    twice_upper = count * (2 * average_us + 1)
+    return (twice_lower + 1) // 2, twice_upper // 2
 
-    All fields come from the same whole-microsecond sum. "Accumulated
-    Latency" is that sum truncated to whole ms by %lld, so Accumulated/Count
-    is low by at most 0.999/count ms. A %.3f average is rounded by at most
-    0.0005 ms. So a correct average is at most 0.999/count + 0.0005 ms above
-    Accumulated/Count. We allow 1/count + 0.0005, which leaves at least
-    0.001/count ms of headroom for float noise. For low-count buckets and
-    sections (e.g. the trailing second of a short --test-time run, or Sets
-    under a skewed --ratio) this term dominates the static floor.
 
-    Below Accumulated/Count, a correct average can only be off by printing.
-    The Time-Serie and Totals averages use double division, so they are off
-    by up to 0.0005 ms of %.3f rounding. The Sets/Gets sections (and
-    arbitrary-command sections with --command-stats-breakdown=line) use
-    integer us division (totals_cmd::summarize), so they are exact multiples
-    of 0.001 ms and at most (count-1)/(1000*count) ms low. The static floor
-    covers both. These bounds do not hold for the default per-type
-    arbitrary-command sections, whose average is an HDR histogram mean;
-    _validate_run_section does not check those. Keeping this side tight is what catches an
-    average truncated to an integer, for low counts too.
+def _assert_sum_feasible(env, label, count, accumulated, average, integer_mean):
+    """Intersect the serializer's possible raw sums, returning the overlap.
+
+    Accumulated truncates an integer-us sum S to whole ms, so S is in
+    [1000*A, 1000*A+999]. The mean imposes a second interval: integer-us
+    division for built-in/per-line rows, rounded double division for Totals
+    and all time buckets. Zero is valid when these intervals intersect.
+    The printed fields cannot expose corruption within the same intervals;
+    known-sum writer tests are needed for indistinguishable outputs.
 
     AGGREGATED AVERAGE RESULTS uses unrounded sample sums for its latency,
     while Count and Accumulated are independently rounded per-run means
     (#703). Their ratio can therefore differ, particularly at small counts;
     this single-run rounding bound does not cover every aggregate row.
     """
-    below = max(ABS_TOLERANCE_MS, REL_TOLERANCE * derived)
-    return below, max(below, 1.0 / count + AVG_PRINT_ROUNDING_MS)
-
-
-def _assert_latency_consistent(env, section_name, section):
-    """Verify Latency, Average Latency and Accumulated Latency agree.
-
-    The invariant is: Latency == Average Latency == Accumulated / Count,
-    within a small tolerance that accounts for the printf rounding used
-    in the output. Catches any regression that stores the average as an
-    integer or otherwise loses precision.
-    """
-    count = section.get("Count", 0)
-    if count <= 0:
-        # Empty sections (e.g., Sets when --ratio=0:1) are valid; nothing
-        # to compare.
-        return
-
-    # Required fields. Their absence is itself a regression.
-    for field in ("Latency", "Average Latency", "Accumulated Latency"):
-        env.assertTrue(
-            field in section,
-            message=f"{section_name}: missing '{field}' in JSON output")
-
-    latency = float(section["Latency"])
-    avg_latency = float(section["Average Latency"])
-    accumulated = float(section["Accumulated Latency"])
-    derived = accumulated / count
-
-    # Latency must equal Average Latency (they share a backing field today).
-    env.assertEqual(
-        latency, avg_latency,
-        message=f"{section_name}: 'Latency' ({latency}) != 'Average Latency' "
-                f"({avg_latency})")
-
-    # Latency must be positive when there are ops with non-zero accumulated
-    # time. The original RED-191460 bug surfaced as Latency=0 for sub-ms
-    # workloads — this assertion catches that direction explicitly.
-    if accumulated > 0:
-        env.assertGreater(
-            latency, 0.0,
-            message=f"{section_name}: 'Latency' is 0 but Accumulated Latency "
-                    f"({accumulated}) and Count ({count}) are non-zero — "
-                    f"derived avg = {derived:.4f} ms")
-
-    # Latency must match Accumulated/Count within tolerance. Catches the
-    # bug where Latency was stored as an integer (e.g., 1.291 -> 1.000).
-    below, above = _latency_bounds(derived, count)
+    valid = isinstance(count, int) and count > 0 and isinstance(accumulated, int) and accumulated >= 0
+    env.assertTrue(valid, message=f"{label}: invalid Count={count}, Accumulated={accumulated}")
+    if not valid:
+        return None
+    average_us = _printed_average_us(env, label, average)
+    if average_us is None:
+        return None
+    lower, upper = _average_sum_interval(count, average_us, integer_mean)
+    lower = max(lower, accumulated * 1000)
+    upper = min(upper, accumulated * 1000 + 999)
     env.assertTrue(
-        -below <= latency - derived <= above,
-        message=f"{section_name}: 'Latency' {latency:.4f} ms inconsistent "
-                f"with Accumulated/Count ({accumulated}/{count} = "
-                f"{derived:.4f} ms); allowed -{below:.4f}/+{above:.4f} ms")
+        lower <= upper,
+        message=f"{label}: average {average} ms cannot come from Count={count}, "
+        f"Accumulated={accumulated} ms ({'integer-us' if integer_mean else 'rounded'} mean); "
+        f"raw sum interval [{lower}, {upper}] us is empty",
+    )
+    return (lower, upper) if lower <= upper else None
+
+
+def _assert_latency_consistent(env, section_name, section, integer_mean=True):
+    """Check a single-run exact-sum row, never a grouped HDR or aggregate row."""
+    count = section.get("Count", 0)
+    env.assertTrue(count >= 0, message=f"{section_name}: negative Count={count}")
+    if count < 0:
+        return None
+    if count == 0:
+        return (0, 0)  # Empty sections need no latency fields.
+    fields = ("Latency", "Average Latency", "Accumulated Latency")
+    for field in fields:
+        env.assertTrue(field in section, message=f"{section_name}: missing '{field}' in JSON output")
+    if not all(field in section for field in fields):
+        return None
+    env.assertEqual(
+        Decimal(str(section["Latency"])),
+        Decimal(str(section["Average Latency"])),
+        message=f"{section_name}: Latency ({section['Latency']}) != "
+        f"Average Latency ({section['Average Latency']})",
+    )
+    return _assert_sum_feasible(
+        env, section_name, count, section["Accumulated Latency"], section["Average Latency"], integer_mean
+    )
 
 
 def _assert_time_series_consistent(env, section_name, section):
-    """Verify each Time-Serie bucket is internally consistent."""
-    ts = section.get("Time-Serie")
-    if not ts:
-        return
-    for bucket_key, bucket in ts.items():
+    """Every nonempty single-run bucket uses an exact-sum double mean."""
+    for bucket_key, bucket in section.get("Time-Serie", {}).items():
         count = bucket.get("Count", 0)
+        label = f"{section_name} Time-Serie[{bucket_key}]"
+        env.assertTrue(count >= 0, message=f"{label}: negative Count={count}")
         if count <= 0:
             continue
-        # Time-series buckets only emit "Average Latency", not "Latency".
-        if "Average Latency" not in bucket or "Accumulated Latency" not in bucket:
-            continue
-        avg = float(bucket["Average Latency"])
-        acc = float(bucket["Accumulated Latency"])
-        derived = acc / count
-        below, above = _latency_bounds(derived, count)
-        if acc > 0:
-            env.assertGreater(
-                avg, 0.0,
-                message=f"{section_name} Time-Serie[{bucket_key}]: "
-                        f"Average Latency is 0 but Accumulated={acc}, "
-                        f"Count={count}")
-        env.assertTrue(
-            -below <= avg - derived <= above,
-            message=f"{section_name} Time-Serie[{bucket_key}]: "
-                    f"Average Latency {avg:.4f} ms inconsistent with "
-                    f"Accumulated/Count ({acc}/{count} = {derived:.4f} ms); "
-                    f"allowed -{below:.4f}/+{above:.4f} ms")
+        fields = ("Average Latency", "Accumulated Latency")
+        for field in fields:
+            env.assertTrue(field in bucket, message=f"{label}: missing '{field}'")
+        if all(field in bucket for field in fields):
+            _assert_sum_feasible(
+                env,
+                label,
+                count,
+                bucket["Accumulated Latency"],
+                bucket["Average Latency"],
+                integer_mean=False,
+            )
 
 
 def _validate_run_section(env, run_label, run_section):
-    """Validate a top-level JSON run section (ALL STATS, BEST RUN..., etc)."""
-    for sub in ("Sets", "Gets", "Totals"):
+    """Validate built-in rows of one run (ALL STATS, BEST/WORST, RUN #N)."""
+    for sub in ("Sets", "Gets", "Waits", "Totals"):
         if sub not in run_section:
             continue
-        _assert_latency_consistent(env, f"{run_label}.{sub}", run_section[sub])
-        _assert_time_series_consistent(env, f"{run_label}.{sub}",
-                                       run_section[sub])
+        _assert_latency_consistent(env, f"{run_label}.{sub}", run_section[sub], integer_mean=sub != "Totals")
+        _assert_time_series_consistent(env, f"{run_label}.{sub}", run_section[sub])
+
+
+def _assert_aggregated_latency_consistent(env, label, aggregate, runs):
+    """Weighted exact-sum aggregate oracle from unaveraged run data (#671).
+
+    Aggregate Count and Accumulated are independently rounded per-run means;
+    their ratio is not a latency oracle, even when all run counts are equal.
+    Reconstruct each run's possible raw sum, combine the intervals, then
+    compare the aggregate's rounded double mean using the total sample count.
+    Grouped arbitrary HDR rows are deliberately excluded from this oracle.
+
+    aggregate_average() leaves the fresh object's per-second stats empty, so
+    aggregate Time-Serie objects currently have no buckets to combine. Pin
+    that contract and validate every individual run's exact-sum buckets;
+    BEST/WORST alone need not cover the middle runs. If aggregate buckets
+    are added later, their calculation needs its own explicit oracle.
+    """
+    for name in ("Sets", "Gets", "Waits", "Totals"):
+        if name not in aggregate:
+            continue
+        row = aggregate[name]
+        env.assertEqual(
+            row.get("Time-Serie", {}), {},
+            message=f"{label}.{name}: aggregate time buckets need an explicit arithmetic oracle",
+        )
+        total_count, lower, upper = 0, 0, 0
+        valid = True
+        for index, run in enumerate(runs, 1):
+            row = run[name]
+            _assert_time_series_consistent(env, f"RUN #{index}.{name}", row)
+            interval = _assert_latency_consistent(
+                env, f"RUN #{index}.{name}", row, integer_mean=name != "Totals"
+            )
+            if interval is None:
+                valid = False
+                continue
+            total_count += row["Count"]
+            lower += interval[0]
+            upper += interval[1]
+        if not valid or not total_count:
+            continue
+        row = aggregate[name]
+        env.assertEqual(row["Latency"], row["Average Latency"], message=f"{label}.{name}: means differ")
+        average_us = _printed_average_us(env, f"{label}.{name}", row["Average Latency"])
+        if average_us is None:
+            continue
+        avg_lower, avg_upper = _average_sum_interval(total_count, average_us, integer_mean=False)
+        env.assertTrue(
+            max(lower, avg_lower) <= min(upper, avg_upper),
+            message=f"{label}.{name}: mean {row['Average Latency']} ms is inconsistent with "
+            f"{total_count} samples and combined raw sum [{lower}, {upper}] us",
+        )
 
 
 def _build_benchmark(env, test_dir, extra_args, threads=2, clients=5,
@@ -405,24 +433,21 @@ def test_reconnect_interval_does_not_zero_out_rates(env):
 
 
 def test_json_multi_run_aggregated_sections_consistent(env):
-    """With --run-count>1 we get BEST/WORST/AGGREGATED sections — each one
-    must satisfy the same Latency invariants as ALL STATS does for a single
-    run. Catches RED-191460 in the aggregated path and the related typo in
-    totals::add() that conflated m_latency with m_total_latency.
-    """
+    """BEST/WORST are single runs; AGGREGATED needs the per-run sum oracle."""
+    run_count = 3
     test_dir = tempfile.mkdtemp()
     try:
         benchmark, run_config = _build_benchmark(
             env, test_dir,
             extra_args=["--ratio=1:1", "--key-pattern=R:R", "--pipeline=1",
-                        "--run-count=2"],
+                        f"--run-count={run_count}", "--print-all-runs"],
             threads=2, clients=4, requests=1500)
         ok = benchmark.run()
         failed_asserts = env.getNumberOfFailedAssertion()
         try:
             env.assertTrue(ok)
             results = _read_json(run_config, env)
-            # The expected sections for run-count=2.
+            # BEST/WORST do not necessarily cover every run.
             expected = ["BEST RUN RESULTS", "WORST RUN RESULTS"]
             for label in expected:
                 env.assertTrue(label in results,
@@ -433,7 +458,8 @@ def test_json_multi_run_aggregated_sections_consistent(env):
                         if k.startswith("AGGREGATED AVERAGE RESULTS")]
             env.assertEqual(len(agg_keys), 1,
                             message="Expected exactly one AGGREGATED section")
-            _validate_run_section(env, agg_keys[0], results[agg_keys[0]])
+            runs = [results[f"RUN #{index} RESULTS"] for index in range(1, run_count + 1)]
+            _assert_aggregated_latency_consistent(env, agg_keys[0], results[agg_keys[0]], runs)
         finally:
             if env.getNumberOfFailedAssertion() > failed_asserts:
                 debugPrintMemtierOnError(run_config, env)
@@ -1323,14 +1349,176 @@ def test_tolerance_bounds_both_sides(env):
         {"Count": 3, "Latency": "0.666", "Average Latency": "0.666",
          "Accumulated Latency": 2})
     env.assertEqual(counter.failures, 0)
-    # Just above the upper bound: 100 ops, Accumulated 10 ms, so the bound is
-    # max(0.01, 1/100 + 0.0005) = 0.0105. An average 0.0106 above 0.1 cannot
-    # come from truncation plus rounding and must be rejected.
+    # 100 ops, Accumulated 10ms means a raw sum of 10000..10999us.
+    # Neither integer-us division nor rounded division can print .111ms.
     _assert_latency_consistent(
         counter, "synthetic.Sets",
-        {"Count": 100, "Latency": "0.1106", "Average Latency": "0.1106",
+        {"Count": 100, "Latency": "0.111", "Average Latency": "0.111",
          "Accumulated Latency": 10})
     env.assertEqual(counter.failures, 1)
+
+
+def test_latency_feasibility_rejects_impossible_means(env):
+    # Both ends are distinguishable despite accumulated-ms truncation. These
+    # two impossible means passed the old 2% / 0.01ms tolerance (#645).
+    for count, accumulated, average in ((3, 152, "50.000"), (1000, 1000, "1.019")):
+        for integer_mean in (False, True):
+            counter = _FailureCounter()
+            section = {
+                "Count": count,
+                "Accumulated Latency": accumulated,
+                "Latency": average,
+                "Average Latency": average,
+            }
+            _assert_latency_consistent(counter, "synthetic", section, integer_mean=integer_mean)
+            env.assertEqual(counter.failures, 1)
+        counter = _FailureCounter()
+        _assert_time_series_consistent(counter, "synthetic", {"Time-Serie": {"0": section}})
+        env.assertEqual(counter.failures, 1)
+
+
+def test_latency_feasibility_respects_calculation_and_zero(env):
+    # S=2000us,N=3 prints .666 after integer-us division, .667 after double
+    # division. .666 is impossible for the latter with accumulated=2ms.
+    section = {"Count": 3, "Accumulated Latency": 2, "Latency": "0.666", "Average Latency": "0.666"}
+    _assert_latency_consistent(env, "integer-us", section, integer_mean=True)
+    counter = _FailureCounter()
+    _assert_latency_consistent(counter, "rounded", section, integer_mean=False)
+    env.assertEqual(counter.failures, 1)
+    counter = _FailureCounter()
+    _assert_time_series_consistent(counter, "rounded", {"Time-Serie": {"0": section}})
+    env.assertEqual(counter.failures, 1)
+    counter = _FailureCounter()
+    _validate_run_section(counter, "dispatch", {"Sets": section, "Totals": section})
+    env.assertEqual(counter.failures, 1)  # Totals must select the rounded policy.
+    # 1000us / 4000 samples legitimately prints zero with either calculation.
+    zero = {"Count": 4000, "Accumulated Latency": 1, "Latency": "0.000", "Average Latency": "0.000"}
+    for integer_mean in (False, True):
+        _assert_latency_consistent(env, "printed-zero", zero, integer_mean=integer_mean)
+    _assert_time_series_consistent(env, "printed-zero", {"Time-Serie": {"0": zero}})
+    _assert_latency_consistent(env, "empty", {"Count": 0})
+    _assert_time_series_consistent(env, "empty", {"Time-Serie": {"0": {"Count": 0}}})
+    # Printed zero is not a blanket exemption: 1000us/3 cannot round to zero.
+    zero["Count"] = 3
+    for integer_mean in (False, True):
+        counter = _FailureCounter()
+        _assert_latency_consistent(counter, "impossible-zero", zero, integer_mean=integer_mean)
+        env.assertEqual(counter.failures, 1)
+
+
+def test_latency_feasibility_rejects_invalid_values(env):
+    valid = {"Count": 3, "Accumulated Latency": 2, "Latency": "0.666", "Average Latency": "0.666"}
+    for change in (
+        {"Count": -1},
+        {"Accumulated Latency": -1},
+        {"Latency": "-0.001", "Average Latency": "-0.001"},
+        {"Latency": "Infinity", "Average Latency": "Infinity"},
+    ):
+        counter = _FailureCounter()
+        _assert_latency_consistent(counter, "invalid", dict(valid, **change))
+        env.assertEqual(counter.failures, 1)
+
+
+def test_latency_feasibility_accepts_known_sum_outputs(env):
+    # Construct independently from known integer-us sums, as the writer does.
+    # Include exact ms boundaries, low counts, sub-us means and printf ties.
+    for count in (1, 2, 3, 6, 7, 99, 1000, 4000, 10000):
+        for total_us in (0, 1, 499, 500, 999, 1000, 1999, 2000, 7999, 41999, 152400, 1000000):
+            for integer_mean in (False, True):
+                mean_us = total_us // count if integer_mean else total_us / count
+                average = f"{mean_us / 1000:.3f}"
+                section = {
+                    "Count": count,
+                    "Accumulated Latency": total_us // 1000,
+                    "Latency": average,
+                    "Average Latency": average,
+                }
+                _assert_latency_consistent(env, f"known-sum={total_us}", section, integer_mean=integer_mean)
+                if not integer_mean:
+                    _assert_time_series_consistent(env, "known-sum", {"Time-Serie": {"0": section}})
+
+
+def test_latency_aggregate_uses_individual_run_sums(env):
+    # Even equal counts do not make the aggregate's independently rounded
+    # Count/Accumulated ratio valid: two runs of 3ops/1500us average .500ms,
+    # while the aggregate displays Count 3, Accumulated 2, whose ratio is .667.
+    row = {"Count": 3, "Accumulated Latency": 1, "Latency": "0.500", "Average Latency": "0.500"}
+    aggregate = {"Count": 3, "Accumulated Latency": 2, "Latency": "0.500", "Average Latency": "0.500"}
+    runs = [{"Sets": row, "Totals": row}, {"Sets": row, "Totals": row}]
+    _assert_aggregated_latency_consistent(env, "aggregate", {"Sets": aggregate, "Totals": aggregate}, runs)
+    # Unequal counts: 2ops/2000us plus 8ops/40000us -> weighted 4.200ms.
+    # A mean of means 3.000 is inconsistent; rounded aggregate metadata is
+    # deliberately not the oracle (it is tested separately by #703 controls).
+    runs = [
+        {"Totals": {"Count": 2, "Accumulated Latency": 2, "Latency": "1.000", "Average Latency": "1.000"}},
+        {"Totals": {"Count": 8, "Accumulated Latency": 40, "Latency": "5.000", "Average Latency": "5.000"}},
+    ]
+    aggregate = {"Count": 5, "Accumulated Latency": 21, "Latency": "4.200", "Average Latency": "4.200"}
+    _assert_aggregated_latency_consistent(env, "weighted", {"Totals": aggregate}, runs)
+    aggregate = dict(aggregate, Latency="3.000", **{"Average Latency": "3.000"})
+    counter = _FailureCounter()
+    _assert_aggregated_latency_consistent(counter, "unweighted", {"Totals": aggregate}, runs)
+    env.assertEqual(counter.failures, 1)
+
+
+def test_latency_aggregate_checks_every_run_time_bucket(env):
+    # All summary rows agree, so only the middle run's corrupted bucket can
+    # fail. A BEST/WORST-only check or a summary-only oracle misses it.
+    bucket = {"Count": 3, "Accumulated Latency": 2, "Average Latency": "0.667"}
+    row = {"Count": 3, "Accumulated Latency": 2, "Latency": "0.666",
+           "Average Latency": "0.666", "Time-Serie": {"0": bucket}}
+    aggregate = {"Sets": dict(row, Latency="0.667",
+                             **{"Average Latency": "0.667", "Time-Serie": {}})}
+    runs = [{"Sets": row}, {"Sets": row}, {"Sets": row}]
+    _assert_aggregated_latency_consistent(env, "valid", aggregate, runs)
+    corrupt_bucket = dict(bucket, **{"Average Latency": "50.000"})
+    runs[1] = {"Sets": dict(row, **{"Time-Serie": {"0": corrupt_bucket}})}
+    counter = _FailureCounter()
+    _assert_aggregated_latency_consistent(counter, "corrupt-middle-bucket", aggregate, runs)
+    env.assertEqual(counter.failures, 1)
+
+    # There is no aggregate time-series calculation in the current writer.
+    # Adding one must trigger review of its oracle rather than silently skip
+    # the buckets or assume the single-run arithmetic also applies to them.
+    counter = _FailureCounter()
+    aggregate["Sets"]["Time-Serie"] = {"0": bucket}
+    _assert_aggregated_latency_consistent(counter, "new-aggregate-buckets", aggregate, [{"Sets": row}])
+    env.assertEqual(counter.failures, 1)
+
+
+def test_json_line_latency_uses_integer_us_mean(env):
+    test_dir = tempfile.mkdtemp()
+    try:
+        benchmark, run_config = _build_benchmark(
+            env,
+            test_dir,
+            extra_args=[
+                "--command=SET __key__ __data__",
+                "--command=GET __key__",
+                "--command=GET __key__",
+                "--command-stats-breakdown=line",
+            ],
+            threads=1,
+            clients=1,
+            requests=7,
+        )
+        ok = benchmark.run()
+        failed_asserts = env.getNumberOfFailedAssertion()
+        try:
+            env.assertTrue(ok)
+            run = _read_json(run_config, env)["ALL STATS"]
+            rows = _command_rows(run)
+            env.assertEqual(len(rows), 3)
+            for name, row in rows.items():
+                _assert_latency_consistent(env, name, row, integer_mean=True)
+                _assert_time_series_consistent(env, name, row)
+            _assert_latency_consistent(env, "Totals", run["Totals"], integer_mean=False)
+            _assert_time_series_consistent(env, "Totals", run["Totals"])
+        finally:
+            if env.getNumberOfFailedAssertion() > failed_asserts:
+                debugPrintMemtierOnError(run_config, env)
+    finally:
+        shutil.rmtree(test_dir, ignore_errors=True)
 
 
 def test_json_wait_latency_and_accumulated(env):
