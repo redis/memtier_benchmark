@@ -141,7 +141,12 @@ def _late_participant(env, mode):
             env.assertLess(abs(stats["Runtime"]["Total duration"] - expected_ms), 350)
             if mode == "unanswered":
                 env.assertEqual(peer.requests["late"], 1)
-                env.assertEqual(stats["Totals"]["Count"], peer.requests["early"])
+                # SIGINT can stop the early client before its final reply is
+                # processed. With pipeline=1 and no early retries, at most one
+                # received command can be absent from its completed Count.
+                outstanding = peer.requests["early"] - stats["Totals"]["Count"]
+                env.assertGreaterEqual(outstanding, 0)
+                env.assertLessEqual(outstanding, 1)
             if mode == "retry":
                 env.assertGreater(peer.requests["late"], 1)
                 env.assertGreater(stats["Totals"]["Retry Attempts"], 0)
