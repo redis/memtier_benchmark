@@ -6291,12 +6291,17 @@ int main(int argc, char *argv[])
                     all_stats[i].print(outfile, &cfg, run_title.c_str(), jsonhandler);
                 }
             }
+            // Prefer complete measurement windows for both rankings. Keep the
+            // partial runs in per-run output and in the aggregate average.
+            const bool have_complete_run = std::any_of(all_stats.begin(), all_stats.end(),
+                                                       [](const run_stats &stats) { return !stats.get_interrupted(); });
             // User wants the best and worst
             double min_ops_sec = 0;
             double max_ops_sec = 0;
             run_stats *worst = NULL;
             run_stats *best = NULL;
             for (std::vector<run_stats>::iterator i = all_stats.begin(); i != all_stats.end(); i++) {
+                if (have_complete_run && i->get_interrupted()) continue;
                 unsigned long long usecs = i->get_duration_usec();
                 double ops_sec = usecs > 0 ? (double) i->get_total_ops() / usecs * 1000000 : 0.0;
                 if (ops_sec < min_ops_sec || worst == NULL) {

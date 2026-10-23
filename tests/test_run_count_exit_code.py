@@ -146,7 +146,7 @@ def test_first_run_abort_exits_2(env):
     env.assertEqual(rc, 2, message=stderr[-2000:])
     # The aborted run stays in the series and marks the average.
     env.assertEqual(results["AGGREGATED AVERAGE RESULTS (3 runs)"]["Runtime"]["Interrupted"], "true")
-    env.assertEqual(results["WORST RUN RESULTS"]["Runtime"]["Interrupted"], "true")
+    env.assertEqual(results["WORST RUN RESULTS"]["Runtime"]["Interrupted"], "false")
     env.assertEqual(results["BEST RUN RESULTS"]["Runtime"]["Interrupted"], "false")
 
 

@@ -329,8 +329,10 @@ Exit status:
   one: **2** if any run was aborted by `--connection-stage-timeout`,
   otherwise **1** if any run failed or the results could not be written,
   otherwise **0**. An aborted run still counts in `AGGREGATED AVERAGE
-  RESULTS`, which is then marked `"Interrupted": "true"` (as are `BEST RUN
-  RESULTS` or `WORST RUN RESULTS` when they are that run).
+  RESULTS`, which is then marked `"Interrupted": "true"`. BEST and WORST
+  rank only complete runs when any exist; otherwise they rank the available
+  partial runs, retaining their `"Interrupted": "true"` flag. Per-run output
+  and the aggregate average still include all runs that happened.
 
 ### Output write errors
 
