@@ -1165,7 +1165,8 @@ def _restore_requirepass(conn, passwords):
     kwargs = dict(conn.connection_pool.connection_kwargs)
     for password in passwords:
         kwargs["password"] = password
-        client = redis.Redis(connection_class=conn.connection_pool.connection_class, **kwargs)
+        pool = redis.ConnectionPool(connection_class=conn.connection_pool.connection_class, **kwargs)
+        client = redis.Redis(connection_pool=pool)
         try:
             client.execute_command("CONFIG", "SET", "requirepass", original_password)
             return
@@ -1173,7 +1174,25 @@ def _restore_requirepass(conn, passwords):
             continue
         finally:
             client.close()
+            pool.disconnect()
     raise AssertionError("could not restore requirepass")
+
+
+def test_password_restored_after_admin_reconnect(env):
+    """Password-change cleanup must also work after the admin pool disconnects."""
+    env.skipOnCluster()
+    conn = env.getOSSMasterNodesConnectionList()[0]
+    original = conn.connection_pool.connection_kwargs.get("password") or ""
+    temporary = "reconnect-cleanup-dummy"
+    conn.execute_command("CONFIG", "SET", "requirepass", temporary)
+    try:
+        conn.connection_pool.disconnect()
+        _restore_requirepass(conn, (temporary,))
+        env.assertTrue(conn.ping())
+        env.assertEqual(conn.config_get("requirepass")["requirepass"], original)
+    finally:
+        # Preserve the runner configuration even if an assertion fails.
+        _restore_requirepass(conn, (temporary,))
 
 
 def _run_with_mid_run_password_change(env, extra_args, test_time, rate_limit=True):
