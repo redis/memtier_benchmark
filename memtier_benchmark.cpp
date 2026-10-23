@@ -5370,60 +5370,65 @@ int main(int argc, char *argv[])
                             "the monitor file will be ignored and a standard SET/GET benchmark will run.\n");
         }
 
+        // Random placeholders share the monitor list's single per-type stats mapping.
+        bool monitor_stats_initialized = false;
         // Expand monitor placeholders in commands
         for (unsigned int i = 0; i < cfg.arbitrary_commands->size(); i++) {
             arbitrary_command &cmd = cfg.arbitrary_commands->at(i);
 
             // Check if command is a random monitor placeholder
             if (strcmp(cmd.command.c_str(), MONITOR_RANDOM_PLACEHOLDER) == 0) {
-                // Get unique command types from the monitor file
-                std::vector<std::string> unique_types = cfg.monitor_commands->get_unique_command_types();
+                if (!monitor_stats_initialized) {
+                    // Get unique command types from the monitor file
+                    std::vector<std::string> unique_types = cfg.monitor_commands->get_unique_command_types();
 
-                if (unique_types.empty()) {
-                    fprintf(stderr, "error: no valid commands found in monitor input file\n");
-                    exit(1);
-                }
+                    if (unique_types.empty()) {
+                        fprintf(stderr, "error: no valid commands found in monitor input file\n");
+                        exit(1);
+                    }
 
-                // The current command index is where we'll add the stats slots
-                // Add new arbitrary_command entries for each unique command type
-                size_t base_stats_index = cfg.arbitrary_commands->size();
+                    // The current command index is where we'll add the stats slots
+                    // Add new arbitrary_command entries for each unique command type
+                    size_t base_stats_index = cfg.arbitrary_commands->size();
 
-                for (const auto &cmd_type : unique_types) {
-                    // Create a placeholder command for stats tracking
-                    std::string placeholder = "MONITOR_" + cmd_type;
-                    arbitrary_command stats_cmd(placeholder.c_str());
-                    stats_cmd.command_name = cmd_type;
-                    stats_cmd.command_type = cmd_type;
-                    // Mark it as a stats-only slot (no actual command to send)
-                    stats_cmd.command_args.clear();
-                    stats_cmd.stats_only = true;
-                    // resolve_command_meta() returns early for empty argv, so look up
-                    // spec directly and stamp miss_tracking_enabled so runtime hit/miss
-                    // accounting actually fires for this slot.
-                    {
-                        using memtier::command_meta::ReplyShape;
-                        const memtier::command_meta::CommandSpec *cmd_spec =
-                            memtier::command_meta::lookup(cmd_type.c_str());
-                        stats_cmd.spec = cmd_spec;
-                        if (cmd_spec != nullptr) {
-                            switch (cmd_spec->reply_shape) {
-                            case ReplyShape::SingleNullBulk:
-                            case ReplyShape::ArrayPerElementNulls:
-                            case ReplyShape::EmptyCollection:
-                            case ReplyShape::IntegerMembership:
-                                stats_cmd.miss_tracking_enabled = true;
-                                break;
-                            default:
-                                stats_cmd.miss_tracking_enabled = false;
-                                break;
+                    for (const auto &cmd_type : unique_types) {
+                        // Create a placeholder command for stats tracking
+                        std::string placeholder = "MONITOR_" + cmd_type;
+                        arbitrary_command stats_cmd(placeholder.c_str());
+                        stats_cmd.command_name = cmd_type;
+                        stats_cmd.command_type = cmd_type;
+                        // Mark it as a stats-only slot (no actual command to send)
+                        stats_cmd.command_args.clear();
+                        stats_cmd.stats_only = true;
+                        // resolve_command_meta() returns early for empty argv, so look up
+                        // spec directly and stamp miss_tracking_enabled so runtime hit/miss
+                        // accounting actually fires for this slot.
+                        {
+                            using memtier::command_meta::ReplyShape;
+                            const memtier::command_meta::CommandSpec *cmd_spec =
+                                memtier::command_meta::lookup(cmd_type.c_str());
+                            stats_cmd.spec = cmd_spec;
+                            if (cmd_spec != nullptr) {
+                                switch (cmd_spec->reply_shape) {
+                                case ReplyShape::SingleNullBulk:
+                                case ReplyShape::ArrayPerElementNulls:
+                                case ReplyShape::EmptyCollection:
+                                case ReplyShape::IntegerMembership:
+                                    stats_cmd.miss_tracking_enabled = true;
+                                    break;
+                                default:
+                                    stats_cmd.miss_tracking_enabled = false;
+                                    break;
+                                }
                             }
                         }
+                        cfg.arbitrary_commands->add_command(stats_cmd);
                     }
-                    cfg.arbitrary_commands->add_command(stats_cmd);
-                }
 
-                // Set up the stats index mapping in monitor_command_list
-                cfg.monitor_commands->setup_stats_indices(base_stats_index);
+                    // Set up the stats index mapping in monitor_command_list
+                    cfg.monitor_commands->setup_stats_indices(base_stats_index);
+                    monitor_stats_initialized = true;
+                }
 
                 // Re-get the reference since vector may have reallocated
                 arbitrary_command &placeholder_cmd = cfg.arbitrary_commands->at(i);
