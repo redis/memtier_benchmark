@@ -15,6 +15,7 @@ The executable defaults to $MEMTIER_BENCHMARK, then ./memtier_benchmark.exe.
 import ctypes
 import json
 import os
+import re
 import socket
 import ssl
 import subprocess
@@ -185,8 +186,12 @@ class WindowsSmokeTests(unittest.TestCase):
         # The startup guard can expire before Windows reports the socket
         # error. Both paths must still exit unsuccessfully without crashing.
         if "Connection error:" not in result.stderr:
-            self.assertIn("aborting after 3 seconds of connection-stage failures "
-                          "(last error: no response from server during setup)", result.stderr)
+            guard = re.search(r"aborting after (\d+) seconds of connection-stage failures "
+                              r"\(last error: no response from server during setup\)", result.stderr)
+            self.assertIsNotNone(guard, result.stderr)
+            # The diagnostic reports actual elapsed time, which can exceed
+            # the configured timeout if the supervisor was delayed.
+            self.assertGreaterEqual(int(guard.group(1)), 3)
 
     @unittest.skipUnless(sys.platform == "win32", "detached CRT handles are Windows-specific")
     def test_detached_process_writes_requested_output(self):
