@@ -13,10 +13,12 @@ find . -name '*.gcda' -delete
 make code-coverage-capture CODE_COVERAGE_IGNORE_PATTERN= \
   CODE_COVERAGE_OUTPUT_FILE=coverage-threaded.info \
   CODE_COVERAGE_OUTPUT_DIRECTORY=coverage-threaded
-awk -F, '$1 ~ /^FNDA:/ && $2 == "hdr_record_value_capped_atomic" {
+awk -F, '($1 ~ /^FNDA:/ && $2 == "hdr_record_value_capped_atomic") ||
+         ($1 ~ /^FNA:/ && $3 == "hdr_record_value_capped_atomic") {
              seen=1
-             if ($1 != "FNDA:40012") {
-                 print "Threaded coverage: expected 40012 calls, got " substr($1, 6) > "/dev/stderr"
+             count=($1 ~ /^FNDA:/ ? substr($1, 6) : $2)
+             if (count != 40012) {
+                 print "Threaded coverage: expected 40012 calls, got " count > "/dev/stderr"
                  bad=1
              }
          }

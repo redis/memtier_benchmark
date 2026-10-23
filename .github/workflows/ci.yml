@@ -480,6 +480,7 @@ jobs:
 
   coverage-shards:
     name: Coverage shard ${{ matrix.shard }}/4
+    # Retain the lcov 1 baseline; coverage-toolchains also exercises lcov 2.
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
