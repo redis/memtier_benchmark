@@ -118,7 +118,14 @@ AC_DEFUN([AX_CODE_COVERAGE],[
 
 		dnl lcov 2 makes an unmatched optional exclusion an error. Older lcov
 		dnl releases do not know this category; only pass it to versions >= 2.
+		AC_MSG_CHECKING([for lcov major version])
 		ax_lcov_major=`$LCOV --version 2>/dev/null | $SED -n 's/^.*version \([[0-9]][[0-9]]*\)\..*$/\1/p'`
+		AS_IF([test -n "$ax_lcov_major"], [
+			AC_MSG_RESULT([$ax_lcov_major])
+		], [
+			AC_MSG_RESULT([unknown])
+			AC_MSG_WARN([could not parse lcov --version; lcov 2 compatibility options are disabled])
+		])
 		AS_IF([test -n "$ax_lcov_major" && test "$ax_lcov_major" -ge 2], [
 			CODE_COVERAGE_LCOV_RMOPTS_DEFAULT="--ignore-errors unused"
 			dnl Clang emits generated functions without source-line coverpoints.
