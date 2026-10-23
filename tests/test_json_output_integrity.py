@@ -155,14 +155,26 @@ def _assert_aggregated_latency_consistent(env, label, aggregate, runs):
     Reconstruct each run's possible raw sum, combine the intervals, then
     compare the aggregate's rounded double mean using the total sample count.
     Grouped arbitrary HDR rows are deliberately excluded from this oracle.
+
+    aggregate_average() leaves the fresh object's per-second stats empty, so
+    aggregate Time-Serie objects currently have no buckets to combine. Pin
+    that contract and validate every individual run's exact-sum buckets;
+    BEST/WORST alone need not cover the middle runs. If aggregate buckets
+    are added later, their calculation needs its own explicit oracle.
     """
     for name in ("Sets", "Gets", "Waits", "Totals"):
         if name not in aggregate:
             continue
+        row = aggregate[name]
+        env.assertEqual(
+            row.get("Time-Serie", {}), {},
+            message=f"{label}.{name}: aggregate time buckets need an explicit arithmetic oracle",
+        )
         total_count, lower, upper = 0, 0, 0
         valid = True
         for index, run in enumerate(runs, 1):
             row = run[name]
+            _assert_time_series_consistent(env, f"RUN #{index}.{name}", row)
             interval = _assert_latency_consistent(
                 env, f"RUN #{index}.{name}", row, integer_mean=name != "Totals"
             )
@@ -422,19 +434,20 @@ def test_reconnect_interval_does_not_zero_out_rates(env):
 
 def test_json_multi_run_aggregated_sections_consistent(env):
     """BEST/WORST are single runs; AGGREGATED needs the per-run sum oracle."""
+    run_count = 3
     test_dir = tempfile.mkdtemp()
     try:
         benchmark, run_config = _build_benchmark(
             env, test_dir,
             extra_args=["--ratio=1:1", "--key-pattern=R:R", "--pipeline=1",
-                        "--run-count=2", "--print-all-runs"],
+                        f"--run-count={run_count}", "--print-all-runs"],
             threads=2, clients=4, requests=1500)
         ok = benchmark.run()
         failed_asserts = env.getNumberOfFailedAssertion()
         try:
             env.assertTrue(ok)
             results = _read_json(run_config, env)
-            # The expected sections for run-count=2.
+            # BEST/WORST do not necessarily cover every run.
             expected = ["BEST RUN RESULTS", "WORST RUN RESULTS"]
             for label in expected:
                 env.assertTrue(label in results,
@@ -445,7 +458,7 @@ def test_json_multi_run_aggregated_sections_consistent(env):
                         if k.startswith("AGGREGATED AVERAGE RESULTS")]
             env.assertEqual(len(agg_keys), 1,
                             message="Expected exactly one AGGREGATED section")
-            runs = [results[f"RUN #{index} RESULTS"] for index in (1, 2)]
+            runs = [results[f"RUN #{index} RESULTS"] for index in range(1, run_count + 1)]
             _assert_aggregated_latency_consistent(env, agg_keys[0], results[agg_keys[0]], runs)
         finally:
             if env.getNumberOfFailedAssertion() > failed_asserts:
@@ -1445,6 +1458,31 @@ def test_latency_aggregate_uses_individual_run_sums(env):
     aggregate = dict(aggregate, Latency="3.000", **{"Average Latency": "3.000"})
     counter = _FailureCounter()
     _assert_aggregated_latency_consistent(counter, "unweighted", {"Totals": aggregate}, runs)
+    env.assertEqual(counter.failures, 1)
+
+
+def test_latency_aggregate_checks_every_run_time_bucket(env):
+    # All summary rows agree, so only the middle run's corrupted bucket can
+    # fail. A BEST/WORST-only check or a summary-only oracle misses it.
+    bucket = {"Count": 3, "Accumulated Latency": 2, "Average Latency": "0.667"}
+    row = {"Count": 3, "Accumulated Latency": 2, "Latency": "0.666",
+           "Average Latency": "0.666", "Time-Serie": {"0": bucket}}
+    aggregate = {"Sets": dict(row, Latency="0.667",
+                             **{"Average Latency": "0.667", "Time-Serie": {}})}
+    runs = [{"Sets": row}, {"Sets": row}, {"Sets": row}]
+    _assert_aggregated_latency_consistent(env, "valid", aggregate, runs)
+    corrupt_bucket = dict(bucket, **{"Average Latency": "50.000"})
+    runs[1] = {"Sets": dict(row, **{"Time-Serie": {"0": corrupt_bucket}})}
+    counter = _FailureCounter()
+    _assert_aggregated_latency_consistent(counter, "corrupt-middle-bucket", aggregate, runs)
+    env.assertEqual(counter.failures, 1)
+
+    # There is no aggregate time-series calculation in the current writer.
+    # Adding one must trigger review of its oracle rather than silently skip
+    # the buckets or assume the single-run arithmetic also applies to them.
+    counter = _FailureCounter()
+    aggregate["Sets"]["Time-Serie"] = {"0": bucket}
+    _assert_aggregated_latency_consistent(counter, "new-aggregate-buckets", aggregate, [{"Sets": row}])
     env.assertEqual(counter.failures, 1)
 
 
