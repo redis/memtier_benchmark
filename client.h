@@ -111,6 +111,10 @@ protected:
     // EXEC/DISCARD was not yet. If the connection no longer has the MULTI open
     // (it reconnected), the rest of the block is skipped.
     bool m_txn_multi_sent;
+    // Processed requests at the last planned transaction reconnect. The next
+    // interval is measured from the actual (possibly deferred) boundary.
+    unsigned long long m_txn_reconnect_reqs_base;
+    bool transaction_reconnect_due() const;
 
     unsigned long long m_tot_set_ops;  // Total number of SET ops
     unsigned long long m_tot_wait_ops; // Total number of WAIT ops
@@ -235,6 +239,7 @@ public:
     void set_end_time_at(struct timeval *end_time);
     virtual void create_request(struct timeval timestamp, unsigned int conn_id);
     virtual bool hold_pipeline(unsigned int conn_id);
+    virtual bool prepare_transaction_reconnect();
     virtual int connect(void);
     virtual void disconnect(void);
     virtual void disconnect_all(void);

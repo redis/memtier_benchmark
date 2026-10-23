@@ -1815,7 +1815,7 @@ void shard_connection::process_response(void)
         report_connection_stage_failure("response parsing failed (protocol mismatch?)");
     }
 
-    if (m_config->reconnect_interval > 0 && responses_handled) {
+    if (m_config->reconnect_interval > 0 && !m_config->transaction && responses_handled) {
         if ((m_config->requests != m_conns_manager->get_reqs_processed()) &&
             ((m_conns_manager->get_reqs_processed() % m_config->reconnect_interval) == 0)) {
             assert(m_pipeline->size() == 0);
@@ -1859,8 +1859,25 @@ void shard_connection::process_first_request()
     fill_pipeline();
 }
 
+bool shard_connection::reconnect_transaction_interval()
+{
+    if (get_connection_state() != conn_connected || !m_pipeline->empty() || m_conns_manager->finished() ||
+        !m_conns_manager->prepare_transaction_reconnect())
+        return false;
+
+    benchmark_debug_log("reconnecting at transaction boundary, m_reqs_processed = %llu\n",
+                        m_conns_manager->get_reqs_processed());
+    m_conns_manager->disconnect();
+    if (m_conns_manager->connect() != 0) {
+        benchmark_error_log("failed to reconnect.\n");
+        exit(failure_exit_code());
+    }
+    return true;
+}
+
 void shard_connection::fill_pipeline(void)
 {
+    if (m_config->transaction && m_config->reconnect_interval && reconnect_transaction_interval()) return;
     struct timeval now;
     gettimeofday(&now, NULL);
 
@@ -1945,6 +1962,11 @@ void shard_connection::fill_pipeline(void)
         // client manage requests logic
         m_conns_manager->create_request(now, m_id);
     }
+
+    // Skipping a block after an unplanned loss can reach a rotation boundary
+    // without sending a request. There may be no response callback left to
+    // start a deferred planned reconnect, so check again after generation.
+    if (m_config->transaction && m_config->reconnect_interval && reconnect_transaction_interval()) return;
 
     // Check if done: no pending responses and output buffer empty
     if (m_bev != NULL) {

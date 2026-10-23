@@ -57,6 +57,9 @@ public:
 
     virtual void create_request(struct timeval timestamp, unsigned int conn_id) = 0;
     virtual bool hold_pipeline(unsigned int conn_id) = 0;
+    // Called only with a drained pipeline. Commit a planned transaction
+    // reconnect if its interval and full command-rotation boundary are due.
+    virtual bool prepare_transaction_reconnect() { return false; }
 
     // Routed requests can be waiting on another connection's rate budget.
     virtual void handle_rate_limit_refill(unsigned int) {}
