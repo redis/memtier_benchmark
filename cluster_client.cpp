@@ -2889,15 +2889,21 @@ bool cluster_client::enqueue_redirect_retry(unsigned int target, request *req)
 // established (e.g. a TLS handshake at startup) or waiting on its reconnect
 // timer qualifies: its retry queue holds the request until it is set up
 // again, as in hand_off_replay_requests().
-unsigned int cluster_client::redirect_target_conn(protocol_response *response)
+unsigned int cluster_client::redirect_target_conn(unsigned int conn_id, protocol_response *response)
 {
     const char *status = response->get_status();
     const char *addr = status ? strrchr(status, ' ') : NULL;
     const char *port = addr ? strrchr(addr, ':') : NULL;
     if (port == NULL) return UINT_MAX;
     addr++;
-    const size_t addr_len = port - addr;
+    size_t addr_len = port - addr;
     port++;
+    // An empty redirect host means the endpoint of the replying connection,
+    // which may differ from the original seed. Keep the redirected port.
+    if (addr_len == 0) {
+        addr = m_connections[conn_id]->get_address();
+        addr_len = strlen(addr);
+    }
     for (unsigned int i = 0; i < m_connections.size(); i++) {
         shard_connection *sc = m_connections[i];
         if (sc->get_role() == role_primary &&
@@ -2919,7 +2925,7 @@ unsigned int cluster_client::redirect_target_conn(protocol_response *response)
 // routing by the slot map.
 bool cluster_client::retry_after_ask(unsigned int conn_id, request *req, protocol_response *response)
 {
-    unsigned int target = redirect_target_conn(response);
+    unsigned int target = redirect_target_conn(conn_id, response);
     if (target == UINT_MAX) {
         const char *status = response->get_status();
         benchmark_debug_log("no live primary connection for %s; retrying by slot map\n", status ? status : "-ASK");
@@ -2950,7 +2956,8 @@ bool cluster_client::retry_after_moved(unsigned int conn_id, request *req, proto
     if (!req || !req->m_serialized || req->m_serialized_len == 0) return false;
 
     unsigned int target = UINT_MAX;
-    if (!classify_read(req) || m_config->read_preference == rp_primary) target = redirect_target_conn(response);
+    if (!classify_read(req) || m_config->read_preference == rp_primary)
+        target = redirect_target_conn(conn_id, response);
     if (target == UINT_MAX || target == conn_id) return retry_after_redirect(conn_id, req);
 
     // The node that owns the slot gets a plain resend: ASKING from an
