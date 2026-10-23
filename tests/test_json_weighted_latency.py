@@ -94,11 +94,19 @@ def test_json_aggregate_latency_weights_samples(env):
             accumulated = sum(run[name]["Accumulated Latency"] for run in runs)
             actual = aggregate[name]["Latency"]
             env.assertEqual(actual, aggregate[name]["Average Latency"])
-            # Each real run's accumulated latency truncates less than 1ms;
-            # averages print to .001ms. The aggregate's independently rounded
-            # Count/Accumulated are deliberately not used as the oracle.
-            lower = accumulated / count - 0.0005
-            upper = (accumulated + len(runs)) / count + 0.0005
+            if breakdown == "command" and name != "Totals":
+                # Grouped rows already use a sample-weighted HDR mean. Retain
+                # that convention; both individual and aggregate means print
+                # to .001ms, so their combined rounding error is at most .001ms.
+                expected = sum(run[name]["Latency"] * run[name]["Count"] for run in runs) / count
+                rounding = 0.001 + 1e-9  # Include floating-point comparison noise.
+                lower, upper = expected - rounding, expected + rounding
+            else:
+                # Each real run's accumulated latency truncates less than 1ms;
+                # averages print to .001ms. The aggregate's independently rounded
+                # Count/Accumulated are deliberately not used as the oracle.
+                lower = accumulated / count - 0.0005
+                upper = (accumulated + len(runs)) / count + 0.0005
             env.assertGreaterEqual(actual, lower, message=f"{breakdown}/{name}: {actual} < {lower}")
             env.assertLessEqual(actual, upper, message=f"{breakdown}/{name}: {actual} > {upper}")
             env.assertAlmostEqual(aggregate[name]["Ops/sec"],

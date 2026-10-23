@@ -2205,10 +2205,6 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
                 const std::string &command_name = row_keys[a];
 
                 double avg_latency = hdr_mean(agg.latency_hist) / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
-                if (m_averaged_runs > 0) {
-                    // Match per-line and Totals JSON using unrounded sample sums.
-                    avg_latency = agg.stats.m_ops ? (double) agg.stats.m_total_latency / agg.stats.m_ops / 1000.0 : 0.0;
-                }
 
                 unsigned long long sum_hits = 0;
                 unsigned long long sum_misses = 0;
