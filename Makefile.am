@@ -92,7 +92,7 @@ memtier_benchmark_LDADD = \
 
 
 check_PROGRAMS = prometheus_metrics_test rate_limiter_test retry_backoff_test keylist_growth_test hdr_histogram_test cluster_transaction_test \
-    cluster_hslot_test run_stats_counters_test run_stats_merge_test crash_report_test socket_options_test retry_drain_test reconnect_siblings_test memcache_meta_test
+    cluster_hslot_test run_stats_counters_test run_stats_merge_test crash_report_test socket_options_test retry_drain_test reconnect_siblings_test memcache_meta_test cluster_slots_retention_test
 
 # The metrics test links only the pure layer (prometheus_metrics.{h,cpp}, utf8.{h,cpp}).
 # First `make check` program in the repo. The metrics layer is config-free and
@@ -162,6 +162,11 @@ reconnect_siblings_test_SOURCES = tests/unit/reconnect_siblings_test.cpp
 reconnect_siblings_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
 reconnect_siblings_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 reconnect_siblings_test_LDADD = $(filter-out memtier_benchmark-memtier_benchmark.$(OBJEXT),$(memtier_benchmark_OBJECTS)) $(memtier_benchmark_LDADD)
+# Restore parser value retention when a topology refresh completes or disconnects.
+cluster_slots_retention_test_SOURCES = tests/unit/cluster_slots_retention_test.cpp
+cluster_slots_retention_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
+cluster_slots_retention_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+cluster_slots_retention_test_LDADD = $(filter-out memtier_benchmark-memtier_benchmark.$(OBJEXT),$(memtier_benchmark_OBJECTS)) $(memtier_benchmark_LDADD)
 # Check hash slots, including hash tags, against CLUSTER KEYSLOT.
 cluster_hslot_test_SOURCES = tests/unit/cluster_hslot_test.cpp
 cluster_hslot_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
