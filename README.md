@@ -665,6 +665,10 @@ When used for normally distributed data, the samples are usually taken at regula
 By default Memtier will output the 50th, 99th, and 99.9th percentiles. They are the latency thresholds at which 50%, 99%, and 99.9% of commands are faster than that particular presented value. 
 To output different percentiles, use `--print-percentiles` followed by a comma-separated list of finite values from 0 through 100 (for example, `--print-percentiles 90,99,99.9,99.99`). Non-finite and out-of-range values are rejected before connecting.
 
+Rows with no latency samples display `---` for the average and percentiles in the
+final text table. JSON keeps these latency fields and percentile keys with numeric
+zero values; the encoded HDR histogram remains empty.
+
 #### Saving the full latency spectrum
 To save the full latencies you should use the --hdr-file-prefix option followed by the prefix name you wish the filenames to have. 
 Each distinct command will be saved into two different files - one in .txt (textual format) and another in .hgrm (HistogramLogProcessor format).
