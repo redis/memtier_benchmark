@@ -19,6 +19,7 @@ AUTOMAKE_OPTIONS = foreign 1.9 subdir-objects
 CODE_COVERAGE_IGNORE_PATTERN='*/deps/hdr_histogram/*' '*/tests/*'
 # Every executable that consumes instrumented objects needs the compiler's
 # coverage link option, including unit tests with their own source lists.
+# Targets overriding their own _LDFLAGS must include it if instrumented.
 AM_LDFLAGS = $(CODE_COVERAGE_LDFLAGS)
 
 EXTRA_DIST = README.md COPYING version.sh \
