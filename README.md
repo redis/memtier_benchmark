@@ -292,16 +292,17 @@ values:
   `Total Hits` / `Total Misses` are the sum of the rounded `key[i]` values.
 - Ops/sec, KB/sec, and the default workload's Hits/sec and Misses/sec are
   the mean of the per-run values. The Hits/sec and Misses/sec of `--command`
-  rows are time-weighted instead: the
-  hits (or misses) of all runs divided by the duration of all runs.
+  rows are time-weighted instead: the hits (or misses) of all runs divided
+  by the duration of all runs.
 - JSON `Latency` / `Average Latency` weight each completed operation equally:
   total accumulated latency divided by total operations, before rounding the
   per-run counts. Runs with no samples do not lower this mean. Older versions
   averaged run means for Totals, built-in commands and per-line command rows;
   grouped command rows used the merged HDR mean. Unequal run counts therefore
-  produced inconsistent averages. Text averages and percentiles use the merged
-  HDR samples, so
-  the text average can differ slightly due to histogram bucket precision.
+  produced inconsistent averages. Single-run grouped command rows retain
+  their HDR mean; only the aggregate section uses the exact sample mean.
+  Text averages and percentiles use the merged HDR samples, so the text
+  average can differ slightly due to histogram bucket precision.
 - Percentiles come from the latency histograms of all the runs merged
   together, so the section's `Histogram log format` holds the samples of all
   the runs (N times its `Count`).
