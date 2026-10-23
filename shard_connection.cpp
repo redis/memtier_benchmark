@@ -655,7 +655,7 @@ int shard_connection::connect(struct connect_info *addr)
     // call connect
     m_connection_state = conn_in_progress;
 
-    const struct sockaddr *sa = m_unix_sockaddr ? (struct sockaddr *) m_unix_sockaddr : addr->ci_addr;
+    struct sockaddr *sa = m_unix_sockaddr ? (struct sockaddr *) m_unix_sockaddr : addr->ci_addr;
     int socklen = m_unix_sockaddr ? m_unix_sockaddrlen : addr->ci_addrlen;
 #ifdef _WIN32
     int ret = bufferevent_connect_nonblocking(m_bev, sockfd, sa, socklen);
@@ -663,7 +663,7 @@ int shard_connection::connect(struct connect_info *addr)
         // Do not enter the error callback during client preparation. This
         // connection owns the queued event so disconnect/destruction cancels
         // it, including the TLS bufferevent and its SSL ownership. event_new /
-        // event_active work with the existing libevent 2.0.10 minimum.
+        // event_active work with the libevent 2.0 APIs.
         bufferevent_disable(m_bev, EV_READ | EV_WRITE);
         m_deferred_connect_error = event_new(m_event_base, -1, 0, deferred_connect_error_handler, this);
         if (m_deferred_connect_error == NULL) {
@@ -2328,7 +2328,10 @@ double shard_connection::next_reconnect_delay(void)
     // Only with unlimited attempts: a finite --max-reconnect-attempts keeps
     // its backoff schedule, which bounds the run as before (#656).
     if (stops_at_deadline() && run_deadline(&deadline)) {
-        gettimeofday(&now, NULL);
+        // event_add() measures relative delays from the event loop's cached
+        // time. Use that same origin: a fresh wall clock after a slow callback
+        // would shorten the delay and let a deadline retry fire early.
+        if (event_base_gettimeofday_cached(m_event_base, &now) < 0) gettimeofday(&now, NULL);
         double left = (deadline.tv_sec - now.tv_sec) + (deadline.tv_usec - now.tv_usec) / 1000000.0;
         if (left < 0) left = 0;
         if (left < delay) delay = left;

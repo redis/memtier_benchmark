@@ -45,7 +45,7 @@ memtier_benchmark is a high-performance load generation and benchmarking tool fo
 
 - **Build tool**: GNU Autotools (autoconf/automake)
 - **Language**: C++11
-- **Dependencies**: libevent (≥2.0.10), OpenSSL (optional), zlib, pthread
+- **Dependencies**: libevent (≥2.0.11), OpenSSL (optional), zlib, pthread
 
 ### Build Commands
 
