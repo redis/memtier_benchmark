@@ -28,6 +28,7 @@ class _Node(socketserver.ThreadingTCPServer):
     ):
         super().__init__(("127.0.0.1", 0), _Handler)
         self.root = self
+        self.extra = []
         self.ranges = ranges
         self.replica = _Node(ranges) if replica else None
         if self.replica:
@@ -160,8 +161,10 @@ def _run(env, node, args, expected_exit=0, timeout=8, seed_replica=False):
         node.server_close()
         if node.replica:
             node.replica.server_close()
+        for extra in node.extra:
+            extra.server_close()
         env.skip()  # The fixture owns its complete topology and plaintext sockets.
-    nodes = [node] + ([node.replica] if node.replica else [])
+    nodes = [node] + ([node.replica] if node.replica else []) + node.extra
     threads = [threading.Thread(target=n.serve_forever) for n in nodes]
     for t in threads:
         t.start()
@@ -429,3 +432,78 @@ def test_unowned_slot_warning_is_once_per_process(env):
     env.assertEqual(len(node.requests), 120)
     env.assertEqual(len(failures), 120)
     env.assertEqual(stderr.count("has no owner; sending requests to a primary"), 1)
+
+
+class _TwoPrimaries(_Node):
+    """Seed B is connected while advertised-first primary A is still setting up.
+
+    The missing slot accepts data after advertising a hole, modelling recovery
+    between SLOTS and the data command. Successful replies must not depend on
+    CLUSTERDOWN forcing another cache build to keep the producer progressing.
+    """
+
+    def __init__(self, unowned=True):
+        super().__init__([(0, 16383)])
+        self.first_primary = _Node([(0, 16383)], auth_delay=0.1)
+        self.first_primary.root = self
+        self.first_primary.topology = self.topology
+        self.extra = [self.first_primary]
+        self.unowned = unowned
+
+    def topology(self):
+        with self.lock:
+            self.slots_calls += 1
+        ranges = [(0, 3497), (3499, 8000)] if self.unowned else [(0, 8000)]
+        owners = [(low, high, self.first_primary) for low, high in ranges] + [(8001, 16383, self)]
+        reply = b"*" + str(len(owners)).encode() + b"\r\n"
+        for low, high, owner in owners:
+            reply += (
+                b"*3\r\n:"
+                + str(low).encode()
+                + b"\r\n:"
+                + str(high).encode()
+                + b"\r\n*2\r\n$9\r\n127.0.0.1\r\n:"
+                + str(owner.server_address[1]).encode()
+                + b"\r\n"
+            )
+        return reply
+
+
+def test_unowned_mget_keeps_its_primary_producer_during_setup(env):
+    for limits in (
+        ["--requests=20"],
+        ["--requests=20", "--pipeline=8"],
+        ["--test-time=1", "--rate-limiting=20"],
+    ):
+        node = _TwoPrimaries()
+        stats, failures, _ = _run(env, node, ["--ratio=0:2", "--multi-key-get=2"] + limits)
+        count = stats["Totals"]["Count"]
+        if limits[0].startswith("--requests"):
+            env.assertEqual(count, 20)
+        else:
+            env.assertGreater(count, 0)
+        env.assertEqual(len(node.requests), count)
+        env.assertEqual(node.first_primary.requests, [])
+        env.assertTrue(
+            all(verb == b"MGET" and keys == (b"memtier-1", b"memtier-1") for verb, keys in node.requests)
+        )
+        env.assertEqual(failures, [])
+        env.assertEqual(node.slots_calls, 1)
+
+
+def test_two_primary_owned_mget_and_unowned_get_controls(env):
+    for unowned, args in ((False, ["--ratio=0:2", "--multi-key-get=2"]), (True, ["--ratio=0:1"])):
+        node = _TwoPrimaries(unowned=unowned)
+        stats, failures, _ = _run(env, node, ["--requests=20"] + args)
+        requests = node.requests + node.first_primary.requests
+        env.assertEqual(stats["Totals"]["Count"], 20)
+        env.assertEqual(len(requests), 20)
+        env.assertTrue(
+            all(
+                keys == ((b"memtier-1",) if unowned else (b"memtier-1", b"memtier-1")) for _, keys in requests
+            )
+        )
+        if not unowned:
+            env.assertEqual(node.requests, [])
+        env.assertEqual(failures, [])
+        env.assertEqual(node.slots_calls, 1)

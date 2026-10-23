@@ -539,8 +539,9 @@ client, including when a previously full map has become stale. Each client
 maintains its own topology: for example, `-t 8 -c 50` permits up to 400 refreshes
 per second during sustained `CLUSTERDOWN`, in addition to initial discovery.
 Refreshes also occur when retries are disabled. Missing-owner requests use the
-first available primary, so this error traffic can concentrate on one node. Strict
-`secondary` reads with `error` or `queue` fallback fail the run because no
+first available primary, so this error traffic can concentrate on one node.
+MGET retains that primary as its producer until the next topology refresh.
+Strict `secondary` reads with `error` or `queue` fallback fail the run because no
 authoritative replica can be chosen, including for a transient hole discovered
 by a mid-run refresh.
 

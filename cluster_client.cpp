@@ -2522,7 +2522,12 @@ bool cluster_client::create_mget_request(struct timeval &timestamp, unsigned int
         m_mget_defer = true;
         return false;
     }
-    const unsigned int routed = select_target_conn(target_slot, true /* MGET is always a read */);
+    // A missing slot has no authoritative read target. Keep using the primary
+    // producer assigned by the cache until topology changes. Re-selecting the
+    // first connected primary can move this send to a different primary that
+    // is still setting up, and primary-mode pipeline deferral cannot yield that
+    // cross-connection producer. This connection has completed its own setup.
+    const unsigned int routed = slot_is_unowned(target_slot) ? conn_id : select_target_conn(target_slot, true);
     if (routed == UINT_MAX) {
         // Strict-secondary with no live replica and rpf_error/queue. The
         // routing policy has no eligible replica right now, but may have one
@@ -3206,6 +3211,7 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
         // CLUSTERDOWN has no MOVED destination. Even a previously full map
         // can be stale. Poll at most once per second, without flushing any
         // staged keys. The setup ladder defers SLOTS while MULTI is open.
+        // Like READONLY below, this recognizes Redis's simple-error form.
         static const char CLUSTERDOWN_MSG_PREFIX[] = "-CLUSTERDOWN ";
         if (strncmp(response->get_status(), CLUSTERDOWN_MSG_PREFIX, sizeof(CLUSTERDOWN_MSG_PREFIX) - 1) == 0 &&
             (m_last_clusterdown_refresh.tv_sec == 0 || ts_diff(m_last_clusterdown_refresh, timestamp) >= 1000000) &&
