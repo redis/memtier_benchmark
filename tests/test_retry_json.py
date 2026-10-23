@@ -80,7 +80,7 @@ class _RetryJsonHandler(socketserver.StreamRequestHandler):
                 peer.failures.append(repr(error))
 
 
-def _run_retry_json(modes, *, threads=1, clients=1, requests=6, retry=True, arbitrary=False):
+def _run_retry_json(modes, *, threads=1, clients=1, requests=6, retry=True, arbitrary=False, line_breakdown=False):
     with tempfile.TemporaryDirectory() as directory, _RetryJsonPeer(modes, threads * clients) as peer:
         serving = threading.Thread(target=peer.serve_forever)
         serving.start()
@@ -97,6 +97,8 @@ def _run_retry_json(modes, *, threads=1, clients=1, requests=6, retry=True, arbi
                      "--command=INCR __key__", "--command-key-pattern=S"]
         else:
             args += ["--ratio=1:0", "--key-pattern=S:S"]
+        if line_breakdown:
+            args += ["--command-stats-breakdown=line"]
         try:
             process = subprocess.run(args, capture_output=True, text=True, timeout=45)
         finally:
@@ -138,6 +140,9 @@ def test_retry_json_totals(env):
         result, expected = _run_retry_json((mode,), threads=2, clients=2,
                                           arbitrary=arbitrary, retry=retry)
         _assert_totals(result["ALL STATS"], expected[0], retry)
+    result, expected = _run_retry_json(("mixed",), threads=2, clients=2,
+                                      arbitrary=True, line_breakdown=True)
+    _assert_totals(result["ALL STATS"], expected[0])
 
 
 def test_retry_json_run_averages(env):
