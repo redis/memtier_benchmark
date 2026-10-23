@@ -165,6 +165,12 @@ You can replay real command streams by pointing memtier_benchmark to a monitor l
 $ memtier_benchmark --monitor-input=monitor.txt --command=__monitor_line1__
 ```
 
+Repeated `--command "__monitor_line@__"` entries keep their individual command
+ratios and share one statistics slot per monitor command type. Even with
+`--command-stats-breakdown=line`, these shared type rows and HDR files combine
+requests from all random-monitor entries; they are not separate per-placeholder
+distributions. Ordinary command entries retain their own statistics slots.
+
 This lets you mix synthetic workloads with realistic captured traffic. Monitor input works in both single endpoint and cluster mode (`--cluster-mode`); in cluster mode each command is sent to the shard that owns its first argument's key. Monitor lines may use the `__key__` and `__data__` placeholders, and text around `__key__` (for example `user:__key__` or `{tag}__key__`) is kept. Each `__key__` argument gets its own generated key, so in cluster mode a `__monitor_line@__` line with more than one `__key__` argument must give them all the same `{hash tag}` (for example `"MSET" "{t}a:__key__" "v" "{t}b:__key__" "v"`), or memtier_benchmark refuses to start; without a tag the keys could land in different slots. The check looks only at `__key__` arguments: a literal key next to a generated one (for example `"MSET" "fixed" "v" "k:__key__" "v"`) is not detected, and Redis answers `CROSSSLOT` unless both share a hash tag. `--failed-keys-file` and `--retry-on-error` use the first argument as the request's key, the same one the command is routed by.
 
 When the number of requested operations exceeds the number of commands in the monitor file, commands are reused:
