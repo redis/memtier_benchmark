@@ -112,6 +112,21 @@ public:
         m_slot_to_shard_group[slot] = 1;
     }
     bool pool_empty(unsigned int conn_id) const { return m_key_index_pools[conn_id]->empty(); }
+    // Keep the monitor backpressure regression deterministic when #466
+    // restores the integration workload to only 1000 requests per client.
+    void check_monitor_backpressure()
+    {
+        check(m_connections.size() == 2, "two-shard backpressure fixture");
+        m_reqs_generated = 2;
+        m_reqs_processed = 0;
+        check(hold_pipeline(1), "producer pauses at the global in-flight budget");
+        m_staged_monitor_commands[1].push({arbitrary_command("GET key"), 0, {}, 1});
+        check(!hold_pipeline(1), "a shard with staged monitor work may drain at the budget");
+        m_staged_monitor_commands[1].pop();
+        m_reqs_processed = 1;
+        check(!hold_pipeline(1), "one completed reply allows production to resume");
+        m_reqs_generated = m_reqs_processed = 0;
+    }
     void skip(unsigned int command_index)
     {
         check(!send_from(0, command_index), "command of a lost MULTI was not sent");
@@ -296,6 +311,9 @@ static void check_repin_routes_to_staged_owner(unsigned long long first_key)
         check(!client.staged() && client.round_key_valid() && client.round_key() == first_key,
               "owner consumes the staged key");
         check(client.pool_empty(0) && client.pool_empty(1), "no key left in either pool");
+        config.transaction = false;
+        config.pipeline = 1;
+        client.check_monitor_backpressure();
     }
     evbuffer_free(input);
     evbuffer_free(output);
