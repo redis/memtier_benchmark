@@ -111,6 +111,12 @@ public:
         m_slot_to_shard_group.assign(m_slot_to_shard_group.size(), 0);
         m_slot_to_shard_group[slot] = 1;
     }
+    void leave_slot_unowned(unsigned int slot)
+    {
+        m_shard_groups.resize(1);
+        m_slot_to_shard_group.assign(m_slot_to_shard_group.size(), 0);
+        m_slot_to_shard_group[slot] = UINT_MAX;
+    }
     bool pool_empty(unsigned int conn_id) const { return m_key_index_pools[conn_id]->empty(); }
     void skip(unsigned int command_index)
     {
@@ -147,7 +153,7 @@ static void make_transaction_commands(arbitrary_command_list &commands, abstract
 static void make_transaction_config(benchmark_config &config, arbitrary_command_list &commands)
 {
     config.arbitrary_commands = &commands;
-    config.clients = config.threads = 1;
+    config.clients = config.threads = config.pipeline = 1;
     config.key_pattern = "S:S";
     config.protocol = PROTOCOL_REDIS_DEFAULT;
     config.transaction = config.cluster_mode = true;
@@ -296,6 +302,28 @@ static void check_repin_routes_to_staged_owner(unsigned long long first_key)
         check(!client.staged() && client.round_key_valid() && client.round_key() == first_key,
               "owner consumes the staged key");
         check(client.pool_empty(0) && client.pool_empty(1), "no key left in either pool");
+
+        // A missing-slot rotation must park during a real reconnect backoff.
+        // The producer is the still-dialing second connection; only the main
+        // connection remains a primary, and its actual timer is armed below.
+        client.txn_release_pin();
+        client.next_rotation();
+        client.leave_slot_unowned(key_slot("key-" + std::to_string(first_key + 1)));
+        config.reconnect_on_error = true;
+        config.max_reconnect_attempts = 2;
+        client.get_connections()[0]->attempt_reconnect("unit-test primary drop");
+        check(client.get_connections()[0]->is_reconnect_pending(), "primary reconnect timer is armed");
+        check(!client.send_from(1, 0), "missing-slot transaction defers during reconnect");
+        check(client.staged() && client.staged_key() == first_key + 1, "deferred rotation preserves exact key");
+        check(client.hold_pipeline(1), "missing-slot wait yields to the reconnect timer (#685)");
+        check(!client.run_failed(), "armed reconnect is not a terminal routing failure");
+        check(client.staged() && client.staged_key() == first_key + 1, "parking does not consume another key");
+
+        // If the reconnect is canceled with no other primary or refresh in
+        // progress, the wait must fail explicitly, not spin or use a replica.
+        client.get_connections()[0]->disconnect();
+        check(!client.get_connections()[0]->is_reconnect_pending(), "disconnect cancels reconnect timer");
+        check(client.hold_pipeline(1) && client.run_failed(), "terminal missing-slot wait fails the run");
     }
     evbuffer_free(input);
     evbuffer_free(output);

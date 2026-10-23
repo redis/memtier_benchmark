@@ -479,12 +479,20 @@ unsigned int cluster_client::fallback_primary_conn_id() const
     // Deliberately use the first connected primary: there is no owner to hash
     // to, and the server supplies the authoritative routing response.
     unsigned int pending = UINT_MAX;
+    // A shard reconnect timer hands the redial to a SLOTS refresh over the
+    // seed. The timer is already cleared while that reply is in flight.
+    const bool refreshing = MAIN_CONNECTION->get_connection_state() != conn_disconnected &&
+                            MAIN_CONNECTION->get_cluster_slots_state() != setup_done;
     for (const shard_group &group : m_shard_groups) {
         if (group.primary == NULL) continue;
         if (group.primary->get_connection_state() == conn_connected) return group.primary->get_id();
-        if (pending == UINT_MAX) pending = group.primary->get_id();
+        if (pending == UINT_MAX && (group.primary->get_connection_state() != conn_disconnected ||
+                                    group.primary->is_reconnect_pending() || refreshing)) {
+            pending = group.primary->get_id();
+        }
     }
-    // As for a known owner, preserve the key in its pool while setup finishes.
+    // Preserve work while setup or an armed reconnect can make progress. A
+    // permanently disconnected primary cannot drain a staged request.
     return pending;
 }
 
@@ -503,6 +511,13 @@ bool cluster_client::check_unowned_slot(unsigned int slot, bool is_read)
         benchmark_error_log("error: cluster slot %u has no owner; cannot route a strict-secondary read.\n", slot);
         fail_run();
         MAIN_CONNECTION->set_thread_end_reason("unowned-slot-strict-secondary");
+        event_base_loopbreak(m_event_base);
+        return false;
+    }
+    if (fallback_primary_conn_id() == UINT_MAX) {
+        benchmark_error_log("error: cluster slot %u has no owner and no reachable primary.\n", slot);
+        fail_run();
+        MAIN_CONNECTION->set_thread_end_reason("unowned-slot-no-primary");
         event_base_loopbreak(m_event_base);
         return false;
     }
@@ -1877,9 +1892,30 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         }
     }
 
+    // Do not select a monitor line during primary reconnect backoff. The
+    // reconnect clears that primary's staged queue, so enqueueing now would
+    // discard the selected line. The seed's SLOTS refresh resumes production
+    // after redial; setup-gated draining then preserves the selected command.
+    // This also waits for owned monitor keys instead of sending them on a
+    // replica producer while every primary is disconnected.
+    if (m_config->monitor_commands != NULL && m_config->arbitrary_commands->is_defined() &&
+        m_staged_monitor_commands[conn_id].empty()) {
+        const arbitrary_command &cmd = get_arbitrary_command(m_executed_command_index);
+        if (cmd.command_args.size() == 1 && cmd.command_args[0].type == monitor_random_type) {
+            unsigned int primary = fallback_primary_conn_id();
+            if (primary < m_connections.size() && m_connections[primary]->get_connection_state() == conn_disconnected)
+                return true;
+        }
+    }
+
     /* The next rotation waits for its key's owner to reconnect. */
     if (m_config->transaction && m_txn_pinned_conn_id == -1 && m_txn_wait_slot != -1) {
-        unsigned int owner = slot_primary_conn_id((unsigned int) m_txn_wait_slot);
+        const unsigned int slot = (unsigned int) m_txn_wait_slot;
+        unsigned int owner = slot_primary_conn_id(slot);
+        if (slot_is_unowned(slot)) {
+            if (!check_unowned_slot(slot, false)) return true;
+            owner = fallback_primary_conn_id();
+        }
         if (owner < m_connections.size() && m_connections[owner]->get_connection_state() == conn_disconnected) {
             return true;
         }
@@ -2256,7 +2292,7 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
                     // behavior where m_slot_to_shard was zero-initialized.
                     unsigned int pcid = slot_primary_conn_id(hslot);
                     if (slot_is_unowned(hslot)) {
-                        check_unowned_slot(hslot, false); // Primary-pinned transactions: warning only, cannot fail.
+                        if (!check_unowned_slot(hslot, false)) return false;
                         pcid = fallback_primary_conn_id();
                     }
                     target_conn = (pcid == UINT_MAX) ? -1 : (int) pcid;
@@ -2747,11 +2783,13 @@ bool cluster_client::create_monitor_request_cluster(unsigned int command_index, 
             // read; the shard_group indirection is invisible at this site.
             unsigned int shard = slot_primary_conn_id(slot);
             if (slot_is_unowned(slot)) {
-                check_unowned_slot(slot, false); // Primary-routed monitor replay: warning only, cannot fail.
+                if (!check_unowned_slot(slot, false)) return false;
                 shard = fallback_primary_conn_id();
                 // The producer may be a replica seed. Stage on the primary
-                // even during setup; fill_pipeline drains only after AUTH and
-                // SLOTS finish, and retirement compensates staged counts.
+                // during setup; the backoff gate above holds generation until
+                // redial, and fill_pipeline drains only after AUTH and SLOTS
+                // finish. Terminal disconnections
+                // are rejected above before this command is counted.
                 if (shard < m_connections.size()) target_conn = shard;
             } else if (shard != UINT_MAX && shard < m_connections.size() &&
                        m_connections[shard]->get_connection_state() != conn_disconnected &&

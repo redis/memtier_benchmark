@@ -34,6 +34,11 @@ class _Node(socketserver.ThreadingTCPServer):
         if self.replica:
             self.replica.root = self
         self.auth_delay = auth_delay
+        self.auth_closes = 0
+        self.auth_attempts = 0
+        self.slots_delay = 0
+        self.workload = []
+        self.readonly_delay = 0
         self.heal = heal
         self.drop_after = drop_after
         self.dropped = False
@@ -46,6 +51,8 @@ class _Node(socketserver.ThreadingTCPServer):
 
     def topology(self):
         root = self.root
+        if root.slots_calls:
+            time.sleep(root.slots_delay)
         with root.lock:
             root.slots_calls += 1
             if root.heal and root.error_keys:
@@ -91,14 +98,26 @@ class _Handler(socketserver.StreamRequestHandler):
                 if verb == b"AUTH":
                     assert args[-1] == b"dummy-685"
                     time.sleep(node.auth_delay)
+                    with root.lock:
+                        node.auth_attempts += 1
+                        if node.auth_closes:
+                            node.auth_closes -= 1
+                            return
                     authenticated = True
                     reply = b"+OK\r\n"
                 else:
                     assert authenticated
+                    if verb in (b"PING", b"SET", b"GET", b"MGET"):
+                        with root.lock:
+                            node.workload.append(tuple(args))
                     if verb == b"CLUSTER":
                         assert not multi, "CLUSTER SLOTS injected into MULTI"
                         reply = node.topology()
+                    elif verb == b"PING":
+                        reply = b"+PONG\r\n"
                     elif verb in (b"READONLY", b"WATCH", b"DISCARD"):
+                        if verb == b"READONLY":
+                            time.sleep(node.readonly_delay)
                         reply = b"+OK\r\n"
                         if verb == b"DISCARD":
                             multi = dirty = False
@@ -507,3 +526,83 @@ def test_two_primary_owned_mget_and_unowned_get_controls(env):
             env.assertEqual(node.requests, [])
         env.assertEqual(failures, [])
         env.assertEqual(node.slots_calls, 1)
+
+
+def test_unowned_transaction_disconnected_primary(env):
+    for reconnect in (False, True):
+        node = _hole(replica=True, auth_delay=0.02)
+        node.auth_closes = 1
+        node.replica.readonly_delay = 0.2
+        node.slots_delay = 0.1
+        args = [
+            "--requests=24",
+            "--transaction",
+            "--command=MULTI",
+            "--command=SET __key__ value",
+            "--command=EXEC",
+        ]
+        if reconnect:
+            args += ["--reconnect-on-error", "--max-reconnect-attempts=2", "--reconnect-backoff-factor=0.5"]
+        stats, rows, stderr = _run(env, node, args, seed_replica=True, expected_exit=0 if reconnect else 1)
+        env.assertEqual(len(node.replica.requests), 0)
+        env.assertEqual(node.auth_attempts, 2 if reconnect else 1)
+        env.assertEqual(stats["Totals"]["Count"], 24 if reconnect else 0)
+        env.assertEqual(len(node.requests), 8 if reconnect else 0)
+        if reconnect:
+            env.assertEqual([keys for verb, keys in node.requests], [(b"memtier-1",)] * 8)
+        else:
+            env.assertContains("--reconnect-on-error is not set", stderr)
+
+
+def test_unowned_monitor_disconnected_primary(env):
+    for reconnect, unowned in ((False, True), (True, True), (True, False)):
+        node = (
+            _hole(replica=True, auth_delay=0.02)
+            if unowned
+            else _Node([(0, 16383)], replica=True, auth_delay=0.02)
+        )
+        node.auth_closes = 1
+        node.replica.readonly_delay = 0.2
+        node.slots_delay = 0.1
+        with tempfile.TemporaryDirectory() as directory:
+            monitor = os.path.join(directory, "monitor.txt")
+            with open(monitor, "w") as target:
+                for index in range(10):
+                    target.write(f'1.000000 [0 127.0.0.1:12345] "SET" "memtier-1" "value-{index}"\n')
+            # PING reaches steady state before replay: the startup watchdog
+            # must not conceal a counted command stranded on the dead primary.
+            args = [
+                "--requests=20",
+                "--read-preference=secondaryPreferred",
+                "--monitor-input=" + monitor,
+                "--monitor-pattern=S",
+                "--command=PING",
+                "--command=__monitor_line@__",
+            ]
+            if reconnect:
+                args += [
+                    "--reconnect-on-error",
+                    "--max-reconnect-attempts=2",
+                    "--reconnect-backoff-factor=0.5",
+                ]
+            stats, rows, stderr = _run(
+                env, node, args, seed_replica=True, expected_exit=0 if reconnect else 1
+            )
+        env.assertEqual(len(node.replica.requests), 0)
+        if reconnect:
+            env.assertEqual(stats["Totals"]["Count"], 20)
+            env.assertEqual(node.auth_attempts, 2)
+            env.assertEqual(len(node.requests), 10)
+            env.assertEqual(
+                sum(command == (b"PING",) for command in node.workload + node.replica.workload), 10
+            )
+            env.assertEqual(
+                [command for command in node.workload if command[0] == b"SET"],
+                [(b"SET", b"memtier-1", f"value-{index}".encode()) for index in range(10)],
+            )
+            env.assertContains("requested a cluster slot map refresh to reconnect", stderr)
+            env.assertEqual([keys for verb, keys in node.requests], [(b"memtier-1",)] * 10)
+        else:
+            env.assertEqual(stats["Totals"]["Count"], 1)
+            env.assertEqual(len(node.requests), 0)
+            env.assertContains("no reachable primary", stderr)

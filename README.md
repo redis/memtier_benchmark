@@ -541,6 +541,10 @@ per second during sustained `CLUSTERDOWN`, in addition to initial discovery.
 Refreshes also occur when retries are disabled. Missing-owner requests use the
 first available primary, so this error traffic can concentrate on one node.
 MGET retains that primary as its producer until the next topology refresh.
+If no primary is connected, connecting, or awaiting reconnect/refresh, missing-owner
+requests fail the run explicitly. Transactions retain their key while reconnecting.
+Monitor replay waits before selecting its next line while all primaries are in
+reconnect backoff, including for owned keys, so reconnect cannot discard that line.
 Strict `secondary` reads with `error` or `queue` fallback fail the run because no
 authoritative replica can be chosen, including for a transient hole discovered
 by a mid-run refresh.
