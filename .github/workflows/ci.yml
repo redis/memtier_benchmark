@@ -245,8 +245,6 @@ jobs:
         sudo apt-get install lcov autoconf automake pkg-config libevent-dev libssl-dev
 
     - name: Build
-      # for coverage reports we need to use Ubuntu 22.04 or lower
-      # (given Ubuntu 24.04 uses lcov >= 2.0 which is not support on autoconf still)
       run: autoreconf -ivf && ./configure --enable-code-coverage && make -j
 
     - name: Upload build artifact
@@ -440,8 +438,49 @@ jobs:
       if: always()
       run: docker compose -f docker-compose.statsd.yml down -v
 
+  coverage-toolchains:
+    name: Coverage tools ${{ matrix.platform }} / ${{ matrix.compiler }}
+    runs-on: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-22.04
+            compiler: gcc
+          - platform: ubuntu-24.04
+            compiler: gcc
+          - platform: ubuntu-24.04
+            compiler: clang
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install dependencies
+      run: |
+        sudo apt-get -qq update
+        sudo apt-get install lcov autoconf automake pkg-config libevent-dev libssl-dev
+        if [ "${{ matrix.compiler }}" = clang ]; then
+          sudo apt-get install clang llvm libclang-rt-dev
+        fi
+    - name: Configure coverage build
+      env:
+        COVERAGE_COMPILER: ${{ matrix.compiler }}
+      run: |
+        autoreconf -ivf
+        mkdir "$RUNNER_TEMP/coverage-build"
+        cd "$RUNNER_TEMP/coverage-build"
+        if [ "$COVERAGE_COMPILER" = clang ]; then
+          printf '#!/bin/sh\nexec llvm-cov gcov "$@"\n' > "$RUNNER_TEMP/llvm-gcov"
+          chmod +x "$RUNNER_TEMP/llvm-gcov"
+          export CC=clang CXX=clang++ GCOV="$RUNNER_TEMP/llvm-gcov"
+        fi
+        "$GITHUB_WORKSPACE/configure" --enable-code-coverage
+    - name: Check coverage capture and cleanup
+      run: |
+        cd "$RUNNER_TEMP/coverage-build"
+        bash "$GITHUB_WORKSPACE/tests/check_code_coverage.sh"
+
   coverage-shards:
     name: Coverage shard ${{ matrix.shard }}/4
+    # Retain the lcov 1 baseline; coverage-toolchains also exercises lcov 2.
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -456,8 +495,6 @@ jobs:
         sudo apt-get install lcov autoconf automake pkg-config libevent-dev libssl-dev
 
     - name: Build with coverage
-      # for coverage reports we need to use Ubuntu 22.04 or lower
-      # (given Ubuntu 24.04 uses lcov >= 2.0 which is not supported on autoconf still)
       run: autoreconf -ivf && ./configure --enable-code-coverage && make -j
 
     - name: Run unit tests

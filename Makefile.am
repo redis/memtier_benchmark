@@ -17,9 +17,13 @@
 
 AUTOMAKE_OPTIONS = foreign 1.9 subdir-objects
 CODE_COVERAGE_IGNORE_PATTERN='*/deps/hdr_histogram/*' '*/tests/*'
+# Every executable that consumes instrumented objects needs the compiler's
+# coverage link option, including unit tests with their own source lists.
+# Targets overriding their own _LDFLAGS must include it if instrumented.
+AM_LDFLAGS = $(CODE_COVERAGE_LDFLAGS)
 
 EXTRA_DIST = README.md COPYING version.sh \
-	tests/check_version_build.py \
+	tests/check_version_build.py tests/check_code_coverage.sh \
 	scripts/fetch_commands_meta.sh \
 	scripts/gen_command_meta.py \
 	deps/commands_json/REDIS_TAG.txt \
@@ -78,11 +82,7 @@ memtier_benchmark_SOURCES = \
 	deps/hdr_histogram/hdr_histogram.c deps/hdr_histogram/hdr_histogram.h \
 	deps/hdr_histogram/hdr_time.c deps/hdr_histogram/hdr_time.h deps/hdr_histogram/hdr_encoding.c deps/hdr_histogram/hdr_malloc.h
 
-# The vendored AX_CODE_COVERAGE (serial 15) puts -lgcov in CODE_COVERAGE_LDFLAGS
-# and has no CODE_COVERAGE_LIBS. Link it as a library, after the objects, so
-# the unit tests that reuse memtier_benchmark_LDADD get the gcov runtime too.
 memtier_benchmark_LDADD = \
-	$(CODE_COVERAGE_LDFLAGS) \
 	$(LIBEVENT_EXTRA_LIBS) \
 	$(LIBEVENT_LIBS) \
 	$(LIBEVENT_PTHREADS_LIBS) \
@@ -149,8 +149,6 @@ hdr_histogram_test_SOURCES = tests/unit/hdr_histogram_test.cpp latency_histogram
 # run_stats_types includes the TLS-aware benchmark config; honor non-system OpenSSL paths.
 hdr_histogram_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
 hdr_histogram_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
-# memtier_benchmark_CPPFLAGS carries coverage flags; link their runtime too.
-hdr_histogram_test_LDADD = $(CODE_COVERAGE_LDFLAGS)
 # Exercise transaction pin release and lookahead through the real cluster client.
 cluster_transaction_test_SOURCES = tests/unit/cluster_transaction_test.cpp
 cluster_transaction_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
@@ -179,7 +177,6 @@ run_stats_counters_test_SOURCES = tests/unit/run_stats_counters_test.cpp run_sta
     deps/hdr_histogram/hdr_time.c deps/hdr_histogram/hdr_time.h deps/hdr_histogram/hdr_malloc.h
 run_stats_counters_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
 run_stats_counters_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
-run_stats_counters_test_LDADD = $(CODE_COVERAGE_LDFLAGS)
 # Average Start/Finish time over thousands of merged runs, as run_benchmark() does.
 run_stats_merge_test_SOURCES = tests/unit/run_stats_merge_test.cpp
 run_stats_merge_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
