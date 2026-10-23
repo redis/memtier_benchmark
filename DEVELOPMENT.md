@@ -152,6 +152,33 @@ Limitations of the Windows build:
   as access violations, but not for `abort()` or failed assertions, and the
   stack trace holds only raw addresses of the crashing thread.
 
+### Code coverage
+
+Install lcov (including genhtml) and the gcov tool that matches your compiler.
+Configure with `--enable-code-coverage`, then run `make check` followed by
+`make code-coverage-capture`. GCC and Clang use their own coverage runtimes;
+coverage reports work with lcov 1.x and 2.x. With Clang and lcov 2, optional
+function-end inference is disabled: compiler-generated functions can lack
+source-line coverpoints. Line and function execution counts are retained.
+Optional exclusion patterns that
+match no files are allowed; other capture/filter errors still fail the target.
+`make clean` and `make distclean` remove generated `.gcda`, `.gcno` and `.gcov`
+files. Reconfigure and rebuild when switching compilers.
+
+For Clang, point `GCOV` to an executable wrapper that runs the matching LLVM
+version's `llvm-cov gcov` subcommand, rather than GCC's gcov. For example:
+
+```sh
+printf '#!/bin/sh\nexec llvm-cov gcov "$@"\n' > llvm-gcov
+chmod +x llvm-gcov
+GCOV="$PWD/llvm-gcov" CC=clang CXX=clang++ ./configure --enable-code-coverage
+```
+
+CI runs `tests/check_code_coverage.sh` from separate configured build directories
+with GCC/lcov 1, GCC/lcov 2 and Clang/lcov 2. It builds and executes the unit tests,
+checks filtered and unfiltered HTML/trace output, and verifies both cleanup
+paths. The script runs `make distclean` at the end; use a disposable build directory.
+
 ### Building and Installing
 
 After downloading the source tree, use standard autoconf/automake commands:
