@@ -663,7 +663,7 @@ When you impose a rate limit on your benchmark tests, you're essentially mimicki
 
 1. **Identifying Bottlenecks**: Rate-limited benchmarking can help in identifying bottlenecks in your system. If latency increases disproportionately with a small increase in rate limit, it may indicate a bottleneck that needs attention.
 
-1. **Comparative Analysis**: It enables the comparison of different solutions, configurations or hardware in terms of how they handle latency under simmilar benchmark conditions.
+1. **Comparative Analysis**: It enables the comparison of different solutions, configurations or hardware in terms of how they handle latency under similar benchmark conditions.
 
 
 #### Using rate-limiting in memtier
