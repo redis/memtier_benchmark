@@ -178,6 +178,7 @@ client::client(client_group *group) :
         m_txn_rotation_key_valid(false),
         m_txn_rotation_key_seq(0),
         m_txn_multi_sent(false),
+        m_txn_reconnect_reqs_base(0),
         m_tot_set_ops(0),
         m_tot_wait_ops(0),
         m_scan_cursor("0"),
@@ -217,6 +218,7 @@ client::client(struct event_base *event_base, benchmark_config *config, abstract
         m_txn_rotation_key_valid(false),
         m_txn_rotation_key_seq(0),
         m_txn_multi_sent(false),
+        m_txn_reconnect_reqs_base(0),
         m_tot_set_ops(0),
         m_tot_wait_ops(0),
         m_scan_cursor("0"),
@@ -470,6 +472,33 @@ void client::set_end_time_at(struct timeval *end_time)
     }
 }
 
+bool client::transaction_reconnect_due() const
+{
+    if (!m_config->reconnect_interval || m_reqs_generated < m_txn_reconnect_reqs_base ||
+        m_reqs_generated - m_txn_reconnect_reqs_base < m_config->reconnect_interval)
+        return false;
+
+    // The next command must be the first executable entry at the start of
+    // its ratio. Checking only MULTI state would split a WATCH prefix, while
+    // checking only the command index would split a weighted first entry.
+    for (unsigned int i = 0; i < m_config->arbitrary_commands->size(); i++) {
+        const arbitrary_command &cmd = m_config->arbitrary_commands->at(i);
+        if (!cmd.stats_only && cmd.ratio > 0)
+            return m_executed_command_index == i && m_arbitrary_command_ratio_count == 1;
+    }
+    return false;
+}
+
+bool client::prepare_transaction_reconnect()
+{
+    if (!transaction_reconnect_due()) return false;
+    // No new work is generated until the replies for this rotation drain.
+    // Advance the baseline rather than testing a modulus: the boundary can
+    // be beyond the requested interval, including after an unplanned loss.
+    m_txn_reconnect_reqs_base = m_reqs_processed;
+    return true;
+}
+
 bool client::hold_pipeline(unsigned int conn_id)
 {
     // don't exceed requests
@@ -479,6 +508,7 @@ bool client::hold_pipeline(unsigned int conn_id)
 
     // if we have reconnect_interval stop enlarging the pipeline on time
     if (m_config->reconnect_interval) {
+        if (m_config->transaction) return transaction_reconnect_due();
         if ((m_reqs_processed % m_config->reconnect_interval) + (m_reqs_generated - m_reqs_processed) >=
             m_config->reconnect_interval)
             return true;

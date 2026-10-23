@@ -100,7 +100,12 @@ Requires at least one \fB\-\-command\fR.
 \fB\-\-pipeline\fR > 1 is supported: in \fB\-\-cluster\-mode\fR each rotation is
 sent contiguously on its pinned connection, so multiple whole
 transactions can be in flight without interleaving MULTI/EXEC.
-Note: a reconnect (e.g. \fB\-\-reconnect\-on\-error\fR) loses the
+\fB\-\-reconnect\-interval\fR waits for the next full weighted command
+rotation and its replies before reconnecting. The next interval
+starts there; request/time limits still end the run as usual.
+Counts and latencies inside MULTI describe QUEUED acknowledgements,
+not execution; EXEC reports the transaction outcome.
+Note: an unplanned reconnect (\fB\-\-reconnect\-on\-error\fR) loses the
 server\-side WATCH/MULTI state. If it happens inside a MULTI
 block, the rest of that block, through its EXEC/DISCARD, is
 skipped and not counted, so the per\-command counts no longer

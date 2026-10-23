@@ -147,6 +147,28 @@ for command line options.
 
 Numeric options that take a count, size, timeout or port (for example `-n`, `-c`, `-t`, `--test-time`, `--pipeline`, `-d`, `--max-reconnect-attempts`, `--prometheus-port`) reject negative, empty, out-of-range and malformed values instead of silently wrapping them. Leading whitespace and a `+` are still accepted. Note that an empty value such as `--max-reconnect-attempts=` used to mean 0 (unlimited) and is now an error. The same applies to `--max-retries`, which takes -1 (unlimited) up to 2147483647: an empty `--max-retries=` used to mean 0 (retries disabled) and is now an error, and values above 2147483647 are rejected instead of wrapping (4294967295 used to become -1, unlimited). Empty values are also rejected for `--data-offset`, `--select-db`, `--thread-conn-start-min-jitter-micros`, `--thread-conn-start-max-jitter-micros`, `--scan-incremental-max-iterations`, `--replica-clients` and `--replicas-per-shard`, where they used to mean 0; pass `0` explicitly. `-0` (and `-00`) still parse as 0 on every option, since `strtoul()` never wrapped them; every other negative value is rejected. `--data-offset` above 536870911 is now rejected when the option is parsed, with "must be <= 536870911", instead of later with "data-offset too long". `--pipeline`, `-d` and `--reconnect-interval` now print "must be a positive integer" for `-1`, empty values and trailing junk (they used to print "must be greater than zero"), and `--rate-limiting` errors now name the option ("rate-limiting must be ..." instead of "rate must be ..."). `--multi-key-get` is now capped at 16777214, the largest value whose preallocated per-client key buffer (256 bytes per key) stays below 4 GiB (above it, keylist's old 32-bit size wrapped). It is a memory sanity limit: each client preallocates about 272 bytes per key, so size memory accordingly.
 
+### Transaction rotations and planned reconnects
+
+With `--transaction`, one weighted rotation of the `--command` entries is the
+transaction unit. Keep each WATCH/MULTI/EXEC (or DISCARD) sequence within that
+rotation. In standalone mode, `--reconnect-interval=N` waits until at least N
+requests have been generated since the last planned reconnect, finishes the
+current rotation and drains its replies before reconnecting. For example,
+MULTI/SET/EXEC with interval 8 reconnects after 9 commands; the next interval
+starts from that actual boundary. Command ratios and WATCH prefixes are included,
+and pipelining remains supported. Without `--transaction`, the exact interval
+behavior is unchanged. Cluster mode continues to reject `--reconnect-interval`.
+
+Transaction command counts and latencies retain their acknowledgement semantics:
+a successful SET inside MULTI records its QUEUED reply, not a later execution.
+EXEC reports the transaction outcome. An unplanned disconnect, DISCARD or an
+aborted EXEC can therefore leave acknowledged commands counted without executing
+them. The lost-MULTI guard still skips the unsent remainder of an interrupted
+block. This change prevents planned reconnects from deliberately discarding that
+work; it does not convert statistics to executed-command counts. Request/time
+limits still stop the run as before, including a request budget that ends inside
+a rotation (the separate issue #647).
+
 ### Connecting with `--uri`
 
 `--uri=redis://user:password@host:port/dbnum` (or `rediss://` for TLS) sets the server, port, credentials and database in one option, in the format `redis-cli -u` takes. As with `redis-cli -u`, the user name and password are percent-decoded, so characters that have a meaning in the URI can be written as `%40` (`@`), `%3A` (`:`, in the password), `%2F` (`/`), `%3F` (`?`), `%23` (`#`) and `%25` (`%`):
