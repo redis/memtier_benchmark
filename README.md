@@ -530,6 +530,14 @@ When the target node class is unavailable, the fallback is controlled by
 * `queue` - reserved; currently treated as `error`. Request queuing is
   not yet implemented.
 
+A partial `CLUSTER SLOTS` map is accepted. If a generated key has no slot
+owner, writes and reads that permit primary routing are sent to an available
+primary, preserving the key and letting Redis return its routing response.
+`CLUSTERDOWN` replies count as workload errors and follow the usual retry
+policy; while the map is partial they also trigger a topology refresh at
+most once per second per client. Strict `secondary` reads with `error` or
+`queue` fallback fail the run because no authoritative replica can be chosen.
+
 Built-in read commands (GET, MGET) and arbitrary commands marked with
 `--command-is-read` participate in read-preference routing.  Reads on
 arbitrary keyless commands (e.g. `DBSIZE`, `CLUSTER NODES`) are routed

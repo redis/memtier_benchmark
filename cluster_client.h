@@ -142,6 +142,9 @@ protected:
     // workloads where writes succeed (primary is live) but every GET routing
     // attempt fails because no replica is available yet.
     unsigned int m_strict_no_route_attempts;
+    bool m_has_unowned_slots;
+    bool m_warned_unowned_slot;
+    struct timeval m_last_clusterdown_refresh;
     // Monotonic timestamp (CLOCK_MONOTONIC seconds) of the last "all replicas
     // unreachable under read-only workload" warning emitted from
     // hold_pipeline. Rate-limited to once per 60s so a stalled benchmark
@@ -197,12 +200,17 @@ protected:
     // setup_done (the READONLY ladder having lit setup_done is implicit in
     // setup_done for replicas because the readonly ladder is checked alongside).
     //
-    // Returns UINT_MAX when the slot is unmapped (bootstrap window) or when
+    // A missing owner in a committed partial map uses another primary when
+    // the read preference permits it; Redis supplies the routing error.
+    // Returns UINT_MAX before bootstrap or when
     // strict `rp_secondary` has no live replicas. Callers must handle the
     // UINT_MAX case explicitly (typically by treating as not_available and
     // letting the next tick retry, or applying --read-preference-fallback for
     // the strict-secondary case).
     unsigned int select_target_conn(unsigned int slot, bool is_read);
+    bool slot_is_unowned(unsigned int slot) const;
+    unsigned int fallback_primary_conn_id() const;
+    bool check_unowned_slot(unsigned int slot, bool is_read);
 
     // True if the request should be classified as a read for routing
     // purposes (see select_target_conn). Inspects request type plus
