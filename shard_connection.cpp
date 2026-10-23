@@ -1046,7 +1046,11 @@ void shard_connection::push_req(request *req)
     // Per-endpoint routed_ops: count anything that's not a connection-setup
     // request. This is the canonical "how many user-level requests did we
     // route here" tally used by the "Endpoints" array in mb.json.
-    if (is_workload_request(req->m_type)) m_routed_ops++;
+    if (is_workload_request(req->m_type)) {
+        // Keep participation on the logical client: cluster reconnects can
+        // delete this connection before its final statistics are merged.
+        if (m_routed_ops++ == 0) m_conns_manager->mark_workload_submitted();
+    }
     // ASKING only prefixes a resend, which takes its own token.
     if (m_config->request_rate && req->m_type != rt_asking) {
         // Handle race condition during reconnection - don't assert if interval is 0

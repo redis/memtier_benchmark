@@ -25,7 +25,14 @@ class shard_connection;
 
 class connections_manager
 {
+    // Lifetime of the logical client, including deleted/recreated cluster
+    // connections. Written by its worker, read only after that worker joins.
+    bool m_workload_submitted = false;
+
 public:
+    void mark_workload_submitted() { m_workload_submitted = true; }
+    bool has_submitted_workload() const { return m_workload_submitted; }
+
     virtual unsigned long long get_reqs_processed(void) = 0;
     virtual void inc_reqs_processed(void) = 0;
     virtual unsigned long long get_reqs_answered(void) = 0;

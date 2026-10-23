@@ -29,6 +29,7 @@
 #include <cmath>
 #include <stdio.h>
 #include <stdlib.h>
+#include <event2/buffer.h>
 #include "cluster_client.h"
 
 void benchmark_log_file_line(int, const char *, unsigned int, const char *, ...) {}
@@ -294,12 +295,117 @@ static void test_sample_weighted_latency(unsigned int second_count, bool arbitra
     }
 }
 
+// Exercise client_group's participation and shared averaging weight, with
+// exact intervals. Submission goes through the real serializer/pipeline;
+// generated-only requests deliberately do not enter that pipeline.
+static client *duration_client(client_group &group, long long offset, long long duration, bool submit,
+                               bool remove_connection = false)
+{
+    cluster_client *c = new cluster_client(&group);
+    group.get_clients().push_back(c);
+    timeval start = at(epoch_usec + offset), end = at(epoch_usec + offset + duration);
+    c->get_stats()->set_start_time(&start);
+    c->inc_reqs_generated();
+    CHECK(!c->has_submitted_workload());
+    if (submit) {
+        unsigned int id = 0;
+        if (remove_connection) {
+            id = c->get_connections().size();
+            c->get_connections().push_back(
+                new shard_connection(id, c, group.get_config(), group.get_event_base(), group.get_protocol()));
+        }
+        shard_connection *connection = c->get_connections()[id];
+        evbuffer *input = evbuffer_new(), *output = evbuffer_new();
+        connection->set_address_port("127.0.0.1", "1"); // never connected
+        connection->get_protocol()->set_buffers(input, output);
+        connection->send_set_command(&start, "key", 3, "v", 1, 0, 0);
+        CHECK(evbuffer_get_length(output) > 0);
+        CHECK(c->has_submitted_workload());
+        CHECK(c->get_reqs_answered() == 0);
+        CHECK(c->get_stats()->get_total_ops() == 0);
+        if (remove_connection) {
+            static_cast<client *>(c)->disconnect();
+            CHECK(c->get_connections().size() == 1);
+            CHECK(c->get_connections()[0]->get_routed_ops() == 0);
+            CHECK(c->has_submitted_workload());
+        }
+        evbuffer_free(input);
+        evbuffer_free(output);
+    }
+    c->get_stats()->set_end_time(&end);
+    return c;
+}
+
+static void test_duration_participation()
+{
+    arbitrary_command_list commands;
+    benchmark_config config = {};
+    config.arbitrary_commands = &commands;
+    config.clients = config.threads = 1;
+    config.key_pattern = "S:S";
+    config.protocol = PROTOCOL_REDIS_DEFAULT;
+    object_generator generator;
+    generator.set_data_size_fixed(1);
+    abstract_protocol *protocol = protocol_factory(config.protocol);
+    {
+        client_group first(&config, protocol, &generator), second(&config, protocol, &generator);
+        client *setup = duration_client(first, 2000000, 1000000, false);
+        // Retain metadata even when generated work never entered a connection.
+        setup->get_stats()->inc_error(2);
+        setup->get_stats()->add_unanswered_requests(3);
+        setup->get_stats()->set_interrupted(true);
+        timeval error_time = at(epoch_usec + 2000100);
+        setup->get_stats()->update_connection_error(&error_time);
+        // Flush that post-end error bucket as finalization normally would.
+        timeval setup_end = at(epoch_usec + 3000000);
+        setup->get_stats()->set_end_time(&setup_end);
+        duration_client(first, 0, 3000000, true, true);
+        duration_client(second, 2000000, 1000000, false);
+        duration_client(second, 2000000, 1000000, true);
+        run_stats merged(&config);
+        unsigned int weight = 1;
+        first.merge_run_stats(&merged, weight);
+        CHECK(weight == 2);
+        CHECK(merged.get_duration_usec() == 3000000);
+        second.merge_run_stats(&merged, weight);
+        CHECK(weight == 3);
+        CHECK(usec(merged.get_start_time()) == epoch_usec + 1000000);
+        CHECK(merged.get_duration_usec() == 2000000);
+        CHECK(merged.get_total_ops() == 0); // unanswered work still participates
+        CHECK(merged.get_total_errors() == 2);
+        CHECK(merged.get_unanswered_requests() == 3);
+        CHECK(merged.get_interrupted());
+        totals summary;
+        merged.summarize(summary);
+        CHECK(summary.m_connection_errors == 1);
+    }
+    {
+        client_group empty(&config, protocol, &generator);
+        duration_client(empty, 2000000, 1000000, false);
+        client *unconnected = new client(&empty);
+        empty.get_clients().push_back(unconnected);
+        timeval now = at(epoch_usec);
+        unconnected->get_stats()->update_connection_error(&now);
+        run_stats merged(&config);
+        unsigned int weight = 1;
+        empty.merge_run_stats(&merged, weight);
+        CHECK(weight == 1);
+        CHECK(!merged.has_started());
+        CHECK(merged.get_duration_usec() == 0);
+        totals summary;
+        merged.summarize(summary);
+        CHECK(summary.m_connection_errors == 1);
+    }
+    delete protocol;
+}
+
 int main()
 {
     arbitrary_command_list commands;
     benchmark_config config = {};
     config.arbitrary_commands = &commands;
 
+    test_duration_participation();
     test_many_clients(&config);
     test_small_weights_exact(&config);
     test_submillisecond_merge(&config);
