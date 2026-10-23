@@ -119,7 +119,15 @@ class Benchmark(object):
                 'memtier_benchmark timed out after {}s\n'.format(timeout).encode())
             return False
         if _stderr:
-            logging.debug('  >>> stderr <<<\n%s\n', _stderr)
+            # Preserve the original bytes before writing to the CI log. A bytes
+            # repr escapes newlines into one huge line, which can stall the
+            # GitHub Actions runner's log processing (#482).
             self.write_file('mb.stderr', _stderr)
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                logging.debug('  >>> stderr <<<')
+                for line in _stderr.decode('utf-8', errors='replace').splitlines():
+                    # Bound genuine long lines too, without truncating output.
+                    for start in range(0, max(1, len(line)), 2048):
+                        logging.debug('%s', line[start:start + 2048])
         return process.wait() == 0
 

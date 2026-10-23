@@ -165,6 +165,12 @@ You can replay real command streams by pointing memtier_benchmark to a monitor l
 $ memtier_benchmark --monitor-input=monitor.txt --command=__monitor_line1__
 ```
 
+Repeated `--command "__monitor_line@__"` entries keep their individual command
+ratios and share one statistics slot per monitor command type. Even with
+`--command-stats-breakdown=line`, these shared type rows and HDR files combine
+requests from all random-monitor entries; they are not separate per-placeholder
+distributions. Ordinary command entries retain their own statistics slots.
+
 This lets you mix synthetic workloads with realistic captured traffic. Monitor input works in both single endpoint and cluster mode (`--cluster-mode`); in cluster mode each command is sent to the shard that owns its first argument's key. Monitor lines may use the `__key__` and `__data__` placeholders, and text around `__key__` (for example `user:__key__` or `{tag}__key__`) is kept. Each `__key__` argument gets its own generated key, so in cluster mode a `__monitor_line@__` line with more than one `__key__` argument must give them all the same `{hash tag}` (for example `"MSET" "{t}a:__key__" "v" "{t}b:__key__" "v"`), or memtier_benchmark refuses to start; without a tag the keys could land in different slots. The check looks only at `__key__` arguments: a literal key next to a generated one (for example `"MSET" "fixed" "v" "k:__key__" "v"`) is not detected, and Redis answers `CROSSSLOT` unless both share a hash tag. `--failed-keys-file` and `--retry-on-error` use the first argument as the request's key, the same one the command is routed by.
 
 When the number of requested operations exceeds the number of commands in the monitor file, commands are reused:
@@ -268,6 +274,15 @@ error reply counts as connection progress, so `--connection-stage-timeout`
 does not bound these retries. Use a finite `--max-retries` or `--test-time`
 to bound such a workload; requests still count only on success or exhaustion.
 
+With `--retry-on-error`, JSON `Totals` includes integer `Errors`, `Retry Attempts`
+and `Retried Ops` counters, including zeros. `Errors` exposes logical failures
+recorded by retry handling, including terminal errors, retry exhaustion and
+abandoned replays; it is distinct from `Connection Errors`.
+`Retry Attempts` counts retries queued for resend, which may later be canceled,
+and `Retried Ops` counts requests queued for retry at least once. These counters
+are totals for the run, without per-command attribution. They do not change
+request completion or exit-code behavior.
+
 ### Repeated runs (`--run-count`)
 
 With `--run-count N`, memtier reports the best and the worst run (by
@@ -275,7 +290,8 @@ Ops/sec), and an `AGGREGATED AVERAGE RESULTS (N runs)` section with per-run
 values:
 
 - The counts (`Count`, `Accumulated Latency`, `Connection Errors`,
-  `Unanswered requests` and the `Per-Key Misses` counts) are the mean over
+  `Unanswered requests`, the retry-enabled `Errors` / `Retry Attempts` /
+  `Retried Ops`, and the `Per-Key Misses` counts) are the mean over
   the runs, rounded to the nearest integer, so they keep the integer type of
   the other sections (29659 ops over 3 runs give `"Count": 9886`). A count
   that is not 0 over the series never rounds to 0: 1 connection error over 3
@@ -284,10 +300,19 @@ values:
   is exactly the sum of its rows; it can differ from the mean of the per-run
   `Totals` by about one unit per row. In the same way, the `Per-Key Misses`
   `Total Hits` / `Total Misses` are the sum of the rounded `key[i]` values.
-- Ops/sec, KB/sec, the default workload's Hits/sec and Misses/sec, and the
-  JSON `Latency` / `Average Latency` are the mean of the per-run values. The
-  Hits/sec and Misses/sec of `--command` rows are time-weighted instead: the
-  hits (or misses) of all runs divided by the duration of all runs.
+- Ops/sec, KB/sec, and the default workload's Hits/sec and Misses/sec are
+  the mean of the per-run values. The Hits/sec and Misses/sec of `--command`
+  rows are time-weighted instead: the hits (or misses) of all runs divided
+  by the duration of all runs.
+- JSON `Latency` / `Average Latency` weight each completed operation equally.
+  Totals, built-in commands and per-line command rows use total accumulated
+  latency divided by total operations, before rounding the per-run counts.
+  Runs with no samples do not lower this mean. Older versions averaged run
+  means for these rows, producing incorrect results for unequal run counts.
+  Grouped command rows retain their already sample-weighted merged HDR mean,
+  in both individual and aggregate sections. Text averages and percentiles
+  also use the merged HDR samples, so histogram bucket precision can produce
+  small differences from the means calculated from accumulated latency.
 - Percentiles come from the latency histograms of all the runs merged
   together, so the section's `Histogram log format` holds the samples of all
   the runs (N times its `Count`).
@@ -329,8 +354,13 @@ Exit status:
   one: **2** if any run was aborted by `--connection-stage-timeout`,
   otherwise **1** if any run failed or the results could not be written,
   otherwise **0**. An aborted run still counts in `AGGREGATED AVERAGE
-  RESULTS`, which is then marked `"Interrupted": "true"` (as are `BEST RUN
-  RESULTS` or `WORST RUN RESULTS` when they are that run).
+  RESULTS`, which is then marked `"Interrupted": "true"`. BEST and WORST
+  rank only complete runs when any exist; otherwise they rank the available
+  partial runs, retaining their `"Interrupted": "true"` flag. A run with a
+  failed worker is also marked `"Interrupted": "true"`, including failures
+  detected after a timed deadline. Ordinary command error replies do not
+  mark an otherwise completed run interrupted. Per-run output
+  and the aggregate average still include all runs that happened.
 
 ### Output write errors
 

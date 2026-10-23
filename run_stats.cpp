@@ -1164,9 +1164,9 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
     m_totals.m_bytes_sec_rx /= all_stats.size();
     m_totals.m_bytes_sec_tx /= all_stats.size();
     m_totals.m_connection_errors_sec /= all_stats.size();
-    m_totals.m_latency /= all_stats.size();
+    m_totals.m_latency = m_totals.m_ops ? (double) m_totals.m_total_latency / m_totals.m_ops / 1000.0 : 0.0;
 
-    // Every value in the AVERAGE section is a per-run value (#703). The counts
+    // Counts in the AVERAGE section are per-run values (#703). The counts
     // (ops, accumulated latency, connection errors, unanswered requests, hits
     // and misses) stay summed here, and so does the duration set below.
     // Dividing a summed count by the summed duration, count /
@@ -1426,6 +1426,12 @@ void run_stats::summarize(totals &result) const
     result.m_connection_errors = totals.m_connection_errors;
     result.m_connection_errors_sec =
         (test_duration_usec > 0) ? (double) totals.m_connection_errors / test_duration_usec * 1000000 : 0.0;
+
+    // Retry accounting is maintained per run, outside the per-second samples.
+    // Copy it even when summarizing into fresh storage for aggregate_average().
+    result.m_errors = m_totals.m_errors;
+    result.m_retry_attempts = m_totals.m_retry_attempts;
+    result.m_retried_ops = m_totals.m_retried_ops;
 }
 
 // True if key ("pNN.NN") parses back to exactly the quantile it labels.
@@ -1487,7 +1493,8 @@ void result_print_to_json(json_handler *jsonhandler, const char *type, double op
                           long long m_total_latency, long long ops, double connection_errors_sec,
                           long long connection_errors, const std::vector<double> &quantile_list,
                           struct hdr_histogram *latency_histogram, const std::vector<unsigned int> &timestamps,
-                          const std::vector<one_sec_cmd_stats> &timeserie_stats, double aborts = -1.0)
+                          const std::vector<one_sec_cmd_stats> &timeserie_stats, double aborts = -1.0,
+                          const totals *retry_stats = NULL, size_t averaged_runs = 0)
 {
     if (jsonhandler != NULL) { // Added for double verification in case someone accidently send NULL.
         jsonhandler->open_nesting(type);
@@ -1506,6 +1513,13 @@ void result_print_to_json(json_handler *jsonhandler, const char *type, double op
 
         jsonhandler->write_obj("Connection Errors/sec", "%.2f", connection_errors_sec);
         jsonhandler->write_obj("Connection Errors", "%lld", connection_errors);
+
+        // Only Totals has retry attribution; command rows must not repeat it.
+        if (retry_stats != NULL) {
+            jsonhandler->write_obj("Errors", "%llu", mean_count(retry_stats->m_errors, averaged_runs));
+            jsonhandler->write_obj("Retry Attempts", "%llu", mean_count(retry_stats->m_retry_attempts, averaged_runs));
+            jsonhandler->write_obj("Retried Ops", "%llu", mean_count(retry_stats->m_retried_ops, averaged_runs));
+        }
 
         const bool has_samples = hdr_total_count(latency_histogram) > 0;
         const double avg_latency = has_samples ? latency : 0.0;
@@ -2316,8 +2330,8 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
                              0,   // connection_errors (not tracked per command)
                              quantiles_list, m_get_latency_histogram, timestamps, get_stats);
         result_print_to_json(jsonhandler, "Waits", m_totals.m_wait_cmd.m_ops_sec, 0.0, 0.0, cluster_mode ? 0.0 : -1,
-                             cluster_mode ? 0.0 : -1, 0.0, 0.0, 0.0, 0.0, row_latency(0),
-                             row_ops(m_totals.m_wait_cmd.m_ops),
+                             cluster_mode ? 0.0 : -1, 0.0, 0.0, 0.0, m_totals.m_wait_cmd.m_latency,
+                             row_latency(m_totals.m_wait_cmd.m_total_latency), row_ops(m_totals.m_wait_cmd.m_ops),
                              0.0, // connection_errors_sec (not tracked per command)
                              0,   // connection_errors (not tracked per command)
                              quantiles_list, m_wait_latency_histogram, timestamps, wait_stats);
@@ -2359,7 +2373,8 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
                          m_averaged_runs > 0 ? (long long) rows_ops : (long long) m_totals.m_ops,
                          m_totals.m_connection_errors_sec,
                          (long long) mean_count(m_totals.m_connection_errors, m_averaged_runs), quantiles_list,
-                         m_totals.latency_histogram, timestamps, total_stats, totals_aborts_sec);
+                         m_totals.latency_histogram, timestamps, total_stats, totals_aborts_sec,
+                         m_config->retry_on_error ? &m_totals : NULL, m_averaged_runs);
 
     // -----------------------------------------------------------------
     // Read-preference observability (Step 2f).

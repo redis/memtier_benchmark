@@ -81,6 +81,7 @@ static void test_clamping()
 
 static void test_atomic_recording()
 {
+    // tests/check_code_coverage.sh expects these 40000 calls plus 12 from test_clamping.
     hdr_histogram *h = new_histogram();
     std::vector<std::thread> writers;
     for (int t = 0; t < 4; ++t) {

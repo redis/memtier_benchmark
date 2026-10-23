@@ -71,6 +71,10 @@
 #   along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 #serial 15
+# Local backports: upstream d421a58c (coverage cleanup), dedd290b (lcov
+# version-gate removal), fc10ebf6 (drop the /tmp exclusion). Keep the existing
+# CODE_COVERAGE_RULES interface. Local integration also selects the compiler's
+# coverage runtime and tolerates unmatched removal patterns with lcov >= 2.
 
 AC_DEFUN([AX_CODE_COVERAGE],[
 	dnl Check for --enable-code-coverage
@@ -106,34 +110,42 @@ AC_DEFUN([AX_CODE_COVERAGE],[
 			AC_MSG_ERROR([not compiling with gcc, which is required for gcov code coverage])
 		])
 
-		# List of supported lcov versions.
-		lcov_version_list="1.6 1.7 1.8 1.9 1.10 1.11 1.12 1.13 1.14 1.15 1.16"
-
 		AC_CHECK_PROG([LCOV], [lcov], [lcov])
 		AC_CHECK_PROG([GENHTML], [genhtml], [genhtml])
-
-		AS_IF([ test "$LCOV" ], [
-			AC_CACHE_CHECK([for lcov version], ax_cv_lcov_version, [
-				ax_cv_lcov_version=invalid
-				lcov_version=`$LCOV -v 2>/dev/null | $SED -e 's/^.* //'`
-				for lcov_check_version in $lcov_version_list; do
-					if test "$lcov_version" = "$lcov_check_version"; then
-						ax_cv_lcov_version="$lcov_check_version (ok)"
-					fi
-				done
-			])
-		], [
-			lcov_msg="To enable code coverage reporting you must have one of the following lcov versions installed: $lcov_version_list"
-			AC_MSG_ERROR([$lcov_msg])
+		AS_IF([ test -z "$LCOV" ], [
+			AC_MSG_ERROR([To enable code coverage reporting you must have lcov installed])
 		])
 
-		case $ax_cv_lcov_version in
-			""|invalid[)]
-				lcov_msg="You must have one of the following versions of lcov: $lcov_version_list (found: $lcov_version)."
-				AC_MSG_ERROR([$lcov_msg])
-				LCOV="exit 0;"
-			;;
-		esac
+		dnl lcov 2 makes an unmatched optional exclusion an error. Older lcov
+		dnl releases do not know this category; only pass it to versions >= 2.
+		AC_MSG_CHECKING([for lcov major version])
+		ax_lcov_major=`$LCOV --version 2>/dev/null | $SED -n 's/^.*version \([[0-9]][[0-9]]*\)\..*$/\1/p'`
+		AS_IF([test -n "$ax_lcov_major"], [
+			AC_MSG_RESULT([$ax_lcov_major])
+		], [
+			AC_MSG_RESULT([unknown])
+			AC_MSG_WARN([could not parse lcov --version; lcov 2 compatibility options are disabled])
+		])
+		AS_IF([test -n "$ax_lcov_major" && test "$ax_lcov_major" -ge 2], [
+			CODE_COVERAGE_LCOV_RMOPTS_DEFAULT="--ignore-errors unused"
+			dnl Clang emits generated functions without source-line coverpoints.
+			dnl lcov 2's optional end-line inference cannot represent these;
+			dnl retain their original line/function counts without inventing ends.
+			AC_LANG_PUSH([C++])
+			AC_CACHE_CHECK([whether the coverage C++ compiler is Clang],
+			  [ax_cv_code_coverage_clang], [
+				AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+#ifndef __clang__
+#error not Clang
+#endif
+				]], [[]])], [ax_cv_code_coverage_clang=yes],
+				  [ax_cv_code_coverage_clang=no])
+			])
+			AC_LANG_POP([C++])
+			AS_IF([test "$ax_cv_code_coverage_clang" = yes], [
+				CODE_COVERAGE_LCOV_FUNCTION_OPTIONS="--rc derive_function_end_line=0"
+			])
+		])
 
 		AS_IF([ test -z "$GENHTML" ], [
 			AC_MSG_ERROR([Could not find genhtml from the lcov package])
@@ -141,15 +153,43 @@ AC_DEFUN([AX_CODE_COVERAGE],[
 
 		dnl Build the code coverage flags
 		CODE_COVERAGE_CPPFLAGS="-DNDEBUG"
-		CODE_COVERAGE_CFLAGS="-O0 -g -fprofile-arcs -ftest-coverage"
-		CODE_COVERAGE_CXXFLAGS="-O0 -g -fprofile-arcs -ftest-coverage"
-		CODE_COVERAGE_LDFLAGS="-lgcov"
+		CODE_COVERAGE_CFLAGS="-O0 -g -fprofile-arcs -ftest-coverage -fprofile-update=atomic"
+		CODE_COVERAGE_CXXFLAGS="-O0 -g -fprofile-arcs -ftest-coverage -fprofile-update=atomic"
+		# Ask the compiler driver for its own runtime (GCC or Clang).
+		CODE_COVERAGE_LDFLAGS="--coverage"
+
+		dnl memtier and its tests update shared coverage counters from threads.
+		dnl Require atomic instrumentation, including its runtime, rather than
+		dnl silently accepting lost or inconsistent counts on unsupported targets.
+		ax_code_coverage_save_CFLAGS=$CFLAGS
+		ax_code_coverage_save_CXXFLAGS=$CXXFLAGS
+		CFLAGS="$CFLAGS --coverage -fprofile-update=atomic -Werror"
+		CXXFLAGS="$CXXFLAGS --coverage -fprofile-update=atomic -Werror"
+		AC_LANG_PUSH([C])
+		AC_MSG_CHECKING([for atomic C coverage instrumentation])
+		AC_LINK_IFELSE([AC_LANG_PROGRAM([], [])], [AC_MSG_RESULT([yes])], [
+			AC_MSG_RESULT([no])
+			AC_MSG_ERROR([code coverage requires C compiler support for -fprofile-update=atomic])
+		])
+		AC_LANG_POP([C])
+		AC_LANG_PUSH([C++])
+		AC_MSG_CHECKING([for atomic C++ coverage instrumentation])
+		AC_LINK_IFELSE([AC_LANG_PROGRAM([], [])], [AC_MSG_RESULT([yes])], [
+			AC_MSG_RESULT([no])
+			AC_MSG_ERROR([code coverage requires C++ compiler support for -fprofile-update=atomic])
+		])
+		AC_LANG_POP([C++])
+		CFLAGS=$ax_code_coverage_save_CFLAGS
+		CXXFLAGS=$ax_code_coverage_save_CXXFLAGS
 
 		AC_SUBST([CODE_COVERAGE_CPPFLAGS])
 		AC_SUBST([CODE_COVERAGE_CFLAGS])
 		AC_SUBST([CODE_COVERAGE_CXXFLAGS])
 		AC_SUBST([CODE_COVERAGE_LDFLAGS])
 	])
+
+	AC_SUBST([CODE_COVERAGE_LCOV_RMOPTS_DEFAULT])
+	AC_SUBST([CODE_COVERAGE_LCOV_FUNCTION_OPTIONS])
 
 [CODE_COVERAGE_RULES='
 # Code coverage
@@ -169,6 +209,8 @@ AC_DEFUN([AX_CODE_COVERAGE],[
 #    (Default: empty)
 #  - CODE_COVERAGE_LCOV_SHOPTS_DEFAULT: Extra options shared between both lcov
 #    instances. (Default: based on $CODE_COVERAGE_BRANCH_COVERAGE)
+#  - CODE_COVERAGE_LCOV_FUNCTION_OPTIONS: Compiler-specific function metadata
+#    options selected by configure (overridable from make).
 #  - CODE_COVERAGE_LCOV_SHOPTS: Extra options to shared between both lcov
 #    instances. (Default: $CODE_COVERAGE_LCOV_SHOPTS_DEFAULT)
 #  - CODE_COVERAGE_LCOV_OPTIONS_GCOVPATH: --gcov-tool pathtogcov
@@ -177,7 +219,7 @@ AC_DEFUN([AX_CODE_COVERAGE],[
 #  - CODE_COVERAGE_LCOV_OPTIONS: Extra options to pass to the collecting lcov
 #    instance. (Default: $CODE_COVERAGE_LCOV_OPTIONS_DEFAULT)
 #  - CODE_COVERAGE_LCOV_RMOPTS_DEFAULT: Extra options to pass to the filtering
-#    lcov instance. (Default: empty)
+#    lcov instance. (Default: allow unmatched exclusions with lcov >= 2)
 #  - CODE_COVERAGE_LCOV_RMOPTS: Extra options to pass to the filtering lcov
 #    instance. (Default: $CODE_COVERAGE_LCOV_RMOPTS_DEFAULT)
 #  - CODE_COVERAGE_GENHTML_OPTIONS_DEFAULT: Extra options to pass to the
@@ -195,7 +237,7 @@ CODE_COVERAGE_DIRECTORY ?= $(top_builddir)
 CODE_COVERAGE_OUTPUT_FILE ?= $(PACKAGE_NAME)-$(PACKAGE_VERSION)-coverage.info
 CODE_COVERAGE_OUTPUT_DIRECTORY ?= $(PACKAGE_NAME)-$(PACKAGE_VERSION)-coverage
 CODE_COVERAGE_BRANCH_COVERAGE ?=
-CODE_COVERAGE_LCOV_SHOPTS_DEFAULT ?= $(if $(CODE_COVERAGE_BRANCH_COVERAGE),\
+CODE_COVERAGE_LCOV_SHOPTS_DEFAULT ?= $(CODE_COVERAGE_LCOV_FUNCTION_OPTIONS) $(if $(CODE_COVERAGE_BRANCH_COVERAGE),\
 --rc lcov_branch_coverage=$(CODE_COVERAGE_BRANCH_COVERAGE))
 CODE_COVERAGE_LCOV_SHOPTS ?= $(CODE_COVERAGE_LCOV_SHOPTS_DEFAULT)
 CODE_COVERAGE_LCOV_OPTIONS_GCOVPATH ?= --gcov-tool "$(GCOV)"
@@ -203,10 +245,10 @@ CODE_COVERAGE_LCOV_OPTIONS_DEFAULT ?= $(CODE_COVERAGE_LCOV_OPTIONS_GCOVPATH)
 CODE_COVERAGE_LCOV_OPTIONS ?= $(CODE_COVERAGE_LCOV_OPTIONS_DEFAULT)
 CODE_COVERAGE_LCOV_RMOPTS_DEFAULT ?=
 CODE_COVERAGE_LCOV_RMOPTS ?= $(CODE_COVERAGE_LCOV_RMOPTS_DEFAULT)
-CODE_COVERAGE_GENHTML_OPTIONS_DEFAULT ?=\
+CODE_COVERAGE_GENHTML_OPTIONS_DEFAULT ?= $(CODE_COVERAGE_LCOV_FUNCTION_OPTIONS)\
 $(if $(CODE_COVERAGE_BRANCH_COVERAGE),\
 --rc genhtml_branch_coverage=$(CODE_COVERAGE_BRANCH_COVERAGE))
-CODE_COVERAGE_GENHTML_OPTIONS ?= $(CODE_COVERAGE_GENHTML_OPTIONS_DEFAULTS)
+CODE_COVERAGE_GENHTML_OPTIONS ?= $(CODE_COVERAGE_GENHTML_OPTIONS_DEFAULT)
 CODE_COVERAGE_IGNORE_PATTERN ?=
 
 code_coverage_v_lcov_cap = $(code_coverage_v_lcov_cap_$(V))
@@ -215,7 +257,7 @@ code_coverage_v_lcov_cap_0 = @echo "  LCOV   --capture"\
  $(CODE_COVERAGE_OUTPUT_FILE);
 code_coverage_v_lcov_ign = $(code_coverage_v_lcov_ign_$(V))
 code_coverage_v_lcov_ign_ = $(code_coverage_v_lcov_ign_$(AM_DEFAULT_VERBOSITY))
-code_coverage_v_lcov_ign_0 = @echo "  LCOV   --remove /tmp/*"\
+code_coverage_v_lcov_ign_0 = @echo "  LCOV   --remove"\
  $(CODE_COVERAGE_IGNORE_PATTERN);
 code_coverage_v_genhtml = $(code_coverage_v_genhtml_$(V))
 code_coverage_v_genhtml_ = $(code_coverage_v_genhtml_$(AM_DEFAULT_VERBOSITY))
@@ -240,7 +282,11 @@ endif
 code-coverage-capture: code-coverage-capture-hook
 ifeq ($(CODE_COVERAGE_ENABLED),yes)
 	$(code_coverage_v_lcov_cap)$(LCOV) $(code_coverage_quiet) $(addprefix --directory ,$(CODE_COVERAGE_DIRECTORY)) --capture --output-file "$(CODE_COVERAGE_OUTPUT_FILE).tmp" --test-name "$(call code_coverage_sanitize,$(PACKAGE_NAME)-$(PACKAGE_VERSION))" --no-checksum --compat-libtool $(CODE_COVERAGE_LCOV_SHOPTS) $(CODE_COVERAGE_LCOV_OPTIONS)
-	$(code_coverage_v_lcov_ign)$(LCOV) $(code_coverage_quiet) $(addprefix --directory ,$(CODE_COVERAGE_DIRECTORY)) --remove "$(CODE_COVERAGE_OUTPUT_FILE).tmp" "/tmp/*" $(CODE_COVERAGE_IGNORE_PATTERN) --output-file "$(CODE_COVERAGE_OUTPUT_FILE)" $(CODE_COVERAGE_LCOV_SHOPTS) $(CODE_COVERAGE_LCOV_RMOPTS)
+ifneq ($(strip $(CODE_COVERAGE_IGNORE_PATTERN)),)
+	$(code_coverage_v_lcov_ign)$(LCOV) $(code_coverage_quiet) $(addprefix --directory ,$(CODE_COVERAGE_DIRECTORY)) --remove "$(CODE_COVERAGE_OUTPUT_FILE).tmp" $(CODE_COVERAGE_IGNORE_PATTERN) --output-file "$(CODE_COVERAGE_OUTPUT_FILE)" $(CODE_COVERAGE_LCOV_SHOPTS) $(CODE_COVERAGE_LCOV_RMOPTS)
+else
+	$(A''M_V_at)cp "$(CODE_COVERAGE_OUTPUT_FILE).tmp" "$(CODE_COVERAGE_OUTPUT_FILE)"
+endif
 	-@rm -f $(CODE_COVERAGE_OUTPUT_FILE).tmp
 	$(code_coverage_v_genhtml)LANG=C $(GENHTML) $(code_coverage_quiet) $(addprefix --prefix ,$(CODE_COVERAGE_DIRECTORY)) --output-directory "$(CODE_COVERAGE_OUTPUT_DIRECTORY)" --title "$(PACKAGE_NAME)-$(PACKAGE_VERSION) Code Coverage" --legend --show-details "$(CODE_COVERAGE_OUTPUT_FILE)" $(CODE_COVERAGE_GENHTML_OPTIONS)
 	@echo "file://$(abs_builddir)/$(CODE_COVERAGE_OUTPUT_DIRECTORY)/index.html"
@@ -253,10 +299,11 @@ code-coverage-capture-hook:
 
 ifeq ($(CODE_COVERAGE_ENABLED),yes)
 clean: code-coverage-clean
+distclean: code-coverage-clean
 code-coverage-clean:
 	-$(LCOV) --directory $(top_builddir) -z
 	-rm -rf $(CODE_COVERAGE_OUTPUT_FILE) $(CODE_COVERAGE_OUTPUT_FILE).tmp $(CODE_COVERAGE_OUTPUT_DIRECTORY)
-	-find . -name "*.gcda" -o -name "*.gcov" -delete
+	-find . \( -name "*.gcda" -o -name "*.gcno" -o -name "*.gcov" \) -delete
 endif
 
 GITIGNOREFILES ?=
