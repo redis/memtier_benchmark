@@ -546,8 +546,12 @@ If no primary is connected, connecting, or awaiting reconnect/refresh, missing-o
 requests fail the run explicitly. Transactions retain their key while reconnecting.
 Monitor replay waits before selecting its next line while all primaries are in
 reconnect backoff, including for owned keys. Already-selected monitor lines and
-routed keys stay queued across redials to the same endpoint, including repeated
-setup failures, without changing their generated-request counts.
+routed keys stay queued across redials to the same primary endpoint, including
+repeated setup failures, without changing their generated-request counts. Replica
+redials, including a primary demoted to replica, keep the existing policy of
+clearing unsent queues and compensating their generated-request counts so other
+shards can continue. This does not guarantee request identity across replica
+redials.
 Strict `secondary` reads with `error` or `queue` fallback fail the run because no
 authoritative replica can be chosen, including for a transient hole discovered
 by a mid-run refresh.

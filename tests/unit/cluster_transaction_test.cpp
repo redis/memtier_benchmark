@@ -322,6 +322,26 @@ static void check_repin_routes_to_staged_owner(unsigned long long first_key)
         check(client.pool_empty(1) && client.staged_monitor_count(1) == 0, "different endpoint clears both old queues");
         check(client.get_reqs_generated() == generated - 2, "reset compensates both counted requests");
 
+        // The topology assigns the new role before redial. A demoted primary
+        // and a repeated replica redial retain the existing reset policy,
+        // preventing counted reads from stranding completion on a dead replica.
+        client.get_connections()[1]->set_role(role_replica);
+        for (unsigned int attempt = 0; attempt < 2; attempt++) {
+            client.stage_unsent(1);
+            check(client.redial(1, "localhost", port.c_str()), "same replica endpoint redial starts");
+            check(client.pool_empty(1) && client.staged_monitor_count(1) == 0,
+                  "replica redial clears both unsent queues, including demotion");
+            check(client.get_reqs_generated() == generated - 2, "replica reset compensates exactly once");
+        }
+        client.get_connections()[1]->set_role(role_primary);
+        client.stage_unsent(1);
+        check(client.redial(1, "localhost", port.c_str()), "promoted primary redial starts");
+        check(!client.pool_empty(1) && client.staged_monitor_count(1) == 1,
+              "promoted primary retains same endpoint work");
+        check(client.get_reqs_generated() == generated, "promoted primary preserves generated count");
+        check(client.redial(1, "127.0.0.1", port.c_str()), "reset unit fixture endpoint");
+        check(client.get_reqs_generated() == generated - 2, "fixture reset compensates retained work");
+
         // MULTI on the main connection stages the first key and pins to its owner.
         check(!client.send_from(0, 0), "main connection defers to the key owner");
         check(client.pin() == 1 && client.staged() && client.staged_key() == first_key,

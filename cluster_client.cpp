@@ -285,14 +285,16 @@ int cluster_client::reconnect(unsigned int conn_id)
 bool cluster_client::connect_shard_connection(shard_connection *sc, char *address, char *port)
 {
     // Routed keys and monitor lines have already been selected and counted,
-    // but have not reached the wire. Redialing the same endpoint must retain
-    // them: clearing and compensating would generate replacements and skip
-    // the original request identities. A new connection (no address yet) or
-    // a different endpoint keeps the existing reset policy; connection IDs
-    // alone are not enough to establish queue ownership.
+    // but have not reached the wire. Redialing the same primary retains them:
+    // clearing and compensating would replace the selected identities.
+    // Replicas keep their existing reset/compensation policy so a permanently
+    // unavailable replica cannot strand counted reads while other shards
+    // continue (#602). A fresh/different endpoint also resets its queues;
+    // connection IDs alone do not establish queue ownership. The topology
+    // caller sets the current role before reconnecting, including demotions.
     const bool same_endpoint = sc->get_address() != NULL && sc->get_port() != NULL &&
                                strcmp(sc->get_address(), address) == 0 && strcmp(sc->get_port(), port) == 0;
-    if (!same_endpoint) {
+    if (!same_endpoint || sc->is_replica()) {
         if (m_key_index_pools[sc->get_id()]->size()) {
             // Cross-shard reads that were routed to this connection (via
             // create_request_for_other) push a (command_index, key_index) pair into
