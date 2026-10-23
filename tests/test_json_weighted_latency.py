@@ -49,7 +49,8 @@ class _LatencyHandler(socketserver.StreamRequestHandler):
                     # Two timed runs have deliberately different sample counts
                     # and latencies. Assertions use observed sums, never these
                     # requested sleep durations as a timing oracle.
-                    time.sleep(0.001 if run == 1 else 0.02)
+                    if run != 1:
+                        time.sleep(0.05)
                     reply = b"$-1\r\n" if command[0] == b"GET" else b"+OK\r\n"
                 self.wfile.write(reply)
         except (BrokenPipeError, ConnectionResetError):
@@ -105,5 +106,6 @@ def test_json_aggregate_latency_weights_samples(env):
         rows = [name for name in names if name != "Totals"]
         for name in rows:
             total = sum(run[name]["Count"] for run in runs)
+            # mean_count() rounds to nearest, retaining one for nonzero totals.
             env.assertEqual(aggregate[name]["Count"], max(1, (total + 1) // 2))
         env.assertEqual(aggregate["Totals"]["Count"], sum(aggregate[name]["Count"] for name in rows))
