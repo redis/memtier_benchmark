@@ -22,12 +22,11 @@ cluster_client::hold_pipeline, coupling production to drain.
 
 What this test pins down
 ------------------------
-With the fix, p99 latency stays bounded (it reflects real server RTT, not
-queue residence). Without it, p99 blows past tens of ms for this workload and
-grows with the request count. The threshold below has large margin in both
-directions: the fixed client reports sub-millisecond p99 against a loopback
-cluster, while the unbounded-staging regression reports ~80ms+ at this request
-count and worse as it scales.
+The short real-cluster workload must complete with bounded p99 latency. At
+1000 requests the old unbounded producer can also finish below the generous
+CI latency ceiling, so the deterministic producer-cap regression lives in
+cluster_transaction_test: it checks that a full global budget stops a pure
+producer, lets staged commands drain, and resumes after a completed reply.
 
 Run:
     TEST=test_monitor_cluster_backpressure.py OSS_CLUSTER=1 SHARDS=3 ./tests/run_tests.sh
@@ -48,16 +47,12 @@ from include import (
 from mb import Benchmark, RunConfig
 
 
-# p99 latency ceiling, in milliseconds. The fixed client reports sub-ms p99 on
-# a loopback cluster; the unbounded-staging regression reports ~80ms+ at this
-# request count (and grows with it). 50ms leaves >25x margin for the fix while
-# still failing the regression decisively.
+# Generous real-server latency ceiling; the C++ unit checks the exact cap
+# independently of host speed and sanitizer overhead.
 _P99_CEILING_MS = 50.0
 
-# Per-client request count. Large enough that, without backpressure, the staged
-# queues build a tail of ~requests/shards commands per client (the source of the
-# latency climb); small enough to keep the run to ~1-2s.
-_REQUESTS = 4000
+# Original short workload restored after #463's timestamp-averaging fix.
+_REQUESTS = 1000
 
 
 def _make_monitor_file(test_dir, n=200):
@@ -91,6 +86,9 @@ def _run_monitor_cluster(env, monitor_file, threads=1, clients=4, requests=_REQU
         ],
     }
     addTLSArgs(benchmark_specs, env)
+    password = env.getConnection().connection_pool.connection_kwargs.get("password")
+    if password:
+        benchmark_specs["args"].append("--authenticate=" + password)
 
     config = get_default_memtier_config(threads=threads, clients=clients, requests=requests)
     master_nodes_list = env.getMasterNodesList()
@@ -114,10 +112,7 @@ def _run_monitor_cluster(env, monitor_file, threads=1, clients=4, requests=_REQU
 
 
 def test_monitor_cluster_latency_bounded(env):
-    """Replaying a monitor capture against an OSS cluster must keep p99 latency
-    bounded — i.e. production is coupled to drain and the staged queues do not
-    grow without bound. A regression in the backpressure cap reintroduces the
-    monotonic latency climb and trips the ceiling below."""
+    """Smoke-check bounded latency for short monitor replay on a real cluster."""
     if not env.isCluster():
         env.skip()
         return
@@ -151,11 +146,8 @@ def test_monitor_cluster_completes_and_routes(env):
     test_dir = tempfile.mkdtemp()
     monitor_file = _make_monitor_file(test_dir)
 
-    # Smaller, quick run. requests=4000 keeps the smoke check fast while pushing
-    # the aggregate duration above ~1ms so run_stats::timeval_factorial_average
-    # (run_stats.cpp:116-123) does not truncate the diff to 0 us and report
-    # Ops/sec = 0 under sanitizer/UBSan slowdown.
-    ok, js, _run_config = _run_monitor_cluster(env, monitor_file, requests=4000)
+    # #463's integer-microsecond averaging permits the original short run.
+    ok, js, _run_config = _run_monitor_cluster(env, monitor_file, requests=1000)
     env.assertTrue(ok, message="memtier did not complete the monitor-cluster run")
 
     totals = js.get("ALL STATS", {}).get("Totals", {})
