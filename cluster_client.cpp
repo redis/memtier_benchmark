@@ -2744,6 +2744,9 @@ bool cluster_client::create_monitor_request_cluster(unsigned int command_index, 
             if (slot_is_unowned(slot)) {
                 check_unowned_slot(slot, false); // Primary-routed monitor replay: warning only, cannot fail.
                 shard = fallback_primary_conn_id();
+                // The producer may be a replica seed. Stage on the primary
+                // even during setup; fill_pipeline drains only after AUTH and
+                // SLOTS finish, and retirement compensates staged counts.
                 if (shard < m_connections.size()) target_conn = shard;
             } else if (shard != UINT_MAX && shard < m_connections.size() &&
                        m_connections[shard]->get_connection_state() != conn_disconnected &&
@@ -3203,7 +3206,8 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
         // CLUSTERDOWN has no MOVED destination. Even a previously full map
         // can be stale. Poll at most once per second, without flushing any
         // staged keys. The setup ladder defers SLOTS while MULTI is open.
-        if (strncmp(response->get_status(), "-CLUSTERDOWN ", 13) == 0 &&
+        static const char CLUSTERDOWN_MSG_PREFIX[] = "-CLUSTERDOWN ";
+        if (strncmp(response->get_status(), CLUSTERDOWN_MSG_PREFIX, sizeof(CLUSTERDOWN_MSG_PREFIX) - 1) == 0 &&
             (m_last_clusterdown_refresh.tv_sec == 0 || ts_diff(m_last_clusterdown_refresh, timestamp) >= 1000000) &&
             m_connections[conn_id]->get_cluster_slots_state() == setup_done) {
             m_last_clusterdown_refresh = timestamp;

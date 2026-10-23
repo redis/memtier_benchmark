@@ -8,6 +8,7 @@ import socketserver
 import subprocess
 import tempfile
 import threading
+import time
 from include import MEMTIER_BINARY
 
 
@@ -22,13 +23,16 @@ def _slot(key):
 class _Node(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
-    def __init__(self, ranges, replica=False, heal=False, drop_after=0, disconnect_on_drop=True):
+    def __init__(
+        self, ranges, replica=False, heal=False, drop_after=0, disconnect_on_drop=True, auth_delay=0
+    ):
         super().__init__(("127.0.0.1", 0), _Handler)
         self.root = self
         self.ranges = ranges
         self.replica = _Node(ranges) if replica else None
         if self.replica:
             self.replica.root = self
+        self.auth_delay = auth_delay
         self.heal = heal
         self.drop_after = drop_after
         self.dropped = False
@@ -85,6 +89,7 @@ class _Handler(socketserver.StreamRequestHandler):
                 verb = args[0].upper()
                 if verb == b"AUTH":
                     assert args[-1] == b"dummy-685"
+                    time.sleep(node.auth_delay)
                     authenticated = True
                     reply = b"+OK\r\n"
                 else:
@@ -362,18 +367,22 @@ def test_midrun_slot_removal_after_reconnect(env):
 
 
 def test_unowned_monitor_key_is_sent_to_primary(env):
-    node = _hole(replica=True)
-    with tempfile.TemporaryDirectory() as directory:
-        path = os.path.join(directory, "monitor.txt")
-        with open(path, "w") as output:
-            output.write('1.000000 [0 127.0.0.1:12345] "SET" "memtier-1" "dummy"\n')
-        stats, failures, _ = _run(
-            env, node, ["--requests=20", "--monitor-input=" + path, "--command=__monitor_line@__"]
-        )
-    env.assertEqual(stats["Totals"]["Count"], 20)
-    env.assertEqual(len(node.requests), 20)
-    env.assertEqual(node.replica.requests, [])
-    env.assertEqual(len(failures), 20)
+    for seed_replica in (False, True):
+        node = _hole(replica=True, auth_delay=0.1 if seed_replica else 0)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "monitor.txt")
+            with open(path, "w") as output:
+                output.write('1.000000 [0 127.0.0.1:12345] "SET" "memtier-1" "dummy"\n')
+            stats, failures, _ = _run(
+                env,
+                node,
+                ["--requests=20", "--monitor-input=" + path, "--command=__monitor_line@__"],
+                seed_replica=seed_replica,
+            )
+        env.assertEqual(stats["Totals"]["Count"], 20)
+        env.assertEqual(len(node.requests), 20)
+        env.assertEqual(node.replica.requests, [])
+        env.assertEqual(len(failures), 20)
 
 
 def test_unowned_write_from_replica_seed_uses_primary(env):

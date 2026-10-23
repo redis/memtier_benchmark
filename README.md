@@ -535,8 +535,9 @@ owner, writes and reads that permit primary routing are sent to an available
 primary, preserving the key and letting Redis return its routing response.
 `CLUSTERDOWN` replies count as workload errors and follow the usual retry
 policy; they also trigger a topology refresh at most once per second per
-client, including when a previously full map has become stale. Strict `secondary` reads with `error` or
-`queue` fallback fail the run because no authoritative replica can be chosen.
+client, including when a previously full map has become stale. Strict
+`secondary` reads with `error` or `queue` fallback fail the run because no
+authoritative replica can be chosen.
 
 Built-in read commands (GET, MGET) and arbitrary commands marked with
 `--command-is-read` participate in read-preference routing.  Reads on
