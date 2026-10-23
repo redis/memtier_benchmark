@@ -440,8 +440,13 @@ jobs:
       if: always()
       run: docker compose -f docker-compose.statsd.yml down -v
 
-  coverage-ubuntu:
+  coverage-shards:
+    name: Coverage shard ${{ matrix.shard }}/4
     runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
     - uses: actions/checkout@v6
 
@@ -457,6 +462,8 @@ jobs:
 
     - name: Run unit tests
       # Unit tests reuse the instrumented objects and must link the gcov runtime.
+      # Include their coverage once in the merged report.
+      if: matrix.shard == 1
       run: make check
 
     - name: Setup Python
@@ -482,22 +489,81 @@ jobs:
         sudo sysctl -w net.ipv4.tcp_tw_reuse=1
         ulimit -n 40960
 
+    - name: Validate coverage shard selection
+      if: matrix.shard == 1
+      run: python3 utils/check_test_shards.py 4
+
     - name: Run tests for coverage
-      # Kept serial so coverage data is collected exactly as before; see #679.
-      timeout-minutes: 40
+      # Each runner executes a disjoint file shard serially, with its own gcda files.
+      timeout-minutes: 20
       env:
         OSS_STANDALONE: "1"
         OSS_CLUSTER: "0"
         TLS: "0"
         VERBOSE: "1"
       run: |
+        TEST="$(python3 utils/select_test_shard.py ${{ matrix.shard }} 4)"
+        test -n "$TEST"
+        export TEST
         ./tests/run_tests.sh
 
     - name: Capture code coverage
       timeout-minutes: 6
       run: |
         make code-coverage-capture
-        bash <(curl -s https://codecov.io/bash) -f memtier_benchmark-*-coverage.info || echo "Codecov did not collect coverage reports"
+        mv memtier_benchmark-*-coverage.info coverage-shard-${{ matrix.shard }}.info
+
+    - name: Upload shard coverage
+      uses: actions/upload-artifact@v5
+      with:
+        name: coverage-shard-${{ matrix.shard }}
+        path: coverage-shard-${{ matrix.shard }}.info
+        if-no-files-found: error
+        retention-days: 1
+
+  coverage-ubuntu:
+    needs: coverage-shards
+    # Keep the existing check name and explicitly fail if any shard failed.
+    if: always()
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Require every coverage shard to pass
+      env:
+        SHARD_RESULT: ${{ needs.coverage-shards.result }}
+      run: test "$SHARD_RESULT" = success
+
+    - uses: actions/checkout@v6
+
+    - name: Download shard coverage
+      uses: actions/download-artifact@v8
+      with:
+        pattern: coverage-shard-*
+        merge-multiple: true
+        path: coverage
+
+    - name: Merge code coverage
+      timeout-minutes: 6
+      run: |
+        sudo apt-get -qq update
+        sudo apt-get install -y lcov
+        reports=()
+        for shard in 1 2 3 4; do
+          report="coverage/coverage-shard-${shard}.info"
+          test -s "$report"
+          reports+=(--add-tracefile "$report")
+        done
+        lcov "${reports[@]}" --output-file coverage.info
+
+    - name: Upload merged coverage artifact
+      uses: actions/upload-artifact@v5
+      with:
+        name: coverage-merged
+        path: coverage.info
+        if-no-files-found: error
+
+    - name: Publish code coverage
+      run: |
+        bash <(curl -s https://codecov.io/bash) -f coverage.info || echo "Codecov did not collect coverage reports"
 
   build-alpine:
     runs-on: ubuntu-latest
