@@ -422,15 +422,8 @@ int redis_protocol::write_command_cluster_slots()
 
 int redis_protocol::write_command_readonly()
 {
-    int size = 0;
-
-    size = evbuffer_add(m_write_buf,
-                        "*1\r\n"
-                        "$8\r\n"
-                        "READONLY\r\n",
-                        16);
-
-    return size;
+    static const char readonly_command[] = "*1\r\n$8\r\nREADONLY\r\n";
+    return evbuffer_add(m_write_buf, readonly_command, sizeof(readonly_command) - 1);
 }
 
 int redis_protocol::write_command_set(const char *key, int key_len, const char *value, int value_len, int expiry,

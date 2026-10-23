@@ -85,6 +85,7 @@ tests/.env/
 /reconnect_siblings_test
 /cluster_slots_retention_test
 /memcache_meta_test
+/redis_protocol_test
 tests/unit/prometheus_metrics_test
 *.log
 *.trs
