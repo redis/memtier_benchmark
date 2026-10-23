@@ -1335,6 +1335,8 @@ def test_tolerance_bounds_both_sides(env):
 
 def test_json_wait_latency_and_accumulated(env):
     """#803: WAIT's summary must use its samples, not literal zero inputs."""
+    if env.isCluster():
+        env.skip()  # The CLI rejects --wait-ratio with --cluster-mode.
     for run_count in (1, 2):
         with tempfile.TemporaryDirectory() as test_dir:
             args = ["--ratio=1:0", "--wait-ratio=1:1", "--num-slaves=1000-1000",
@@ -1346,7 +1348,12 @@ def test_json_wait_latency_and_accumulated(env):
                 args.append("--authenticate=" + password)
             benchmark, run_config = _build_benchmark(
                 env, test_dir, args, threads=1, clients=1, requests=12)
-            env.assertTrue(benchmark.run(), message="WAIT benchmark failed")
+            ok = benchmark.run(timeout=30)
+            if not ok:
+                debugPrintMemtierOnError(run_config, env)
+            env.assertTrue(ok, message="WAIT benchmark failed")
+            if not ok:
+                return
             results = _read_json(run_config, env)
             runs = ([results["ALL STATS"]] if run_count == 1 else
                     [results[f"RUN #{i} RESULTS"] for i in (1, 2)])
@@ -1375,6 +1382,13 @@ def test_json_wait_latency_and_accumulated(env):
                                     sum(aggregate[name][key] for name in ("Sets", "Gets", "Waits")))
                 env.assertGreater(aggregate["Waits"]["Latency"], 0)
                 env.assertEqual(aggregate["Waits"]["Latency"], aggregate["Waits"]["Average Latency"])
+                # These fixed-request runs have equal WAIT sample counts.
+                # Each real-run mean truncates less than .001ms; the aggregate
+                # prints to .001ms. Allow both bounds, including when #671
+                # computes its mean from unrounded sample sums.
+                env.assertEqual(runs[0]["Waits"]["Count"], runs[1]["Waits"]["Count"])
+                expected_latency = sum(run["Waits"]["Latency"] for run in runs) / len(runs)
+                env.assertAlmostEqual(aggregate["Waits"]["Latency"], expected_latency, 0.0015)
                 # BEST/WORST are actual runs and must retain their WAIT data.
                 for name in ("BEST RUN RESULTS", "WORST RUN RESULTS"):
                     env.assertIn(results[name]["Waits"], [run["Waits"] for run in runs])
@@ -1383,12 +1397,17 @@ def test_json_wait_latency_and_accumulated(env):
 def test_json_no_wait_samples_stays_zero(env):
     """The populated WAIT correction must preserve the empty-row contract."""
     with tempfile.TemporaryDirectory() as test_dir:
-        args = ["--ratio=1:0", "--wait-ratio=1:0", "--run-count=2", "--print-all-runs"]
+        args = ["--ratio=1:0", "--run-count=2", "--print-all-runs"]
         password = env.getConnection().connection_pool.connection_kwargs.get("password")
         if password:
             args.append("--authenticate=" + password)
         benchmark, run_config = _build_benchmark(env, test_dir, args, threads=1, clients=1, requests=12)
-        env.assertTrue(benchmark.run())
+        ok = benchmark.run(timeout=30)
+        if not ok:
+            debugPrintMemtierOnError(run_config, env)
+        env.assertTrue(ok)
+        if not ok:
+            return
         results = _read_json(run_config, env)
         for name in ("RUN #1 RESULTS", "RUN #2 RESULTS", "BEST RUN RESULTS", "WORST RUN RESULTS",
                      _aggregated_key(env, results)):
