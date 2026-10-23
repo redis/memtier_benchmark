@@ -2328,7 +2328,10 @@ double shard_connection::next_reconnect_delay(void)
     // Only with unlimited attempts: a finite --max-reconnect-attempts keeps
     // its backoff schedule, which bounds the run as before (#656).
     if (stops_at_deadline() && run_deadline(&deadline)) {
-        gettimeofday(&now, NULL);
+        // event_add() measures relative delays from the event loop's cached
+        // time. Use that same origin: a fresh wall clock after a slow callback
+        // would shorten the delay and let a deadline retry fire early.
+        if (event_base_gettimeofday_cached(m_event_base, &now) < 0) gettimeofday(&now, NULL);
         double left = (deadline.tv_sec - now.tv_sec) + (deadline.tv_usec - now.tv_usec) / 1000000.0;
         if (left < 0) left = 0;
         if (left < delay) delay = left;

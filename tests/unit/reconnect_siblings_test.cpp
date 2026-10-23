@@ -28,6 +28,8 @@
 #include "platform_compat.h"
 #include <unistd.h>
 #include <string>
+#include <chrono>
+#include <thread>
 #include <event2/event.h>
 #include "client.h"
 #include "obj_gen.h"
@@ -250,6 +252,49 @@ static void test_interrupted_deadline()
     event_base_free(base);
 }
 
+// Run inside a callback so libevent retains its time cache while the worker
+// is delayed. A deadline-clamped reconnect must still be scheduled at the
+// deadline, rather than earlier by the time spent in this callback.
+static void test_cached_reconnect_deadline(evutil_socket_t, short, void *context)
+{
+    event_base *base = static_cast<event_base *>(context);
+    arbitrary_command_list commands;
+    benchmark_config config = {};
+    config.arbitrary_commands = &commands;
+    config.clients = config.threads = 1;
+    config.key_pattern = "S:S";
+    config.protocol = PROTOCOL_REDIS_DEFAULT;
+    config.test_time = 2;
+    config.reconnect_on_error = true;
+    timeval cached, elapsed = {1, 500000};
+    check(event_base_gettimeofday_cached(base, &cached) == 0, "read callback's cached time");
+    evutil_timersub(&cached, &elapsed, &config.benchmark_start_time);
+    steady_state = true;
+    abstract_protocol *protocol = protocol_factory(config.protocol);
+    {
+        object_generator generator;
+        client manager(base, &config, protocol, &generator);
+        shard_connection &connection = *manager.get_connections()[0];
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        const double delay = connection.next_reconnect_delay();
+        check(delay >= 0.499999 && delay <= 0.500001,
+              "callback work must not advance a deadline-clamped reconnect timer");
+        config.max_reconnect_attempts = 5;
+        check(connection.next_reconnect_delay() == 1.0, "bounded reconnect retains its backoff");
+        config.max_reconnect_attempts = 0;
+        config.test_time = 0;
+        check(connection.next_reconnect_delay() == 1.0, "request-count runs retain their backoff");
+        config.test_time = 2;
+        steady_state = false;
+        check(connection.next_reconnect_delay() == 1.0, "startup retains its backoff before steady state");
+        steady_state = true;
+        config.benchmark_start_time.tv_sec -= 2;
+        check(connection.next_reconnect_delay() == 0.0, "an expired deadline is scheduled immediately");
+    }
+    steady_state = false;
+    delete protocol;
+}
+
 int main()
 {
 #ifdef _WIN32
@@ -267,6 +312,12 @@ int main()
     rmdir(directory);
 #endif
     test_interrupted_deadline();
+    event_base *clock_base = event_base_new();
+    timeval immediately = {0, 0};
+    check(event_base_once(clock_base, -1, EV_TIMEOUT, test_cached_reconnect_deadline, clock_base, &immediately) == 0,
+          "schedule cached-clock regression");
+    event_base_dispatch(clock_base);
+    event_base_free(clock_base);
 
     arbitrary_command_list commands;
     benchmark_config config = {};
