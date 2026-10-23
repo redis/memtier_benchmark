@@ -655,7 +655,7 @@ int shard_connection::connect(struct connect_info *addr)
     // call connect
     m_connection_state = conn_in_progress;
 
-    const struct sockaddr *sa = m_unix_sockaddr ? (struct sockaddr *) m_unix_sockaddr : addr->ci_addr;
+    struct sockaddr *sa = m_unix_sockaddr ? (struct sockaddr *) m_unix_sockaddr : addr->ci_addr;
     int socklen = m_unix_sockaddr ? m_unix_sockaddrlen : addr->ci_addrlen;
 #ifdef _WIN32
     int ret = bufferevent_connect_nonblocking(m_bev, sockfd, sa, socklen);
@@ -663,7 +663,7 @@ int shard_connection::connect(struct connect_info *addr)
         // Do not enter the error callback during client preparation. This
         // connection owns the queued event so disconnect/destruction cancels
         // it, including the TLS bufferevent and its SSL ownership. event_new /
-        // event_active work with the existing libevent 2.0.10 minimum.
+        // event_active work with the libevent 2.0 APIs.
         bufferevent_disable(m_bev, EV_READ | EV_WRITE);
         m_deferred_connect_error = event_new(m_event_base, -1, 0, deferred_connect_error_handler, this);
         if (m_deferred_connect_error == NULL) {

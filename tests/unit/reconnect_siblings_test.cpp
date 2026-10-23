@@ -252,12 +252,19 @@ static void test_interrupted_deadline()
     event_base_free(base);
 }
 
+struct reconnect_clock_context
+{
+    event_base *base;
+    timeval before_dispatch;
+};
+
 // Run inside a callback so libevent retains its time cache while the worker
 // is delayed. A deadline-clamped reconnect must still be scheduled at the
 // deadline, rather than earlier by the time spent in this callback.
 static void test_cached_reconnect_deadline(evutil_socket_t, short, void *context)
 {
-    event_base *base = static_cast<event_base *>(context);
+    reconnect_clock_context *clock = static_cast<reconnect_clock_context *>(context);
+    event_base *base = clock->base;
     arbitrary_command_list commands;
     benchmark_config config = {};
     config.arbitrary_commands = &commands;
@@ -266,8 +273,14 @@ static void test_cached_reconnect_deadline(evutil_socket_t, short, void *context
     config.protocol = PROTOCOL_REDIS_DEFAULT;
     config.test_time = 2;
     config.reconnect_on_error = true;
-    timeval cached, elapsed = {1, 500000};
+    timeval cached, wall, elapsed = {1, 500000};
     check(event_base_gettimeofday_cached(base, &cached) == 0, "read callback's cached time");
+    gettimeofday(&wall, NULL);
+    // Independent wall samples bracket this event-loop iteration. libevent
+    // 2.0.10 returns monotonic uptime here on Linux; self-anchoring the
+    // deadline to that value would incorrectly let the regression pass.
+    check(ts_diff(clock->before_dispatch, cached) >= -1000 && ts_diff(cached, wall) >= -1000,
+          "cached event-loop time uses the wall-clock epoch");
     evutil_timersub(&cached, &elapsed, &config.benchmark_start_time);
     steady_state = true;
     abstract_protocol *protocol = protocol_factory(config.protocol);
@@ -279,6 +292,14 @@ static void test_cached_reconnect_deadline(evutil_socket_t, short, void *context
         const double delay = connection.next_reconnect_delay();
         check(delay >= 0.499999 && delay <= 0.500001,
               "callback work must not advance a deadline-clamped reconnect timer");
+        // Also use the production contract: the run starts in wall time.
+        // Bound the expected remaining delay with the independent wall
+        // samples rather than assuming callback dispatch was instantaneous.
+        evutil_timersub(&wall, &elapsed, &config.benchmark_start_time);
+        const double wall_delay = connection.next_reconnect_delay();
+        const double upper = 0.501 + ts_diff(clock->before_dispatch, wall) / 1000000.0;
+        check(wall_delay >= 0.499 && wall_delay <= upper,
+              "wall-anchored deadline clamps reconnect in the same clock epoch");
         config.max_reconnect_attempts = 5;
         check(connection.next_reconnect_delay() == 1.0, "bounded reconnect retains its backoff");
         config.max_reconnect_attempts = 0;
@@ -314,8 +335,11 @@ int main()
     test_interrupted_deadline();
     event_base *clock_base = event_base_new();
     timeval immediately = {0, 0};
-    check(event_base_once(clock_base, -1, EV_TIMEOUT, test_cached_reconnect_deadline, clock_base, &immediately) == 0,
+    reconnect_clock_context clock_context = {clock_base, {0, 0}};
+    check(event_base_once(clock_base, -1, EV_TIMEOUT, test_cached_reconnect_deadline, &clock_context, &immediately) ==
+              0,
           "schedule cached-clock regression");
+    gettimeofday(&clock_context.before_dispatch, NULL);
     event_base_dispatch(clock_base);
     event_base_free(clock_base);
 
