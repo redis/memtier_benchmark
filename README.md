@@ -274,6 +274,15 @@ error reply counts as connection progress, so `--connection-stage-timeout`
 does not bound these retries. Use a finite `--max-retries` or `--test-time`
 to bound such a workload; requests still count only on success or exhaustion.
 
+With `--retry-on-error`, JSON `Totals` includes integer `Errors`, `Retry Attempts`
+and `Retried Ops` counters, including zeros. `Errors` exposes logical failures
+recorded by retry handling, including terminal errors, retry exhaustion and
+abandoned replays; it is distinct from `Connection Errors`.
+`Retry Attempts` counts retries queued for resend, which may later be canceled,
+and `Retried Ops` counts requests queued for retry at least once. These counters
+are totals for the run, without per-command attribution. They do not change
+request completion or exit-code behavior.
+
 ### Repeated runs (`--run-count`)
 
 With `--run-count N`, memtier reports the best and the worst run (by
@@ -281,7 +290,8 @@ Ops/sec), and an `AGGREGATED AVERAGE RESULTS (N runs)` section with per-run
 values:
 
 - The counts (`Count`, `Accumulated Latency`, `Connection Errors`,
-  `Unanswered requests` and the `Per-Key Misses` counts) are the mean over
+  `Unanswered requests`, the retry-enabled `Errors` / `Retry Attempts` /
+  `Retried Ops`, and the `Per-Key Misses` counts) are the mean over
   the runs, rounded to the nearest integer, so they keep the integer type of
   the other sections (29659 ops over 3 runs give `"Count": 9886`). A count
   that is not 0 over the series never rounds to 0: 1 connection error over 3
