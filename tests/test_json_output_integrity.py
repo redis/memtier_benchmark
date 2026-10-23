@@ -71,10 +71,10 @@ def _latency_bounds(derived, count):
     _validate_run_section does not check those. Keeping this side tight is what catches an
     average truncated to an integer, for low counts too.
 
-    AGGREGATED AVERAGE RESULTS is the exception: its averages are unweighted
-    means of the per-run averages, while Count and Accumulated are per-run
-    means of the totals (#703), so the invariant holds there only when every
-    run has the same count (as with --requests). See #671.
+    AGGREGATED AVERAGE RESULTS uses unrounded sample sums for its latency,
+    while Count and Accumulated are independently rounded per-run means
+    (#703). Their ratio can therefore differ, particularly at small counts;
+    this single-run rounding bound does not cover every aggregate row.
     """
     below = max(ABS_TOLERANCE_MS, REL_TOLERANCE * derived)
     return below, max(below, 1.0 / count + AVG_PRINT_ROUNDING_MS)
