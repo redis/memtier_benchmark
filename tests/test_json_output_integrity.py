@@ -91,7 +91,9 @@ def _assert_latency_consistent(env, section_name, section, integer_mean=True):
     """Check a single-run exact-sum row, never a grouped HDR or aggregate row."""
     count = section.get("Count", 0)
     env.assertTrue(count >= 0, message=f"{section_name}: negative Count={count}")
-    if count <= 0:
+    if count < 0:
+        return None
+    if count == 0:
         return (0, 0)  # Empty sections need no latency fields.
     fields = ("Latency", "Average Latency", "Accumulated Latency")
     for field in fields:
@@ -101,7 +103,8 @@ def _assert_latency_consistent(env, section_name, section, integer_mean=True):
     env.assertEqual(
         Decimal(str(section["Latency"])),
         Decimal(str(section["Average Latency"])),
-        message=f"{section_name}: Latency != Average Latency",
+        message=f"{section_name}: Latency ({section['Latency']}) != "
+        f"Average Latency ({section['Average Latency']})",
     )
     return _assert_sum_feasible(
         env, section_name, count, section["Accumulated Latency"], section["Average Latency"], integer_mean
@@ -132,7 +135,7 @@ def _assert_time_series_consistent(env, section_name, section):
 
 def _validate_run_section(env, run_label, run_section):
     """Validate built-in rows of one run (ALL STATS, BEST/WORST, RUN #N)."""
-    for sub in ("Sets", "Gets", "Totals"):
+    for sub in ("Sets", "Gets", "Waits", "Totals"):
         if sub not in run_section:
             continue
         _assert_latency_consistent(env, f"{run_label}.{sub}", run_section[sub], integer_mean=sub != "Totals")
@@ -148,7 +151,7 @@ def _assert_aggregated_latency_consistent(env, label, aggregate, runs):
     compare the aggregate's rounded double mean using the total sample count.
     Grouped arbitrary HDR rows are deliberately excluded from this oracle.
     """
-    for name in ("Sets", "Gets", "Totals"):
+    for name in ("Sets", "Gets", "Waits", "Totals"):
         if name not in aggregate:
             continue
         total_count, lower, upper = 0, 0, 0
@@ -1387,9 +1390,12 @@ def test_latency_feasibility_respects_calculation_and_zero(env):
 
 def test_latency_feasibility_rejects_invalid_values(env):
     valid = {"Count": 3, "Accumulated Latency": 2, "Latency": "0.666", "Average Latency": "0.666"}
-    for change in ({"Count": -1}, {"Accumulated Latency": -1},
-                   {"Latency": "-0.001", "Average Latency": "-0.001"},
-                   {"Latency": "Infinity", "Average Latency": "Infinity"}):
+    for change in (
+        {"Count": -1},
+        {"Accumulated Latency": -1},
+        {"Latency": "-0.001", "Average Latency": "-0.001"},
+        {"Latency": "Infinity", "Average Latency": "Infinity"},
+    ):
         counter = _FailureCounter()
         _assert_latency_consistent(counter, "invalid", dict(valid, **change))
         env.assertEqual(counter.failures, 1)
