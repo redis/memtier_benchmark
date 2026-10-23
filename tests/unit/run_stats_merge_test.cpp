@@ -133,6 +133,52 @@ static void test_small_weights_exact(benchmark_config *config)
     CHECK(b.get_duration_usec() == 1000);
 }
 
+static void test_retry_counters(benchmark_config *config)
+{
+    std::vector<run_stats> runs;
+    runs.reserve(2);
+    for (unsigned int i = 0; i < 2; i++) {
+        runs.emplace_back(config);
+        struct timeval start = at(epoch_usec);
+        struct timeval end = at(epoch_usec + 1000000);
+        runs.back().set_start_time(&start);
+        runs.back().set_end_time(&end);
+        runs.back().inc_error(i + 1);
+        for (unsigned int n = 0; n < i + 3; n++)
+            runs.back().inc_retry_attempt();
+        for (unsigned int n = 0; n < i + 2; n++)
+            runs.back().inc_retried_op();
+    }
+
+    totals fresh;
+    runs[0].summarize(fresh);
+    CHECK(fresh.m_errors == 1);
+    CHECK(fresh.m_retry_attempts == 3);
+    CHECK(fresh.m_retried_ops == 2);
+    runs[1].summarize(fresh);
+    CHECK(fresh.m_errors == 2);
+    CHECK(fresh.m_retry_attempts == 4);
+    CHECK(fresh.m_retried_ops == 3);
+
+    run_stats merged(config), average(config);
+    merged.merge(runs[0], 1);
+    merged.merge(runs[1], 2);
+    CHECK(merged.get_total_errors() == 3);
+    CHECK(merged.get_total_retry_attempts() == 7);
+    CHECK(merged.get_total_retried_ops() == 5);
+    // Stored counts stay summed; JSON applies the per-run mean when writing.
+    average.aggregate_average(runs);
+    CHECK(average.get_total_errors() == 3);
+    CHECK(average.get_total_retry_attempts() == 7);
+    CHECK(average.get_total_retried_ops() == 5);
+
+    run_stats empty(config);
+    empty.summarize(fresh);
+    CHECK(fresh.m_errors == 0);
+    CHECK(fresh.m_retry_attempts == 0);
+    CHECK(fresh.m_retried_ops == 0);
+}
+
 // Read the aggregate without calling summarize(), which rebuilds a single-run
 // summary from per-second data. Exercise the same worker -> run -> series path
 // as run_benchmark(), with exact samples rather than wall-clock timings.
@@ -207,6 +253,7 @@ int main()
 
     test_many_clients(&config);
     test_small_weights_exact(&config);
+    test_retry_counters(&config);
     for (unsigned int count : {0U, 10U, 100U}) {
         test_sample_weighted_latency(count, false);
         test_sample_weighted_latency(count, true);

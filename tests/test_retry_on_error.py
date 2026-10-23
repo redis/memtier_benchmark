@@ -654,11 +654,13 @@ def test_test_time_ends_when_every_request_is_retried(env):
             no_reply = _NO_REPLY_WARNING.findall(stderr)
             retrying = _STILL_RETRYING_WARNING.findall(stderr)
             with open("{0}/mb.json".format(config.results_dir)) as f:
-                runtime = json.load(f)["ALL STATS"]["Runtime"]
+                stats = json.load(f)["ALL STATS"]
+                runtime = stats["Runtime"]
             # The report covers --test-time, not the grace spent retrying.
             env.assertGreaterEqual(runtime["Total duration"], test_time * 1000, message=label)
             env.assertLess(runtime["Total duration"], test_time * 1000 + 200, message=label)
             if not retry:
+                env.assertFalse("Errors" in stats["Totals"], message=label)
                 env.assertEqual(no_reply + retrying, [], message=label)
                 env.assertGreaterEqual(elapsed, test_time, message=label)
                 env.assertLess(elapsed, test_time + 3, message="{}: did not end at --test-time".format(label))
@@ -685,6 +687,7 @@ def test_test_time_ends_when_every_request_is_retried(env):
             env.assertEqual(statuses.count("run-ended-before-resend"), held, message=label)
             env.assertEqual(statuses.count("no-reply-after-test-time"), unanswered, message=label)
             env.assertEqual(len(statuses), held + unanswered, message=label)
+            env.assertEqual(stats["Totals"]["Errors"], held + unanswered, message=label)
             totals = re.findall(r"errors (\d+) \(\+\d+\)", stderr)
             env.assertTrue(totals, message=label)
             if totals:
@@ -1053,6 +1056,11 @@ def test_dropped_replays_are_counted_as_errors(env):
     with open(failed_log) as f:
         rows = list(csv.reader(f))[1:]
     env.assertGreater(len(rows), 0, message="no request was dropped; the scenario was not hit")
+    with open(os.path.join(config.results_dir, "mb.json")) as f:
+        json_totals = json.load(f)["ALL STATS"]["Totals"]
+    env.assertEqual(json_totals["Errors"], len(rows))
+    env.assertEqual(json_totals["Retry Attempts"], 0)
+    env.assertEqual(json_totals["Retried Ops"], 0)
     # A request still held for retry when --test-time ends is abandoned as
     # "run-ended-before-resend"; it is counted the same way.
     env.assertEqual([row for row in rows if row[3] not in ("connection-dropped", "run-ended-before-resend")], [])
