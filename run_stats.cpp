@@ -2330,8 +2330,8 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
                              0,   // connection_errors (not tracked per command)
                              quantiles_list, m_get_latency_histogram, timestamps, get_stats);
         result_print_to_json(jsonhandler, "Waits", m_totals.m_wait_cmd.m_ops_sec, 0.0, 0.0, cluster_mode ? 0.0 : -1,
-                             cluster_mode ? 0.0 : -1, 0.0, 0.0, 0.0, 0.0, row_latency(0),
-                             row_ops(m_totals.m_wait_cmd.m_ops),
+                             cluster_mode ? 0.0 : -1, 0.0, 0.0, 0.0, m_totals.m_wait_cmd.m_latency,
+                             row_latency(m_totals.m_wait_cmd.m_total_latency), row_ops(m_totals.m_wait_cmd.m_ops),
                              0.0, // connection_errors_sec (not tracked per command)
                              0,   // connection_errors (not tracked per command)
                              quantiles_list, m_wait_latency_histogram, timestamps, wait_stats);
