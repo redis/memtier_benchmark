@@ -112,11 +112,13 @@ public:
         m_slot_to_shard_group[slot] = 1;
     }
     bool pool_empty(unsigned int conn_id) const { return m_key_index_pools[conn_id]->empty(); }
-    // Keep the monitor backpressure regression deterministic when #466
-    // restores the integration workload to only 1000 requests per client.
+    // Keep the cap regression deterministic regardless of the integration
+    // workload size or server latency.
     void check_monitor_backpressure()
     {
         check(m_connections.size() == 2, "two-shard backpressure fixture");
+        check(m_config->requests == 0 && m_config->pipeline == 1,
+              "backpressure fixture has no request limit and one in-flight request per shard");
         m_reqs_generated = 2;
         m_reqs_processed = 0;
         check(hold_pipeline(1), "producer pauses at the global in-flight budget");
