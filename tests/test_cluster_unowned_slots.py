@@ -22,7 +22,7 @@ def _slot(key):
 class _Node(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
-    def __init__(self, ranges, replica=False, heal=False, drop_after=0):
+    def __init__(self, ranges, replica=False, heal=False, drop_after=0, disconnect_on_drop=True):
         super().__init__(("127.0.0.1", 0), _Handler)
         self.root = self
         self.ranges = ranges
@@ -32,6 +32,7 @@ class _Node(socketserver.ThreadingTCPServer):
         self.heal = heal
         self.drop_after = drop_after
         self.dropped = False
+        self.disconnect_on_drop = disconnect_on_drop
         self.slots_calls = 0
         self.requests = []
         self.error_keys = []
@@ -115,7 +116,8 @@ class _Handler(socketserver.StreamRequestHandler):
                             if root.drop_after and not root.dropped and len(root.requests) == root.drop_after:
                                 root.dropped = True
                                 root.ranges = [(0, 3497), (3499, 16383)]
-                                return
+                                if root.disconnect_on_drop:
+                                    return
                             missing = any(
                                 not any(low <= _slot(key) <= high for low, high in root.ranges)
                                 for key in keys
@@ -393,3 +395,25 @@ def test_unowned_strict_secondary_mget_and_arbitrary_fail(env):
         env.assertEqual(node.requests, [])
         env.assertEqual(node.replica.requests, [])
         env.assertContains("cannot route a strict-secondary read", stderr)
+
+
+def test_full_map_discovers_slot_removal_without_disconnect(env):
+    for retry in ([], ["--retry-on-error", "--max-retries=1", "--retry-backoff-ms=10"]):
+        node = _Node([(0, 16383)], drop_after=5, disconnect_on_drop=False, heal=True)
+        stats, failures, _ = _run(env, node, ["--requests=20"] + retry)
+        env.assertTrue(node.dropped)
+        env.assertEqual(stats["Totals"]["Count"], 20)
+        env.assertEqual(len(node.requests), 21 if retry else 20)
+        env.assertEqual(len(node.error_keys), 1)
+        env.assertEqual(len(failures), 0 if retry else 1)
+        env.assertEqual(node.slots_calls, 2)
+        env.assertTrue(all(keys == (b"memtier-1",) for _, keys in node.requests))
+
+
+def test_unowned_slot_warning_is_once_per_process(env):
+    node = _hole()
+    stats, failures, stderr = _run(env, node, ["--requests=20", "--threads=2", "--clients=3"])
+    env.assertEqual(stats["Totals"]["Count"], 120)
+    env.assertEqual(len(node.requests), 120)
+    env.assertEqual(len(failures), 120)
+    env.assertEqual(stderr.count("has no owner; sending requests to a primary"), 1)

@@ -534,8 +534,8 @@ A partial `CLUSTER SLOTS` map is accepted. If a generated key has no slot
 owner, writes and reads that permit primary routing are sent to an available
 primary, preserving the key and letting Redis return its routing response.
 `CLUSTERDOWN` replies count as workload errors and follow the usual retry
-policy; while the map is partial they also trigger a topology refresh at
-most once per second per client. Strict `secondary` reads with `error` or
+policy; they also trigger a topology refresh at most once per second per
+client, including when a previously full map has become stale. Strict `secondary` reads with `error` or
 `queue` fallback fail the run because no authoritative replica can be chosen.
 
 Built-in read commands (GET, MGET) and arbitrary commands marked with

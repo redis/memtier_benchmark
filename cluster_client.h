@@ -142,8 +142,6 @@ protected:
     // workloads where writes succeed (primary is live) but every GET routing
     // attempt fails because no replica is available yet.
     unsigned int m_strict_no_route_attempts;
-    bool m_has_unowned_slots;
-    bool m_warned_unowned_slot;
     struct timeval m_last_clusterdown_refresh;
     // Monotonic timestamp (CLOCK_MONOTONIC seconds) of the last "all replicas
     // unreachable under read-only workload" warning emitted from
@@ -211,6 +209,7 @@ protected:
     bool slot_is_unowned(unsigned int slot) const;
     unsigned int fallback_primary_conn_id() const;
     bool check_unowned_slot(unsigned int slot, bool is_read);
+    bool requires_replica(bool is_read) const;
 
     // True if the request should be classified as a read for routing
     // purposes (see select_target_conn). Inspects request type plus

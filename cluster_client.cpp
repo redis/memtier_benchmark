@@ -133,8 +133,6 @@ cluster_client::cluster_client(client_group *group) :
         m_txn_wait_slot(-1),
         m_txn_multi_conn_id(-1),
         m_strict_no_route_attempts(0),
-        m_has_unowned_slots(false),
-        m_warned_unowned_slot(false),
         m_last_clusterdown_refresh(),
         m_last_no_replica_warning_ts(0)
 {
@@ -478,6 +476,8 @@ bool cluster_client::slot_is_unowned(unsigned int slot) const
 
 unsigned int cluster_client::fallback_primary_conn_id() const
 {
+    // Deliberately use the first connected primary: there is no owner to hash
+    // to, and the server supplies the authoritative routing response.
     unsigned int pending = UINT_MAX;
     for (const shard_group &group : m_shard_groups) {
         if (group.primary == NULL) continue;
@@ -488,10 +488,15 @@ unsigned int cluster_client::fallback_primary_conn_id() const
     return pending;
 }
 
+bool cluster_client::requires_replica(bool is_read) const
+{
+    return is_read && m_config->read_preference == rp_secondary && m_config->read_preference_fallback != rpf_primary;
+}
+
 bool cluster_client::check_unowned_slot(unsigned int slot, bool is_read)
 {
     if (!slot_is_unowned(slot)) return true;
-    if (is_read && m_config->read_preference == rp_secondary && m_config->read_preference_fallback != rpf_primary) {
+    if (requires_replica(is_read)) {
         // queue is reserved and currently has the documented error policy.
         // No replica can own a slot with no authoritative primary; do not
         // discard the generated key or silently send the read to a primary.
@@ -501,11 +506,11 @@ bool cluster_client::check_unowned_slot(unsigned int slot, bool is_read)
         event_base_loopbreak(m_event_base);
         return false;
     }
-    if (!m_warned_unowned_slot) {
+    static std::atomic<bool> warned(false);
+    if (!warned.exchange(true, std::memory_order_relaxed)) {
         benchmark_error_log("warning: cluster slot %u has no owner; sending requests to a primary for the server's "
                             "routing response.\n",
                             slot);
-        m_warned_unowned_slot = true;
     }
     return true;
 }
@@ -515,8 +520,7 @@ unsigned int cluster_client::select_target_conn(unsigned int slot, bool is_read)
     if (slot >= m_slot_to_shard_group.size()) return UINT_MAX;
     unsigned int gidx = m_slot_to_shard_group[slot];
     if (gidx >= m_shard_groups.size()) {
-        if (is_read && m_config->read_preference == rp_secondary && m_config->read_preference_fallback != rpf_primary)
-            return UINT_MAX;
+        if (requires_replica(is_read)) return UINT_MAX;
         return fallback_primary_conn_id();
     }
     shard_group &group = m_shard_groups[gidx];
@@ -1441,8 +1445,6 @@ bool cluster_client::handle_cluster_slots(unsigned int conn_id, protocol_respons
     // unconditional assign(), just deferred until here).
     m_slot_to_shard_group.swap(new_slot_map);
     m_shard_groups.swap(new_groups);
-    m_has_unowned_slots =
-        std::find(m_slot_to_shard_group.begin(), m_slot_to_shard_group.end(), UINT_MAX) != m_slot_to_shard_group.end();
 
     // Emit the one-shot human-readable topology summary now that the new
     // topology is committed (slot ranges and endpoint roles are only known
@@ -2254,7 +2256,7 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
                     // behavior where m_slot_to_shard was zero-initialized.
                     unsigned int pcid = slot_primary_conn_id(hslot);
                     if (slot_is_unowned(hslot)) {
-                        check_unowned_slot(hslot, false); // Transactions stay primary-pinned.
+                        check_unowned_slot(hslot, false); // Primary-pinned transactions: warning only, cannot fail.
                         pcid = fallback_primary_conn_id();
                     }
                     target_conn = (pcid == UINT_MAX) ? -1 : (int) pcid;
@@ -2740,7 +2742,7 @@ bool cluster_client::create_monitor_request_cluster(unsigned int command_index, 
             // read; the shard_group indirection is invisible at this site.
             unsigned int shard = slot_primary_conn_id(slot);
             if (slot_is_unowned(slot)) {
-                check_unowned_slot(slot, false); // Monitor replay retains primary routing.
+                check_unowned_slot(slot, false); // Primary-routed monitor replay: warning only, cannot fail.
                 shard = fallback_primary_conn_id();
                 if (shard < m_connections.size()) target_conn = shard;
             } else if (shard != UINT_MAX && shard < m_connections.size() &&
@@ -3198,10 +3200,10 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
     if (response->is_error()) {
         benchmark_debug_log("server %s handle response: %s\n", m_connections[conn_id]->get_readable_id(),
                             response->get_status());
-        // CLUSTERDOWN has no MOVED destination. Poll a partial map at most
-        // once per second while these replies persist, without flushing any
+        // CLUSTERDOWN has no MOVED destination. Even a previously full map
+        // can be stale. Poll at most once per second, without flushing any
         // staged keys. The setup ladder defers SLOTS while MULTI is open.
-        if (m_has_unowned_slots && strncmp(response->get_status(), "-CLUSTERDOWN ", 13) == 0 &&
+        if (strncmp(response->get_status(), "-CLUSTERDOWN ", 13) == 0 &&
             (m_last_clusterdown_refresh.tv_sec == 0 || ts_diff(m_last_clusterdown_refresh, timestamp) >= 1000000) &&
             m_connections[conn_id]->get_cluster_slots_state() == setup_done) {
             m_last_clusterdown_refresh = timestamp;
