@@ -1164,9 +1164,9 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
     m_totals.m_bytes_sec_rx /= all_stats.size();
     m_totals.m_bytes_sec_tx /= all_stats.size();
     m_totals.m_connection_errors_sec /= all_stats.size();
-    m_totals.m_latency /= all_stats.size();
+    m_totals.m_latency = m_totals.m_ops ? (double) m_totals.m_total_latency / m_totals.m_ops / 1000.0 : 0.0;
 
-    // Every value in the AVERAGE section is a per-run value (#703). The counts
+    // Counts in the AVERAGE section are per-run values (#703). The counts
     // (ops, accumulated latency, connection errors, unanswered requests, hits
     // and misses) stay summed here, and so does the duration set below.
     // Dividing a summed count by the summed duration, count /
@@ -2330,8 +2330,8 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
                              0,   // connection_errors (not tracked per command)
                              quantiles_list, m_get_latency_histogram, timestamps, get_stats);
         result_print_to_json(jsonhandler, "Waits", m_totals.m_wait_cmd.m_ops_sec, 0.0, 0.0, cluster_mode ? 0.0 : -1,
-                             cluster_mode ? 0.0 : -1, 0.0, 0.0, 0.0, 0.0, row_latency(0),
-                             row_ops(m_totals.m_wait_cmd.m_ops),
+                             cluster_mode ? 0.0 : -1, 0.0, 0.0, 0.0, m_totals.m_wait_cmd.m_latency,
+                             row_latency(m_totals.m_wait_cmd.m_total_latency), row_ops(m_totals.m_wait_cmd.m_ops),
                              0.0, // connection_errors_sec (not tracked per command)
                              0,   // connection_errors (not tracked per command)
                              quantiles_list, m_wait_latency_histogram, timestamps, wait_stats);
