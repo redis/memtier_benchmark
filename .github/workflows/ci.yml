@@ -265,6 +265,10 @@ jobs:
           - name: "Single Endpoint: TCP Plaintext"
             env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "0", VERBOSE: "1", PARALLELISM: "2" }
             tls: false
+          - name: "Single Endpoint: Unix socket reconnects"
+            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", UNIX: "1", TLS: "0", VERBOSE: "1",
+                   TEST: "test_reconnections.py", REDIS_PORT: "22001", REDIS_PASSWORD: "unix-ci-dummy" }
+            tls: false
           - name: "Single Endpoint: TCP TLS"
             env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", VERBOSE: "1", PARALLELISM: "2" }
             tls: true
@@ -372,6 +376,24 @@ jobs:
       env: ${{ matrix.test-config.env }}
       run: |
         ./tests/run_tests.sh
+
+    - name: Package Unix-socket failure logs
+      if: failure() && matrix.test-config.env.UNIX == '1'
+      run: |
+        # RLTest result directories contain colons, which upload-artifact rejects.
+        shopt -s nullglob
+        logs=(/tmp/memtier-unix.*)
+        if (( ${#logs[@]} )); then
+          tar -czf unix-socket-failure-logs.tar.gz "${logs[@]}"
+        fi
+
+    - name: Upload Unix-socket failure logs
+      if: failure() && matrix.test-config.env.UNIX == '1'
+      uses: actions/upload-artifact@v5
+      with:
+        name: unix-socket-failure-logs-${{ matrix.platform }}
+        path: unix-socket-failure-logs.tar.gz
+        retention-days: 7
 
   test-statsd:
     needs: build-ubuntu
