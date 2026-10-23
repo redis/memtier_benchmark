@@ -72,6 +72,23 @@ static void check(bool condition, const char *message)
 class transaction_client : public cluster_client
 {
 public:
+    // Keep the cap regression deterministic regardless of the integration
+    // workload size or server latency.
+    void check_monitor_backpressure()
+    {
+        check(m_connections.size() == 2, "two-shard backpressure fixture");
+        check(m_config->requests == 0 && m_config->pipeline == 1,
+              "backpressure fixture has no request limit and one in-flight request per shard");
+        m_reqs_generated = 2;
+        m_reqs_processed = 0;
+        check(hold_pipeline(1), "producer pauses at the global in-flight budget");
+        m_staged_monitor_commands[1].push({arbitrary_command("GET key"), 0, {}, 1});
+        check(!hold_pipeline(1), "a shard with staged monitor work may drain at the budget");
+        m_staged_monitor_commands[1].pop();
+        m_reqs_processed = 1;
+        check(!hold_pipeline(1), "one completed reply allows production to resume");
+        m_reqs_generated = m_reqs_processed = 0;
+    }
     explicit transaction_client(client_group *group) : cluster_client(group)
     {
         m_key_index_pools.push_back(new key_index_pool);
@@ -151,6 +168,42 @@ static void make_transaction_config(benchmark_config &config, arbitrary_command_
     config.key_pattern = "S:S";
     config.protocol = PROTOCOL_REDIS_DEFAULT;
     config.transaction = config.cluster_mode = true;
+}
+
+// Use a fresh client: transaction routing tests can end with a failed run,
+// pending requests or a pinned MULTI, which are independent hold conditions.
+static void check_monitor_backpressure()
+{
+    evutil_socket_t listener = socket(AF_INET, SOCK_STREAM, 0);
+    check(listener != static_cast<evutil_socket_t>(-1), "backpressure listener socket");
+    sockaddr_in address = {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t address_len = sizeof(address);
+    check(bind(listener, (sockaddr *) &address, sizeof(address)) == 0 && listen(listener, 4) == 0 &&
+              getsockname(listener, (sockaddr *) &address, &address_len) == 0,
+          "backpressure listener bound");
+    const std::string port = std::to_string(ntohs(address.sin_port));
+
+    arbitrary_command_list commands;
+    abstract_protocol *protocol = protocol_factory(PROTOCOL_REDIS_DEFAULT);
+    make_transaction_commands(commands, protocol);
+    benchmark_config config = {};
+    make_transaction_config(config, commands);
+    config.transaction = false;
+    config.pipeline = 1;
+    object_generator generator(commands.size());
+    generator.set_data_size_fixed(1);
+    generator.set_key_prefix("key-");
+    generator.set_key_range(1, 10);
+    {
+        client_group group(&config, protocol, &generator);
+        transaction_client client(&group);
+        client.route_slot_to_second_shard(protocol, key_slot("key-1"), port.c_str());
+        client.check_monitor_backpressure();
+    }
+    delete protocol;
+    evutil_closesocket(listener);
 }
 
 static void check_pin_release(unsigned long long first_key)
@@ -309,6 +362,7 @@ int main()
     WSADATA data;
     check(WSAStartup(MAKEWORD(2, 2), &data) == 0, "Winsock startup");
 #endif
+    check_monitor_backpressure();
     check_pin_release(1);
     check_pin_release(1221322);
     check_repin_routes_to_staged_owner(1);
