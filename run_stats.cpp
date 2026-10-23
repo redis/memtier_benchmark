@@ -1508,7 +1508,7 @@ void result_print_to_json(json_handler *jsonhandler, const char *type, double op
         jsonhandler->write_obj("Connection Errors", "%lld", connection_errors);
 
         const bool has_samples = hdr_total_count(latency_histogram) > 0;
-        const double avg_latency = latency;
+        const double avg_latency = has_samples ? latency : 0.0;
         const double min_latency =
             has_samples ? (hdr_min(latency_histogram) * 1.0) / (double) LATENCY_HDR_RESULTS_MULTIPLIER : 0.0;
         const double max_latency =
@@ -1560,7 +1560,7 @@ void result_print_to_json(json_handler *jsonhandler, const char *type, double op
             const double quantile = quantile_list[i];
             char quantile_header[32];
             format_percentile_key(quantile_header, sizeof(quantile_header), quantile, "p%.3f");
-            const double value = values[i] / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
+            const double value = has_samples ? values[i] / (double) LATENCY_HDR_RESULTS_MULTIPLIER : 0.0;
             jsonhandler->write_obj((char *) quantile_header, "%.3f", value);
         }
         jsonhandler->open_nesting("Histogram log format");
@@ -1955,14 +1955,23 @@ void run_stats::print_avg_latency_column(output_table &table,
     if (print_arbitrary_commands_results()) {
         if (aggregated != nullptr) {
             for (const auto &agg : *aggregated) {
-                column.elements.push_back(
-                    *el.init_double("%15.05f ", hdr_mean(agg.latency_hist) / (double) LATENCY_HDR_RESULTS_MULTIPLIER));
+                if (hdr_total_count(agg.latency_hist) > 0) {
+                    column.elements.push_back(*el.init_double("%15.05f ", hdr_mean(agg.latency_hist) /
+                                                                              (double) LATENCY_HDR_RESULTS_MULTIPLIER));
+                } else {
+                    column.elements.push_back(*el.init_str("%15s ", "---"));
+                }
                 hdr_add(m_totals_latency_histogram, agg.latency_hist);
             }
         } else {
             for (unsigned int i = 0; i < m_totals.m_ar_commands.size(); i++) {
-                column.elements.push_back(*el.init_double("%15.05f ", hdr_mean(m_ar_commands_latency_histograms[i]) /
-                                                                          (double) LATENCY_HDR_RESULTS_MULTIPLIER));
+                if (hdr_total_count(m_ar_commands_latency_histograms[i]) > 0) {
+                    column.elements.push_back(
+                        *el.init_double("%15.05f ", hdr_mean(m_ar_commands_latency_histograms[i]) /
+                                                        (double) LATENCY_HDR_RESULTS_MULTIPLIER));
+                } else {
+                    column.elements.push_back(*el.init_str("%15s ", "---"));
+                }
                 hdr_add(m_totals_latency_histogram, m_ar_commands_latency_histograms[i]);
             }
         }
@@ -1989,8 +1998,12 @@ void run_stats::print_avg_latency_column(output_table &table,
             column.elements.push_back(*el.init_str("%15s ", "---"));
         }
     }
-    column.elements.push_back(
-        *el.init_double("%15.05f ", hdr_mean(m_totals_latency_histogram) / (double) LATENCY_HDR_RESULTS_MULTIPLIER));
+    if (hdr_total_count(m_totals_latency_histogram) > 0) {
+        column.elements.push_back(*el.init_double("%15.05f ", hdr_mean(m_totals_latency_histogram) /
+                                                                  (double) LATENCY_HDR_RESULTS_MULTIPLIER));
+    } else {
+        column.elements.push_back(*el.init_str("%15s ", "---"));
+    }
 
     table.add_column(column);
 }
@@ -2029,7 +2042,7 @@ void run_stats::print_quantile_latency_columns(output_table &table, const std::v
     latency_percentiles query(quantiles);
     std::vector<std::vector<int64_t> > values;
     for (size_t row = 0; row < histograms.size(); ++row) {
-        if (!arbitrary && row + 1 < histograms.size() && hdr_total_count(histograms[row]) == 0)
+        if (hdr_total_count(histograms[row]) == 0)
             values.emplace_back(); // These rows display dashes, with no percentile lookup.
         else
             values.push_back(query.calculate(histograms[row]));

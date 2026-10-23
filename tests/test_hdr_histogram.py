@@ -176,7 +176,8 @@ def test_percentile_values_match_encoded_distribution_and_table(env):
                 percentiles = stats[name]["Percentile Latencies"]
                 actual = {float(key[1:]): value for key, value in percentiles.items() if key.startswith("p")}
                 source = merged if name == "Totals" else decoded[name]
-                expected = [_percentile(source, p) / 1000 for p in requested]
+                expected = [_percentile(source, p) / 1000 if stats[name]["Count"] else 0.0
+                            for p in requested]
                 env.assertEqual([actual[p] for p in requested], expected)
                 # The last field is KB/sec, preceded by configured percentile columns.
                 table_values = rows[name][-len(requested)-1:-1]
