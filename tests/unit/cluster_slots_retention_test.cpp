@@ -211,6 +211,9 @@ static void exercise(bool prior, int path)
         shard_connection &connection = *manager.get_connections()[1];
         abstract_protocol *protocol = connection.get_protocol();
         protocol->set_keep_value(prior);
+        connection.disconnect();
+        require(protocol->get_keep_value() == prior, "disconnect before any refresh preserves caller policy");
+        check_values(protocol, prior);
         peer server(base);
         for (int cycle = 0; cycle < 2; ++cycle) {
             connection.set_cluster_slots();
@@ -247,6 +250,13 @@ static void exercise(bool prior, int path)
             server.drain(connection);
             require(protocol->get_keep_value() == prior, "non-main reconnect preserves policy");
             connection.disconnect();
+            // Once the override has been released, a later caller can change
+            // policy. Further teardown must not restore the old saved value.
+            protocol->set_keep_value(!prior);
+            connection.disconnect();
+            require(protocol->get_keep_value() == !prior, "inactive override preserves later caller policy");
+            check_values(protocol, !prior);
+            protocol->set_keep_value(prior);
         }
     }
     delete prototype;
