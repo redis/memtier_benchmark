@@ -4751,6 +4751,9 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
                 run_id, failed_threads, (unsigned int) threads.size(),
                 cfg->requests > 0 ? "request count" : "test time");
         g_worker_failed = true;
+        // Keep this run's invalidity with its results, including BEST/WORST
+        // selection and the aggregate, rather than only in the process status.
+        stats.set_interrupted(true);
     }
 
     // -----------------------------------------------------------------

@@ -331,7 +331,10 @@ Exit status:
   otherwise **0**. An aborted run still counts in `AGGREGATED AVERAGE
   RESULTS`, which is then marked `"Interrupted": "true"`. BEST and WORST
   rank only complete runs when any exist; otherwise they rank the available
-  partial runs, retaining their `"Interrupted": "true"` flag. Per-run output
+  partial runs, retaining their `"Interrupted": "true"` flag. A run with a
+  failed worker is also marked `"Interrupted": "true"`, including failures
+  detected after a timed deadline. Ordinary command error replies do not
+  mark an otherwise completed run interrupted. Per-run output
   and the aggregate average still include all runs that happened.
 
 ### Output write errors
