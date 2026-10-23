@@ -282,6 +282,52 @@ int cluster_client::reconnect(unsigned int conn_id)
     return 1;
 }
 
+void cluster_client::reset_shard_queues(unsigned int conn_id)
+{
+    if (m_key_index_pools[conn_id]->size()) {
+        // Cross-shard reads that were routed to this connection (via
+        // create_request_for_other) push a (command_index, key_index) pair into
+        // m_key_index_pools[conn_id] AFTER client::create_request has
+        // already incremented m_reqs_generated (client.cpp:656 for GET, the
+        // arbitrary path at create_request_for_other for --command). Clearing
+        // the pool here without compensating leaves m_reqs_processed < m_reqs_generated
+        // permanently, so a --requests run hangs and a --test-time run
+        // mis-accounts pending in-flight. Compensate by n/2 (pairs).
+        // Defensive clamp guards against accounting underflow. Transaction
+        // lookahead stays in transaction state and never enters this queue.
+        key_index_pool empty_queue;
+        std::swap(*m_key_index_pools[conn_id], empty_queue);
+        {
+            const size_t n = empty_queue.size() / 2;
+            m_reqs_generated -= (m_reqs_generated >= n) ? n : m_reqs_generated;
+        }
+    }
+    {
+        std::queue<staged_monitor_cmd> empty_staged;
+        std::swap(m_staged_monitor_commands[conn_id], empty_staged);
+        // Commands in the cleared staged queue were already counted in m_reqs_generated at
+        // staging time. Compensate so a --requests run is not left waiting for responses
+        // that will never arrive.
+        // Defensive clamp: today entries in empty_staged are popped before m_reqs_generated
+        // is decremented so underflow cannot occur, but guard explicitly so a future
+        // refactor does not silently wrap to 2^64.  Matches the pattern at hold_pipeline.
+        {
+            const size_t n = empty_staged.size();
+            m_reqs_generated -= (m_reqs_generated >= n) ? n : m_reqs_generated;
+        }
+    }
+}
+
+void cluster_client::set_shard_role(shard_connection *sc, enum shard_role role)
+{
+    // A replica's queued reads were selected under the old role. The pooled
+    // drain bypasses routing, so retaining them on promotion could send strict
+    // secondary reads to a primary. Reset and compensate before changing role,
+    // including when its reconnect timer is pending or its socket is still live.
+    if (sc->is_replica() && role == role_primary) reset_shard_queues(sc->get_id());
+    sc->set_role(role);
+}
+
 bool cluster_client::connect_shard_connection(shard_connection *sc, char *address, char *port)
 {
     // Routed keys and monitor lines have already been selected and counted,
@@ -294,40 +340,7 @@ bool cluster_client::connect_shard_connection(shard_connection *sc, char *addres
     // caller sets the current role before reconnecting, including demotions.
     const bool same_endpoint = sc->get_address() != NULL && sc->get_port() != NULL &&
                                strcmp(sc->get_address(), address) == 0 && strcmp(sc->get_port(), port) == 0;
-    if (!same_endpoint || sc->is_replica()) {
-        if (m_key_index_pools[sc->get_id()]->size()) {
-            // Cross-shard reads that were routed to this connection (via
-            // create_request_for_other) push a (command_index, key_index) pair into
-            // m_key_index_pools[sc->get_id()] AFTER client::create_request has
-            // already incremented m_reqs_generated (client.cpp:656 for GET, the
-            // arbitrary path at create_request_for_other for --command). Clearing
-            // the pool here without compensating leaves m_reqs_processed < m_reqs_generated
-            // permanently, so a --requests run hangs and a --test-time run
-            // mis-accounts pending in-flight. Compensate by n/2 (pairs).
-            // Defensive clamp guards against accounting underflow. Transaction
-            // lookahead stays in transaction state and never enters this queue.
-            key_index_pool empty_queue;
-            std::swap(*m_key_index_pools[sc->get_id()], empty_queue);
-            {
-                const size_t n = empty_queue.size() / 2;
-                m_reqs_generated -= (m_reqs_generated >= n) ? n : m_reqs_generated;
-            }
-        }
-        {
-            std::queue<staged_monitor_cmd> empty_staged;
-            std::swap(m_staged_monitor_commands[sc->get_id()], empty_staged);
-            // Commands in the cleared staged queue were already counted in m_reqs_generated at
-            // staging time. Compensate so a --requests run is not left waiting for responses
-            // that will never arrive.
-            // Defensive clamp: today entries in empty_staged are popped before m_reqs_generated
-            // is decremented so underflow cannot occur, but guard explicitly so a future
-            // refactor does not silently wrap to 2^64.  Matches the pattern at hold_pipeline.
-            {
-                const size_t n = empty_staged.size();
-                m_reqs_generated -= (m_reqs_generated >= n) ? n : m_reqs_generated;
-            }
-        }
-    }
+    if (!same_endpoint || sc->is_replica()) reset_shard_queues(sc->get_id());
 
     // save address and port
     sc->set_address_port(address, port);
@@ -1166,7 +1179,7 @@ bool cluster_client::handle_cluster_slots(unsigned int conn_id, protocol_respons
                     // it as group.primary while it still presents replica-side
                     // setup state. Mirrors the set_role-before-connect order
                     // used for replicas below.
-                    sc->set_role(role_primary);
+                    set_shard_role(sc, role_primary);
                     connect_shard_connection(sc, addr, port);
                 }
 
@@ -1179,7 +1192,7 @@ bool cluster_client::handle_cluster_slots(unsigned int conn_id, protocol_respons
             sc = create_shard_connection(MAIN_CONNECTION->get_protocol());
             // Set the role before connect() so the setup ladder is armed at
             // connect time (primary path: no READONLY ladder).
-            sc->set_role(role_primary);
+            set_shard_role(sc, role_primary);
             connect_shard_connection(sc, addr, port);
         }
 
@@ -1188,7 +1201,7 @@ bool cluster_client::handle_cluster_slots(unsigned int conn_id, protocol_respons
         // set_role is idempotent; already-correct for newly-created and
         // reconnected primaries; covers the already-connected role-flip case
         // where the previous label was role_replica.
-        sc->set_role(role_primary);
+        set_shard_role(sc, role_primary);
 
         free(addr);
         free(port);
@@ -1344,7 +1357,7 @@ bool cluster_client::handle_cluster_slots(unsigned int conn_id, protocol_respons
                         // Nor is a replica closed because it rejected its
                         // setup under --read-preference primary (#737).
                         if (!rsc->is_reconnect_pending() && !rsc->is_setup_rejected_replica()) {
-                            rsc->set_role(role_replica);
+                            set_shard_role(rsc, role_replica);
                             connect_shard_connection(rsc, r_addr, r_port);
                         }
                     } else if (rsc->get_role() != role_replica) {
@@ -1363,7 +1376,7 @@ bool cluster_client::handle_cluster_slots(unsigned int conn_id, protocol_respons
                         // is_ready_for_reads() until the next ack, briefly
                         // dropping a stable replica out of read routing on
                         // every periodic topology refresh.
-                        rsc->set_role(role_replica);
+                        set_shard_role(rsc, role_replica);
                         rsc->rearm_readonly();
                     }
                     break;
@@ -1419,7 +1432,7 @@ bool cluster_client::handle_cluster_slots(unsigned int conn_id, protocol_respons
                 rsc = create_shard_connection(MAIN_CONNECTION->get_protocol());
                 // Set the role before connect() so the READONLY ladder is
                 // armed at connect time.
-                rsc->set_role(role_replica);
+                set_shard_role(rsc, role_replica);
                 connect_shard_connection(rsc, r_addr, r_port);
                 // Defensive invariant: a freshly created rsc cannot already
                 // be a primary in this reply (it was just allocated).

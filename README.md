@@ -550,8 +550,9 @@ routed keys stay queued across redials to the same primary endpoint, including
 repeated setup failures, without changing their generated-request counts. Replica
 redials, including a primary demoted to replica, keep the existing policy of
 clearing unsent queues and compensating their generated-request counts so other
-shards can continue. This does not guarantee request identity across replica
-redials.
+shards can continue. Promotion also clears previously staged replica work before
+changing its role, so strict-secondary reads cannot drain on the new primary.
+This does not guarantee request identity across replica redials or promotion.
 Strict `secondary` reads with `error` or `queue` fallback fail the run because no
 authoritative replica can be chosen, including for a transient hole discovered
 by a mid-run refresh.

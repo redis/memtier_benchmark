@@ -229,6 +229,8 @@ protected:
     void record_builtin_read_routing(request_type rt, bool from_replica);
 
     shard_connection *create_shard_connection(abstract_protocol *abs_protocol);
+    void reset_shard_queues(unsigned int conn_id);
+    void set_shard_role(shard_connection *sc, enum shard_role role);
     bool connect_shard_connection(shard_connection *sc, char *address, char *port);
     void handle_moved(unsigned int conn_id);
     void update_redirect_stats(struct timeval timestamp, request *req, protocol_response *response, bool moved,

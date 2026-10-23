@@ -45,6 +45,7 @@ class _Node(socketserver.ThreadingTCPServer):
         self.disconnect_on_drop = disconnect_on_drop
         self.slots_calls = 0
         self.requests = []
+        self.drop_request = None
         self.error_keys = []
         self.errors = []
         self.lock = threading.Lock()
@@ -138,6 +139,8 @@ class _Handler(socketserver.StreamRequestHandler):
                         keys = args[1:] if verb == b"MGET" else args[1:2]
                         with root.lock:
                             node.requests.append((verb, tuple(keys)))
+                            if node.drop_request is not None and node.drop_request(args):
+                                return
                             if root.drop_after and not root.dropped and len(root.requests) == root.drop_after:
                                 root.dropped = True
                                 root.ranges = [(0, 3497), (3499, 16383)]
@@ -650,3 +653,53 @@ def test_unowned_keys_survive_repeated_redial(env):
             [keys for _, keys in node.requests],
             [(f"{{memtier-1}}-{index}".encode(),) for index in range(1, 21)],
         )
+
+
+def test_replica_promotion_does_not_drain_secondary_reads(env):
+    """A former replica's staged GETs must not bypass routing after promotion."""
+    for pipeline in (4, 16, 64):
+        node = _Node([(0, 16383)], replica=True)
+        other = _Node([(0, 16383)])
+        other.root = node
+        node.extra = [other]
+        target = node.replica
+        promoted = False
+        primary_reads = []
+
+        def drop_first_read(args):
+            nonlocal promoted
+            if not promoted:
+                promoted = True
+                return True
+            primary_reads.append(tuple(args))
+            return False
+
+        def topology():
+            with node.lock:
+                node.slots_calls += 1
+                nodes = [target, node, other] if promoted else [node, target, other]
+            reply = b"*1\r\n*5\r\n:0\r\n:16383\r\n"
+            for server in nodes:
+                reply += b"*2\r\n$9\r\n127.0.0.1\r\n:" + str(server.server_address[1]).encode() + b"\r\n"
+            return reply
+
+        target.drop_request = drop_first_read
+        node.topology = target.topology = other.topology = topology
+        stats, _, _ = _run(
+            env,
+            node,
+            [
+                "--requests=1000",
+                "--pipeline=" + str(pipeline),
+                "--ratio=0:1",
+                "--read-preference=secondary",
+                "--read-preference-fallback=error",
+                "--reconnect-on-error",
+                "--max-reconnect-attempts=3",
+                "--reconnect-backoff-factor=0.5",
+            ],
+            timeout=15,
+        )
+        env.assertEqual(promoted, True, message="fixture must close and promote the selected replica")
+        env.assertEqual(stats["Totals"]["Count"], 1000)
+        env.assertEqual(primary_reads, [], message="staged strict-secondary reads reached a promoted primary")
