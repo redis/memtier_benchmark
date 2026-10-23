@@ -3,6 +3,21 @@
 set -euo pipefail
 
 build_jobs=${JOBS:-2}
+
+# Check the instrumentation itself: the HDR unit makes 4 * 10000 concurrent
+# atomic recordings plus 12 clamping calls. Non-atomic profile counters can
+# undercount these even when the unit passes, or make lcov reject the trace.
+make -j"$build_jobs" hdr_histogram_test
+find . -name '*.gcda' -delete
+./hdr_histogram_test
+make code-coverage-capture CODE_COVERAGE_IGNORE_PATTERN= \
+  CODE_COVERAGE_OUTPUT_FILE=coverage-threaded.info \
+  CODE_COVERAGE_OUTPUT_DIRECTORY=coverage-threaded
+awk -F, '$1 ~ /^FNDA:/ && $2 == "hdr_record_value_capped_atomic" {
+             seen=1; if ($1 != "FNDA:40012") bad=1
+         }
+         END { exit (!seen || bad) }' coverage-threaded.info
+
 make -j"$build_jobs" check
 ./memtier_benchmark --version
 

@@ -153,10 +153,34 @@ AC_DEFUN([AX_CODE_COVERAGE],[
 
 		dnl Build the code coverage flags
 		CODE_COVERAGE_CPPFLAGS="-DNDEBUG"
-		CODE_COVERAGE_CFLAGS="-O0 -g -fprofile-arcs -ftest-coverage"
-		CODE_COVERAGE_CXXFLAGS="-O0 -g -fprofile-arcs -ftest-coverage"
+		CODE_COVERAGE_CFLAGS="-O0 -g -fprofile-arcs -ftest-coverage -fprofile-update=atomic"
+		CODE_COVERAGE_CXXFLAGS="-O0 -g -fprofile-arcs -ftest-coverage -fprofile-update=atomic"
 		# Ask the compiler driver for its own runtime (GCC or Clang).
 		CODE_COVERAGE_LDFLAGS="--coverage"
+
+		dnl memtier and its tests update shared coverage counters from threads.
+		dnl Require atomic instrumentation, including its runtime, rather than
+		dnl silently accepting lost or inconsistent counts on unsupported targets.
+		ax_code_coverage_save_CFLAGS=$CFLAGS
+		ax_code_coverage_save_CXXFLAGS=$CXXFLAGS
+		CFLAGS="$CFLAGS --coverage -fprofile-update=atomic -Werror"
+		CXXFLAGS="$CXXFLAGS --coverage -fprofile-update=atomic -Werror"
+		AC_LANG_PUSH([C])
+		AC_MSG_CHECKING([for atomic C coverage instrumentation])
+		AC_LINK_IFELSE([AC_LANG_PROGRAM([], [])], [AC_MSG_RESULT([yes])], [
+			AC_MSG_RESULT([no])
+			AC_MSG_ERROR([code coverage requires C compiler support for -fprofile-update=atomic])
+		])
+		AC_LANG_POP([C])
+		AC_LANG_PUSH([C++])
+		AC_MSG_CHECKING([for atomic C++ coverage instrumentation])
+		AC_LINK_IFELSE([AC_LANG_PROGRAM([], [])], [AC_MSG_RESULT([yes])], [
+			AC_MSG_RESULT([no])
+			AC_MSG_ERROR([code coverage requires C++ compiler support for -fprofile-update=atomic])
+		])
+		AC_LANG_POP([C++])
+		CFLAGS=$ax_code_coverage_save_CFLAGS
+		CXXFLAGS=$ax_code_coverage_save_CXXFLAGS
 
 		AC_SUBST([CODE_COVERAGE_CPPFLAGS])
 		AC_SUBST([CODE_COVERAGE_CFLAGS])
