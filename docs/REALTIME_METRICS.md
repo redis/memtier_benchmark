@@ -107,8 +107,15 @@ The following metrics are sent approximately every 1 second during the benchmark
 
 | Metric | StatsD type | Graphite path | Description |
 |--------|-------------|---------------|-------------|
-| `connections` | gauge | `stats.gauges.<prefix>.<label>.connections` | Active connection count (`--clients` × active thread count) |
+| `connections` | gauge | `stats.gauges.<prefix>.<label>.connections` | Configured clients per unfinished worker × unfinished worker count; uses the scheduled count in staircase mode |
 | `connection_errors` | gauge | `stats.gauges.<prefix>.<label>.connection_errors` | Cumulative connection error count. **Only sent when the count is > 0** and not zeroed at run end — stale values may linger in Graphite after errors clear. Protocol-level command errors are not tracked here. |
+
+The `connections` gauge includes clients waiting for setup or reconnect, and clients
+that finished while their worker thread is still running. In staircase mode it
+uses the scheduled client count per worker; actual activation and metric sampling
+can occur at different times. On normal completion the gauge reaches zero when
+no workers remain. An interrupted StatsD run can leave its last sampled value;
+Prometheus explicitly publishes zero connections and threads at run end.
 
 ### Progress
 
@@ -180,7 +187,7 @@ The included dashboard provides:
 - **Operations per Second** - Current and average ops/sec over time
 - **Latency** - Current and average latency in milliseconds
 - **Throughput** - Current and average bytes/sec
-- **Connections** - Active connection count
+- **Connections** - Configured client concurrency in unfinished worker threads
 - **Progress** - Benchmark completion percentage
 - **Connection Errors** - Error count indicator
 
@@ -286,7 +293,8 @@ differences from the StatsD names above:
 | `memtier_errors_total` | counter | — | Requests that ultimately failed: errors after retries are exhausted, or requests given up on without a reply under `--retry-on-error`. |
 | `memtier_connection_errors_total` | counter | `connection_errors` | Accumulated across runs (StatsD reports the raw per-run value). |
 | `memtier_retry_attempts_total` / `memtier_retried_ops_total` | counter | — | Nonzero only with `--retry-on-error`. |
-| `memtier_connections` / `memtier_threads` | gauge | `connections` | |
+| `memtier_connections` | gauge | `connections` | Configured client concurrency; see [Connections and Errors](#connections-and-errors). |
+| `memtier_threads` | gauge | — | Worker threads that have not finished, including those waiting for setup or reconnect. |
 | `memtier_run` / `memtier_configured_runs` | gauge | — | Current run (1-based; 0 before the first run) and `--run-count`. |
 | `memtier_config_test_time_seconds` | gauge | — | Configured `--test-time` (0 when bounded by `--requests`). |
 | `memtier_latency_seconds` | histogram | `latency_ms` family | Seconds, not milliseconds; see the accuracy notes below. |
@@ -337,6 +345,10 @@ is the operator's responsibility (there is no authentication on the endpoint).
 HTTP hardening rejects non-GET methods, oversized headers, and unknown paths.
 
 ### Mode interactions
+
+The connection gauges count logical clients. In cluster mode each client may open
+several physical connections to primaries and replicas; the gauges are not
+multiplied by the shard or replica count.
 
 - **`--cluster-mode`** is supported. Counters are cluster-wide totals summed
   across all shard connections; the exporter binds its own TCP socket
