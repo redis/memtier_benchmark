@@ -247,7 +247,8 @@ void totals_cmd::aggregate_average(size_t stats_size)
     m_bytes_sec /= stats_size;
     m_bytes_sec_rx /= stats_size;
     m_bytes_sec_tx /= stats_size;
-    m_latency /= stats_size;
+    // Latency weights each completed operation equally, including across runs.
+    m_latency = m_ops ? (double) m_total_latency / m_ops / 1000.0 : 0.0;
 }
 
 void totals_cmd::summarize(const one_sec_cmd_stats &other, unsigned long long test_duration_usec)
