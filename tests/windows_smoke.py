@@ -55,12 +55,6 @@ def run_memtier(*args):
                           timeout=RUN_TIMEOUT, universal_newlines=True)
 
 
-def unused_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
-
-
 class TLSCommandSink(RESPCommandSink):
     def __init__(self, context):
         super().__init__()
@@ -177,13 +171,22 @@ class WindowsSmokeTests(unittest.TestCase):
         self.assertIn("CPU Stats", stats)
 
     def test_closed_port_fails_without_crashing(self):
-        result = run_memtier("-s", "127.0.0.1", "-p", str(unused_port()), "-t", "1", "-c", "1", "-n", "10",
-                             "--connection-stage-timeout=3", "--hide-histogram")
+        # Reserve the port without listening, so another process cannot take
+        # the endpoint between choosing it and the client's connect attempt.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            result = run_memtier("-s", "127.0.0.1", "-p", str(probe.getsockname()[1]),
+                                 "-t", "1", "-c", "1", "-n", "10",
+                                 "--connection-stage-timeout=3", "--hide-histogram")
         code = result.returncode & 0xFFFFFFFF
         self.assertNotEqual(code, 0, result.stderr)
         self.assertLess(code, NTSTATUS_ERROR_MIN, "crashed: 0x%08x" % code)
         self.assertNotIn("BUG REPORT", result.stderr)
-        self.assertIn("Connection error:", result.stderr)
+        # The startup guard can expire before Windows reports the socket
+        # error. Both paths must still exit unsuccessfully without crashing.
+        if "Connection error:" not in result.stderr:
+            self.assertIn("aborting after 3 seconds of connection-stage failures "
+                          "(last error: no response from server during setup)", result.stderr)
 
     @unittest.skipUnless(sys.platform == "win32", "detached CRT handles are Windows-specific")
     def test_detached_process_writes_requested_output(self):
