@@ -377,12 +377,22 @@ jobs:
       run: |
         ./tests/run_tests.sh
 
+    - name: Package Unix-socket failure logs
+      if: failure() && matrix.test-config.env.UNIX == '1'
+      run: |
+        # RLTest result directories contain colons, which upload-artifact rejects.
+        shopt -s nullglob
+        logs=(/tmp/memtier-unix.*)
+        if (( ${#logs[@]} )); then
+          tar -czf unix-socket-failure-logs.tar.gz "${logs[@]}"
+        fi
+
     - name: Upload Unix-socket failure logs
       if: failure() && matrix.test-config.env.UNIX == '1'
       uses: actions/upload-artifact@v5
       with:
         name: unix-socket-failure-logs-${{ matrix.platform }}
-        path: /tmp/memtier-unix.*
+        path: unix-socket-failure-logs.tar.gz
         retention-days: 7
 
   test-statsd:

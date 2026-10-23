@@ -1732,13 +1732,24 @@ def test_accept_then_close_peer_with_retry_on_error_ends_at_test_time(env):
     """
     env.skipOnCluster()
     test_time = 4
-    rc, elapsed, stderr_content, stdout_content, _ = _run_until_server_gone(
-        env, ["--retry-on-error"], test_time, accept_after_stop=True)
+    # Keep replies in flight before the close: otherwise an idle rate-limited
+    # client can finish at its deadline without entering the replay path.
+    rc, elapsed, stderr_content, stdout_content, results = _run_until_server_gone(
+        env, ["--retry-on-error", "--pipeline=8"], test_time,
+        script=[(1.0, lambda p: p.freeze()),
+                (2.0, lambda p: p.stop(keep_accepting=True))])
     env.assertIsNotNone(rc, message="memtier kept reconnecting past --test-time")
     env.assertEqual(rc, 0, message="a run that reached --test-time must end normally")
     env.assertTrue("run is over, not reconnecting" in stderr_content,
                    message="the run did not stop reconnecting at --test-time")
+    env.assertTrue("held for retry when the run ended were not resent" in stderr_content,
+                   message="the test did not leave requests held for replay")
     env.assertTrue("Totals" in stdout_content, message="the report was not printed")
+    env.assertIsNotNone(results, message="no JSON report")
+    if results is not None:
+        env.assertGreater(results["ALL STATS"]["Totals"]["Count"], 0)
+        env.assertGreaterEqual(results["ALL STATS"]["Totals"]["Connection Errors"], 4)
+        env.assertGreaterEqual(results["ALL STATS"]["Runtime"]["Total duration"], test_time * 1000 - 1)
     env.assertLess(elapsed, test_time + 4 + _SLACK,
                    message="run took {:.1f}s for --test-time={}".format(elapsed, test_time))
 
