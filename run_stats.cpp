@@ -1164,9 +1164,9 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
     m_totals.m_bytes_sec_rx /= all_stats.size();
     m_totals.m_bytes_sec_tx /= all_stats.size();
     m_totals.m_connection_errors_sec /= all_stats.size();
-    m_totals.m_latency /= all_stats.size();
+    m_totals.m_latency = m_totals.m_ops ? (double) m_totals.m_total_latency / m_totals.m_ops / 1000.0 : 0.0;
 
-    // Every value in the AVERAGE section is a per-run value (#703). The counts
+    // Counts in the AVERAGE section are per-run values (#703). The counts
     // (ops, accumulated latency, connection errors, unanswered requests, hits
     // and misses) stay summed here, and so does the duration set below.
     // Dividing a summed count by the summed duration, count /
@@ -2191,6 +2191,10 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
                 const std::string &command_name = row_keys[a];
 
                 double avg_latency = hdr_mean(agg.latency_hist) / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
+                if (m_averaged_runs > 0) {
+                    // Match per-line and Totals JSON using unrounded sample sums.
+                    avg_latency = agg.stats.m_ops ? (double) agg.stats.m_total_latency / agg.stats.m_ops / 1000.0 : 0.0;
+                }
 
                 unsigned long long sum_hits = 0;
                 unsigned long long sum_misses = 0;

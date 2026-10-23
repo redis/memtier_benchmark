@@ -26,6 +26,7 @@
 #endif
 
 #include <assert.h>
+#include <cmath>
 #include <stdio.h>
 #include <stdlib.h>
 #include "cluster_client.h"
@@ -132,6 +133,72 @@ static void test_small_weights_exact(benchmark_config *config)
     CHECK(b.get_duration_usec() == 1000);
 }
 
+// Read the aggregate without calling summarize(), which rebuilds a single-run
+// summary from per-second data. Exercise the same worker -> run -> series path
+// as run_benchmark(), with exact samples rather than wall-clock timings.
+class inspected_run_stats : public run_stats
+{
+public:
+    explicit inspected_run_stats(benchmark_config *config) : run_stats(config) {}
+    const totals &result() const { return m_totals; }
+};
+
+static void test_sample_weighted_latency(unsigned int second_count, bool arbitrary, unsigned int first_count = 100)
+{
+    arbitrary_command_list commands;
+    if (arbitrary) {
+        commands.add_command(arbitrary_command("SET a b"));
+        commands.add_command(arbitrary_command("GET a"));
+    }
+    benchmark_config config = {};
+    config.arbitrary_commands = &commands;
+    std::vector<run_stats> runs;
+    runs.reserve(2);
+    for (unsigned int run = 0; run < 2; ++run) {
+        runs.emplace_back(&config);
+        for (unsigned int client = 0; client < 2; ++client) {
+            run_stats worker(&config);
+            timeval start = at(epoch_usec), sample = at(epoch_usec + 100000);
+            // Unequal durations ensure latency weighting cannot accidentally
+            // use elapsed time, while rates retain their per-run means.
+            timeval end = at(epoch_usec + (run + 1) * 1000000);
+            worker.set_start_time(&start);
+            const unsigned int count = run ? second_count : first_count;
+            const unsigned int latency = run ? 9001 : 1000;
+            for (unsigned int i = client; i < count; i += 2) {
+                if (arbitrary) {
+                    worker.update_arbitrary_op(&sample, 5, 5, latency, 0);
+                    worker.update_arbitrary_op(&sample, 5, 5, latency * 2, 1);
+                } else {
+                    worker.update_set_op(&sample, 5, 5, latency);
+                    worker.update_get_op(&sample, 5, 5, latency * 2, 1, 0);
+                    worker.update_wait_op(&sample, latency * 3);
+                }
+            }
+            worker.set_end_time(&end);
+            runs.back().merge(worker, client + 1);
+        }
+    }
+    inspected_run_stats average(&config);
+    average.aggregate_average(runs);
+    const totals &t = average.result();
+    const double expected = first_count + second_count
+                                ? (first_count * 1000.0 + second_count * 9001.0) / (first_count + second_count) / 1000.0
+                                : 0.0;
+    const double multiplier = arbitrary ? 1.5 : 2.0;
+    CHECK(std::fabs(t.m_latency - expected * multiplier) < 1e-9);
+    CHECK(t.m_ops == (first_count + second_count) * (arbitrary ? 2 : 3));
+    CHECK(std::fabs(t.m_ops_sec - (first_count + second_count / 2.0) * (arbitrary ? 2 : 3) / 2) < 1e-9);
+    if (arbitrary) {
+        CHECK(std::fabs(t.m_ar_commands[0].m_latency - expected) < 1e-9);
+        CHECK(std::fabs(t.m_ar_commands[1].m_latency - expected * 2) < 1e-9);
+    } else {
+        CHECK(std::fabs(t.m_set_cmd.m_latency - expected) < 1e-9);
+        CHECK(std::fabs(t.m_get_cmd.m_latency - expected * 2) < 1e-9);
+        CHECK(std::fabs(t.m_wait_cmd.m_latency - expected * 3) < 1e-9);
+    }
+}
+
 int main()
 {
     arbitrary_command_list commands;
@@ -140,6 +207,12 @@ int main()
 
     test_many_clients(&config);
     test_small_weights_exact(&config);
+    for (unsigned int count : {0U, 10U, 100U}) {
+        test_sample_weighted_latency(count, false);
+        test_sample_weighted_latency(count, true);
+    }
+    test_sample_weighted_latency(0, false, 0);
+    test_sample_weighted_latency(0, true, 0);
     if (failures) {
         fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;
