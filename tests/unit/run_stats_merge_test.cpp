@@ -133,6 +133,55 @@ static void test_small_weights_exact(benchmark_config *config)
     CHECK(b.get_duration_usec() == 1000);
 }
 
+// #463: averaging seconds and microseconds separately turns a 200 us
+// interval across a second boundary into 500200 us. Exercise the production
+// helper through merge(), without exposing an internal function for tests.
+static void test_submillisecond_merge(benchmark_config *config)
+{
+    run_stats merged(config);
+    for (unsigned int i = 0; i < 2; ++i) {
+        run_stats client_stats(config);
+        timeval start = at(1700999900LL + i * 150);
+        timeval end = at(1701000100LL + i * 150);
+        client_stats.set_start_time(&start);
+        client_stats.update_set_op(&end, 5, 5, 200);
+        client_stats.set_end_time(&end);
+        merged.merge(client_stats, i + 1);
+    }
+    CHECK(usec(merged.get_start_time()) == 1700999975LL);
+    CHECK(merged.get_duration_usec() == 200);
+    totals summary;
+    merged.summarize(summary);
+    CHECK(summary.m_ops == 2);
+    CHECK(std::fabs(summary.m_ops_sec - 10000.0) < 1e-9);
+
+    // Arithmetic progression: at every weight 2..16 the exact mean is
+    // halfway between the first and last client, even across the boundary.
+    run_stats series(config);
+    for (unsigned int i = 0; i < 16; ++i) {
+        run_stats client_stats(config);
+        timeval start = at(1700999900LL + i * 32);
+        timeval end = at(1701000100LL + i * 32);
+        client_stats.set_start_time(&start);
+        client_stats.set_end_time(&end);
+        series.merge(client_stats, i + 1);
+        CHECK(usec(series.get_start_time()) == 1700999900LL + i * 16);
+        CHECK(series.get_duration_usec() == 200);
+    }
+
+    // A one-microsecond difference contributes less than one microsecond
+    // at each later weight. Rounding the start must not erase the duration.
+    long long offsets[16] = {};
+    for (unsigned int i = 1; i < 16; ++i)
+        offsets[i] = 1;
+    for (unsigned int n = 2; n <= 16; ++n) {
+        run_stats tiny(config);
+        merge_runs(config, tiny, offsets, n, 1);
+        CHECK(usec(tiny.get_start_time()) == epoch_usec);
+        CHECK(tiny.get_duration_usec() == 1);
+    }
+}
+
 static void test_retry_counters(benchmark_config *config)
 {
     std::vector<run_stats> runs;
@@ -253,6 +302,7 @@ int main()
 
     test_many_clients(&config);
     test_small_weights_exact(&config);
+    test_submillisecond_merge(&config);
     test_retry_counters(&config);
     for (unsigned int count : {0U, 10U, 100U}) {
         test_sample_weighted_latency(count, false);

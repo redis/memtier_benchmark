@@ -16,7 +16,8 @@ def _add_auth_args(benchmark_specs, env):
     """--authenticate with the env's password (e.g. --oss_password), so
     memtier's clients get a session the kills below can target."""
     password = env.getOSSMasterNodesConnectionList()[0].connection_pool.connection_kwargs.get("password")
-    if password:
+    if password and not any(arg == "--authenticate" or arg.startswith("--authenticate=")
+                            for arg in benchmark_specs["args"]):
         benchmark_specs["args"].append("--authenticate=" + password)
 
 
@@ -786,6 +787,7 @@ def _run_with_mid_run_client_kill(env, extra_args, test_time, kill_after):
         ] + extra_args,
     }
     addTLSArgs(benchmark_specs, env)
+    _add_auth_args(benchmark_specs, env)
 
     config = get_default_memtier_config(threads=2, clients=2, requests=None, test_time=test_time)
     master_nodes_list = env.getMasterNodesList()
@@ -933,6 +935,7 @@ def test_dropped_in_flight_requests_do_not_stall_client(env):
     ]
     benchmark_specs = {"name": env.testName, "args": args}
     addTLSArgs(benchmark_specs, env)
+    _add_auth_args(benchmark_specs, env)
 
     config = get_default_memtier_config(threads=1, clients=1, requests=None, test_time=test_time)
     master_nodes_list = env.getMasterNodesList()
@@ -1147,28 +1150,49 @@ def test_cluster_shard_dial_failure_honors_max_reconnect_attempts(env):
     env.assertNotEqual(proc.returncode, 0)
 
 
-def _clear_requirepass(conn, passwords):
-    """Remove requirepass so later tests on this server can connect. The pool
-    may open a new connection, which then has to authenticate first."""
+def _restore_requirepass(conn, passwords):
+    """Restore the runner's password after a test changes it. The pool may
+    open a new connection, which then has to authenticate first."""
     import redis
 
+    original_password = conn.connection_pool.connection_kwargs.get("password") or ""
+
     try:
-        conn.execute_command("CONFIG", "SET", "requirepass", "")
+        conn.execute_command("CONFIG", "SET", "requirepass", original_password)
         return
     except redis.exceptions.AuthenticationError:
         pass
     kwargs = dict(conn.connection_pool.connection_kwargs)
     for password in passwords:
         kwargs["password"] = password
-        client = redis.Redis(connection_class=conn.connection_pool.connection_class, **kwargs)
+        pool = redis.ConnectionPool(connection_class=conn.connection_pool.connection_class, **kwargs)
+        client = redis.Redis(connection_pool=pool)
         try:
-            client.execute_command("CONFIG", "SET", "requirepass", "")
+            client.execute_command("CONFIG", "SET", "requirepass", original_password)
             return
         except redis.exceptions.AuthenticationError:
             continue
         finally:
             client.close()
-    raise AssertionError("could not clear requirepass")
+            pool.disconnect()
+    raise AssertionError("could not restore requirepass")
+
+
+def test_password_restored_after_admin_reconnect(env):
+    """Password-change cleanup must also work after the admin pool disconnects."""
+    env.skipOnCluster()
+    conn = env.getOSSMasterNodesConnectionList()[0]
+    original = conn.connection_pool.connection_kwargs.get("password") or ""
+    temporary = "reconnect-cleanup-dummy"
+    conn.execute_command("CONFIG", "SET", "requirepass", temporary)
+    try:
+        conn.connection_pool.disconnect()
+        _restore_requirepass(conn, (temporary,))
+        env.assertTrue(conn.ping())
+        env.assertEqual(conn.config_get("requirepass")["requirepass"], original)
+    finally:
+        # Preserve the runner configuration even if an assertion fails.
+        _restore_requirepass(conn, (temporary,))
 
 
 def _run_with_mid_run_password_change(env, extra_args, test_time, rate_limit=True):
@@ -1215,7 +1239,7 @@ def _run_with_mid_run_password_change(env, extra_args, test_time, rate_limit=Tru
                     proc.kill()
                 proc.wait(timeout=10)
     finally:
-        _clear_requirepass(conn, ("other-625", "pw-625"))
+        _restore_requirepass(conn, ("other-625", "pw-625"))
     elapsed = time.monotonic() - started
     with open(stderr_path) as f:
         stderr_content = f.read()
@@ -1460,6 +1484,7 @@ def _run_until_server_gone(env, extra_args, test_time, requests=None, stop_after
         "args": ["--reconnect-on-error", "--rate-limiting=200", "--hide-histogram"] + extra_args,
     }
     addTLSArgs(benchmark_specs, env)
+    _add_auth_args(benchmark_specs, env)
     config = get_default_memtier_config(threads=threads, clients=clients, requests=requests, test_time=test_time)
     node = dict(env.getMasterNodesList()[0])
     if env.isUnixSocket():
@@ -1707,13 +1732,24 @@ def test_accept_then_close_peer_with_retry_on_error_ends_at_test_time(env):
     """
     env.skipOnCluster()
     test_time = 4
-    rc, elapsed, stderr_content, stdout_content, _ = _run_until_server_gone(
-        env, ["--retry-on-error"], test_time, accept_after_stop=True)
+    # Keep replies in flight before the close: otherwise an idle rate-limited
+    # client can finish at its deadline without entering the replay path.
+    rc, elapsed, stderr_content, stdout_content, results = _run_until_server_gone(
+        env, ["--retry-on-error", "--pipeline=8"], test_time,
+        script=[(1.0, lambda p: p.freeze()),
+                (2.0, lambda p: p.stop(keep_accepting=True))])
     env.assertIsNotNone(rc, message="memtier kept reconnecting past --test-time")
     env.assertEqual(rc, 0, message="a run that reached --test-time must end normally")
     env.assertTrue("run is over, not reconnecting" in stderr_content,
                    message="the run did not stop reconnecting at --test-time")
+    env.assertTrue("held for retry when the run ended were not resent" in stderr_content,
+                   message="the test did not leave requests held for replay")
     env.assertTrue("Totals" in stdout_content, message="the report was not printed")
+    env.assertIsNotNone(results, message="no JSON report")
+    if results is not None:
+        env.assertGreater(results["ALL STATS"]["Totals"]["Count"], 0)
+        env.assertGreaterEqual(results["ALL STATS"]["Totals"]["Connection Errors"], 4)
+        env.assertGreaterEqual(results["ALL STATS"]["Runtime"]["Total duration"], test_time * 1000 - 1)
     env.assertLess(elapsed, test_time + 4 + _SLACK,
                    message="run took {:.1f}s for --test-time={}".format(elapsed, test_time))
 
@@ -1803,7 +1839,7 @@ def test_setup_rejected_then_server_gone_fails_the_run(env):
             # server is gone for the next ones.
             script=[(1.5, change_password), (3.0, lambda p: p.stop())])
     finally:
-        _clear_requirepass(conn, ("other-656", "pw-656"))
+        _restore_requirepass(conn, ("other-656", "pw-656"))
     env.assertTrue("authentication failed" in stderr_content, message="AUTH was not rejected on reconnect")
     env.assertEqual(rc, 1, message="a run whose setup was rejected before the server went away must fail")
     env.assertTrue("Connection setup failed earlier and the run is over" in stderr_content,
@@ -1841,7 +1877,7 @@ def test_setup_recovered_then_server_gone_ends_normally(env):
                         (2.5, lambda p: conn.execute_command("CONFIG", "SET", "requirepass", "pw-656")),
                         (4.5, lambda p: p.stop())])
         finally:
-            _clear_requirepass(conn, ("other-656", "pw-656"))
+            _restore_requirepass(conn, ("other-656", "pw-656"))
         label = " ".join(extra) or "default workload"
         env.assertTrue("authentication failed" in stderr_content,
                        message="{}: AUTH was not rejected on reconnect".format(label))
@@ -1981,6 +2017,7 @@ def test_merged_duration_averages_all_threads(env):
         ],
     }
     addTLSArgs(benchmark_specs, env)
+    _add_auth_args(benchmark_specs, env)
     config = get_default_memtier_config(threads=4, clients=1, requests=requests)
     add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
     test_dir = tempfile.mkdtemp()
