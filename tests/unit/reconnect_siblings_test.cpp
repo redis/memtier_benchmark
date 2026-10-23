@@ -21,6 +21,7 @@
 #endif
 
 #include <assert.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -165,6 +166,90 @@ static void test_sibling_with_replay(const char *path)
 #endif
 }
 
+// Interrupts finalize after the worker has joined. Use exact timestamps to
+// exercise the deadline boundary without depending on scheduler timing.
+static void test_interrupted_deadline()
+{
+    arbitrary_command_list commands;
+    benchmark_config config = {};
+    config.arbitrary_commands = &commands;
+    config.clients = config.threads = 1;
+    config.key_pattern = "S:S";
+    config.protocol = PROTOCOL_REDIS_DEFAULT;
+    config.test_time = 2;
+    config.benchmark_start_time = {100, 750000};
+    event_base *base = event_base_new();
+    abstract_protocol *protocol = protocol_factory(config.protocol);
+    struct
+    {
+        timeval end;
+        unsigned long long duration;
+        const char *name;
+    } cases[] = {
+        {{100, 749999}, 0, "interrupt before start clamps to start"},
+        {{101, 250000}, 500000, "early interrupt keeps its actual duration"},
+        {{102, 750000}, 2000000, "interrupt exactly at deadline"},
+        {{102, 750001}, 2000000, "interrupt one microsecond after deadline"},
+        {{105, 250000}, 2000000, "interrupt during drain caps at deadline"},
+    };
+    for (unsigned int i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        object_generator generator;
+        client manager(base, &config, protocol, &generator);
+        manager.set_start_time_at(&config.benchmark_start_time);
+        manager.set_end_time_interrupted(&cases[i].end);
+        check(manager.get_stats()->get_duration_usec() == cases[i].duration, cases[i].name);
+        check(manager.end_time_set(), "interrupt finalizes the client");
+    }
+    struct timeval late = {105, 250000};
+    {
+        object_generator generator;
+        client manager(base, &config, protocol, &generator);
+        manager.set_end_time_interrupted(&late);
+        check(manager.get_stats()->get_duration_usec() == 0, "never-started interrupted client has no duration");
+        check(manager.end_time_set(), "never-started interrupted client is finalized");
+    }
+    {
+        object_generator generator;
+        client manager(base, &config, protocol, &generator);
+        manager.set_start_time_at(&config.benchmark_start_time);
+        struct timeval early = {101, 0};
+        manager.set_end_time_at(&early);
+        manager.set_end_time_interrupted(&late);
+        check(manager.get_stats()->get_duration_usec() == 250000, "interrupt does not refinalize an ended client");
+    }
+    {
+        config.clients_start = 1;
+        object_generator generator;
+        client manager(base, &config, protocol, &generator);
+        manager.set_start_time();
+        manager.set_end_time_interrupted(&late);
+        check(manager.get_stats()->get_duration_usec() == 2000000, "staircase uses the shared benchmark deadline");
+        config.clients_start = 0;
+    }
+    {
+        config.test_time = UINT_MAX;
+        struct timeval recent_start = {1792300000, 750000};
+        struct timeval early = {1792300001, 250000};
+        object_generator generator;
+        client manager(base, &config, protocol, &generator);
+        manager.set_start_time_at(&recent_start);
+        manager.set_end_time_interrupted(&early);
+        check(manager.get_stats()->get_duration_usec() == 500000,
+              "large test time does not overflow a 32-bit timeval deadline on an early interrupt");
+    }
+    {
+        config.test_time = 0;
+        config.requests = 100;
+        object_generator generator;
+        client manager(base, &config, protocol, &generator);
+        manager.set_start_time_at(&config.benchmark_start_time);
+        manager.set_end_time_interrupted(&late);
+        check(manager.get_stats()->get_duration_usec() == 4500000, "request-count interrupt keeps its actual duration");
+    }
+    delete protocol;
+    event_base_free(base);
+}
+
 int main()
 {
 #ifdef _WIN32
@@ -181,6 +266,7 @@ int main()
     test_sibling_with_replay(path.c_str());
     rmdir(directory);
 #endif
+    test_interrupted_deadline();
 
     arbitrary_command_list commands;
     benchmark_config config = {};
