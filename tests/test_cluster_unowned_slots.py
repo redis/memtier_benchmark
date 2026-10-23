@@ -192,7 +192,9 @@ def _run(env, node, args, expected_exit=0, timeout=8, seed_replica=False):
             if not any(arg.startswith("--command=") for arg in args):
                 command.extend(["--ratio=1:0", "--key-pattern=S:S"])
             command += args
+            started = time.monotonic()
             result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+            node.run_elapsed = time.monotonic() - started
             env.assertEqual(result.returncode, expected_exit, message=result.stderr[-3000:])
             with open(path) as source:
                 stats = json.load(source)["ALL STATS"]
@@ -222,7 +224,8 @@ def test_unowned_requests_are_sent_and_counted(env):
     env.assertEqual(len(failures), 100)
     env.assertTrue(all(keys == (b"memtier-1",) for _, keys in node.requests))
     env.assertGreaterEqual(node.slots_calls, 2)
-    env.assertLessEqual(node.slots_calls, 3)
+    # Bootstrap, one immediate refresh, then at most one per elapsed second.
+    env.assertLessEqual(node.slots_calls, 2 + int(node.run_elapsed))
 
 
 def test_unowned_timed_run_ends_and_refresh_is_bounded(env):
@@ -232,7 +235,7 @@ def test_unowned_timed_run_ends_and_refresh_is_bounded(env):
     env.assertEqual(stats["Totals"]["Count"], len(node.requests))
     env.assertEqual(len(failures), len(node.requests))
     env.assertGreaterEqual(node.slots_calls, 2)
-    env.assertLessEqual(node.slots_calls, 4)
+    env.assertLessEqual(node.slots_calls, 2 + int(node.run_elapsed))
 
 
 def test_partial_map_preserves_sequential_key_identity(env):
