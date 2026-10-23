@@ -284,37 +284,46 @@ int cluster_client::reconnect(unsigned int conn_id)
 
 bool cluster_client::connect_shard_connection(shard_connection *sc, char *address, char *port)
 {
-    // empty key index queue and staged monitor commands
-    if (m_key_index_pools[sc->get_id()]->size()) {
-        // Cross-shard reads that were routed to this connection (via
-        // create_request_for_other) push a (command_index, key_index) pair into
-        // m_key_index_pools[sc->get_id()] AFTER client::create_request has
-        // already incremented m_reqs_generated (client.cpp:656 for GET, the
-        // arbitrary path at create_request_for_other for --command). Clearing
-        // the pool here without compensating leaves m_reqs_processed < m_reqs_generated
-        // permanently, so a --requests run hangs and a --test-time run
-        // mis-accounts pending in-flight. Compensate by n/2 (pairs).
-        // Defensive clamp guards against accounting underflow. Transaction
-        // lookahead stays in transaction state and never enters this queue.
-        key_index_pool empty_queue;
-        std::swap(*m_key_index_pools[sc->get_id()], empty_queue);
-        {
-            const size_t n = empty_queue.size() / 2;
-            m_reqs_generated -= (m_reqs_generated >= n) ? n : m_reqs_generated;
+    // Routed keys and monitor lines have already been selected and counted,
+    // but have not reached the wire. Redialing the same endpoint must retain
+    // them: clearing and compensating would generate replacements and skip
+    // the original request identities. A new connection (no address yet) or
+    // a different endpoint keeps the existing reset policy; connection IDs
+    // alone are not enough to establish queue ownership.
+    const bool same_endpoint = sc->get_address() != NULL && sc->get_port() != NULL &&
+                               strcmp(sc->get_address(), address) == 0 && strcmp(sc->get_port(), port) == 0;
+    if (!same_endpoint) {
+        if (m_key_index_pools[sc->get_id()]->size()) {
+            // Cross-shard reads that were routed to this connection (via
+            // create_request_for_other) push a (command_index, key_index) pair into
+            // m_key_index_pools[sc->get_id()] AFTER client::create_request has
+            // already incremented m_reqs_generated (client.cpp:656 for GET, the
+            // arbitrary path at create_request_for_other for --command). Clearing
+            // the pool here without compensating leaves m_reqs_processed < m_reqs_generated
+            // permanently, so a --requests run hangs and a --test-time run
+            // mis-accounts pending in-flight. Compensate by n/2 (pairs).
+            // Defensive clamp guards against accounting underflow. Transaction
+            // lookahead stays in transaction state and never enters this queue.
+            key_index_pool empty_queue;
+            std::swap(*m_key_index_pools[sc->get_id()], empty_queue);
+            {
+                const size_t n = empty_queue.size() / 2;
+                m_reqs_generated -= (m_reqs_generated >= n) ? n : m_reqs_generated;
+            }
         }
-    }
-    {
-        std::queue<staged_monitor_cmd> empty_staged;
-        std::swap(m_staged_monitor_commands[sc->get_id()], empty_staged);
-        // Commands in the cleared staged queue were already counted in m_reqs_generated at
-        // staging time. Compensate so a --requests run is not left waiting for responses
-        // that will never arrive.
-        // Defensive clamp: today entries in empty_staged are popped before m_reqs_generated
-        // is decremented so underflow cannot occur, but guard explicitly so a future
-        // refactor does not silently wrap to 2^64.  Matches the pattern at hold_pipeline.
         {
-            const size_t n = empty_staged.size();
-            m_reqs_generated -= (m_reqs_generated >= n) ? n : m_reqs_generated;
+            std::queue<staged_monitor_cmd> empty_staged;
+            std::swap(m_staged_monitor_commands[sc->get_id()], empty_staged);
+            // Commands in the cleared staged queue were already counted in m_reqs_generated at
+            // staging time. Compensate so a --requests run is not left waiting for responses
+            // that will never arrive.
+            // Defensive clamp: today entries in empty_staged are popped before m_reqs_generated
+            // is decremented so underflow cannot occur, but guard explicitly so a future
+            // refactor does not silently wrap to 2^64.  Matches the pattern at hold_pipeline.
+            {
+                const size_t n = empty_staged.size();
+                m_reqs_generated -= (m_reqs_generated >= n) ? n : m_reqs_generated;
+            }
         }
     }
 
@@ -1892,10 +1901,9 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         }
     }
 
-    // Do not select a monitor line during primary reconnect backoff. The
-    // reconnect clears that primary's staged queue, so enqueueing now would
-    // discard the selected line. The seed's SLOTS refresh resumes production
-    // after redial; setup-gated draining then preserves the selected command.
+    // Do not select a monitor line during primary reconnect backoff. Let the
+    // seed's SLOTS refresh choose a live destination before staging more work.
+    // Already-staged lines survive same-endpoint redial; setup gates draining.
     // This also waits for owned monitor keys instead of sending them on a
     // replica producer while every primary is disconnected.
     if (m_config->monitor_commands != NULL && m_config->arbitrary_commands->is_defined() &&

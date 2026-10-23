@@ -103,8 +103,14 @@ public:
     void route_slot_to_second_shard(abstract_protocol *protocol, unsigned int slot, const char *port)
     {
         shard_connection *second = create_shard_connection(protocol);
+        check(second->get_address() == NULL && second->get_port() == NULL, "new endpoint is uninitialized");
+        const unsigned long long generated = get_reqs_generated();
+        stage_unsent(second->get_id());
         check(connect_shard_connection(second, (char *) "127.0.0.1", (char *) port), "second shard dialed");
         check(second->get_connection_state() != conn_disconnected, "second shard is not disconnected");
+        check(pool_empty(second->get_id()) && staged_monitor_count(second->get_id()) == 0,
+              "fresh endpoint does not inherit queued work by numeric ID");
+        check(get_reqs_generated() == generated, "fresh endpoint compensates old counted work");
         m_shard_groups.clear();
         m_shard_groups.push_back(shard_group{0, m_connections[0], {}, 0});
         m_shard_groups.push_back(shard_group{1, second, {}, 0});
@@ -117,7 +123,30 @@ public:
         m_slot_to_shard_group.assign(m_slot_to_shard_group.size(), 0);
         m_slot_to_shard_group[slot] = UINT_MAX;
     }
+    void second_primary_with_hole(unsigned int slot)
+    {
+        m_shard_groups.erase(m_shard_groups.begin());
+        m_shard_groups[0].id = 0;
+        m_slot_to_shard_group.assign(m_slot_to_shard_group.size(), 0);
+        m_slot_to_shard_group[slot] = UINT_MAX;
+    }
+    bool can_route_unowned(unsigned int slot) { return check_unowned_slot(slot, false); }
     bool pool_empty(unsigned int conn_id) const { return m_key_index_pools[conn_id]->empty(); }
+    void stage_unsent(unsigned int conn_id)
+    {
+        m_key_index_pools[conn_id]->push(SET_CMD_IDX);
+        m_key_index_pools[conn_id]->push(42);
+        arbitrary_command cmd("SET unit-key unit-value");
+        check(cmd.split_command_to_args(), "parse staged monitor command");
+        m_staged_monitor_commands[conn_id].push(staged_monitor_cmd{std::move(cmd), 0, timeval{}, 1});
+        m_reqs_generated += 2;
+    }
+    size_t staged_monitor_count(unsigned int conn_id) const { return m_staged_monitor_commands[conn_id].size(); }
+    bool redial(unsigned int conn_id, const char *address, const char *port)
+    {
+        m_connections[conn_id]->disconnect();
+        return connect_shard_connection(m_connections[conn_id], (char *) address, (char *) port);
+    }
     void skip(unsigned int command_index)
     {
         check(!send_from(0, command_index), "command of a lost MULTI was not sent");
@@ -282,6 +311,17 @@ static void check_repin_routes_to_staged_owner(unsigned long long first_key)
         client.get_connections()[0]->get_protocol()->set_buffers(input, output);
         client.route_slot_to_second_shard(protocol, staged_slot, port.c_str());
 
+        client.stage_unsent(1);
+        const unsigned long long generated = client.get_reqs_generated();
+        check(client.redial(1, "127.0.0.1", port.c_str()), "same endpoint redial starts");
+        check(!client.pool_empty(1) && client.staged_monitor_count(1) == 1, "same endpoint retains both unsent queues");
+        check(client.get_reqs_generated() == generated, "retained requests stay counted exactly once");
+        // Same numeric connection ID, different endpoint identity: retain
+        // the old reset/compensation policy rather than inherit stale work.
+        check(client.redial(1, "localhost", port.c_str()), "different endpoint redial starts");
+        check(client.pool_empty(1) && client.staged_monitor_count(1) == 0, "different endpoint clears both old queues");
+        check(client.get_reqs_generated() == generated - 2, "reset compensates both counted requests");
+
         // MULTI on the main connection stages the first key and pins to its owner.
         check(!client.send_from(0, 0), "main connection defers to the key owner");
         check(client.pin() == 1 && client.staged() && client.staged_key() == first_key,
@@ -327,6 +367,24 @@ static void check_repin_routes_to_staged_owner(unsigned long long first_key)
     }
     evbuffer_free(input);
     evbuffer_free(output);
+    // A shard reconnect timer has cleared, and the live seed is waiting for
+    // SLOTS to redial it. No timer is armed now, but the fallback must remain
+    // eligible until that refresh finishes. A disconnected seed is different.
+    {
+        client_group group(&config, protocol, &generator);
+        transaction_client client(&group);
+        client.route_slot_to_second_shard(protocol, staged_slot, port.c_str());
+        client.second_primary_with_hole(staged_slot);
+        client.get_connections()[1]->disconnect();
+        check(client.redial(0, "127.0.0.1", port.c_str()), "seed is connecting for refresh");
+        client.get_connections()[0]->set_cluster_slots();
+        check(!client.get_connections()[1]->is_reconnect_pending(), "shard timer has already cleared");
+        check(client.can_route_unowned(staged_slot) && !client.run_failed(),
+              "live seed SLOTS refresh keeps disconnected primary eligible");
+        client.get_connections()[0]->disconnect();
+        check(!client.can_route_unowned(staged_slot) && client.run_failed(),
+              "disconnected seed is not a pending topology refresh");
+    }
     delete protocol;
     evutil_closesocket(listener);
 }

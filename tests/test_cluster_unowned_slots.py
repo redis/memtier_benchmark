@@ -555,15 +555,22 @@ def test_unowned_transaction_disconnected_primary(env):
 
 
 def test_unowned_monitor_disconnected_primary(env):
-    for reconnect, unowned in ((False, True), (True, True), (True, False)):
+    for reconnect, unowned, drops, pipeline in (
+        (False, True, 1, 1),
+        (True, True, 1, 1),
+        (True, False, 1, 1),
+        (True, True, 2, 1),
+        (True, True, 2, 4),
+        (True, False, 2, 4),
+    ):
         node = (
             _hole(replica=True, auth_delay=0.02)
             if unowned
             else _Node([(0, 16383)], replica=True, auth_delay=0.02)
         )
-        node.auth_closes = 1
+        node.auth_closes = drops
         node.replica.readonly_delay = 0.2
-        node.slots_delay = 0.1
+        node.slots_delay = 0.4 if drops > 1 else 0.1
         with tempfile.TemporaryDirectory() as directory:
             monitor = os.path.join(directory, "monitor.txt")
             with open(monitor, "w") as target:
@@ -573,6 +580,7 @@ def test_unowned_monitor_disconnected_primary(env):
             # must not conceal a counted command stranded on the dead primary.
             args = [
                 "--requests=20",
+                "--pipeline=" + str(pipeline),
                 "--read-preference=secondaryPreferred",
                 "--monitor-input=" + monitor,
                 "--monitor-pattern=S",
@@ -582,7 +590,7 @@ def test_unowned_monitor_disconnected_primary(env):
             if reconnect:
                 args += [
                     "--reconnect-on-error",
-                    "--max-reconnect-attempts=2",
+                    "--max-reconnect-attempts=3",
                     "--reconnect-backoff-factor=0.5",
                 ]
             stats, rows, stderr = _run(
@@ -591,7 +599,7 @@ def test_unowned_monitor_disconnected_primary(env):
         env.assertEqual(len(node.replica.requests), 0)
         if reconnect:
             env.assertEqual(stats["Totals"]["Count"], 20)
-            env.assertEqual(node.auth_attempts, 2)
+            env.assertEqual(node.auth_attempts, drops + 1)
             env.assertEqual(len(node.requests), 10)
             env.assertEqual(
                 sum(command == (b"PING",) for command in node.workload + node.replica.workload), 10
@@ -606,3 +614,39 @@ def test_unowned_monitor_disconnected_primary(env):
             env.assertEqual(stats["Totals"]["Count"], 1)
             env.assertEqual(len(node.requests), 0)
             env.assertContains("no reachable primary", stderr)
+
+
+def test_unowned_keys_survive_repeated_redial(env):
+    # The same queue-reset bug affects ordinary routed key indices: dropping
+    # them and decrementing the count silently substitutes later keys.
+    for unowned, drops, pipeline in ((True, 1, 1), (True, 2, 4), (False, 2, 4)):
+        node = (
+            _hole(replica=True, auth_delay=0.02)
+            if unowned
+            else _Node([(0, 16383)], replica=True, auth_delay=0.02)
+        )
+        node.auth_closes = drops
+        node.replica.readonly_delay = 0.2
+        node.slots_delay = 0.4
+        stats, _, _ = _run(
+            env,
+            node,
+            [
+                "--requests=20",
+                "--pipeline=" + str(pipeline),
+                "--key-prefix={memtier-1}-",
+                "--key-maximum=100",
+                "--read-preference=secondaryPreferred",
+                "--reconnect-on-error",
+                "--max-reconnect-attempts=3",
+                "--reconnect-backoff-factor=0.5",
+            ],
+            seed_replica=True,
+        )
+        env.assertEqual(stats["Totals"]["Count"], 20)
+        env.assertEqual(node.auth_attempts, drops + 1)
+        env.assertEqual(node.replica.requests, [])
+        env.assertEqual(
+            [keys for _, keys in node.requests],
+            [(f"{{memtier-1}}-{index}".encode(),) for index in range(1, 21)],
+        )

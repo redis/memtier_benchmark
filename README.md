@@ -540,11 +540,14 @@ maintains its own topology: for example, `-t 8 -c 50` permits up to 400 refreshe
 per second during sustained `CLUSTERDOWN`, in addition to initial discovery.
 Refreshes also occur when retries are disabled. Missing-owner requests use the
 first available primary, so this error traffic can concentrate on one node.
+The missing-owner warning prints once per process, including across `--run-count` runs.
 MGET retains that primary as its producer until the next topology refresh.
 If no primary is connected, connecting, or awaiting reconnect/refresh, missing-owner
 requests fail the run explicitly. Transactions retain their key while reconnecting.
 Monitor replay waits before selecting its next line while all primaries are in
-reconnect backoff, including for owned keys, so reconnect cannot discard that line.
+reconnect backoff, including for owned keys. Already-selected monitor lines and
+routed keys stay queued across redials to the same endpoint, including repeated
+setup failures, without changing their generated-request counts.
 Strict `secondary` reads with `error` or `queue` fallback fail the run because no
 authoritative replica can be chosen, including for a transient hole discovered
 by a mid-run refresh.
