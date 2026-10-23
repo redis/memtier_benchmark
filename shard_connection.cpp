@@ -292,6 +292,8 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_authentication(setup_done),
         m_db_selection(setup_done),
         m_cluster_slots(setup_done),
+        m_cluster_slots_value_override(false),
+        m_cluster_slots_previous_keep_value(false),
         m_readonly_state(setup_done),
         m_multi_open(false),
         m_reconnect_attempts(0),
@@ -767,6 +769,7 @@ static void log_abandoned_request(const request *req, const char *reason)
 
 void shard_connection::disconnect()
 {
+    restore_cluster_slots_value_policy();
 #ifdef _WIN32
     cancel_deferred_connect_error();
 #endif
@@ -1476,12 +1479,24 @@ void shard_connection::send_conn_setup_commands(struct timeval timestamp)
 
         benchmark_debug_log("sending cluster slots command.\n");
 
-        // in case we send CLUSTER SLOTS command, we need to keep the response to parse it
+        // Retain the slot map temporarily, without losing a caller's policy
+        // (verification and incremental SCAN also retain response values).
+        m_cluster_slots_previous_keep_value = m_protocol->get_keep_value();
+        m_cluster_slots_value_override = true;
         m_protocol->set_keep_value(true);
         m_protocol->write_command_cluster_slots();
         push_req(new request(rt_cluster_slots, 0, &timestamp, 0));
         m_cluster_slots = setup_sent;
     }
+}
+
+void shard_connection::restore_cluster_slots_value_policy()
+{
+    // The topology callback can disconnect this connection while handling
+    // the reply. Restore once, whether it completed or was abandoned.
+    if (!m_cluster_slots_value_override) return;
+    m_protocol->set_keep_value(m_cluster_slots_previous_keep_value);
+    m_cluster_slots_value_override = false;
 }
 
 // Called by cluster_client::handle_cluster_slots when a live CLUSTER SLOTS
@@ -1597,9 +1612,7 @@ void shard_connection::process_response(void)
                 benchmark_error_log("cluster slot failed.\n");
                 report_connection_stage_failure("CLUSTER SLOTS failed (server returned empty or non-cluster reply; "
                                                 "is the server actually cluster-enabled?)");
-                // As after a parsed reply: once the slot map is in, data
-                // replies on this connection must not be copied as values.
-                m_protocol->set_keep_value(false);
+                restore_cluster_slots_value_policy();
                 retry_cluster_slots_after_error();
                 error = true;
             } else {
@@ -1625,7 +1638,7 @@ void shard_connection::process_response(void)
                 // (a promoted replica becomes a primary).
                 const bool was_replica = m_role == role_replica;
                 bool committed = m_conns_manager->handle_cluster_slots(m_id, r);
-                m_protocol->set_keep_value(false);
+                restore_cluster_slots_value_policy();
 
                 if (committed) {
                     m_cluster_slots = setup_done;

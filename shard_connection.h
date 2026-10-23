@@ -405,6 +405,7 @@ private:
     // --transaction rotation this connection drives to close its MULTI.
     bool setup_held_for_transaction();
     void send_conn_setup_commands(struct timeval timestamp);
+    void restore_cluster_slots_value_policy();
     // Schedule a fill on every other connected connection of this client, so
     // that those held in hold_pipeline() re-check it.
     void wake_peers(void);
@@ -475,6 +476,8 @@ private:
     enum setup_state m_authentication;
     enum setup_state m_db_selection;
     enum setup_state m_cluster_slots;
+    bool m_cluster_slots_value_override;
+    bool m_cluster_slots_previous_keep_value;
     // READONLY ladder stage. Only ever leaves setup_done when m_role ==
     // role_replica; primaries skip the stage entirely. Re-armed on every
     // reconnect because READONLY is connection-scoped on the server side.

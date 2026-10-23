@@ -512,6 +512,7 @@ def _assert_worker_exception_stats(env, unknown, finalization_failure=False):
         with open(os.path.join(config.results_dir, "mb.json")) as output:
             stats = json.load(output)["ALL STATS"]
         runtime = stats["Runtime"]
+        env.assertEqual(runtime["Interrupted"], "true")
         env.assertGreater(runtime["Finish time"], runtime["Start time"])
         env.assertGreater(runtime["Total duration"], 0)
         env.assertLess(runtime["Total duration"], 3000)
