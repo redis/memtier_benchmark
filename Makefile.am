@@ -61,7 +61,7 @@ memtier_benchmark_CPPFLAGS = \
 	$(LIBSSL_CFLAGS)
 memtier_benchmark_SOURCES = \
 	platform_compat.h \
-	memtier_benchmark.cpp memtier_benchmark.h crash_report.h \
+	memtier_benchmark.cpp memtier_benchmark.h connection_stage_clock.h crash_report.h \
 	client.cpp client.h \
 	cluster_client.cpp cluster_client.h \
 	shard_connection.cpp shard_connection.h connections_manager.h \
@@ -110,6 +110,12 @@ if MEMTIER_WINDOWS
 # and only under this feature macro. That is enough for this test's use of it.
 prometheus_metrics_test_CPPFLAGS += -D_POSIX_THREAD_SAFE_FUNCTIONS
 endif
+
+# --connection-stage-timeout compares microseconds, not whole seconds.
+check_PROGRAMS += connection_stage_clock_test
+connection_stage_clock_test_SOURCES = tests/unit/connection_stage_clock_test.cpp connection_stage_clock.h
+connection_stage_clock_test_CPPFLAGS = -I$(srcdir)
+connection_stage_clock_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 
 # Exact Redis command framing through the production serializer.
 check_PROGRAMS += redis_protocol_test
