@@ -683,7 +683,41 @@ int redis_protocol::parse_response(void)
             m_response_len += res_len + 2;
 
             if (aggregate_type(line[0])) {
-                int count = strtol(line + 1, NULL, 10);
+                long long declared = strtoll(line + 1, NULL, 10);
+
+                // from bulks counter perspective every count < 0 is equal to 0, because it's not followed by bulks.
+                if (declared < 0) {
+                    declared = 0;
+                }
+
+                // Map or Attribute contain key-value pair
+                long long per_entry = (line[0] == '%' || line[0] == '|') ? 2 : 1;
+
+                // Reject a count whose elements, together with the ones still
+                // outstanding, cannot be represented as int: the doubling right
+                // after this check and the m_nested_remaining bookkeeping
+                // further down are int arithmetic and would overflow. The
+                // bound also keeps m_total_bulks_count within int range.
+                // strtoll (not strtol: long is 32-bit on Windows) keeps counts
+                // above INT_MAX distinguishable and clamps out-of-range ones to
+                // LLONG_MAX. A nested aggregate fills one of the outstanding
+                // slots of its parent.
+                long long outstanding = m_total_bulks_count > 0 ? (long long) m_total_bulks_count - 1 : 0;
+                // A tracked nested aggregate also adds count - 1 to
+                // m_nested_remaining. That is not always bounded by
+                // m_total_bulks_count: a nested attribute takes a parent slot
+                // without being tracked. Bound it directly.
+                bool tracked_nested = m_track_elem_misses && m_tracking && m_nested_remaining > 0 &&
+                                      m_total_bulks_count > 0 && !m_push && line[0] != '|' && line[0] != '>';
+                if (tracked_nested && (long long) m_nested_remaining - 1 > outstanding) {
+                    outstanding = (long long) m_nested_remaining - 1;
+                }
+                if (declared > (INT_MAX - outstanding) / per_entry) {
+                    benchmark_debug_log("invalid aggregate count: '%s'.\n", line);
+                    free(line);
+                    return -1;
+                }
+                int count = (int) (declared * per_entry);
 
                 // The reply's top-level aggregate is the one parsed while no
                 // bulks are still outstanding. Capture its declared length so
@@ -699,11 +733,6 @@ int redis_protocol::parse_response(void)
                     m_total_bulks_count--;
                 }
 
-                // from bulks counter perspective every count < 0 is equal to 0, because it's not followed by bulks.
-                if (count < 0) {
-                    count = 0;
-                }
-
                 if (line[0] == '|') {
                     // Nested attribute?
                     assert(!m_attribute);
@@ -716,11 +745,6 @@ int redis_protocol::parse_response(void)
                     // pushes (push inside push) are not defined by RESP3
                     // and not expected; only set the flag once.
                     m_push = true;
-                }
-
-                // Map or Attribute contain key-value pair
-                if (line[0] == '%' || line[0] == '|') {
-                    count *= 2;
                 }
 
                 // Record the reply body's declared element count (count is now
@@ -781,12 +805,23 @@ int redis_protocol::parse_response(void)
                     return 1;
                 }
             } else if (blob_type(line[0])) {
+                long bulk_len = strtol(line + 1, NULL, 10);
+
+                // The payload plus its CRLF (m_bulk_len + 2) must be
+                // representable as long; strtol clamps an out-of-range length
+                // to LONG_MAX, and the rs_read_bulk arithmetic would overflow.
+                if (bulk_len > LONG_MAX - 2) {
+                    benchmark_debug_log("invalid bulk length: '%s'.\n", line);
+                    free(line);
+                    return -1;
+                }
+                m_bulk_len = bulk_len;
+
                 // if it's single bulk (not part of mbulk), we count it here
                 if (m_total_bulks_count == 0) {
                     m_total_bulks_count++;
                 }
 
-                m_bulk_len = strtol(line + 1, NULL, 10);
                 // A bulk leaf is a hit iff it carries a value ($N, N>0). A null
                 // bulk ($-1) and an empty bulk ($0) are misses -- matching the
                 // pre-existing value!=NULL convention of the materialized walk.

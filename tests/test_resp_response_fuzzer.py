@@ -11,8 +11,11 @@ and asserts:
      SIGFPE/SIGILL).
   2. stderr contains none of the crash needles:
      `Aborted`, `Segmentation fault`, `AddressSanitizer`,
-     `UndefinedBehaviorSanitizer`, `stack smashing detected`,
-     `assertion failed`.
+     `LeakSanitizer`, `UndefinedBehaviorSanitizer`, `runtime error:`,
+     `stack smashing detected`, `assertion failed`. UBSan reports
+     only `runtime error:` (no summary) and exits 1 under
+     halt_on_error=1 without abort_on_error, so the exit code alone
+     does not reveal it.
   3. memtier terminates within the per-fixture wall-clock budget (no
      hang / spin loop).
 
@@ -50,7 +53,11 @@ CRASH_NEEDLES = (
     "Aborted",
     "Segmentation fault",
     "AddressSanitizer",
+    "LeakSanitizer",
     "UndefinedBehaviorSanitizer",
+    # UBSan's report line; with halt_on_error=1 and no abort_on_error it is
+    # the only trace of the error (exit code 1, no summary line).
+    "runtime error:",
     "stack smashing detected",
     "assertion failed",
 )
