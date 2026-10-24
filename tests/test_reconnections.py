@@ -569,7 +569,7 @@ def test_connection_errors_reported_when_only_a_later_client_connects(env):
             "--reconnect-backoff-factor=2",
             "--max-reconnect-attempts=2",
             "--test-time=8",
-        ],
+        ] + memtier_auth_args(env),
     )
     # Delays are 2 s and 4 s: client 0 dials at 0 s, 2 s and 6 s, client 1 at
     # 3 s. Client 0's last dial fails at 6 s, before the 8 s deadline, so it

@@ -27,7 +27,7 @@ import subprocess
 import tempfile
 import time
 
-from include import MEMTIER_BINARY, addTLSArgs
+from include import MEMTIER_BINARY, addTLSArgs, memtier_auth_args
 
 
 # Short timeout so the regression suite finishes in seconds, not 30 s per
@@ -88,7 +88,7 @@ def _run_memtier(args):
 
 def _assert_supervisor_tripped(env, args, label):
     """Common assertions for a single fuzz scenario."""
-    rc, stderr_text, elapsed = _run_memtier(args)
+    rc, stderr_text, elapsed = _run_memtier(args + memtier_auth_args(env, args))
     # Non-None return code = process exited under its own steam.
     env.assertIsNotNone(
         rc,
@@ -136,7 +136,7 @@ def _assert_supervisor_tripped(env, args, label):
 
 def _assert_worker_failed(env, args, label):
     """A server disconnect must fail the worker without waiting for retries."""
-    rc, stderr_text, elapsed = _run_memtier(args)
+    rc, stderr_text, elapsed = _run_memtier(args + memtier_auth_args(env, args))
     env.assertEqual(rc, 1, message=f"[{label}] expected worker failure, got {rc}: {stderr_text[-2000:]}")
     env.assertTrue("client(s) stopped before reaching their stop condition" in stderr_text,
                    message=f"[{label}] missing worker failure diagnostic: {stderr_text[-2000:]}")

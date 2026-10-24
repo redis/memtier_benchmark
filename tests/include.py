@@ -42,6 +42,40 @@ def assert_minimum_memtier_outcomes(config, env, memtier_ok, overall_expected_re
         if env.getNumberOfFailedAssertion() > failed_asserts:
             debugPrintMemtierOnError(config, env)
 
+def _option_values(args, short, long):
+    """Values of a memtier option passed as -x v, -xv, --long v or --long=v."""
+    values = []
+    for i, arg in enumerate(args):
+        if arg in (short, long):
+            values.append(args[i + 1] if i + 1 < len(args) else "")
+        elif arg.startswith(long + "="):
+            values.append(arg[len(long) + 1:])
+        elif arg.startswith(short) and not arg.startswith("--"):
+            values.append(arg[len(short):])
+    return values
+
+
+def memtier_auth_args(env, args=()):
+    """
+    --authenticate with the env's password (run_tests.sh REDIS_PASSWORD), for
+    tests that build the memtier command line themselves. Empty when the env
+    has no password, when args already carry -a/--authenticate or a -u/--uri
+    with userinfo, or when args select a memcache protocol (which cannot AUTH
+    as a Redis client).
+    """
+    password = env.getMasterNodesList()[0].get("password")
+    args = [str(arg) for arg in args]
+    if not password or _option_values(args, "-a", "--authenticate"):
+        return []
+    if any("@" in uri.split("://", 1)[-1].split("/", 1)[0]
+           for uri in _option_values(args, "-u", "--uri")):
+        return []
+    if any(protocol.startswith("memcache")
+           for protocol in _option_values(args, "-P", "--protocol")):
+        return []
+    return ["--authenticate", password]
+
+
 def add_required_env_arguments(benchmark_specs, config, env, master_nodes_list):
     if VERBOSE:
         logging.basicConfig(level=logging.DEBUG)
@@ -50,6 +84,8 @@ def add_required_env_arguments(benchmark_specs, config, env, master_nodes_list):
     master_nodes_connections = env.getOSSMasterNodesConnectionList()
     ensure_tls_protocols(master_nodes_connections)
 
+    # run_tests.sh starts the servers with REDIS_PASSWORD
+    benchmark_specs["args"].extend(memtier_auth_args(env, benchmark_specs["args"]))
     # check if environment is cluster
     if env.isCluster():
         benchmark_specs["args"].append("--cluster-mode")
