@@ -26,8 +26,8 @@ class _RetryJsonPeer(socketserver.ThreadingTCPServer):
         self.failures = []
         self.lock = threading.Lock()
         self.pause_run = None
+        self.retried = set()
         self.paused = threading.Event()
-        self.stop = threading.Event()
         super().__init__(("127.0.0.1", 0), _RetryJsonHandler)
 
 
@@ -40,6 +40,8 @@ class _RetryJsonHandler(socketserver.StreamRequestHandler):
             peer.connections += 1
         run = connection // peer.clients
         authenticated = False
+        holding = False
+        replayed = set()
         try:
             while True:
                 line = self.rfile.readline()
@@ -63,14 +65,25 @@ class _RetryJsonHandler(socketserver.StreamRequestHandler):
                     with peer.lock:
                         peer.attempts[key] += 1
                         attempt = peer.attempts[key]
-                    if run == peer.pause_run and attempt == 2:
-                        peer.paused.set()
-                        peer.stop.wait(15)
-                        return
+                    if run == peer.pause_run and (holding or attempt == 2):
+                        # From the first replay on, read without replying. A
+                        # replay is sent only after memtier counted its
+                        # TRYAGAIN, so once every key answered with TRYAGAIN
+                        # has been replayed, memtier's counters cover all of
+                        # them and nothing it can still count is in flight.
+                        holding = True
+                        if attempt == 2:
+                            replayed.add(key)
+                        if replayed >= peer.retried:
+                            peer.paused.set()
+                        continue
                     mode = peer.modes[run]
                     fail = mode == "fail" or (mode == "mixed" and command == b"INCR")
                     retry_once = mode in ("once", "mixed") and attempt == 1
                     reply = b"-TRYAGAIN injected\r\n" if fail or retry_once else b"+OK\r\n"
+                    if run == peer.pause_run and retry_once:
+                        with peer.lock:
+                            peer.retried.add(key)
                 self.wfile.write(reply)
                 self.wfile.flush()
         except (ConnectionResetError, BrokenPipeError):
@@ -189,8 +202,11 @@ def test_retry_json_interrupted_series(env):
             first, second = (result["RUN #{} RESULTS".format(i)] for i in (1, 2))
             _assert_totals(first, (0, 6, 6))
             assert second["Runtime"]["Interrupted"] == "true"
-            # Every first attempt received TRYAGAIN before the peer paused a replay.
-            queued = sum(key[0] == 1 for key in peer.attempts)
+            # The peer paused only once it had the replays of all the keys it
+            # answered with TRYAGAIN, so memtier had counted each of them. A
+            # fresh key read after the first replay gets no reply, so it is
+            # not counted on either side.
+            queued = len(peer.retried)
             assert queued > 0
             assert second["Totals"]["Retry Attempts"] == queued, second["Totals"]
             assert second["Totals"]["Retried Ops"] == queued, second["Totals"]
@@ -206,6 +222,5 @@ def test_retry_json_interrupted_series(env):
             if child is not None and child.poll() is None:
                 child.kill()
                 child.communicate(timeout=3)
-            peer.stop.set()
             peer.shutdown()
             serving.join(timeout=5)
