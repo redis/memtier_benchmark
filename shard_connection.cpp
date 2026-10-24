@@ -531,6 +531,8 @@ bool shard_connection::setup_event(evutil_socket_t sockfd)
             // older libevent: see libevent_ssl_failure_socket_is_ours().
             benchmark_error_log("error: bufferevent_openssl_socket_new() failed; cannot create the TLS "
                                 "connection.\n");
+            // The loaded library does the cleanup, so ask its (runtime)
+            // version, not LIBEVENT_VERSION_NUMBER from the headers.
             if (libevent_ssl_failure_socket_is_ours(event_get_version_number())) {
                 evutil_closesocket(sockfd);
             } else {

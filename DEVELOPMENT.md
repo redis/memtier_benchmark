@@ -24,7 +24,9 @@ The following libraries are required for building:
 `configure` itself accepts older releases: the Prometheus exporter needs
 libevent_extra 2.1.4 or newer (`evhttp_request_set_on_complete_cb()`), and
 `./configure --disable-prometheus` accepts the minimum checked in
-`configure.ac`. Those older releases are not tested.
+`configure.ac`: 2.0.11, because timed reconnect deadlines need
+`event_base_gettimeofday_cached()` to return wall-clock time and earlier
+releases return monotonic time. Those older releases are not tested.
 
 Build against the libevent (and OpenSSL) you run with. memtier prints a
 warning on stderr at startup when the library loaded at run time is from
