@@ -326,8 +326,4 @@ bool connection_stage_should_abort(unsigned int timeout_secs, std::string *out_l
 // run of this --run-count series was aborted by the supervisor, else 1.
 int failure_exit_code(void);
 
-// Warn about --print-percentiles the run's sample bound can never resolve;
-// rate_conns counts the connections each limited by --rate-limiting.
-void warn_unresolvable_percentiles(const benchmark_config *cfg, unsigned long long rate_conns);
-
 #endif /* _MEMTIER_BENCHMARK_H */

@@ -853,18 +853,22 @@ memtier_benchmark ... --realtime-latencies --latency-window=60 --print-percentil
 [RUN #1  50%  90s] latency [overall ] n=2.81M   p50  0.119   p99  0.239   p99.9999  2.104  ms
 ```
 
-`n` is the row's sample count. A percentile p needs at least `1/(1-p)` samples
+`n` is the row's sample count. A percentile p needs at least `100/(100-p)` samples
 (100 for p99, 1,000,000 for p99.9999); with fewer, it is just the largest
 sample, so the value is marked `*`. When `--requests` or `--rate-limiting`
 bound the number of samples, memtier warns before the run about percentiles
 the run or the window can never resolve, e.g. `--rate-limiting=100` on 160
 connections gives at most 960,000 samples per 60 second window. The run-level
 warning applies to the final results table too, so it is printed with or
-without `--realtime-latencies`. In cluster mode the limit applies to each
-endpoint connection, so the check runs once the topology is known.
+without `--realtime-latencies`; it checks the total sample count, and
+per-command rows have fewer samples. In cluster mode the limit applies to each
+endpoint connection, so the check runs once the first topology is known, after
+the threads start.
 
 The window and overall rows merge the per-second histograms each client has
-completed, so every sample is counted exactly once and they lag the `inst` row
-by up to one second. The window covers the last N seconds of wall-clock time,
+completed, so every sample is counted exactly once. A client's second is
+completed when it records its first sample of the next second, so these rows
+normally lag the `inst` row by about a second, and samples of a stalled client
+appear only once it completes another request. The window covers the last N seconds of wall-clock time,
 even if the progress loop drifts. Each window second keeps one histogram (about
 21 KB).

@@ -3308,8 +3308,8 @@ void usage()
         "      --realtime-latencies       Replace the periodic single-line progress output with a per-tick block: "
         "line 1 = throughput + miss ratio, then labeled latency rows carrying the percentiles configured by "
         "--print-percentiles: inst (current second), win<N>s (sliding window, see --latency-window) and overall "
-        "(full run). Each row shows its sample count n; a percentile p with fewer than 1/(1-p) samples (1M for "
-        "p99.9999) only reports the maximum and is marked '*'. Redraws in place on a TTY; appends cleanly when "
+        "(full run). Each row shows its sample count n; a percentile p with fewer than 100/(100-p) samples (1M "
+        "for p99.9999) only reports the maximum and is marked '*'. Redraws in place on a TTY; appends cleanly when "
         "stderr is redirected to a file.\n"
         "      --latency-window=SECS      Sliding-window size for the win<N>s row of --realtime-latencies: "
         "percentiles over every sample completed in the last SECS seconds. Default: 60. Set to 0 to disable the "
@@ -4142,8 +4142,8 @@ static void format_sample_count(unsigned long long n, char *buf, size_t len)
 // bound the sample count; otherwise the realtime rows flag them live.
 // rate_conns is the number of request-generating connections, each limited to
 // --rate-limiting: clients x threads, times the traffic endpoints in cluster
-// mode, which is why cluster_client calls this once the topology is known.
-void warn_unresolvable_percentiles(const benchmark_config *cfg, unsigned long long rate_conns)
+// mode, which is only known once the first topology is committed.
+static void warn_unresolvable_percentiles(const benchmark_config *cfg, unsigned long long rate_conns)
 {
     // Upper bounds on recorded latency samples; 0 means unbounded.
     const double clients = (double) cfg->clients * cfg->threads;
@@ -4368,9 +4368,8 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     bool stderr_is_tty = isatty(fileno(stderr)) != 0;
     bool first_rtl_frame = true;
 
-    // Cumulative latency histogram for --realtime-latencies "overall" percentiles.
-    // We hdr_add each tick's aggregated inst histogram into this so the percentiles
-    // shown for the 'overall' row reflect the whole run, not just the last second.
+    // Cumulative latency histogram for --realtime-latencies "overall" percentiles:
+    // every completed second drained during the run (see rtl_completed_hist).
     hdr_histogram *rtl_totals_hist = NULL;
     if (cfg->realtime_latencies) {
         hdr_init(LATENCY_HDR_MIN_VALUE, LATENCY_HDR_SEC_MAX_VALUE, LATENCY_HDR_SEC_SIGDIGTS, &rtl_totals_hist);
@@ -4601,6 +4600,17 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         bool inst_samples = inst_hist_agg != NULL && hdr_total_count(inst_hist_agg) > 0;
         if (inst_samples) inst_percentiles.calculate(inst_hist_agg);
         const std::vector<int64_t> &inst_values = inst_percentiles.values();
+
+        // Cluster mode knows its rate-limited connection fan-out only after
+        // the first topology commit, so check the percentile bounds here,
+        // once per process. Restart the realtime frame so the warning is not
+        // overwritten by the TTY redraw.
+        static bool cluster_percentiles_checked = false;
+        if (cfg->cluster_mode && !cluster_percentiles_checked && cluster_client::rate_limited_connections() > 0) {
+            cluster_percentiles_checked = true;
+            warn_unresolvable_percentiles(cfg, cluster_client::rate_limited_connections());
+            first_rtl_frame = true;
+        }
 
         // Drain the seconds completed since the previous tick, once, for both
         // Prometheus and the --realtime-latencies rows.
@@ -5508,7 +5518,6 @@ int main(int argc, char *argv[])
     cfg.prometheus_port = -1;
 #endif
     cfg.prometheus = NULL;
-    cfg.latency_window_set = false;
 
     if (config_parse_args(argc, argv, &cfg) < 0) {
         usage();
