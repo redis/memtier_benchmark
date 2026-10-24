@@ -685,7 +685,7 @@ jobs:
     steps:
     - uses: actions/checkout@v6
     - name: Install dependencies
-      run: brew install autoconf automake pkg-config openssl@${{ matrix.openssl }}
+      run: brew install autoconf automake pkg-config cmake openssl@${{ matrix.openssl }}
     - name: Build libevent against the selected OpenSSL
       run: bash scripts/build-macos-libevent.sh "$(brew --prefix openssl@${{ matrix.openssl }})"
     - name: Build
@@ -745,7 +745,7 @@ jobs:
     steps:
     - uses: actions/checkout@v6
     - name: Install dependencies
-      run: brew install autoconf automake pkg-config openssl@1.1
+      run: brew install autoconf automake pkg-config cmake openssl@1.1
     - name: Build libevent against the selected OpenSSL
       run: bash scripts/build-macos-libevent.sh "$(brew --prefix openssl@1.1)"
     - name: Build

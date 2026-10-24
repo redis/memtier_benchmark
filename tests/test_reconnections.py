@@ -21,6 +21,22 @@ def _add_auth_args(benchmark_specs, env):
         benchmark_specs["args"].append("--authenticate=" + password)
 
 
+def _dump_stderr_if_signalled(env, return_code, stderr_content):
+    """Print memtier's stderr when it died from a signal (negative code, or
+    128+signal from a shell), so sanitizer aborts and assertions are visible
+    in the CI log. Starts at the first sanitizer report when there is one."""
+    if return_code is None or not (return_code < 0 or return_code > 128):
+        return
+    start = len(stderr_content)
+    for marker in ("==ERROR: ", "runtime error:", "LeakSanitizer", "Assertion `"):
+        index = stderr_content.find(marker)
+        if index != -1:
+            start = min(start, index)
+    start = max(0, len(stderr_content) - 4000) if start == len(stderr_content) else max(0, start - 1000)
+    env.debugPrint("memtier died from a signal (exit code {}); STDERR from offset {}:\n{}".format(
+        return_code, start, stderr_content[start:start + 16000]), True)
+
+
 def _run_with_memtier_kills(env, benchmark, config, conns, waves, timeout=60):
     """Run memtier and kill its connections in `waves` waves.
 
@@ -66,6 +82,7 @@ def _run_with_memtier_kills(env, benchmark, config, conns, waves, timeout=60):
             pass
     env.debugPrint("memtier exit code: {}, memtier clients killed per wave: {}, Connection Errors: {}".format(
         rc, kills, totals.get("Connection Errors")), True)
+    _dump_stderr_if_signalled(env, rc, stderr_content)
     return rc, kills, stderr_content, totals
 
 
@@ -229,6 +246,8 @@ def test_reconnect_cluster_mode_no_assertion(env):
     has_assertion_abort = "Assertion `m_connections.size() == m_key_index_pools.size()'" in stderr_content
     if has_assertion_abort:
         env.debugPrint("STDERR:\n{}".format(stderr_content), True)
+    else:
+        _dump_stderr_if_signalled(env, return_code, stderr_content)
     env.assertFalse(has_assertion_abort)
 
     # We must have actually killed at least one connection or this test is meaningless.
@@ -394,9 +413,9 @@ def _logged_reconnect_errors(stderr):
 
     Each call counts one connection error and logs either an "attempting
     reconnection" line or the final "Maximum reconnection attempts" line.
-    Unlike the "Connection error: " line before it, which is "TLS connection
-    error: " over TLS and missing when errno is 0, this is the same for every
-    transport. A duplicate call while a reconnect is pending is counted but
+    Unlike the "Connection error: " line before it, which TLS reason lines
+    can replace and which is missing when errno is 0, this is the same for
+    every transport. A duplicate call while a reconnect is pending is counted but
     not logged, so the counter can be higher.
     """
     return len(

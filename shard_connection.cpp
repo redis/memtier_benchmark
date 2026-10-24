@@ -2072,15 +2072,53 @@ void shard_connection::handle_event(short events)
 
     if (events & BEV_EVENT_ERROR) {
         bool ssl_error = false;
+        // Read the socket error before logging anything: logging may change
+        // it, and the Windows deferred refusal reports through it.
+        int socket_error = EVUTIL_SOCKET_ERROR();
 #ifdef USE_TLS
-        unsigned long sslerr;
-        while ((sslerr = bufferevent_get_openssl_error(m_bev))) {
-            ssl_error = true;
-            benchmark_error_log("TLS connection error: %s\n", ERR_reason_error_string(sslerr));
+        // Only TLS connections have an OpenSSL bufferevent (see setup_event()).
+        // libevent 2.2.2 asserts that type in its accessor and, when built with
+        // NDEBUG, reads and writes past a plain socket bufferevent instead.
+        if (m_config->openssl_ctx != NULL) {
+            unsigned long sslerr;
+            while ((sslerr = bufferevent_get_openssl_error(m_bev))) {
+                // libevent also queues the SSL_get_error() code of the failed
+                // call (e.g. SSL_ERROR_SYSCALL), which is not an OpenSSL error
+                // code and has no reason string. The socket error and the
+                // queued OpenSSL errors describe the failure instead.
+                if (ERR_GET_LIB(sslerr) == 0) continue;
+                const char *reason = ERR_reason_error_string(sslerr);
+                char error_text[256];
+                if (reason == NULL) {
+                    ERR_error_string_n(sslerr, error_text, sizeof(error_text));
+                    reason = error_text;
+                }
+                ssl_error = true;
+                benchmark_error_log("TLS connection error: %s\n", reason);
+            }
+            // libevent 2.2.2 drains the OpenSSL queue into the bufferevent but
+            // its accessor returns nothing for a TLS bufferevent
+            // (https://github.com/libevent/libevent/issues/1935). Recover what
+            // the SSL object still holds so a rejected certificate is reported.
+            if (!ssl_error) {
+                SSL *ssl = bufferevent_openssl_get_ssl(m_bev);
+                long verify_result = X509_V_OK;
+                // With --tls-skip-verify OpenSSL still records a result, but
+                // it did not cause the failure.
+                if (ssl != NULL && !m_config->tls_skip_verify) verify_result = SSL_get_verify_result(ssl);
+                if (verify_result != X509_V_OK) {
+                    ssl_error = true;
+                    benchmark_error_log("TLS connection error: certificate verify failed: %s\n",
+                                        X509_verify_cert_error_string(verify_result));
+                } else if (!socket_error) {
+                    benchmark_error_log("TLS connection error: no OpenSSL reason reported (libevent %s)\n",
+                                        event_get_version());
+                }
+            }
         }
 #endif
-        if (!ssl_error && EVUTIL_SOCKET_ERROR()) {
-            benchmark_error_log("Connection error: %s\n", evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR()));
+        if (!ssl_error && socket_error) {
+            benchmark_error_log("Connection error: %s\n", evutil_socket_error_to_string(socket_error));
         }
 
         attempt_reconnect("Connection error");
