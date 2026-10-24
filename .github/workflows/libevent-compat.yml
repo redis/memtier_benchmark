@@ -246,7 +246,9 @@ jobs:
           TLS: ${{ matrix.mode == 'tls' && '1' || '0' }}
           VERBOSE: '1'
           PARALLELISM: '2'
-        run: ./tests/run_tests.sh
+        run: |
+          # Some tests compile helpers against libevent: use the same one.
+          PKG_CONFIG_PATH="$LIBEVENT_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" ./tests/run_tests.sh
 
       - name: Package failure logs
         if: failure()
