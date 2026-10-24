@@ -29,8 +29,9 @@ libevent_extra 2.1.4 or newer (`evhttp_request_set_on_complete_cb()`), and
 Build against the libevent (and OpenSSL) you run with. memtier prints a
 warning on stderr at startup when the library loaded at run time is from
 another release series than the headers it was built with (libevent
-major.minor; OpenSSL major, or major.minor before 3.0). Patch level
-differences within a series are compatible and are not reported. The JSON
+major.minor; OpenSSL major.minor before 3.0, and from 3.0 on another major
+version or an older minor version than the headers). Other differences, such
+as patch levels, are compatible and are not reported. The JSON
 `run information` section records `libevent runtime version` and
 `libevent build version` (and `OpenSSL runtime version` and
 `OpenSSL build version` when TLS is compiled in). Results from different

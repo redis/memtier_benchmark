@@ -526,10 +526,11 @@ bool shard_connection::setup_event(evutil_socket_t sockfd)
             // SSL (libevent >= 2.1.9, upstream commit e86ccfe5, and 2.2.2), so
             // it must not be freed here. Recheck this when the libevent floor
             // or a new series changes; tests/library_failure_injector.c
-            // mimics this contract. The socket is still ours: the SSL's socket BIO does not
-            // close it. libevent <= 2.1.8 may already have closed it while
-            // freeing its partial bufferevent; leak it there rather than risk
-            // closing a descriptor another thread has just been given.
+            // mimics this contract.
+            // The socket is still ours: the SSL's socket BIO does not close
+            // it. libevent <= 2.1.8 may already have closed it while freeing
+            // its partial bufferevent; leak it there rather than risk closing
+            // a descriptor another thread has just been given.
             benchmark_error_log("error: bufferevent_openssl_socket_new() failed; cannot create the TLS "
                                 "connection.\n");
             if (event_get_version_number() >= 0x02010900) evutil_closesocket(sockfd);

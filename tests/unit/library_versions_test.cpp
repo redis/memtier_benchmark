@@ -43,9 +43,13 @@ int main(void)
     CHECK(libevent_series_differs(0x02001600UL, 0x02010c00UL)); // 2.0.22 / 2.1.12
     CHECK(libevent_series_differs(0x02010c00UL, 0x03010c00UL)); // major differs
 
-    // OpenSSL 3+: compatible within the major version.
+    // OpenSSL 3+: a newer library of the same major is compatible, an older
+    // minor version than the headers is not.
     CHECK(!openssl_series_differs(0x30000000UL, 0x300000d0UL)); // 3.0.0 / 3.0.13
-    CHECK(!openssl_series_differs(0x30500010UL, 0x30000020UL)); // 3.5.1 built, 3.0.2 run
+    CHECK(!openssl_series_differs(0x300000d0UL, 0x30000000UL)); // 3.0.13 built, 3.0.0 run (patch)
+    CHECK(!openssl_series_differs(0x30000020UL, 0x30500010UL)); // 3.0.2 built, 3.5.1 run
+    CHECK(openssl_series_differs(0x30500010UL, 0x30000020UL));  // 3.5.1 built, 3.0.2 run
+    CHECK(openssl_series_differs(0x30600000UL, 0x30500040UL));  // 3.6.0 built, 3.5.4 run
     CHECK(openssl_series_differs(0x30000020UL, 0x40000000UL));  // 3.0.2 / 4.0.0
     CHECK(openssl_series_differs(0x30000020UL, 0x1010117fUL));  // 3.0.2 / 1.1.1w
     // OpenSSL 1.x: compatible within major.minor.

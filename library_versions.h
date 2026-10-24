@@ -30,9 +30,12 @@ static inline bool libevent_series_differs(unsigned long build, unsigned long ru
     return (build >> 16) != (runtime >> 16);
 }
 
-// OpenSSL version numbers are 0xMNN00PP0 from 3.0 on, compatible within a
-// major version, and 0xMNNFFPPS before that, compatible within major.minor
-// (1.0.x vs 1.1.x). LibreSSL reports a fixed 0x20000000.
+// OpenSSL version numbers are 0xMNN00PP0 from 3.0 on and 0xMNNFFPPS before
+// that. From 3.0 on a major version only promises that a binary built with
+// older headers runs on a newer library, so a library of another major
+// version, or an older minor version than the headers, is reported. Before
+// 3.0 compatibility holds within major.minor (1.0.x vs 1.1.x). LibreSSL
+// reports a fixed 0x20000000.
 static inline unsigned long openssl_version_series(unsigned long version)
 {
     return version >= 0x30000000UL ? version >> 28 : version >> 20;
@@ -40,7 +43,9 @@ static inline unsigned long openssl_version_series(unsigned long version)
 
 static inline bool openssl_series_differs(unsigned long build, unsigned long runtime)
 {
-    return openssl_version_series(build) != openssl_version_series(runtime);
+    if (openssl_version_series(build) != openssl_version_series(runtime)) return true;
+    // Same 3.x major: only a runtime minor older than the headers' differs.
+    return build >= 0x30000000UL && (runtime >> 20) < (build >> 20);
 }
 
 #endif // MEMTIER_BENCHMARK_LIBRARY_VERSIONS_H
