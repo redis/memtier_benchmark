@@ -21,6 +21,7 @@ usage() {
 version="${LIBEVENT_VERSION:-2.1.13-stable}"
 flavour="${LIBEVENT_FLAVOUR:-release}"
 # Upstream libevent master; bump deliberately (the canary tracks this pin).
+# Bump the canary's expected version in libevent-compat.yml with it.
 master_commit=d82464a277d0f42703702c4dfd9af6af38595a83
 case "$version" in
     2.1.12-stable) source_id=92e6de1be9ec176428fd2367677e61ceffc2ee1cb119035037a27d346b0403bb ;;

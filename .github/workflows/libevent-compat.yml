@@ -77,7 +77,8 @@ jobs:
           versions = {"legacy": ("2.1.12-stable", "2.1.12-stable"),
                       "stable": ("2.1.13-stable", "2.1.13-stable"),
                       "next": ("2.2.2-alpha", "2.2.2-alpha-dev"),
-                      # master currently reports the 2.2.2-alpha-dev string too.
+                      # master @ the helper's master_commit reports 2.2.2-alpha-dev
+                      # too; update this together with that pin.
                       "canary": ("master", "2.2.2-alpha-dev")}
           cells = []
           def add(track, mode, topology, flavour="release", os_="ubuntu-24.04", openssl="system"):
