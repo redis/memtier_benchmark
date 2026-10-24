@@ -298,7 +298,7 @@ checks to `check-macos-tls-links.sh`).
   failures from the SSL object
   (`TLS connection error: certificate verify failed: <reason>`); any other
   TLS failure without a socket error prints
-  `TLS connection error: libevent <version> reported no OpenSSL reason`.
+  `TLS connection error: no OpenSSL reason reported (libevent <version>)`.
   Failure and reconnect handling are the same as on 2.1.
 
 ### Code Style
