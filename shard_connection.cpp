@@ -2097,7 +2097,8 @@ void shard_connection::handle_event(short events)
                 benchmark_error_log("TLS connection error: %s\n", reason);
             }
             // libevent 2.2.2 drains the OpenSSL queue into the bufferevent but
-            // its accessor returns nothing for a TLS bufferevent. Recover what
+            // its accessor returns nothing for a TLS bufferevent
+            // (https://github.com/libevent/libevent/issues/1935). Recover what
             // the SSL object still holds so a rejected certificate is reported.
             if (!ssl_error) {
                 SSL *ssl = bufferevent_openssl_get_ssl(m_bev);
