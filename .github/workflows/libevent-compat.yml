@@ -139,7 +139,8 @@ jobs:
     env:
       LIBEVENT_VERSION: ${{ matrix.version }}
       LIBEVENT_FLAVOUR: ${{ matrix.flavour }}
-      # Every cell builds the Prometheus exporter unless the matrix says otherwise.
+      # Every cell builds the Prometheus exporter: no cell sets prometheus: no
+      # yet; the knob is there for a future cell without the exporter.
       PROMETHEUS_BUILD: ${{ matrix.prometheus == 'no' && 'no' || 'yes' }}
       # abort_on_error turns every sanitizer report, leaks included, into
       # SIGABRT so a test that only checks the exit code cannot pass over it.
