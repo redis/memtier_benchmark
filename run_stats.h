@@ -349,7 +349,9 @@ public:
     void aggregate_average(const std::vector<run_stats> &all_stats);
     void summarize(totals &result) const;
     void summarize_current_second(void);
-    void merge(const run_stats &other, int iteration);
+    // include_duration is false for a client that never submitted workload.
+    // Generic statistics callers retain timestamp-based participation.
+    void merge(const run_stats &other, int iteration, bool include_duration = true);
     std::vector<one_sec_cmd_stats> get_one_sec_cmd_stats_get();
     std::vector<one_sec_cmd_stats> get_one_sec_cmd_stats_set();
     std::vector<one_sec_cmd_stats> get_one_sec_cmd_stats_wait();
