@@ -695,9 +695,9 @@ int redis_protocol::parse_response(void)
 
                 // Reject a count whose elements, together with the ones still
                 // outstanding, cannot be represented as int: the doubling right
-                // after this check, m_total_bulks_count and the
-                // m_nested_remaining bookkeeping further down are int-sized
-                // and would overflow. strtoll (not strtol: long is 32-bit on
+                // after this check and the m_nested_remaining bookkeeping
+                // further down are int arithmetic and would overflow. The
+                // bound also keeps m_total_bulks_count within int range. strtoll (not strtol: long is 32-bit on
                 // Windows) keeps counts above INT_MAX distinguishable and
                 // clamps out-of-range ones to LLONG_MAX. A nested aggregate
                 // fills one of the outstanding slots of its parent.
