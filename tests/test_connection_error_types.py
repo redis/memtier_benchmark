@@ -6,7 +6,7 @@ import ssl
 import subprocess
 import threading
 
-from include import MEMTIER_BINARY, TLS_CERT, TLS_KEY
+from include import MEMTIER_BINARY, TLS_CACERT, TLS_CERT, TLS_KEY
 
 
 def _tls_enabled():
@@ -72,6 +72,22 @@ def test_plaintext_connection_refused(env):
     env.assertNotContains("TLS connection error:", stderr, message=stderr)
 
 
+def test_tls_connection_refused(env):
+    # The TCP connect fails before any TLS record is sent: that is not a TLS
+    # failure, even when libevent 2.2.2 reports no OpenSSL reason.
+    if not _tls_enabled():
+        env.skip()
+        return
+    with socket.socket() as reserved:
+        reserved.bind(("127.0.0.1", 0))
+        stderr = _run_failure(env, reserved.getsockname()[1],
+                              ["--tls", "--tls-skip-verify"])
+    env.assertNotContains("reported no OpenSSL reason", stderr, message=stderr)
+    # libevent 2.1 also queues SSL_ERROR_SYSCALL, which has no reason string.
+    env.assertNotContains("(null)", stderr, message=stderr)
+    env.assertContains("Connection error: Connection refused", stderr, message=stderr)
+
+
 def test_tls_handshake_failure(env):
     if not _tls_enabled():
         env.skip()
@@ -121,3 +137,37 @@ def test_tls_certificate_verify_failure(env):
         env.assertFalse(worker.is_alive())
     env.assertGreaterEqual(len(accepted), 2)
     env.assertContains("certificate verify failed", stderr, message=stderr)
+
+
+def test_tls_skip_verify_failure_not_blamed_on_certificate(env):
+    # The server sends its certificate and then rejects the handshake because
+    # memtier has no client certificate. With --tls-skip-verify OpenSSL still
+    # records the (ignored) verification result; it must not be reported.
+    if not _tls_enabled() or not TLS_CERT or not TLS_KEY or not os.path.exists(TLS_CERT):
+        env.skip()
+        return
+
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(TLS_CERT, TLS_KEY)
+    context.load_verify_locations(TLS_CACERT)
+    context.verify_mode = ssl.CERT_REQUIRED
+    # TLS 1.3 completes the client handshake before the server checks the
+    # client certificate; 1.2 fails the handshake itself.
+    context.maximum_version = ssl.TLSVersion.TLSv1_2
+
+    def handshake(conn):
+        with context.wrap_socket(conn, server_side=True) as tls:
+            tls.recv(4096)
+
+    with _listener() as listener:
+        stop, worker, accepted = _serve(listener, handshake)
+        try:
+            stderr = _run_failure(env, listener.getsockname()[1],
+                                  ["--tls", "--tls-skip-verify"])
+        finally:
+            stop.set()
+            worker.join(timeout=3)
+        env.assertFalse(worker.is_alive())
+    env.assertGreaterEqual(len(accepted), 2)
+    env.assertContains("TLS connection error:", stderr, message=stderr)
+    env.assertNotContains("certificate verify failed", stderr, message=stderr)
