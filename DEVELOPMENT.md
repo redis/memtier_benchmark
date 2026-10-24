@@ -8,7 +8,7 @@ This document provides information for developers working on memtier_benchmark.
 
 The following libraries are required for building:
 
-* libevent 2.1.1 or newer (the default-on Prometheus exporter requires evhttp >= 2.1.1; libevent 2.0.10 suffices with ./configure --disable-prometheus).
+* libevent 2.1.1 or newer (the default-on Prometheus exporter requires evhttp >= 2.1.1; libevent 2.0.11 suffices with ./configure --disable-prometheus). The 2.0.11 minimum is required for cached event-loop timestamps in the wall-clock epoch, used by timed reconnect deadlines.
 * OpenSSL (unless TLS support is disabled by `./configure --disable-tls`).
 * Prometheus /metrics exporter support can be disabled by ./configure --disable-prometheus.
 
