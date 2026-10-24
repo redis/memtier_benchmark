@@ -502,6 +502,12 @@ bool shard_connection::setup_event(evutil_socket_t sockfd)
         // bufferevent can be created below.
         if (m_protocol != NULL) m_protocol->set_buffers(NULL, NULL);
     }
+    // A Unix socket connect retry belongs to the previous attempt; it must not
+    // fire against the bufferevent created below (or against none).
+    if (m_unix_connect_timer != NULL) {
+        event_free(m_unix_connect_timer);
+        m_unix_connect_timer = NULL;
+    }
     // Fresh bufferevent below starts enabled by default (after we call
     // bufferevent_enable in handle_event on BEV_EVENT_CONNECTED); reset the
     // pause flag so we don't carry stale state from a prior socket.
@@ -533,7 +539,8 @@ bool shard_connection::setup_event(evutil_socket_t sockfd)
             // The socket is still ours: the SSL's socket BIO does not close
             // it. libevent <= 2.1.8 may already have closed it while freeing
             // its partial bufferevent; leak it there rather than risk closing
-            // a descriptor another thread has just been given.
+            // a descriptor another thread has just been given. Under repeated
+            // failure (cluster mode retries) that is one descriptor per attempt.
             benchmark_error_log("error: bufferevent_openssl_socket_new() failed; cannot create the TLS "
                                 "connection.\n");
             if (event_get_version_number() >= 0x02010900) evutil_closesocket(sockfd);
