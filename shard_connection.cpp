@@ -498,6 +498,9 @@ bool shard_connection::setup_event(evutil_socket_t sockfd)
     if (m_bev) {
         bufferevent_free(m_bev);
         m_bev = NULL;
+        // Don't leave the protocol pointing at the freed evbuffers if no new
+        // bufferevent can be created below.
+        if (m_protocol != NULL) m_protocol->set_buffers(NULL, NULL);
     }
     // Fresh bufferevent below starts enabled by default (after we call
     // bufferevent_enable in handle_event on BEV_EVENT_CONNECTED); reset the
