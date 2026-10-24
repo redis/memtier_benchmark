@@ -294,9 +294,10 @@ checks to `check-macos-tls-links.sh`).
   that `--version` reports with results and compare runs only on the same
   libevent build.
 * **TLS error details.** libevent 2.2.2-alpha's `bufferevent_get_openssl_error()`
-  returns nothing for TLS bufferevents. memtier then reports
-  `TLS connection error: certificate verify failed: <reason>` from the SSL
-  object when certificate verification failed, and otherwise
+  returns nothing for TLS bufferevents. memtier then reports certificate
+  failures from the SSL object
+  (`TLS connection error: certificate verify failed: <reason>`); any other
+  TLS failure without a socket error prints
   `TLS connection error: libevent <version> reported no OpenSSL reason`.
   Failure and reconnect handling are the same as on 2.1.
 
