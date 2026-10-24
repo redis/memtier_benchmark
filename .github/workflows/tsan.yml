@@ -171,7 +171,6 @@ jobs:
             tls: false
     runs-on: ubuntu-latest
     name: TSAN ${{ matrix.test-config.name }}
-    continue-on-error: true  # Don't fail build on known races
     steps:
     - uses: actions/checkout@v5
 
@@ -195,7 +194,7 @@ jobs:
         architecture: x64
 
     - name: Install Python test dependencies
-      run: pip install -r ./tests/test_requirements.txt
+      run: ./utils/install_test_requirements.sh
 
     - name: Install Redis
       run: |

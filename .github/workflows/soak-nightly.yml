@@ -111,7 +111,7 @@ jobs:
           architecture: x64
 
       - name: Install Python dependencies
-        run: pip install -r ./tests/test_requirements.txt
+        run: ./utils/install_test_requirements.sh
 
       - name: Install Redis
         run: |
