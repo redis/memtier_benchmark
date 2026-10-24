@@ -948,12 +948,16 @@ def test_F15b_zero_snapshot_no_publish_during_verify(env):
 # F16 -- IPv6
 # ---------------------------------------------------------------------------
 def test_F16_ipv6(env):
-    # skip-guard: can we bind ::1 at all on this host?
+    # skip-guard: can we bind ::1 at all on this host? evhttp resolves the
+    # address with AI_ADDRCONFIG, which rejects IPv6 when no non-loopback
+    # IPv6 address is configured (e.g. in a default Docker container).
     try:
+        socket.getaddrinfo("::1", 0, socket.AF_UNSPEC, socket.SOCK_STREAM, 0,
+                           socket.AI_PASSIVE | socket.AI_ADDRCONFIG)
         s6 = socket.socket(socket.AF_INET6)
         s6.bind(("::1", 0))
         s6.close()
-    except OSError:
+    except (OSError, socket.gaierror):
         env.skip()
         return
     rd = _new_results_dir()

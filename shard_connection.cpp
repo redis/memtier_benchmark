@@ -320,7 +320,9 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_deferred_fill_timer(NULL),
         m_cluster_slots_retry_timer(NULL),
         m_setup_rejected_timer(NULL),
-        m_bev_paused(false)
+        m_bev_paused(false),
+        m_in_socket_connect(false),
+        m_socket_connect_error(0)
 {
     m_id = id;
     m_conns_manager = conns_man;
@@ -616,6 +618,18 @@ static int bufferevent_connect_nonblocking(struct bufferevent *bev, evutil_socke
 }
 #endif
 
+// bufferevent_socket_connect() on m_bev. A failure that libevent 2.1.8 and
+// older report through handle_event() from inside the call is kept in
+// m_socket_connect_error for the caller instead (see handle_event()).
+int shard_connection::socket_connect(struct sockaddr *sa, int socklen)
+{
+    m_in_socket_connect = true;
+    m_socket_connect_error = 0;
+    int ret = bufferevent_socket_connect(m_bev, sa, socklen);
+    m_in_socket_connect = false;
+    return ret;
+}
+
 int shard_connection::connect(struct connect_info *addr)
 {
     // Belt-and-suspenders: disconnect() already calls reset_state(), but if
@@ -658,7 +672,10 @@ int shard_connection::connect(struct connect_info *addr)
     struct sockaddr *sa = m_unix_sockaddr ? (struct sockaddr *) m_unix_sockaddr : addr->ci_addr;
     int socklen = m_unix_sockaddr ? m_unix_sockaddrlen : addr->ci_addrlen;
 #ifdef _WIN32
+    m_in_socket_connect = true;
+    m_socket_connect_error = 0;
     int ret = bufferevent_connect_nonblocking(m_bev, sockfd, sa, socklen);
+    m_in_socket_connect = false;
     if (ret == 1) {
         // Do not enter the error callback during client preparation. This
         // connection owns the queued event so disconnect/destruction cancels
@@ -675,10 +692,10 @@ int shard_connection::connect(struct connect_info *addr)
         }
     }
 #else
-    int ret = bufferevent_socket_connect(m_bev, sa, socklen);
+    int ret = socket_connect(sa, socklen);
 #endif
     if (ret == -1) {
-        const int error = EVUTIL_SOCKET_ERROR();
+        const int error = m_socket_connect_error != 0 ? m_socket_connect_error : EVUTIL_SOCKET_ERROR();
         // A full Unix listener backlog returns EAGAIN without starting a
         // connection. Wait between attempts so the worker and supervisor can
         // still run. TCP EINPROGRESS is already handled by libevent.
@@ -744,13 +761,13 @@ void shard_connection::handle_unix_connect_retry()
         attempt_reconnect("Unix socket listen queue still full at run deadline");
         return;
     }
-    if (bufferevent_socket_connect(m_bev, (struct sockaddr *) m_unix_sockaddr, m_unix_sockaddrlen) == 0) {
+    if (socket_connect((struct sockaddr *) m_unix_sockaddr, m_unix_sockaddrlen) == 0) {
         event_free(m_unix_connect_timer);
         m_unix_connect_timer = NULL;
         bufferevent_enable(m_bev, EV_READ | EV_WRITE);
         return;
     }
-    const int error = errno;
+    const int error = m_socket_connect_error != 0 ? m_socket_connect_error : errno;
     if (error == EAGAIN || error == EWOULDBLOCK) return;
 
     event_free(m_unix_connect_timer);
@@ -1990,6 +2007,15 @@ void shard_connection::fill_pipeline(void)
 
 void shard_connection::handle_event(short events)
 {
+    // libevent 2.1.8 and older run the error callback from inside a failing
+    // bufferevent_socket_connect(), before it returns -1. connect() handles
+    // that failure itself, as with newer libevent, which does not call back:
+    // just keep the error for it.
+    if (m_in_socket_connect) {
+        if (events & BEV_EVENT_ERROR) m_socket_connect_error = EVUTIL_SOCKET_ERROR();
+        return;
+    }
+
     // connect() returning to us?  normally we expect EV_WRITE, but for UNIX domain
     // sockets we workaround since connect() returned immediately, but we don't want
     // to do any I/O from the client::connect() call...
