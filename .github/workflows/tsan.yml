@@ -61,6 +61,24 @@ jobs:
         ./configure --enable-thread-sanitizer
         make -j
 
+    # Unit tests inherit the sanitizer CXXFLAGS/LDFLAGS set by configure.
+    # Same ASLR workaround and suppressions as the RLTest jobs.
+    - name: Run unit tests
+      run: |
+        export TSAN_OPTIONS="suppressions=$(pwd)/tsan_suppressions.txt"
+        setarch `uname -m` -R make -j check
+
+    - name: Upload unit test logs
+      if: failure()
+      uses: actions/upload-artifact@v5
+      with:
+        name: memtier-tsan-unit-test-logs
+        path: |
+          test-suite.log
+          *_test.log
+        if-no-files-found: ignore
+        retention-days: 7
+
     - name: Verify TSAN is enabled
       run: |
         ldd ./memtier_benchmark | grep tsan
