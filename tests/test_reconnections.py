@@ -12,15 +12,6 @@ from include import *
 from mb import Benchmark, RunConfig
 
 
-def _add_auth_args(benchmark_specs, env):
-    """--authenticate with the env's password (e.g. --oss_password), so
-    memtier's clients get a session the kills below can target."""
-    password = env.getOSSMasterNodesConnectionList()[0].connection_pool.connection_kwargs.get("password")
-    if password and not any(arg == "--authenticate" or arg.startswith("--authenticate=")
-                            for arg in benchmark_specs["args"]):
-        benchmark_specs["args"].append("--authenticate=" + password)
-
-
 def _run_with_memtier_kills(env, benchmark, config, conns, waves, timeout=60):
     """Run memtier and kill its connections in `waves` waves.
 
@@ -96,7 +87,7 @@ def test_reconnect_on_connection_kill(env):
         ],
     }
     addTLSArgs(benchmark_specs, env)
-    _add_auth_args(benchmark_specs, env)
+    benchmark_specs["args"].extend(memtier_auth_args(env, benchmark_specs["args"]))
 
     config = get_default_memtier_config(threads=2, clients=2, requests=20000)
     master_nodes_list = env.getMasterNodesList()
@@ -167,7 +158,7 @@ def test_reconnect_cluster_mode_no_assertion(env):
         ],
     }
     addTLSArgs(benchmark_specs, env)
-    _add_auth_args(benchmark_specs, env)
+    benchmark_specs["args"].extend(memtier_auth_args(env, benchmark_specs["args"]))
 
     config = get_default_memtier_config(threads=4, clients=2, requests=None, test_time=10)
     master_nodes_list = env.getMasterNodesList()
@@ -282,7 +273,7 @@ def test_reconnect_unlimited_no_spurious_thread_restart(env):
         ],
     }
     addTLSArgs(benchmark_specs, env)
-    _add_auth_args(benchmark_specs, env)
+    benchmark_specs["args"].extend(memtier_auth_args(env, benchmark_specs["args"]))
 
     config = get_default_memtier_config(threads=2, clients=2, requests=20000)
     master_nodes_list = env.getMasterNodesList()
@@ -339,7 +330,7 @@ def test_reconnect_disabled_by_default(env):
         ],
     }
     addTLSArgs(benchmark_specs, env)
-    _add_auth_args(benchmark_specs, env)
+    benchmark_specs["args"].extend(memtier_auth_args(env, benchmark_specs["args"]))
 
     config = get_default_memtier_config(threads=1, clients=1, requests=100000)
     master_nodes_list = env.getMasterNodesList()
@@ -787,7 +778,7 @@ def _run_with_mid_run_client_kill(env, extra_args, test_time, kill_after):
         ] + extra_args,
     }
     addTLSArgs(benchmark_specs, env)
-    _add_auth_args(benchmark_specs, env)
+    benchmark_specs["args"].extend(memtier_auth_args(env, benchmark_specs["args"]))
 
     config = get_default_memtier_config(threads=2, clients=2, requests=None, test_time=test_time)
     master_nodes_list = env.getMasterNodesList()
@@ -935,7 +926,7 @@ def test_dropped_in_flight_requests_do_not_stall_client(env):
     ]
     benchmark_specs = {"name": env.testName, "args": args}
     addTLSArgs(benchmark_specs, env)
-    _add_auth_args(benchmark_specs, env)
+    benchmark_specs["args"].extend(memtier_auth_args(env, benchmark_specs["args"]))
 
     config = get_default_memtier_config(threads=1, clients=1, requests=None, test_time=test_time)
     master_nodes_list = env.getMasterNodesList()
@@ -1484,7 +1475,7 @@ def _run_until_server_gone(env, extra_args, test_time, requests=None, stop_after
         "args": ["--reconnect-on-error", "--rate-limiting=200", "--hide-histogram"] + extra_args,
     }
     addTLSArgs(benchmark_specs, env)
-    _add_auth_args(benchmark_specs, env)
+    benchmark_specs["args"].extend(memtier_auth_args(env, benchmark_specs["args"]))
     config = get_default_memtier_config(threads=threads, clients=clients, requests=requests, test_time=test_time)
     node = dict(env.getMasterNodesList()[0])
     if env.isUnixSocket():
@@ -2017,7 +2008,7 @@ def test_merged_duration_averages_all_threads(env):
         ],
     }
     addTLSArgs(benchmark_specs, env)
-    _add_auth_args(benchmark_specs, env)
+    benchmark_specs["args"].extend(memtier_auth_args(env, benchmark_specs["args"]))
     config = get_default_memtier_config(threads=4, clients=1, requests=requests)
     add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
     test_dir = tempfile.mkdtemp()

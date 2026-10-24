@@ -180,6 +180,9 @@ def _base_args(env, requests=None):
 # Issue #426 item 1: --authenticate '' against no-auth Redis hangs.
 # ---------------------------------------------------------------------------
 def test_426_1_authenticate_empty_password_against_no_auth(env):
+    if env.getMasterNodesList()[0].get("password"):
+        env.skip()  # the server requires a password: not the case under test
+        return
     args = _base_args(env)
     if args is None:
         return
