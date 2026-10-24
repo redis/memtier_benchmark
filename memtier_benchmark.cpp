@@ -3308,9 +3308,9 @@ void usage()
         "iterations\n"
         "      --realtime-latencies       Replace the periodic single-line progress output with a per-tick block: "
         "line 1 = throughput + miss ratio, then labeled latency rows carrying the percentiles configured by "
-        "--print-percentiles: inst (each client's current second), win<N>s (sliding window, see --latency-window) and "
-        "overall "
-        "(full run). Each row shows its sample count n; a percentile p with fewer than 100/(100-p) samples (1M "
+        "--print-percentiles: inst (each client's current second), win<N>s (sliding window, see --latency-window) "
+        "and overall (full run). Each row shows its sample count n; a percentile p with fewer than 100/(100-p) samples "
+        "(1M "
         "for p99.9999) is not resolved and is marked '*'. Redraws in place on a TTY; appends cleanly when "
         "stderr is redirected to a file.\n"
         "      --latency-window=SECS      Sliding-window size for the win<N>s row of --realtime-latencies: "
@@ -4121,16 +4121,16 @@ static unsigned long long percentile_min_samples(double p)
 {
     if (p >= 100.0) return 1;
     double n = 100.0 / (100.0 - p);
-    // The binary rounding of p is amplified by 100 / (100 - p): snap n to the
-    // significant digits that survive it (at most 7), so p99.9999 needs 1e6
-    // and p99.99999999 1e10, not slightly more.
-    double rel_err = 400.0 * DBL_EPSILON / (100.0 - p);
-    double digits = floor(-log10(rel_err));
-    if (digits > 7) digits = 7;
-    if (digits < 1) digits = 1;
-    double scale = pow(10.0, digits - 1 - floor(log10(n)));
-    n = round(n * scale) / scale;
-    return (unsigned long long) ceil(n * (1.0 - 1e-12));
+    // p parsed from decimal is off by at most half an ulp of 100 (32 epsilon),
+    // which 100 / (100 - p) amplifies. When n is within that error of a value
+    // the user plausibly meant (an integer, or for many nines the significant
+    // digits that survive), use it: p99.9999 needs 1e6, not 1e6 + 1, and
+    // p99.9999999999 1e12. Otherwise round up: p99.99991 needs 1111112.
+    double err = n * 64.0 * DBL_EPSILON / (100.0 - p);
+    double unit = 1;
+    if (err >= 0.5) unit = pow(10.0, floor(log10(err)) + 1);
+    double candidate = round(n / unit) * unit;
+    return (unsigned long long) llround(fabs(n - candidate) <= err ? candidate : ceil(n));
 }
 
 // Compact sample count for the --realtime-latencies rows: 987, 12.3K, 1.23M.
@@ -4152,7 +4152,9 @@ static void format_sample_count(unsigned long long n, char *buf, size_t len)
 // bound the sample count; otherwise the realtime rows flag them live.
 // rate_conns is the number of request-generating connections, each limited to
 // --rate-limiting: clients x threads, times the traffic endpoints in cluster
-// mode, which is only known once the first topology is committed.
+// mode, which is only known once the first topology is committed. The check
+// runs once per process, so a later topology with more endpoints can exceed
+// the bound it reported.
 static void warn_unresolvable_percentiles(const benchmark_config *cfg, unsigned long long rate_conns)
 {
     // Upper bounds on recorded latency samples; 0 means unbounded. A
@@ -4175,10 +4177,11 @@ static void warn_unresolvable_percentiles(const benchmark_config *cfg, unsigned 
     for (size_t i = 0; i < quantiles.size(); i++) {
         unsigned long long need = percentile_min_samples(quantiles[i]);
         if (run_max && run_max < need) {
+            // --requests is an exact bound; the rate-limit bound is approximate.
             fprintf(stderr,
-                    "warning: p%.10g needs at least %llu latency samples, but this run records at most about %.0f, "
+                    "warning: p%.10g needs at least %llu latency samples, but this run records at most %s%.0f, "
                     "so it will not be resolved.\n",
-                    quantiles[i], need, run_max);
+                    quantiles[i], need, cfg->requests ? "" : "about ", run_max);
         } else if (window_max && window_max < need) {
             fprintf(stderr,
                     "warning: p%.10g needs at least %llu latency samples, but the %us latency window holds at "

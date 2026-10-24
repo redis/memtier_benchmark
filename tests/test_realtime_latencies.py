@@ -293,11 +293,9 @@ def test_default_progress_line_unchanged(env):
             debugPrintMemtierOnError(config, env)
 
 
-def test_latency_window_ring_smooths_spikes(env):
-    """A short window (2s) plus a long-enough run must produce a [win2s] row
-    whose p99 falls into the same numeric range as the inst row over time
-    (smoothed but not zero). Sanity check that the ring is actually populated
-    and computed, not silently empty."""
+def test_latency_window_row_reports_values(env):
+    """A short window (2s) over a 5s run must produce several [win2s] rows with
+    a positive p99: the ring is populated and computed, not silently empty."""
     benchmark_specs = {
         "name": env.testName,
         "args": [
@@ -415,7 +413,7 @@ def test_latency_window_counts_every_sample_and_marks_unresolved(env):
 
         env.assertTrue(
             re.search(
-                r"warning: p99\.99 needs at least 10000 latency samples, but this run records at most about 1000,", stderr
+                r"warning: p99\.99 needs at least 10000 latency samples, but this run records at most 1000,", stderr
             )
             is not None,
             message=stderr[:2000],
@@ -480,6 +478,8 @@ def test_latency_window_warns_when_rate_limit_cannot_fill_it(env):
             "the win1s row marks it with '*'." % (202 * endpoints)
         )
         env.assertEqual(stderr.count(expected), 1, message=stderr[:2000])
+        # No other check (e.g. one that ignores the cluster endpoints) warns.
+        env.assertEqual(stderr.count("warning: p99.9 needs"), 1, message=stderr[:2000])
         # Every rendered win1s p99.9 is unresolved, as the warning promises.
         for frame in _frames(stderr):
             if "win1s" in frame:
