@@ -239,6 +239,11 @@ def test_crash_handler_worker_thread(env):
         proc.kill()
         proc.wait()
         env.assertTrue(False, message="Process did not exit after SEGV signal")
+    finally:
+        # The TSan signal helper can raise; do not leave memtier running.
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
 
     # Read the crash log
     with open(log_file, 'r') as f:
@@ -480,8 +485,8 @@ def _signal_tsan_main(pid, sig, timeout=10.0):
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        os.kill(pid, signal.SIGSTOP)
         try:
+            os.kill(pid, signal.SIGSTOP)
             if _wait_stopped(pid) and _main_thread_sleeping(pid):
                 if not _tgkill(pid, pid, sig):
                     raise RuntimeError("tgkill is needed to signal a TSan build's main thread")
