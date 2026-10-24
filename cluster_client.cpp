@@ -863,6 +863,13 @@ std::vector<cluster_endpoint_info> cluster_client::build_topology_snapshot() con
     return out;
 }
 
+static std::atomic<unsigned long long> s_rate_limited_connections(0);
+
+unsigned long long cluster_client::rate_limited_connections()
+{
+    return s_rate_limited_connections.load();
+}
+
 void cluster_client::print_topology_summary() const
 {
     std::vector<cluster_endpoint_info> eps = build_topology_snapshot();
@@ -970,6 +977,16 @@ void cluster_client::print_topology_summary() const
                                              (unsigned long long) m_config->clients * traffic_eps;
         fprintf(stderr, "[RUN #%u] Rate limit: %u req/s/conn -> %llu req/s aggregate target%s\n", rid,
                 m_config->request_rate, aggregate, ramp);
+    }
+
+    // Publish the same connection fan-out for the main thread's
+    // unresolvable-percentile check (first topology only).
+    if (s_rate_limited_connections.load() == 0) {
+        const unsigned long long traffic_eps =
+            (unsigned long long) primaries +
+            (m_config->read_preference != rp_primary ? (unsigned long long) replicas : 0);
+        s_rate_limited_connections.store((unsigned long long) m_config->threads *
+                                         (unsigned long long) m_config->clients * traffic_eps);
     }
 
     pthread_mutex_unlock(&s_mtx);

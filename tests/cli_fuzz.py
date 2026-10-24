@@ -289,6 +289,7 @@ FLAG_SPECS = [
     ("--print-percentiles", percentiles_like),
     ("--print-all-runs", None),
     ("--realtime-latencies", None),
+    ("--latency-window", weird_int),
     ("--command-stats-breakdown", breakdown_like),
     ("--command-miss-tracking", miss_tracking_like),
     ("--miss-rate-threshold", weird_float),

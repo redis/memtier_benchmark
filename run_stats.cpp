@@ -201,7 +201,8 @@ void run_stats::summarize_current_second(void)
     hdr_reset(inst_m_set_latency_histogram);
     hdr_reset(inst_m_wait_latency_histogram);
     pthread_mutex_lock(&m_inst_histogram_mutex.mtx);
-    if (m_config->prometheus != NULL) hdr_add(m_prom_pending_latency_histogram, inst_m_totals_latency_histogram);
+    if (m_config->prometheus != NULL || m_config->realtime_latencies)
+        hdr_add(m_prom_pending_latency_histogram, inst_m_totals_latency_histogram);
     hdr_reset(inst_m_totals_latency_histogram);
     pthread_mutex_unlock(&m_inst_histogram_mutex.mtx);
 }
