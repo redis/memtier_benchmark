@@ -871,14 +871,13 @@ interval. JSON configuration records the interval as `progress_interval`.
 `--realtime-latencies` prints three latency rows per tick: `inst` (each
 client's current second), `win<N>s` (every sample completed in the last N
 seconds, set by `--latency-window=N`, default 60, 0 disables, max 3600) and
-`overall` (the whole
-run). For example, the last 60 seconds' p99.9999:
+`overall` (the whole run). For example, the last 60 seconds' p99.9999:
 
 ```
 memtier_benchmark ... --realtime-latencies --latency-window=60 --print-percentiles=50,99,99.9999
-[RUN #1  50%  90s] latency [inst    ] n=31.2K   p50  0.111   p99  0.223   p99.9999  0.912*
-[RUN #1  50%  90s] latency [win60s  ] n=1.87M   p50  0.119   p99  0.239   p99.9999  1.733
-[RUN #1  50%  90s] latency [overall ] n=2.81M   p50  0.119   p99  0.239   p99.9999  2.104  ms
+[RUN #1  50%  90s] latency [inst    ] n=31.2K    p50  0.111   p99  0.223   p99.9999  0.912*
+[RUN #1  50%  90s] latency [win60s  ] n=1.87M    p50  0.119   p99  0.239   p99.9999  1.733
+[RUN #1  50%  90s] latency [overall ] n=2.81M    p50  0.119   p99  0.239   p99.9999  2.104  ms
 ```
 
 `n` is the row's sample count. A percentile p needs at least `100/(100-p)`
