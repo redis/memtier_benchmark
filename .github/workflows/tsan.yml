@@ -4,8 +4,8 @@ name: TSAN (ThreadSanitizer)
 # This workflow builds memtier_benchmark with TSAN enabled and runs
 # tests to detect data races and threading issues.
 #
-# NOTE: TSAN currently detects known data races in the codebase.
-# This workflow is informational and will not fail the build.
+# Known benign races are suppressed in tsan_suppressions.txt; any other TSAN
+# report or test failure fails the workflow.
 # See: https://github.com/google/sanitizers/issues/1716 for TSAN/ASLR issues
 
 on:

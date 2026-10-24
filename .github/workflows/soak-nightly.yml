@@ -111,7 +111,13 @@ jobs:
           architecture: x64
 
       - name: Install Python dependencies
-        run: ./utils/install_test_requirements.sh
+        # Release branches checked out above may predate the helper.
+        run: |
+          if [ -x ./utils/install_test_requirements.sh ]; then
+            ./utils/install_test_requirements.sh
+          else
+            pip install -r ./tests/test_requirements.txt
+          fi
 
       - name: Install Redis
         run: |
