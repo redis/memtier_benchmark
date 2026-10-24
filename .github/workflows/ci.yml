@@ -265,6 +265,11 @@ jobs:
           - name: "Single Endpoint: TCP Plaintext"
             env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "0", VERBOSE: "1", PARALLELISM: "2" }
             tls: false
+          # Servers require a password: every test must authenticate memtier (#826).
+          - name: "Single Endpoint: TCP Plaintext with auth"
+            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "0", VERBOSE: "1", PARALLELISM: "2",
+                   REDIS_PASSWORD: "auth-ci-dummy" }
+            tls: false
           - name: "Single Endpoint: Unix socket reconnects"
             env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", UNIX: "1", TLS: "0", VERBOSE: "1",
                    TEST: "test_reconnections.py", REDIS_PORT: "22001", REDIS_PASSWORD: "unix-ci-dummy" }
@@ -347,7 +352,7 @@ jobs:
         architecture: x64
 
     - name: Install Python dependencies
-      run: pip install -r ./tests/test_requirements.txt
+      run: ./utils/install_test_requirements.sh
 
     - name: Install Redis
       run: |
@@ -425,7 +430,7 @@ jobs:
         architecture: x64
 
     - name: Install Python dependencies
-      run: pip install -r ./tests/test_requirements.txt
+      run: ./utils/install_test_requirements.sh
 
     - name: Install Redis
       run: |
@@ -532,7 +537,7 @@ jobs:
         architecture: x64
 
     - name: Install Python dependencies
-      run: pip install -r ./tests/test_requirements.txt
+      run: ./utils/install_test_requirements.sh
 
     - name: Install Redis
       run: |

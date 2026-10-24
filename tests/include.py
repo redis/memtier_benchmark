@@ -42,6 +42,40 @@ def assert_minimum_memtier_outcomes(config, env, memtier_ok, overall_expected_re
         if env.getNumberOfFailedAssertion() > failed_asserts:
             debugPrintMemtierOnError(config, env)
 
+def _option_values(args, short, long):
+    """Values of a memtier option passed as -x v, -xv, --long v or --long=v."""
+    values = []
+    for i, arg in enumerate(args):
+        if arg in (short, long):
+            values.append(args[i + 1] if i + 1 < len(args) else "")
+        elif arg.startswith(long + "="):
+            values.append(arg[len(long) + 1:])
+        elif arg.startswith(short) and not arg.startswith("--"):
+            values.append(arg[len(short):])
+    return values
+
+
+def memtier_auth_args(env, args=()):
+    """
+    --authenticate with the env's password (run_tests.sh REDIS_PASSWORD), for
+    tests that build the memtier command line themselves. Empty when the env
+    has no password, when args already carry -a/--authenticate or a -u/--uri
+    with userinfo, or when args select a memcache protocol (which cannot AUTH
+    as a Redis client). As in memtier, the last --uri and --protocol win.
+    """
+    password = env.getMasterNodesList()[0].get("password")
+    args = [str(arg) for arg in args]
+    if not password or _option_values(args, "-a", "--authenticate"):
+        return []
+    uris = _option_values(args, "-u", "--uri")
+    if uris and "@" in uris[-1].split("://", 1)[-1].split("/", 1)[0]:
+        return []
+    protocols = _option_values(args, "-P", "--protocol")
+    if protocols and protocols[-1].startswith("memcache"):
+        return []
+    return ["--authenticate", password]
+
+
 def add_required_env_arguments(benchmark_specs, config, env, master_nodes_list):
     if VERBOSE:
         logging.basicConfig(level=logging.DEBUG)
@@ -50,6 +84,8 @@ def add_required_env_arguments(benchmark_specs, config, env, master_nodes_list):
     master_nodes_connections = env.getOSSMasterNodesConnectionList()
     ensure_tls_protocols(master_nodes_connections)
 
+    # The env's password (run_tests.sh REDIS_PASSWORD, RLTest --oss_password)
+    benchmark_specs["args"].extend(memtier_auth_args(env, benchmark_specs["args"]))
     # check if environment is cluster
     if env.isCluster():
         benchmark_specs["args"].append("--cluster-mode")
@@ -75,15 +111,25 @@ def debugPrintMemtierOnError(config, env):
             for line in f:
                 env.debugPrint(line.rstrip(), True)
 
-    if not env.isCluster():
-        if env.envRunner is not None:
-            log_file = os.path.join(env.envRunner.dbDirPath, env.envRunner._getFileName('master', '.log'))
-            with open(log_file) as redislog:
-                env.debugPrint("### REDIS LOG ###", True)
-                env.debugPrint(
-                    "### log_file file location: {0}".format(log_file), True)
-                for line in redislog:
-                    env.debugPrint(line.rstrip(), True)
+    if env.isCluster():
+        return
+    runner = getattr(env, 'envRunner', None)
+    db_dir = getattr(runner, 'dbDirPath', None)
+    get_file_name = getattr(runner, '_getFileName', None)
+    if db_dir is None or not callable(get_file_name):
+        env.debugPrint("### Redis log unavailable (environment has no captured log) ###", True)
+        return
+    log_file = os.path.join(db_dir, get_file_name('master', '.log'))
+    try:
+        with open(log_file, errors="replace") as redislog:
+            env.debugPrint("### REDIS LOG ###", True)
+            env.debugPrint("### log_file file location: {0}".format(log_file), True)
+            for line in redislog:
+                env.debugPrint(line.rstrip(), True)
+    except OSError as error:
+        # Existing environments and -s may not provide a log. Diagnostic IO
+        # must not replace the assertion failure that brought us here.
+        env.debugPrint("### Redis log unavailable: {0} ###".format(error), True)
 
 
 def get_expected_request_count(config, key_minimum=0, key_maximum=1000000):

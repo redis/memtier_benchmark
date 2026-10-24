@@ -400,9 +400,7 @@ def test_retried_requests_are_counted_once(env):
 
     conn = env.getOSSMasterNodesConnectionList()[0]
     conn.execute_command("FLUSHALL")
-    saved = conn.execute_command("CONFIG", "GET", "maxmemory*")
-    # Keys come back as bytes without decoded responses.
-    saved = {k.decode() if isinstance(k, bytes) else k: v for k, v in zip(saved[0::2], saved[1::2])}
+    saved = conn.config_get("maxmemory*")
     conn.execute_command("CONFIG", "SET", "maxmemory-policy", "noeviction")
     conn.execute_command("CONFIG", "RESETSTAT")
 
@@ -466,9 +464,7 @@ def test_retry_after_last_request_is_sent(env):
 
     conn = env.getOSSMasterNodesConnectionList()[0]
     conn.execute_command("FLUSHALL")
-    saved = conn.execute_command("CONFIG", "GET", "maxmemory*")
-    # Keys come back as bytes without decoded responses.
-    saved = {k.decode() if isinstance(k, bytes) else k: v for k, v in zip(saved[0::2], saved[1::2])}
+    saved = conn.config_get("maxmemory*")
     conn.execute_command("CONFIG", "SET", "maxmemory-policy", "noeviction")
     # Every SET fails with a retryable -OOM until the window below ends, so
     # the last request is retried after all of them were sent.
@@ -537,9 +533,7 @@ def test_retry_backoff_is_per_request(env):
 
     conn = env.getOSSMasterNodesConnectionList()[0]
     conn.execute_command("FLUSHALL")
-    saved = conn.execute_command("CONFIG", "GET", "maxmemory*")
-    # Keys come back as bytes without decoded responses.
-    saved = {k.decode() if isinstance(k, bytes) else k: v for k, v in zip(saved[0::2], saved[1::2])}
+    saved = conn.config_get("maxmemory*")
     conn.execute_command("CONFIG", "SET", "maxmemory-policy", "noeviction")
     # Every SET fails with a retryable -OOM for the whole run.
     conn.execute_command("CONFIG", "SET", "maxmemory", "1")
@@ -602,9 +596,7 @@ def test_test_time_ends_when_every_request_is_retried(env):
     max_grace = 10
     conn = env.getOSSMasterNodesConnectionList()[0]
     conn.execute_command("FLUSHALL")
-    saved = conn.execute_command("CONFIG", "GET", "maxmemory*")
-    # Keys come back as bytes without decoded responses.
-    saved = {k.decode() if isinstance(k, bytes) else k: v for k, v in zip(saved[0::2], saved[1::2])}
+    saved = conn.config_get("maxmemory*")
     conn.execute_command("CONFIG", "SET", "maxmemory-policy", "noeviction")
     # Every SET fails with a retryable -OOM for the whole run.
     conn.execute_command("CONFIG", "SET", "maxmemory", "1")
@@ -1326,7 +1318,9 @@ def _replay_churn_run(env, extra_args, password=None):
         rc, stderr_content = _run_with_background(env, benchmark, config, kill_waves, timeout=test_time + 30)
     finally:
         if password is not None:
-            admin.execute_command("CONFIG", "SET", "requirepass", "")
+            # Restore the env's own password (REDIS_PASSWORD), if it has one.
+            admin.execute_command("CONFIG", "SET", "requirepass",
+                                  admin.connection_pool.connection_kwargs.get("password") or "")
 
     env.assertGreaterEqual(sum(kills), 1, message="no CLIENT KILL wave found a memtier connection")
     env.assertGreaterEqual(stderr_content.count("Reconnection successful"), 1,
@@ -1452,7 +1446,7 @@ def test_replays_after_deadline_are_counted(env):
             args = [MEMTIER_BINARY, "--server=127.0.0.1", "--port={}".format(proxy.port), "--threads=1",
                     "--clients={}".format(clients), "--pipeline={}".format(pipeline), "--test-time=2",
                     "--ratio=1:0", "--select-db=3", "--retry-on-error", "--reconnect-on-error",
-                    "--hide-histogram", "--json-out-file=" + stats]
+                    "--hide-histogram", "--json-out-file=" + stats] + memtier_auth_args(env)
             result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, text=True)
             with open(stats) as f:
                 totals = json.load(f)["ALL STATS"]["Totals"]
