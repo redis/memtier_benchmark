@@ -83,7 +83,7 @@ def _shim_env(env, directory):
 def _marker(child_env):
     try:
         with open(child_env["MEMTIER_TEST_SHIM_MARKER"]) as f:
-            return f.read().split()
+            return f.read().splitlines()
     except OSError:
         return []
 
@@ -158,6 +158,10 @@ def test_libevent_series_mismatch_warns_on_stderr(env):
         env.assertTrue(any("running with OpenSSL 15.99.0-fake" in l for l in warnings), message=warnings)
     env.assertFalse(_MISMATCH in stdout, message=stdout[-2000:])
     env.assertEqual((info or {}).get("libevent runtime version"), "2.99.1-fake")
+    env.assertNotEqual((info or {}).get("libevent build version"), "2.99.1-fake")
+    if _has_tls():
+        env.assertEqual((info or {}).get("OpenSSL runtime version"), "OpenSSL 15.99.0-fake")
+        env.assertNotEqual((info or {}).get("OpenSSL build version"), "OpenSSL 15.99.0-fake")
     # --version stays quiet on stderr.
     env.assertEqual(version.returncode, 0)
     env.assertEqual(version.stderr, "")
@@ -195,6 +199,8 @@ def test_evthread_failure_is_fatal(env):
     env.assertEqual(rc, 1, message=stderr[-2000:])
     env.assertContains("error: evthread_use_pthreads() failed", stderr)
     env.assertTrue(info is None, message=info)
+    # A clean exit: nothing left for LeakSanitizer to report.
+    env.assertFalse("LeakSanitizer" in stderr, message=stderr[-4000:])
     # The shim was loaded for both option runs too.
     env.assertEqual(option_marker, ["evthread_use_pthreads"] * 3)
     for option, (out, plain) in options.items():
@@ -214,8 +220,74 @@ def test_bufferevent_creation_failure_fails_connection(env):
     # An error exit, not a signal (the assert used to abort here).
     env.assertGreater(rc, 0, message=stderr[-2000:])
     env.assertContains("error: " + function + "() failed", stderr)
+    # memtier closed the socket the failed call was given (libevent >= 2.1.9
+    # and plain bufferevents leave it to the caller).
+    env.assertTrue("socket closed" in marker, message=marker)
     # Standalone aborts the run in prepare; cluster mode retries the
     # connection and ends the run as failed.
     env.assertTrue("failed to connect" in stderr or "the results of this run are not valid" in stderr,
                    message=stderr[-2000:])
     env.assertFalse("ERROR: AddressSanitizer" in stderr, message=stderr[-4000:])
+
+
+def test_tls_bufferevent_failure_leaves_socket_on_libevent_2_1_8(env):
+    """On libevent <= 2.1.8 the socket may already be closed by libevent, so
+    memtier leaves it open and says so."""
+    if not env.useTLS:
+        print("SKIP: needs TLS")
+        env.skip()
+    with tempfile.TemporaryDirectory() as directory:
+        child_env = _shim_env(env, directory)
+        child_env["MEMTIER_TEST_FAIL_BUFFEREVENT"] = "1"
+        child_env["MEMTIER_TEST_LIBEVENT_VERSION"] = "2.1.8-fake:0x02010800"
+        rc, stderr, _, _ = _run(env, directory, child_env=child_env)
+        marker = _marker(child_env)
+    env.assertTrue("bufferevent_openssl_socket_new" in marker, message=marker)
+    env.assertGreater(rc, 0, message=stderr[-2000:])
+    env.assertContains("left open on purpose: libevent 2.1.8-fake", stderr)
+    env.assertTrue("socket open" in marker, message=marker)
+    env.assertFalse("ERROR: AddressSanitizer" in stderr, message=stderr[-4000:])
+
+
+def test_crash_report_separates_build_and_runtime_versions(env):
+    """With a faked runtime libevent/OpenSSL, the crash report's runtime
+    fields show the fake and its build fields do not."""
+    import re
+    import signal
+    import time
+    with tempfile.TemporaryDirectory() as directory:
+        child_env = _shim_env(env, directory)
+        child_env["MEMTIER_TEST_LIBEVENT_VERSION"] = "2.99.1-fake:0x02630100"
+        if _has_tls():
+            child_env["MEMTIER_TEST_OPENSSL_VERSION"] = "OpenSSL 15.99.0-fake:0xf6300000"
+        specs = {"name": env.testName, "args": []}
+        addTLSArgs(specs, env)
+        config = get_default_memtier_config(threads=1, clients=1, requests=None, test_time=30)
+        add_required_env_arguments(specs, config, env, env.getMasterNodesList())
+        run_config = RunConfig(directory, env.testName, config, {})
+        ensure_clean_benchmark_folder(run_config.results_dir)
+        benchmark = Benchmark.from_json(run_config, specs)
+        log_path = os.path.join(directory, "crash.log")
+        with open(log_path, "w") as log:
+            proc = subprocess.Popen(benchmark.args, stdout=log, stderr=subprocess.STDOUT, env=child_env)
+        try:
+            time.sleep(2)
+            env.assertTrue(proc.poll() is None, message="memtier_benchmark exited before the SEGV")
+            if proc.poll() is None:
+                os.kill(proc.pid, signal.SIGSEGV)
+            proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        with open(log_path) as log:
+            output = log.read()
+
+    def field(name):
+        match = re.search(r"# " + name + r":(.*)$", output, re.MULTILINE)
+        return match.group(1).strip() if match else None
+
+    env.assertEqual(field("libevent_version"), "2.99.1-fake", message=output[-3000:])
+    env.assertTrue(field("libevent_build_version") not in (None, "2.99.1-fake"), message=output[-3000:])
+    if _has_tls():
+        env.assertEqual(field("openssl_runtime_version"), "OpenSSL 15.99.0-fake", message=output[-3000:])
+        env.assertTrue(field("openssl_version") not in (None, "OpenSSL 15.99.0-fake"), message=output[-3000:])

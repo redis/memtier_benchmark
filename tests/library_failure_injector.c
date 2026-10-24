@@ -31,11 +31,14 @@
 // MEMTIER_TEST_OPENSSL_VERSION=<text>:<number>    OpenSSL_version(OPENSSL_VERSION)
 //     and OpenSSL_version_num() report another OpenSSL.
 // MEMTIER_TEST_SHIM_MARKER=<path>    one line is appended per injected call.
+//     At exit, if a bufferevent call was failed, "socket closed" or "socket
+//     open" says what became of the socket the last failed call was given.
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define BEV_OPT_CLOSE_ON_FREE_ (1 << 0)
@@ -47,6 +50,15 @@ static char libevent_text[128];
 static unsigned int libevent_number;
 static char openssl_text[128];
 static unsigned long openssl_number;
+// The socket handed to the last failed bufferevent call, and its identity, so
+// a later descriptor that reuses the number is not mistaken for it.
+static int failed_fd = -1;
+static struct stat failed_fd_stat;
+
+static void remember_failed_fd(int fd)
+{
+    if (fd >= 0 && fstat(fd, &failed_fd_stat) == 0) failed_fd = fd;
+}
 
 static void mark(const char *what)
 {
@@ -90,6 +102,15 @@ __attribute__((constructor)) static void read_options(void)
         openssl_text[0] = '\0';
 }
 
+__attribute__((destructor)) static void report_failed_fd(void)
+{
+    if (failed_fd < 0) return;
+    struct stat st;
+    int open_still = fstat(failed_fd, &st) == 0 && st.st_dev == failed_fd_stat.st_dev &&
+                     st.st_ino == failed_fd_stat.st_ino;
+    mark(open_still ? "socket open" : "socket closed");
+}
+
 int evthread_use_pthreads(void)
 {
     if (fail_evthread) {
@@ -104,6 +125,7 @@ struct bufferevent *bufferevent_socket_new(void *base, int fd, int options)
 {
     if (fail_bufferevent) {
         mark("bufferevent_socket_new");
+        remember_failed_fd(fd);
         return NULL;
     }
     struct bufferevent *(*real)(void *, int, int) =
@@ -115,6 +137,7 @@ struct bufferevent *bufferevent_openssl_socket_new(void *base, int fd, void *ssl
 {
     if (fail_bufferevent) {
         mark("bufferevent_openssl_socket_new");
+        remember_failed_fd(fd);
         if (options & BEV_OPT_CLOSE_ON_FREE_) {
             void (*ssl_free)(void *) = (void (*)(void *)) dlsym(RTLD_DEFAULT, "SSL_free");
             if (ssl_free) ssl_free(ssl);

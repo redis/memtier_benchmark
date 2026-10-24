@@ -499,17 +499,10 @@ bool shard_connection::setup_event(evutil_socket_t sockfd)
     if (m_bev) {
         bufferevent_free(m_bev);
         m_bev = NULL;
-        // Don't leave the protocol pointing at the freed evbuffers if no new
-        // bufferevent can be created below.
-        if (m_protocol != NULL) m_protocol->set_buffers(NULL, NULL);
     }
-    // A Unix socket connect retry belongs to the previous attempt; it must not
-    // fire against the bufferevent created below (or against none). Defensive:
-    // the reconnect paths call disconnect() first, which already frees it.
-    if (m_unix_connect_timer != NULL) {
-        event_free(m_unix_connect_timer);
-        m_unix_connect_timer = NULL;
-    }
+    // Until a new bufferevent exists the protocol has no buffers, rather than
+    // the freed ones (also after disconnect()), should creation fail below.
+    if (m_protocol != NULL) m_protocol->set_buffers(NULL, NULL);
     // Fresh bufferevent below starts enabled by default (after we call
     // bufferevent_enable in handle_event on BEV_EVENT_CONNECTED); reset the
     // pause flag so we don't carry stale state from a prior socket.
@@ -533,19 +526,9 @@ bool shard_connection::setup_event(evutil_socket_t sockfd)
         m_bev = bufferevent_openssl_socket_new(m_event_base, sockfd, ctx, BUFFEREVENT_SSL_CONNECTING,
                                                BEV_OPT_CLOSE_ON_FREE);
         if (m_bev == NULL) {
-            // With BEV_OPT_CLOSE_ON_FREE a failed call has already freed the
-            // SSL (libevent >= 2.1.9, upstream commit e86ccfe5, and 2.2.2), so
-            // it must not be freed here. Recheck this when the libevent floor
-            // or a new series changes; tests/library_failure_injector.c
-            // mimics this contract.
-            // The socket is still ours there (the SSL's socket BIO does not
-            // close it). On libevent <= 2.1.8 it is closed or not depending on
-            // where libevent failed (see libevent_ssl_failure_socket_is_ours()),
-            // which cannot be told from here: leak it rather than risk closing
-            // a descriptor another thread has just been given. Under repeated
-            // failure that is one descriptor (and possibly one SSL) per
-            // connect attempt, bounded by --max-reconnect-attempts and the run
-            // length; this only happens when libevent cannot allocate.
+            // libevent has freed the SSL (BEV_OPT_CLOSE_ON_FREE). Whether the
+            // socket is still ours depends on the libevent version: see
+            // libevent_ssl_failure_socket_is_ours().
             benchmark_error_log("error: bufferevent_openssl_socket_new() failed; cannot create the TLS "
                                 "connection.\n");
             if (libevent_ssl_failure_socket_is_ours(event_get_version_number())) {
@@ -824,6 +807,7 @@ void shard_connection::disconnect()
     if (m_bev) {
         bufferevent_free(m_bev);
         m_bev = NULL;
+        if (m_protocol != NULL) m_protocol->set_buffers(NULL, NULL);
     }
     // After free, any future bufferevent starts in the default (enabled) state.
     m_bev_paused = false;

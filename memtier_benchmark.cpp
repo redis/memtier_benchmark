@@ -5379,7 +5379,7 @@ int main(int argc, char *argv[])
         fprintf(stderr, "error: evthread_use_pthreads() failed; libevent's pthreads support (libevent_pthreads) "
                         "is required to stop worker threads.\n");
 #endif
-        return 1;
+        exit(1);
     }
     warn_on_library_version_mismatch();
 

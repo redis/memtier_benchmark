@@ -38,6 +38,11 @@ static inline bool libevent_series_differs(unsigned long build, unsigned long ru
 // leaves the socket open (and leaks the SSL, which the caller can't know it
 // still owns), but a failure to arm the handshake events frees the partial
 // bufferevent with the SSL still attached, whose destructor closes both.
+// When false the caller leaves the socket open rather than risk closing a
+// descriptor another thread has just been given: one socket (and maybe one
+// SSL) per failed attempt, which only happens when libevent cannot allocate.
+// tests/library_failure_injector.c mimics the >= 2.1.9 contract; recheck it
+// when the libevent floor or a new series changes.
 static inline bool libevent_ssl_failure_socket_is_ours(unsigned long runtime)
 {
     return runtime >= 0x02010900UL;
