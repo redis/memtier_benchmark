@@ -236,12 +236,13 @@ in CI (`.github/workflows/libevent-compat.yml` for the source-built ones):
 |---|---|---|
 | 2.1.12-stable (Ubuntu 22.04–26.04, Debian 12, Amazon Linux 2023) | Ubuntu `libevent-dev`; source build | All PR suites (incl. ASan/UBSan/TSan) on the distro build; nightly full plaintext/TLS suites on the source build |
 | 2.1.13-stable (RHEL 9/10, Debian 13, Fedora, Alpine ≥ 3.21, Homebrew, MSYS2) | Source build; also the distro package in the Alpine, Debian trixie/sid, MSYS2 and el9/el10 build jobs | Every PR: full standalone + cluster TLS suites; nightly plaintext and `--disable-tls` |
-| 2.2.2-alpha | Source build | Every PR: full TLS suites, plaintext suites with ASan+UBSan in memtier **and** libevent, `--disable-tls` + `make check`; nightly plaintext and macOS (OpenSSL 3 and 4) |
+| 2.2.2-alpha | Source build | Every PR: full TLS suites, plaintext suites with ASan+UBSan in memtier **and** libevent, `--disable-tls` + `make check`; nightly plaintext, TLS standalone with ASan+UBSan in libevent, and macOS (OpenSSL 3 and 4) |
 | libevent `master` (pinned commit) | Source build | Weekly canary; allowed to fail, never required |
 
 2.2.2-alpha is an alpha: supported for evaluation, not a new minimum. Only the
 `libevent-compat-gate` job needs to be required; it fails if any cell except the
-canary fails.
+canary fails. Make it required only after three consecutive green nightly runs
+and one green `full+canary` dispatch, so its flake rate is known first.
 
 #### Evaluating another libevent locally
 
@@ -291,10 +292,10 @@ checks to `check-macos-tls-links.sh`).
   socket per read event; 2.2 reads up to 16 KiB. With deep pipelines and
   large replies the same memtier source then takes more event-loop passes on
   2.1, so throughput can differ by libevent series alone. TLS bufferevents
-  read 4 KiB (2.1) or 16 KiB (2.2) and then whatever OpenSSL already holds
-  decrypted, about one TLS record per read event on both. Record the libevent
-  version that `--version` reports with results and compare runs only on the
-  same libevent build.
+  differ too: 2.1 reads about one TLS record per read event (4 KiB, then what
+  OpenSSL already holds decrypted), while 2.2 keeps reading records until 16
+  KiB or the socket is drained. Record the libevent version that `--version`
+  reports with results and compare runs only on the same libevent build.
 * **TLS error details.** libevent 2.2.2-alpha's `bufferevent_get_openssl_error()`
   returns nothing for TLS bufferevents. memtier then reports certificate
   failures from the SSL object
