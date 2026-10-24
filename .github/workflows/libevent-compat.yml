@@ -341,12 +341,18 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          failed="$(gh api --paginate "repos/$REPO/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs" \
-            --jq '.jobs[] | select(.name | startswith("libevent-compat (canary,")) | select(.conclusion == "failure" or .conclusion == "timed_out") | "- \(.name): \(.conclusion)"')"
+          jobs="$(gh api --paginate "repos/$REPO/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs" \
+            --jq '.jobs[] | select(.name | startswith("libevent-compat (canary,")) | "\(.conclusion)\t\(.name)"')"
+          failed="$(awk -F'\t' '$1 == "failure" || $1 == "timed_out" { print "- " $2 ": " $1 }' <<<"$jobs")"
           title='libevent master canary is failing'
           issue="$(gh issue list -R "$REPO" --state open --search "\"$title\" in:title" --json number,title \
             --jq ".[] | select(.title == \"$title\") | .number" | head -n 1)"
           if [[ -z "$failed" ]]; then
+            # A cancelled run is not a recovery: close only after a canary job passed.
+            if ! awk -F'\t' '$1 == "success" { ok = 1 } END { exit !ok }' <<<"$jobs"; then
+              echo "libevent master canary did not complete"
+              exit 0
+            fi
             echo "libevent master canary passed"
             if [[ -n "$issue" ]]; then
               gh issue close "$issue" -R "$REPO" --comment "The weekly libevent master canary passed again in $RUN_URL."
