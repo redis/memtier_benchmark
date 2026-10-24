@@ -1,126 +1,283 @@
 name: Libevent compatibility
 
+# Builds pinned libevent releases from source (scripts/build-libevent.sh) and
+# runs memtier against each. Distribution CI (ci.yml) covers the system
+# libevent (2.1.12 on Ubuntu); this workflow covers what users may build with:
+#
+#   track   libevent        where
+#   stable  2.1.13-stable   every PR/push (current security release)
+#   next    2.2.2-alpha     every PR/push (incl. ASan+UBSan in libevent too)
+#   legacy  2.1.12-stable   nightly, and PRs that change this harness
+#   canary  master (pinned) weekly + workflow_dispatch; never required
+#
+# There are no path filters: a required check that is skipped never reports.
+# Make only `libevent-compat-gate` required; cell names are stable
+# (`libevent-compat (<track>, <cell>)`) and never contain a version.
+
 on:
   push:
-    branches: [master, main]
-    paths:
-      - '.github/workflows/libevent-compat.yml'
-      - '.github/workflows/ci.yml'
-      - 'scripts/build-libevent.sh'
-      - 'scripts/build-macos-libevent.sh'
-      - 'configure.ac'
-      - 'Makefile.am'
-      - 'shard_connection.cpp'
-      - 'tests/test_connection_error_types.py'
-      - 'tests/test_reconnections.py'
-      - 'tests/run_tests.sh'
-      - 'tests/test_requirements.txt'
-      - 'tests/gen-test-certs.sh'
+    branches: [master, main, '2.*']
   pull_request:
-    branches: [master, main]
-    paths:
-      - '.github/workflows/libevent-compat.yml'
-      - '.github/workflows/ci.yml'
-      - 'scripts/build-libevent.sh'
-      - 'scripts/build-macos-libevent.sh'
-      - 'configure.ac'
-      - 'Makefile.am'
-      - 'shard_connection.cpp'
-      - 'tests/test_connection_error_types.py'
-      - 'tests/test_reconnections.py'
-      - 'tests/run_tests.sh'
-      - 'tests/test_requirements.txt'
-      - 'tests/gen-test-certs.sh'
-  workflow_dispatch:
+    branches: [master, main, '2.*']
   schedule:
-    - cron: '23 3 * * 1'
+    - cron: '23 3 * * *'   # nightly: full grid
+    - cron: '41 4 * * 0'   # weekly: full grid + libevent master canary
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: 'Cells to run'
+        type: choice
+        options: [full+canary, full, pr]
+        default: full+canary
 
 permissions:
   contents: read
 
+concurrency:
+  group: libevent-compat-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  compatibility:
+  plan:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Select cells
+        id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          SCOPE: ${{ inputs.scope }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          # The PR cells always run. Changes to this harness also run the
+          # nightly cells, so a PR cannot break cells it would never execute.
+          scope='pr'
+          case "$EVENT_NAME" in
+            schedule) scope=full; [[ "$SCHEDULE" == '41 4 * * 0' ]] && scope=full+canary ;;
+            workflow_dispatch) scope="${SCOPE:-full+canary}" ;;
+            *)
+              base="${PR_BASE:-$PUSH_BEFORE}"
+              harness='^(\.github/workflows/libevent-compat\.yml|scripts/(build-libevent|check-libevent-linkage|build-macos-libevent|check-macos-tls-links)\.sh)$'
+              if [[ -z "$base" || "$base" =~ ^0+$ ]] ||
+                 ! changed="$(git diff --name-only "$base" HEAD)" ||
+                 grep -Eq "$harness" <<<"$changed"; then
+                scope=full
+              fi ;;
+          esac
+          echo "scope=$scope"
+          SCOPE="$scope" python3 - >>"$GITHUB_OUTPUT" <<'EOF'
+          import json, os
+          scope = os.environ["SCOPE"]
+          versions = {"legacy": ("2.1.12-stable", "2.1.12-stable"),
+                      "stable": ("2.1.13-stable", "2.1.13-stable"),
+                      "next": ("2.2.2-alpha", "2.2.2-alpha-dev"),
+                      # master currently reports the 2.2.2-alpha-dev string too.
+                      "canary": ("master", "2.2.2-alpha-dev")}
+          cells = []
+          def add(track, mode, topology, flavour="release", os_="ubuntu-24.04", openssl="system"):
+              version, expect = versions[track]
+              label = mode + ("-asan" if flavour == "sanitize" else "")
+              if os_.startswith("macos"):
+                  label = "macos, openssl@" + openssl
+              elif topology != "build":
+                  label += ", " + topology
+              cells.append(dict(track=track, cell=label, version=version, expect=expect,
+                                mode=mode, topology=topology, flavour=flavour, os=os_, openssl=openssl,
+                                canary=track == "canary"))
+          for track in ("stable", "next"):
+              for topology in ("standalone", "cluster"):
+                  add(track, "tls", topology)
+          add("next", "no-tls", "build")
+          # This cell catches #822's regression: libevent 2.2's TLS error
+          # accessor run on a plain socket bufferevent is an out-of-bounds
+          # access that only ASan in libevent itself reports.
+          for topology in ("standalone", "cluster"):
+              add("next", "plaintext", topology, flavour="sanitize")
+          if scope.startswith("full"):
+              for topology in ("standalone", "cluster"):
+                  add("legacy", "tls", topology)
+                  for track in ("legacy", "stable", "next"):
+                      add(track, "plaintext", topology)
+              add("legacy", "no-tls", "build")
+              add("stable", "no-tls", "build")
+              for openssl in ("3", "4"):
+                  add("next", "tls", "build", os_="macos-latest", openssl=openssl)
+          if scope == "full+canary":
+              for topology in ("standalone", "cluster"):
+                  add("canary", "tls", topology)
+          print("matrix=" + json.dumps({"include": cells}))
+          EOF
+          cat "$GITHUB_OUTPUT"
+
+  compat:
+    needs: plan
+    name: libevent-compat (${{ matrix.track }}, ${{ matrix.cell }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    # Only the canary (libevent master) may fail without failing the gate.
+    continue-on-error: ${{ matrix.canary }}
     strategy:
       fail-fast: false
-      matrix:
-        libevent: [2.1.13-stable, 2.2.2-alpha]
-        mode: [plaintext, tls, no-tls]
-    name: libevent ${{ matrix.libevent }} (${{ matrix.mode }})
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     env:
-      LIBEVENT_VERSION: ${{ matrix.libevent }}
-      # Instrument the dependency too: memtier-only ASan cannot catch invalid
-      # accesses performed inside an uninstrumented libevent error accessor.
-      SANITIZE: ${{ matrix.libevent == '2.2.2-alpha' && matrix.mode == 'plaintext' && '1' || '0' }}
+      LIBEVENT_VERSION: ${{ matrix.version }}
+      LIBEVENT_FLAVOUR: ${{ matrix.flavour }}
+      # abort_on_error turns every sanitizer report, leaks included, into
+      # SIGABRT so a test that only checks the exit code cannot pass over it.
       ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
       UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-      - name: Install dependencies
+
+      - name: Select private libevent prefix
+        run: echo "LIBEVENT_PREFIX=$RUNNER_TEMP/libevent" >>"$GITHUB_ENV"
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y build-essential autoconf automake pkg-config cmake libssl-dev zlib1g-dev redis-server
-          sudo service redis-server stop
-          python -m pip install -r tests/test_requirements.txt
-      - name: Build pinned libevent
+          sudo apt-get -qq update
+          sudo apt-get install -y build-essential autoconf automake pkg-config cmake libssl-dev zlib1g-dev
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        env:
+          OPENSSL_FORMULA: openssl@${{ matrix.openssl }}
+        run: |
+          brew install autoconf automake pkg-config cmake "$OPENSSL_FORMULA"
+          echo "OPENSSL_PREFIX=$(brew --prefix "$OPENSSL_FORMULA")" >>"$GITHUB_ENV"
+
+      - name: Libevent cache key
+        id: key
+        run: |
+          source_id="$(bash scripts/build-libevent.sh --source-id)"
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            ssl="$(dpkg-query -W -f='${Version}' libssl-dev)"
+            cc="gcc-$(gcc -dumpfullversion)"
+          else
+            ssl="$("$OPENSSL_PREFIX/bin/openssl" version | awk '{print $2}')"
+            cc="$(cc --version | head -n 1 | tr -c 'A-Za-z0-9.\n' '-')"
+          fi
+          echo "key=libevent-$RUNNER_OS-$RUNNER_ARCH-$source_id-$LIBEVENT_FLAVOUR-openssl-$ssl-$cc" >>"$GITHUB_OUTPUT"
+
+      - name: Restore libevent
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/libevent
+          key: ${{ steps.key.outputs.key }}-${{ hashFiles('scripts/build-libevent.sh') }}
+
+      - name: Build libevent
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
           cmake_args=()
-          if [[ "$SANITIZE" == 1 ]]; then
-            cmake_args+=('-DCMAKE_C_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer -g')
-            cmake_args+=('-DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=address,undefined')
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            export PKG_CONFIG_PATH="$OPENSSL_PREFIX/lib/pkgconfig"
+            cmake_args+=("-DOPENSSL_ROOT_DIR=$OPENSSL_PREFIX")
           fi
-          bash scripts/build-libevent.sh "$RUNNER_TEMP/libevent" "${cmake_args[@]}"
+          bash scripts/build-libevent.sh "$LIBEVENT_PREFIX" "${cmake_args[@]}"
+
       - name: Build memtier
         env:
           MODE: ${{ matrix.mode }}
         run: |
           autoreconf -ivf
           configure_args=()
-          if [[ "$MODE" == no-tls ]]; then
-            configure_args+=(--disable-tls)
-          fi
-          if [[ "$SANITIZE" == 1 ]]; then
-            configure_args+=(--enable-sanitizers --enable-ubsan)
-          fi
-          PKG_CONFIG_PATH="$RUNNER_TEMP/libevent/lib/pkgconfig" \
-            LDFLAGS="-Wl,-rpath,$RUNNER_TEMP/libevent/lib" ./configure "${configure_args[@]}"
-          make -j2
-          make check
-      - name: Verify runtime version and linkage
-        run: |
-          ./memtier_benchmark --version | tee version.txt
-          # Alpha releases append -dev to the runtime version string.
-          expected="$LIBEVENT_VERSION"
-          if [[ "$expected" == *-alpha ]]; then expected+=-dev; fi
-          grep -F " libevent=$expected " version.txt
-          ldd ./memtier_benchmark | tee linkage.txt
-          awk -v prefix="$RUNNER_TEMP/libevent/lib/" '
-            /libevent[^ ]* =>/ { found++; if (index($3, prefix) != 1) exit 1 }
-            END { if (!found) exit 1 }
-          ' linkage.txt
-      - name: Generate TLS certificates
-        if: matrix.mode == 'tls'
-        run: ./tests/gen-test-certs.sh
-      - name: Integration tests (standalone and cluster)
+          [[ "$MODE" == no-tls ]] && configure_args+=(--disable-tls)
+          [[ "$LIBEVENT_FLAVOUR" == sanitize ]] && configure_args+=(--enable-sanitizers --enable-ubsan)
+          pc="$LIBEVENT_PREFIX/lib/pkgconfig"
+          [[ "$RUNNER_OS" == macOS ]] && pc+=":$OPENSSL_PREFIX/lib/pkgconfig"
+          PKG_CONFIG_PATH="$pc" LDFLAGS="-Wl,-rpath,$LIBEVENT_PREFIX/lib" ./configure "${configure_args[@]}"
+          make -j"$(getconf _NPROCESSORS_ONLN)"
+
+      - name: Verify the libevent memtier runs with
         env:
-          OSS_STANDALONE: '1'
-          OSS_CLUSTER: '1'
-          PARALLELISM: '2'
+          EXPECT: ${{ matrix.expect }}
+          TLS_BUILD: ${{ matrix.mode == 'no-tls' && 'no' || 'yes' }}
+        run: |
+          bash scripts/check-libevent-linkage.sh --prefix "$LIBEVENT_PREFIX" \
+            --expect-version "$EXPECT" --tls "$TLS_BUILD" --prometheus yes
+
+      - name: Unit tests
+        run: make check
+
+      - uses: actions/setup-python@v6
+        if: matrix.topology != 'build'
+        with:
+          python-version: '3.10'
+          architecture: x64
+
+      - name: Install Python dependencies
+        if: matrix.topology != 'build'
+        run: pip install -r ./tests/test_requirements.txt
+
+      # Same Redis source as ci.yml.
+      - name: Install Redis
+        if: matrix.topology != 'build'
+        run: |
+          curl -fsSL https://packages.redis.io/gpg | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/redis.list
+          sudo apt-get -qq update
+          sudo apt-get install redis
+          sudo service redis-server stop
+
+      - name: Increase connection limit
+        if: matrix.topology != 'build'
+        run: |
+          sudo sysctl -w net.ipv4.tcp_fin_timeout=10
+          sudo sysctl -w net.ipv4.tcp_tw_reuse=1
+          ulimit -n 40960
+
+      - name: Generate TLS test certificates
+        if: matrix.topology != 'build' && matrix.mode == 'tls'
+        run: ./tests/gen-test-certs.sh
+
+      - name: Integration tests
+        if: matrix.topology != 'build'
+        timeout-minutes: 40
+        env:
+          OSS_STANDALONE: ${{ matrix.topology == 'standalone' && '1' || '0' }}
+          OSS_CLUSTER: ${{ matrix.topology == 'cluster' && '1' || '0' }}
           TLS: ${{ matrix.mode == 'tls' && '1' || '0' }}
+          VERBOSE: '1'
+          PARALLELISM: '2'
         run: ./tests/run_tests.sh
-      - name: Upload diagnostics
-        if: always()
+
+      - name: Package failure logs
+        if: failure()
+        run: |
+          # RLTest log names contain colons, which upload-artifact rejects.
+          logs=()
+          for path in config.log test-suite.log tests/logs; do
+            [[ -e "$path" ]] && logs+=("$path")
+          done
+          if (( ${#logs[@]} )); then tar -czf libevent-compat-logs.tar.gz "${logs[@]}"; fi
+
+      - name: Upload failure logs
+        if: failure()
         uses: actions/upload-artifact@v5
         with:
-          name: libevent-${{ matrix.libevent }}-${{ matrix.mode }}
-          path: |
-            version.txt
-            linkage.txt
-            config.log
-            test-suite.log
-            tests/logs/
-          retention-days: 7
+          name: libevent-compat-${{ matrix.track }}-${{ strategy.job-index }}
+          path: libevent-compat-logs.tar.gz
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # The one check to mark as required. A cancelled or failed plan, or any
+  # failed non-canary cell, fails the gate.
+  libevent-compat-gate:
+    if: always()
+    needs: [plan, compat]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every libevent cell to pass
+        env:
+          PLAN: ${{ needs.plan.result }}
+          COMPAT: ${{ needs.compat.result }}
+        run: |
+          echo "plan=$PLAN compat=$COMPAT"
+          [[ "$PLAN" == success && "$COMPAT" == success ]]

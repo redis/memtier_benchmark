@@ -227,19 +227,35 @@ $ ./configure CXXFLAGS="-g -O0 -Wall"
 
 This disables optimizations (`-O0`), making it easier to step through code in a debugger, but should not be used for performance testing or production.
 
-### Opt-in libevent 2.2.2-alpha build
+### Libevent versions
 
-The normal build uses your installed libevent. To evaluate **2.2.2-alpha**
-without replacing the system library, install it in a separate prefix with the
-checksum-pinned helper below. This is an alpha release, not a new minimum
-requirement. The helper defaults to **2.1.13-stable** when `LIBEVENT_VERSION` is
-unset. It requires CMake, curl, tar, `sha256sum` (or `shasum` on macOS), and OpenSSL development files in
-addition to the normal build prerequisites.
+memtier uses whichever libevent `pkg-config` finds. These versions are tested
+in CI (`.github/workflows/libevent-compat.yml` for the source-built ones):
+
+| libevent | How CI gets it | Coverage |
+|---|---|---|
+| 2.1.12-stable | Ubuntu `libevent-dev`; source build | All PR suites (incl. ASan/UBSan/TSan) on the distro build; nightly full plaintext/TLS suites on the source build |
+| 2.1.13-stable | Source build; macOS, Alpine, Debian trixie/sid, MSYS2, el9/el10 | Every PR: full standalone + cluster TLS suites; nightly plaintext and `--disable-tls` |
+| 2.2.2-alpha | Source build | Every PR: full TLS suites, plaintext suites with ASan+UBSan in memtier **and** libevent, `--disable-tls` + `make check`; nightly plaintext and macOS (OpenSSL 3 and 4) |
+| libevent `master` (pinned commit) | Source build | Weekly canary; allowed to fail, never required |
+
+2.2.2-alpha is an alpha: supported for evaluation, not a new minimum. Only the
+`libevent-compat-gate` job needs to be required; it fails if any cell except the
+canary fails.
+
+#### Evaluating another libevent locally
+
+`scripts/build-libevent.sh` builds one of the versions above into a private
+prefix, never over the system library. It verifies the release tarball's
+sha256 (or, for `master`, the pinned commit) and refuses a non-empty prefix,
+so two versions can never mix. It needs CMake (3.15+ for 2.2), curl, tar,
+`sha256sum` or `shasum`, git (for `master` only) and the OpenSSL development
+files. `LIBEVENT_FLAVOUR=sanitize` builds libevent with ASan+UBSan too.
 
 From a clean source checkout on Linux:
 
 ```bash
-# Use a fresh prefix for each version; the helper rejects nonempty prefixes.
+# Use a fresh prefix for each version.
 event_prefix="$PWD/.local/libevent-2.2.2-alpha"
 LIBEVENT_VERSION=2.2.2-alpha bash scripts/build-libevent.sh "$event_prefix"
 autoreconf -ivf
@@ -249,39 +265,40 @@ PKG_CONFIG_PATH="$event_prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH
   LDFLAGS="-Wl,-rpath,$event_prefix/lib" ../configure
 make -j2
 make check
-./memtier_benchmark --version
-ldd ./memtier_benchmark
+bash ../scripts/check-libevent-linkage.sh --prefix "$event_prefix" \
+  --expect-version 2.2.2-alpha-dev
 ```
 
-`--version` already reports the **runtime** library, for example
-`libevent=2.2.2-alpha-dev`. Check that `ldd` resolves every libevent component
-from the selected prefix. The runtime search path above keeps this build using
-that prefix without a global `LD_LIBRARY_PATH`. Use a new build directory when
-switching dependency versions; if the source tree was configured in place,
-run `make distclean` before creating an out-of-tree build. Subsequent `make`
-runs within the same build directory are incremental.
+`--version` reports the **runtime** libevent (`libevent=2.2.2-alpha-dev` for
+2.2.2-alpha; libevent `master` currently reports the same string).
+`check-libevent-linkage.sh` fails unless that matches, the prefix's pkg-config
+files are the same release, every libevent library memtier loads comes from
+the prefix, and `libevent_openssl` loads the same libssl as memtier. The
+runtime search path keeps the build on that prefix without `LD_LIBRARY_PATH`.
+Use a new build directory when switching libevent versions; if the source tree
+was configured in place, run `make distclean` before an out-of-tree build.
 
-On macOS, also select the same Homebrew OpenSSL for libevent and memtier: pass
-`-DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"` to the helper and include that
-OpenSSL prefix's `lib/pkgconfig` in `PKG_CONFIG_PATH`. Inspect linkage with
-`otool -L` instead of `ldd`.
+On macOS, build libevent and memtier against the same Homebrew OpenSSL: pass
+`-DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"` to the helper, put that
+OpenSSL's `lib/pkgconfig` in `PKG_CONFIG_PATH` for both, and run the checker
+with `OPENSSL_PREFIX="$(brew --prefix openssl@3)"` (it delegates the library
+checks to `check-macos-tls-links.sh`).
 
-Libevent 2.1.13 still limits individual plaintext evbuffer reads to 4 KiB.
-The 2.2 series includes the configurable read limit and bufferevent integration
-([upstream issue #798](https://github.com/libevent/libevent/issues/798)), which
-can affect pipelined benchmark throughput. Pin the same libevent build when
-comparing results; changing the library changes the benchmark client.
-The dedicated libevent compatibility workflow runs the full standalone and
-cluster test suites against both pinned versions. It runs automatically for
-changes to the build/test harness, connection implementation, configuration, or this workflow, weekly on the
-default branch, and on demand via `workflow_dispatch`. Ordinary source changes
-continue to use the existing distribution-library CI builds; the alpha adds no
-new minimum dependency requirement.
-The alpha plaintext job instruments both memtier and libevent with ASan/UBSan,
-including the connection-failure and reconnect paths. Alpha 2.2.2 currently
-returns no queued OpenSSL errors from its accessor for a TLS bufferevent, so
-detailed TLS failure diagnostics can differ from stable even when failure and
-reconnect handling still work.
+#### Behaviour differences between 2.1 and 2.2
+
+* **Socket read size** ([#535](https://github.com/redis/memtier_benchmark/issues/535)).
+  libevent 2.1 reads at most 4 KiB per socket read (`EVBUFFER_MAX_READ`); 2.2
+  reads up to 16 KiB per read for bufferevents, including TLS. With deep
+  pipelines the same memtier source makes fewer read calls on 2.2, so
+  throughput can differ by libevent series alone. Record the libevent version
+  that `--version` reports with results and compare runs only on the same
+  libevent build.
+* **TLS error details.** libevent 2.2.2-alpha's `bufferevent_get_openssl_error()`
+  returns nothing for TLS bufferevents. memtier then reports
+  `TLS connection error: certificate verify failed: <reason>` from the SSL
+  object when certificate verification failed, and otherwise
+  `TLS connection error: libevent <version> reported no OpenSSL reason`.
+  Failure and reconnect handling are the same as on 2.1.
 
 ### Code Style
 
