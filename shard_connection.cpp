@@ -526,9 +526,9 @@ bool shard_connection::setup_event(evutil_socket_t sockfd)
         m_bev = bufferevent_openssl_socket_new(m_event_base, sockfd, ctx, BUFFEREVENT_SSL_CONNECTING,
                                                BEV_OPT_CLOSE_ON_FREE);
         if (m_bev == NULL) {
-            // libevent has freed the SSL (BEV_OPT_CLOSE_ON_FREE). Whether the
-            // socket is still ours depends on the libevent version: see
-            // libevent_ssl_failure_socket_is_ours().
+            // Do not free the SSL: libevent >= 2.1.9 already has
+            // (BEV_OPT_CLOSE_ON_FREE). Who owns the SSL and the socket on
+            // older libevent: see libevent_ssl_failure_socket_is_ours().
             benchmark_error_log("error: bufferevent_openssl_socket_new() failed; cannot create the TLS "
                                 "connection.\n");
             if (libevent_ssl_failure_socket_is_ours(event_get_version_number())) {
