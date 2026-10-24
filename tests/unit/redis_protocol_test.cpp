@@ -73,10 +73,67 @@ static void check_readonly(PROTOCOL_TYPE mode)
     evbuffer_free(output);
 }
 
+// Feed one reply to a fresh parser and return parse_response()'s result:
+// 1 complete, 0 waiting for more bytes, -1 protocol error.
+static int parse_reply(PROTOCOL_TYPE mode, const char *wire, bool track_misses = false)
+{
+    abstract_protocol *protocol = protocol_factory(mode);
+    evbuffer *input = evbuffer_new();
+    evbuffer *output = evbuffer_new();
+    if (!protocol || !input || !output) {
+        fprintf(stderr, "FAIL: cannot allocate protocol fixture\n");
+        exit(1);
+    }
+    protocol->set_buffers(input, output);
+    check(protocol->configure_protocol(mode) >= 0, "configure requested Redis mode");
+    protocol->set_track_elem_misses(track_misses);
+    evbuffer_add(input, wire, strlen(wire));
+    int rc = protocol->parse_response();
+    delete protocol;
+    evbuffer_free(input);
+    evbuffer_free(output);
+    return rc;
+}
+
+static void check_length_limits()
+{
+    // Bulk lengths whose payload plus CRLF (len + 2) cannot be represented
+    // are protocol errors; strtol clamps the out-of-range one to LONG_MAX.
+    check(parse_reply(PROTOCOL_RESP2, "$9223372036854775807\r\n") == -1, "reject LONG_MAX bulk length");
+    check(parse_reply(PROTOCOL_RESP2, "$9223372036854775806\r\n") == -1, "reject LONG_MAX - 1 bulk length");
+    check(parse_reply(PROTOCOL_RESP2, "$99999999999999999999\r\n") == -1, "reject out-of-range bulk length");
+    check(parse_reply(PROTOCOL_RESP3, "!9223372036854775807\r\n") == -1, "reject LONG_MAX blob error length");
+    check(parse_reply(PROTOCOL_RESP3, "=9223372036854775807\r\n") == -1, "reject LONG_MAX verbatim length");
+    check(parse_reply(PROTOCOL_RESP2, "$9223372036854775805\r\n") == 0, "LONG_MAX - 2 bulk length waits for data");
+    check(parse_reply(PROTOCOL_RESP2, "$3\r\nfoo\r\n") == 1, "regular bulk completes");
+    check(parse_reply(PROTOCOL_RESP2, "$0\r\n\r\n") == 1, "empty bulk completes");
+    check(parse_reply(PROTOCOL_RESP2, "$-1\r\n") == 1, "null bulk completes");
+    check(parse_reply(PROTOCOL_RESP2, "*1\r\n$9223372036854775807\r\n") == -1, "reject LONG_MAX nested bulk length");
+
+    // Aggregate counts are tracked as int; reject what cannot be represented.
+    check(parse_reply(PROTOCOL_RESP2, "*2147483647\r\n") == 0, "INT_MAX array count waits for elements");
+    check(parse_reply(PROTOCOL_RESP2, "*2147483648\r\n") == -1, "reject array count above INT_MAX");
+    check(parse_reply(PROTOCOL_RESP2, "*99999999999999999999\r\n") == -1, "reject out-of-range array count");
+    check(parse_reply(PROTOCOL_RESP2, "*-1\r\n") == 1, "null array completes");
+    check(parse_reply(PROTOCOL_RESP3, "%1073741823\r\n") == 0, "largest representable map count waits");
+    check(parse_reply(PROTOCOL_RESP3, "%1073741824\r\n") == -1, "reject map count whose doubling overflows");
+    check(parse_reply(PROTOCOL_RESP3, "|1073741824\r\n") == -1, "reject attribute count whose doubling overflows");
+    check(parse_reply(PROTOCOL_RESP3, "%1\r\n+k\r\n+v\r\n") == 1, "regular map completes");
+    check(parse_reply(PROTOCOL_RESP2, "*2\r\n*1\r\n+a\r\n$1\r\nb\r\n", true) == 1, "nested array completes");
+
+    // Nested counts add to the outstanding elements; with miss tracking the
+    // nested bookkeeping is int arithmetic too.
+    check(parse_reply(PROTOCOL_RESP2, "*2\r\n*2147483646\r\n*1\r\n", true) == 0,
+          "nested counts up to INT_MAX outstanding wait");
+    check(parse_reply(PROTOCOL_RESP2, "*2\r\n*2147483646\r\n*3\r\n", true) == -1,
+          "reject nested counts above INT_MAX outstanding");
+}
+
 int main()
 {
     check_readonly(PROTOCOL_REDIS_DEFAULT);
     check_readonly(PROTOCOL_RESP2);
     check_readonly(PROTOCOL_RESP3);
+    check_length_limits();
     return failures ? 1 : 0;
 }
