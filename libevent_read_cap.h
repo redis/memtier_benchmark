@@ -19,8 +19,9 @@
 #ifndef MEMTIER_LIBEVENT_READ_CAP_H
 #define MEMTIER_LIBEVENT_READ_CAP_H
 
-// libevent before 2.2 reads at most 4 KiB (EVBUFFER_MAX_READ) from a socket
-// per read event, so pipelined replies are read and parsed 4 KiB at a time;
+// libevent before 2.2 (2.0.11, the oldest configure accepts, to 2.1.13) reads
+// at most 4 KiB (EVBUFFER_MAX_READ) from a socket per read event, so
+// pipelined replies are read and parsed 4 KiB at a time;
 // libevent 2.2 reads up to 16 KiB (issue #535). For a plaintext socket
 // bufferevent, read on after a capped read so that a read event takes the
 // same amount of data on both series. TLS bufferevents read whole records
@@ -59,7 +60,8 @@ static inline void libevent_read_added_cb(struct evbuffer *, const struct evbuff
 // than comparing lengths around process_response(), which can delete the
 // connection (e.g. a cluster reconnect frees non-main connections). Our own
 // read below triggers it too; libevent's next read overwrites that value
-// before the next read callback.
+// before the next read callback, as long as only libevent's reads run the
+// read callback (memtier never calls bufferevent_trigger() on it).
 static inline void track_libevent_reads(struct evbuffer *input, size_t *last_added)
 {
     *last_added = 0;
