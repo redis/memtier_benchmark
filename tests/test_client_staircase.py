@@ -827,7 +827,11 @@ def test_staircase_exits_at_test_time(env):
 
     Measure each worker thread's lifetime with the JSON "CPU" cpu_wall_seconds
     (the longest event-loop thread, so process startup does not count). It
-    must end within a moment of --test-time. Without per-thread CPU accounting
+    must end within a moment of --test-time. A thread still waits for the
+    replies in flight at the deadline, so also allow the run's slowest reply
+    ("Max Latency"): a sanitizer build on a loaded runner can take a second
+    to answer one. The bug left the loop idle until the next step with nothing
+    in flight, so it still fails. Without per-thread CPU accounting
     (non-Linux), fall back to the process wall time.
     """
     # (test_time, step_duration): longer than the run, not dividing it, and
@@ -847,12 +851,15 @@ def test_staircase_exits_at_test_time(env):
             env.assertTrue(ok, message="memtier_benchmark should exit successfully")
             if not ok:
                 continue
-            cpu = _load_json(run_config)["ALL STATS"].get("CPU", {})
+            stats = _load_json(run_config)["ALL STATS"]
+            cpu = stats.get("CPU", {})
             if "cpu_wall_seconds" in cpu:
                 thread_wall = float(cpu["cpu_wall_seconds"])
-                env.assertTrue(thread_wall < test_time + 0.5,
-                               message="--test-time {} --step-duration {}: worker threads ran {:.3f} s".format(
-                                   test_time, step_duration, thread_wall))
+                drain = float(stats["Totals"]["Max Latency"]) / 1000.0
+                env.assertTrue(thread_wall < test_time + 0.5 + drain,
+                               message="--test-time {} --step-duration {}: worker threads ran {:.3f} s "
+                                       "(slowest reply {:.3f} s)".format(
+                                   test_time, step_duration, thread_wall, drain))
             else:
                 env.assertTrue(process_wall < test_time + 3,
                                message="--test-time {} --step-duration {}: run took {:.2f} s "
