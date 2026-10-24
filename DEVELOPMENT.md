@@ -16,7 +16,7 @@ The following libraries are required for building:
 
 | libevent | Status |
 |---|---|
-| 2.1.8 | Oldest release known to work (RHEL 8): memtier builds with TLS and the Prometheus exporter and `make check` passes on Rocky Linux 8. CI does not build it yet. |
+| 2.1.8 | Oldest release known to work (RHEL 8): memtier builds with TLS and the Prometheus exporter and `make check` passes on Rocky Linux 8. CI does not build it yet. If libevent fails to allocate a TLS connection, memtier leaks that connection's socket (and possibly its SSL) rather than risk closing a reused descriptor; 2.1.9 and newer don't need this. |
 | 2.1.12 | Recommended minimum (Ubuntu 22.04/24.04, Debian 12, Amazon Linux 2023). The full CI test suite runs on it. |
 | 2.1.13 | Current stable release, with security fixes (RHEL 9/10, Debian 13, Fedora, Alpine, Homebrew, MSYS2). |
 | 2.2.2-alpha | Supported experimentally. 2.2 is not a stable series yet. |
