@@ -43,6 +43,13 @@ int main(void)
     CHECK(libevent_series_differs(0x02001600UL, 0x02010c00UL)); // 2.0.22 / 2.1.12
     CHECK(libevent_series_differs(0x02010c00UL, 0x03010c00UL)); // major differs
 
+    // Failed TLS bufferevent creation leaves the socket to the caller from 2.1.9 on.
+    CHECK(!libevent_ssl_failure_keeps_socket(0x02010800UL)); // 2.1.8
+    CHECK(!libevent_ssl_failure_keeps_socket(0x02001600UL)); // 2.0.22
+    CHECK(libevent_ssl_failure_keeps_socket(0x02010900UL));  // 2.1.9-beta
+    CHECK(libevent_ssl_failure_keeps_socket(0x02010c00UL));  // 2.1.12
+    CHECK(libevent_ssl_failure_keeps_socket(0x02020200UL));  // 2.2.2-alpha
+
     // OpenSSL 3+: a newer library of the same major is compatible, an older
     // minor version than the headers is not.
     CHECK(!openssl_series_differs(0x30000000UL, 0x300000d0UL)); // 3.0.0 / 3.0.13

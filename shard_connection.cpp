@@ -47,6 +47,7 @@
 #include "client.h"
 #include "retry_policy.h"
 #include "retry_backoff.h"
+#include "library_versions.h"
 #include "event2/bufferevent.h"
 
 // Maximum reconnect delay enforced after every exponential-backoff
@@ -536,14 +537,15 @@ bool shard_connection::setup_event(evutil_socket_t sockfd)
             // it must not be freed here. Recheck this when the libevent floor
             // or a new series changes; tests/library_failure_injector.c
             // mimics this contract.
-            // The socket is still ours: the SSL's socket BIO does not close
-            // it. libevent <= 2.1.8 may already have closed it while freeing
-            // its partial bufferevent; leak it there rather than risk closing
+            // The socket is still ours there (the SSL's socket BIO does not
+            // close it). On libevent <= 2.1.8 it is closed or not depending on
+            // where libevent failed (see libevent_ssl_failure_keeps_socket()),
+            // which cannot be told from here: leak it rather than risk closing
             // a descriptor another thread has just been given. Under repeated
             // failure (cluster mode retries) that is one descriptor per attempt.
             benchmark_error_log("error: bufferevent_openssl_socket_new() failed; cannot create the TLS "
                                 "connection.\n");
-            if (event_get_version_number() >= 0x02010900) evutil_closesocket(sockfd);
+            if (libevent_ssl_failure_keeps_socket(event_get_version_number())) evutil_closesocket(sockfd);
             return false;
         }
     } else {
