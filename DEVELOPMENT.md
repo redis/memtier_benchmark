@@ -8,7 +8,7 @@ This document provides information for developers working on memtier_benchmark.
 
 The following libraries are required for building:
 
-* libevent 2.1.8 or newer; 2.1.12 or newer is recommended. See [Supported libevent versions](#supported-libevent-versions).
+* libevent (2.1.8 or newer is supported, 2.1.12 or newer is recommended; see [Supported libevent versions](#supported-libevent-versions)).
 * OpenSSL (unless TLS support is disabled by `./configure --disable-tls`).
 * Prometheus /metrics exporter support can be disabled by ./configure --disable-prometheus.
 
