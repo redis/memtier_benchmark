@@ -74,6 +74,75 @@ static void check_readonly(PROTOCOL_TYPE mode)
     evbuffer_free(output);
 }
 
+// Feeds `wire` to a fresh RESP3 keep_value parser and parses two replies,
+// returning the parser so the caller can inspect the second reply.
+static abstract_protocol *parse_two_resp3_kept_replies(const char *wire, evbuffer **input_out)
+{
+    abstract_protocol *protocol = protocol_factory(PROTOCOL_RESP3);
+    evbuffer *input = evbuffer_new();
+    evbuffer *output = evbuffer_new();
+    if (!protocol || !input || !output) {
+        fprintf(stderr, "FAIL: cannot allocate protocol fixture\n");
+        exit(1);
+    }
+    protocol->set_buffers(input, output);
+    protocol->configure_protocol(PROTOCOL_RESP3);
+    protocol->set_keep_value(true);
+    evbuffer_add(input, wire, strlen(wire));
+
+    check(protocol->parse_response() == 1, "first kept reply with nested push completes");
+    check(protocol->parse_response() == 1, "second kept reply completes");
+    check(evbuffer_get_length(input) == 0, "both replies consume the whole input");
+    evbuffer_free(output);
+    *input_out = input;
+    return protocol;
+}
+
+// Issue #839: a RESP3 push frame nested in a kept aggregate drains the
+// aggregate's remaining slots, so the reply completes with the mbulk cursor
+// still pointing into the tree. The next reply frees that tree in rs_initial
+// and must not write through the stale cursor (heap-use-after-free under ASan).
+static void check_nested_push_keep_value()
+{
+    evbuffer *input;
+    abstract_protocol *protocol =
+        parse_two_resp3_kept_replies("%1\r\n*2\r\n>0\r\n%0\r\n+s\r\n$2\r\nab\r\n+OK\r\n", &input);
+    protocol_response *r = protocol->get_response();
+    check(r->get_mbulk_value() == NULL, "status reply after nested push has no mbulk tree");
+    check(r->get_status() && strcmp(r->get_status(), "+OK") == 0, "status reply after nested push is +OK");
+    delete protocol;
+    evbuffer_free(input);
+
+    // Same, with a bulk second reply: it must be kept as the reply value, not
+    // appended to the previous reply's freed aggregate.
+    protocol = parse_two_resp3_kept_replies("%1\r\n*2\r\n>0\r\n%0\r\n+s\r\n$2\r\nab\r\n$2\r\nhi\r\n", &input);
+    r = protocol->get_response();
+    unsigned int len = 0;
+    const char *value = r->get_value(&len);
+    check(r->get_mbulk_value() == NULL, "bulk reply after nested push has no mbulk tree");
+    check(value && len == 2 && memcmp(value, "hi", 2) == 0, "bulk reply after nested push keeps its value");
+    delete protocol;
+    evbuffer_free(input);
+
+    // Same, with the first reply ending on a status rather than a bulk.
+    protocol = parse_two_resp3_kept_replies("%1\r\n*2\r\n>0\r\n%0\r\n+s\r\n+t\r\n$2\r\nhi\r\n", &input);
+    r = protocol->get_response();
+    value = r->get_value(&len);
+    check(value && len == 2 && memcmp(value, "hi", 2) == 0,
+          "bulk reply after status-ended nested push keeps its value");
+    delete protocol;
+    evbuffer_free(input);
+
+    // Same, with an aggregate second reply: it must start a new tree.
+    protocol = parse_two_resp3_kept_replies("%1\r\n*2\r\n>0\r\n%0\r\n+s\r\n$2\r\nab\r\n*1\r\n$2\r\nhi\r\n", &input);
+    r = protocol->get_response();
+    mbulk_size_el *root = r->get_mbulk_value();
+    check(root && root->upper_level == NULL && root->mbulks_elements.size() == 1,
+          "aggregate reply after nested push starts a new tree");
+    delete protocol;
+    evbuffer_free(input);
+}
+
 // Feed one reply to a fresh parser and return parse_response()'s result:
 // 1 complete, 0 waiting for more bytes, -1 protocol error.
 static int parse_reply(PROTOCOL_TYPE mode, const char *wire, bool track_misses = false)
@@ -156,5 +225,6 @@ int main()
     check_readonly(PROTOCOL_RESP2);
     check_readonly(PROTOCOL_RESP3);
     check_length_limits();
+    check_nested_push_keep_value();
     return failures ? 1 : 0;
 }
