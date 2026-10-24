@@ -41,9 +41,12 @@ from mb import Benchmark, RunConfig
 def _get_redis_conn(env):
     """Return a redis.Redis connection that matches the test environment."""
     master_nodes_list = env.getMasterNodesList()
+    password = master_nodes_list[0].get("password")
     if env.isUnixSocket():
-        return redis.Redis(unix_socket_path=master_nodes_list[0]["unix_socket_path"])
-    kwargs = {"host": "127.0.0.1", "port": master_nodes_list[0]["port"]}
+        return redis.Redis(unix_socket_path=master_nodes_list[0]["unix_socket_path"],
+                           password=password)
+    kwargs = {"host": "127.0.0.1", "port": master_nodes_list[0]["port"],
+              "password": password}
     if getattr(env, "useTLS", False):
         # Skip server cert verification: test certs are self-signed and the CN
         # rarely matches "127.0.0.1", which would cause hostname-check failure.

@@ -27,7 +27,7 @@ tests.
 """
 import subprocess
 
-from include import MEMTIER_BINARY
+from include import MEMTIER_BINARY, memtier_auth_args
 
 
 def _run_memtier(args):
@@ -43,7 +43,7 @@ def _run_memtier(args):
 def _common_args(env):
     """Minimal connection args; the parser rejects before any connect."""
     master = env.getMasterNodesList()[0]
-    return ["-s", "127.0.0.1", "-p", str(master["port"])]
+    return ["-s", "127.0.0.1", "-p", str(master["port"])] + memtier_auth_args(env)
 
 
 # ---------------------------------------------------------------------------

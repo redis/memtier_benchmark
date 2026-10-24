@@ -80,7 +80,7 @@ AS_IF([test "x$enable_tls" != "xno"], [
                  [1],
                  [define to enable TLS/SSL support])
        PKG_CHECK_MODULES([LIBEVENT_OPENSSL],
-                         [libevent_openssl >= 2.0.10],
+                         [libevent_openssl >= 2.0.11],
                          AC_SUBST(LIBEVENT_OPENSSL_CFLAGS) AC_SUBST(LIBEVENT_OPENSSL_LIBS))
        PKG_CHECK_MODULES([LIBSSL],
                          [libssl],
@@ -150,9 +150,10 @@ AC_CHECK_LIB([z], [deflateInit_], , AC_MSG_ERROR([zlib is required; try installi
 AC_CHECK_LIB([pthread], [pthread_create], , AC_MSG_ERROR([pthread is required.]))
 AC_CHECK_LIB([socket], [gai_strerror])
 
-# libevent
+# libevent 2.0.11 fixes event_base_gettimeofday_cached() to return wall time,
+# required to clamp reconnect timers to the benchmark wall-clock deadline.
 PKG_CHECK_MODULES(LIBEVENT,
-    [libevent >= 2.0.10],
+    [libevent >= 2.0.11],
     AC_SUBST(LIBEVENT_CFLAGS) AC_SUBST(LIBEVENT_LIBS)
 )
 
@@ -169,7 +170,7 @@ AS_IF([test "x$memtier_windows" = "xyes"], [
        AC_SUBST(LIBEVENT_PTHREADS_LIBS)
        ], [
        PKG_CHECK_MODULES(LIBEVENT_PTHREADS,
-           [libevent_pthreads >= 2.0.10],
+           [libevent_pthreads >= 2.0.11],
            AC_SUBST(LIBEVENT_PTHREADS_CFLAGS) AC_SUBST(LIBEVENT_PTHREADS_LIBS)
        )
        ])

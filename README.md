@@ -582,6 +582,33 @@ When the target node class is unavailable, the fallback is controlled by
 * `queue` - reserved; currently treated as `error`. Request queuing is
   not yet implemented.
 
+A partial `CLUSTER SLOTS` map is accepted. If a generated key has no slot
+owner, writes and reads that permit primary routing are sent to an available
+primary, preserving the key and letting Redis return its routing response.
+`CLUSTERDOWN` replies count as workload errors and follow the usual retry
+policy; they also trigger a topology refresh at most once per second per
+client, including when a previously full map has become stale. Each client
+maintains its own topology: for example, `-t 8 -c 50` permits up to 400 refreshes
+per second during sustained `CLUSTERDOWN`, in addition to initial discovery.
+Refreshes also occur when retries are disabled. Missing-owner requests use the
+first available primary, so this error traffic can concentrate on one node.
+The missing-owner warning prints once per process, including across `--run-count` runs.
+MGET retains that primary as its producer until the next topology refresh.
+If no primary is connected, connecting, or awaiting reconnect/refresh, missing-owner
+requests fail the run explicitly. Transactions retain their key while reconnecting.
+Monitor replay waits before selecting its next line while all primaries are in
+reconnect backoff, including for owned keys. Already-selected monitor lines and
+routed keys stay queued across redials to the same primary endpoint, including
+repeated setup failures, without changing their generated-request counts. Replica
+redials, including a primary demoted to replica, keep the existing policy of
+clearing unsent queues and compensating their generated-request counts so other
+shards can continue. Promotion also clears previously staged replica work before
+changing its role, so strict-secondary reads cannot drain on the new primary.
+This does not guarantee request identity across replica redials or promotion.
+Strict `secondary` reads with `error` or `queue` fallback fail the run because no
+authoritative replica can be chosen, including for a transient hole discovered
+by a mid-run refresh.
+
 Built-in read commands (GET, MGET) and arbitrary commands marked with
 `--command-is-read` participate in read-preference routing.  Reads on
 arbitrary keyless commands (e.g. `DBSIZE`, `CLUSTER NODES`) are routed
@@ -838,3 +865,39 @@ Only display rendering is throttled. Timeouts, interruption, StatsD/Prometheus
 exports and CPU/latency sampling retain their existing cadence. Instantaneous
 rates and latencies describe the most recent sample, not the whole display
 interval. JSON configuration records the interval as `progress_interval`.
+
+### Sliding-window tail latency
+
+`--realtime-latencies` prints three latency rows per tick: `inst` (each
+client's current second), `win<N>s` (every sample completed in the last N
+seconds, set by `--latency-window=N`, default 60, 0 disables, max 3600) and
+`overall` (the whole run). For example, the last 60 seconds' p99.9999:
+
+```
+memtier_benchmark ... --realtime-latencies --latency-window=60 --print-percentiles=50,99,99.9999
+[RUN #1  50%  90s] latency [inst    ] n=31.2K    p50  0.111   p99  0.223   p99.9999  0.912*
+[RUN #1  50%  90s] latency [win60s  ] n=1.87M    p50  0.119   p99  0.239   p99.9999  1.733
+[RUN #1  50%  90s] latency [overall ] n=2.81M    p50  0.119   p99  0.239   p99.9999  2.104  ms
+```
+
+`n` is the row's sample count. A percentile p needs at least `100/(100-p)`
+samples (100 for p99, 1,000,000 for p99.9999); with fewer, it falls on one of
+the few largest samples and is not resolved, so the value is marked `*`. When
+`--requests` or `--rate-limiting` bound the number of samples, memtier warns
+before the run about percentiles the run or the window can never resolve. For
+example, `--rate-limiting=100` on 160 connections gives at most about 976,000
+samples per 60 second window (61 seconds of completed client seconds plus the
+initial per-connection burst), not enough for p99.9999. The run-level warning
+applies to the final results table too, so it is printed with or without
+`--realtime-latencies`; it checks the total sample count, and per-command rows
+have fewer samples. In cluster mode the limit applies to each endpoint
+connection, so the check runs once the first topology is known, after the
+threads start.
+
+The window and overall rows merge the per-second histograms each client has
+completed, so every sample is counted exactly once. A client's second is
+completed when it records its first sample of the next second, so these rows
+normally lag the `inst` row by about a second, and samples of a stalled client
+appear only once it completes another request. The window covers the last N
+seconds of wall-clock time, even if the progress loop drifts. Each window
+second keeps one histogram (about 21 KB).

@@ -1943,19 +1943,15 @@ unsigned long long int client_group::get_total_errors(void)
 void client_group::merge_run_stats(run_stats *target, unsigned int &iteration_counter)
 {
     assert(target != NULL);
-    // Iterate ALL clients (not just active_client_count) to avoid dropping
-    // stats from clients that were prepare()-d but not yet counted in the
-    // atomic when the benchmark ended. Clients that never started
-    // (set_start_time never called) are merged too, for the connection errors
-    // and interrupted flag they recorded; run_stats::merge() leaves their
-    // zeroed m_start_time out of the factorial-averaged timestamps, so they
-    // do not advance the iteration counter. The caller owns the counter
-    // (starting at 1) and passes the same one to every client_group merged
-    // into the same target, so the timestamps average over all their clients.
+    // Include every client's errors/interruption, but only clients that
+    // submitted workload participate in the duration average. Setup attempts
+    // can stamp/reset a start time without ever sending a workload request.
+    // One counter spans every group merged into the same target.
     for (unsigned int i = 0; i < m_clients.size(); i++) {
         run_stats *stats = m_clients[i]->get_stats();
-        target->merge(*stats, iteration_counter);
-        if (stats->has_started()) iteration_counter++;
+        bool participates = m_clients[i]->has_submitted_workload();
+        target->merge(*stats, iteration_counter, participates);
+        if (stats->has_started() && participates) iteration_counter++;
     }
 }
 
