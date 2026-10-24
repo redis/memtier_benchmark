@@ -139,9 +139,6 @@ jobs:
     env:
       LIBEVENT_VERSION: ${{ matrix.version }}
       LIBEVENT_FLAVOUR: ${{ matrix.flavour }}
-      # Every cell builds the Prometheus exporter: no cell sets prometheus: no
-      # yet; the knob is there for a future cell without the exporter.
-      PROMETHEUS_BUILD: ${{ matrix.prometheus == 'no' && 'no' || 'yes' }}
       # abort_on_error turns every sanitizer report, leaks included, into
       # SIGABRT so a test that only checks the exit code cannot pass over it.
       ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
@@ -204,7 +201,6 @@ jobs:
           autoreconf -ivf
           configure_args=()
           [[ "$MODE" == no-tls ]] && configure_args+=(--disable-tls)
-          [[ "$PROMETHEUS_BUILD" == no ]] && configure_args+=(--disable-prometheus)
           [[ "$LIBEVENT_FLAVOUR" == sanitize ]] && configure_args+=(--enable-sanitizers --enable-ubsan)
           pc="$LIBEVENT_PREFIX/lib/pkgconfig"
           [[ "$RUNNER_OS" == macOS ]] && pc+=":$OPENSSL_PREFIX/lib/pkgconfig"
@@ -217,7 +213,7 @@ jobs:
           TLS_BUILD: ${{ matrix.mode == 'no-tls' && 'no' || 'yes' }}
         run: |
           bash scripts/check-libevent-linkage.sh --prefix "$LIBEVENT_PREFIX" \
-            --expect-version "$EXPECT" --tls "$TLS_BUILD" --prometheus "$PROMETHEUS_BUILD"
+            --expect-version "$EXPECT" --tls "$TLS_BUILD" --prometheus yes
 
       - name: Unit tests
         run: make check
@@ -242,12 +238,11 @@ jobs:
           sudo apt-get install redis
           sudo service redis-server stop
 
-      - name: Increase connection limit
+      - name: Shorten TCP TIME_WAIT
         if: matrix.topology != 'build'
         run: |
           sudo sysctl -w net.ipv4.tcp_fin_timeout=10
           sudo sysctl -w net.ipv4.tcp_tw_reuse=1
-          ulimit -n 40960
 
       - name: Generate TLS test certificates
         if: matrix.topology != 'build' && matrix.mode == 'tls'
@@ -273,6 +268,8 @@ jobs:
           VERBOSE: '1'
           PARALLELISM: '2'
         run: |
+          # ulimit only lasts for this step's shell.
+          ulimit -n 40960
           # Some tests compile helpers against libevent: use the same one.
           PKG_CONFIG_PATH="$LIBEVENT_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" ./tests/run_tests.sh
 

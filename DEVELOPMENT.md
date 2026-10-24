@@ -300,7 +300,8 @@ checks to `check-macos-tls-links.sh`).
   (`TLS connection error: certificate verify failed: <reason>`); any other
   TLS failure without a socket error prints
   `TLS connection error: no OpenSSL reason reported (libevent <version>)`.
-  Failure and reconnect handling are the same as on 2.1.
+  That line can also appear on 2.1, for example when the peer closes during
+  the handshake. Failure and reconnect handling are the same as on 2.1.
 
 ### Code Style
 
