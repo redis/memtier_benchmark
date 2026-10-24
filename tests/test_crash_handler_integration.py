@@ -438,6 +438,9 @@ def _main_thread_sleeping(pid):
         with open(f"/proc/{pid}/task/{pid}/syscall") as f:
             fields = f.read().split()
         number, pc = int(fields[0]), int(fields[-1], 16)
+    except PermissionError as e:
+        # Reading it needs ptrace access; retrying would only time out.
+        raise RuntimeError(f"cannot read the main thread's system call: {e}") from e
     except (OSError, ValueError, IndexError):
         return False  # "running", or not in a system call ("-1 sp pc")
     if number not in _SYS_SLEEP.get(platform.machine(), ()):
@@ -546,6 +549,7 @@ def _crash_worker(env, child_env, stderr=None, wait_timeout=15, before_crash=Non
                                 stderr=stderr if stderr is not None else subprocess.STDOUT,
                                 env=child_env)
     elapsed = None
+    start = None
     sent_at = None
     try:
         # Wait until the workers exist and have started sending traffic.
@@ -558,11 +562,17 @@ def _crash_worker(env, child_env, stderr=None, wait_timeout=15, before_crash=Non
         worker_tids = workers() if proc.poll() is None else []
         env.assertIsNone(proc.poll(), message="memtier_benchmark exited before the SEGV")
         env.assertTrue(len(worker_tids) > 0, message="no worker threads found")
-        start = time.monotonic()
-        sent_at = datetime.datetime.now(datetime.timezone.utc)
         # On TSan, before_crash runs with the main thread held in its sleep:
         # filling stderr earlier could block main on a progress write first.
-        _signal_thread(proc.pid, worker_tids[0], signal.SIGSEGV, before_signal=before_crash)
+        # Time from the signal itself, not from the helper's wait for it.
+        def before_signal():
+            nonlocal start, sent_at
+            if before_crash is not None:
+                before_crash()
+            start = time.monotonic()
+            sent_at = datetime.datetime.now(datetime.timezone.utc)
+
+        _signal_thread(proc.pid, worker_tids[0], signal.SIGSEGV, before_signal=before_signal)
         proc.wait(timeout=wait_timeout)
         elapsed = time.monotonic() - start
         print(f"Exit status {proc.returncode}, {elapsed:.1f} s after the SEGV")
