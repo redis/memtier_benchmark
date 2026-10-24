@@ -97,6 +97,11 @@ cmake_args=(
     -DEVENT__DISABLE_SAMPLES=ON
     -DEVENT__DISABLE_BENCHMARK=ON
 )
+if [[ "$(uname -s)" == Darwin ]]; then
+    # 2.1 sets absolute install names itself; 2.2 would default to @rpath,
+    # which lets dyld pick a libevent from any rpath entry.
+    cmake_args+=("-DCMAKE_INSTALL_NAME_DIR=$prefix/lib")
+fi
 if [[ -n "$sanitize_flags" ]]; then
     cmake_args+=("-DCMAKE_C_FLAGS=$sanitize_flags" "-DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=address,undefined")
 fi
