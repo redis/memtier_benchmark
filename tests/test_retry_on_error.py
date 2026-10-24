@@ -1120,18 +1120,17 @@ def _run_transaction_with_kills(env, extra_args, requests=None, test_time=None, 
     poll_errors = []
 
     def blocked():
-        """How many of memtier's connections the servers hold a write of."""
-        held = 0
+        """Whether a server holds a write of one of memtier's connections."""
         for conn, ids in zip(conns, harness):
             try:
-                held += sum(1 for c in conn.client_list(_type="normal")
-                            if int(c["id"]) not in ids and "b" in c["flags"])
+                if any(int(c["id"]) not in ids and "b" in c["flags"] for c in conn.client_list(_type="normal")):
+                    return True
             except Exception as e:
                 # Polled every 1ms: log the first failure only.
                 if not poll_errors:
                     env.debugPrint("CLIENT LIST failed: {}".format(e), True)
                 poll_errors.append(e)
-        return held
+        return False
 
     def dropped():
         try:
@@ -1143,29 +1142,31 @@ def _run_transaction_with_kills(env, extra_args, requests=None, test_time=None, 
     def kill_wave(proc, end):
         """Kill memtier's clients once the servers hold one of its requests.
 
-        A request is in flight only until the server answers it, and a busy
-        server answers at once: a wave that went in on the first MULTI after
-        a reconnect, or that found a slow client, mostly found nothing
-        unanswered. Under --cluster-mode such a wave also found most
-        connections still reconnecting and restarted their backoff, so the
-        next one did too (#830). CLIENT PAUSE WRITE holds the next SET or EXEC
-        each running client sends, unanswered, until the kill drops it.
-        Returns how many clients were killed, or None if no request was held.
+        CLIENT PAUSE WRITE holds the next SET (or EXEC of a queued write)
+        each running client sends, unanswered, so every kill drops a request.
+        Returns how many clients were killed, or None if memtier exited or
+        nothing was held by end.
         """
-        for conn in conns:
-            conn.execute_command("CLIENT", "PAUSE", 60000, "WRITE")
         try:
+            for conn in conns:
+                conn.execute_command("CLIENT", "PAUSE", 60000, "WRITE")
             while not blocked():
-                if proc.poll() is not None or (kills and time.time() >= end):
+                if proc.poll() is not None or time.time() >= end:
                     return None
                 time.sleep(0.001)
             return kill_memtier_clients(env, conns, harness)
         finally:
+            # Unpause every primary, also the ones after one that fails.
             for conn in conns:
-                conn.execute_command("CLIENT", "UNPAUSE")
+                try:
+                    conn.execute_command("CLIENT", "UNPAUSE")
+                except Exception as e:
+                    env.debugPrint("CLIENT UNPAUSE failed: {}".format(e), True)
 
     def kill_loop(proc):
         end = time.time() + (test_time - 1 if test_time else 60)
+        # The first wave may wait through a slow connect, but not forever.
+        first_end = end + 30
         while proc.poll() is None and (max_waves is None or len(kills) < max_waves):
             # memtier logs a dropped request once it handles the kill, so look
             # for it after kill_interval, not right after the kill.
@@ -1174,9 +1175,9 @@ def _run_transaction_with_kills(env, extra_args, requests=None, test_time=None, 
             # Each wave goes in as soon as memtier has a request held. The
             # first one is not one kill_interval in: a fast runner can finish a
             # --requests run within kill_interval, and nothing is killed
-            # (#682). It is not bound by end either: a slow runner can take
+            # (#682). It gets until first_end, not end: a slow runner can take
             # most of the run to connect.
-            killed = kill_wave(proc, end)
+            killed = kill_wave(proc, end if kills else first_end)
             if killed is None:
                 break
             kills.append(killed)
@@ -1268,7 +1269,8 @@ def test_transaction_lost_multi_is_not_continued(env):
         env.skip()
         return
     # Long blocks, so most kills land inside one; a --pipeline that does not
-    # divide the rotation, so the kill does not always find it at a boundary.
+    # divide the rotation, so the clients killed along with the held one are
+    # caught at different points of it.
     get_ratio, pipeline = 50, 7
     rc, stderr_content, killed, errors, _ = _run_transaction_with_kills(
         env, ["--command=GET __key__", "--command-ratio={}".format(get_ratio)], test_time=6, kill_interval=0.3,
