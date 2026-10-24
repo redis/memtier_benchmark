@@ -400,9 +400,7 @@ def test_retried_requests_are_counted_once(env):
 
     conn = env.getOSSMasterNodesConnectionList()[0]
     conn.execute_command("FLUSHALL")
-    saved = conn.execute_command("CONFIG", "GET", "maxmemory*")
-    # Keys come back as bytes without decoded responses.
-    saved = {k.decode() if isinstance(k, bytes) else k: v for k, v in zip(saved[0::2], saved[1::2])}
+    saved = conn.config_get("maxmemory*")
     conn.execute_command("CONFIG", "SET", "maxmemory-policy", "noeviction")
     conn.execute_command("CONFIG", "RESETSTAT")
 
@@ -466,9 +464,7 @@ def test_retry_after_last_request_is_sent(env):
 
     conn = env.getOSSMasterNodesConnectionList()[0]
     conn.execute_command("FLUSHALL")
-    saved = conn.execute_command("CONFIG", "GET", "maxmemory*")
-    # Keys come back as bytes without decoded responses.
-    saved = {k.decode() if isinstance(k, bytes) else k: v for k, v in zip(saved[0::2], saved[1::2])}
+    saved = conn.config_get("maxmemory*")
     conn.execute_command("CONFIG", "SET", "maxmemory-policy", "noeviction")
     # Every SET fails with a retryable -OOM until the window below ends, so
     # the last request is retried after all of them were sent.
@@ -537,9 +533,7 @@ def test_retry_backoff_is_per_request(env):
 
     conn = env.getOSSMasterNodesConnectionList()[0]
     conn.execute_command("FLUSHALL")
-    saved = conn.execute_command("CONFIG", "GET", "maxmemory*")
-    # Keys come back as bytes without decoded responses.
-    saved = {k.decode() if isinstance(k, bytes) else k: v for k, v in zip(saved[0::2], saved[1::2])}
+    saved = conn.config_get("maxmemory*")
     conn.execute_command("CONFIG", "SET", "maxmemory-policy", "noeviction")
     # Every SET fails with a retryable -OOM for the whole run.
     conn.execute_command("CONFIG", "SET", "maxmemory", "1")
@@ -602,9 +596,7 @@ def test_test_time_ends_when_every_request_is_retried(env):
     max_grace = 10
     conn = env.getOSSMasterNodesConnectionList()[0]
     conn.execute_command("FLUSHALL")
-    saved = conn.execute_command("CONFIG", "GET", "maxmemory*")
-    # Keys come back as bytes without decoded responses.
-    saved = {k.decode() if isinstance(k, bytes) else k: v for k, v in zip(saved[0::2], saved[1::2])}
+    saved = conn.config_get("maxmemory*")
     conn.execute_command("CONFIG", "SET", "maxmemory-policy", "noeviction")
     # Every SET fails with a retryable -OOM for the whole run.
     conn.execute_command("CONFIG", "SET", "maxmemory", "1")
