@@ -87,9 +87,15 @@ jobs:
                   label = "macos, openssl@" + openssl
               elif topology != "build":
                   label += ", " + topology
-              cells.append(dict(track=track, cell=label, version=version, expect=expect,
-                                mode=mode, topology=topology, flavour=flavour, os=os_, openssl=openssl,
-                                canary=track == "canary"))
+              # The cluster suite takes as long as ci.yml's slowest cell; split
+              # it by test file (utils/select_test_shard.py) to stay off the
+              # critical path.
+              shards = ["1", "2"] if topology == "cluster" else [""]
+              for shard in shards:
+                  cells.append(dict(track=track, cell=label + (" " + shard + "/2" if shard else ""),
+                                    version=version, expect=expect, mode=mode, topology=topology,
+                                    shard=shard, flavour=flavour, os=os_, openssl=openssl,
+                                    canary=track == "canary"))
           for track in ("stable", "next"):
               for topology in ("standalone", "cluster"):
                   add(track, "tls", topology)
@@ -236,6 +242,16 @@ jobs:
       - name: Generate TLS test certificates
         if: matrix.topology != 'build' && matrix.mode == 'tls'
         run: ./tests/gen-test-certs.sh
+
+      - name: Validate cluster shard coverage
+        if: matrix.shard == '1'
+        run: python3 utils/check_test_shards.py 2
+
+      - name: Select cluster test shard
+        if: matrix.shard != ''
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: echo "TEST=$(python3 utils/select_test_shard.py "$SHARD" 2)" >>"$GITHUB_ENV"
 
       - name: Integration tests
         if: matrix.topology != 'build'
