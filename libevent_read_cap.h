@@ -24,8 +24,8 @@
 // libevent 2.2 reads up to 16 KiB (issue #535). For a plaintext socket
 // bufferevent, read on after a capped read so that a read event takes the
 // same amount of data on both series. TLS bufferevents read whole records
-// and are left alone. Windows keeps libevent's reads: its CI runs no
-// integration tests over sockets.
+// and are left alone. Windows keeps libevent's reads: the Winsock version
+// (ioctlsocket(), and IOCP bufferevents) is neither written nor tested.
 
 #include <assert.h>
 #include <stddef.h>
