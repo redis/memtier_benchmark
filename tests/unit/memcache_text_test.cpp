@@ -68,6 +68,13 @@ int main(void)
     hits = 99;
     check(parse("VALUE k 0 1\r\nv\r\nEND\r\n", &hits) == 1, "a GET hit completes");
     check(hits == 1, "a hit is counted");
+    // A multi-key GET: every VALUE line after the status line is freed (an
+    // ASan build reports a leak otherwise), and so is an unknown later line.
+    hits = 99;
+    check(parse("VALUE a 0 1\r\nx\r\nVALUE b 0 1\r\ny\r\nVALUE c 0 1\r\nz\r\nEND\r\n", &hits) == 1,
+          "a multi-key GET completes");
+    check(hits == 3, "every hit is counted");
+    check(parse("VALUE a 0 1\r\nx\r\nBOGUS\r\n") == -1, "an unknown line after a value is rejected");
 
     // Lines shorter than "VALUE", "STORED" or "END" are unknown replies.
     const char *short_lines[] = {"\r\n", "E\r\n", "EN\r\n", "VAL\r\n", "STORE\r\n"};

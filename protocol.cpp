@@ -1209,6 +1209,8 @@ int memcache_text_protocol::parse_response(void)
                     return -1;
                 }
 
+                // Only the first line is kept, as the status.
+                if (m_last_response.get_status() != line) free(line);
                 m_response_state = rs_read_value;
                 continue;
             } else if ((tmplen >= 3 && memcmp(line, "END", 3) == 0) ||
@@ -1219,6 +1221,7 @@ int memcache_text_protocol::parse_response(void)
             } else {
                 m_last_response.set_error();
                 benchmark_debug_log("unknown response: %s\n", line);
+                if (m_last_response.get_status() != line) free(line);
                 return -1;
             }
             break;
