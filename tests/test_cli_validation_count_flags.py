@@ -31,7 +31,7 @@ import subprocess
 import tempfile
 
 from include import (MEMTIER_BINARY, addTLSArgs, add_required_env_arguments,
-                     get_default_memtier_config)
+                     get_default_memtier_config, memtier_auth_args)
 from mb import Benchmark, RunConfig
 
 
@@ -703,6 +703,7 @@ def test_key_maximum_full_range_runs(env):
         specs = {"args": ["-s", "127.0.0.1", "-p", str(master["port"]), "-n", "3", "-c", clients, "-t", "1",
                           "--key-maximum=" + ULLONG_MAX, "--key-pattern=" + pattern, "--hide-histogram"]}
         addTLSArgs(specs, env)  # the TLS CI cells run a TLS-only server
+        specs["args"] += memtier_auth_args(env)
         try:
             result = subprocess.run([MEMTIER_BINARY] + specs["args"], capture_output=True, text=True, timeout=30)
         except subprocess.TimeoutExpired:

@@ -32,7 +32,7 @@ help() {
 
 		REDIS_SERVER=path   Location of redis-server
 		REDIS_PORT=n        Override the RLTest base port
-		REDIS_PASSWORD=str  Password for RLTest Redis servers (tests must pass it to clients)
+		REDIS_PASSWORD=str  Password for RLTest Redis servers (passed to memtier as --authenticate)
 		MEMTIER_BINARY=path Location of the memtier_benchmark binary to test
 		                    (default: the in-tree build at the repo root)
 		VERBOSE=1           Print commands
