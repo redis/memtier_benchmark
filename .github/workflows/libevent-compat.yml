@@ -66,7 +66,7 @@ jobs:
             workflow_dispatch) scope="${SCOPE:-full+canary}" ;;
             *)
               base="${PR_BASE:-$PUSH_BEFORE}"
-              harness='^(\.github/workflows/libevent-compat\.yml|scripts/(build-libevent|check-libevent-linkage|build-macos-libevent|check-macos-tls-links)\.sh)$'
+              harness='^(\.github/workflows/libevent-compat\.yml|scripts/(build-libevent|check-libevent-linkage|build-macos-libevent|check-macos-tls-links)\.sh|utils/(select_test_shard|check_test_shards)\.py)$'
               if [[ -z "$base" || "$base" =~ ^0+$ ]] ||
                  ! changed="$(git diff --name-only "$base" HEAD)" ||
                  grep -Eq "$harness" <<<"$changed"; then
@@ -116,6 +116,10 @@ jobs:
                       add(track, "plaintext", topology)
               add("legacy", "no-tls", "build")
               add("stable", "no-tls", "build")
+              # #822's TLS fallback (bufferevent_openssl_get_ssl() and
+              # SSL_get_verify_result() when 2.2 queues no OpenSSL error)
+              # against an ASan+UBSan libevent; nightly to keep PR cost down.
+              add("next", "tls", "standalone", flavour="sanitize")
               for openssl in ("3", "4"):
                   add("next", "tls", "build", os_="macos-latest", openssl=openssl)
           if scope == "full+canary":
