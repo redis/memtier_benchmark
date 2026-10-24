@@ -57,12 +57,21 @@ jobs:
         ./configure --enable-ubsan
         make -j
 
+    # A linked runtime alone does not prove C translation units were instrumented.
+    - name: Verify HDR C instrumentation
+      run: nm -u deps/hdr_histogram/memtier_benchmark-hdr_histogram.o | grep -E '__ubsan_handle_'
+
     # Unit tests inherit the sanitizer CXXFLAGS/LDFLAGS set by configure.
     # UBSan only reports by default; halt_on_error makes a report fail the test.
     - name: Run unit tests
       env:
         UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-      run: make -j check
+      timeout-minutes: 15
+      run: |
+        if ! make -j check; then
+          cat test-suite.log
+          exit 1
+        fi
 
     - name: Upload unit test logs
       if: failure()
@@ -74,10 +83,6 @@ jobs:
           *_test.log
         if-no-files-found: ignore
         retention-days: 7
-
-    # A linked runtime alone does not prove C translation units were instrumented.
-    - name: Verify HDR C instrumentation
-      run: nm -u deps/hdr_histogram/memtier_benchmark-hdr_histogram.o | grep -E '__ubsan_handle_'
 
     - name: Upload build artifact
       uses: actions/upload-artifact@v5

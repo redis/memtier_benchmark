@@ -61,12 +61,25 @@ jobs:
         ./configure --enable-thread-sanitizer
         make -j
 
+    - name: Verify TSAN is enabled
+      run: |
+        ldd ./memtier_benchmark | grep tsan
+        echo "✓ ThreadSanitizer is linked"
+
+    # A linked runtime alone does not prove C translation units were instrumented.
+    - name: Verify HDR C instrumentation
+      run: nm -u deps/hdr_histogram/memtier_benchmark-hdr_histogram.o | grep -E '__tsan_(read|write)'
+
     # Unit tests inherit the sanitizer CXXFLAGS/LDFLAGS set by configure.
     # Same ASLR workaround and suppressions as the RLTest jobs.
     - name: Run unit tests
+      timeout-minutes: 15
       run: |
         export TSAN_OPTIONS="suppressions=$(pwd)/tsan_suppressions.txt"
-        setarch `uname -m` -R make -j check
+        if ! setarch `uname -m` -R make -j check; then
+          cat test-suite.log
+          exit 1
+        fi
 
     - name: Upload unit test logs
       if: failure()
@@ -78,15 +91,6 @@ jobs:
           *_test.log
         if-no-files-found: ignore
         retention-days: 7
-
-    - name: Verify TSAN is enabled
-      run: |
-        ldd ./memtier_benchmark | grep tsan
-        echo "✓ ThreadSanitizer is linked"
-
-    # A linked runtime alone does not prove C translation units were instrumented.
-    - name: Verify HDR C instrumentation
-      run: nm -u deps/hdr_histogram/memtier_benchmark-hdr_histogram.o | grep -E '__tsan_(read|write)'
 
     - name: Upload build artifact
       uses: actions/upload-artifact@v5
