@@ -660,8 +660,12 @@ int redis_protocol::parse_response(void)
     while (true) {
         switch (m_response_state) {
         case rs_initial:
-            // clear last response
+            // clear last response; this frees the kept mbulk tree, so the
+            // cursor into it must go too. A reply can complete with the
+            // cursor still set (e.g. a nested RESP3 push drained the slots
+            // of an enclosing kept aggregate), see #839.
             m_last_response.clear();
+            m_current_mbulk = NULL;
             m_response_len = 0;
             m_total_bulks_count = 0;
             m_attribute = 0;
