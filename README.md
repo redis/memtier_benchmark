@@ -858,8 +858,13 @@ memtier_benchmark ... --realtime-latencies --latency-window=60 --print-percentil
 sample, so the value is marked `*`. When `--requests` or `--rate-limiting`
 bound the number of samples, memtier warns before the run about percentiles
 the run or the window can never resolve, e.g. `--rate-limiting=100` on 160
-connections gives at most 960,000 samples per 60 second window.
+connections gives at most 960,000 samples per 60 second window. The run-level
+warning applies to the final results table too, so it is printed with or
+without `--realtime-latencies`. In cluster mode the limit applies to each
+endpoint connection, so the check runs once the topology is known.
 
 The window and overall rows merge the per-second histograms each client has
 completed, so every sample is counted exactly once and they lag the `inst` row
-by up to one second. Each window second keeps one histogram (about 21 KB).
+by up to one second. The window covers the last N seconds of wall-clock time,
+even if the progress loop drifts. Each window second keeps one histogram (about
+21 KB).

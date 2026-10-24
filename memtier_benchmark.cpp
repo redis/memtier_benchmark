@@ -1598,6 +1598,7 @@ static void config_init_defaults(struct benchmark_config *cfg)
     if (!cfg->requests && !cfg->test_time) cfg->requests = 10000;
     if (!cfg->hdr_prefix) cfg->hdr_prefix = "";
     if (!cfg->print_percentiles.is_defined()) cfg->print_percentiles = config_quantiles("50,99,99.9");
+    if (!cfg->latency_window_set) cfg->latency_window_secs = 60;
     if (!cfg->monitor_pattern) cfg->monitor_pattern = 'S';
     if (cfg->miss_rate_threshold < 0.0) cfg->miss_rate_threshold = 0.01; // Default: warn above 1%
     if (cfg->cpu_warn_threshold < 0.0) cfg->cpu_warn_threshold = 0.95;   // Default: warn above 95% of a core
@@ -4139,20 +4140,20 @@ static void format_sample_count(unsigned long long n, char *buf, size_t len)
 // Warn up front about --print-percentiles values a bounded run can never
 // resolve (see percentile_min_samples). Only --requests and --rate-limiting
 // bound the sample count; otherwise the realtime rows flag them live.
-static void warn_unresolvable_percentiles(const benchmark_config *cfg)
+// rate_conns is the number of request-generating connections, each limited to
+// --rate-limiting: clients x threads, times the traffic endpoints in cluster
+// mode, which is why cluster_client calls this once the topology is known.
+void warn_unresolvable_percentiles(const benchmark_config *cfg, unsigned long long rate_conns)
 {
-    if (cfg->latency_window_set && !cfg->realtime_latencies)
-        fprintf(stderr, "warning: --latency-window only applies to --realtime-latencies.\n");
-
     // Upper bounds on recorded latency samples; 0 means unbounded.
-    const double conns = (double) cfg->clients * cfg->threads;
+    const double clients = (double) cfg->clients * cfg->threads;
     double run_max = 0, window_max = 0;
     if (cfg->requests)
-        run_max = (double) cfg->requests * conns;
+        run_max = (double) cfg->requests * clients;
     else if (cfg->request_rate && cfg->test_time)
-        run_max = (double) cfg->request_rate * conns * cfg->test_time;
+        run_max = (double) cfg->request_rate * rate_conns * cfg->test_time;
     const unsigned int window = cfg->realtime_latencies ? cfg->latency_window_secs : 0;
-    if (window && cfg->request_rate) window_max = (double) cfg->request_rate * conns * window;
+    if (window && cfg->request_rate) window_max = (double) cfg->request_rate * rate_conns * window;
     if (window && run_max && (!window_max || run_max < window_max)) window_max = run_max;
 
     const std::vector<double> &quantiles = cfg->print_percentiles.quantile_list;
@@ -4393,11 +4394,13 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     }
 
     // Sliding window (--latency-window): one ring slot per tick holding that
-    // tick's completed seconds. Empty ticks take a slot too, so the window
-    // spans wall-clock ticks, not ticks with traffic. Slots are allocated on
-    // first use and merged into rtl_window_hist when a frame is rendered.
+    // tick's completed seconds, stamped with the tick time. Empty ticks take a
+    // slot too, so the window spans wall-clock time, not ticks with traffic.
+    // Slots are allocated on first use and merged into rtl_window_hist when a
+    // frame is rendered.
     const unsigned int win_secs = cfg->realtime_latencies ? cfg->latency_window_secs : 0;
     std::vector<hdr_histogram *> rtl_window_ring(win_secs, (hdr_histogram *) NULL);
+    std::vector<std::chrono::steady_clock::time_point> rtl_window_times(win_secs);
     unsigned int rtl_window_next = 0;
     unsigned int rtl_window_filled = 0;
     hdr_histogram *rtl_window_hist = NULL;
@@ -4620,6 +4623,7 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
                 hdr_reset(slot);
                 if (completed_samples) hdr_add(slot, completed_hist);
             }
+            rtl_window_times[rtl_window_next] = std::chrono::steady_clock::now();
             rtl_window_next = (rtl_window_next + 1) % win_secs;
             if (rtl_window_filled < win_secs) rtl_window_filled++;
         }
@@ -4718,9 +4722,13 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
                 const size_t kPctPerLine = 3;
                 size_t chunks_per_row = quantiles.empty() ? 1 : ((quantiles.size() + kPctPerLine - 1) / kPctPerLine);
 
+                // A tick is normally one second, but the loop can drift (e.g.
+                // under sanitizers), so only merge slots from the last
+                // win_secs seconds of wall-clock time.
                 if (rtl_window_hist != NULL) {
                     hdr_reset(rtl_window_hist);
                     for (unsigned int s = 0; s < rtl_window_filled; s++) {
+                        if (progress_now - rtl_window_times[s] >= std::chrono::seconds(win_secs)) continue;
                         if (rtl_window_ring[s] != NULL && hdr_total_count(rtl_window_ring[s]) > 0)
                             hdr_add(rtl_window_hist, rtl_window_ring[s]);
                     }
@@ -5500,9 +5508,6 @@ int main(int argc, char *argv[])
     cfg.prometheus_port = -1;
 #endif
     cfg.prometheus = NULL;
-    // Sliding-window default: 60s. Initialize before parsing so an explicit
-    // --latency-window=0 (disabled) survives config_init_defaults.
-    cfg.latency_window_secs = 60;
     cfg.latency_window_set = false;
 
     if (config_parse_args(argc, argv, &cfg) < 0) {
@@ -6364,7 +6369,10 @@ int main(int argc, char *argv[])
         // settle pause, since the signal can arrive during it. The interrupted
         // run itself is kept, marked Interrupted. Run 1 always runs, so
         // all_stats is never empty.
-        warn_unresolvable_percentiles(&cfg);
+        if (cfg.latency_window_set && !cfg.realtime_latencies)
+            fprintf(stderr, "warning: --latency-window only applies to --realtime-latencies.\n");
+        // Cluster mode checks once the topology gives its connection fan-out.
+        if (!cfg.cluster_mode) warn_unresolvable_percentiles(&cfg, (unsigned long long) cfg.clients * cfg.threads);
         for (unsigned int run_id = 1; run_id <= cfg.run_count; run_id++) {
             if (run_id > 1) {
                 if (g_interrupted) break;

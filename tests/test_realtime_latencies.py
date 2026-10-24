@@ -449,9 +449,11 @@ def test_latency_window_counts_every_sample_and_marks_unresolved(env):
 
 
 def test_latency_window_warns_when_rate_limit_cannot_fill_it(env):
-    """2 connections at 100 req/s give at most 200 samples per 1s window and
-    600 per 3s run: p99.8 (needs 500) is resolvable for the run but never for
-    the window, so only the window warning is printed."""
+    """2 connections per endpoint at 100 req/s give at most 200 samples per
+    endpoint per 1s window and 1200 per 6s run: p99.9 (needs 1000) is
+    resolvable for the run but never for the window, so only the window
+    warning is printed. In cluster mode the limit applies per endpoint
+    connection, so the bound scales with the primaries."""
     config, memtier_ok = _run(
         env,
         [
@@ -462,20 +464,21 @@ def test_latency_window_warns_when_rate_limit_cannot_fill_it(env):
             "--rate-limiting=100",
             "--realtime-latencies",
             "--latency-window=1",
-            "--print-percentiles=50,99.8",
+            "--print-percentiles=50,99.9",
         ],
         threads=1,
         clients=2,
-        test_time=3,
+        test_time=6,
     )
     try:
         env.assertTrue(memtier_ok)
         stderr = _read_stderr(config)
-        env.assertTrue(
-            "warning: p99.8 needs at least 500 latency samples, but the 1s latency window holds at most 200; "
-            "the win1s row marks it with '*'." in stderr,
-            message=stderr[:2000],
+        endpoints = len(env.getMasterNodesList()) if env.isCluster() else 1
+        expected = (
+            "warning: p99.9 needs at least 1000 latency samples, but the 1s latency window holds at most %d; "
+            "the win1s row marks it with '*'." % (200 * endpoints)
         )
+        env.assertEqual(stderr.count(expected), 1, message=stderr[:2000])
         env.assertFalse("this run records at most" in stderr, message=stderr[:2000])
         env.assertFalse("warning: p50 needs" in stderr, message=stderr[:2000])
     finally:
@@ -510,10 +513,11 @@ def test_latency_window_expires_old_seconds(env):
         last = frames[-1]
         win_n = _parse_count(last["win1s"][0])
         overall_n = _parse_count(last["overall"][0])
-        # ~200 samples per second for ~5 seconds.
+        # At least ~200 samples per second (more in cluster mode, where the
+        # limit applies per endpoint connection) for ~5 seconds; the window
+        # keeps only the last second of them.
         env.assertGreater(overall_n, 600, message=stderr[:3000])
         env.assertLess(win_n, overall_n / 2, message=stderr[:3000])
-        env.assertTrue(all(_parse_count(f["win1s"][0]) <= 500 for f in frames), message=stderr[:3000])
     finally:
         if not memtier_ok:
             debugPrintMemtierOnError(config, env)

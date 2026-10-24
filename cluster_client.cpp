@@ -886,6 +886,18 @@ void cluster_client::print_topology_summary() const
                 m_config->request_rate, aggregate, ramp);
     }
 
+    // Unresolvable-percentile warnings need the same connection fan-out, so
+    // cluster mode emits them here, once per process.
+    static bool s_percentiles_checked = false;
+    if (!s_percentiles_checked) {
+        s_percentiles_checked = true;
+        const unsigned long long traffic_eps =
+            (unsigned long long) primaries +
+            (m_config->read_preference != rp_primary ? (unsigned long long) replicas : 0);
+        warn_unresolvable_percentiles(m_config, (unsigned long long) m_config->threads *
+                                                    (unsigned long long) m_config->clients * traffic_eps);
+    }
+
     pthread_mutex_unlock(&s_mtx);
 }
 
