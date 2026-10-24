@@ -1219,7 +1219,9 @@ void client::handle_response(unsigned int conn_id, struct timeval timestamp, req
         // Extract cursor from SCAN response for incremental iteration
         if (m_config->scan_incremental_iteration && !response->is_error()) {
             mbulk_size_el *top = response->get_mbulk_value();
-            if (top && top->mbulks_elements.size() >= 1) {
+            // The cursor must be a bulk string; as_bulk() asserts on an
+            // aggregate, so a malformed reply restarts iteration instead.
+            if (top && top->mbulks_elements.size() >= 1 && top->mbulks_elements[0]->is_bulk()) {
                 bulk_el *cursor_el = top->mbulks_elements[0]->as_bulk();
                 if (cursor_el && cursor_el->value && cursor_el->value_len > 0) {
                     m_scan_cursor.assign(cursor_el->value, cursor_el->value_len);
