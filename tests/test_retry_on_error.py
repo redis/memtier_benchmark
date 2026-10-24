@@ -1077,8 +1077,8 @@ def _run_transaction_with_kills(env, extra_args, requests=None, test_time=None, 
                                 set_ratio=1, max_waves=None, until_dropped=False):
     """Run a MULTI/SET/EXEC --transaction rotation while memtier's clients on
     every primary are killed every kill_interval seconds, at most max_waves
-    times. Each wave waits until memtier has sent a MULTI since the last one,
-    so no wave lands while every connection is still reconnecting. With
+    times. Each wave holds memtier's writes (CLIENT PAUSE WRITE) and goes in
+    once a server holds one, so it always finds a request in flight. With
     until_dropped, the waves stop once a kill has dropped an in-flight
     request (a transaction-not-replayed row in --failed-keys-file).
 
@@ -1119,16 +1119,19 @@ def _run_transaction_with_kills(env, extra_args, requests=None, test_time=None, 
 
     poll_errors = []
 
-    def multi_calls():
-        try:
-            return sum(conn.execute_command("INFO", "commandstats").get("cmdstat_multi", {}).get("calls", 0)
-                       for conn in conns)
-        except Exception as e:
-            # Polled every 1ms: log the first failure only.
-            if not poll_errors:
-                env.debugPrint("INFO commandstats failed: {}".format(e), True)
-            poll_errors.append(e)
-            return -1
+    def blocked():
+        """How many of memtier's connections the servers hold a write of."""
+        held = 0
+        for conn, ids in zip(conns, harness):
+            try:
+                held += sum(1 for c in conn.client_list(_type="normal")
+                            if int(c["id"]) not in ids and "b" in c["flags"])
+            except Exception as e:
+                # Polled every 1ms: log the first failure only.
+                if not poll_errors:
+                    env.debugPrint("CLIENT LIST failed: {}".format(e), True)
+                poll_errors.append(e)
+        return held
 
     def dropped():
         try:
@@ -1137,26 +1140,46 @@ def _run_transaction_with_kills(env, extra_args, requests=None, test_time=None, 
         except OSError:
             return False
 
+    def kill_wave(proc, end):
+        """Kill memtier's clients once the servers hold one of its requests.
+
+        A request is in flight only until the server answers it, and a busy
+        server answers at once: a wave that went in on the first MULTI after
+        a reconnect, or that found a slow client, mostly found nothing
+        unanswered. Under --cluster-mode such a wave also found most
+        connections still reconnecting and restarted their backoff, so the
+        next one did too (#830). CLIENT PAUSE WRITE holds the next SET or EXEC
+        each running client sends, unanswered, until the kill drops it.
+        Returns how many clients were killed, or None if no request was held.
+        """
+        for conn in conns:
+            conn.execute_command("CLIENT", "PAUSE", 60000, "WRITE")
+        try:
+            while not blocked():
+                if proc.poll() is not None or (kills and time.time() >= end):
+                    return None
+                time.sleep(0.001)
+            return kill_memtier_clients(env, conns, harness)
+        finally:
+            for conn in conns:
+                conn.execute_command("CLIENT", "UNPAUSE")
+
     def kill_loop(proc):
         end = time.time() + (test_time - 1 if test_time else 60)
-        last = 0
-        while time.time() < end and proc.poll() is None and (max_waves is None or len(kills) < max_waves):
+        while proc.poll() is None and (max_waves is None or len(kills) < max_waves):
             # memtier logs a dropped request once it handles the kill, so look
             # for it after kill_interval, not right after the kill.
-            if until_dropped and dropped():
+            if (until_dropped and dropped()) or (kills and time.time() >= end):
                 break
-            # Each wave goes in as soon as memtier has sent a MULTI since the
-            # last one. The first one is not one kill_interval in: a fast
-            # runner can finish a --requests run within kill_interval, and
-            # nothing is killed (#682).
-            calls = multi_calls()
-            while calls <= last and time.time() < end and proc.poll() is None:
-                time.sleep(0.001)
-                calls = multi_calls()
-            if calls <= last:
+            # Each wave goes in as soon as memtier has a request held. The
+            # first one is not one kill_interval in: a fast runner can finish a
+            # --requests run within kill_interval, and nothing is killed
+            # (#682). It is not bound by end either: a slow runner can take
+            # most of the run to connect.
+            killed = kill_wave(proc, end)
+            if killed is None:
                 break
-            last = calls
-            kills.append(kill_memtier_clients(env, conns, harness))
+            kills.append(killed)
             time.sleep(kill_interval)
 
     rc, stderr_content = _run_with_background(env, benchmark, config, kill_loop, timeout=(test_time or 60) + 30)
