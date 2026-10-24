@@ -504,7 +504,8 @@ bool shard_connection::setup_event(evutil_socket_t sockfd)
         if (m_protocol != NULL) m_protocol->set_buffers(NULL, NULL);
     }
     // A Unix socket connect retry belongs to the previous attempt; it must not
-    // fire against the bufferevent created below (or against none).
+    // fire against the bufferevent created below (or against none). Defensive:
+    // the reconnect paths call disconnect() first, which already frees it.
     if (m_unix_connect_timer != NULL) {
         event_free(m_unix_connect_timer);
         m_unix_connect_timer = NULL;
@@ -539,7 +540,7 @@ bool shard_connection::setup_event(evutil_socket_t sockfd)
             // mimics this contract.
             // The socket is still ours there (the SSL's socket BIO does not
             // close it). On libevent <= 2.1.8 it is closed or not depending on
-            // where libevent failed (see libevent_ssl_failure_keeps_socket()),
+            // where libevent failed (see libevent_ssl_failure_socket_is_ours()),
             // which cannot be told from here: leak it rather than risk closing
             // a descriptor another thread has just been given. Under repeated
             // failure that is one descriptor (and possibly one SSL) per
@@ -547,7 +548,7 @@ bool shard_connection::setup_event(evutil_socket_t sockfd)
             // length; this only happens when libevent cannot allocate.
             benchmark_error_log("error: bufferevent_openssl_socket_new() failed; cannot create the TLS "
                                 "connection.\n");
-            if (libevent_ssl_failure_keeps_socket(event_get_version_number())) evutil_closesocket(sockfd);
+            if (libevent_ssl_failure_socket_is_ours(event_get_version_number())) evutil_closesocket(sockfd);
             return false;
         }
     } else {

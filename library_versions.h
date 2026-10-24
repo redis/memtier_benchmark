@@ -30,15 +30,15 @@ static inline bool libevent_series_differs(unsigned long build, unsigned long ru
     return (build >> 16) != (runtime >> 16);
 }
 
-// Whether a failed bufferevent_openssl_socket_new(..., BEV_OPT_CLOSE_ON_FREE)
-// is known to leave the socket open for the caller to close. From 2.1.9-beta
+// Whether the caller still owns (and must close) the socket after a failed
+// bufferevent_openssl_socket_new(..., BEV_OPT_CLOSE_ON_FREE). From 2.1.9-beta
 // (upstream commit e86ccfe5, also 2.2) it frees the SSL itself and clears it
 // before freeing the partial bufferevent, so the socket is never reached. In
 // 2.1.8 and older that depends on where it failed: an allocation failure
 // leaves the socket open (and leaks the SSL, which the caller can't know it
 // still owns), but a failure to arm the handshake events frees the partial
 // bufferevent with the SSL still attached, whose destructor closes both.
-static inline bool libevent_ssl_failure_keeps_socket(unsigned long runtime)
+static inline bool libevent_ssl_failure_socket_is_ours(unsigned long runtime)
 {
     return runtime >= 0x02010900UL;
 }
