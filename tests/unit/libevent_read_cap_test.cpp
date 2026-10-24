@@ -96,6 +96,13 @@ static void run(reader *r, size_t queued, bool close_after, int events)
         return;
     }
     evutil_make_socket_nonblocking(fds[0]);
+    // Queue all the data before the first read: raise the buffer sizes (macOS
+    // gives Unix sockets 8 KiB by default), and write without blocking so that
+    // a short write fails the test instead of hanging it.
+    int size = 65536;
+    setsockopt(fds[1], SOL_SOCKET, SO_SNDBUF, &size, sizeof(size));
+    setsockopt(fds[0], SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
+    evutil_make_socket_nonblocking(fds[1]);
     static char payload[65536];
     memset(payload, 'v', sizeof(payload));
     if (write(fds[1], payload, queued) != (ssize_t) queued) {

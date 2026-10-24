@@ -57,7 +57,9 @@ static inline void libevent_read_added_cb(struct evbuffer *, const struct evbuff
 
 // Record in *last_added how much each read adds to input. A callback rather
 // than comparing lengths around process_response(), which can delete the
-// connection (e.g. a cluster reconnect frees non-main connections).
+// connection (e.g. a cluster reconnect frees non-main connections). Our own
+// read below triggers it too; libevent's next read overwrites that value
+// before the next read callback.
 static inline void track_libevent_reads(struct evbuffer *input, size_t *last_added)
 {
     *last_added = 0;
