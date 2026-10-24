@@ -841,9 +841,10 @@ interval. JSON configuration records the interval as `progress_interval`.
 
 ### Sliding-window tail latency
 
-`--realtime-latencies` prints three latency rows per tick: `inst` (the current
-second), `win<N>s` (every sample completed in the last N seconds, set by
-`--latency-window=N`, default 60, 0 disables, max 3600) and `overall` (the whole
+`--realtime-latencies` prints three latency rows per tick: `inst` (each
+client's current second), `win<N>s` (every sample completed in the last N
+seconds, set by `--latency-window=N`, default 60, 0 disables, max 3600) and
+`overall` (the whole
 run). For example, the last 60 seconds' p99.9999:
 
 ```
@@ -853,22 +854,24 @@ memtier_benchmark ... --realtime-latencies --latency-window=60 --print-percentil
 [RUN #1  50%  90s] latency [overall ] n=2.81M   p50  0.119   p99  0.239   p99.9999  2.104  ms
 ```
 
-`n` is the row's sample count. A percentile p needs at least `100/(100-p)` samples
-(100 for p99, 1,000,000 for p99.9999); with fewer, it is just the largest
-sample, so the value is marked `*`. When `--requests` or `--rate-limiting`
-bound the number of samples, memtier warns before the run about percentiles
-the run or the window can never resolve, e.g. `--rate-limiting=100` on 160
-connections gives at most 960,000 samples per 60 second window. The run-level
-warning applies to the final results table too, so it is printed with or
-without `--realtime-latencies`; it checks the total sample count, and
-per-command rows have fewer samples. In cluster mode the limit applies to each
-endpoint connection, so the check runs once the first topology is known, after
-the threads start.
+`n` is the row's sample count. A percentile p needs at least `100/(100-p)`
+samples (100 for p99, 1,000,000 for p99.9999); with fewer, it falls on one of
+the few largest samples and is not resolved, so the value is marked `*`. When
+`--requests` or `--rate-limiting` bound the number of samples, memtier warns
+before the run about percentiles the run or the window can never resolve. For
+example, `--rate-limiting=100` on 160 connections gives at most about 976,000
+samples per 60 second window (61 seconds of completed client seconds plus the
+initial per-connection burst), not enough for p99.9999. The run-level warning
+applies to the final results table too, so it is printed with or without
+`--realtime-latencies`; it checks the total sample count, and per-command rows
+have fewer samples. In cluster mode the limit applies to each endpoint
+connection, so the check runs once the first topology is known, after the
+threads start.
 
 The window and overall rows merge the per-second histograms each client has
 completed, so every sample is counted exactly once. A client's second is
 completed when it records its first sample of the next second, so these rows
 normally lag the `inst` row by about a second, and samples of a stalled client
-appear only once it completes another request. The window covers the last N seconds of wall-clock time,
-even if the progress loop drifts. Each window second keeps one histogram (about
-21 KB).
+appear only once it completes another request. The window covers the last N
+seconds of wall-clock time, even if the progress loop drifts. Each window
+second keeps one histogram (about 21 KB).

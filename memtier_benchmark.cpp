@@ -93,6 +93,7 @@ static bool bitmask_is_contiguous(unsigned int mask);
 
 #endif
 
+#include <cfloat>
 #include <cmath>
 #include <cstring>
 #include <set>
@@ -3307,9 +3308,10 @@ void usage()
         "iterations\n"
         "      --realtime-latencies       Replace the periodic single-line progress output with a per-tick block: "
         "line 1 = throughput + miss ratio, then labeled latency rows carrying the percentiles configured by "
-        "--print-percentiles: inst (current second), win<N>s (sliding window, see --latency-window) and overall "
+        "--print-percentiles: inst (each client's current second), win<N>s (sliding window, see --latency-window) and "
+        "overall "
         "(full run). Each row shows its sample count n; a percentile p with fewer than 100/(100-p) samples (1M "
-        "for p99.9999) only reports the maximum and is marked '*'. Redraws in place on a TTY; appends cleanly when "
+        "for p99.9999) is not resolved and is marked '*'. Redraws in place on a TTY; appends cleanly when "
         "stderr is redirected to a file.\n"
         "      --latency-window=SECS      Sliding-window size for the win<N>s row of --realtime-latencies: "
         "percentiles over every sample completed in the last SECS seconds. Default: 60. Set to 0 to disable the "
@@ -4112,15 +4114,23 @@ static hdr_histogram *drain_completed_latency(std::vector<cg_thread *> &threads,
     return target;
 }
 
-// Smallest sample count at which percentile p (0-100) is resolved below the
-// maximum: ceil(1 / (1 - p/100)), e.g. 1,000,000 for p99.9999. With fewer
-// samples, hdr_value_at_percentile() just returns the largest one.
+// Smallest sample count at which percentile p (0-100) is resolved:
+// ceil(100 / (100 - p)), e.g. 1,000,000 for p99.9999. With fewer samples the
+// percentile falls on one of the few largest samples and is not meaningful.
 static unsigned long long percentile_min_samples(double p)
 {
     if (p >= 100.0) return 1;
     double n = 100.0 / (100.0 - p);
-    // Absorb the binary rounding of p, so p99.9999 needs 1e6 and not 1e6 + 1.
-    return (unsigned long long) ceil(n * (1.0 - 1e-9));
+    // The binary rounding of p is amplified by 100 / (100 - p): snap n to the
+    // significant digits that survive it (at most 7), so p99.9999 needs 1e6
+    // and p99.99999999 1e10, not slightly more.
+    double rel_err = 400.0 * DBL_EPSILON / (100.0 - p);
+    double digits = floor(-log10(rel_err));
+    if (digits > 7) digits = 7;
+    if (digits < 1) digits = 1;
+    double scale = pow(10.0, digits - 1 - floor(log10(n)));
+    n = round(n * scale) / scale;
+    return (unsigned long long) ceil(n * (1.0 - 1e-12));
 }
 
 // Compact sample count for the --realtime-latencies rows: 987, 12.3K, 1.23M.
@@ -4145,15 +4155,20 @@ static void format_sample_count(unsigned long long n, char *buf, size_t len)
 // mode, which is only known once the first topology is committed.
 static void warn_unresolvable_percentiles(const benchmark_config *cfg, unsigned long long rate_conns)
 {
-    // Upper bounds on recorded latency samples; 0 means unbounded.
+    // Upper bounds on recorded latency samples; 0 means unbounded. A
+    // rate-limited connection sends at most rate x T plus the burst of
+    // request_per_interval it is granted on connect, in any T seconds. The
+    // window merges the last N ticks of completed client seconds, which can
+    // span N + 1 seconds.
     const double clients = (double) cfg->clients * cfg->threads;
+    const double burst = (double) cfg->request_per_interval;
     double run_max = 0, window_max = 0;
     if (cfg->requests)
         run_max = (double) cfg->requests * clients;
     else if (cfg->request_rate && cfg->test_time)
-        run_max = (double) cfg->request_rate * rate_conns * cfg->test_time;
+        run_max = ((double) cfg->request_rate * cfg->test_time + 2 * burst) * rate_conns;
     const unsigned int window = cfg->realtime_latencies ? cfg->latency_window_secs : 0;
-    if (window && cfg->request_rate) window_max = (double) cfg->request_rate * rate_conns * window;
+    if (window && cfg->request_rate) window_max = ((double) cfg->request_rate * (window + 1) + burst) * rate_conns;
     if (window && run_max && (!window_max || run_max < window_max)) window_max = run_max;
 
     const std::vector<double> &quantiles = cfg->print_percentiles.quantile_list;
@@ -4161,13 +4176,13 @@ static void warn_unresolvable_percentiles(const benchmark_config *cfg, unsigned 
         unsigned long long need = percentile_min_samples(quantiles[i]);
         if (run_max && run_max < need) {
             fprintf(stderr,
-                    "warning: p%.10g needs at least %llu latency samples, but this run records at most %.0f; "
-                    "it will only report the maximum latency.\n",
+                    "warning: p%.10g needs at least %llu latency samples, but this run records at most about %.0f, "
+                    "so it will not be resolved.\n",
                     quantiles[i], need, run_max);
         } else if (window_max && window_max < need) {
             fprintf(stderr,
                     "warning: p%.10g needs at least %llu latency samples, but the %us latency window holds at "
-                    "most %.0f; the win%us row marks it with '*'.\n",
+                    "most about %.0f; the win%us row marks it with '*'.\n",
                     quantiles[i], need, window, window_max, window);
         }
     }
@@ -4367,6 +4382,7 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     // this to choose between in-place cursor-up redraw and plain-append output.
     bool stderr_is_tty = isatty(fileno(stderr)) != 0;
     bool first_rtl_frame = true;
+    bool progress_printed = false;
 
     // Cumulative latency histogram for --realtime-latencies "overall" percentiles:
     // every completed second drained during the run (see rtl_completed_hist).
@@ -4387,8 +4403,9 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     // client seconds completed since the previous tick, drained once per tick,
     // so every sample is counted exactly once. The 'inst' row instead samples
     // each client's live, partial second.
+    // Prometheus drains into its own tick histogram, which the rows share.
     hdr_histogram *rtl_completed_hist = NULL;
-    if (cfg->realtime_latencies) {
+    if (cfg->realtime_latencies && !prom_enabled(cfg)) {
         hdr_init(LATENCY_HDR_MIN_VALUE, LATENCY_HDR_SEC_MAX_VALUE, LATENCY_HDR_SEC_SIGDIGTS, &rtl_completed_hist);
     }
 
@@ -4608,6 +4625,8 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         static bool cluster_percentiles_checked = false;
         if (cfg->cluster_mode && !cluster_percentiles_checked && cluster_client::rate_limited_connections() > 0) {
             cluster_percentiles_checked = true;
+            // The single-line progress display ends with '\r'.
+            if (progress_printed && !cfg->realtime_latencies) fputc('\n', stderr);
             warn_unresolvable_percentiles(cfg, cluster_client::rate_limited_connections());
             first_rtl_frame = true;
         }
@@ -4643,6 +4662,7 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         auto progress_now = std::chrono::steady_clock::now();
         if (active_threads == 0 || progress_now - last_progress_time >= std::chrono::seconds(cfg->progress_interval)) {
             last_progress_time = progress_now;
+            progress_printed = true;
             if (cfg->realtime_latencies) {
                 // Two-line, time-series-friendly block. On a TTY we move the cursor
                 // back up 2 lines so the block redraws in place; on a non-TTY (file
@@ -4793,7 +4813,7 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
                     }
                     if (quantiles.empty()) chunks[0] = "  (no percentiles configured)";
                     char count_field[24];
-                    snprintf(count_field, sizeof(count_field), "n=%-6s", count_str);
+                    snprintf(count_field, sizeof(count_field), "n=%-7s", count_str);
                     for (size_t k = 0; k < chunks_per_row; k++) {
                         // Continuation lines blank the count to keep columns aligned.
                         std::string count_col = k == 0 ? count_field : std::string(strlen(count_field), ' ');
