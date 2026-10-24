@@ -2072,15 +2072,29 @@ void shard_connection::handle_event(short events)
 
     if (events & BEV_EVENT_ERROR) {
         bool ssl_error = false;
+        // Read the socket error before logging anything: logging may change
+        // it, and the Windows deferred refusal reports through it.
+        int socket_error = EVUTIL_SOCKET_ERROR();
 #ifdef USE_TLS
         // Only TLS connections have an OpenSSL bufferevent (see setup_event()).
-        // libevent 2.2 asserts that type in its accessor and, when built with
+        // libevent 2.2.2 asserts that type in its accessor and, when built with
         // NDEBUG, reads and writes past a plain socket bufferevent instead.
         if (m_config->openssl_ctx != NULL) {
             unsigned long sslerr;
             while ((sslerr = bufferevent_get_openssl_error(m_bev))) {
+                // libevent also queues the SSL_get_error() code of the failed
+                // call (e.g. SSL_ERROR_SYSCALL), which is not an OpenSSL error
+                // code and has no reason string. The socket error and the
+                // queued OpenSSL errors describe the failure instead.
+                if (ERR_GET_LIB(sslerr) == 0) continue;
+                const char *reason = ERR_reason_error_string(sslerr);
+                char error_text[256];
+                if (reason == NULL) {
+                    ERR_error_string_n(sslerr, error_text, sizeof(error_text));
+                    reason = error_text;
+                }
                 ssl_error = true;
-                benchmark_error_log("TLS connection error: %s\n", ERR_reason_error_string(sslerr));
+                benchmark_error_log("TLS connection error: %s\n", reason);
             }
             // libevent 2.2.2 drains the OpenSSL queue into the bufferevent but
             // its accessor returns nothing for a TLS bufferevent. Recover what
@@ -2095,15 +2109,15 @@ void shard_connection::handle_event(short events)
                     ssl_error = true;
                     benchmark_error_log("TLS connection error: certificate verify failed: %s\n",
                                         X509_verify_cert_error_string(verify_result));
-                } else if (event_get_version_number() >= 0x02020000) {
-                    benchmark_error_log("TLS connection error: libevent %s reported no OpenSSL reason\n",
+                } else if (!socket_error) {
+                    benchmark_error_log("TLS connection error: no OpenSSL reason reported (libevent %s)\n",
                                         event_get_version());
                 }
             }
         }
 #endif
-        if (!ssl_error && EVUTIL_SOCKET_ERROR()) {
-            benchmark_error_log("Connection error: %s\n", evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR()));
+        if (!ssl_error && socket_error) {
+            benchmark_error_log("Connection error: %s\n", evutil_socket_error_to_string(socket_error));
         }
 
         attempt_reconnect("Connection error");

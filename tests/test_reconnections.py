@@ -413,9 +413,9 @@ def _logged_reconnect_errors(stderr):
 
     Each call counts one connection error and logs either an "attempting
     reconnection" line or the final "Maximum reconnection attempts" line.
-    Unlike the "Connection error: " line before it, which is "TLS connection
-    error: " over TLS and missing when errno is 0, this is the same for every
-    transport. A duplicate call while a reconnect is pending is counted but
+    Unlike the "Connection error: " line before it, which TLS reason lines
+    can replace and which is missing when errno is 0, this is the same for
+    every transport. A duplicate call while a reconnect is pending is counted but
     not logged, so the counter can be higher.
     """
     return len(
