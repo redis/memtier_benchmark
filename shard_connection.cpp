@@ -523,8 +523,10 @@ bool shard_connection::setup_event(evutil_socket_t sockfd)
                                                BEV_OPT_CLOSE_ON_FREE);
         if (m_bev == NULL) {
             // With BEV_OPT_CLOSE_ON_FREE a failed call has already freed the
-            // SSL (libevent >= 2.1.9, including 2.2), so it must not be freed
-            // here. The socket is still ours: the SSL's socket BIO does not
+            // SSL (libevent >= 2.1.9, upstream commit e86ccfe5, and 2.2.2), so
+            // it must not be freed here. Recheck this when the libevent floor
+            // or a new series changes; tests/library_failure_injector.c
+            // mimics this contract. The socket is still ours: the SSL's socket BIO does not
             // close it. libevent <= 2.1.8 may already have closed it while
             // freeing its partial bufferevent; leak it there rather than risk
             // closing a descriptor another thread has just been given.

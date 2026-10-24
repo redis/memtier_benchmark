@@ -5301,19 +5301,12 @@ int main(int argc, char *argv[])
     // --connection-stage-timeout abort (Phase 1 of #426) or a Ctrl+C.
     // Must run before any event_base is created so the locking callbacks
     // are installed for every subsequent base.
-    // Without them a shutdown or timeout could hang, so this is fatal.
+    // Without them a shutdown or timeout could hang, so a failure is fatal,
+    // but only once options are parsed: --help and --version still work.
 #ifdef _WIN32
-    if (evthread_use_windows_threads() < 0) {
-        fprintf(stderr, "error: evthread_use_windows_threads() failed; libevent's Windows threading support is "
-                        "required to stop worker threads.\n");
-        return 1;
-    }
+    const bool evthread_failed = evthread_use_windows_threads() < 0;
 #else
-    if (evthread_use_pthreads() < 0) {
-        fprintf(stderr, "error: evthread_use_pthreads() failed; libevent's pthreads support (libevent_pthreads) "
-                        "is required to stop worker threads.\n");
-        return 1;
-    }
+    const bool evthread_failed = evthread_use_pthreads() < 0;
 #endif
 
     // Install signal handler for Ctrl+C. SIGTERM (kill, timeout, docker stop,
@@ -5377,6 +5370,16 @@ int main(int argc, char *argv[])
 
     if (config_parse_args(argc, argv, &cfg) < 0) {
         usage();
+    }
+    if (evthread_failed) {
+#ifdef _WIN32
+        fprintf(stderr, "error: evthread_use_windows_threads() failed; libevent's Windows threading support is "
+                        "required to stop worker threads.\n");
+#else
+        fprintf(stderr, "error: evthread_use_pthreads() failed; libevent's pthreads support (libevent_pthreads) "
+                        "is required to stop worker threads.\n");
+#endif
+        return 1;
     }
     warn_on_library_version_mismatch();
 

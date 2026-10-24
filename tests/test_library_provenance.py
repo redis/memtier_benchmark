@@ -5,7 +5,8 @@
 - A matched installation prints no version-mismatch warning; a runtime
   library from another release series than the build headers gets one
   warning on stderr, and stdout is unchanged.
-- evthread_use_pthreads() failing is fatal (exit 1) instead of a warning.
+- evthread_use_pthreads() failing is fatal (exit 1) for a run instead of a
+  warning; --help and --version still work.
 - bufferevent creation failing fails the connection (error exit) instead of
   aborting on an assert.
 
@@ -182,10 +183,24 @@ def test_evthread_failure_is_fatal(env):
         child_env["MEMTIER_TEST_FAIL_EVTHREAD"] = "1"
         rc, stderr, _, info = _run(env, directory, child_env=child_env)
         marker = _marker(child_env)
+        # --help and --version do not need worker threads and still work
+        # (--help exits 2 by design; compare with a run without the shim).
+        options = {}
+        for option in ("--version", "--help"):
+            options[option] = (
+                subprocess.run([MEMTIER_BINARY, option], capture_output=True, text=True, timeout=30, env=child_env),
+                subprocess.run([MEMTIER_BINARY, option], capture_output=True, text=True, timeout=30))
+        option_marker = _marker(child_env)
     env.assertEqual(marker, ["evthread_use_pthreads"])
     env.assertEqual(rc, 1, message=stderr[-2000:])
     env.assertContains("error: evthread_use_pthreads() failed", stderr)
     env.assertTrue(info is None, message=info)
+    # The shim was loaded for both option runs too.
+    env.assertEqual(option_marker, ["evthread_use_pthreads"] * 3)
+    for option, (out, plain) in options.items():
+        env.assertEqual(out.returncode, plain.returncode, message=option + ": " + out.stderr[-500:])
+        env.assertEqual(out.stdout, plain.stdout, message=option)
+        env.assertFalse("evthread_use_pthreads() failed" in out.stderr, message=option)
 
 
 def test_bufferevent_creation_failure_fails_connection(env):
