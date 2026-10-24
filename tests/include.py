@@ -111,15 +111,25 @@ def debugPrintMemtierOnError(config, env):
             for line in f:
                 env.debugPrint(line.rstrip(), True)
 
-    if not env.isCluster():
-        if env.envRunner is not None:
-            log_file = os.path.join(env.envRunner.dbDirPath, env.envRunner._getFileName('master', '.log'))
-            with open(log_file) as redislog:
-                env.debugPrint("### REDIS LOG ###", True)
-                env.debugPrint(
-                    "### log_file file location: {0}".format(log_file), True)
-                for line in redislog:
-                    env.debugPrint(line.rstrip(), True)
+    if env.isCluster():
+        return
+    runner = getattr(env, 'envRunner', None)
+    db_dir = getattr(runner, 'dbDirPath', None)
+    get_file_name = getattr(runner, '_getFileName', None)
+    if db_dir is None or not callable(get_file_name):
+        env.debugPrint("### Redis log unavailable (environment has no captured log) ###", True)
+        return
+    log_file = os.path.join(db_dir, get_file_name('master', '.log'))
+    try:
+        with open(log_file, errors="replace") as redislog:
+            env.debugPrint("### REDIS LOG ###", True)
+            env.debugPrint("### log_file file location: {0}".format(log_file), True)
+            for line in redislog:
+                env.debugPrint(line.rstrip(), True)
+    except OSError as error:
+        # Existing environments and -s may not provide a log. Diagnostic IO
+        # must not replace the assertion failure that brought us here.
+        env.debugPrint("### Redis log unavailable: {0} ###".format(error), True)
 
 
 def get_expected_request_count(config, key_minimum=0, key_maximum=1000000):
