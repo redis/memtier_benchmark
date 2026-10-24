@@ -66,7 +66,10 @@ def test_crash_handler_with_active_connections(env):
 
         # Send SEGV signal to trigger crash handler
         print(f"Sending SEGV signal to PID {proc.pid}")
-        os.kill(proc.pid, signal.SIGSEGV)
+        if _tsan_build():
+            _signal_tsan_main(proc.pid, signal.SIGSEGV)
+        else:
+            os.kill(proc.pid, signal.SIGSEGV)
 
         # Wait for process to crash
         proc.wait(timeout=10)
@@ -394,34 +397,106 @@ def _worker_tids(pid):
 _SYS_TGKILL = {"x86_64": 234, "aarch64": 131, "i686": 270, "armv7l": 268}
 
 
-def _signal_thread(pid, tid, sig):
+def _tgkill(pid, tid, sig):
     """
-    Send sig to thread tid of process pid. os.kill(tid) is kill(2): it sends a
-    process-directed signal that any thread may take, so use tgkill(2) when
-    libc has it or this architecture's syscall number is known.
-
-    TSan builds get kill(2) to the process instead. TSan runs the handler for
-    a signal sent to a busy thread later, from an intercepted call and not on
-    the alternate signal stack, and in 1 of about 20 local runs that handler
-    printed nothing before the watchdog fired. kill(2) is what these tests
-    always used; the kernel then picks a thread, normally the main thread
-    sleeping between progress lines, where TSan delivers it at once.
+    Send sig to thread tid of process pid with tgkill(2). False when this
+    libc and architecture have no way to call it, or the call fails.
     """
-    if _tsan_build():
-        os.kill(pid, sig)
-        return
     libc = ctypes.CDLL(None, use_errno=True)
     if hasattr(libc, "tgkill"):  # glibc 2.30 and later
         result = libc.tgkill(pid, tid, sig)
     elif platform.machine() in _SYS_TGKILL:
         result = libc.syscall(_SYS_TGKILL[platform.machine()], pid, tid, sig)
     else:
-        result = None
-    if result == 0:
+        return False
+    if result != 0:
+        print(f"tgkill failed (errno {ctypes.get_errno()})")
+    return result == 0
+
+
+# nanosleep and clock_nanosleep, where the main thread waits between
+# progress lines.
+_SYS_SLEEP = {"x86_64": (35, 230), "aarch64": (101, 115)}
+
+
+def _main_thread_sleeping(pid):
+    """
+    True when the main thread of stopped process pid is in a nanosleep or
+    clock_nanosleep call made from libc. The sanitizer runtime makes its own
+    raw system calls, so the call must come from libc's code.
+    """
+    try:
+        with open(f"/proc/{pid}/task/{pid}/syscall") as f:
+            fields = f.read().split()
+        number, pc = int(fields[0]), int(fields[-1], 16)
+    except (OSError, ValueError, IndexError):
+        return False  # "running", or not in a system call ("-1 sp pc")
+    if number not in _SYS_SLEEP.get(platform.machine(), ()):
+        return False
+    with open(f"/proc/{pid}/maps") as maps:
+        for line in maps:
+            parts = line.split()
+            low, high = (int(x, 16) for x in parts[0].split("-"))
+            if low <= pc < high:
+                return len(parts) > 5 and os.path.basename(parts[5]).startswith("libc.so")
+    return False
+
+
+def _wait_stopped(pid, timeout=2.0):
+    """Wait until the main thread of pid is stopped (state T after SIGSTOP)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with open(f"/proc/{pid}/task/{pid}/stat") as f:
+            if f.read().rsplit(")", 1)[1].split()[0] == "T":
+                return True
+        time.sleep(0.001)
+    return False
+
+
+def _signal_tsan_main(pid, sig, timeout=10.0):
+    """
+    Send sig to the main thread of TSan process pid while it sleeps in libc.
+
+    TSan runs the handler of a SIGSEGV at once, as for a real fault, on
+    whatever the receiving thread was doing. A kill(2) to the process lands
+    on the main thread, and that thread can be inside the TSan runtime, for
+    example reporting the progress counters' known race, and holding its
+    internal locks. The first race report or trace switch in the handler
+    then waits for those locks forever and the watchdog kills the process
+    halfway through the report. A real crash cannot interrupt the runtime.
+    So stop the process, and send the signal only when the main thread is
+    asleep between progress lines; otherwise let it run and try again.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        os.kill(pid, signal.SIGSTOP)
+        try:
+            if _wait_stopped(pid) and _main_thread_sleeping(pid):
+                if not _tgkill(pid, pid, sig):
+                    raise RuntimeError("tgkill is needed to signal a TSan build's main thread")
+                return
+        finally:
+            os.kill(pid, signal.SIGCONT)
+        time.sleep(0.02)
+    raise RuntimeError(f"the main thread of {pid} was not seen asleep within {timeout} s")
+
+
+def _signal_thread(pid, tid, sig):
+    """
+    Send sig to thread tid of process pid. os.kill(tid) is kill(2): it sends a
+    process-directed signal that any thread may take, so use tgkill(2) when
+    libc has it or this architecture's syscall number is known.
+
+    TSan builds get the signal on the main thread instead, sent by
+    _signal_tsan_main() while it sleeps between progress lines: a busy worker
+    can be inside the TSan runtime too, where the handler can deadlock.
+    """
+    if _tsan_build():
+        _signal_tsan_main(pid, sig)
         return
-    if result is not None:
-        print(f"tgkill failed (errno {ctypes.get_errno()}), falling back to kill")
-    os.kill(tid, sig)
+    if not _tgkill(pid, tid, sig):
+        print("falling back to kill")
+        os.kill(tid, sig)
 
 
 def _crash_worker(env, child_env, stderr=None, wait_timeout=15, before_crash=None):
