@@ -2069,13 +2069,32 @@ void shard_connection::handle_event(short events)
     if (events & BEV_EVENT_ERROR) {
         bool ssl_error = false;
 #ifdef USE_TLS
-        // Only TLS connections have an OpenSSL bufferevent. libevent 2.2
-        // requires that type when querying its OpenSSL error queue.
+        // Only TLS connections have an OpenSSL bufferevent (see setup_event()).
+        // libevent 2.2 asserts that type in its accessor and, when built with
+        // NDEBUG, reads and writes past a plain socket bufferevent instead.
         if (m_config->openssl_ctx != NULL) {
             unsigned long sslerr;
             while ((sslerr = bufferevent_get_openssl_error(m_bev))) {
                 ssl_error = true;
                 benchmark_error_log("TLS connection error: %s\n", ERR_reason_error_string(sslerr));
+            }
+            // libevent 2.2.2 drains the OpenSSL queue into the bufferevent but
+            // its accessor returns nothing for a TLS bufferevent. Recover what
+            // the SSL object still holds so a rejected certificate is reported.
+            if (!ssl_error) {
+                SSL *ssl = bufferevent_openssl_get_ssl(m_bev);
+                long verify_result = X509_V_OK;
+                // With --tls-skip-verify OpenSSL still records a result, but
+                // it did not cause the failure.
+                if (ssl != NULL && !m_config->tls_skip_verify) verify_result = SSL_get_verify_result(ssl);
+                if (verify_result != X509_V_OK) {
+                    ssl_error = true;
+                    benchmark_error_log("TLS connection error: certificate verify failed: %s\n",
+                                        X509_verify_cert_error_string(verify_result));
+                } else if (event_get_version_number() >= 0x02020000) {
+                    benchmark_error_log("TLS connection error: libevent %s reported no OpenSSL reason\n",
+                                        event_get_version());
+                }
             }
         }
 #endif
