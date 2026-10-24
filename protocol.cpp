@@ -687,6 +687,9 @@ int redis_protocol::parse_response(void)
             m_response_len += res_len + 2;
 
             if (aggregate_type(line[0])) {
+                // strtoll, not strtol: long is 32-bit on Windows. Counts above
+                // INT_MAX stay distinguishable; out-of-range ones clamp to
+                // LLONG_MAX.
                 long long declared = strtoll(line + 1, NULL, 10);
 
                 // from bulks counter perspective every count < 0 is equal to 0, because it's not followed by bulks.
@@ -701,11 +704,9 @@ int redis_protocol::parse_response(void)
                 // outstanding, cannot be represented as int: the doubling right
                 // after this check and the m_nested_remaining bookkeeping
                 // further down are int arithmetic and would overflow. The
-                // bound also keeps m_total_bulks_count within int range.
-                // strtoll (not strtol: long is 32-bit on Windows) keeps counts
-                // above INT_MAX distinguishable and clamps out-of-range ones to
-                // LLONG_MAX. A nested aggregate fills one of the outstanding
-                // slots of its parent.
+                // bound also keeps m_total_bulks_count within int range. A
+                // nested aggregate fills one of the outstanding slots of its
+                // parent.
                 long long outstanding = m_total_bulks_count > 0 ? (long long) m_total_bulks_count - 1 : 0;
                 // A tracked nested aggregate also adds count - 1 to
                 // m_nested_remaining. That is not always bounded by
