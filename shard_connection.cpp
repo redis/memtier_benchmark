@@ -505,6 +505,9 @@ void shard_connection::setup_event(evutil_socket_t sockfd)
     // pause flag so we don't carry stale state from a prior socket.
     m_bev_paused = false;
 
+    // No BEV_OPT_DEFER_CALLBACKS on either bufferevent: socket_connect()
+    // relies on libevent before 2.1.9 calling the error callback from inside
+    // a failing bufferevent_socket_connect(), not later from the loop.
 #ifdef USE_TLS
     if (m_config->openssl_ctx) {
         SSL *ctx = SSL_new(m_config->openssl_ctx);
