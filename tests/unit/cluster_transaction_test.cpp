@@ -414,8 +414,11 @@ static void check_repin_routes_to_staged_owner(unsigned long long first_key)
         check(deferred, "main connection still defers to the key owner");
         check(client.staged() && client.staged_key() == first_key, "re-pin retains the staged key");
 
+        // Staging and re-pinning have not submitted workload (#819).
+        check(!client.has_submitted_workload(), "staged-only client does not participate in duration");
         // The owner sends the unit with the retained key.
         check(client.send_from(1, 0), "owner sends MULTI");
+        check(client.has_submitted_workload(), "submitted MULTI participates before any reply");
         check(client.send_from(1, 1), "owner sends SET");
         check(!client.staged() && client.round_key_valid() && client.round_key() == first_key,
               "owner consumes the staged key");
