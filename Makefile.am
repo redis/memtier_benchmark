@@ -16,56 +16,214 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 AUTOMAKE_OPTIONS = foreign 1.9 subdir-objects
-CODE_COVERAGE_IGNORE_PATTERN='*/deps/hdr_histogram/*'
+CODE_COVERAGE_IGNORE_PATTERN='*/deps/hdr_histogram/*' '*/tests/*'
+# Every executable that consumes instrumented objects needs the compiler's
+# coverage link option, including unit tests with their own source lists.
+# Targets overriding their own _LDFLAGS must include it if instrumented.
+AM_LDFLAGS = $(CODE_COVERAGE_LDFLAGS)
 
-EXTRA_DIST = README.md COPYING version.sh
+EXTRA_DIST = README.md COPYING version.sh \
+	tests/check_version_build.py tests/check_code_coverage.sh \
+	scripts/fetch_commands_meta.sh \
+	scripts/gen_command_meta.py \
+	deps/commands_json/REDIS_TAG.txt \
+	deps/hdr_histogram/README.md deps/hdr_histogram/SHA256SUMS
 
 # Generate version.h before building
 BUILT_SOURCES = version.h
 CLEANFILES = version.h
 
-version.h:
-	$(SHELL) $(srcdir)/version.sh
+# HEAD and tracked-file state can change without touching a build input.
+# version.sh preserves the header timestamp when its contents are unchanged.
+.PHONY: FORCE_VERSION
+FORCE_VERSION:
+
+version.h: $(srcdir)/version.sh FORCE_VERSION
+	$(SHELL) $(srcdir)/version.sh "$(srcdir)"
+
+# BUILT_SOURCES covers aggregate targets; direct binary/object targets need
+# these dependencies too, including their first parallel build.
+memtier_benchmark-memtier_benchmark.$(OBJEXT) memtier_benchmark-prometheus_exporter.$(OBJEXT): version.h
 
 bin_PROGRAMS = memtier_benchmark
-completionsdir=$(BASH_COMPLETION_DIR)
-completions_DATA=bash-completion/memtier_benchmark
+if INSTALL_BASH_COMPLETION
+completionsdir = $(BASH_COMPLETION_DIR)
+dist_completions_DATA = bash-completion/memtier_benchmark
+endif
 
 memtier_benchmark_CPPFLAGS = \
 	$(CODE_COVERAGE_CFLAGS) \
 	$(LIBEVENT_CFLAGS) \
+	$(LIBEVENT_EXTRA_CFLAGS) \
+	$(LIBEVENT_PTHREADS_CFLAGS) \
 	$(LIBEVENT_OPENSSL_CFLAGS) \
 	$(LIBCRYPTO_CFLAGS) \
 	$(LIBSSL_CFLAGS)
 memtier_benchmark_SOURCES = \
-	memtier_benchmark.cpp memtier_benchmark.h \
+	platform_compat.h \
+	memtier_benchmark.cpp memtier_benchmark.h crash_report.h \
 	client.cpp client.h \
 	cluster_client.cpp cluster_client.h \
 	shard_connection.cpp shard_connection.h connections_manager.h \
-	run_stats_types.cpp run_stats_types.h \
-	run_stats.cpp run_stats.h \
-	JSON_handler.cpp JSON_handler.h \
-	protocol.cpp protocol.h \
+	run_stats_types.cpp run_stats_types.h latency_percentiles.h \
+	run_stats.cpp run_stats.h latency_histogram.h \
+	JSON_handler.cpp JSON_handler.h utf8.cpp utf8.h \
+	protocol.cpp protocol.h keylist_growth.h libmemcached_protocol/binary.h libmemcached_protocol/vbucket.h \
 	obj_gen.cpp obj_gen.h \
 	item.cpp item.h \
 	file_io.cpp file_io.h \
 	config_types.cpp config_types.h \
+	command_meta.cpp command_meta.h command_meta_data.h \
 	statsd.cpp statsd.h \
-	retry_policy.cpp retry_policy.h \
-	deps/hdr_histogram/hdr_histogram_log.c deps/hdr_histogram/hdr_histogram_log.h deps/hdr_histogram/byteorder.h \
+	prometheus_metrics.cpp prometheus_metrics.h \
+	prometheus_exporter.cpp prometheus_exporter.h \
+	retry_policy.cpp retry_policy.h retry_backoff.h \
+	deps/hdr_histogram/hdr_histogram_log.c deps/hdr_histogram/hdr_histogram_log.h \
 	deps/hdr_histogram/hdr_histogram.c deps/hdr_histogram/hdr_histogram.h \
-	deps/hdr_histogram/hdr_time.c deps/hdr_histogram/hdr_time.h deps/hdr_histogram/hdr_encoding.c deps/hdr_histogram/hdr_encoding.h
+	deps/hdr_histogram/hdr_time.c deps/hdr_histogram/hdr_time.h deps/hdr_histogram/hdr_encoding.c deps/hdr_histogram/hdr_malloc.h
 
 memtier_benchmark_LDADD = \
-	$(CODE_COVERAGE_LIBS) \
+	$(LIBEVENT_EXTRA_LIBS) \
 	$(LIBEVENT_LIBS) \
+	$(LIBEVENT_PTHREADS_LIBS) \
 	$(LIBEVENT_OPENSSL_LIBS) \
 	$(LIBCRYPTO_LIBS) \
 	$(LIBSSL_LIBS)
 
 
+check_PROGRAMS = prometheus_metrics_test rate_limiter_test retry_backoff_test keylist_growth_test hdr_histogram_test cluster_transaction_test \
+    cluster_hslot_test run_stats_counters_test run_stats_merge_test crash_report_test socket_options_test retry_drain_test reconnect_siblings_test memcache_meta_test cluster_slots_retention_test
+
+# The metrics test links only the pure layer (prometheus_metrics.{h,cpp}, utf8.{h,cpp}).
+# First `make check` program in the repo. The metrics layer is config-free and
+# libevent-free (Decisions #52 purity contract), so this links only the metrics
+# layer + hdr_histogram (a leaf dep). No $(LIBEVENT_CFLAGS) by design (hygiene
+# only; purity is enforced by the S10 grep audit). -I$(srcdir) is required for
+# VPATH builds.
+prometheus_metrics_test_SOURCES = tests/unit/prometheus_metrics_test.cpp \
+    prometheus_metrics.cpp prometheus_metrics.h utf8.cpp utf8.h latency_histogram.h \
+    deps/hdr_histogram/hdr_histogram.c deps/hdr_histogram/hdr_histogram.h
+prometheus_metrics_test_CPPFLAGS = -I$(srcdir)
+prometheus_metrics_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+if MEMTIER_WINDOWS
+# mingw-w64 provides rand_r() only as a macro over rand() (the seed is ignored),
+# and only under this feature macro. That is enough for this test's use of it.
+prometheus_metrics_test_CPPFLAGS += -D_POSIX_THREAD_SAFE_FUNCTIONS
+endif
+
+# Exact Redis command framing through the production serializer.
+check_PROGRAMS += redis_protocol_test
+redis_protocol_test_SOURCES = tests/unit/redis_protocol_test.cpp protocol.cpp protocol.h
+redis_protocol_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
+redis_protocol_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+redis_protocol_test_LDADD = $(memtier_benchmark_LDADD)
+
+memcache_meta_test_SOURCES = tests/unit/memcache_meta_test.cpp protocol.cpp protocol.h
+memcache_meta_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
+memcache_meta_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+memcache_meta_test_LDADD = $(memtier_benchmark_LDADD)
+
+rate_limiter_test_SOURCES = tests/unit/rate_limiter_test.cpp rate_limiter.h
+rate_limiter_test_CPPFLAGS = -I$(srcdir)
+rate_limiter_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+keylist_growth_test_SOURCES = tests/unit/keylist_growth_test.cpp keylist_growth.h
+keylist_growth_test_CPPFLAGS = -I$(srcdir)
+keylist_growth_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+retry_backoff_test_SOURCES = tests/unit/retry_backoff_test.cpp retry_backoff.h
+retry_backoff_test_CPPFLAGS = -I$(srcdir)
+retry_backoff_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+# Resend a retry whose drain timer fired before its connection could send.
+retry_drain_test_SOURCES = tests/unit/retry_drain_test.cpp
+retry_drain_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
+retry_drain_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+retry_drain_test_LDADD = $(filter-out memtier_benchmark-memtier_benchmark.$(OBJEXT),$(memtier_benchmark_OBJECTS)) $(memtier_benchmark_LDADD)
+# Exercise the real connection setup with a test-only socket descriptor recorder.
+# The test includes shard_connection.cpp; do not compile it a second time here.
+socket_options_test_SOURCES = tests/unit/socket_options_test.cpp
+socket_options_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
+SOCKET_TEST_EXTRA_CXXFLAGS =
+socket_options_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g $(SOCKET_TEST_EXTRA_CXXFLAGS)
+# Per-target memtier_benchmark_CPPFLAGS give these objects their target prefix.
+# Reuse the real client RTTI for UBSan; the test supplies main and shard_connection.
+socket_options_test_LDADD = $(filter-out memtier_benchmark-memtier_benchmark.$(OBJEXT) \
+    memtier_benchmark-shard_connection.$(OBJEXT),$(memtier_benchmark_OBJECTS)) $(memtier_benchmark_LDADD)
+hdr_histogram_test_SOURCES = tests/unit/hdr_histogram_test.cpp latency_histogram.h latency_percentiles.h \
+    run_stats_types.cpp run_stats_types.h \
+    deps/hdr_histogram/hdr_histogram.c deps/hdr_histogram/hdr_histogram.h \
+    deps/hdr_histogram/hdr_histogram_log.c deps/hdr_histogram/hdr_histogram_log.h \
+    deps/hdr_histogram/hdr_encoding.c deps/hdr_histogram/hdr_time.c \
+    deps/hdr_histogram/hdr_time.h deps/hdr_histogram/hdr_malloc.h
+# run_stats_types includes the TLS-aware benchmark config; honor non-system OpenSSL paths.
+hdr_histogram_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
+hdr_histogram_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+# Exercise transaction pin release and lookahead through the real cluster client.
+cluster_transaction_test_SOURCES = tests/unit/cluster_transaction_test.cpp
+cluster_transaction_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
+cluster_transaction_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+cluster_transaction_test_LDADD = $(filter-out memtier_benchmark-memtier_benchmark.$(OBJEXT),$(memtier_benchmark_OBJECTS)) $(memtier_benchmark_LDADD)
+# A failed connect after the run is over must not end a client whose other
+# connection still has a reconnect pending.
+reconnect_siblings_test_SOURCES = tests/unit/reconnect_siblings_test.cpp
+reconnect_siblings_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
+reconnect_siblings_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+reconnect_siblings_test_LDADD = $(filter-out memtier_benchmark-memtier_benchmark.$(OBJEXT),$(memtier_benchmark_OBJECTS)) $(memtier_benchmark_LDADD)
+# Restore parser value retention when a topology refresh completes or disconnects.
+cluster_slots_retention_test_SOURCES = tests/unit/cluster_slots_retention_test.cpp
+cluster_slots_retention_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
+cluster_slots_retention_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+cluster_slots_retention_test_LDADD = $(filter-out memtier_benchmark-memtier_benchmark.$(OBJEXT),$(memtier_benchmark_OBJECTS)) $(memtier_benchmark_LDADD)
+# Check hash slots, including hash tags, against CLUSTER KEYSLOT.
+cluster_hslot_test_SOURCES = tests/unit/cluster_hslot_test.cpp
+cluster_hslot_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
+cluster_hslot_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+cluster_hslot_test_LDADD = $(filter-out memtier_benchmark-memtier_benchmark.$(OBJEXT),$(memtier_benchmark_OBJECTS)) $(memtier_benchmark_LDADD)
+# Sum per-second hit/miss/MOVED/ASK counters past 2^32, as run_stats::summarize() does.
+run_stats_counters_test_SOURCES = tests/unit/run_stats_counters_test.cpp run_stats_types.cpp run_stats_types.h \
+    latency_histogram.h latency_percentiles.h \
+    deps/hdr_histogram/hdr_histogram.c deps/hdr_histogram/hdr_histogram.h \
+    deps/hdr_histogram/hdr_time.c deps/hdr_histogram/hdr_time.h deps/hdr_histogram/hdr_malloc.h
+run_stats_counters_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
+run_stats_counters_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+# Average Start/Finish time over thousands of merged runs, as run_benchmark() does.
+run_stats_merge_test_SOURCES = tests/unit/run_stats_merge_test.cpp
+run_stats_merge_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
+run_stats_merge_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+run_stats_merge_test_LDADD = $(filter-out memtier_benchmark-memtier_benchmark.$(OBJEXT),$(memtier_benchmark_OBJECTS)) $(memtier_benchmark_LDADD)
+# Crash report timestamp formatting and UTC offset (#681), against libc.
+crash_report_test_SOURCES = tests/unit/crash_report_test.cpp crash_report.h
+crash_report_test_CPPFLAGS = -I$(srcdir)
+crash_report_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+# --data-import reader: errors, truncated last item, reopen (#766).
+check_PROGRAMS += file_io_test
+file_io_test_SOURCES = tests/unit/file_io_test.cpp file_io.cpp file_io.h item.cpp item.h
+file_io_test_CPPFLAGS = -I$(srcdir)
+file_io_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+# Independent import readers, including copies of copies (#774).
+check_PROGRAMS += import_object_generator_test
+import_object_generator_test_SOURCES = tests/unit/import_object_generator_test.cpp \
+    obj_gen.cpp obj_gen.h file_io.cpp file_io.h item.cpp item.h \
+    config_types.cpp config_types.h command_meta.cpp command_meta.h
+import_object_generator_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
+import_object_generator_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+import_object_generator_test_LDADD = $(memtier_benchmark_LDADD)
+TESTS = $(check_PROGRAMS)
+
+# Keep the release amalgamation byte-identical to the recorded upstream asset.
+# This runs in CI and the local gate through make check, including VPATH builds.
+.PHONY: check-hdr-vendor
+check-local: check-hdr-vendor
+check-hdr-vendor:
+	@cd "$(srcdir)/deps/hdr_histogram" && \
+	if command -v sha256sum >/dev/null 2>&1; then \
+		sha256sum -c SHA256SUMS; \
+	elif command -v shasum >/dev/null 2>&1; then \
+		shasum -a 256 -c SHA256SUMS; \
+	else \
+		echo "HDR vendor verification requires sha256sum or shasum" >&2; \
+		exit 1; \
+	fi
+
 @CODE_COVERAGE_RULES@
-memtier_benchmark_LDFLAGS = $(CODE_COVERAGE_LDFLAGS)
 
 dist_man1_MANS = memtier_benchmark.1
 
@@ -73,17 +231,24 @@ dist_man1_MANS = memtier_benchmark.1
 rebuild-man:
 	help2man --name="NoSQL benchmark tool" --no-info --no-discard-stderr --output=memtier_benchmark.1 $(builddir)/memtier_benchmark
 
+# One-command local gate (PLAN.md §11): both-flavor VPATH builds, unit + CLI +
+# functional + redaction + statsd suites, HTTP smoke, sanitizers, and the
+# docs/completion/purity grep audits. GATE_FAST=1 skips the sanitizer stage.
+.PHONY: gate
+gate:
+	$(srcdir)/tests/run_local_gate.sh
+
 # Code formatting
 .PHONY: format format-check
 format:
 	@echo "Formatting C++ source files..."
-	@find $(srcdir) -name "*.cpp" -o -name "*.h" | grep -v deps/ | grep -v autom4te.cache/ | xargs clang-format -i
+	@find $(srcdir) -name "*.cpp" -o -name "*.h" | grep -v deps/ | grep -v autom4te.cache/ | grep -v -E '(^|/)build-[^/]*/' | grep -v -E '(^|/)(config|version)\.h$$' | xargs clang-format -i
 	@echo "Done."
 
 format-check:
 	@echo "Checking C++ source file formatting..."
 	@FAILED=0; \
-	for file in $$(find $(srcdir) -name "*.cpp" -o -name "*.h" | grep -v deps/ | grep -v autom4te.cache/); do \
+	for file in $$(find $(srcdir) -name "*.cpp" -o -name "*.h" | grep -v deps/ | grep -v autom4te.cache/ | grep -v -E '(^|/)build-[^/]*/' | grep -v -E '(^|/)(config|version)\.h$$'); do \
 		if ! clang-format --dry-run --Werror "$$file" 2>/dev/null; then \
 			echo "Needs formatting: $$file"; \
 			FAILED=1; \
@@ -132,3 +297,105 @@ install-hooks:
 	@git config core.hooksPath .githooks
 	@echo "Git hooks enabled (core.hooksPath = .githooks)."
 	@echo "Pre-commit hook will run 'make format-check-staged' on staged C/C++ changes."
+
+# Command metadata vendored from redis/redis@<REDIS_VERSION>.
+# This is a maintainer step, not invoked by `make all`. It refreshes the
+# vendored src/commands/*.json snapshot in deps/commands_json/ and regenerates
+# the command_meta_data.h header consumed by command_meta.cpp.
+#
+# Usage:
+#   make commands-meta                       # uses default pinned version
+#   make commands-meta REDIS_VERSION=8.8     # override branch / tag / sha
+#
+# The two halves can be invoked independently for partial regeneration:
+#   make commands-meta-fetch REDIS_VERSION=unstable
+#   make commands-meta-gen   # rebuild .h from already-vendored JSONs
+#
+# CI guard:
+#   make commands-meta-check                 # fails if .h is stale
+REDIS_VERSION ?= 8.8
+
+.PHONY: commands-meta commands-meta-fetch commands-meta-gen commands-meta-check
+commands-meta: commands-meta-fetch commands-meta-gen
+	@echo "commands-meta: refreshed for redis $(REDIS_VERSION)"
+
+commands-meta-fetch:
+	$(SHELL) $(srcdir)/scripts/fetch_commands_meta.sh $(REDIS_VERSION) $(srcdir)/deps/commands_json
+
+commands-meta-gen:
+	$(PYTHON) $(srcdir)/scripts/gen_command_meta.py \
+	    --in  $(srcdir)/deps/commands_json \
+	    --out $(srcdir)/command_meta_data.h
+	@if command -v clang-format >/dev/null 2>&1; then \
+	    clang-format -i $(srcdir)/command_meta_data.h; \
+	fi
+
+commands-meta-check:
+	@TMP=$$(mktemp); \
+	$(PYTHON) $(srcdir)/scripts/gen_command_meta.py \
+	    --in  $(srcdir)/deps/commands_json \
+	    --out $$TMP > /dev/null; \
+	if ! diff -u $(srcdir)/command_meta_data.h $$TMP; then \
+	    echo ""; \
+	    echo "command_meta_data.h is stale; run 'make commands-meta-gen'"; \
+	    rm -f $$TMP; exit 1; \
+	fi; \
+	rm -f $$TMP; \
+	echo "command_meta_data.h is up to date."
+
+# ----------------------------------------------------------------------------
+# libFuzzer harnesses for in-process parsers (--enable-fuzz).
+#
+# These are noinst_PROGRAMS — they're built only on demand and never installed.
+# We re-compile config_types.cpp / protocol.cpp / command_meta.cpp into the
+# fuzz target rather than reusing the memtier_benchmark objects so the
+# fuzz-only sanitizer flags (-fsanitize=fuzzer,address,undefined) don't leak
+# into the main binary's build.
+#
+# A tiny shim (fuzz_stubs.cpp) provides the logging entry points expected by
+# protocol.cpp (defined in memtier_benchmark.cpp in the real build) so we
+# don't have to drag main() and the entire async stack in.
+# ----------------------------------------------------------------------------
+if FUZZ_ENABLED
+
+memtier_fuzz_cxxflags   = -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer -g -O1 -std=c++11 -Wall \
+                  -I$(srcdir) $(LIBEVENT_CFLAGS)
+memtier_fuzz_ldflags    = -fsanitize=fuzzer,address,undefined
+memtier_fuzz_ldadd      = $(LIBEVENT_LIBS) -lpthread -lz
+
+memtier_fuzz_shared_sources = \
+    config_types.cpp config_types.h \
+    protocol.cpp protocol.h \
+    command_meta.cpp command_meta.h command_meta_data.h \
+    tests/fuzz/fuzz_stubs.cpp
+
+noinst_PROGRAMS = \
+    split_command_to_args_fuzz \
+    monitor_input_fuzz \
+    redis_protocol_fuzz
+
+split_command_to_args_fuzz_SOURCES = \
+    tests/fuzz/split_command_to_args_fuzz.cpp \
+    $(memtier_fuzz_shared_sources)
+split_command_to_args_fuzz_CPPFLAGS = $(memtier_fuzz_cxxflags)
+split_command_to_args_fuzz_CXXFLAGS = $(memtier_fuzz_cxxflags)
+split_command_to_args_fuzz_LDFLAGS  = $(memtier_fuzz_ldflags)
+split_command_to_args_fuzz_LDADD    = $(memtier_fuzz_ldadd)
+
+monitor_input_fuzz_SOURCES = \
+    tests/fuzz/monitor_input_fuzz.cpp \
+    $(memtier_fuzz_shared_sources)
+monitor_input_fuzz_CPPFLAGS = $(memtier_fuzz_cxxflags)
+monitor_input_fuzz_CXXFLAGS = $(memtier_fuzz_cxxflags)
+monitor_input_fuzz_LDFLAGS  = $(memtier_fuzz_ldflags)
+monitor_input_fuzz_LDADD    = $(memtier_fuzz_ldadd)
+
+redis_protocol_fuzz_SOURCES = \
+    tests/fuzz/redis_protocol_fuzz.cpp \
+    $(memtier_fuzz_shared_sources)
+redis_protocol_fuzz_CPPFLAGS = $(memtier_fuzz_cxxflags)
+redis_protocol_fuzz_CXXFLAGS = $(memtier_fuzz_cxxflags)
+redis_protocol_fuzz_LDFLAGS  = $(memtier_fuzz_ldflags)
+redis_protocol_fuzz_LDADD    = $(memtier_fuzz_ldadd)
+
+endif

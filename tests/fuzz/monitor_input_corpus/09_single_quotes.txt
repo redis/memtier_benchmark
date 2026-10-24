@@ -1,0 +1,4 @@
+[ proxy1 ] 1.0 [0 127.0.0.1:1] 'SET' 'k1' 'v1'
+[ proxy2 ] 1.0 [0 127.0.0.1:2] 'GET' 'k1'
+[ proxy3 ] 1.0 [0 127.0.0.1:3] 'HSET' 'h' 'f' 'with \'escaped\' quote'
+[ proxy4 ] 1.0 [0 127.0.0.1:4] "SET" 'mixed' "kinds"

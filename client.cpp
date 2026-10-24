@@ -30,9 +30,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-#ifdef HAVE_SYS_SOCKET_H
-#include <sys/socket.h>
-#endif
 #ifdef HAVE_NETINET_TCP_H
 #include <netinet/tcp.h>
 #endif
@@ -47,22 +44,43 @@
 #include <math.h>
 #include <algorithm>
 #include <sstream>
-#include <arpa/inet.h>
+#include "platform_compat.h"
 
 #include "client.h"
 #include "cluster_client.h"
 #include "config_types.h"
+#include "rate_limiter.h"
 #include "retry_policy.h"
 
+
+void client::apply_arbitrary_tracking_flags(abstract_protocol *protocol)
+{
+    // Mirror the per-element miss-tracking decision made in setup_client onto a
+    // single protocol. In cluster mode shard connections are *re-created* (not
+    // reconnected in place) on topology reset -- cluster_client::disconnect()
+    // deletes the non-main connections and the next cluster-slots discovery
+    // rebuilds them via create_shard_connection(). Each rebuild clone()s a fresh
+    // protocol with runtime flags reset to defaults, so the flag must be
+    // re-applied here or miss tracking silently never engages for them. (An
+    // in-place reconnect keeps the same protocol object; reset_state() preserves
+    // the flag, so that path needs nothing.) See issue #476.
+    if (protocol == NULL) return;
+    if (m_arbitrary_needs_elem_tracking) {
+        protocol->set_track_elem_misses(true);
+    }
+}
 
 bool client::setup_client(benchmark_config *config, abstract_protocol *protocol, object_generator *objgen)
 {
     m_config = config;
     assert(m_config != NULL);
-    unsigned long long total_num_of_clients = config->clients * config->threads;
+    unsigned long long total_num_of_clients = static_cast<unsigned long long>(config->clients) * config->threads;
+    m_request_rate_phase_microsecond =
+        calculate_rate_limit_phase(config->request_interval_microsecond, config->next_client_idx, total_num_of_clients);
 
     // create main connection
-    shard_connection *conn = new shard_connection(m_connections.size(), this, m_config, m_event_base, protocol);
+    shard_connection *conn = new shard_connection(m_connections.size(), this, m_config, m_event_base, protocol,
+                                                  m_request_rate_phase_microsecond);
     m_connections.push_back(conn);
 
     m_obj_gen = objgen->clone();
@@ -82,7 +100,39 @@ bool client::setup_client(benchmark_config *config, abstract_protocol *protocol,
 
     // Enable value keeping for SCAN incremental iteration (needed to extract cursor from response)
     if (config->scan_incremental_iteration) {
+        // The copied commands have matching argument indices; bound both consumers
+        // of the generated-argument cache even in release builds.
+        m_scan_args.resize(std::max(config->arbitrary_commands->at(0).command_args.size(),
+                                    config->scan_continuation_command->command_args.size()));
         MAIN_CONNECTION->get_protocol()->set_keep_value(true);
+    }
+
+    // Enable per-element miss tracking only when a configured command needs
+    // per-position reply inspection. Only ArrayPerElementNulls
+    // (HMGET/MGET/ZMSCORE/GEOPOS/...) attributes hits/misses per position; the
+    // parser records a per-top-level-element hit bitmap directly
+    // (set_track_elem_misses), with zero reply materialization -- no malloc /
+    // memcpy of element values, no mbulk tree. EmptyCollection
+    // (HGETALL/SMEMBERS/LRANGE) only needs the top-level array length
+    // (response->get_top_array_len()); SingleNullBulk and IntegerMembership use
+    // the parser's scalar counters / status line. None of them keep values.
+    if (config->arbitrary_commands->is_defined()) {
+        for (size_t i = 0; i < config->arbitrary_commands->size(); ++i) {
+            const arbitrary_command &cmd = config->arbitrary_commands->at(i);
+            if (!cmd.miss_tracking_enabled || cmd.spec == NULL) continue;
+            using memtier::command_meta::ReplyShape;
+            if (cmd.spec->reply_shape == ReplyShape::ArrayPerElementNulls) {
+                m_arbitrary_needs_elem_tracking = true;
+                break;
+            }
+        }
+        // Apply to the connections that exist now. Connections created later --
+        // notably the per-shard connections that cluster_client builds during
+        // cluster-slots discovery -- pick the flag up via
+        // apply_arbitrary_tracking_flags() at creation time (see issue #476).
+        for (size_t i = 0; i < m_connections.size(); ++i) {
+            apply_arbitrary_tracking_flags(m_connections[i]->get_protocol());
+        }
     }
 
     // Parallel key-pattern determined according to the first command
@@ -112,19 +162,30 @@ client::client(client_group *group) :
         m_event_base(NULL),
         m_initialized(false),
         m_end_set(false),
+        m_run_failed(false),
         m_config(NULL),
         m_obj_gen(NULL),
         m_stats(group->get_config()),
         m_reqs_processed(0),
+        m_reqs_answered(0),
         m_reqs_generated(0),
         m_set_ratio_count(0),
         m_get_ratio_count(0),
         m_arbitrary_command_ratio_count(0),
         m_executed_command_index(0),
+        m_arbitrary_command_rotation_seq(0),
+        m_txn_rotation_key_index(0),
+        m_txn_rotation_key_valid(false),
+        m_txn_rotation_key_seq(0),
+        m_txn_multi_sent(false),
+        m_txn_reconnect_reqs_base(0),
         m_tot_set_ops(0),
         m_tot_wait_ops(0),
         m_scan_cursor("0"),
-        m_scan_iteration_count(0)
+        m_scan_iteration_count(0),
+        m_mget_defer(false),
+        m_arbitrary_needs_elem_tracking(false),
+        m_request_rate_phase_microsecond(0)
 {
     m_event_base = group->get_event_base();
 
@@ -141,20 +202,31 @@ client::client(struct event_base *event_base, benchmark_config *config, abstract
         m_event_base(NULL),
         m_initialized(false),
         m_end_set(false),
+        m_run_failed(false),
         m_config(NULL),
         m_obj_gen(NULL),
         m_stats(config),
         m_reqs_processed(0),
+        m_reqs_answered(0),
         m_reqs_generated(0),
         m_set_ratio_count(0),
         m_get_ratio_count(0),
         m_arbitrary_command_ratio_count(0),
         m_executed_command_index(0),
+        m_arbitrary_command_rotation_seq(0),
+        m_txn_rotation_key_index(0),
+        m_txn_rotation_key_valid(false),
+        m_txn_rotation_key_seq(0),
+        m_txn_multi_sent(false),
+        m_txn_reconnect_reqs_base(0),
         m_tot_set_ops(0),
         m_tot_wait_ops(0),
         m_scan_cursor("0"),
         m_scan_iteration_count(0),
-        m_keylist(NULL)
+        m_keylist(NULL),
+        m_mget_defer(false),
+        m_arbitrary_needs_elem_tracking(false),
+        m_request_rate_phase_microsecond(0)
 {
     m_event_base = event_base;
 
@@ -200,12 +272,34 @@ void client::disconnect(void)
 
 void client::disconnect_all(void)
 {
+    unsigned long long abandoned = disconnect_and_abandon_held();
+    if (abandoned) {
+        benchmark_error_log("warning: %llu request(s) held for retry when the run ended were not resent; "
+                            "counted as errors.\n",
+                            abandoned);
+    }
+}
+
+unsigned long long client::disconnect_and_abandon_held(void)
+{
+    // This ends the run, once it is finished and no replies are pending. A
+    // request still held for resend (waiting in a retry queue for its
+    // backoff, or in a replay queue for a reconnect) is not pending, so it
+    // is never resent: e.g. a --test-time run whose last replies all
+    // arrive, after the deadline, as retryable errors. disconnect() moves
+    // the retry queue into the replay queue; account every request left
+    // there instead of dropping it silently with the connection. It counts
+    // as an error but, unlike a refused retry, not as an op: it never got a
+    // final reply.
+    unsigned long long abandoned = 0;
     for (unsigned int i = 0; i < m_connections.size(); i++) {
         shard_connection *sc = m_connections[i];
         if (sc != NULL) {
             sc->disconnect();
+            abandoned += sc->abandon_replay_requests("run-ended-before-resend");
         }
     }
+    return abandoned;
 }
 
 int client::connect(void)
@@ -253,10 +347,12 @@ bool client::finished(void)
     if (m_config->test_time > 0) {
         if (m_config->clients_start > 0) {
             // Staircase mode: use global deadline so all clients stop together
-            struct timeval now;
+            // Compare full timevals: whole seconds alone would end the run
+            // up to 1 s early when it started late in a second.
+            struct timeval now, elapsed;
             gettimeofday(&now, NULL);
-            unsigned int elapsed = now.tv_sec - m_config->benchmark_start_time.tv_sec;
-            if (elapsed >= m_config->test_time) return true;
+            evutil_timersub(&now, &m_config->benchmark_start_time, &elapsed);
+            if (elapsed.tv_sec >= (time_t) m_config->test_time) return true;
         } else {
             if (m_stats.get_duration() >= m_config->test_time) return true;
         }
@@ -294,9 +390,113 @@ void client::set_end_time()
     if (!m_end_set) {
         benchmark_debug_log("nothing else to do, test is finished.\n");
 
-        m_stats.set_end_time(NULL);
-        m_end_set = true;
+        set_end_time_at(NULL);
     }
+}
+
+void client::set_end_time_interrupted(struct timeval *end_time)
+{
+    if (m_end_set) return;
+    // A client whose connection completed in the loop iteration that the
+    // interrupt ended may have started after the interrupt time.
+    struct timeval start_time = m_stats.get_start_time();
+    if (m_stats.has_started() && timercmp(end_time, &start_time, <)) end_time = &start_time;
+    // Interrupting the drain after a timed run must not include the drain
+    // in its throughput denominator, just as normal deadline finalization.
+    struct timeval deadline = start_time;
+    if (m_stats.has_started() && m_config->test_time > 0 &&
+        ts_diff(start_time, *end_time) > (long long) m_config->test_time * 1000000) {
+        // Only construct a deadline within the captured time interval. A large
+        // test time can otherwise overflow Winsock's 32-bit timeval seconds.
+        deadline.tv_sec = (long long) start_time.tv_sec + m_config->test_time;
+        end_time = &deadline;
+    }
+    m_stats.set_end_time(end_time);
+    m_end_set = true;
+}
+
+bool client::abandon_unanswered_requests(unsigned long long *unanswered, unsigned long long *held)
+{
+    if (m_end_set || m_config->test_time == 0) return false;
+    if (m_stats.get_duration_usec() < (unsigned long long) (m_config->test_time + TEST_TIME_DRAIN_GRACE_SECS) * 1000000)
+        return false;
+
+    // Only a client that is waiting for replies, or that keeps resending
+    // --retry-on-error retries that never succeed (#715): one with nothing
+    // in flight ends by itself, or is waiting for a reconnect. A retry held
+    // for its backoff is not pending.
+    if (all_connections_idle()) {
+        bool holds_retries = false;
+        for (unsigned int i = 0; i < m_connections.size() && !holds_retries; i++) {
+            holds_retries = m_connections[i] != NULL && m_connections[i]->holds_retries();
+        }
+        if (!holds_retries) return false;
+    }
+
+    // Drop them before disconnecting, so --retry-on-error does not hold them
+    // for a resend that will never come (they would then be counted a
+    // second time). Workload requests that never got a reply are errors,
+    // not ops (drop_pending_requests() counts them through
+    // abandon_requests()); setup commands are not counted.
+    unsigned int abandoned = 0;
+    for (unsigned int i = 0; i < m_connections.size(); i++) {
+        if (m_connections[i] != NULL) abandoned += m_connections[i]->drop_pending_requests();
+    }
+    m_stats.add_unanswered_requests(abandoned);
+    *unanswered += abandoned;
+
+    // The run measured --test-time, not the grace period spent waiting.
+    struct timeval end_time = m_stats.get_start_time();
+    end_time.tv_sec += m_config->test_time;
+    set_end_time_at(&end_time);
+    // The caller reports the requests held for retry with the others.
+    *held += disconnect_and_abandon_held();
+    return true;
+}
+
+void client::set_end_time_at(struct timeval *end_time)
+{
+    if (!m_end_set) {
+        m_stats.set_end_time(end_time);
+        m_end_set = true;
+        // A connection whose setup the server rejected since its last reply
+        // (a required replica, say) and that never recovered fails the run
+        // (#630), also when another connection ends the client first. Apply
+        // this at a normal end and when a failed connect or drain-grace expiry
+        // caps the stats at the deadline: which connection ends first is only
+        // timing.
+        for (unsigned int i = 0; i < m_connections.size(); i++) {
+            shard_connection *sc = m_connections[i];
+            if (sc != NULL && sc->stops_at_deadline() && sc->setup_failed_since_reply()) m_run_failed = true;
+        }
+    }
+}
+
+bool client::transaction_reconnect_due() const
+{
+    if (!m_config->reconnect_interval || m_reqs_generated < m_txn_reconnect_reqs_base ||
+        m_reqs_generated - m_txn_reconnect_reqs_base < m_config->reconnect_interval)
+        return false;
+
+    // The next command must be the first executable entry at the start of
+    // its ratio. Checking only MULTI state would split a WATCH prefix, while
+    // checking only the command index would split a weighted first entry.
+    for (unsigned int i = 0; i < m_config->arbitrary_commands->size(); i++) {
+        const arbitrary_command &cmd = m_config->arbitrary_commands->at(i);
+        if (!cmd.stats_only && cmd.ratio > 0)
+            return m_executed_command_index == i && m_arbitrary_command_ratio_count == 1;
+    }
+    return false;
+}
+
+bool client::prepare_transaction_reconnect()
+{
+    if (!transaction_reconnect_due()) return false;
+    // No new work is generated until the replies for this rotation drain.
+    // Advance the baseline rather than testing a modulus: the boundary can
+    // be beyond the requested interval, including after an unplanned loss.
+    m_txn_reconnect_reqs_base = m_reqs_processed;
+    return true;
 }
 
 bool client::hold_pipeline(unsigned int conn_id)
@@ -308,6 +508,7 @@ bool client::hold_pipeline(unsigned int conn_id)
 
     // if we have reconnect_interval stop enlarging the pipeline on time
     if (m_config->reconnect_interval) {
+        if (m_config->transaction) return transaction_reconnect_due();
         if ((m_reqs_processed % m_config->reconnect_interval) + (m_reqs_generated - m_reqs_processed) >=
             m_config->reconnect_interval)
             return true;
@@ -335,6 +536,86 @@ get_key_response client::get_key_for_conn(unsigned int command_index, unsigned i
     }
 
     return available_for_conn;
+}
+
+// --monitor-input "__monitor_line@__": replace the first __key__ in an
+// argument with a generated key, keeping the text around it (e.g.
+// {tag}__key__ or user:__key__; like the --command path, any later __key__
+// in the same argument stays literal). Call it after split_command_to_args()
+// and before format_arbitrary_command(). Resolved arguments are marked
+// `resolved`, so format_arbitrary_command() frames them as constants without
+// scanning the generated text for placeholders again, and cluster mode can
+// route by the key that is actually sent. Argument 1 after resolution (a
+// literal or a generated key) is kept in cmd.resolved_key for the request's
+// log key: it is what cluster mode hashes to pick the shard, so
+// --failed-keys-file and --retry-on-error see the same key the router used.
+// A bare __data__ (other than as the first argument) is left for
+// format_arbitrary_command() to mark data_type: write_monitor_command_args()
+// writes the value at send time, without copying it into the command.
+// Each __data__ is sized under --data-size-pattern=S by the most recent
+// __key__ before it, as in create_arbitrary_request().
+void client::resolve_monitor_placeholders(arbitrary_command &cmd, unsigned int command_index, unsigned int conn_id)
+{
+    // 0 until the first __key__: get_value() clamps it to --key-minimum.
+    unsigned long long last_key_index = 0;
+    // Argument 0 is the command name.
+    for (size_t i = 1; i < cmd.command_args.size(); i++) {
+        command_arg &arg = cmd.command_args[i];
+        size_t pos = arg.data.find(KEY_PLACEHOLDER);
+        if (pos == std::string::npos) {
+            arg.data_key_index = last_key_index;
+            // The first argument is what cluster mode routes by, so a bare
+            // __data__ there is filled in now rather than at send time. No
+            // __key__ precedes it, so it gets the minimum size under
+            // --data-size-pattern=S (the index 0 is clamped to --key-minimum).
+            if (i == 1 && arg.data == DATA_PLACEHOLDER) {
+                unsigned int value_len;
+                const char *value = m_obj_gen->get_value(last_key_index, &value_len);
+                assert(value != NULL);
+                assert(value_len > 0);
+                arg.data.assign(value, value_len);
+                arg.resolved = true;
+            }
+            continue;
+        }
+        unsigned long long key_index;
+        // Base-class lookup: cluster_client routes by the resolved key
+        // afterwards, so its per-shard key pool must not be used here.
+        get_key_response res = client::get_key_for_conn(command_index, conn_id, &key_index);
+        assert(res == available_for_conn);
+        (void) res;
+        last_key_index = key_index;
+        arg.data.replace(pos, strlen(KEY_PLACEHOLDER), m_obj_gen->get_key(), m_obj_gen->get_key_len());
+        arg.resolved = true;
+    }
+    if (cmd.command_args.size() >= 2) cmd.resolved_key = cmd.command_args[1].data;
+}
+
+// Write a formatted __monitor_line@__ command (see
+// resolve_monitor_placeholders()) to conn_id: constant arguments as they are,
+// a __data__ argument with a value generated now. Returns the bytes written.
+int client::write_monitor_command_args(const arbitrary_command &cmd, unsigned int conn_id)
+{
+    int cmd_size = 0;
+    for (unsigned int i = 0; i < cmd.command_args.size(); i++) {
+        const command_arg *arg = &cmd.command_args[i];
+        if (arg->type == const_type) {
+            cmd_size += m_connections[conn_id]->send_arbitrary_command(arg);
+        } else if (arg->type == data_type) {
+            unsigned int value_len;
+            const char *value = m_obj_gen->get_value(arg->data_key_index, &value_len);
+            assert(value != NULL);
+            assert(value_len > 0);
+            cmd_size += m_connections[conn_id]->send_arbitrary_command(arg, value, value_len);
+        }
+    }
+    // Attach the key only to a command that is going out, so it cannot leak
+    // onto the next request when nothing was written.
+    if (cmd_size > 0) {
+        m_connections[conn_id]->set_arbitrary_command_key(cmd.resolved_key.data(),
+                                                          (unsigned int) cmd.resolved_key.size());
+    }
+    return cmd_size;
 }
 
 bool client::create_arbitrary_request(unsigned int command_index, struct timeval &timestamp, unsigned int conn_id)
@@ -374,6 +655,8 @@ bool client::create_arbitrary_request(unsigned int command_index, struct timeval
             return true; // Skip this command but continue processing
         }
 
+        resolve_monitor_placeholders(temp_cmd, command_index, conn_id);
+
         // Format the command for the protocol (adds RESP headers)
         if (!m_connections[conn_id]->get_protocol()->format_arbitrary_command(temp_cmd)) {
             fprintf(stderr, "warning: skipping unformattable monitor command at line %zu: %s\n", selected_index + 1,
@@ -382,24 +665,7 @@ bool client::create_arbitrary_request(unsigned int command_index, struct timeval
         }
 
         // Send the randomly selected command
-        for (unsigned int i = 0; i < temp_cmd.command_args.size(); i++) {
-            const command_arg *arg = &temp_cmd.command_args[i];
-            if (arg->type == const_type) {
-                cmd_size += m_connections[conn_id]->send_arbitrary_command(arg);
-            } else if (arg->type == key_type) {
-                unsigned long long key_index;
-                get_key_response res = get_key_for_conn(command_index, conn_id, &key_index);
-                assert(res == available_for_conn);
-                cmd_size +=
-                    m_connections[conn_id]->send_arbitrary_command(arg, m_obj_gen->get_key(), m_obj_gen->get_key_len());
-            } else if (arg->type == data_type) {
-                unsigned int value_len;
-                const char *value = m_obj_gen->get_value(0, &value_len);
-                assert(value != NULL);
-                assert(value_len > 0);
-                cmd_size += m_connections[conn_id]->send_arbitrary_command(arg, value, value_len);
-            }
-        }
+        cmd_size = write_monitor_command_args(temp_cmd, conn_id);
 
         // Get the stats index for the actual command type (e.g., SET, GET)
         // instead of using the placeholder's index
@@ -409,18 +675,54 @@ bool client::create_arbitrary_request(unsigned int command_index, struct timeval
     }
 
     // Normal arbitrary command handling
+    const bool scan_incremental_iteration = m_config->scan_incremental_iteration;
+    // Key index of the last __key__ sent, which sizes a following __data__
+    // under --data-size-pattern=S the way create_set_request() does. With no
+    // preceding __key__, get_value() clamps 0 to --key-minimum.
+    unsigned long long data_key_index = 0;
     for (unsigned int i = 0; i < cmd.command_args.size(); i++) {
         const command_arg *arg = &cmd.command_args[i];
         if (arg->type == const_type) {
             cmd_size += m_connections[conn_id]->send_arbitrary_command(arg);
         } else if (arg->type == key_type) {
-            unsigned long long key_index;
-            get_key_response res = get_key_for_conn(command_index, conn_id, &key_index);
-            /* If key not available for this connection, we have a bug of sending partial request */
-            assert(res == available_for_conn);
+            // --transaction: reuse one key for every __key__ in the rotation so
+            // the whole WATCH/MULTI/EXEC unit resolves to a single key/slot.
+            // Non-cluster path only: in --cluster-mode, cluster_client drives the
+            // reuse by pushing the rotation key onto m_key_index_pools and relies
+            // on this method draining it via get_key_for_conn, so the fast path
+            // here would leave the pool un-drained. Also skip the data-import
+            // path, which streams a distinct key per command.
+            const bool txn_reuse =
+                m_config->transaction && !m_config->cluster_mode && (!m_config->data_import || m_config->generate_keys);
+            if (txn_reuse && m_txn_rotation_key_valid && m_txn_rotation_key_seq == m_arbitrary_command_rotation_seq) {
+                // Same rotation as the cached key: regenerate the identical key
+                // string without advancing the per-iter key cursor.
+                m_obj_gen->generate_key(m_txn_rotation_key_index);
+                data_key_index = m_txn_rotation_key_index;
+            } else {
+                unsigned long long key_index;
+                get_key_response res = get_key_for_conn(command_index, conn_id, &key_index);
+                /* If key not available for this connection, we have a bug of sending partial request */
+                assert(res == available_for_conn);
+                data_key_index = key_index;
+                if (txn_reuse) {
+                    // First keyed command of the rotation: adopt this key for
+                    // the rest of the rotation.
+                    m_txn_rotation_key_index = key_index;
+                    m_txn_rotation_key_valid = true;
+                    m_txn_rotation_key_seq = m_arbitrary_command_rotation_seq;
+                }
+            }
 
-            // when we have static data mixed with the key placeholder
-            if (arg->has_key_affixes) {
+            if (scan_incremental_iteration) {
+                assert(i < m_scan_args.size());
+                m_scan_args[i] = arg->data_prefix;
+                m_scan_args[i].append(m_obj_gen->get_key(), m_obj_gen->get_key_len());
+                m_scan_args[i].append(arg->data_suffix);
+                cmd_size +=
+                    m_connections[conn_id]->send_arbitrary_command(arg, m_scan_args[i].data(), m_scan_args[i].size());
+            } else if (arg->has_key_affixes) {
+                // Static data mixed with the key placeholder.
                 // Pre-calculate total length to avoid reallocations
                 const char *key = m_obj_gen->get_key();
                 unsigned int key_len = m_obj_gen->get_key_len();
@@ -462,11 +764,15 @@ bool client::create_arbitrary_request(unsigned int command_index, struct timeval
             }
         } else if (arg->type == data_type) {
             unsigned int value_len;
-            const char *value = m_obj_gen->get_value(0, &value_len);
+            const char *value = m_obj_gen->get_value(data_key_index, &value_len);
 
             assert(value != NULL);
             assert(value_len > 0);
 
+            if (scan_incremental_iteration) {
+                assert(i < m_scan_args.size());
+                m_scan_args[i].assign(value, value_len);
+            }
             cmd_size += m_connections[conn_id]->send_arbitrary_command(arg, value, value_len);
         }
     }
@@ -490,18 +796,10 @@ bool client::create_scan_continuation_request(struct timeval &timestamp, unsigne
         } else if (arg->type == scan_cursor_type) {
             cmd_size +=
                 m_connections[conn_id]->send_arbitrary_command(arg, m_scan_cursor.c_str(), m_scan_cursor.length());
-        } else if (arg->type == key_type) {
-            unsigned long long key_index;
-            get_key_response res = get_key_for_conn(0, conn_id, &key_index);
-            assert(res == available_for_conn);
-            cmd_size +=
-                m_connections[conn_id]->send_arbitrary_command(arg, m_obj_gen->get_key(), m_obj_gen->get_key_len());
-        } else if (arg->type == data_type) {
-            unsigned int value_len;
-            const char *value = m_obj_gen->get_value(0, &value_len);
-            assert(value != NULL);
-            assert(value_len > 0);
-            cmd_size += m_connections[conn_id]->send_arbitrary_command(arg, value, value_len);
+        } else if (arg->type == key_type || arg->type == data_type) {
+            assert(i < m_scan_args.size());
+            const std::string &value = m_scan_args[i];
+            cmd_size += m_connections[conn_id]->send_arbitrary_command(arg, value.data(), value.size());
         }
     }
 
@@ -560,11 +858,12 @@ bool client::create_mget_request(struct timeval &timestamp, unsigned int conn_id
     m_keylist->clear();
     for (unsigned int i = 0; i < keys_count; i++) {
         get_key_response res = get_key_for_conn(GET_CMD_IDX, conn_id, &key_index);
-        /* Not supported in cluster mode */
-        assert(res == available_for_conn);
+        if (res != available_for_conn) continue;
 
         m_keylist->add_key(m_obj_gen->get_key(), m_obj_gen->get_key_len());
     }
+
+    if (m_keylist->get_keys_count() == 0) return false;
 
     m_connections[conn_id]->send_mget_command(&timestamp, m_keylist);
     return true;
@@ -584,6 +883,8 @@ void client::create_request(struct timeval timestamp, unsigned int conn_id)
                 }
             } else {
                 // Send initial SCAN 0, stats to index 0
+                // Release the transaction key pin before selecting the next scan key.
+                m_txn_rotation_key_valid = false;
                 if (create_arbitrary_request(0, timestamp, conn_id)) {
                     m_reqs_generated++;
                 }
@@ -591,7 +892,31 @@ void client::create_request(struct timeval timestamp, unsigned int conn_id)
             return;
         }
 
+        const arbitrary_command &cmd = get_arbitrary_command(m_executed_command_index);
+        /* Cluster mode can fall through to here (an empty key pool), but
+         * there the MULTI may sit on another connection than conn_id; its
+         * own check is in cluster_client::create_arbitrary_request(). */
+        if (m_config->transaction && !m_config->cluster_mode) {
+            /* The connection lost this rotation's MULTI when it reconnected.
+             * Sent now, the rest of the block would run outside any
+             * transaction and its EXEC would fail with "EXEC without MULTI".
+             * Skip it up to and including the EXEC/DISCARD; the server already
+             * discarded the commands queued before. */
+            if (m_txn_multi_sent && cmd.multi_effect != multi_effect_opens &&
+                !m_connections[conn_id]->is_multi_open()) {
+                benchmark_debug_log("--transaction: MULTI lost on reconnect; skipping command %u\n",
+                                    m_executed_command_index);
+                if (cmd.multi_effect == multi_effect_closes) m_txn_multi_sent = false;
+                advance_arbitrary_command_index();
+                return;
+            }
+        }
         if (create_arbitrary_request(m_executed_command_index, timestamp, conn_id)) {
+            if (cmd.multi_effect == multi_effect_opens) {
+                m_txn_multi_sent = true;
+            } else if (cmd.multi_effect == multi_effect_closes) {
+                m_txn_multi_sent = false;
+            }
             advance_arbitrary_command_index();
             m_reqs_generated++;
         }
@@ -630,9 +955,23 @@ void client::create_request(struct timeval timestamp, unsigned int conn_id)
         }
 
         // MGET command
-        if (!create_mget_request(timestamp, conn_id)) return;
+        if (!create_mget_request(timestamp, conn_id)) {
+            // Two distinct reasons for false:
+            //   defer  (m_mget_defer==true):  backpressure or no-route — the
+            //     destination connection is at pipeline capacity or the routing
+            //     policy found no eligible replica right now. Do NOT advance the
+            //     ratio counter; the next fill_pipeline tick will retry.
+            //   exhausted (m_mget_defer==false): this connection owns no slots
+            //     in the configured key range. Force the counter past the
+            //     threshold so create_request() resets both counters on the next
+            //     call instead of busy-spinning here forever.
+            if (!m_mget_defer) {
+                m_get_ratio_count = m_config->ratio.b;
+            }
+            return;
+        }
 
-        m_get_ratio_count += m_config->multi_key_get;
+        m_get_ratio_count += m_keylist->get_keys_count();
         m_reqs_generated++;
     } else {
         // overlap counters
@@ -654,7 +993,7 @@ int client::prepare(void)
 }
 
 // Maps internal request_type to a short uppercase string for failed-keys logs.
-static const char *request_type_to_name(request_type t)
+const char *request_type_to_name(request_type t)
 {
     switch (t) {
     case rt_get:
@@ -732,6 +1071,151 @@ void client::handle_response(unsigned int conn_id, struct timeval timestamp, req
         m_stats.update_arbitrary_op(&timestamp, response->get_total_len(), request->m_size,
                                     ts_diff(ref_sent, timestamp), ar->index);
 
+        // Per-key miss accounting. Only fires when:
+        //   1. the command resolved to a registry entry (spec != NULL)
+        //   2. miss tracking wasn't disabled by --command-miss-tracking=off
+        //   3. the reply isn't an error (errors are recorded separately by the
+        //      protocol layer; counting them as misses would double-book).
+        if (ar->m_cmd_meta != NULL && ar->m_cmd_meta->miss_tracking_enabled && ar->m_cmd_meta->spec != NULL &&
+            !response->is_error()) {
+            unsigned int num_keys = request->m_keys;
+            unsigned int hits = 0;
+            unsigned int misses = 0;
+            // Each case allocates per_key_hit at the right size once. Avoiding
+            // a pre-resize here means SingleNullBulk pays only for a 1-bucket
+            // vector and ArrayPerElementNulls pays for one assign() instead of
+            // a resize-then-assign pair on the hot reply path.
+            std::vector<bool> per_key_hit;
+
+            using memtier::command_meta::ReplyShape;
+            switch (ar->m_cmd_meta->spec->reply_shape) {
+            case ReplyShape::SingleNullBulk: {
+                // Hit iff the top-level reply isn't a null sentinel. We can't
+                // use response->get_hits() here: the parser increments it for
+                // every non-null bulk it walks, which overcounts for blocking
+                // pop commands (BLPOP/BRPOP/BZPOPMAX/BZPOPMIN return [key,
+                // value] arrays on success — get_hits() returns 2) and for
+                // multi-element pops (LPOP key COUNT N returns an N-element
+                // array). The status line carries the top-level RESP type
+                // header, which is what we actually care about: $-1 (null
+                // bulk), *-1 (null array), or anything else (a value).
+                const char *status = response->get_status();
+                // Miss sentinels: $-1 (null bulk), *-1 (null array, RESP2),
+                // *0 (empty array - returned by SPOP/SRANDMEMBER with a
+                // count argument when the key is absent), and "_" (RESP3
+                // null, parsed via single_type and stored verbatim as the
+                // status line without the CRLF). Anything else is a value
+                // (or a non-empty container) and counts as a hit.
+                bool is_null = (status != NULL && (strcmp(status, "$-1") == 0 || strcmp(status, "*-1") == 0 ||
+                                                   strcmp(status, "*0") == 0 || strcmp(status, "_") == 0));
+                // Always one bucket for SingleNullBulk: variadic-key blocking
+                // commands like BLPOP carry the winning key in the reply but
+                // we don't parse it, so per-key attribution beyond hit/miss
+                // isn't available.
+                per_key_hit.assign(1, false);
+                num_keys = 1;
+                hits = is_null ? 0 : 1;
+                misses = is_null ? 1 : 0;
+                if (!is_null) per_key_hit[0] = true;
+                break;
+            }
+            case ReplyShape::ArrayPerElementNulls: {
+                // The parser recorded a per-top-level-element hit/miss bitmap at
+                // parse time (set_track_elem_misses) with no materialization --
+                // no value malloc/memcpy, no mbulk tree. Bucket count is the
+                // reply element count, not the spec key count: HMGET / ZMSCORE
+                // have 1 Redis key but produce one reply element per
+                // field/member; MGET (multi-key spec) matches reply size 1:1.
+                //
+                // The bitmap reproduces the old materialized walk's semantics:
+                //   - bulk leaf: hit iff $N with N>0 (null $-1 and empty $0 are
+                //     misses); RESP3 null '_' is a miss; other single types are
+                //     hits (see track_leaf in protocol.cpp).
+                //   - nested sub-array element (GEOPOS/SORT_RO/...): hit iff the
+                //     sub-array is non-empty (*0 / *-1 are misses).
+                if (response->get_top_array_len() < 0) {
+                    // Top-level reply isn't an array (+OK, -ERR, a single bulk,
+                    // or any non-array misshape). One miss bucket, matching the
+                    // previous get_mbulk_value()==NULL guard.
+                    per_key_hit.assign(1, false);
+                    num_keys = 1;
+                    misses = 1;
+                } else {
+                    const std::vector<uint8_t> &eh = response->get_elem_hits();
+                    size_t n = eh.size();
+                    per_key_hit.assign(n, false);
+                    num_keys = (unsigned int) n;
+                    for (size_t i = 0; i < n; ++i) {
+                        if (eh[i]) {
+                            per_key_hit[i] = true;
+                            hits++;
+                        }
+                    }
+                    misses = (num_keys > hits) ? (num_keys - hits) : 0;
+                }
+                break;
+            }
+            case ReplyShape::EmptyCollection: {
+                // Heuristic: empty array == missing key. EmptyCollection
+                // commands (SMEMBERS, LRANGE, HGETALL, ...) virtually always
+                // carry exactly 1 key.
+                //
+                // We only need the top-level element count, not the element
+                // values, so we avoid set_keep_value() materialization (see the
+                // keep_value gate in setup_client) and read the declared
+                // aggregate length the parser captured from the reply header.
+                // get_top_array_len() is:
+                //   >0  for a populated array/map/set  -> hit (regardless of
+                //       whether the elements are zero-length: the count comes
+                //       from the *N/%N/~N header, not a per-value walk),
+                //    0  for an empty (*0) or null (*-1) collection -> miss,
+                //   -1  when the reply was not a top-level aggregate at all
+                //       (a scalar/bulk misshape) -> miss, matching the previous
+                //       get_mbulk_value()==NULL guard.
+                // This reproduces the old structural check exactly while
+                // staying alloc-free, and is independent of keep_value (it is
+                // captured whether or not an ArrayPerElementNulls command on
+                // the same connection forced materialization on).
+                bool empty = (response->get_top_array_len() <= 0);
+                per_key_hit.assign(num_keys, !empty);
+                hits = empty ? 0 : num_keys;
+                misses = empty ? num_keys : 0;
+                break;
+            }
+            case ReplyShape::IntegerMembership: {
+                // Reply is ":N\r\n" where N is the count of present keys.
+                // Per-position attribution is impossible from this reply, so
+                // we mark the first N buckets as hits and the rest as misses;
+                // the aggregate is correct, the per-position is conventional.
+                const char *status = response->get_status();
+                unsigned int n = 0;
+                if (status != NULL && status[0] == ':') {
+                    long v = strtol(status + 1, NULL, 10);
+                    if (v > 0) n = (unsigned int) v;
+                }
+                if (n > num_keys) n = num_keys;
+                hits = n;
+                misses = num_keys - n;
+                per_key_hit.assign(num_keys, false);
+                for (unsigned int i = 0; i < hits; ++i)
+                    per_key_hit[i] = true;
+                break;
+            }
+            default:
+                // Unreachable today: miss_tracking_enabled is only set for the
+                // four miss-bearing shapes above. Skip the stats call entirely
+                // here so a future shape addition doesn't silently record
+                // zero-valued hits/misses with an empty per_key_hit; the build
+                // will fail to compile (missing case label) only if -Wswitch
+                // catches it, so the guard makes the intent explicit.
+                break;
+            }
+
+            if (!per_key_hit.empty()) {
+                m_stats.update_arbitrary_op_misses(ar->index, hits, misses, per_key_hit);
+            }
+        }
+
         // Extract cursor from SCAN response for incremental iteration
         if (m_config->scan_incremental_iteration && !response->is_error()) {
             mbulk_size_el *top = response->get_mbulk_value();
@@ -761,13 +1245,6 @@ void client::handle_response(unsigned int conn_id, struct timeval timestamp, req
     default:
         assert(0);
         break;
-    }
-
-    // On success after one or more retries: reset the per-connection backoff
-    // so a transient burst of errors doesn't keep us in slow-retry mode after
-    // the SUT recovers.
-    if (m_config->retry_on_error && !response->is_error() && request->m_retries > 0) {
-        m_connections[conn_id]->reset_retry_backoff();
     }
 }
 
@@ -874,15 +1351,17 @@ void verify_client::handle_response(unsigned int conn_id, struct timeval timesta
             benchmark_debug_log("key: [%.*s] verified successfuly.\n", vr->m_key_len, vr->m_key);
             m_verified_keys++;
         }
-        // Reset retry backoff after a non-error protocol response, matching
-        // client::handle_response. A value mismatch is a successful round-trip
-        // from the server's perspective, so the backoff should reset on either
-        // branch — without this, a transient error burst keeps the
-        // per-connection backoff inflated.
-        if (m_config->retry_on_error && request->m_retries > 0) {
-            m_connections[conn_id]->reset_retry_backoff();
-        }
     }
+}
+
+bool verify_client::verification_complete() const
+{
+    // GET/MGET/WAIT positions issue no verification request, but still count
+    // toward the generated request budget.
+    // Each SET position issues one verification GET; retries must end in a
+    // matching or failed reply before the pass can be considered complete.
+    return m_config->requests > 0 && m_reqs_generated >= m_config->requests &&
+           m_verified_keys + m_errors == m_tot_set_ops;
 }
 
 bool verify_client::finished(void)
@@ -900,8 +1379,15 @@ client_group::client_group(benchmark_config *config, abstract_protocol *protocol
         m_protocol(protocol),
         m_obj_gen(obj_gen),
         m_staircase_timer(NULL),
-        m_staircase_active_clients(0)
+        m_staircase_deadline_timer(NULL),
+        m_staircase_active_clients(0),
+        m_staircase_steps(0),
+        m_interrupt_requested(false),
+        m_worker_tid_set(false),
+        m_joined(false)
 {
+    m_interrupt_time.tv_sec = 0;
+    m_interrupt_time.tv_usec = 0;
     m_base = event_base_new();
     assert(m_base != NULL);
 
@@ -911,10 +1397,11 @@ client_group::client_group(benchmark_config *config, abstract_protocol *protocol
 
 client_group::~client_group(void)
 {
-    if (m_staircase_timer != NULL) {
-        event_del(m_staircase_timer);
-        event_free(m_staircase_timer);
-        m_staircase_timer = NULL;
+    remove_staircase_timer();
+    if (m_staircase_deadline_timer != NULL) {
+        event_del(m_staircase_deadline_timer);
+        event_free(m_staircase_deadline_timer);
+        m_staircase_deadline_timer = NULL;
     }
 
     for (std::vector<client *>::iterator i = m_clients.begin(); i != m_clients.end(); i++) {
@@ -953,7 +1440,8 @@ int client_group::create_clients(int num)
             unsigned int jitter_micros = m_config->thread_conn_start_min_jitter_micros;
 
             if (jitter_range > 0) {
-                jitter_micros += rand() % (jitter_range + 1);
+                // 64-bit: jitter_range + 1 wraps to 0 for a UINT_MAX range.
+                jitter_micros += rand() % ((unsigned long long) jitter_range + 1);
             }
 
             usleep(jitter_micros);
@@ -993,10 +1481,40 @@ unsigned int client_group::active_client_count(void)
 
 void client_group::run(void)
 {
+    m_worker_tid = pthread_self();
+    m_worker_tid_set.store(true, std::memory_order_release);
     if (m_config->clients_start > 0) {
         setup_staircase_timer();
     }
     event_base_dispatch(m_base);
+
+    // The loop can end while requests are still held for resend: a
+    // connection that lost its server for good (no --reconnect-on-error, or
+    // out of reconnect attempts) ends the whole thread. The other
+    // connections on it may have moved their in-flight requests to their
+    // replay queues on the same outage, or still have them in flight, their
+    // own EOF not handled yet. Nothing resends them now; count them as
+    // errors instead of freeing them silently with the connections. A run
+    // that ended normally has already emptied them (disconnect_all()). On
+    // Ctrl+C, requests still in flight are dropped as before.
+    const bool interrupted = !m_clients.empty() && m_clients[0]->get_stats()->get_interrupted();
+    unsigned long long abandoned = 0;
+    for (unsigned int i = 0; i < m_clients.size(); i++) {
+        std::vector<shard_connection *> &conns = m_clients[i]->get_connections();
+        for (unsigned int j = 0; j < conns.size(); j++) {
+            shard_connection *sc = conns[j];
+            if (sc == NULL) continue;
+            // Moves the requests still in flight to the replay queue.
+            if (m_config->retry_on_error && !interrupted && sc->get_pending_resp() > 0) sc->disconnect();
+            const char *reason = sc->get_thread_end_reason();
+            abandoned += sc->abandon_replay_requests(reason ? reason : "thread-ended-before-resend");
+        }
+    }
+    if (abandoned) {
+        benchmark_error_log("warning: %llu request(s) held for resend when the thread ended were not resent; "
+                            "counted as errors.\n",
+                            abandoned);
+    }
 }
 
 void client_group::staircase_timer_cb(evutil_socket_t fd, short what, void *arg)
@@ -1007,28 +1525,69 @@ void client_group::staircase_timer_cb(evutil_socket_t fd, short what, void *arg)
     cg->handle_staircase_step();
 }
 
+void client_group::staircase_deadline_cb(evutil_socket_t fd, short what, void *arg)
+{
+    (void) fd;
+    (void) what;
+    ((client_group *) arg)->remove_staircase_timer();
+}
+
+void client_group::remove_staircase_timer(void)
+{
+    if (m_staircase_timer != NULL) {
+        event_del(m_staircase_timer);
+        event_free(m_staircase_timer);
+        m_staircase_timer = NULL;
+    }
+}
+
 void client_group::setup_staircase_timer(void)
 {
     struct timeval interval = {(long) m_config->step_duration, 0};
     m_staircase_timer = event_new(m_base, -1, EV_PERSIST, staircase_timer_cb, (void *) this);
+    if (m_staircase_timer == NULL) {
+        benchmark_error_log("error: staircase: failed to create the step timer; no clients will be added.\n");
+        return;
+    }
     event_add(m_staircase_timer, &interval);
+
+    // The step timer is persistent, so once the clients stop at the deadline
+    // it alone would keep event_base_dispatch() running until its next tick
+    // (up to step_duration past --test-time). Remove it at the deadline.
+    struct timeval now, elapsed, deadline = {0, 0}, remaining = {0, 0};
+    deadline.tv_sec = m_config->test_time;
+    gettimeofday(&now, NULL);
+    evutil_timersub(&now, &m_config->benchmark_start_time, &elapsed);
+    if (timercmp(&elapsed, &deadline, <)) evutil_timersub(&deadline, &elapsed, &remaining);
+    m_staircase_deadline_timer = event_new(m_base, -1, 0, staircase_deadline_cb, (void *) this);
+    if (m_staircase_deadline_timer == NULL) {
+        // The step timer still stops itself at its first tick past the deadline.
+        benchmark_error_log("warning: staircase: failed to create the deadline timer; the run may end up to "
+                            "--step-duration late.\n");
+        return;
+    }
+    event_add(m_staircase_deadline_timer, &remaining);
 }
 
 void client_group::handle_staircase_step(void)
 {
-    // Check if the test deadline has passed. Without this, the EV_PERSIST
-    // timer keeps event_base_dispatch alive even after all clients' finished()
-    // returns true, extending the run far beyond test_time.
+    // Stop the ramp at the test deadline; two checks, either one stops:
+    // - The step count: step k is due at k * step_duration. The clock alone
+    //   can't decide this: the timer runs on libevent's monotonic clock and
+    //   can fire a hair before the deadline by gettimeofday(), which would add
+    //   clients that the deadline stops at once.
+    // - The clock: after a stall of the event loop (SIGSTOP, VM pause), the
+    //   timer is rescheduled from "now", so the count lags behind and a step
+    //   could fire after the deadline. Compare full timevals, as finished()
+    //   does.
+    m_staircase_steps++;
     if (m_config->test_time > 0) {
-        struct timeval now;
+        struct timeval now, elapsed;
         gettimeofday(&now, NULL);
-        unsigned int elapsed = now.tv_sec - m_config->benchmark_start_time.tv_sec;
-        if (elapsed >= m_config->test_time) {
-            if (m_staircase_timer != NULL) {
-                event_del(m_staircase_timer);
-                event_free(m_staircase_timer);
-                m_staircase_timer = NULL;
-            }
+        evutil_timersub(&now, &m_config->benchmark_start_time, &elapsed);
+        if ((unsigned long long) m_staircase_steps * m_config->step_duration >= m_config->test_time ||
+            elapsed.tv_sec >= (time_t) m_config->test_time) {
+            remove_staircase_timer();
             return;
         }
     }
@@ -1039,11 +1598,7 @@ void client_group::handle_staircase_step(void)
 
     if (current >= target) {
         // Already at max, remove the timer
-        if (m_staircase_timer != NULL) {
-            event_del(m_staircase_timer);
-            event_free(m_staircase_timer);
-            m_staircase_timer = NULL;
-        }
+        remove_staircase_timer();
         return;
     }
 
@@ -1065,34 +1620,155 @@ void client_group::handle_staircase_step(void)
 
     // If we've reached max, remove the timer
     if (connected >= m_config->clients) {
-        if (m_staircase_timer != NULL) {
-            event_del(m_staircase_timer);
-            event_free(m_staircase_timer);
-            m_staircase_timer = NULL;
+        remove_staircase_timer();
+    }
+}
+
+// Called from the main thread once a --test-time run is
+// TEST_TIME_DRAIN_GRACE_SECS past its deadline and this thread has not ended.
+// The clients belong to the worker thread, so hand the work to its event loop
+// (this also wakes it from a poll that has nothing left to deliver).
+void client_group::end_stalled_clients(void)
+{
+    struct timeval zero = {0, 0};
+    event_base_once(m_base, -1, EV_TIMEOUT, end_stalled_clients_cb, (void *) this, &zero);
+}
+
+void client_group::end_stalled_clients_cb(evutil_socket_t fd, short what, void *arg)
+{
+    (void) fd;
+    (void) what;
+    ((client_group *) arg)->handle_end_stalled_clients();
+}
+
+void client_group::handle_end_stalled_clients(void)
+{
+    // A client is reported as waiting for replies if it was (even if only
+    // for setup commands, which are not counted), and as retrying if it
+    // held requests for retry; one that had both is in both lines.
+    unsigned long long unanswered = 0, held = 0;
+    unsigned int no_reply = 0, retrying = 0, ended = 0;
+    unsigned int count = active_client_count();
+    for (unsigned int i = 0; i < count && i < m_clients.size(); i++) {
+        if (m_clients[i]->end_time_set()) continue;
+        unsigned long long client_unanswered = 0, client_held = 0;
+        if (!m_clients[i]->abandon_unanswered_requests(&client_unanswered, &client_held)) continue;
+        ended++;
+        if (client_unanswered > 0 || client_held == 0) {
+            no_reply++;
+            unanswered += client_unanswered;
+        }
+        if (client_held > 0) {
+            retrying++;
+            held += client_held;
+        }
+    }
+    if (ended > 0) {
+        // The deadline has passed, so the ramp is over. The deadline timer has
+        // normally removed the step timer already; this only covers the case
+        // where that timer could not be created.
+        remove_staircase_timer();
+        if (no_reply > 0) {
+            benchmark_error_log("warning: %u client(s) got no reply to %llu request(s) %u seconds after the test time "
+                                "ended; abandoned them (counted as errors, \"Unanswered requests\" in the JSON "
+                                "Runtime).\n",
+                                no_reply, unanswered, TEST_TIME_DRAIN_GRACE_SECS);
+        }
+        if (retrying > 0) {
+            benchmark_error_log("warning: %u client(s) were still retrying %llu request(s) %u seconds after the test "
+                                "time ended; ended them (counted as errors, not resent).\n",
+                                retrying, held, TEST_TIME_DRAIN_GRACE_SECS);
         }
     }
 }
 
 void client_group::interrupt(void)
 {
+    // The end time of the clients that have not ended yet. Taken first, so
+    // that it does not include the time the loop takes to stop.
+    if (!m_interrupt_requested) {
+        gettimeofday(&m_interrupt_time, NULL);
+        m_interrupt_requested = true;
+    }
     // Mark all clients as interrupted
     set_all_clients_interrupted();
-    // Break the event loop to stop processing
+    // Break the event loop to stop processing.
+    //
+    // We pair loopbreak() (terminate after the current iteration) with a
+    // loopexit(timeval{0,0}) (schedule an immediate timer that wakes the
+    // poll). Without the loopexit wake-up, a worker that is sitting idle
+    // in epoll_wait() with no live event sources (e.g. a connection that
+    // failed setup but never disconnected) will block forever, so
+    // pthread_join() in the parent hangs indefinitely. This is the same
+    // pattern libevent recommends for terminating an idle loop from
+    // another thread; loopbreak alone is documented to only take effect
+    // *between* iterations.
     event_base_loopbreak(m_base);
-    // Set end time for all clients as close as possible to the loop break
-    finalize_all_clients();
+    struct timeval zero = {0, 0};
+    event_base_loopexit(m_base, &zero);
+    // Do not finalize the clients here: the worker may still be in a callback
+    // that records into the same run_stats (roll_cur_stats() and
+    // set_end_time() both fold and append the current second).
+    // finalize_interrupted_clients() does it after pthread_join(), with the
+    // end time taken here.
 }
 
-void client_group::finalize_all_clients(void)
+void client_group::finalize_interrupted_clients(void)
 {
+    if (m_interrupt_requested) finalize_all_clients(&m_interrupt_time);
+}
+
+void client_group::check_stats_owner(const char *what)
+{
+    if (m_joined.load(std::memory_order_acquire)) return;
+    if (m_worker_tid_set.load(std::memory_order_acquire) && pthread_equal(pthread_self(), m_worker_tid)) return;
+    // Another thread would race with the worker recording into the same
+    // run_stats (roll_cur_stats() vs. set_end_time()). Always on: the race
+    // itself only shows up under a sanitizer, and then not every time.
+    fprintf(stderr, "BUG: %s off the worker thread before join\n", what);
+    abort();
+}
+
+void client_group::finalize_all_clients(struct timeval *end_time)
+{
+    check_stats_owner("finalize_all_clients()");
     // Iterate ALL clients, not just active ones. During staircase mode,
     // a client may have been prepare()-d but not yet counted in the atomic
     // (race window in handle_staircase_step). Using m_clients.size() ensures
     // no client is missed. Calling set_end_time() on never-started clients
     // is harmless — they won't be included in merge (which uses active_client_count).
     for (unsigned int i = 0; i < m_clients.size(); i++) {
-        m_clients[i]->set_end_time();
+        if (end_time != NULL)
+            m_clients[i]->set_end_time_interrupted(end_time);
+        else
+            m_clients[i]->set_end_time();
     }
+}
+
+// Connected (prepare()-d) clients that have not reached their stop condition
+// when the event loop returns (those marked failed are counted by
+// count_failed_clients()). The missing end time establishes incomplete work,
+// not its cause. Clients a staircase ramp never connected are not counted.
+unsigned int client_group::count_unended_clients(void)
+{
+    unsigned int count = 0;
+    unsigned int active = active_client_count();
+    for (unsigned int i = 0; i < active && i < m_clients.size(); i++) {
+        if (!m_clients[i]->end_time_set() && !m_clients[i]->run_failed()) count++;
+    }
+    return count;
+}
+
+// Connected clients that a connection marked failed after the run was over
+// (client::fail_run(), e.g. a setup rejected since the last reply).
+unsigned int client_group::count_failed_clients(void)
+{
+    unsigned int count = 0;
+    unsigned int active = active_client_count();
+    for (unsigned int i = 0; i < active && i < m_clients.size(); i++) {
+        if (m_clients[i]->run_failed()) count++;
+    }
+    return count;
 }
 
 void client_group::set_all_clients_interrupted(void)
@@ -1103,9 +1779,9 @@ void client_group::set_all_clients_interrupted(void)
     }
 }
 
-unsigned long int client_group::get_total_bytes(void)
+unsigned long long int client_group::get_total_bytes(void)
 {
-    unsigned long int total_bytes = 0;
+    unsigned long long int total_bytes = 0;
     unsigned int count = active_client_count();
     for (unsigned int i = 0; i < count; i++) {
         total_bytes += m_clients[i]->get_stats()->get_total_bytes();
@@ -1114,9 +1790,31 @@ unsigned long int client_group::get_total_bytes(void)
     return total_bytes;
 }
 
-unsigned long int client_group::get_total_ops(void)
+unsigned long long int client_group::get_total_bytes_rx(void)
 {
-    unsigned long int total_ops = 0;
+    unsigned long long int total_bytes_rx = 0;
+    unsigned int count = active_client_count();
+    for (unsigned int i = 0; i < count; i++) {
+        total_bytes_rx += m_clients[i]->get_stats()->get_total_bytes_rx();
+    }
+
+    return total_bytes_rx;
+}
+
+unsigned long long int client_group::get_total_bytes_tx(void)
+{
+    unsigned long long int total_bytes_tx = 0;
+    unsigned int count = active_client_count();
+    for (unsigned int i = 0; i < count; i++) {
+        total_bytes_tx += m_clients[i]->get_stats()->get_total_bytes_tx();
+    }
+
+    return total_bytes_tx;
+}
+
+unsigned long long int client_group::get_total_ops(void)
+{
+    unsigned long long int total_ops = 0;
     unsigned int count = active_client_count();
     for (unsigned int i = 0; i < count; i++) {
         total_ops += m_clients[i]->get_stats()->get_total_ops();
@@ -1136,9 +1834,9 @@ double client_group::get_total_latency(void)
     return total_latency;
 }
 
-unsigned long int client_group::get_duration_usec(void)
+unsigned long long int client_group::get_duration_usec(void)
 {
-    unsigned long int duration = 0;
+    unsigned long long int duration = 0;
     unsigned int thread_counter = 1;
     unsigned int count = active_client_count();
     for (unsigned int i = 0; i < count; i++) {
@@ -1151,9 +1849,9 @@ unsigned long int client_group::get_duration_usec(void)
     return duration;
 }
 
-unsigned long int client_group::get_total_connection_errors(void)
+unsigned long long int client_group::get_total_connection_errors(void)
 {
-    unsigned long int total_errors = 0;
+    unsigned long long int total_errors = 0;
     unsigned int count = active_client_count();
     for (unsigned int i = 0; i < count; i++) {
         total_errors += m_clients[i]->get_stats()->get_total_connection_errors();
@@ -1162,9 +1860,9 @@ unsigned long int client_group::get_total_connection_errors(void)
     return total_errors;
 }
 
-unsigned long int client_group::get_total_hits(void)
+unsigned long long int client_group::get_total_hits(void)
 {
-    unsigned long int total = 0;
+    unsigned long long int total = 0;
     unsigned int count = active_client_count();
     for (unsigned int i = 0; i < count; i++) {
         total += m_clients[i]->get_stats()->get_total_hits();
@@ -1172,9 +1870,9 @@ unsigned long int client_group::get_total_hits(void)
     return total;
 }
 
-unsigned long int client_group::get_total_misses(void)
+unsigned long long int client_group::get_total_misses(void)
 {
-    unsigned long int total = 0;
+    unsigned long long int total = 0;
     unsigned int count = active_client_count();
     for (unsigned int i = 0; i < count; i++) {
         total += m_clients[i]->get_stats()->get_total_misses();
@@ -1182,9 +1880,39 @@ unsigned long int client_group::get_total_misses(void)
     return total;
 }
 
-unsigned long int client_group::get_total_retry_attempts(void)
+unsigned long long client_group::get_total_arbitrary_hits(void)
 {
-    unsigned long int total = 0;
+    unsigned long long total = 0;
+    unsigned int count = active_client_count();
+    for (unsigned int i = 0; i < count; i++) {
+        total += m_clients[i]->get_stats()->get_total_arbitrary_hits();
+    }
+    return total;
+}
+
+unsigned long long client_group::get_total_arbitrary_misses(void)
+{
+    unsigned long long total = 0;
+    unsigned int count = active_client_count();
+    for (unsigned int i = 0; i < count; i++) {
+        total += m_clients[i]->get_stats()->get_total_arbitrary_misses();
+    }
+    return total;
+}
+
+unsigned long long client_group::get_total_arbitrary_aborts(void)
+{
+    unsigned long long total = 0;
+    unsigned int count = active_client_count();
+    for (unsigned int i = 0; i < count; i++) {
+        total += m_clients[i]->get_stats()->get_total_arbitrary_aborts();
+    }
+    return total;
+}
+
+unsigned long long int client_group::get_total_retry_attempts(void)
+{
+    unsigned long long int total = 0;
     unsigned int count = active_client_count();
     for (unsigned int i = 0; i < count; i++) {
         total += m_clients[i]->get_stats()->get_total_retry_attempts();
@@ -1192,9 +1920,9 @@ unsigned long int client_group::get_total_retry_attempts(void)
     return total;
 }
 
-unsigned long int client_group::get_total_retried_ops(void)
+unsigned long long int client_group::get_total_retried_ops(void)
 {
-    unsigned long int total = 0;
+    unsigned long long int total = 0;
     unsigned int count = active_client_count();
     for (unsigned int i = 0; i < count; i++) {
         total += m_clients[i]->get_stats()->get_total_retried_ops();
@@ -1202,9 +1930,9 @@ unsigned long int client_group::get_total_retried_ops(void)
     return total;
 }
 
-unsigned long int client_group::get_total_errors(void)
+unsigned long long int client_group::get_total_errors(void)
 {
-    unsigned long int total = 0;
+    unsigned long long int total = 0;
     unsigned int count = active_client_count();
     for (unsigned int i = 0; i < count; i++) {
         total += m_clients[i]->get_stats()->get_total_errors();
@@ -1212,18 +1940,22 @@ unsigned long int client_group::get_total_errors(void)
     return total;
 }
 
-void client_group::merge_run_stats(run_stats *target)
+void client_group::merge_run_stats(run_stats *target, unsigned int &iteration_counter)
 {
     assert(target != NULL);
     // Iterate ALL clients (not just active_client_count) to avoid dropping
     // stats from clients that were prepare()-d but not yet counted in the
-    // atomic when the benchmark ended. Skip clients that never started
-    // (set_start_time never called) — merging their zeroed m_start_time
-    // would corrupt the factorial-averaged timestamps.
-    unsigned int iteration_counter = 1;
+    // atomic when the benchmark ended. Clients that never started
+    // (set_start_time never called) are merged too, for the connection errors
+    // and interrupted flag they recorded; run_stats::merge() leaves their
+    // zeroed m_start_time out of the factorial-averaged timestamps, so they
+    // do not advance the iteration counter. The caller owns the counter
+    // (starting at 1) and passes the same one to every client_group merged
+    // into the same target, so the timestamps average over all their clients.
     for (unsigned int i = 0; i < m_clients.size(); i++) {
-        if (!m_clients[i]->get_stats()->has_started()) continue;
-        target->merge(*m_clients[i]->get_stats(), iteration_counter++);
+        run_stats *stats = m_clients[i]->get_stats();
+        target->merge(*stats, iteration_counter);
+        if (stats->has_started()) iteration_counter++;
     }
 }
 
@@ -1235,16 +1967,25 @@ void client_group::aggregate_inst_histogram(hdr_histogram *target)
     }
 }
 
+void client_group::drain_prom_latency_histogram(hdr_histogram *target, bool run_end)
+{
+    for (unsigned int i = 0; i < m_clients.size(); i++) {
+        if (!m_clients[i]->get_stats()->has_started()) continue;
+        m_clients[i]->get_stats()->drain_prom_latency_histogram(target, run_end);
+    }
+}
 
-void client_group::write_client_stats(const char *prefix)
+
+// *failures counts the CSVs that could not be written; only the first
+// failure is printed, since all the clients' files usually fail the same way
+// (e.g. a missing directory).
+void client_group::write_client_stats(const char *prefix, unsigned int *failures)
 {
     for (unsigned int i = 0; i < m_clients.size(); i++) {
         if (!m_clients[i]->get_stats()->has_started()) continue;
         char filename[PATH_MAX];
 
         snprintf(filename, sizeof(filename) - 1, "%s-%u.csv", prefix, i);
-        if (!m_clients[i]->get_stats()->save_csv(filename, m_config)) {
-            fprintf(stderr, "error: %s: failed to write client stats.\n", filename);
-        }
+        if (!m_clients[i]->get_stats()->save_csv(filename, m_config, *failures == 0)) (*failures)++;
     }
 }

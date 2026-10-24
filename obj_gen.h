@@ -22,6 +22,12 @@
 #include <vector>
 #include "file_io.h"
 
+// MinGW has neither random_r() nor jrand48(): obj_gen.cpp supplies a jrand48()
+// equivalent so the HAVE_DRAND48 code path can be used unchanged.
+#if defined(_WIN32) && !defined(HAVE_RANDOM_R) && !defined(HAVE_DRAND48)
+#define MEMTIER_JRAND48_SHIM 1
+#endif
+
 struct random_data;
 struct config_weight_list;
 
@@ -37,7 +43,7 @@ private:
 #ifdef HAVE_RANDOM_R
     struct random_data m_data_blob;
     char m_state_array[512];
-#elif (defined HAVE_DRAND48)
+#elif (defined HAVE_DRAND48) || (defined MEMTIER_JRAND48_SHIM)
     unsigned short m_data_blob[3];
 #endif
 };
@@ -173,7 +179,9 @@ public:
     imported_keylist(const char *filename);
     ~imported_keylist();
 
-    bool read_keys(void);
+    // Read the whole file, stopping at the first malformed item. With
+    // keep_keys false the file is only validated and no keys are stored.
+    bool read_keys(bool keep_keys = true);
     unsigned int size();
     const char *get(unsigned int pos, unsigned int *len);
 };

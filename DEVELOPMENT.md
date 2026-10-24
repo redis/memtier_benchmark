@@ -8,8 +8,9 @@ This document provides information for developers working on memtier_benchmark.
 
 The following libraries are required for building:
 
-* libevent 2.0.10 or newer.
+* libevent 2.1.1 or newer (the default-on Prometheus exporter requires evhttp >= 2.1.1; libevent 2.0.10 suffices with ./configure --disable-prometheus).
 * OpenSSL (unless TLS support is disabled by `./configure --disable-tls`).
+* Prometheus /metrics exporter support can be disabled by ./configure --disable-prometheus.
 
 The following tools are required:
 * autoconf
@@ -42,15 +43,154 @@ $ sudo apt-get install build-essential autoconf automake \
 To build natively on macOS, use Homebrew to install the required dependencies:
 
 ```
-$ brew install autoconf automake libtool libevent pkg-config openssl@3.0 clang-format
+$ brew install autoconf automake libevent pkg-config clang-format
 ```
 
-When running `./configure`, if it fails to find libssl it may be necessary to
-tweak the `PKG_CONFIG_PATH` environment variable:
+memtier must use the same OpenSSL that Homebrew's `libevent` is linked against.
+Mixing two OpenSSL versions in one process crashes on `--tls`. Which OpenSSL
+that is depends on the `libevent` revision you have, so ask Homebrew and point
+`PKG_CONFIG_PATH` at it when running `./configure`:
 
 ```
-PKG_CONFIG_PATH=`brew --prefix openssl@3.0`/lib/pkgconfig ./configure
+$ ssl=$(brew deps libevent | grep '^openssl@' | head -n 1)
+$ brew install $ssl
+$ PKG_CONFIG_PATH="$(brew --prefix $ssl)/lib/pkgconfig" ./configure
 ```
+
+To use a different OpenSSL, install it (for example `brew install openssl@3`),
+build libevent from source against it, and put both prefixes in
+`PKG_CONFIG_PATH`. `scripts/build-macos-libevent.sh` does this and installs it
+under `$RUNNER_TEMP/libevent-memtier`:
+
+```
+$ brew install openssl@3
+$ RUNNER_TEMP=$HOME/build bash scripts/build-macos-libevent.sh "$(brew --prefix openssl@3)"
+$ PKG_CONFIG_PATH="$HOME/build/libevent-memtier/lib/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig" ./configure
+```
+
+After `make`, check that `memtier_benchmark` and libevent's `libevent_openssl`
+link the same OpenSSL. For the Homebrew libevent build:
+
+```
+$ bash scripts/check-macos-tls-links.sh "$(brew --prefix $ssl)" "$(brew --prefix libevent)"
+```
+
+For the source-built libevent:
+
+```
+$ RUNNER_TEMP=$HOME/build bash scripts/check-macos-tls-links.sh "$(brew --prefix openssl@3)"
+```
+
+### Windows (MSYS2 / MinGW-w64)
+
+memtier_benchmark builds natively on Windows with the MinGW-w64 toolchain
+from [MSYS2](https://www.msys2.org/) and requires Windows 10 or later (it
+targets API level 0x0A00 and uses `afunix.h`). It is tested with the UCRT64
+environment (GCC 16.2, libevent 2.1.13, OpenSSL 3.6). In an MSYS2 shell,
+install the prerequisites:
+
+```
+$ pacman -S --needed autoconf-wrapper automake-wrapper make git \
+    mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-pkgconf \
+    mingw-w64-ucrt-x86_64-libevent mingw-w64-ucrt-x86_64-openssl \
+    mingw-w64-ucrt-x86_64-zlib mingw-w64-ucrt-x86_64-python
+```
+
+`git` provides the commit hash shown by `--version` (it is `00000000` without
+it) and Python is only needed to run `tests/windows_smoke.py`. Then, from an
+MSYS2 **UCRT64** shell:
+
+```
+$ autoreconf -ivf
+$ ./configure
+$ make
+$ make check
+```
+
+The result is `./memtier_benchmark.exe`. It needs the MinGW runtime DLLs from
+`C:\msys64\ucrt64\bin`, which the UCRT64 shell already has on its `PATH`. To
+run it elsewhere, copy the executable together with `libcrypto-3-x64.dll`,
+`libevent-7.dll`, `libevent_core-7.dll`, `libevent_extra-7.dll`,
+`libevent_openssl-7.dll`, `libgcc_s_seh-1.dll`, `libssl-3-x64.dll`,
+`libstdc++-6.dll`, `libwinpthread-1.dll` and `zlib1.dll` from that directory.
+
+Alternatively, link statically so that the executable depends only on Windows
+system DLLs (about 18 MB). The following is an example that was verified with
+the MSYS2 packages listed above at the time of writing; the library list may
+need adjusting when those packages change. Delete the executable and relink
+with:
+
+```
+$ rm memtier_benchmark.exe
+$ make LDFLAGS=-static \
+    LIBS='-lz -lcrypto -lws2_32 -lgdi32 -lcrypt32 -ladvapi32 -luser32 -liphlpapi -lws2_32'
+```
+
+`make check` runs all unit programs on Windows, including TCP socket
+options, reconnect descriptor closure, retry-drain and sibling-deadline
+regressions, and TLS socket setup. The Unix-domain portion of the socket
+options test runs only on POSIX.
+
+`tests/windows_smoke.py` runs end-to-end checks against a built
+executable without needing a Redis server (`python tests/windows_smoke.py
+./memtier_benchmark.exe`). The RLTest integration suite is not run in CI on
+Windows. It can be run locally against a Windows Redis-compatible server such
+as Memurai, but RLTest needs a small local shim for that (a stand-in for
+`fcntl`, the POSIX signal names the tests reference, the hard-coded `/tmp`
+paths and, for Memurai, its `--version` output format). Some tests need POSIX
+signals or `/proc` (the crash-handler, SIGINT and SIGPIPE-immunity tests) and
+cannot pass on Windows.
+
+Limitations of the Windows build:
+
+* `--unix-socket` is not supported and is rejected with an error.
+* libevent uses its `win32` backend, which is based on `select()`. It may
+  scale worse than `epoll` on Linux at very high connection counts.
+* CPU usage is read with `GetThreadTimes()`, which advances in scheduler ticks
+  of about 15.6 ms, so very short runs and the per-second CPU samples are coarse.
+* The crash report is best-effort. It is printed for unhandled exceptions such
+  as access violations, but not for `abort()` or failed assertions, and the
+  stack trace holds only raw addresses of the crashing thread.
+
+### Code coverage
+
+Install lcov (including genhtml) and the gcov tool that matches your compiler.
+Configure with `--enable-code-coverage`, then run `make check` followed by
+`make code-coverage-capture`. GCC and Clang use their own coverage runtimes;
+coverage capture supports lcov 1.x and 2.x. With Clang and lcov 2, optional
+function-end inference is disabled: compiler-generated functions can lack
+source-line coverpoints. Line and function execution counts are retained.
+Coverage builds require C and C++ support for `-fprofile-update=atomic` so
+worker threads do not lose or corrupt profiling counts. Configure checks both
+compilers and their coverage runtimes; coverage-disabled builds do not require
+this option.
+Optional exclusion patterns that
+match no files are allowed; other capture/filter errors still fail the target.
+`make clean` and `make distclean` remove generated `.gcda`, `.gcno` and `.gcov`
+files. Reconfigure and rebuild when switching compilers.
+
+For Clang, point `GCOV` to an executable wrapper that runs the matching LLVM
+version's `llvm-cov gcov` subcommand, rather than GCC's gcov. For example:
+
+```sh
+printf '#!/bin/sh\nexec llvm-cov gcov "$@"\n' > llvm-gcov
+chmod +x llvm-gcov
+GCOV="$PWD/llvm-gcov" CC=clang CXX=clang++ ./configure --enable-code-coverage
+```
+
+CI runs `tests/check_code_coverage.sh` from separate configured build directories
+with GCC/lcov 1, GCC/lcov 2 and Clang/lcov 2. It builds and executes the unit tests,
+checks filtered and unfiltered HTML/trace output, and verifies both cleanup
+paths. It also checks an exact function-call count from the threaded HDR unit.
+The script resets existing coverage counters and runs `make distclean` at the
+end; use a disposable build directory.
+
+Full capture/HTML/cleanup validation covers lcov 1.16 and 2.0. The threaded
+count check accepts both legacy `FNDA` records and lcov 2.2's `FNA` records.
+With GCC 13 and lcov 2.2, capture succeeds, but genhtml can reject compiler-generated
+destructor aliases whose execution counts differ from their shared source line.
+That consistency error remains fatal; a successful capture alone does not mean
+the HTML report succeeded.
 
 ### Building and Installing
 
@@ -62,6 +202,17 @@ $ ./configure
 $ make
 $ sudo make install
 ```
+
+The bash completion script is installed under the prefix, in
+`$prefix/share/bash-completion/completions` (`/usr/local/share/...` by
+default). bash-completion 2.x finds the default location when `XDG_DATA_DIRS`
+is unset or includes `/usr/local/share`. For another prefix, add its `share`
+directory to `XDG_DATA_DIRS`, or use the system completion directory:
+`./configure --with-bash-completion-dir="$(pkg-config --variable=completionsdir bash-completion)"`.
+An explicit directory must be absolute and non-empty. Use
+`--without-bash-completion-dir` to skip installation. Upgrading from a build
+that installed into `/usr/share` leaves that old copy in place; remove the
+old completion if it shadows the one installed under the new prefix.
 
 **Note**: Debug symbols (`-g`) are included by default in all builds for crash analysis and debugging. The default build flags are `-O2 -g -Wall`, which provides:
 - Full optimizations (`-O2`) for production performance
@@ -191,6 +342,79 @@ To verify TSAN is enabled:
 
 **Note:** TSAN and ASAN are mutually exclusive and cannot be used together. A suppression file (`tsan_suppressions.txt`) is provided to ignore known benign data races that do not affect correctness.
 
+### Prometheus exporter build flavor
+
+memtier_benchmark ships a built-in Prometheus `/metrics` exporter (a second
+real-time transport alongside StatsD; see
+[Real-Time Metrics Visualization](docs/REALTIME_METRICS.md)). It is **enabled by
+default** — no extra configure flag is needed:
+
+    $ ./configure && make
+
+The exporter is built on libevent's `evhttp`, which requires **libevent 2.1.1 or
+newer**. `configure` performs an explicit **LINK test** for `evhttp_new` (not just
+a header check); if your libevent is too old, the build fails loudly at configure
+time with a message pointing at `--disable-prometheus`. To build without the
+exporter (e.g. on a host pinned to libevent 2.0.x):
+
+    $ ./configure --disable-prometheus && make
+
+Verify which flavor you built using the `--version` token:
+
+    $ ./memtier_benchmark --version
+    memtier_benchmark ... prometheus=yes      # default-on build
+    $ ./memtier_benchmark --version            # after --disable-prometheus
+    memtier_benchmark ... prometheus=no
+
+In a `prometheus=no` build the `--prometheus-*` flags are rejected with
+`unrecognized option` (exit code 2). The `make check` unit harness
+(`tests/unit/prometheus_metrics_test.cpp`) runs under **both** flavors — the
+metrics-layer unit tests are independent of libevent and validate the histogram
+math, exposition rendering, and bucket parsing in either build.
+
+Before pushing changes that touch the exporter, run the one-command local gate
+(`tests/run_local_gate.sh`):
+
+    $ make gate
+
+It builds both flavors in sibling VPATH directories, runs the unit harness under
+each, the RLTest CLI/functional/redaction/statsd suites, a live HTTP smoke
+(hardening, render-cache TTL, run-boundary monotonicity, teardown race window),
+the error-path/IPv6/in-flight-cap checks, the ASan and TSan cells, and the
+docs/completion/purity grep audits — printing `GATE PASS` on success. Set
+`GATE_FAST=1 make gate` to skip the (slower) sanitizer stage. The gate validates
+`/metrics` with `promtool` when it is on `PATH`, otherwise via a pinned
+`prom/prometheus` Docker image (warn+skip if that image is unavailable offline).
+
+### On-demand fuzzers and extra suites (PR labels)
+
+A few longer-running test suites do not run on every PR by default — their wall-clock cost outweighs the per-PR signal — but you can opt a PR into running them by attaching a label:
+
+| Label | Workflow | What it runs | When to use |
+|---|---|---|---|
+| `run-fuzz` | `.github/workflows/monitor-fuzz.yml` | Black-box fuzz driver (`tests/fuzz/fuzz_monitor_input.py`) against `--monitor-input` / `arbitrary_command::split_command_to_args`, ASAN+UBSan build, `FUZZ_ITER=300` (~3-4 min). | Any PR that touches the monitor-input parser, the arbitrary-command splitter, or the RESP-encoded request path. |
+| `run-differential` | `.github/workflows/differential.yml` | Differential harness (`tests/differential_redis_benchmark.py`) — memtier vs `redis-benchmark` / `redis-cli` against the same redis, asserts total ops / hits / p99 latency / throughput / server-killed diagnostics agree within explicit tolerances. | Any PR that plausibly affects the protocol formatter, the RESP parser, MGET pipelining, latency accounting, or hit/miss bookkeeping. |
+| `run-soak` | `.github/workflows/soak-nightly.yml` | Seven-scenario soak / stress / chaos matrix (`tests/soak/`): 30 min memory soak (RSS slope), giant MONITOR-input payloads, 32t/256c high concurrency + FD hygiene, `CLIENT KILL` churn, cluster failover + reshard mid-run, `-ERR`-only retry storm, `tc netem` slow network. ~30-35 min total under a 60-min matrix cap. | Any PR that plausibly affects memory growth, retry / reconnect, cluster handling, or large-payload paths. |
+
+Attach a label via the CLI:
+
+    $ gh pr edit <num> --add-label run-fuzz
+    $ gh pr edit <num> --add-label run-differential
+    $ gh pr edit <num> --add-label run-soak
+
+Removing the label and pushing a new commit skips the workflow again. All three also run on `workflow_dispatch`; `run-fuzz` runs nightly with `FUZZ_ITER=2000` and `run-soak` runs nightly via cron. Failures upload reproducers / logs / `tests/logs/` as workflow artifacts.
+
+Local runs:
+
+    $ MEMTIER=$(pwd)/memtier_benchmark FUZZ_ITER=200 \
+          python3 tests/fuzz/fuzz_monitor_input.py
+
+    $ RUN_DIFFERENTIAL=1 MEMTIER_BINARY=$(pwd)/memtier_benchmark \
+          pytest tests/differential_redis_benchmark.py -v
+
+    $ MEMTIER_BINARY=$(pwd)/memtier_benchmark \
+          python3 -m RLTest --test tests/soak/test_large_payloads.py -v
+
 ## Crash Handling and Debugging
 
 memtier_benchmark includes built-in crash handling that automatically prints a detailed bug report when the program crashes due to signals like SIGSEGV, SIGBUS, SIGFPE, SIGILL, or SIGABRT.
@@ -273,6 +497,24 @@ When a crash occurs, memtier_benchmark will automatically:
 
        Please report this bug by opening an issue on github.com/redis/memtier_benchmark
 ```
+
+The header lines (START, signal, signal code, fault address) are written with
+async-signal-safe calls only, so they appear even when the crash interrupted a
+thread holding the malloc, stdio or time zone lock. The rest of the report is
+best effort. If the handler gets stuck after the header, a watchdog ends the
+process with SIGALRM about 5 seconds after the crash, and the report ends
+with this line instead of the END marker:
+
+```
+=== MEMTIER_BENCHMARK BUG REPORT INCOMPLETE: crash handler timed out ===
+```
+
+If even that line cannot be written (for example, stderr is a pipe that nobody
+reads), the process still exits about a second later. In both cases the
+process ends by SIGALRM rather than the original signal, so no core dump is
+written. ThreadSanitizer builds never print the INCOMPLETE line: there the
+watchdog keeps the default SIGALRM action, because TSan would defer a handler
+for it indefinitely.
 
 ### Testing the Crash Handler
 

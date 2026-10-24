@@ -1,0 +1,4 @@
+[ proxy1 ] 1.0 [0 127.0.0.1:1] "SET" "k1" "v1 never closed
+[ proxy2 ] 1.0 [0 127.0.0.1:2] "GET" "k1"
+[ proxy3 ] 1.0 [0 127.0.0.1:3] "SET" "k2
+[ proxy4 ] 1.0 [0 127.0.0.1:4] 'unterminated single

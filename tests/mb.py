@@ -3,6 +3,7 @@ Simple replacement for mbdirector package.
 Contains only the Benchmark and RunConfig classes needed for tests.
 """
 import os
+import re
 import subprocess
 import logging
 
@@ -28,8 +29,11 @@ class RunConfig(object):
         self.explicit_connect_args = bool(
             mbconfig.get('explicit_connect_args'))
 
+        # RLTest test names look like "file.py:test_name"; ':' (and other
+        # reserved characters) cannot appear in Windows directory names.
+        safe_name = re.sub(r'[<>:"/\\|?*]', '_', name) if os.name == 'nt' else name
         self.results_dir = os.path.join(base_results_dir,
-                                        '{:04}_{}'.format(self.id, name))
+                                        '{:04}_{}'.format(self.id, safe_name))
 
     def __repr__(self):
         return '<RunConfig id={}>'.format(self.id)
@@ -75,14 +79,55 @@ class Benchmark(object):
         with open(os.path.join(self.config.results_dir, name), 'wb') as outfile:
             outfile.write(data)
 
-    def run(self):
+    def run(self, timeout=240):
+        """Run memtier_benchmark to completion.
+
+        timeout: hard upper bound (seconds) on the child process. A real
+        spin or hang in memtier would otherwise block communicate() until
+        the CI job's 6-hour cap, which produces no diagnostic. When the
+        timeout fires we kill the child, drain its pipes, write a
+        truncated mb.stderr, and return False so the calling test fails
+        fast rather than hanging.
+
+        The default of 240s accommodates ASAN+TLS+reconnect-heavy workloads
+        with margin. test_short_reconnect_interval, for example, runs 50,000
+        ops at --reconnect-interval=1 with a full TLS handshake per op and
+        sustains only ~380-450 ops/sec under ASAN+TLS (110-130s wall time),
+        so a tighter default would flake on slow CI cells. Spin-guard tests
+        that need a tight bound to fail fast on a real hang still override
+        with a small explicit timeout (e.g. timeout=20 in
+        test_read_preference_mget).
+        """
         logging.debug('  Command: %s', ' '.join(self.args))
         process = subprocess.Popen(
             stdin=None, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             executable=self.binary, args=self.args)
-        _stdout, _stderr = process.communicate()
+        try:
+            _stdout, _stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            logging.error(
+                '  memtier_benchmark exceeded %ds timeout; killing child', timeout)
+            process.kill()
+            try:
+                _stdout, _stderr = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                _stdout, _stderr = b'', b''
+            if _stderr:
+                self.write_file('mb.stderr', _stderr)
+            self.write_file(
+                'mb.timeout',
+                'memtier_benchmark timed out after {}s\n'.format(timeout).encode())
+            return False
         if _stderr:
-            logging.debug('  >>> stderr <<<\n%s\n', _stderr)
+            # Preserve the original bytes before writing to the CI log. A bytes
+            # repr escapes newlines into one huge line, which can stall the
+            # GitHub Actions runner's log processing (#482).
             self.write_file('mb.stderr', _stderr)
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                logging.debug('  >>> stderr <<<')
+                for line in _stderr.decode('utf-8', errors='replace').splitlines():
+                    # Bound genuine long lines too, without truncating output.
+                    for start in range(0, max(1, len(line)), 2048):
+                        logging.debug('%s', line[start:start + 2048])
         return process.wait() == 0
 

@@ -51,10 +51,13 @@ public:
     failed_keys_logger();
     ~failed_keys_logger();
 
-    // Open the log file. Idempotent. Returns true on success; on failure logs
-    // an error to stderr once and the instance becomes a no-op.
+    // Open the log file and write the CSV header to a new file. Idempotent.
+    // Returns true on success; on failure (open or header write) logs an
+    // error to stderr once and the instance becomes a no-op.
     bool open(const char *path);
-    void close();
+    // Close the log file. Returns the errno of the first failure to open or
+    // write it (reported on stderr when it happened), or 0 if there was none.
+    int close();
 
     // Write one record. Any of key/status may be NULL/empty.
     //   ts        timestamp of final failure
@@ -69,9 +72,12 @@ public:
                      const char *status, unsigned int retries);
 
 private:
+    void write_failed_locked(int err);
+
     FILE *m_fp;
     pthread_mutex_t m_mtx;
     bool m_disabled; // set true on first I/O failure to silence further attempts
+    int m_err;       // errno of the first open/write failure, 0 if none
     char *m_path;    // strdup'd, for diagnostic logging only
 };
 

@@ -19,8 +19,12 @@
 #ifndef _MEMTIER_BENCHMARK_H
 #define _MEMTIER_BENCHMARK_H
 
+#include <atomic>
 #include <vector>
+#include <string>
+#include <utility>
 #include <sys/time.h>
+#include <pthread.h>
 #include "config_types.h"
 
 #ifdef USE_TLS
@@ -29,6 +33,7 @@
 
 // Forward declaration
 class statsd_client;
+class prometheus_exporter;
 
 #define LOGLEVEL_ERROR 0
 #define LOGLEVEL_DEBUG 1
@@ -51,6 +56,55 @@ enum PROTOCOL_TYPE
     PROTOCOL_RESP3,
     PROTOCOL_MEMCACHE_TEXT,
     PROTOCOL_MEMCACHE_BINARY,
+    PROTOCOL_MEMCACHE_META,
+};
+
+// ---------------------------------------------------------------------------
+// Read-preference enums (storage lives in benchmark_config below)
+// ---------------------------------------------------------------------------
+
+// Which node class should receive read commands.
+enum read_pref_mode
+{
+    rp_primary = 0,         // all reads go to the master/primary (default)
+    rp_secondary,           // reads go to replica nodes only
+    rp_secondary_preferred, // replicas preferred; fall back to primary
+    rp_nearest              // any node; no strict placement guarantee
+};
+
+// What to do when the target node class is unavailable.
+enum read_pref_fallback
+{
+    rpf_error = 0, // return an error to the caller (default)
+    rpf_queue,     // queue the request until a suitable node is available
+    rpf_primary    // fall back silently to the primary
+};
+
+// Lightweight representation of a --read-server HOST:PORT entry.
+// Stored at parse time; routing code converts to server_addr objects later.
+struct read_server_spec
+{
+    std::string host;
+    unsigned short port;
+
+    read_server_spec(const std::string &h, unsigned short p) : host(h), port(p) {}
+};
+
+// Shared MGET slot cache: built once (lazily, on first topology load) and
+// read concurrently by all cluster_client threads.  m_mget_slot_keys is
+// identical for every thread — only the per-slot round-robin cursors differ.
+struct mget_slot_cache
+{
+    std::vector<std::vector<unsigned long long> > slot_keys; // [slot] → key indices; read-only after built
+    std::atomic<bool> built;
+    pthread_mutex_t mutex;
+
+    mget_slot_cache() : built(false) { pthread_mutex_init(&mutex, NULL); }
+    ~mget_slot_cache() { pthread_mutex_destroy(&mutex); }
+
+private:
+    mget_slot_cache(const mget_slot_cache &);
+    mget_slot_cache &operator=(const mget_slot_cache &);
 };
 
 struct benchmark_config
@@ -67,6 +121,7 @@ struct benchmark_config
     int debug;
     int show_config;
     int hide_histogram;
+    unsigned int progress_interval;
     config_quantiles print_percentiles;
     bool print_all_runs;
     bool realtime_latencies;
@@ -126,9 +181,17 @@ struct benchmark_config
     // logged once and the benchmark continues.
     const char *failed_keys_file;
     unsigned int connection_timeout;
+    // Per-process bound on time spent in the *connection-setup* phase
+    // (AUTH, HELLO, SELECT, CLUSTER SLOTS, initial probe). Once any thread
+    // reaches steady-state (first non-setup response processed), this bound
+    // no longer applies; --test-time takes over. Independent of
+    // --connection-timeout (which is per-connect attempt) and --test-time
+    // (which bounds the steady-state run). Default 30 s; 0 disables.
+    unsigned int connection_stage_timeout;
     unsigned int thread_conn_start_min_jitter_micros;
     unsigned int thread_conn_start_max_jitter_micros;
     int multi_key_get;
+    struct mget_slot_cache *mget_cache; // NULL unless cluster_mode && multi_key_get > 0
     const char *authenticate;
     int select_db;
     const char *uri;
@@ -141,11 +204,19 @@ struct benchmark_config
     // JSON additions
     const char *json_out_file;
     bool cluster_mode;
+    // When set together with --cluster-mode, every full rotation of --command
+    // entries (one logical transactional unit, e.g. WATCH/MULTI/.../EXEC) is
+    // pinned to a single shard connection so that keyless commands stay on
+    // the same connection as the keyed ones.
+    bool transaction;
     struct arbitrary_command_list *arbitrary_commands;
     const char *monitor_input;
     struct monitor_command_list *monitor_commands;
     char monitor_pattern;
     bool command_stats_by_type; // true = aggregate by command type (default), false = per command line
+    bool command_miss_tracking; // true = auto (track misses for known shapes), false = off
+    double miss_rate_threshold; // warn when miss rate exceeds this fraction (default 0.01 = 1%)
+    double cpu_warn_threshold;  // warn when a memtier thread's CPU exceeds this fraction of a core (default 0.95)
     const char *hdr_prefix;
     unsigned int request_rate;
     unsigned int request_per_interval;
@@ -155,6 +226,11 @@ struct benchmark_config
     unsigned int clients_step;
     unsigned int step_duration;
     struct timeval benchmark_start_time;
+    // Index of the currently-executing run (1-based), set at the top of
+    // run_benchmark(). Read by cluster_client::handle_cluster_slots() so the
+    // one-shot topology summary it prints can label itself "[RUN #N]" and emit
+    // exactly once per run (runs are sequential, so a plain field is enough).
+    unsigned int current_run_id;
     // StatsD metrics export
     const char *statsd_host;
     unsigned short statsd_port;
@@ -162,10 +238,35 @@ struct benchmark_config
     const char *statsd_run_label;
     unsigned short graphite_port;
     statsd_client *statsd;
+    // Prometheus metrics export (PLAN.md v5 sections 3.1, 5). The four flag
+    // members are guarded; the exporter pointer is unguarded (statsd idiom,
+    // Decisions #25): NULL when disabled or compiled out.
+#ifdef HAVE_EVHTTP
+    int prometheus_port;              // sentinel -1 = unset; 0 = ephemeral; else fixed port
+    const char *prometheus_bind_addr; // NULL until config_init_defaults applies 127.0.0.1
+    std::vector<std::pair<std::string, std::string> > prometheus_run_labels; // raw; renderer escapes
+    std::vector<double> prometheus_latency_buckets;                          // seconds; empty = default
+#endif
+    prometheus_exporter *prometheus; // unguarded ownership alias of g_prom_exporter
     // SCAN incremental cursor iteration
     bool scan_incremental_iteration;
     unsigned int scan_incremental_max_iterations;
     arbitrary_command *scan_continuation_command;
+    // ---------------------------------------------------------------------------
+    // Read-preference configuration
+    //   read_preference         which node class receives reads (default: primary)
+    //   read_preference_fallback what to do when the target is unavailable
+    //   read_servers            replica endpoints for standalone mode
+    //                           (--read-server HOST:PORT, repeatable)
+    //   replica_clients         connections per replica per client thread;
+    //                           0 = inherit --clients
+    //   replicas_per_shard      cap on replicas used per shard; 0 = all
+    // ---------------------------------------------------------------------------
+    enum read_pref_mode read_preference;
+    enum read_pref_fallback read_preference_fallback;
+    std::vector<read_server_spec> read_servers;
+    unsigned int replica_clients;
+    unsigned int replicas_per_shard;
 #ifdef USE_TLS
     bool tls;
     const char *tls_cert;
@@ -175,6 +276,11 @@ struct benchmark_config
     const char *tls_sni;
     int tls_protocols;
     SSL_CTX *openssl_ctx;
+    // Negotiated TLS protocol/cipher, captured once on the first completed
+    // handshake (static OpenSSL strings; NULL until then). Written under a
+    // call_once on a worker thread, read on the main thread post-join.
+    const char *tls_negotiated_version;
+    const char *tls_negotiated_cipher;
 #endif
 };
 
@@ -182,5 +288,42 @@ struct benchmark_config
 extern void benchmark_log_file_line(int level, const char *filename, unsigned int line, const char *fmt, ...);
 extern void benchmark_log(int level, const char *fmt, ...);
 bool is_redis_protocol(enum PROTOCOL_TYPE type);
+
+// ---------------------------------------------------------------------------
+// Connection-stage supervisor (Phase 1 of #426)
+// ---------------------------------------------------------------------------
+//
+// The worker threads (shard_connection / cluster_client) report two events
+// here:
+//   - report_connection_stage_failure(): a connection-setup step failed
+//     (AUTH / HELLO / SELECT / CLUSTER SLOTS / -ERR / parse error during
+//     initial probe). The first call in a streak stamps the wall-clock
+//     start of the streak; subsequent calls only update the last-error
+//     message.
+//   - report_connection_stage_success(): the worker exited the conn-setup
+//     phase and processed a real response. Clears the streak and arms a
+//     latch (steady_state_reached) so the supervisor stops policing this
+//     run for setup-stalls.
+//
+// The main thread polls connection_stage_should_abort() once per second
+// from run_benchmark(). It returns true when either:
+//   (a) a failure streak has been live for >= --connection-stage-timeout, or
+//   (b) the run has been alive for >= --connection-stage-timeout without
+//       any thread ever reaching steady state (covers the "stuck WAIT" /
+//       "first request never returns" hangs in #426 #17).
+//
+// All state lives behind atomics + a small mutex protecting the
+// last-error string so worker threads can call into it lock-free on the
+// hot success path.
+void connection_stage_supervisor_reset(void);
+void report_connection_stage_failure(const char *err);
+void report_connection_stage_success(void);
+// Whether any connection has reached steady state in this run, i.e. the
+// supervisor is disarmed.
+bool connection_stage_steady_state_reached(void);
+bool connection_stage_should_abort(unsigned int timeout_secs, std::string *out_last_err, unsigned int *out_elapsed);
+// Exit code for a failure that ends memtier before main() returns: 2 if a
+// run of this --run-count series was aborted by the supervisor, else 1.
+int failure_exit_code(void);
 
 #endif /* _MEMTIER_BENCHMARK_H */

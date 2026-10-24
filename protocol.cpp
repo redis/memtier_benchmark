@@ -21,19 +21,26 @@
 #endif
 
 #include <stdlib.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
+#include <deque>
 #ifdef HAVE_ASSERT_H
 #include <assert.h>
 #endif
 
 #include "protocol.h"
+#include "keylist_growth.h"
 #include "memtier_benchmark.h"
 #include "libmemcached_protocol/binary.h"
 
 /////////////////////////////////////////////////////////////////////////
 
-abstract_protocol::abstract_protocol() : m_read_buf(NULL), m_write_buf(NULL), m_keep_value(false) {}
+abstract_protocol::abstract_protocol() :
+        m_read_buf(NULL), m_write_buf(NULL), m_keep_value(false), m_track_elem_misses(false)
+{
+}
 
 abstract_protocol::~abstract_protocol() {}
 
@@ -48,10 +55,30 @@ void abstract_protocol::set_keep_value(bool flag)
     m_keep_value = flag;
 }
 
+void abstract_protocol::set_track_elem_misses(bool flag)
+{
+    m_track_elem_misses = flag;
+}
+
+void abstract_protocol::reset_state()
+{
+    // Default: just clear m_last_response so any allocated mbulk tree /
+    // status / value strings are freed before the next connection reuses
+    // this object. Subclasses with their own parser-cursor fields (see
+    // redis_protocol) override to additionally reset those.
+    m_last_response.clear();
+}
+
 /////////////////////////////////////////////////////////////////////////
 
 protocol_response::protocol_response() :
-        m_status(NULL), m_mbulk_value(NULL), m_value(NULL), m_value_len(0), m_hits(0), m_error(false)
+        m_status(NULL),
+        m_mbulk_value(NULL),
+        m_value(NULL),
+        m_value_len(0),
+        m_hits(0),
+        m_error(false),
+        m_top_array_len(-1)
 {
 }
 
@@ -116,6 +143,31 @@ unsigned int protocol_response::get_hits(void)
     return m_hits;
 }
 
+void protocol_response::set_top_array_len(int len)
+{
+    m_top_array_len = len;
+}
+
+int protocol_response::get_top_array_len(void)
+{
+    return m_top_array_len;
+}
+
+void protocol_response::elem_hits_reserve(size_t n)
+{
+    m_elem_hits.reserve(n);
+}
+
+void protocol_response::elem_hit_push(bool hit)
+{
+    m_elem_hits.push_back(hit ? 1 : 0);
+}
+
+const std::vector<uint8_t> &protocol_response::get_elem_hits(void)
+{
+    return m_elem_hits;
+}
+
 void protocol_response::clear(void)
 {
     if (m_status != NULL) {
@@ -135,6 +187,8 @@ void protocol_response::clear(void)
     m_total_len = 0;
     m_hits = 0;
     m_error = 0;
+    m_top_array_len = -1;
+    m_elem_hits.clear();
 }
 
 void protocol_response::set_mbulk_value(mbulk_size_el *element)
@@ -167,11 +221,41 @@ protected:
     mbulk_size_el *m_current_mbulk;
     bool m_resp3;
     bool m_attribute;
+    // Drain mode for RESP3 server-pushed frames ('>'). Pushes are
+    // out-of-band (pubsub, keyspace notifications, client tracking
+    // invalidations) and must not be delivered as a reply to any
+    // in-flight command. While true the parser still walks the frame
+    // to advance the read buffer, but suppresses all writes into
+    // m_last_response (status, mbulk tree, value, hits).
+    // TODO: full out-of-band routing — surface push frames to a
+    // listener instead of silently dropping them.
+    bool m_push;
+    // Per-response state for alloc-free ArrayPerElementNulls miss tracking
+    // (m_track_elem_misses). m_tracking turns true once the reply's top-level
+    // array header is seen. m_nested_remaining counts leaf/element slots still
+    // to consume inside the current top-level element's subtree: while >0 we
+    // are below the top level and skip recording; when it returns to 0 the next
+    // element is again a direct child of the top array. This handles arbitrary
+    // nesting depth without a frame stack.
+    bool m_tracking;
+    int m_nested_remaining;
 
     bool aggregate_type(char c);
     bool blob_type(char c);
     bool single_type(char c);
     bool response_ended();
+    // Record one leaf element (bulk / single type) for alloc-free miss
+    // tracking: pushes a hit/miss flag when the leaf is a direct child of the
+    // top-level array, otherwise just consumes a slot of the current nested
+    // subtree. No-op unless tracking is active for this reply.
+    inline void track_leaf(bool hit)
+    {
+        if (!m_track_elem_misses || m_push || !m_tracking) return;
+        if (m_nested_remaining == 0)
+            m_last_response.elem_hit_push(hit);
+        else
+            m_nested_remaining--;
+    }
 
 public:
     redis_protocol() :
@@ -181,14 +265,19 @@ public:
             m_total_bulks_count(0),
             m_current_mbulk(NULL),
             m_resp3(false),
-            m_attribute(false)
+            m_attribute(false),
+            m_push(false),
+            m_tracking(false),
+            m_nested_remaining(0)
     {
     }
     virtual redis_protocol *clone(void) { return new redis_protocol(); }
+    virtual void reset_state();
     virtual int select_db(int db);
     virtual int authenticate(const char *credentials);
     virtual int configure_protocol(enum PROTOCOL_TYPE type);
     virtual int write_command_cluster_slots();
+    virtual int write_command_readonly();
     virtual int write_command_set(const char *key, int key_len, const char *value, int value_len, int expiry,
                                   unsigned int offset);
     virtual int write_command_get(const char *key, int key_len, unsigned int offset);
@@ -201,6 +290,36 @@ public:
     int write_arbitrary_command(const command_arg *arg);
     int write_arbitrary_command(const char *val, int val_len);
 };
+
+void redis_protocol::reset_state()
+{
+    // Discard partial-parse state from a previous connection. Without this,
+    // a TCP RST received mid-bulk under RESP3 (e.g. while draining a server
+    // push frame) leaves m_response_state at rs_read_bulk / rs_end_bulk and
+    // m_total_bulks_count / m_push / m_attribute mid-walk. The next
+    // bufferevent attached to this object would then parse fresh bytes
+    // under stale cursor state and either lose framing or silently drop a
+    // reply.
+    //
+    // m_last_response.clear() also frees any partially-built mbulk tree
+    // hanging off m_current_mbulk (the tree's root is owned by
+    // m_last_response::m_mbulk_value), so we just null the cursor here.
+    //
+    // NB: m_resp3 is intentionally preserved -- it reflects the negotiated
+    // protocol version from HELLO, not parser cursor state. A reconnect
+    // re-runs HELLO via the setup ladder, but we should not roll back the
+    // observed value here.
+    m_last_response.clear();
+    m_response_state = rs_initial;
+    m_total_bulks_count = 0;
+    m_attribute = false;
+    m_push = false;
+    m_bulk_len = 0;
+    m_response_len = 0;
+    m_current_mbulk = NULL;
+    m_tracking = false;
+    m_nested_remaining = 0;
+}
 
 int redis_protocol::select_db(int db)
 {
@@ -251,20 +370,21 @@ int redis_protocol::authenticate(const char *credentials)
                                    "*2\r\n"
                                    "$4\r\n"
                                    "AUTH\r\n"
-                                   "$%zu\r\n"
+                                   "$%llu\r\n"
                                    "%s\r\n",
-                                   strlen(password), password);
+                                   (unsigned long long) strlen(password), password);
     } else {
         size_t user_len = password - user - 1;
         size = evbuffer_add_printf(m_write_buf,
                                    "*3\r\n"
                                    "$4\r\n"
                                    "AUTH\r\n"
-                                   "$%zu\r\n"
+                                   "$%llu\r\n"
                                    "%.*s\r\n"
-                                   "$%zu\r\n"
+                                   "$%llu\r\n"
                                    "%s\r\n",
-                                   user_len, (int) user_len, user, strlen(password), password);
+                                   (unsigned long long) user_len, (int) user_len, user,
+                                   (unsigned long long) strlen(password), password);
     }
     return size;
 }
@@ -298,6 +418,12 @@ int redis_protocol::write_command_cluster_slots()
                         28);
 
     return size;
+}
+
+int redis_protocol::write_command_readonly()
+{
+    static const char readonly_command[] = "*1\r\n$8\r\nREADONLY\r\n";
+    return evbuffer_add(m_write_buf, readonly_command, sizeof(readonly_command) - 1);
 }
 
 int redis_protocol::write_command_set(const char *key, int key_len, const char *value, int value_len, int expiry,
@@ -368,8 +494,31 @@ int redis_protocol::write_command_set(const char *key, int key_len, const char *
 
 int redis_protocol::write_command_multi_get(const keylist *keylist)
 {
-    fprintf(stderr, "error: multi get not implemented for redis yet!\n");
-    assert(0);
+    assert(keylist != NULL);
+    assert(keylist->get_keys_count() > 0);
+
+    int size = 0;
+    unsigned int keys_count = keylist->get_keys_count();
+
+    // *<1+keys_count>\r\n$4\r\nMGET\r\n
+    size = evbuffer_add_printf(m_write_buf,
+                               "*%u\r\n"
+                               "$4\r\n"
+                               "MGET\r\n",
+                               1 + keys_count);
+
+    for (unsigned int i = 0; i < keys_count; i++) {
+        unsigned int key_len = 0;
+        const char *key = keylist->get_key(i, &key_len);
+        assert(key != NULL);
+
+        size += evbuffer_add_printf(m_write_buf, "$%u\r\n", key_len);
+        evbuffer_add(m_write_buf, key, key_len);
+        evbuffer_add(m_write_buf, "\r\n", 2);
+        size += key_len + 2;
+    }
+
+    return size;
 }
 
 int redis_protocol::write_command_get(const char *key, int key_len, unsigned int offset)
@@ -448,7 +597,16 @@ bool redis_protocol::aggregate_type(char c)
 {
     if (c == '*') return true;
 
-    if (m_resp3 && (c == '%' || c == '~' || c == '|')) return true;
+    // RESP3: map (%), set (~), attribute (|), and push (>) are all aggregate
+    // types.  Push frames (">N\r\n" followed by N elements) are structurally
+    // identical to arrays and can be emitted by Redis 7+ at any point on a
+    // RESP3 connection (pubsub, keyspace notifications, client-tracking
+    // invalidation).  We parse them as ordinary aggregates and discard the
+    // content; the alternative -- returning -1 from parse_response -- tears
+    // down the connection unnecessarily.
+    // TODO: route drained push frames to an out-of-band callback so callers
+    // can observe server-initiated events without disrupting the reply stream.
+    if (m_resp3 && (c == '%' || c == '~' || c == '|' || c == '>')) return true;
 
     return false;
 }
@@ -475,11 +633,22 @@ bool redis_protocol::response_ended()
 {
     if (m_total_bulks_count != 0) return false;
 
-    if (m_attribute) {
-        m_attribute = false;
-        return false;
+    bool was_push = m_push;
+    bool was_attribute = m_attribute;
+
+    if (was_attribute) m_attribute = false;
+    // A RESP3 push frame just finished draining. The actual reply to
+    // the in-flight command (if any) is still pending — keep reading
+    // and do NOT signal a complete reply for the push.
+    // Also handles the case where an attribute (|) is nested inside a
+    // push frame (>) and both complete at the same call: clear BOTH
+    // flags together so m_push does not remain set and eat the next reply.
+    if (was_push) {
+        m_push = false;
+        m_response_len = 0; // reset: push bytes don't count toward the next reply
     }
 
+    if (was_push || was_attribute) return false;
     return true;
 }
 
@@ -496,6 +665,9 @@ int redis_protocol::parse_response(void)
             m_response_len = 0;
             m_total_bulks_count = 0;
             m_attribute = 0;
+            m_push = 0;
+            m_tracking = false;
+            m_nested_remaining = 0;
             m_response_state = rs_read_line;
 
             break;
@@ -512,6 +684,15 @@ int redis_protocol::parse_response(void)
 
             if (aggregate_type(line[0])) {
                 int count = strtol(line + 1, NULL, 10);
+
+                // The reply's top-level aggregate is the one parsed while no
+                // bulks are still outstanding. Capture its declared length so
+                // miss-tracking can tell an empty collection from a populated
+                // one without materializing values (see EmptyCollection in
+                // client::handle_response). Out-of-band frames are excluded:
+                // attribute (|) is a prefix to the real reply, push (>) is not
+                // a reply at all.
+                bool top_level_aggregate = (m_total_bulks_count == 0);
 
                 // in case of nested mbulk, the mbulk is one of the total bulks
                 if (m_total_bulks_count > 0) {
@@ -530,12 +711,48 @@ int redis_protocol::parse_response(void)
                     m_attribute = true;
                 }
 
+                if (line[0] == '>') {
+                    // Top-level push frame: enter drain mode. Nested
+                    // pushes (push inside push) are not defined by RESP3
+                    // and not expected; only set the flag once.
+                    m_push = true;
+                }
+
                 // Map or Attribute contain key-value pair
                 if (line[0] == '%' || line[0] == '|') {
                     count *= 2;
                 }
 
-                if (m_keep_value) {
+                // Record the reply body's declared element count (count is now
+                // null-clamped to >=0 and map-doubled). '|' is the attribute
+                // prefix, not the reply body; '>' (m_push) is out-of-band.
+                if (top_level_aggregate && !m_push && line[0] != '|') {
+                    m_last_response.set_top_array_len(count);
+                }
+
+                // Alloc-free per-element miss tracking (m_track_elem_misses).
+                // The top-level array container starts tracking; a nested
+                // aggregate is itself an element -- a hit iff it is non-empty
+                // (count>0). See the m_tracking/m_nested_remaining contract.
+                if (m_track_elem_misses && !m_push && line[0] != '|') {
+                    if (top_level_aggregate) {
+                        m_tracking = true;
+                        m_nested_remaining = 0;
+                        m_last_response.elem_hits_reserve(count);
+                    } else if (m_tracking) {
+                        if (m_nested_remaining == 0) {
+                            m_last_response.elem_hit_push(count > 0);
+                            m_nested_remaining = count; // descend into this element's subtree
+                        } else {
+                            m_nested_remaining += count - 1; // consume this slot, add its children
+                        }
+                    }
+                }
+
+                // Suppress mbulk allocation while draining a push frame:
+                // the contents are out-of-band and must not be delivered
+                // as the reply to any in-flight command.
+                if (m_keep_value && !m_push) {
                     mbulk_size_el *new_mbulk_size = new mbulk_size_el();
                     new_mbulk_size->bulks_count = count;
                     new_mbulk_size->upper_level = m_current_mbulk;
@@ -551,7 +768,11 @@ int redis_protocol::parse_response(void)
                     m_current_mbulk = new_mbulk_size->get_next_mbulk();
                 }
 
-                m_last_response.set_status(line);
+                if (!m_push) {
+                    m_last_response.set_status(line);
+                } else {
+                    free(line);
+                }
                 m_total_bulks_count += count;
 
                 if (response_ended()) {
@@ -566,9 +787,18 @@ int redis_protocol::parse_response(void)
                 }
 
                 m_bulk_len = strtol(line + 1, NULL, 10);
-                m_last_response.set_status(line);
+                // A bulk leaf is a hit iff it carries a value ($N, N>0). A null
+                // bulk ($-1) and an empty bulk ($0) are misses -- matching the
+                // pre-existing value!=NULL convention of the materialized walk.
+                track_leaf(m_bulk_len > 0);
+                // Suppress reply mutation while draining a push frame.
+                if (!m_push) {
+                    m_last_response.set_status(line);
 
-                if (line[0] == '!') m_last_response.set_error();
+                    if (line[0] == '!') m_last_response.set_error();
+                } else {
+                    free(line);
+                }
 
                 /*
                  * only on negative bulk, the data ends right after the first CRLF ($-1\r\n), so
@@ -585,23 +815,38 @@ int redis_protocol::parse_response(void)
                     m_total_bulks_count++;
                 }
 
+                // A single-type leaf carries a value (+status, :int, ,double,
+                // #bool, (bignum, -error) and counts as a hit; only the RESP3
+                // null '_' is a miss. Mirrors the materialized walk, which kept
+                // a value for every single type except '_' (is_resp3_null).
+                track_leaf(line[0] != '_');
+
                 // if we are not inside mbulk, the status will be kept in m_status anyway
-                if (m_keep_value && m_current_mbulk) {
+                if (m_keep_value && m_current_mbulk && !m_push) {
                     char *bulk_value = strdup(line);
                     assert(bulk_value != NULL);
 
                     bulk_el *new_bulk = new bulk_el();
                     new_bulk->value = bulk_value;
                     new_bulk->value_len = strlen(bulk_value);
+                    // Mark RESP3 null elements explicitly so the walker can
+                    // distinguish them from a legitimate bulk string whose
+                    // content happens to be the single character '_' (which
+                    // would arrive via blob_type / rs_read_bulk, not here).
+                    new_bulk->is_resp3_null = (line[0] == '_');
 
                     // insert it to current mbulk
                     m_current_mbulk->add_new_element(new_bulk);
                     m_current_mbulk = m_current_mbulk->get_next_mbulk();
                 }
 
-                if (line[0] == '-') m_last_response.set_error();
+                if (!m_push) {
+                    if (line[0] == '-') m_last_response.set_error();
 
-                m_last_response.set_status(line);
+                    m_last_response.set_status(line);
+                } else {
+                    free(line);
+                }
                 m_total_bulks_count--;
 
                 if (response_ended()) {
@@ -627,7 +872,9 @@ int redis_protocol::parse_response(void)
                  * such key as well as non existing key or existing key without data
                  * in the requested range
                  */
-                if (m_bulk_len > 0) {
+                // Suppress hit accounting while draining a push frame; the
+                // bulk belongs to an out-of-band message, not the reply.
+                if (m_bulk_len > 0 && !m_push) {
                     m_last_response.incr_hits();
                 }
 
@@ -637,7 +884,14 @@ int redis_protocol::parse_response(void)
             }
             break;
         case rs_end_bulk:
-            if (m_keep_value) {
+            // Push-frame drain: read+discard the bulk bytes without
+            // touching m_last_response so the reply remains clean.
+            if (m_push) {
+                if (m_bulk_len >= 0) {
+                    int ret = evbuffer_drain(m_read_buf, m_bulk_len + 2);
+                    assert(ret != -1);
+                }
+            } else if (m_keep_value) {
                 /*
                  * keep bulk value - in case we need to save bulk value it depends
                  * if it's inside a mbulk or not.
@@ -727,7 +981,12 @@ bool redis_protocol::format_arbitrary_command(arbitrary_command &cmd)
         current_arg->type = const_type;
 
         // check arg type
-        if (current_arg->data.find(KEY_PLACEHOLDER) != std::string::npos) {
+        if (current_arg->scan_cursor) {
+            current_arg->type = scan_cursor_type;
+        } else if (current_arg->resolved) {
+            // Already filled in by client::resolve_monitor_placeholders():
+            // frame the generated key as-is, without scanning it again.
+        } else if (current_arg->data.find(KEY_PLACEHOLDER) != std::string::npos) {
             if (current_arg->data.length() != strlen(KEY_PLACEHOLDER)) {
                 current_arg->has_key_affixes = true;
                 current_arg->data_prefix = current_arg->data.substr(0, current_arg->data.find(KEY_PLACEHOLDER));
@@ -743,8 +1002,6 @@ bool redis_protocol::format_arbitrary_command(arbitrary_command &cmd)
             }
 
             current_arg->type = data_type;
-        } else if (current_arg->data == SCAN_CURSOR_PLACEHOLDER) {
-            current_arg->type = scan_cursor_type;
         }
 
         // we expect that first arg is the COMMAND name
@@ -793,6 +1050,7 @@ public:
     virtual int authenticate(const char *credentials);
     virtual int configure_protocol(enum PROTOCOL_TYPE type);
     virtual int write_command_cluster_slots();
+    virtual int write_command_readonly();
     virtual int write_command_set(const char *key, int key_len, const char *value, int value_len, int expiry,
                                   unsigned int offset);
     virtual int write_command_get(const char *key, int key_len, unsigned int offset);
@@ -809,21 +1067,31 @@ public:
 int memcache_text_protocol::select_db(int db)
 {
     assert(0);
+    return -1;
 }
 
 int memcache_text_protocol::authenticate(const char *credentials)
 {
     assert(0);
+    return -1;
 }
 
 int memcache_text_protocol::configure_protocol(enum PROTOCOL_TYPE type)
 {
     assert(0);
+    return -1;
 }
 
 int memcache_text_protocol::write_command_cluster_slots()
 {
     assert(0);
+    return -1;
+}
+
+int memcache_text_protocol::write_command_readonly()
+{
+    assert(0);
+    return -1;
 }
 
 int memcache_text_protocol::write_command_set(const char *key, int key_len, const char *value, int value_len,
@@ -867,7 +1135,7 @@ int memcache_text_protocol::write_command_multi_get(const keylist *keylist)
 
     for (unsigned int i = 0; i < keylist->get_keys_count(); i++) {
         const char *key;
-        unsigned int key_len;
+        unsigned int key_len = 0;
 
         n = evbuffer_add(m_write_buf, " ", 1);
         assert(n != -1);
@@ -892,6 +1160,7 @@ int memcache_text_protocol::write_command_wait(unsigned int num_slaves, unsigned
 {
     fprintf(stderr, "error: WAIT command not implemented for memcache!\n");
     assert(0);
+    return -1;
 }
 
 int memcache_text_protocol::parse_response(void)
@@ -923,7 +1192,12 @@ int memcache_text_protocol::parse_response(void)
                 unsigned int flags;
                 unsigned int cas;
 
-                int res = sscanf(line, "%s %s %u %u %u", prefix, key, &flags, &m_value_len, &cas);
+                // Width specifiers cap %s at sizeof(buf)-1; a malicious/buggy
+                // memcached server sending "VALUE <very-long-key> ..." cannot
+                // overflow `key[256]` or `prefix[50]` and corrupt the worker
+                // stack. Same class of bug as the VLA in arbitrary_command
+                // (PR #405).
+                int res = sscanf(line, "%49s %255s %u %u %u", prefix, key, &flags, &m_value_len, &cas);
                 if (res < 4 || res > 5) {
                     benchmark_debug_log("unexpected VALUE response: %s\n", line);
                     if (m_last_response.get_status() != line) free(line);
@@ -950,7 +1224,7 @@ int memcache_text_protocol::parse_response(void)
                     assert(value != NULL);
 
                     int ret = evbuffer_remove(m_read_buf, value, m_value_len);
-                    assert((unsigned int) ret == 0);
+                    assert(ret != -1); // evbuffer_remove returns bytes read on success, not 0
 
                     m_last_response.set_value(value, m_value_len);
                 } else {
@@ -984,16 +1258,312 @@ int memcache_text_protocol::parse_response(void)
 bool memcache_text_protocol::format_arbitrary_command(arbitrary_command &cmd)
 {
     assert(0);
+    return false;
 }
 
 int memcache_text_protocol::write_arbitrary_command(const command_arg *arg)
 {
     assert(0);
+    return -1;
 }
 
 int memcache_text_protocol::write_arbitrary_command(const char *val, int val_len)
 {
     assert(0);
+    return -1;
+}
+
+/////////////////////////////////////////////////////////////////////////
+//
+// Memcache Meta Protocol (memcached 1.6.10+).
+//
+// The meta protocol is a compact, flag-based ASCII protocol that supersedes
+// the classic text protocol. We implement just enough to drive a representative
+// SET / GET / multi-GET benchmark:
+//
+//   ms <key> <datalen> T<exp>\r\n<data>\r\n   ->  HD | NS | EX | NF
+//   mg <key> v\r\n                            ->  VA <size>\r\n<data>\r\n | EN
+//   <pipelined mg ...> mn\r\n                 ->  ...VA/EN..., MN  (multi-get)
+//
+// Inheriting from memcache_text_protocol lets us share the read/write buffers
+// and the methods that are also unsupported on the text path
+// (select_db / authenticate / configure_protocol / write_command_cluster_slots /
+// write_command_wait / *arbitrary_command -- all assert(0)). Meta overrides
+// its command writers, parser and reconnect reset.
+//
+// IMPORTANT design choice -- every command is terminated on the wire by `mn`,
+// the meta protocol's no-op:
+//   ms <k> <l> T<e>\r\n<data>\r\nmn\r\n   ->  HD\r\nMN\r\n
+//   mg <k> v\r\nmn\r\n                  ->  VA <n>\r\n<data>\r\nMN\r\n  (or EN\r\nMN\r\n)
+//   <pipelined mg ...> mn\r\n            ->  ...VA/EN..., MN  (mn is the natural terminator)
+//
+// The ordered expectation queue validates reply kinds and exact section counts;
+// MN then marks the end of each logical request, including errors and multi-get.
+// Keeping this boundary uniform is a deliberate wire-format choice, not a
+// requirement of the queue. Single-key operations could omit mn in another mode.
+// Each logical operation includes one extra server command and 4 request +
+// 4 response bytes; its processing overhead depends on the workload.
+class memcache_meta_protocol : public memcache_text_protocol
+{
+    struct expected_reply
+    {
+        bool get;
+        unsigned int remaining;
+    };
+    // Validate before returning a completed response to shard_connection.
+    // Raw serialized retries must restore this metadata through the replay hook.
+    std::deque<expected_reply> m_expected_replies;
+
+public:
+    memcache_meta_protocol() {}
+    virtual memcache_meta_protocol *clone(void) { return new memcache_meta_protocol(); }
+    virtual void prepare_request_replay(bool is_get, unsigned int keys)
+    {
+        m_expected_replies.push_back({is_get, is_get ? keys : 1});
+    }
+    virtual void reset_state()
+    {
+        abstract_protocol::reset_state();
+        m_response_state = rs_initial;
+        m_value_len = 0;
+        m_response_len = 0;
+        m_expected_replies.clear();
+    }
+
+    virtual int write_command_set(const char *key, int key_len, const char *value, int value_len, int expiry,
+                                  unsigned int offset);
+    virtual int write_command_get(const char *key, int key_len, unsigned int offset);
+    virtual int write_command_multi_get(const keylist *keylist);
+    virtual int parse_response(void);
+};
+
+// Header / trailer literals factored out so that:
+//   (a) `mg ... v\r\n` is built with three raw `evbuffer_add` calls instead of
+//       a `vsnprintf`-driven `evbuffer_add_printf`. libevent appends each piece
+//       to the tail chain as a single memcpy, which matches the existing
+//       memcache_text_protocol multi-get write path.
+//   (b) Trailer length is shared between get / multi-get so the math is
+//       impossible to drift.
+static const char k_mg_prefix[] = "mg ";
+static const char k_mg_suffix[] = " v\r\n";
+static const char k_mn_term[] = "mn\r\n";
+static const size_t k_mg_prefix_len = sizeof(k_mg_prefix) - 1; // "mg "
+static const size_t k_mg_suffix_len = sizeof(k_mg_suffix) - 1; // " v\r\n"
+static const size_t k_mn_term_len = sizeof(k_mn_term) - 1;     // "mn\r\n"
+
+int memcache_meta_protocol::write_command_set(const char *key, int key_len, const char *value, int value_len,
+                                              int expiry, unsigned int offset)
+{
+    assert(key != NULL);
+    assert(key_len > 0);
+    assert(value != NULL);
+    assert(value_len > 0);
+
+    // `ms <key> <datalen> T<exp>\r\n<value>\r\nmn\r\n`. The trailing mn makes
+    // every command's response self-terminating at MN. The expectation queue
+    // also validates that this section is a storage reply.
+    int size = evbuffer_add_printf(m_write_buf, "ms %.*s %u T%u\r\n", key_len, key, (unsigned int) value_len, expiry);
+    evbuffer_add(m_write_buf, value, value_len);
+    evbuffer_add(m_write_buf, "\r\n", 2);
+    evbuffer_add(m_write_buf, k_mn_term, k_mn_term_len);
+    m_expected_replies.push_back({false, 1});
+    return size + value_len + 2 + (int) k_mn_term_len;
+}
+
+int memcache_meta_protocol::write_command_get(const char *key, int key_len, unsigned int offset)
+{
+    assert(key != NULL);
+    assert(key_len > 0);
+    evbuffer_add(m_write_buf, k_mg_prefix, k_mg_prefix_len);
+    evbuffer_add(m_write_buf, key, key_len);
+    evbuffer_add(m_write_buf, k_mg_suffix, k_mg_suffix_len);
+    evbuffer_add(m_write_buf, k_mn_term, k_mn_term_len);
+    m_expected_replies.push_back({true, 1});
+    return (int) (k_mg_prefix_len + key_len + k_mg_suffix_len + k_mn_term_len);
+}
+
+int memcache_meta_protocol::write_command_multi_get(const keylist *keylist)
+{
+    assert(keylist != NULL);
+    assert(keylist->get_keys_count() > 0);
+
+    int size = 0;
+    for (unsigned int i = 0; i < keylist->get_keys_count(); i++) {
+        unsigned int key_len;
+        const char *key = keylist->get_key(i, &key_len);
+        assert(key != NULL);
+        evbuffer_add(m_write_buf, k_mg_prefix, k_mg_prefix_len);
+        evbuffer_add(m_write_buf, key, key_len);
+        evbuffer_add(m_write_buf, k_mg_suffix, k_mg_suffix_len);
+        size += (int) (k_mg_prefix_len + key_len + k_mg_suffix_len);
+    }
+    // Single mn at the end of the pipeline -- one terminator covers all keys
+    // in this multi-get logical request, mirroring the per-command `mn`
+    // suffix used by ms / mg above.
+    evbuffer_add(m_write_buf, k_mn_term, k_mn_term_len);
+    m_expected_replies.push_back({true, keylist->get_keys_count()});
+    return size + (int) k_mn_term_len;
+}
+
+int memcache_meta_protocol::parse_response(void)
+{
+    char *line;
+    size_t tmplen;
+
+    while (true) {
+        switch (m_response_state) {
+        case rs_initial:
+            m_last_response.clear();
+            m_response_state = rs_read_section;
+            m_response_len = 0;
+            break;
+
+        case rs_read_section: {
+            line = evbuffer_readln(m_read_buf, &tmplen, EVBUFFER_EOL_CRLF_STRICT);
+            if (!line) return 0;
+
+            m_response_len += tmplen + 2; // For CRLF
+            // Adopt the first status; a later defined error replaces it so
+            // error accounting/retry sees the error rather than a prior hit.
+            if (m_last_response.get_status() == NULL) {
+                m_last_response.set_status(line);
+            }
+            m_last_response.set_total_len((unsigned int) m_response_len);
+
+            // Decode the section header. Meta has very few shapes:
+            //   VA <size> [<flags>...]   value follows on the next line
+            //   MN                       end of a multi-op pipeline
+            //   HD | EN | NS | EX | NF   2-letter status (stored / miss / not-stored / exists / not-found)
+            bool need_value = false;
+            bool done = false;
+            bool unknown = false;
+            bool server_error = false;
+
+            if (memchr(line, '\0', tmplen) != NULL) {
+                unknown = true;
+            } else if ((tmplen == 5 && memcmp(line, "ERROR", 5) == 0) ||
+                       (tmplen >= 12 && (tmplen == 12 || line[12] == ' ') &&
+                        (memcmp(line, "CLIENT_ERROR", 12) == 0 || memcmp(line, "SERVER_ERROR", 12) == 0))) {
+                // Every command may return a defined error instead of its
+                // normal section. Retain the first error even if an earlier
+                // MGET section supplied a valid status, and still drain to MN.
+                server_error = true;
+                if (!m_last_response.is_error() && m_last_response.get_status() != line)
+                    m_last_response.set_status(line);
+                m_last_response.set_error();
+            } else if (tmplen >= 3 && memcmp(line, "VA ", 3) == 0) {
+                // Parse the value size with strtoul rather than sscanf -- on
+                // the GET hot path this avoids the full stdio scanner machinery
+                // (locale, format-string re-parse) for what is just a single
+                // unsigned integer immediately following a fixed prefix.
+                char *endptr = NULL;
+                errno = 0;
+                unsigned long v = strtoul(line + 3, &endptr, 10);
+                // evbuffer_remove returns int; reject sizes that cannot be
+                // represented, signs, missing digits and partial number tokens.
+                if (line[3] < '0' || line[3] > '9' || errno == ERANGE || v > INT_MAX ||
+                    (*endptr != '\0' && *endptr != ' ')) {
+                    unknown = true;
+                } else {
+                    m_value_len = (unsigned int) v;
+                    need_value = true;
+                }
+            } else if (tmplen == 2 && memcmp(line, "MN", 2) == 0) {
+                // MN is the universal response terminator. Every command we
+                // write ends in `mn\r\n`, so every response ends with `MN`.
+                done = m_last_response.get_status() != line;
+                unknown = !done; // A terminator alone is not a command reply.
+            } else if (tmplen >= 2 && (tmplen == 2 || line[2] == ' ') &&
+                       (memcmp(line, "HD", 2) == 0 || memcmp(line, "EN", 2) == 0 || memcmp(line, "NS", 2) == 0 ||
+                        memcmp(line, "EX", 2) == 0 || memcmp(line, "NF", 2) == 0)) {
+                // 2-letter status: stored / miss / not-stored / exists / not-found.
+                // Always intermediate -- we keep reading until MN.
+            } else {
+                unknown = true;
+            }
+
+            // Non-quiet mg returns exactly one VA/EN per key, while ms
+            // returns one storage status. Keep expectations in issue order:
+            // a single mutable mode cannot describe mixed pipelined requests.
+            if (!unknown) {
+                if (m_expected_replies.empty()) {
+                    unknown = true;
+                } else if (done) {
+                    unknown = m_expected_replies.front().remaining != 0;
+                } else {
+                    expected_reply &expected = m_expected_replies.front();
+                    bool get_reply = need_value || memcmp(line, "EN", 2) == 0;
+                    unknown = expected.remaining == 0 || (!server_error && expected.get != get_reply);
+                    if (!unknown) --expected.remaining;
+                }
+            }
+
+            if (unknown) benchmark_debug_log("invalid meta response: %s\n", line);
+            // Free `line` if it wasn't adopted as status.
+            if (m_last_response.get_status() != line) free(line);
+
+            if (unknown) {
+                m_last_response.set_error();
+                // Reset state so the connection (reused by shard_connection)
+                // starts cleanly on the next call.
+                m_response_state = rs_initial;
+                return -1;
+            }
+            if (need_value) {
+                m_response_state = rs_read_value;
+                continue;
+            }
+            if (done) {
+                m_response_state = rs_read_end;
+            }
+            // else: 2-letter status -- keep reading sections until MN.
+            break;
+        }
+
+        case rs_read_value:
+            if (evbuffer_get_length(m_read_buf) < (size_t) m_value_len + 2) return 0;
+            if (m_keep_value) {
+                char *value = (char *) malloc(m_value_len ? m_value_len : 1);
+                if (value == NULL) {
+                    m_last_response.set_error();
+                    m_response_state = rs_initial;
+                    return -1;
+                }
+                int ret = evbuffer_remove(m_read_buf, value, m_value_len);
+                assert(ret == (int) m_value_len);
+                m_last_response.set_value(value, m_value_len);
+            } else {
+                int ret = evbuffer_drain(m_read_buf, m_value_len);
+                assert(ret == 0);
+            }
+            {
+                char ending[2];
+                int ret = evbuffer_remove(m_read_buf, ending, sizeof(ending));
+                if (ret != 2 || ending[0] != '\r' || ending[1] != '\n') {
+                    m_last_response.set_error();
+                    m_response_state = rs_initial;
+                    return -1;
+                }
+            }
+            m_last_response.incr_hits();
+            m_response_len += m_value_len + 2;
+            // Always go back to read more sections; the response only ends at MN.
+            m_response_state = rs_read_section;
+            break;
+
+        case rs_read_end:
+            m_expected_replies.pop_front();
+            m_response_state = rs_initial;
+            return 1;
+
+        default:
+            benchmark_debug_log("unknown response state %d.\n", m_response_state);
+            m_response_state = rs_initial;
+            return -1;
+        }
+    }
+
+    return -1;
 }
 
 /////////////////////////////////////////////////////////////////////////
@@ -1019,6 +1589,7 @@ public:
     virtual int authenticate(const char *credentials);
     virtual int configure_protocol(enum PROTOCOL_TYPE type);
     virtual int write_command_cluster_slots();
+    virtual int write_command_readonly();
     virtual int write_command_set(const char *key, int key_len, const char *value, int value_len, int expiry,
                                   unsigned int offset);
     virtual int write_command_get(const char *key, int key_len, unsigned int offset);
@@ -1035,6 +1606,7 @@ public:
 int memcache_binary_protocol::select_db(int db)
 {
     assert(0);
+    return -1;
 }
 
 int memcache_binary_protocol::authenticate(const char *credentials)
@@ -1077,11 +1649,19 @@ int memcache_binary_protocol::authenticate(const char *credentials)
 int memcache_binary_protocol::configure_protocol(enum PROTOCOL_TYPE type)
 {
     assert(0);
+    return -1;
 }
 
 int memcache_binary_protocol::write_command_cluster_slots()
 {
     assert(0);
+    return -1;
+}
+
+int memcache_binary_protocol::write_command_readonly()
+{
+    assert(0);
+    return -1;
 }
 
 int memcache_binary_protocol::write_command_set(const char *key, int key_len, const char *value, int value_len,
@@ -1135,6 +1715,7 @@ int memcache_binary_protocol::write_command_multi_get(const keylist *keylist)
 {
     fprintf(stderr, "error: multi get not implemented for binary memcache yet!\n");
     assert(0);
+    return -1;
 }
 
 const char *memcache_binary_protocol::status_text(void)
@@ -1172,6 +1753,7 @@ int memcache_binary_protocol::write_command_wait(unsigned int num_slaves, unsign
 {
     fprintf(stderr, "error: WAIT command not implemented for memcache!\n");
     assert(0);
+    return -1;
 }
 
 int memcache_binary_protocol::parse_response(void)
@@ -1259,16 +1841,19 @@ int memcache_binary_protocol::parse_response(void)
 bool memcache_binary_protocol::format_arbitrary_command(arbitrary_command &cmd)
 {
     assert(0);
+    return false;
 }
 
 int memcache_binary_protocol::write_arbitrary_command(const command_arg *arg)
 {
     assert(0);
+    return -1;
 }
 
 int memcache_binary_protocol::write_arbitrary_command(const char *val, int val_len)
 {
     assert(0);
+    return -1;
 }
 
 /////////////////////////////////////////////////////////////////////////
@@ -1281,6 +1866,8 @@ class abstract_protocol *protocol_factory(enum PROTOCOL_TYPE type)
         return new memcache_text_protocol();
     } else if (type == PROTOCOL_MEMCACHE_BINARY) {
         return new memcache_binary_protocol();
+    } else if (type == PROTOCOL_MEMCACHE_META) {
+        return new memcache_meta_protocol();
     } else {
         benchmark_error_log("Error: unknown protocol type: %d.\n", type);
         return NULL;
@@ -1289,18 +1876,26 @@ class abstract_protocol *protocol_factory(enum PROTOCOL_TYPE type)
 
 /////////////////////////////////////////////////////////////////////////
 
+// The MGET key list can need GBs with a large --multi-key-get and long keys:
+// fail with a clear message rather than an assert.
+static void keylist_out_of_memory(void)
+{
+    fprintf(stderr, "error: out of memory building MGET key list (reduce --multi-key-get or the key size).\n");
+    exit(1);
+}
+
 keylist::keylist(unsigned int max_keys) :
         m_buffer(NULL), m_buffer_ptr(NULL), m_buffer_size(0), m_keys(NULL), m_keys_size(0), m_keys_count(0)
 {
     m_keys_size = max_keys;
     m_keys = (key_entry *) malloc(m_keys_size * sizeof(key_entry));
-    assert(m_keys != NULL);
+    if (m_keys == NULL) keylist_out_of_memory();
     memset(m_keys, 0, m_keys_size * sizeof(key_entry));
 
     /* allocate buffer for actual keys */
-    m_buffer_size = 256 * m_keys_size;
+    m_buffer_size = (size_t) 256 * m_keys_size;
     m_buffer = (char *) malloc(m_buffer_size);
-    assert(m_buffer != NULL);
+    if (m_buffer == NULL) keylist_out_of_memory();
     memset(m_buffer, 0, m_buffer_size);
 
     m_buffer_ptr = m_buffer;
@@ -1323,13 +1918,24 @@ bool keylist::add_key(const char *key, unsigned int key_len)
     // have room?
     if (m_keys_count >= m_keys_size) return false;
 
-    // have buffer?
-    if (m_buffer_ptr + key_len >= m_buffer + m_buffer_size) {
-        while (m_buffer_ptr + key_len >= m_buffer + m_buffer_size) {
-            m_buffer_size *= 2;
-        }
+    // have buffer? (+1 for the NUL terminator written after the key bytes)
+    size_t offset = (size_t) (m_buffer_ptr - m_buffer);
+    size_t needed = offset + (size_t) key_len + 1;
+    if (needed > m_buffer_size) {
+        // size_t growth: an unsigned int size wrapped to 0 past 2 GiB and the
+        // doubling loop never ended.
+        m_buffer_size = keylist_grow_size(m_buffer_size, needed);
         m_buffer = (char *) realloc(m_buffer, m_buffer_size);
-        assert(m_buffer != NULL);
+        if (m_buffer == NULL) keylist_out_of_memory();
+        // Re-base all key_ptr entries into the new allocation. Keys are packed
+        // contiguously (key bytes + NUL terminator), so we can recompute each
+        // pointer from m_keys[k].key_len without touching the old allocation.
+        char *p = m_buffer;
+        for (unsigned int k = 0; k < m_keys_count; k++) {
+            m_keys[k].key_ptr = p;
+            p += m_keys[k].key_len + 1;
+        }
+        m_buffer_ptr = m_buffer + offset;
     }
 
     // copy key

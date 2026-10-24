@@ -21,6 +21,7 @@ class MonitorThread(threading.Thread):
     def __init__(self, connection, stop_commands: set[str] = None):
         threading.Thread.__init__(self)
         self.monitor: redis.client.Monitor = connection.monitor()
+        self.ready = threading.Event()
         self.stop_commands: set[str] = stop_commands or {
             "INFO COMMANDSTATS",
             "FLUSHALL",
@@ -31,6 +32,8 @@ class MonitorThread(threading.Thread):
     def run(self):
         try:
             with self.monitor as m:
+                # The context manager has received the MONITOR acknowledgement.
+                self.ready.set()
                 for command_info in m.listen():
                     command = command_info.get("command")
 
@@ -141,6 +144,8 @@ class ZipfianBenchmarkRunner:
             monitor_thread = MonitorThread(conn)
             monitor_thread.start()
             monitor_threads.append(monitor_thread)
+            self.env.assertTrue(monitor_thread.ready.wait(timeout=10),
+                                message="MONITOR must be active before starting the benchmark")
 
         # Run the benchmark
         memtier_ok = benchmark.run()
@@ -218,6 +223,8 @@ class ZipfianBenchmarkRunner:
             monitor_thread = MonitorThread(conn)
             monitor_thread.start()
             monitor_threads.append(monitor_thread)
+            self.env.assertTrue(monitor_thread.ready.wait(timeout=10),
+                                message="MONITOR must be active before starting the benchmark")
 
         # Run the benchmark
         memtier_ok = benchmark.run()

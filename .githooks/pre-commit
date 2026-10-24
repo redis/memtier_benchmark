@@ -14,10 +14,31 @@
 
 set -e
 
+# Locate the Makefile: git worktrees share hooks via commondir (core.hookspath
+# resolves relative to the worktree root) but may not have their own
+# configured build tree. Walk up from the git common directory to find the
+# root Makefile so the hook works from both the main worktree and any linked
+# worktree that was checked out without running ./configure.
+_GIT_COMMON=$(git rev-parse --git-common-dir)
+_MAKE_DIR=$(dirname "$_GIT_COMMON")
+if [ ! -f Makefile ] && [ -f "$_MAKE_DIR/Makefile" ]; then
+    _MAKE_ARGS="-C $_MAKE_DIR"
+else
+    _MAKE_ARGS=""
+fi
+
+# When running from a linked worktree the git index lives in the worktree's
+# private directory, not in the common .git. Export GIT_INDEX_FILE so that
+# `git diff --cached` inside the Makefile rule sees the *correct* staged
+# snapshot for this worktree rather than the main worktree's index.
+_GIT_DIR=$(git rev-parse --git-dir)
+export GIT_INDEX_FILE="$_GIT_DIR/index"
+
 # format-check-staged is a no-op when no C/C++ file is staged, and emits its
 # own remediation guidance on failure; we only need to translate the exit
 # code into a friendly hook-level message.
-if ! make format-check-staged; then
+# shellcheck disable=SC2086
+if ! make $_MAKE_ARGS format-check-staged; then
     echo
     echo "✗ Pre-commit format check failed (see remediation above)."
     echo "  Bypass (not recommended): git commit --no-verify"
