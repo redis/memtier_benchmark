@@ -957,7 +957,7 @@ def test_F16_ipv6(env):
         s6 = socket.socket(socket.AF_INET6)
         s6.bind(("::1", 0))
         s6.close()
-    except (OSError, socket.gaierror):
+    except OSError:  # includes socket.gaierror
         env.skip()
         return
     rd = _new_results_dir()

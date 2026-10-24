@@ -618,8 +618,8 @@ static int bufferevent_connect_nonblocking(struct bufferevent *bev, evutil_socke
 }
 #endif
 
-// bufferevent_socket_connect() on m_bev. A failure that libevent 2.1.8 and
-// older report through handle_event() from inside the call is kept in
+// bufferevent_socket_connect() on m_bev. A failure that libevent before
+// 2.1.9 reports through handle_event() from inside the call is kept in
 // m_socket_connect_error for the caller instead (see handle_event()).
 int shard_connection::socket_connect(struct sockaddr *sa, int socklen)
 {
@@ -672,10 +672,10 @@ int shard_connection::connect(struct connect_info *addr)
     struct sockaddr *sa = m_unix_sockaddr ? (struct sockaddr *) m_unix_sockaddr : addr->ci_addr;
     int socklen = m_unix_sockaddr ? m_unix_sockaddrlen : addr->ci_addrlen;
 #ifdef _WIN32
-    m_in_socket_connect = true;
+    // bufferevent_connect_nonblocking() connects the socket itself and passes
+    // libevent no address, so libevent cannot fail the connect synchronously.
     m_socket_connect_error = 0;
     int ret = bufferevent_connect_nonblocking(m_bev, sockfd, sa, socklen);
-    m_in_socket_connect = false;
     if (ret == 1) {
         // Do not enter the error callback during client preparation. This
         // connection owns the queued event so disconnect/destruction cancels
@@ -2007,12 +2007,12 @@ void shard_connection::fill_pipeline(void)
 
 void shard_connection::handle_event(short events)
 {
-    // libevent 2.1.8 and older run the error callback from inside a failing
-    // bufferevent_socket_connect(), before it returns -1. connect() handles
-    // that failure itself, as with newer libevent, which does not call back:
-    // just keep the error for it.
-    if (m_in_socket_connect) {
-        if (events & BEV_EVENT_ERROR) m_socket_connect_error = EVUTIL_SOCKET_ERROR();
+    // libevent before 2.1.9 runs the error callback from inside a failing
+    // bufferevent_socket_connect(), before it returns -1. The caller of
+    // socket_connect() handles that failure itself, as with newer libevent,
+    // which does not call back: just keep the error for it.
+    if (m_in_socket_connect && (events & BEV_EVENT_ERROR)) {
+        m_socket_connect_error = EVUTIL_SOCKET_ERROR();
         return;
     }
 

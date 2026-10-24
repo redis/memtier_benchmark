@@ -575,8 +575,8 @@ private:
     bool m_bev_paused;
 
     // Set while socket_connect() is inside bufferevent_socket_connect(); the
-    // error libevent 2.1.8 reports from there through handle_event() is kept
-    // in m_socket_connect_error.
+    // error libevent before 2.1.9 reports from there through handle_event()
+    // is kept in m_socket_connect_error.
     bool m_in_socket_connect;
     int m_socket_connect_error;
 

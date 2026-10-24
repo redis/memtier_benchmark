@@ -166,8 +166,8 @@ jobs:
         ldd ./memtier_benchmark | grep libevent
         ldd ./memtier_benchmark | grep ssl
 
-  # RHEL 8 ships libevent 2.1.8, the oldest release DEVELOPMENT.md lists as
-  # working, with OpenSSL 1.1.1 and GCC 8. 2.1.8 behaves differently from
+  # RHEL 8 ships libevent 2.1.8, with OpenSSL 1.1.1 and GCC 8: the oldest
+  # libevent in a supported distribution. 2.1.8 behaves differently from
   # 2.1.9+ in ways memtier must handle (a failing bufferevent_socket_connect()
   # runs the error callback before it returns), so run the suite against it.
   test-rockylinux-8:
