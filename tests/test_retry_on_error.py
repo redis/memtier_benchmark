@@ -1326,7 +1326,9 @@ def _replay_churn_run(env, extra_args, password=None):
         rc, stderr_content = _run_with_background(env, benchmark, config, kill_waves, timeout=test_time + 30)
     finally:
         if password is not None:
-            admin.execute_command("CONFIG", "SET", "requirepass", "")
+            # Restore the env's own password (REDIS_PASSWORD), if it has one.
+            admin.execute_command("CONFIG", "SET", "requirepass",
+                                  admin.connection_pool.connection_kwargs.get("password") or "")
 
     env.assertGreaterEqual(sum(kills), 1, message="no CLIENT KILL wave found a memtier connection")
     env.assertGreaterEqual(stderr_content.count("Reconnection successful"), 1,
@@ -1452,7 +1454,7 @@ def test_replays_after_deadline_are_counted(env):
             args = [MEMTIER_BINARY, "--server=127.0.0.1", "--port={}".format(proxy.port), "--threads=1",
                     "--clients={}".format(clients), "--pipeline={}".format(pipeline), "--test-time=2",
                     "--ratio=1:0", "--select-db=3", "--retry-on-error", "--reconnect-on-error",
-                    "--hide-histogram", "--json-out-file=" + stats]
+                    "--hide-histogram", "--json-out-file=" + stats] + memtier_auth_args(env)
             result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, text=True)
             with open(stats) as f:
                 totals = json.load(f)["ALL STATS"]["Totals"]

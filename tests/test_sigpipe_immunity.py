@@ -19,7 +19,7 @@ import subprocess
 import tempfile
 import time
 
-from include import MEMTIER_BINARY, addTLSArgs
+from include import MEMTIER_BINARY, addTLSArgs, memtier_auth_args
 
 
 def test_sigpipe_ignored(env):
@@ -50,7 +50,7 @@ def test_sigpipe_ignored(env):
     # Forward TLS flags using the same helper as other tests.
     benchmark_specs = {"args": []}
     addTLSArgs(benchmark_specs, env)
-    args.extend(benchmark_specs["args"])
+    args.extend(benchmark_specs["args"] + memtier_auth_args(env))
 
     with tempfile.TemporaryDirectory() as td:
         stdout_path = os.path.join(td, "mb.stdout")

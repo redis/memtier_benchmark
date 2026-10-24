@@ -42,6 +42,7 @@ from include import (
     TLS_CACERT,
     TLS_CERT,
     TLS_KEY,
+    memtier_auth_args,
     prom_scrape,
     wait_for_prometheus_url,
 )
@@ -149,9 +150,11 @@ def _set_password(env, password):
 
 
 def _clear_password(env, password):
+    # Restore the env's own password (REDIS_PASSWORD), if it has one.
+    original = _master(env).get("password") or ""
     try:
         for conn in _master_conns(env, password=password):
-            conn.execute_command("CONFIG", "SET", "requirepass", "")
+            conn.execute_command("CONFIG", "SET", "requirepass", original)
     except Exception:
         pass
 
@@ -161,7 +164,7 @@ def _popen(env, extra_args, results_dir, password=None):
     stderr_path = os.path.join(results_dir, "mb.stderr")
     tls, _paths = _tls_args(env)
     srv, _host, _port = _server_args(env)
-    auth = ["--authenticate={}".format(password)] if password else []
+    auth = ["--authenticate={}".format(password)] if password else memtier_auth_args(env)
     args = [MEMTIER_BINARY] + srv + auth + tls + extra_args
     so = open(stdout_path, "w")
     se = open(stderr_path, "w")

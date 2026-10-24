@@ -41,6 +41,7 @@ from include import (
     TLS_CERT,
     TLS_KEY,
     TLS_PROTOCOLS,
+    memtier_auth_args,
     prom_parse,
     prom_sample_value,
     prom_scrape,
@@ -107,6 +108,7 @@ def _server_args(env):
     Standalone: --server/--port of the master shard.
     Cluster:    --server/--port of one shard plus --cluster-mode (memtier
                 discovers the rest via CLUSTER SLOTS).
+    Password:   --authenticate when the env has one (REDIS_PASSWORD).
     TLS:        when the env runs TLS, redis accepts only TLS connections, so
                 add --tls and the cert material (mirrors include.addTLSArgs).
                 The exporter listener stays plain HTTP regardless.
@@ -116,7 +118,7 @@ def _server_args(env):
     # RLTest node dicts carry the port; host defaults to loopback.
     port = node["port"]
     host = node.get("host", "127.0.0.1") or "127.0.0.1"
-    args = ["--server", str(host), "--port", str(port)]
+    args = ["--server", str(host), "--port", str(port)] + memtier_auth_args(env)
     if _is_cluster(env):
         args.append("--cluster-mode")
     if getattr(env, "useTLS", False):
