@@ -102,6 +102,15 @@ def test_crash_handler_with_active_connections(env):
         errors.append("Missing client list output section")
     if "=== MEMTIER_BENCHMARK BUG REPORT END" not in crash_output:
         errors.append("Missing bug report end marker")
+    # Library provenance: runtime and build-time versions.
+    for field in ("libevent_version:", "libevent_build_version:"):
+        if "# " + field not in crash_output:
+            errors.append(f"Missing {field} in info output")
+    version = subprocess.run([benchmark.args[0], "--version"], capture_output=True, text=True, timeout=30).stdout
+    if " openssl=" in version:
+        for field in ("openssl_version:", "openssl_runtime_version:"):
+            if "# " + field not in crash_output:
+                errors.append(f"Missing {field} in info output")
 
     # Verify CLIENT LIST OUTPUT contains expected information
     # Should have 2 threads with 2 clients each = 4 total client entries

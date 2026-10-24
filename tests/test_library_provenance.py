@@ -1,0 +1,206 @@
+"""libevent/OpenSSL provenance and failure handling.
+
+- The JSON "run information" records the libevent (and, with TLS, OpenSSL)
+  version memtier runs with and the one it was built against.
+- A matched installation prints no version-mismatch warning; a runtime
+  library from another release series than the build headers gets one
+  warning on stderr, and stdout is unchanged.
+- evthread_use_pthreads() failing is fatal (exit 1) instead of a warning.
+- bufferevent creation failing fails the connection (error exit) instead of
+  aborting on an assert.
+
+The last three use tests/library_failure_injector.c (LD_PRELOAD, Linux).
+"""
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+from include import *
+from mb import Benchmark, RunConfig
+
+_MISMATCH = "warning: memtier_benchmark was built with"
+
+
+def _version_line():
+    out = subprocess.run([MEMTIER_BINARY, "--version"], capture_output=True, text=True, timeout=30)
+    return out.stdout.splitlines()[0] if out.stdout else ""
+
+
+def _version_field(line, name):
+    for word in line.split():
+        if word.startswith(name + "="):
+            return word[len(name) + 1:]
+    return None
+
+
+def _has_tls():
+    return " openssl=" in _version_line()
+
+
+def _shim_env(env, directory):
+    """Build the preload shim and return a child environment using it, or
+    skip the test where that cannot be done."""
+    compiler = shlex.split(os.environ.get("CC", "cc"))
+    if (sys.platform != "linux" or not compiler or not shutil.which(compiler[0])
+            or not shutil.which("ldd")):
+        print("SKIP: needs Linux, a C compiler and ldd")
+        env.skip()
+    binary = shutil.which(MEMTIER_BINARY) or MEMTIER_BINARY
+    linked = subprocess.run(["ldd", binary], capture_output=True, text=True, timeout=60)
+    if linked.returncode != 0 or "libevent" not in linked.stdout:
+        print("SKIP: memtier_benchmark is not dynamically linked against libevent")
+        env.skip()
+    library = Path(directory) / "library_failure.so"
+    try:
+        subprocess.run(compiler + ["-shared", "-fPIC",
+                                   str(Path(__file__).with_name("library_failure_injector.c")),
+                                   "-o", str(library), "-ldl"],
+                       check=True, capture_output=True, text=True, timeout=120)
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
+        print(f"SKIP: compiling the preload shim failed: {e}")
+        env.skip()
+    # Keep the sanitizer runtime first; its interceptors forward to the shim.
+    runtimes = [line.split()[2] for line in linked.stdout.splitlines()
+                if line.strip().startswith(("libasan.so", "libtsan.so", "libubsan.so"))
+                and "=>" in line and len(line.split()) >= 3]
+    preloads = runtimes + [str(library)]
+    if os.environ.get("LD_PRELOAD"):
+        preloads.append(os.environ["LD_PRELOAD"])
+    child_env = dict(os.environ, LD_PRELOAD=":".join(preloads))
+    for name in ("MEMTIER_TEST_FAIL_EVTHREAD", "MEMTIER_TEST_FAIL_BUFFEREVENT",
+                 "MEMTIER_TEST_LIBEVENT_VERSION", "MEMTIER_TEST_OPENSSL_VERSION"):
+        child_env.pop(name, None)
+    child_env["MEMTIER_TEST_SHIM_MARKER"] = str(Path(directory) / "shim_marker.txt")
+    return child_env
+
+
+def _marker(child_env):
+    try:
+        with open(child_env["MEMTIER_TEST_SHIM_MARKER"]) as f:
+            return f.read().split()
+    except OSError:
+        return []
+
+
+def _run(env, directory, extra_args=(), child_env=None, requests=50):
+    """Run memtier against the test server with --json-out-file; return
+    (returncode, stderr, stdout, run information or None)."""
+    specs = {"name": env.testName, "args": list(extra_args)}
+    addTLSArgs(specs, env)
+    config = get_default_memtier_config(threads=1, clients=2, requests=requests)
+    add_required_env_arguments(specs, config, env, env.getMasterNodesList())
+    run_config = RunConfig(directory, env.testName, config, {})
+    ensure_clean_benchmark_folder(run_config.results_dir)
+    benchmark = Benchmark.from_json(run_config, specs)
+    json_path = os.path.join(directory, "out.json")
+    out_path = os.path.join(run_config.results_dir, "mb.stdout")
+    args = benchmark.args + ["--json-out-file", json_path]
+    proc = subprocess.run(args, capture_output=True, text=True, timeout=120, env=child_env)
+    if proc.returncode < 0 or "ERROR: AddressSanitizer" in proc.stderr:
+        print(proc.stderr[-4000:])
+    stdout = proc.stdout
+    if os.path.exists(out_path):
+        with open(out_path) as f:
+            stdout += f.read()
+    info = None
+    try:
+        with open(json_path) as f:
+            info = json.load(f).get("run information")
+    except (OSError, ValueError):
+        pass
+    return proc.returncode, proc.stderr, stdout, info
+
+
+def test_json_run_information_library_versions(env):
+    line = _version_line()
+    with tempfile.TemporaryDirectory() as directory:
+        rc, stderr, _, info = _run(env, directory)
+    env.assertEqual(rc, 0, message=stderr[-2000:])
+    env.assertTrue(info is not None, message="no run information in the JSON output")
+    info = info or {}
+    # The runtime version is the one --version reports.
+    env.assertEqual(info.get("libevent runtime version"), _version_field(line, "libevent"), message=info)
+    env.assertTrue(bool(info.get("libevent build version")), message=info)
+    if _has_tls():
+        env.assertTrue(bool(info.get("OpenSSL runtime version")), message=info)
+        # --version's openssl= field is the build-time OpenSSL text.
+        env.assertContains(_version_field(line, "openssl"), info.get("OpenSSL build version", ""))
+    else:
+        env.assertFalse("OpenSSL runtime version" in info, message=info)
+        env.assertFalse("OpenSSL build version" in info, message=info)
+    # Existing keys keep their names.
+    for key in ("Threads", "Connections per thread", "Runs completed", "Format version"):
+        env.assertTrue(key in info, message=key)
+    # A matched installation gets no warning.
+    env.assertFalse(_MISMATCH in stderr, message=stderr[-2000:])
+
+
+def test_libevent_series_mismatch_warns_on_stderr(env):
+    with tempfile.TemporaryDirectory() as directory:
+        child_env = _shim_env(env, directory)
+        child_env["MEMTIER_TEST_LIBEVENT_VERSION"] = "2.99.1-fake:0x02630100"
+        if _has_tls():
+            child_env["MEMTIER_TEST_OPENSSL_VERSION"] = "OpenSSL 99.0.0-fake:0xf6300000"
+        rc, stderr, stdout, info = _run(env, directory, child_env=child_env)
+        version = subprocess.run([MEMTIER_BINARY, "--version"], capture_output=True, text=True, timeout=30,
+                                 env=child_env)
+    env.assertEqual(rc, 0, message=stderr[-2000:])
+    warnings = [l for l in stderr.splitlines() if l.startswith(_MISMATCH)]
+    env.assertEqual(len(warnings), 2 if _has_tls() else 1, message=stderr[-2000:])
+    env.assertTrue(any("running with libevent 2.99.1-fake" in l for l in warnings), message=warnings)
+    if _has_tls():
+        env.assertTrue(any("running with OpenSSL 99.0.0-fake" in l for l in warnings), message=warnings)
+    env.assertFalse(_MISMATCH in stdout, message=stdout[-2000:])
+    env.assertEqual((info or {}).get("libevent runtime version"), "2.99.1-fake")
+    # --version stays quiet on stderr.
+    env.assertEqual(version.returncode, 0)
+    env.assertEqual(version.stderr, "")
+
+
+def test_libevent_patch_difference_does_not_warn(env):
+    with tempfile.TemporaryDirectory() as directory:
+        child_env = _shim_env(env, directory)
+        # Same series as any 2.1.x build; only a different patch level.
+        real = _version_field(_version_line(), "libevent") or ""
+        if not real.startswith("2.1."):
+            print(f"SKIP: needs a libevent 2.1.x build, have {real}")
+            env.skip()
+        child_env["MEMTIER_TEST_LIBEVENT_VERSION"] = "2.1.99-fake:0x02016300"
+        rc, stderr, _, _ = _run(env, directory, child_env=child_env)
+    env.assertEqual(rc, 0, message=stderr[-2000:])
+    env.assertFalse(_MISMATCH in stderr, message=stderr[-2000:])
+
+
+def test_evthread_failure_is_fatal(env):
+    with tempfile.TemporaryDirectory() as directory:
+        child_env = _shim_env(env, directory)
+        child_env["MEMTIER_TEST_FAIL_EVTHREAD"] = "1"
+        rc, stderr, _, info = _run(env, directory, child_env=child_env)
+        marker = _marker(child_env)
+    env.assertEqual(marker, ["evthread_use_pthreads"])
+    env.assertEqual(rc, 1, message=stderr[-2000:])
+    env.assertContains("error: evthread_use_pthreads() failed", stderr)
+    env.assertTrue(info is None, message=info)
+
+
+def test_bufferevent_creation_failure_fails_connection(env):
+    with tempfile.TemporaryDirectory() as directory:
+        child_env = _shim_env(env, directory)
+        child_env["MEMTIER_TEST_FAIL_BUFFEREVENT"] = "1"
+        rc, stderr, _, _ = _run(env, directory, child_env=child_env)
+        marker = _marker(child_env)
+    function = "bufferevent_openssl_socket_new" if env.useTLS else "bufferevent_socket_new"
+    env.assertTrue(function in marker, message=marker)
+    # An error exit, not a signal (the assert used to abort here).
+    env.assertGreater(rc, 0, message=stderr[-2000:])
+    env.assertContains("error: " + function + "() failed", stderr)
+    # Standalone aborts the run in prepare; cluster mode retries the
+    # connection and ends the run as failed.
+    env.assertTrue("failed to connect" in stderr or "the results of this run are not valid" in stderr,
+                   message=stderr[-2000:])
+    env.assertFalse("ERROR: AddressSanitizer" in stderr, message=stderr[-4000:])
