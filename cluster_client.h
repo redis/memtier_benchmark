@@ -306,6 +306,11 @@ public:
     // exactly once per run across all worker threads.
     void print_topology_summary() const;
 
+    // Request-generating connections (threads x clients x traffic endpoints)
+    // of the first committed topology, for the main thread's percentile
+    // sample-bound check; 0 until a topology summary has been printed.
+    static unsigned long long rate_limited_connections();
+
     // client manager api's
     virtual bool handle_cluster_slots(unsigned int conn_id, protocol_response *r);
     virtual void create_request(struct timeval timestamp, unsigned int conn_id);
