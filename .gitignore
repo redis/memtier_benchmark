@@ -60,6 +60,7 @@ __pycache__
 *.gcov
 *.gcda
 *.info
+/memtier_benchmark-*-coverage/
 
 # redis related
 *.rdb
@@ -71,6 +72,22 @@ tests/.env/
 
 # Unit-test harness (tests/unit/) build + automake check-driver artifacts
 /prometheus_metrics_test
+/hdr_histogram_test
+/cluster_transaction_test
+/cluster_hslot_test
+/rate_limiter_test
+/keylist_growth_test
+/retry_backoff_test
+/retry_drain_test
+/socket_options_test
+/run_stats_counters_test
+/file_io_test
+/run_stats_merge_test
+/crash_report_test
+/reconnect_siblings_test
+/cluster_slots_retention_test
+/memcache_meta_test
+/redis_protocol_test
 tests/unit/prometheus_metrics_test
 *.log
 *.trs
@@ -84,3 +101,9 @@ crash-*
 leak-*
 timeout-*
 oom-*
+
+# Windows (MinGW) build outputs
+*.exe
+/.libs/
+
+/import_object_generator_test

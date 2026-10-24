@@ -22,7 +22,7 @@ AC_CONFIG_HEADER([config.h])
 AM_INIT_AUTOMAKE
 AM_SILENT_RULES([yes])
 AC_CONFIG_MACRO_DIR([m4])
-LT_INIT
+AC_CANONICAL_HOST
 
 # Python is only required for the maintainer-only `make commands-meta` target.
 # Resolve to ":" (the no-op shell builtin) when absent so end-user builds keep
@@ -35,8 +35,19 @@ dnl `char buffer[N]` blew an 8-12 MB stack the moment a 20 MB MONITOR-replay
 dnl line was selected. Keep this hard-error to prevent the next one.
 CXXFLAGS="-O2 -g -Wall -Werror=vla -std=c++11 $CXXFLAGS"
 
-# Checks for programs.
+# Checks for programs. AC_PROG_CC is for the hdr_histogram C sources, and it
+# must come before AX_CODE_COVERAGE, which reads $GCC.
+AC_PROG_CC
 AC_PROG_CXX
+
+# MinGW builds use Winsock and libevent's Windows thread backend.
+AS_CASE([$host_os],
+  [mingw*], [
+    CPPFLAGS="$CPPFLAGS -D_WIN32_WINNT=0x0A00 -DWIN32_LEAN_AND_MEAN -DNOMINMAX -D__USE_MINGW_ANSI_STDIO=1"
+    LIBS="$LIBS -lws2_32"
+    memtier_windows=yes
+  ], [memtier_windows=no])
+AM_CONDITIONAL([MEMTIER_WINDOWS], [test "x$memtier_windows" = "xyes"])
 
 # Coverage
 AX_CODE_COVERAGE
@@ -85,6 +96,7 @@ AC_ARG_ENABLE([sanitizers],
                   [Enable AddressSanitizer and LeakSanitizer for memory error detection])])
 AS_IF([test "x$enable_sanitizers" = "xyes"], [
        AC_MSG_NOTICE([Enabling AddressSanitizer and LeakSanitizer])
+       CFLAGS="$CFLAGS -fsanitize=address -fsanitize=leak -fno-omit-frame-pointer -O1 -g"
        CXXFLAGS="$CXXFLAGS -fsanitize=address -fsanitize=leak -fno-omit-frame-pointer -O1 -g"
        LDFLAGS="$LDFLAGS -fsanitize=address -fsanitize=leak"
        ], [])
@@ -95,6 +107,7 @@ AC_ARG_ENABLE([ubsan],
                   [Enable UndefinedBehaviorSanitizer for undefined behavior detection])])
 AS_IF([test "x$enable_ubsan" = "xyes"], [
        AC_MSG_NOTICE([Enabling UndefinedBehaviorSanitizer])
+       CFLAGS="$CFLAGS -fsanitize=undefined -fno-omit-frame-pointer -O1 -g"
        CXXFLAGS="$CXXFLAGS -fsanitize=undefined -fno-omit-frame-pointer -O1 -g"
        LDFLAGS="$LDFLAGS -fsanitize=undefined"
        ], [])
@@ -108,6 +121,7 @@ AS_IF([test "x$enable_thread_sanitizer" = "xyes"], [
               AC_MSG_ERROR([--enable-thread-sanitizer and --enable-sanitizers are mutually exclusive])
        ])
        AC_MSG_NOTICE([Enabling ThreadSanitizer])
+       CFLAGS="$CFLAGS -fsanitize=thread -fno-omit-frame-pointer -O1 -g"
        CXXFLAGS="$CXXFLAGS -fsanitize=thread -fno-omit-frame-pointer -O1 -g"
        LDFLAGS="$LDFLAGS -fsanitize=thread"
        ], [])
@@ -148,10 +162,17 @@ PKG_CHECK_MODULES(LIBEVENT,
 # epoll_wait(), so an idle worker hangs after a cross-thread shutdown
 # request (Phase 1 of #426 / Ctrl+C). The pthreads bindings ship as a
 # separate .so since libevent 2.0, so we have to depend on it explicitly.
-PKG_CHECK_MODULES(LIBEVENT_PTHREADS,
-    [libevent_pthreads >= 2.0.10],
-    AC_SUBST(LIBEVENT_PTHREADS_CFLAGS) AC_SUBST(LIBEVENT_PTHREADS_LIBS)
-)
+AS_IF([test "x$memtier_windows" = "xyes"], [
+       LIBEVENT_PTHREADS_CFLAGS=""
+       LIBEVENT_PTHREADS_LIBS=""
+       AC_SUBST(LIBEVENT_PTHREADS_CFLAGS)
+       AC_SUBST(LIBEVENT_PTHREADS_LIBS)
+       ], [
+       PKG_CHECK_MODULES(LIBEVENT_PTHREADS,
+           [libevent_pthreads >= 2.0.10],
+           AC_SUBST(LIBEVENT_PTHREADS_CFLAGS) AC_SUBST(LIBEVENT_PTHREADS_LIBS)
+       )
+       ])
 
 # Prometheus exporter (evhttp) is optional, default ON. PKG check = non-fatal hygiene;
 # the LINK test is the real gate (bare AC_CHECK_HEADERS mis-detects on keg-only Homebrew
@@ -191,11 +212,21 @@ or configure with --disable-prometheus.])])
        AC_SUBST(LIBEVENT_EXTRA_LIBS)
        ])
 
-# bash completion
-PKG_CHECK_MODULES([BASH_COMPLETION], [bash-completion >= 2.0],
-    [BASH_COMPLETION_DIR="`pkg-config --variable=completionsdir bash-completion`"],
-    [BASH_COMPLETION_DIR="$datadir/bash-completion/completions"])
+# bash completion. The default follows --prefix, so a non-root prefix install
+# and make distcheck stay inside the prefix; --prefix=/usr gives the distro
+# path. Pass DIR to install elsewhere, or --without-bash-completion-dir to skip.
+AC_ARG_WITH([bash-completion-dir],
+  [AS_HELP_STRING([--with-bash-completion-dir@<:@=DIR@:>@],
+                  [install the bash completion script in DIR
+                   @<:@DATADIR/bash-completion/completions@:>@])],
+  [], [with_bash_completion_dir=yes])
+AS_CASE(["$with_bash_completion_dir"],
+  [yes], [BASH_COMPLETION_DIR='${datadir}/bash-completion/completions'],
+  [no], [BASH_COMPLETION_DIR=],
+  [/*], [BASH_COMPLETION_DIR="$with_bash_completion_dir"],
+  [AC_MSG_ERROR([--with-bash-completion-dir requires an absolute, non-empty directory; use --without-bash-completion-dir to disable installation])])
 AC_SUBST([BASH_COMPLETION_DIR])
+AM_CONDITIONAL([INSTALL_BASH_COMPLETION], [test "x$with_bash_completion_dir" != "xno"])
 
 AC_CONFIG_FILES([
    	Makefile

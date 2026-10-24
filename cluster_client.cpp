@@ -100,21 +100,12 @@ static inline uint16_t crc16(const char *buf, size_t len)
     return crc;
 }
 
-static uint32_t calc_hslot_crc16_cluster(const char *str, size_t length)
-{
-    uint32_t rv = (uint32_t) crc16(str, length) & MAX_CLUSTER_HSLOT;
-    return rv;
-}
-
-// Hash-tag-aware variant of calc_hslot_crc16_cluster. Mirrors Redis' rule
+// Hash slot of a key, following Redis' hash tag rule
 // (https://redis.io/docs/reference/cluster-spec/#hash-tags): if the key
 // contains a {tag} substring with at least one byte between the braces, only
 // the bytes inside the first such {tag} are hashed; otherwise the whole key
-// is hashed. memtier's default slot computation skips this rule because the
-// generic routing path only sees obj_gen->get_key() — never the literal
-// affixes like "{mx}-" that the user wrote in --command. This helper is used
-// by --transaction to pin to the actual slot owner.
-static uint32_t calc_hslot_crc16_with_hash_tag(const char *str, size_t length)
+// is hashed.
+uint32_t calc_hslot_crc16_cluster(const char *str, size_t length)
 {
     const char *open = (const char *) memchr(str, '{', length);
     if (open != NULL) {
@@ -139,6 +130,8 @@ cluster_client::cluster_client(client_group *group) :
         m_txn_round_key_index(0),
         m_txn_round_key_valid(false),
         m_txn_pin_lost_warned(false),
+        m_txn_wait_slot(-1),
+        m_txn_multi_conn_id(-1),
         m_strict_no_route_attempts(0),
         m_last_no_replica_warning_ts(0)
 {
@@ -191,24 +184,21 @@ int cluster_client::connect(void)
 
 void cluster_client::txn_release_pin()
 {
-    if (m_txn_has_staged_key) {
-        // Return the staged key to the pin connection's pool so the next
-        // rotation can reuse it. Without this, every mid-rotation pin reset
-        // (MOVED, disconnect) silently burns one key from the sequential
-        // iterator, permanently skipping that index under --key-pattern=S.
-        m_key_index_pools[m_txn_pinned_conn_id]->push(m_txn_staged_key_index);
-        m_txn_has_staged_key = false;
-    }
-    // Forget the rotation's shared key: a dropped pin restarts the rotation on
-    // a fresh pin/lookahead, which will adopt a new key. Leaving this set would
-    // make the re-pinned rotation reuse the old key while the fresh lookahead
-    // key goes unconsumed -- burning a sequential index at the next wrap.
+    // Keep an unconsumed lookahead key in transaction state. The routed pool
+    // holds (command_index, key_index) pairs, so returning a bare key there
+    // makes create_request() interpret it as a command index. Re-pinning will
+    // resolve this same key against the current topology without advancing
+    // its iterator again.
+    // A consumed rotation key is no longer reusable after the pin is lost.
     m_txn_round_key_valid = false;
     m_txn_pinned_conn_id = -1;
 }
 
 void cluster_client::disconnect(void)
 {
+    // Connection IDs can be reused when the topology is rebuilt after reconnect.
+    m_mget_waiting_producers.clear();
+
     // Reset transaction pin state so a post-reconnect topology with fewer
     // shards doesn't leave m_txn_pinned_conn_id pointing past the end of
     // m_connections (which would be an out-of-bounds access).
@@ -216,6 +206,8 @@ void cluster_client::disconnect(void)
     m_txn_has_staged_key = false;
     m_txn_round_key_valid = false;
     m_txn_pin_lost_warned = false;
+    m_txn_wait_slot = -1;
+    m_txn_multi_conn_id = -1;
 
     unsigned int conn_size = m_connections.size();
     unsigned int i;
@@ -265,6 +257,32 @@ shard_connection *cluster_client::create_shard_connection(abstract_protocol *abs
     return sc;
 }
 
+int cluster_client::reconnect(unsigned int conn_id)
+{
+    shard_connection *sc = m_connections[conn_id];
+    // Already reconnected, e.g. by a CLUSTER SLOTS refresh while this
+    // connection's reconnect timer was pending: connecting again would
+    // discard its in-flight requests.
+    if (sc->get_connection_state() != conn_disconnected) return 0;
+    if (sc == MAIN_CONNECTION) return connect();
+    // Reconnecting the main connection refreshes the slot map, which then
+    // reconnects this one.
+    if (MAIN_CONNECTION->get_connection_state() == conn_disconnected) return connect() < 0 ? -1 : 1;
+
+    // Leave reconnecting this shard connection to a CLUSTER SLOTS refresh
+    // over the main connection, which reconnects it with its current role,
+    // or not at all if the node left the cluster. Don't reconnect the main
+    // connection for that, as connect() would: that discards its in-flight
+    // requests, which stay counted as pending, so the run never ends. Wake
+    // it too: an idle main connection is paused and would not send CLUSTER
+    // SLOTS until something else resumed it. A refresh already queued or in
+    // flight reconnects it too; requesting another would send a second
+    // CLUSTER SLOTS before the first reply is handled.
+    if (MAIN_CONNECTION->get_cluster_slots_state() == setup_done) MAIN_CONNECTION->set_cluster_slots();
+    MAIN_CONNECTION->schedule_fill();
+    return 1;
+}
+
 bool cluster_client::connect_shard_connection(shard_connection *sc, char *address, char *port)
 {
     // empty key index queue and staged monitor commands
@@ -277,12 +295,8 @@ bool cluster_client::connect_shard_connection(shard_connection *sc, char *addres
         // the pool here without compensating leaves m_reqs_processed < m_reqs_generated
         // permanently, so a --requests run hangs and a --test-time run
         // mis-accounts pending in-flight. Compensate by n/2 (pairs).
-        // Defensive clamp guards against underflow from any future single-entry
-        // push pattern (txn_release_pin pushes a lone key, but the pin path
-        // does not increment m_reqs_generated for that staged key -- it is
-        // consumed by the next rotation -- so n/2 is the right accounting
-        // for cross-shard residue and a no-op for the txn-staged singleton
-        // beyond the clamp.) Matches the pattern at hold_pipeline.
+        // Defensive clamp guards against accounting underflow. Transaction
+        // lookahead stays in transaction state and never enters this queue.
         key_index_pool empty_queue;
         std::swap(*m_key_index_pools[sc->get_id()], empty_queue);
         {
@@ -321,23 +335,37 @@ bool cluster_client::connect_shard_connection(shard_connection *sc, char *addres
     int res = getaddrinfo(address, port, &hints, &addr_info);
     if (res != 0) {
         benchmark_error_log("connect: resolve error: %s\n", gai_strerror(res));
+    } else {
+        ci.ci_family = addr_info->ai_family;
+        ci.ci_socktype = addr_info->ai_socktype;
+        ci.ci_protocol = addr_info->ai_protocol;
+        assert(addr_info->ai_addrlen <= sizeof(ci.addr_buf));
+        memcpy(ci.addr_buf, addr_info->ai_addr, addr_info->ai_addrlen);
+        ci.ci_addr = (struct sockaddr *) ci.addr_buf;
+        ci.ci_addrlen = addr_info->ai_addrlen;
+
+        freeaddrinfo(addr_info);
+
+        // call connect
+        res = sc->connect(&ci);
+    }
+    if (res == 0) return true;
+
+    // The connection failed before reaching the event loop (resolve error,
+    // EMFILE, ENETUNREACH, ...), so no connection event will report it, and
+    // no reconnect timer is pending: callers only dial connections without
+    // one. Handle it like a connection error, so it is retried with backoff
+    // and counts against --max-reconnect-attempts, instead of leaving the
+    // connection dead or redialing it on every slot map refresh. Once the run
+    // is over, leave it dead: there is nothing left to send, and ending the
+    // client from here (stop_reconnecting_if_run_over()) would disconnect the
+    // main connection in the middle of handling its CLUSTER SLOTS reply.
+    if (sc->stops_at_deadline() && sc->run_is_over()) {
+        sc->count_connection_error();
         return false;
     }
-
-    ci.ci_family = addr_info->ai_family;
-    ci.ci_socktype = addr_info->ai_socktype;
-    ci.ci_protocol = addr_info->ai_protocol;
-    assert(addr_info->ai_addrlen <= sizeof(ci.addr_buf));
-    memcpy(ci.addr_buf, addr_info->ai_addr, addr_info->ai_addrlen);
-    ci.ci_addr = (struct sockaddr *) ci.addr_buf;
-    ci.ci_addrlen = addr_info->ai_addrlen;
-
-    freeaddrinfo(addr_info);
-
-    // call connect
-    res = sc->connect(&ci);
-
-    return res == 0;
+    sc->attempt_reconnect("Connection failed");
+    return false;
 }
 
 void cluster_client::build_mget_slot_cache()
@@ -370,7 +398,7 @@ void cluster_client::build_mget_slot_cache()
         unsigned int filled_slots = 0;
         for (unsigned long long idx = key_min; idx <= key_max && filled_slots < MAX_CLUSTER_HSLOT + 1; idx++) {
             m_obj_gen->generate_key(idx);
-            unsigned int slot = calc_hslot_crc16_with_hash_tag(m_obj_gen->get_key(), m_obj_gen->get_key_len());
+            unsigned int slot = calc_hslot_crc16_cluster(m_obj_gen->get_key(), m_obj_gen->get_key_len());
             if (cache->slot_keys[slot].size() < cap) {
                 cache->slot_keys[slot].push_back(idx);
                 if (cache->slot_keys[slot].size() == cap) filled_slots++;
@@ -472,8 +500,10 @@ unsigned int cluster_client::select_target_conn(unsigned int slot, bool is_read)
     //
     // The cluster_slots gate is meaningful only for reads, which need a
     // valid slot map to ROUTE; writes to the producer's primary do not
-    // re-look-up routing. Reads continue to use the full
-    // conn_is_live_for_routing() / is_ready_for_reads() predicate below.
+    // re-look-up routing. Under the non-primary read preferences, reads
+    // continue to use the full conn_is_live_for_routing() /
+    // is_ready_for_reads() predicate below; rp_primary reads route like
+    // writes (#610).
     //
     // Round-13: even the conn_connected gate has been removed for writes.
     // The producer's own slot is conn_connected by definition (fill_pipeline
@@ -496,11 +526,13 @@ unsigned int cluster_client::select_target_conn(unsigned int slot, bool is_read)
     // declaration instead of shadowing each other.
     const size_t nreplicas = group.replicas.size();
 
-    // rp_primary: legacy behavior (read from primary). Falling all the way
-    // through to the slot's primary owner gives parity with the
-    // pre-read-preference world.
+    // rp_primary: legacy behavior (read from primary). Like a write, route to
+    // the slot's primary even while it is still connecting: the read waits in
+    // its key index pool until its setup ladder is done. Returning UINT_MAX
+    // would leave a seed that owns none of the keys spinning in fill_pipeline
+    // before the other connections can connect (#610).
     if (mode == rp_primary) {
-        return conn_is_live_for_routing(group.primary) ? group.primary->get_id() : UINT_MAX;
+        return group.primary->get_id();
     }
 
     // rp_nearest: scan warm replicas (and the primary if it has already
@@ -600,6 +632,8 @@ bool cluster_client::classify_read(const request *req) const
     case rt_cluster_slots:
     case rt_hello:
     case rt_readonly:
+    case rt_discard:
+    case rt_asking:
         return false;
     case rt_arbitrary: {
         const arbitrary_request *ar = static_cast<const arbitrary_request *>(req);
@@ -855,8 +889,28 @@ void cluster_client::print_topology_summary() const
     pthread_mutex_unlock(&s_mtx);
 }
 
-bool cluster_client::handle_cluster_slots(protocol_response *r)
+// Redis specifies the replying connection's host for NULL endpoints; empty
+// endpoints may use the same fallback. "?" instead means an unknown hostname.
+static bool cluster_slots_host(const bulk_el *host, const std::string &sender_host, std::string &address)
 {
+    if (host->is_resp3_null || host->value_len == 0) {
+        address = sender_host;
+        return !address.empty();
+    }
+    if (memchr(host->value, '\0', host->value_len) != NULL || (host->value_len == 1 && host->value[0] == '?'))
+        return false;
+    address.assign(host->value, host->value_len);
+    return true;
+}
+
+bool cluster_client::handle_cluster_slots(unsigned int conn_id, protocol_response *r)
+{
+    if (conn_id >= m_connections.size()) return false;
+    // Parsing can reconnect/readdress this connection. Own the sender host
+    // before any topology mutation, and retain each tuple's advertised port.
+    const char *sender_address = m_connections[conn_id]->get_address();
+    const std::string sender_host = sender_address ? sender_address : "";
+
     /*
      * temporary array to test if some of the connections are left with no
      * slots, and need to be closed.
@@ -939,12 +993,11 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
             continue;
         bulk_el *pa = pn->mbulks_elements[0]->as_bulk();
         bulk_el *pp = pn->mbulks_elements[1]->as_bulk();
-        if (pa->value_len == 0 || pp->value_len == 0) continue;
-        if (memchr(pa->value, '\0', pa->value_len) != NULL) continue;
+        std::string p_addr;
+        if (!cluster_slots_host(pa, sender_host, p_addr) || pp->value_len == 0) continue;
         // pp->value points at the bulk header (':' integer-reply prefix);
         // value+1 / value_len-1 strips it, matching the primary-port copy
         // at lines 754-757.
-        std::string p_addr((const char *) pa->value, pa->value_len);
         std::string p_port((const char *) pp->value + 1, pp->value_len - 1);
         advertised_primary_endpoints.push_back(std::make_pair(p_addr, p_port));
     }
@@ -994,23 +1047,14 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
             continue;
         }
 
-        // hostname/ip + port: reject zero-length bulks (memcpy(..., NULL+1, 0)
-        // is technically UB; embedded NULs would also alias other addrs in
-        // strcmp-based lookup).
         bulk_el *mbulk_addr_el = node->mbulks_elements[0]->as_bulk();
         bulk_el *mbulk_port_el = node->mbulks_elements[1]->as_bulk();
-        if (mbulk_addr_el->value_len == 0 || mbulk_port_el->value_len == 0) {
-            benchmark_error_log("warning: CLUSTER SLOTS: shard %u empty host/port; skipping\n", i);
+        std::string primary_host;
+        if (!cluster_slots_host(mbulk_addr_el, sender_host, primary_host) || mbulk_port_el->value_len == 0) {
+            benchmark_error_log("warning: CLUSTER SLOTS: shard %u invalid host/port; skipping\n", i);
             continue;
         }
-        if (memchr(mbulk_addr_el->value, '\0', mbulk_addr_el->value_len) != NULL) {
-            benchmark_error_log("warning: CLUSTER SLOTS: shard %u host contains NUL; skipping\n", i);
-            continue;
-        }
-
-        char *addr = (char *) malloc(mbulk_addr_el->value_len + 1);
-        memcpy(addr, mbulk_addr_el->value, mbulk_addr_el->value_len);
-        addr[mbulk_addr_el->value_len] = '\0';
+        char *addr = strdup(primary_host.c_str());
 
         // value points at the bulk header byte (':' for integer reply) and
         // value_len is the strdup'd length INCLUDING that prefix. value+1
@@ -1034,8 +1078,12 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
                 // mark not to close this connection
                 if (j < prev_connections_size) close_sc[j] = false;
 
-                // if connection disconnected, try to reconnect
-                if (sc->get_connection_state() == conn_disconnected) {
+                // if connection disconnected, try to reconnect, unless its own
+                // reconnect timer is pending: that honors the backoff and
+                // --max-reconnect-attempts, and its reconnect() refreshes the
+                // slot map again. Redialing here instead would let every
+                // refresh during a failover redial a dead node at once.
+                if (sc->get_connection_state() == conn_disconnected && !sc->is_reconnect_pending()) {
                     // Role must be set BEFORE connect() so the setup ladder is
                     // armed against the *new* role (primary). A reused endpoint
                     // that was previously labeled role_replica would otherwise
@@ -1101,20 +1149,13 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
             }
             bulk_el *r_addr_el = replica_node->mbulks_elements[0]->as_bulk();
             bulk_el *r_port_el = replica_node->mbulks_elements[1]->as_bulk();
-            if (r_addr_el->value_len == 0 || r_port_el->value_len == 0) {
-                benchmark_error_log("warning: CLUSTER SLOTS: shard %u replica %u empty host/port; skipping\n", i,
+            std::string replica_host;
+            if (!cluster_slots_host(r_addr_el, sender_host, replica_host) || r_port_el->value_len == 0) {
+                benchmark_error_log("warning: CLUSTER SLOTS: shard %u replica %u invalid host/port; skipping\n", i,
                                     n - 3);
                 continue;
             }
-            if (memchr(r_addr_el->value, '\0', r_addr_el->value_len) != NULL) {
-                benchmark_error_log("warning: CLUSTER SLOTS: shard %u replica %u host contains NUL; skipping\n", i,
-                                    n - 3);
-                continue;
-            }
-
-            char *r_addr = (char *) malloc(r_addr_el->value_len + 1);
-            memcpy(r_addr, r_addr_el->value, r_addr_el->value_len);
-            r_addr[r_addr_el->value_len] = '\0';
+            char *r_addr = strdup(replica_host.c_str());
 
             // Same +1 prefix accounting as the primary port copy above:
             // value_len includes the ':' bulk header, so the digit run is
@@ -1225,9 +1266,14 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
                         // Role must be set BEFORE connect() so the READONLY
                         // ladder is armed during the AUTH/HELLO/READONLY/
                         // CLUSTER SLOTS sequence. set_role is a no-op for
-                        // already-known replicas (idempotent).
-                        rsc->set_role(role_replica);
-                        connect_shard_connection(rsc, r_addr, r_port);
+                        // already-known replicas (idempotent). A pending
+                        // reconnect timer redials it instead, as for primaries.
+                        // Nor is a replica closed because it rejected its
+                        // setup under --read-preference primary (#737).
+                        if (!rsc->is_reconnect_pending() && !rsc->is_setup_rejected_replica()) {
+                            rsc->set_role(role_replica);
+                            connect_shard_connection(rsc, r_addr, r_port);
+                        }
                     } else if (rsc->get_role() != role_replica) {
                         // Live role flip: this conn was previously treated as
                         // a primary (m_readonly_state == setup_done with
@@ -1359,8 +1405,13 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
     print_topology_summary();
 
     // check if some connections left with no slots, and need to be closed
+    bool retired_any = false;
     for (unsigned int i = 0; i < prev_connections_size; i++) {
         if (close_sc[i] == true) {
+            // Whatever is dropped below (staged commands, key pool, the
+            // pipeline, replays hand_off_replay_requests() can't place) frees
+            // --requests and in-flight budget, so wake the producers below.
+            retired_any = true;
             // Flush staged monitor commands unconditionally for any retired shard,
             // regardless of its connection state. A shard can be already disconnected
             // (TCP dropped mid-run) while still holding staged commands that were
@@ -1394,19 +1445,38 @@ bool cluster_client::handle_cluster_slots(protocol_response *r)
                 }
             }
             if (m_connections[i]->get_connection_state() != conn_disconnected) {
+                // This can be the connection whose CLUSTER SLOTS reply is
+                // being handled: its process_response() stops parsing once
+                // it sees the disconnect.
                 m_connections[i]->disconnect();
             }
+            // With --retry-on-error, disconnect() kept the in-flight and
+            // retry-queued requests for resend after a reconnect, still
+            // counted as generated. A retired connection doesn't reconnect,
+            // so without this a --requests run ends short of its count.
+            hand_off_replay_requests(i);
         }
     }
 
     // Rebuild same-slot key index cache for MGET if enabled.
     build_mget_slot_cache();
 
+    // The wakeup below makes every producer retry against the new topology;
+    // none should remain tied to a retired destination.
+    m_mget_waiting_producers.clear();
+
     // Wake all connected shard connections so each one re-evaluates hold_pipeline()
     // with the freshly-built m_mget_conn_slots.  Without this, a connection that
     // was bufferevent_disable()'d before the cache existed would never re-run
     // fill_pipeline() and would stay permanently idle.
-    if (m_config->multi_key_get > 0) {
+    // Retiring a connection frees in-flight budget too (its pipeline was
+    // requeued or uncounted), but none of its replies are left to make a
+    // producer that hold_pipeline() parked run fill_pipeline() again. With
+    // every connection parked, the event loop has nothing left and exits.
+    // A rotation waiting for its key's owner (m_txn_wait_slot) parks every
+    // connection the same way; if the new map moves that slot to a live
+    // connection, one of them must run hold_pipeline() again to resume it.
+    if (m_config->multi_key_get > 0 || retired_any || m_txn_wait_slot != -1) {
         for (size_t i = 0; i < m_connections.size(); i++) {
             if (m_connections[i]->get_connection_state() != conn_disconnected) m_connections[i]->schedule_fill();
         }
@@ -1734,9 +1804,11 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
      * get_key_for_conn bumps the counter on every no-route (reads AND writes),
      * so by the time it crosses STRICT_NO_ROUTE_HOLD_THRESHOLD here we know
      * routing has been wedged for at least that many attempts. If the topology
-     * is empty OR every shard group's primary is unroutable, yield to the
-     * event loop so the timer can fire and so any in-progress CLUSTER SLOTS
-     * refresh can land. Reset the counter on yield to preserve the
+     * is empty OR no shard group's primary is ready to serve requests, yield
+     * to the event loop so the timer can fire and so any in-progress CLUSTER
+     * SLOTS refresh can land. Readiness is the routing predicate, not just a
+     * connected socket: during a failover the live primaries can all be
+     * waiting for a CLUSTER SLOTS reply, which only the event loop reads. Reset the counter on yield to preserve the
      * self-clearing semantics of the gate above (bounded spin instead of
      * deadlock; see the long comment block on the previous gate for the
      * rationale). */
@@ -1744,7 +1816,7 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         bool any_live_primary = false;
         for (size_t i = 0; i < m_shard_groups.size() && !any_live_primary; i++) {
             shard_connection *p = m_shard_groups[i].primary;
-            if (p != NULL && p->get_connection_state() == conn_connected) {
+            if (p != NULL && p->is_ready_for_reads()) {
                 any_live_primary = true;
             }
         }
@@ -1752,6 +1824,15 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
             m_strict_no_route_attempts = 0;
             return true;
         }
+    }
+
+    /* The next rotation waits for its key's owner to reconnect. */
+    if (m_config->transaction && m_txn_pinned_conn_id == -1 && m_txn_wait_slot != -1) {
+        unsigned int owner = slot_primary_conn_id((unsigned int) m_txn_wait_slot);
+        if (owner < m_connections.size() && m_connections[owner]->get_connection_state() == conn_disconnected) {
+            return true;
+        }
+        m_txn_wait_slot = -1;
     }
 
     /* In transaction mode the pin connection drives the entire rotation.
@@ -1795,6 +1876,28 @@ bool cluster_client::is_read_command_index(unsigned int command_index) const
     return command_index == GET_CMD_IDX;
 }
 
+// Slot of the key that cmd sends for the key m_obj_gen generated last. A key
+// argument such as "{tag}-__key__" puts literal text around the generated
+// key, so hash data_prefix + key + data_suffix the way Redis does, honouring
+// {tag}. Cluster mode allows one key argument per command.
+unsigned int cluster_client::calc_arbitrary_key_hslot(const arbitrary_command &cmd)
+{
+    const char *key = m_obj_gen->get_key();
+    unsigned int key_len = m_obj_gen->get_key_len();
+    for (size_t i = 0; i < cmd.command_args.size(); i++) {
+        const command_arg &arg = cmd.command_args[i];
+        if (arg.type != key_type) continue;
+        if (!arg.has_key_affixes) break;
+        std::string full;
+        full.reserve(arg.data_prefix.size() + key_len + arg.data_suffix.size());
+        full.append(arg.data_prefix);
+        full.append(key, key_len);
+        full.append(arg.data_suffix);
+        return calc_hslot_crc16_cluster(full.data(), full.size());
+    }
+    return calc_hslot_crc16_cluster(key, key_len);
+}
+
 get_key_response cluster_client::get_key_for_conn(unsigned int command_index, unsigned int conn_id,
                                                   unsigned long long *key_index)
 {
@@ -1810,7 +1913,13 @@ get_key_response cluster_client::get_key_for_conn(unsigned int command_index, un
     // generate key
     client::get_key_for_conn(command_index, conn_id, key_index);
 
-    unsigned int hslot = calc_hslot_crc16_cluster(m_obj_gen->get_key(), m_obj_gen->get_key_len());
+    unsigned int hslot;
+    if (m_config->arbitrary_commands != NULL && m_config->arbitrary_commands->is_defined() &&
+        command_index < m_config->arbitrary_commands->size()) {
+        hslot = calc_arbitrary_key_hslot(get_arbitrary_command(command_index));
+    } else {
+        hslot = calc_hslot_crc16_cluster(m_obj_gen->get_key(), m_obj_gen->get_key_len());
+    }
 
     // Read-preference-aware target selection. For writes this collapses to
     // the slot's primary owner (identical to the pre-read-pref world). For
@@ -1882,9 +1991,10 @@ get_key_response cluster_client::get_key_for_conn(unsigned int command_index, un
     // handle key for other connection
     unsigned int other_conn_id = target_conn_id;
 
-    // The target connection picked by select_target_conn was live at selection
-    // time (conn_is_live_for_routing already filters disconnected nodes), but a
-    // TOCTOU window exists between that check and the dispatch here -- the
+    // For non-primary read preferences select_target_conn only returns a live
+    // connection, but a write or an rp_primary read goes to the slot's primary
+    // even when it is connecting or disconnected, and a TOCTOU window exists
+    // between selection and the dispatch here too -- the
     // bufferevent can fire BEV_EVENT_EOF in between. If the target is no longer
     // connected at dispatch time, route the recovery based on its role:
     //
@@ -1919,9 +2029,8 @@ get_key_response cluster_client::get_key_for_conn(unsigned int command_index, un
     // disconnect only) but fall through to the cross-shard queue push
     // below. Queueing onto the target's pool is safe: the target's
     // fill_pipeline waits for setup_done before draining, and on
-    // reconnect the pool drains normally. The read-side setup_done
-    // gate at line ~1352 still protects reads that need a populated
-    // slot map to route.
+    // reconnect the pool drains normally. A slot map refresh that
+    // retires the connection uncounts what is left in its pool.
     if (m_connections[other_conn_id]->get_connection_state() == conn_disconnected &&
         !m_connections[other_conn_id]->is_replica()) {
         m_connections[conn_id]->set_cluster_slots();
@@ -2034,9 +2143,12 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
         if (m_arbitrary_command_rotation_seq != m_txn_observed_rotation_seq) {
             m_txn_observed_rotation_seq = m_arbitrary_command_rotation_seq;
             m_txn_pinned_conn_id = -1;
-            m_txn_has_staged_key = false;
+            // An unsent staged key (its rotation was cut short below) is
+            // kept for this rotation, so the sequential range has no gap.
             m_txn_round_key_valid = false;
             m_txn_pin_lost_warned = false;
+            m_txn_wait_slot = -1;
+            m_txn_multi_conn_id = -1;
             /* Wake up connections that were held back by hold_pipeline so
              * they can participate in the new rotation's lookahead. */
             for (size_t i = 0; i < m_connections.size(); i++) {
@@ -2065,9 +2177,9 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
              * and the actual send for that command_index pushes it onto
              * the pool just before calling client::create_arbitrary_request. */
             int target_conn = -1;
+            unsigned int hslot = 0;
             unsigned long long staged_key_index = 0;
             bool have_staged_key = false;
-            m_txn_has_staged_key = false;
             unsigned int total = m_config->arbitrary_commands->size();
             for (unsigned int off = 0; off < total; off++) {
                 unsigned int look_idx = (m_executed_command_index + off) % total;
@@ -2075,36 +2187,15 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
                 if (look.stats_only) continue;
                 if (look.keys_count == 0) continue;
 
-                client::get_key_for_conn(look_idx, conn_id, &staged_key_index);
+                if (m_txn_has_staged_key) {
+                    staged_key_index = m_txn_staged_key_index;
+                    m_obj_gen->generate_key(staged_key_index);
+                } else {
+                    client::get_key_for_conn(look_idx, conn_id, &staged_key_index);
+                }
                 have_staged_key = true;
 
-                /* Reconstruct the actual key string that would be sent on
-                 * the wire — data_prefix + obj_gen.get_key() + data_suffix
-                 * — and hash it the way Redis does (honoring {tag}
-                 * substrings). The default memtier slot computation only
-                 * sees the generated portion of the key, so it would
-                 * route to a random shard when the keyed argument carries
-                 * hash-tag affixes. */
-                const command_arg *key_arg = NULL;
-                for (size_t a = 0; a < look.command_args.size(); a++) {
-                    if (look.command_args[a].type == key_type) {
-                        key_arg = &look.command_args[a];
-                        break;
-                    }
-                }
-                const char *gen_key = m_obj_gen->get_key();
-                unsigned int gen_key_len = m_obj_gen->get_key_len();
-                unsigned int hslot;
-                if (key_arg != NULL && key_arg->has_key_affixes) {
-                    std::string full;
-                    full.reserve(key_arg->data_prefix.size() + gen_key_len + key_arg->data_suffix.size());
-                    full.append(key_arg->data_prefix);
-                    full.append(gen_key, gen_key_len);
-                    full.append(key_arg->data_suffix);
-                    hslot = calc_hslot_crc16_with_hash_tag(full.data(), full.size());
-                } else {
-                    hslot = calc_hslot_crc16_with_hash_tag(gen_key, gen_key_len);
-                }
+                hslot = calc_arbitrary_key_hslot(look);
                 {
                     // Resolve slot via the shard_group indirection. If the
                     // map isn't populated yet (slot_primary_conn_id returns
@@ -2116,14 +2207,23 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
                 }
                 break;
             }
-            /* If we couldn't find a keyed cmd, or the slot mapping isn't
-             * populated yet (target_conn out of range), or the elected shard
-             * is currently disconnected (e.g. pin just dropped and hasn't
-             * reconnected yet), fall back to the current conn so the rotation
-             * can proceed rather than re-pinning to a dead connection and
-             * permanently stalling all other conns via hold_pipeline. */
-            if (target_conn < 0 || target_conn >= (int) m_connections.size() ||
+            /* If the shard that owns the key is reconnecting, wait for it.
+             * Any other shard answers the keyed command with -MOVED and the
+             * transaction with EXECABORT. Keep the staged key for the owner;
+             * hold_pipeline() parks every connection until the owner is back
+             * (or a slot map refresh moves the slot to a live one), and the
+             * owner resumes the rotation from its own fill_pipeline(). */
+            if (target_conn >= 0 && target_conn < (int) m_connections.size() &&
                 m_connections[target_conn]->get_connection_state() == conn_disconnected) {
+                m_txn_staged_key_index = staged_key_index;
+                m_txn_has_staged_key = true;
+                m_txn_wait_slot = (int) hslot;
+                return false;
+            }
+            /* If we couldn't find a keyed cmd, or the slot mapping isn't
+             * populated yet (target_conn out of range), fall back to the
+             * current conn so the rotation can proceed. */
+            if (target_conn < 0 || target_conn >= (int) m_connections.size()) {
                 target_conn = (int) conn_id;
                 // keep have_staged_key: the key was already generated and the
                 // sequential counter advanced, so we must reuse it here (on
@@ -2155,6 +2255,21 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
             return false;
         }
 
+        /* This rotation's MULTI was sent on a connection that no longer holds
+         * it: the pinned connection dropped, and either reconnected or the
+         * pin moved to another connection. Sent now, the rest of the block
+         * would run outside any transaction and its EXEC would fail with
+         * "EXEC without MULTI". Skip it up to and including the EXEC/DISCARD;
+         * the server already discarded the commands queued before. */
+        if (m_txn_multi_conn_id != -1 && cmd.multi_effect != multi_effect_opens &&
+            (m_txn_multi_conn_id != (int) conn_id || !m_connections[conn_id]->is_multi_open())) {
+            benchmark_debug_log("--transaction: MULTI lost on connection %d; skipping command %u\n",
+                                m_txn_multi_conn_id, command_index);
+            if (cmd.multi_effect == multi_effect_closes) m_txn_multi_conn_id = -1;
+            advance_arbitrary_command_index();
+            return false;
+        }
+
         /* Every keyed --command in one rotation must resolve to the SAME key so
          * the whole WATCH/MULTI/EXEC unit hits a single slot -- otherwise the
          * cluster rejects it with CROSSSLOT. The first keyed command adopts the
@@ -2179,6 +2294,11 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
             }
         }
         client::create_arbitrary_request(command_index, timestamp, conn_id);
+        if (cmd.multi_effect == multi_effect_opens) {
+            m_txn_multi_conn_id = (int) conn_id;
+        } else if (cmd.multi_effect == multi_effect_closes) {
+            m_txn_multi_conn_id = -1;
+        }
         return true;
     }
 
@@ -2362,6 +2482,20 @@ bool cluster_client::create_mget_request(struct timeval &timestamp, unsigned int
         return false;
     }
 
+    if (routed != conn_id) {
+        if (m_mget_waiting_producers.size() < m_connections.size()) {
+            m_mget_waiting_producers.resize(m_connections.size());
+        }
+        // Register successful sends as well as cap deferrals: after sending
+        // the producer can park with no local I/O, while only the destination
+        // receives a response. Each producer is registered at most once per
+        // destination until a response releases it.
+        std::vector<unsigned int> &producers = m_mget_waiting_producers[routed];
+        if (std::find(producers.begin(), producers.end(), conn_id) == producers.end()) {
+            producers.push_back(conn_id);
+        }
+    }
+
     // Cross-connection backpressure: when MGET is routed to a different
     // connection than the producer (replica / nearest-mode / preferred
     // fallback), fill_pipeline's `m_pipeline->size() < pipeline` gate caps
@@ -2375,8 +2509,12 @@ bool cluster_client::create_mget_request(struct timeval &timestamp, unsigned int
     // MGET when the destination is at its per-connection pipeline cap.
     // schedule_fill() wakes the destination so its own fill_pipeline can
     // drain and re-check; the next outer create_request tick rebalances.
-    if (routed != conn_id && (unsigned int) m_connections[routed]->get_pending_resp() >= m_config->pipeline) {
-        m_connections[routed]->schedule_fill();
+    if (routed != conn_id && ((unsigned int) m_connections[routed]->get_pending_resp() >= m_config->pipeline ||
+                              !m_connections[routed]->has_request_rate_budget())) {
+        // Routed sends consume the destination's tokens, not the producer's.
+        // When that budget is exhausted, only its refill timer can release
+        // this hold; scheduling it immediately would just retry without tokens.
+        if (m_connections[routed]->has_request_rate_budget()) m_connections[routed]->schedule_fill();
         // Bump the strict-no-route counter on pipeline-cap defer too. In
         // pure-MGET workloads (--ratio 0:N --multi-key-get) with a
         // saturated destination replica the producer's pipeline never
@@ -2408,6 +2546,12 @@ bool cluster_client::create_mget_request(struct timeval &timestamp, unsigned int
     }
 
     m_connections[routed]->send_mget_command(&timestamp, m_keylist);
+    if (routed != conn_id) {
+        // The destination may itself be paused after its previous batch. In
+        // particular, the last request need not hit the cap-defer path above,
+        // so sending must wake its I/O even when no further work is generated.
+        m_connections[routed]->schedule_fill();
+    }
     // routed_ops is bumped by shard_connection::push_req. Record the
     // read-routing decision (Ops from Primary / Ops from Replica) here
     // because the send-side has no other context about the routing class.
@@ -2478,13 +2622,7 @@ void cluster_client::process_staged_monitor_command(struct timeval /*timestamp*/
         return;
     }
 
-    int cmd_size = 0;
-    for (unsigned int i = 0; i < staged.parsed_cmd.command_args.size(); i++) {
-        const command_arg *arg = &staged.parsed_cmd.command_args[i];
-        if (arg->type == const_type) {
-            cmd_size += m_connections[conn_id]->send_arbitrary_command(arg);
-        }
-    }
+    int cmd_size = write_monitor_command_args(staged.parsed_cmd, conn_id);
     if (cmd_size == 0) {
         // format_arbitrary_command succeeded but produced no sendable bytes — guard against
         // pushing a zero-length phantom request that the server would never respond to.
@@ -2521,6 +2659,10 @@ bool cluster_client::create_monitor_request_cluster(unsigned int command_index, 
         return false;
     }
 
+    // Fill in __key__ now, so the slot below comes from the key that is sent.
+    // __data__ is written when the command is sent (write_monitor_command_args).
+    resolve_monitor_placeholders(temp_cmd, command_index, conn_id);
+
     // Determine target shard from the first key argument (index 1 = first arg after command name).
     // Fall back to the current connection if topology isn't ready yet or there is no key.
     //
@@ -2535,7 +2677,7 @@ bool cluster_client::create_monitor_request_cluster(unsigned int command_index, 
     if (temp_cmd.command_args.size() >= 2) {
         const std::string &key = temp_cmd.command_args[1].data;
         if (!key.empty()) {
-            uint32_t slot = calc_hslot_crc16_with_hash_tag(key.c_str(), key.size());
+            uint32_t slot = calc_hslot_crc16_cluster(key.c_str(), key.size());
             // Same primaries-only resolution as the prior m_slot_to_shard
             // read; the shard_group indirection is invisible at this site.
             unsigned int shard = slot_primary_conn_id(slot);
@@ -2573,13 +2715,7 @@ bool cluster_client::create_monitor_request_cluster(unsigned int command_index, 
         return false;
     }
 
-    int cmd_size = 0;
-    for (unsigned int i = 0; i < temp_cmd.command_args.size(); i++) {
-        const command_arg *arg = &temp_cmd.command_args[i];
-        if (arg->type == const_type) {
-            cmd_size += m_connections[conn_id]->send_arbitrary_command(arg);
-        }
-    }
+    int cmd_size = write_monitor_command_args(temp_cmd, conn_id);
     if (cmd_size == 0) {
         // Defensive: formatted command produced no sendable bytes; nothing was written
         // to the socket so no response will arrive. Don't count as a generated request.
@@ -2590,24 +2726,8 @@ bool cluster_client::create_monitor_request_cluster(unsigned int command_index, 
 }
 
 // In case of -MOVED response, we sends CLUSTER SLOTS command to get the new topology
-void cluster_client::handle_moved(unsigned int conn_id, struct timeval timestamp, request *request,
-                                  protocol_response *response)
+void cluster_client::handle_moved(unsigned int conn_id)
 {
-    // update stats
-    if (request->m_type == rt_get) {
-        m_stats.update_moved_get_op(&timestamp, response->get_total_len(), request->m_size,
-                                    ts_diff(request->m_sent_time, timestamp));
-    } else if (request->m_type == rt_set) {
-        m_stats.update_moved_set_op(&timestamp, response->get_total_len(), request->m_size,
-                                    ts_diff(request->m_sent_time, timestamp));
-    } else if (request->m_type == rt_arbitrary) {
-        arbitrary_request *ar = static_cast<arbitrary_request *>(request);
-        m_stats.update_moved_arbitrary_op(&timestamp, response->get_total_len(), request->m_size,
-                                          ts_diff(request->m_sent_time, timestamp), ar->index);
-    } else {
-        assert(0);
-    }
-
     // connection already issued 'cluster slots' command, wait for slots mapping to be updated
     if (m_connections[conn_id]->get_cluster_slots_state() != setup_done) return;
 
@@ -2647,30 +2767,47 @@ void cluster_client::handle_moved(unsigned int conn_id, struct timeval timestamp
     m_connections[conn_id]->set_cluster_slots();
 }
 
-// In case of -ASK response, we ignore the response and we will update to the new topology when we get -MOVED response
-void cluster_client::handle_ask(unsigned int conn_id, struct timeval timestamp, request *request,
-                                protocol_response *response)
+// Record every redirect, but count an operation only if it will not be retried.
+void cluster_client::update_redirect_stats(struct timeval timestamp, request *request, protocol_response *response,
+                                           bool moved, bool completed)
 {
-    // update stats
-    if (request->m_type == rt_get) {
-        m_stats.update_ask_get_op(&timestamp, response->get_total_len(), request->m_size,
-                                  ts_diff(request->m_sent_time, timestamp));
-    } else if (request->m_type == rt_set) {
-        m_stats.update_ask_set_op(&timestamp, response->get_total_len(), request->m_size,
-                                  ts_diff(request->m_sent_time, timestamp));
-    } else if (request->m_type == rt_arbitrary) {
-        arbitrary_request *ar = static_cast<arbitrary_request *>(request);
-        m_stats.update_ask_arbitrary_op(&timestamp, response->get_total_len(), request->m_size,
-                                        ts_diff(request->m_sent_time, timestamp), ar->index);
+    // enqueue_retry() defers replay to the event loop, so the request remains
+    // valid here. Terminal latency spans all attempts, as in client::handle_response.
+    if (moved) {
+        if (request->m_type == rt_get) {
+            m_stats.update_moved_get_op(&timestamp, response->get_total_len(), request->m_size,
+                                        ts_diff(request->m_first_sent_time, timestamp), completed);
+        } else if (request->m_type == rt_set) {
+            m_stats.update_moved_set_op(&timestamp, response->get_total_len(), request->m_size,
+                                        ts_diff(request->m_first_sent_time, timestamp), completed);
+        } else if (request->m_type == rt_arbitrary) {
+            arbitrary_request *ar = static_cast<arbitrary_request *>(request);
+            m_stats.update_moved_arbitrary_op(&timestamp, response->get_total_len(), request->m_size,
+                                              ts_diff(request->m_first_sent_time, timestamp), ar->index, completed);
+        } else {
+            assert(0);
+        }
     } else {
-        assert(0);
+        if (request->m_type == rt_get) {
+            m_stats.update_ask_get_op(&timestamp, response->get_total_len(), request->m_size,
+                                      ts_diff(request->m_first_sent_time, timestamp), completed);
+        } else if (request->m_type == rt_set) {
+            m_stats.update_ask_set_op(&timestamp, response->get_total_len(), request->m_size,
+                                      ts_diff(request->m_first_sent_time, timestamp), completed);
+        } else if (request->m_type == rt_arbitrary) {
+            arbitrary_request *ar = static_cast<arbitrary_request *>(request);
+            m_stats.update_ask_arbitrary_op(&timestamp, response->get_total_len(), request->m_size,
+                                            ts_diff(request->m_first_sent_time, timestamp), ar->index, completed);
+        } else {
+            assert(0);
+        }
     }
 }
 
 // Try to resend the request to the connection that now owns the key's slot.
-// Falls back to retrying on the same connection if the key is not captured
-// (e.g. arbitrary command without --retry-on-error key plumbing). Returns true
-// if ownership of `req` was transferred to a retry queue.
+// Falls back to retrying on the same connection if the request has no key
+// (keyless commands, or --monitor-input lines, whose keys are literal args).
+// Returns true if ownership of `req` was transferred to a retry queue.
 //
 // Read-preference-aware: for read-class requests, select_target_conn honors
 // --read-preference on retry, so a read that hit MOVED on a replica that no
@@ -2683,14 +2820,12 @@ bool cluster_client::retry_after_redirect(unsigned int conn_id, request *req)
 {
     if (!m_config->retry_on_error) return false;
     if (!req || !req->m_serialized || req->m_serialized_len == 0) return false;
+    // Routed by the slot map now, not to the node an earlier -ASK named.
+    req->m_asking = false;
 
     unsigned int target = conn_id;
     if (req->m_key && req->m_key_len > 0) {
-        // Use the hash-tag-aware variant so a retry of an arbitrary command
-        // whose key carries a {tag} prefix (e.g. "{foo}-key-5") routes to
-        // the correct shard. calc_hslot_crc16_cluster hashes the full string
-        // and would map to a different slot, causing an infinite MOVED loop.
-        unsigned int hslot = calc_hslot_crc16_with_hash_tag(req->m_key, req->m_key_len);
+        unsigned int hslot = calc_hslot_crc16_cluster(req->m_key, req->m_key_len);
         const bool is_read = classify_read(req);
         unsigned int mapped = select_target_conn(hslot, is_read);
         // select_target_conn returns UINT_MAX when strict rp_secondary finds no
@@ -2738,12 +2873,147 @@ bool cluster_client::retry_after_redirect(unsigned int conn_id, request *req)
         }
     }
 
-    if (m_connections[target]->enqueue_retry(req)) {
-        m_stats.inc_retry_attempt();
-        if (req->m_retries == 0) m_stats.inc_retried_op();
-        return true;
+    return enqueue_redirect_retry(target, req);
+}
+
+bool cluster_client::enqueue_redirect_retry(unsigned int target, request *req)
+{
+    if (!m_connections[target]->enqueue_retry(req)) return false;
+    m_stats.inc_retry_attempt();
+    if (req->m_retries == 0) m_stats.inc_retried_op();
+    return true;
+}
+
+// The primary connection to the node named by "-MOVED/-ASK <slot>
+// <host>:<port>", or UINT_MAX if there is none. A connection still being
+// established (e.g. a TLS handshake at startup) or waiting on its reconnect
+// timer qualifies: its retry queue holds the request until it is set up
+// again, as in hand_off_replay_requests().
+unsigned int cluster_client::redirect_target_conn(unsigned int conn_id, protocol_response *response)
+{
+    const char *status = response->get_status();
+    const char *addr = status ? strrchr(status, ' ') : NULL;
+    const char *port = addr ? strrchr(addr, ':') : NULL;
+    if (port == NULL) return UINT_MAX;
+    addr++;
+    size_t addr_len = port - addr;
+    port++;
+    // An empty redirect host means the endpoint of the replying connection,
+    // which may differ from the original seed. Keep the redirected port.
+    if (addr_len == 0) {
+        addr = m_connections[conn_id]->get_address();
+        addr_len = strlen(addr);
     }
-    return false;
+    for (unsigned int i = 0; i < m_connections.size(); i++) {
+        shard_connection *sc = m_connections[i];
+        if (sc->get_role() == role_primary &&
+            (sc->get_connection_state() != conn_disconnected || sc->is_reconnect_pending()) &&
+            strncmp(sc->get_address(), addr, addr_len) == 0 && sc->get_address()[addr_len] == '\0' &&
+            strcmp(sc->get_port(), port) == 0) {
+            return i;
+        }
+    }
+    return UINT_MAX;
+}
+
+// Resend the request to the node named by "-ASK <slot> <host>:<port>",
+// preceded by ASKING: during a slot migration only that node serves the key,
+// and only for a command sent right after ASKING. That node is the importing
+// primary, so this retry goes to a primary whatever --read-preference says:
+// no replica serves the key, and the slot map would send it back to the
+// migrating node. Without a usable connection to that node, fall back to
+// routing by the slot map.
+bool cluster_client::retry_after_ask(unsigned int conn_id, request *req, protocol_response *response)
+{
+    unsigned int target = redirect_target_conn(conn_id, response);
+    if (target == UINT_MAX) {
+        const char *status = response->get_status();
+        benchmark_debug_log("no live primary connection for %s; retrying by slot map\n", status ? status : "-ASK");
+        return retry_after_redirect(conn_id, req);
+    }
+
+    if (!enqueue_redirect_retry(target, req)) return false;
+    req->m_asking = true;
+    return true;
+}
+
+// Resend the request to the node named by "-MOVED <slot> <host>:<port>".
+// handle_moved() only asks for a CLUSTER SLOTS refresh; until its reply lands
+// the slot map still names this connection, so a retry routed by the map
+// comes straight back here and is redirected again. With unlimited
+// --max-retries that repeats for as long as the refresh takes.
+//
+// The -MOVED address is authoritative, so a read under rp_primary goes there
+// like a write, without waiting for the target's CLUSTER SLOTS ladder (as
+// select_target_conn() does since #612). A read under another
+// --read-preference may belong on a replica, so it keeps routing by the slot
+// map, as does a request whose target has no primary connection (e.g. a node
+// not in the map yet, or one memtier still has as a replica after a
+// failover: its connection may have sent READONLY).
+bool cluster_client::retry_after_moved(unsigned int conn_id, request *req, protocol_response *response)
+{
+    if (!m_config->retry_on_error) return false;
+    if (!req || !req->m_serialized || req->m_serialized_len == 0) return false;
+
+    unsigned int target = UINT_MAX;
+    if (!classify_read(req) || m_config->read_preference == rp_primary)
+        target = redirect_target_conn(conn_id, response);
+    if (target == UINT_MAX || target == conn_id) return retry_after_redirect(conn_id, req);
+
+    // The node that owns the slot gets a plain resend: ASKING from an
+    // earlier -ASK would let a node importing the slot serve a key it does
+    // not own.
+    req->m_asking = false;
+    return enqueue_redirect_retry(target, req);
+}
+
+void cluster_client::hand_off_replay_requests(unsigned int conn_id)
+{
+    unsigned long long dropped = 0;
+    request *req;
+    while ((req = m_connections[conn_id]->pop_replay_request()) != NULL) {
+        const char *drop_reason = NULL;
+        unsigned int target = UINT_MAX;
+        if (m_config->transaction) {
+            // As for MOVED/ASK under --transaction: resending part of a
+            // MULTI/EXEC block on another connection would split it, or land
+            // it inside a block that connection has open. disconnect() no
+            // longer queues --transaction requests (#611), so this is a guard.
+            drop_reason = "transaction-not-replayed";
+        } else {
+            // Writes need the primary, and it serves reads too.
+            if (req->m_key && req->m_key_len > 0) {
+                target = slot_primary_conn_id(calc_hslot_crc16_cluster(req->m_key, req->m_key_len));
+            }
+            if (target >= m_connections.size() || target == conn_id) {
+                drop_reason = "no-slot-owner-for-replay";
+            } else if (m_connections[target]->get_connection_state() == conn_disconnected &&
+                       !m_connections[target]->is_reconnect_pending()) {
+                // Every primary of the topology just committed is connected,
+                // connecting, or waiting on a reconnect timer: the refresh
+                // dials the ones without a timer, and a dial that fails
+                // schedules one. A primary left disconnected with no timer
+                // is one attempt_reconnect() gave up on (no
+                // --reconnect-on-error, or --max-reconnect-attempts reached),
+                // so nothing would replay the request.
+                drop_reason = "slot-owner-down-for-replay";
+            }
+        }
+        if (drop_reason != NULL) {
+            struct timeval now;
+            gettimeofday(&now, NULL);
+            global_failed_keys_logger().log_failure(now, "REPLAY", req->m_key, req->m_key_len, drop_reason,
+                                                    req->m_retries);
+            dropped++;
+            delete req;
+            continue;
+        }
+        req->m_asking = false;
+        m_connections[target]->adopt_replay_request(req);
+    }
+    // Dropped requests are never resent: uncount them and count them as
+    // errors, as drain_replay_queue_after_reconnect does.
+    if (dropped) abandon_requests(dropped);
 }
 
 // Terminal accounting for a MOVED/ASK request whose retry was refused (e.g.
@@ -2772,9 +3042,68 @@ void cluster_client::finalize_dropped_redirect(struct timeval timestamp, request
     m_stats.inc_error();
 }
 
+// Terminal accounting for a request rejected with -READONLY and not retried.
+// Unlike MOVED/ASK there are no redirect stats to record it, so count the op
+// here, as client::handle_response does for any other error reply.
+void cluster_client::finalize_dropped_readonly(struct timeval timestamp, request *req, protocol_response *response)
+{
+    finalize_dropped_redirect(timestamp, req, response);
+
+    const unsigned int latency = ts_diff(req->m_first_sent_time, timestamp);
+    switch (req->m_type) {
+    case rt_get:
+        m_stats.update_get_op(&timestamp, response->get_total_len(), req->m_size, latency, response->get_hits(),
+                              req->m_keys - response->get_hits());
+        break;
+    case rt_set:
+        m_stats.update_set_op(&timestamp, response->get_total_len(), req->m_size, latency);
+        break;
+    case rt_wait:
+        m_stats.update_wait_op(&timestamp, latency);
+        break;
+    case rt_arbitrary:
+        m_stats.update_arbitrary_op(&timestamp, response->get_total_len(), req->m_size, latency,
+                                    static_cast<arbitrary_request *>(req)->index);
+        break;
+    default:
+        assert(0);
+        break;
+    }
+}
+
+void cluster_client::wake_mget_producers(unsigned int conn_id)
+{
+    if (conn_id >= m_mget_waiting_producers.size()) return;
+
+    std::vector<unsigned int> &producers = m_mget_waiting_producers[conn_id];
+    for (std::vector<unsigned int>::const_iterator i = producers.begin(); i != producers.end(); ++i) {
+        if (*i < m_connections.size()) m_connections[*i]->schedule_fill();
+    }
+    producers.clear(); // Retain capacity: no allocation on steady-state wakeups.
+}
+
+void cluster_client::handle_rate_limit_refill(unsigned int conn_id)
+{
+    wake_mget_producers(conn_id);
+}
+
+void cluster_client::handle_connection_disconnect(unsigned int conn_id)
+{
+    // A disconnected destination will not answer its pending requests. Let
+    // their producers retry routing to another live replica or the primary.
+    wake_mget_producers(conn_id);
+}
+
 void cluster_client::handle_response(unsigned int conn_id, struct timeval timestamp, request *request,
                                      protocol_response *response)
 {
+    // pop_req() has freed destination capacity. Wake before the error/redirect
+    // branches too, since those responses also release a pipeline slot. The
+    // coalesced callback runs after inc_reqs_processed(), never recursively
+    // inside this response handler; routing and the pipeline cap are checked
+    // again then. Reconnect/setup and topology changes have their own wakeups.
+    wake_mget_producers(conn_id);
+
     // EWMA latency update for `--read-preference=nearest`. Computed from the
     // request's most-recent send time (m_sent_time), not its first attempt;
     // retries should be reflected in the latency observed by selection.
@@ -2846,34 +3175,49 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
             // to `conn_id` (the rejecting replica) -- doing so re-queues the
             // request onto the same connection that just returned -READONLY,
             // guaranteeing another rejection until --retry-max-attempts is
-            // hit. Instead, schedule a topology refresh on this connection
-            // (the next CLUSTER SLOTS reply re-binds slot -> primary) and
-            // finalize the in-flight request as a terminal error -- the next
-            // pipeline tick reroutes future traffic correctly.
+            // hit. Instead, finalize the in-flight request as a terminal
+            // error, and refresh the topology only when the slot map may be
+            // stale (see below).
             // Match the readiness predicate used by MOVED/ASK write retries
             // and select_target_conn's write path: a TCP-connected primary
             // is sufficient for a write-class retry, even during a
             // CLUSTER SLOTS refresh (cluster_slots_state transiently !=
             // setup_done). Requiring setup_done here would drop valid
             // retries to a primary mid-refresh as terminal errors.
+            //
+            // Only --retry-on-error routes by m_key: --failed-keys-file also
+            // fills it, and recording a failure must not change recovery.
+            // A slot map that still names the rejecting connection as the
+            // primary is stale (e.g. it was just demoted), so treat that as
+            // "no live primary" too and refresh instead of re-queuing there.
+            // With --transaction, resending one command of a MULTI/EXEC block
+            // on another connection would split the block, so drop it like
+            // MOVED/ASK do.
+            //
+            // shard_connection pops a request for every reply it hands us.
+            assert(request != NULL);
             unsigned int primary_target = UINT_MAX;
-            if (request && request->m_key && request->m_key_len > 0) {
-                unsigned int hslot = calc_hslot_crc16_with_hash_tag(request->m_key, request->m_key_len);
+            if (m_config->retry_on_error && !m_config->transaction && request->m_key && request->m_key_len > 0) {
+                unsigned int hslot = calc_hslot_crc16_cluster(request->m_key, request->m_key_len);
                 unsigned int p = slot_primary_conn_id(hslot);
-                if (p != UINT_MAX && p < m_connections.size() &&
+                if (p != UINT_MAX && p != conn_id && p < m_connections.size() &&
                     m_connections[p]->get_connection_state() == conn_connected) {
                     primary_target = p;
                 }
             }
             if (primary_target == UINT_MAX) {
-                // No live primary known for this slot. Trigger a topology
-                // refresh on the rejecting connection and drop the request
-                // instead of looping it back onto the same replica.
-                m_connections[conn_id]->set_cluster_slots();
-                finalize_dropped_redirect(timestamp, request, response);
+                // No live primary to retry on: drop the request instead of
+                // looping it back onto the same replica. Refresh the topology
+                // only if the slot map still calls the rejecting connection a
+                // primary (e.g. it was just demoted). On a known replica,
+                // -READONLY is the expected answer to a write and a refresh
+                // cannot change that, so refreshing would cost one CLUSTER
+                // SLOTS per reply (#651).
+                if (m_connections[conn_id]->get_role() == role_primary) m_connections[conn_id]->set_cluster_slots();
+                finalize_dropped_readonly(timestamp, request, response);
                 return;
             }
-            if (m_config->retry_on_error && request && request->m_serialized && request->m_serialized_len > 0 &&
+            if (m_config->retry_on_error && request->m_serialized && request->m_serialized_len > 0 &&
                 m_connections[primary_target]->enqueue_retry(request)) {
                 m_stats.inc_retry_attempt();
                 if (request->m_retries == 0) m_stats.inc_retried_op();
@@ -2883,12 +3227,13 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
             // through and finalize as a terminal error to keep accounting
             // honest (the original send did happen on the wire and the
             // server explicitly rejected it).
-            finalize_dropped_redirect(timestamp, request, response);
+            finalize_dropped_readonly(timestamp, request, response);
             return;
         }
         // handle "-MOVED"
         if (strncmp(response->get_status(), MOVED_MSG_PREFIX, MOVED_MSG_PREFIX_LEN) == 0) {
-            handle_moved(conn_id, timestamp, request, response);
+            handle_moved(conn_id);
+            bool retried = false;
             // With --transaction, retrying a mid-rotation command on the new
             // slot owner would split the MULTI/EXEC block across two shard
             // connections. Drop the command instead. Reset the pin only when the
@@ -2905,10 +3250,18 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
                                             "interrupted rotation will be inaccurate.\n",
                                             conn_id);
                     }
-                    txn_release_pin();
-                    for (size_t i = 0; i < m_connections.size(); i++) {
-                        if (i != conn_id && m_connections[i]->get_connection_state() != conn_disconnected)
-                            m_connections[i]->schedule_fill();
+                    // Inside an open MULTI the server rejected the command
+                    // without queuing it and will answer the rotation's EXEC
+                    // with EXECABORT. Keep the pin then, so that EXEC still
+                    // goes to the connection holding the MULTI: moving it
+                    // would send EXEC elsewhere ("EXEC without MULTI") and
+                    // leave this MULTI open (#569).
+                    if (!m_connections[conn_id]->is_multi_open()) {
+                        txn_release_pin();
+                        for (size_t i = 0; i < m_connections.size(); i++) {
+                            if (i != conn_id && m_connections[i]->get_connection_state() != conn_disconnected)
+                                m_connections[i]->schedule_fill();
+                        }
                     }
                 } else {
                     benchmark_debug_log("--transaction: MOVED on stale (non-pin) connection %u dropped; "
@@ -2916,7 +3269,7 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
                                         conn_id, m_txn_pinned_conn_id);
                 }
                 finalize_dropped_redirect(timestamp, request, response);
-            } else if (m_config->retry_on_error && !retry_after_redirect(conn_id, request)) {
+            } else if (m_config->retry_on_error && !(retried = retry_after_moved(conn_id, request, response))) {
                 // With --retry-on-error, the captured command bytes are resent
                 // on the slot-owning connection. MOVED/ASK count toward
                 // max_retries. If the retry is refused (budget exhausted /
@@ -2924,12 +3277,13 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
                 // error so the request doesn't silently disappear from stats.
                 finalize_dropped_redirect(timestamp, request, response);
             }
+            update_redirect_stats(timestamp, request, response, true, !retried);
             return;
         }
 
         // handle "-ASK"
         if (strncmp(response->get_status(), ASK_MSG_PREFIX, ASK_MSG_PREFIX_LEN) == 0) {
-            handle_ask(conn_id, timestamp, request, response);
+            bool retried = false;
             if (m_config->transaction) {
                 if ((int) conn_id == m_txn_pinned_conn_id) {
                     if (!m_txn_pin_lost_warned) {
@@ -2939,10 +3293,18 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
                                             "interrupted rotation will be inaccurate.\n",
                                             conn_id);
                     }
-                    txn_release_pin();
-                    for (size_t i = 0; i < m_connections.size(); i++) {
-                        if (i != conn_id && m_connections[i]->get_connection_state() != conn_disconnected)
-                            m_connections[i]->schedule_fill();
+                    // Inside an open MULTI the server rejected the command
+                    // without queuing it and will answer the rotation's EXEC
+                    // with EXECABORT. Keep the pin then, so that EXEC still
+                    // goes to the connection holding the MULTI: moving it
+                    // would send EXEC elsewhere ("EXEC without MULTI") and
+                    // leave this MULTI open (#569).
+                    if (!m_connections[conn_id]->is_multi_open()) {
+                        txn_release_pin();
+                        for (size_t i = 0; i < m_connections.size(); i++) {
+                            if (i != conn_id && m_connections[i]->get_connection_state() != conn_disconnected)
+                                m_connections[i]->schedule_fill();
+                        }
                     }
                 } else {
                     benchmark_debug_log("--transaction: ASK on stale (non-pin) connection %u dropped; "
@@ -2950,9 +3312,10 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
                                         conn_id, m_txn_pinned_conn_id);
                 }
                 finalize_dropped_redirect(timestamp, request, response);
-            } else if (m_config->retry_on_error && !retry_after_redirect(conn_id, request)) {
+            } else if (m_config->retry_on_error && !(retried = retry_after_ask(conn_id, request, response))) {
                 finalize_dropped_redirect(timestamp, request, response);
             }
+            update_redirect_stats(timestamp, request, response, false, !retried);
             return;
         }
     }

@@ -270,6 +270,10 @@ def test_statsd_metrics_emitted(env):
             f"{expected_prefix}bytes_sec",
             f"{expected_prefix}latency_ms",
             f"{expected_prefix}connections",
+            # Instantaneous percentiles for the default --print-percentiles.
+            f"{expected_prefix}latency_p50",
+            f"{expected_prefix}latency_p99",
+            f"{expected_prefix}latency_p99_9",
         ]
 
         missing = [m for m in required_metrics if m not in names]

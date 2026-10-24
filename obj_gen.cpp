@@ -34,6 +34,21 @@
 #include "obj_gen.h"
 #include "memtier_benchmark.h"
 
+#ifdef MEMTIER_JRAND48_SHIM
+#include <stdint.h>
+// 48-bit LCG as specified for jrand48(): X = (0x5DEECE66D * X + 0xB) mod 2^48,
+// returns the high 32 bits of X as a signed value.
+static long jrand48(unsigned short xsubi[3])
+{
+    uint64_t x = (uint64_t) xsubi[0] | ((uint64_t) xsubi[1] << 16) | ((uint64_t) xsubi[2] << 32);
+    x = (x * UINT64_C(0x5DEECE66D) + UINT64_C(0xB)) & UINT64_C(0xFFFFFFFFFFFF);
+    xsubi[0] = (unsigned short) x;
+    xsubi[1] = (unsigned short) (x >> 16);
+    xsubi[2] = (unsigned short) (x >> 32);
+    return (int32_t) (x >> 16);
+}
+#endif
+
 random_generator::random_generator()
 {
     set_seed(0);
@@ -48,7 +63,7 @@ void random_generator::set_seed(int seed)
 
     int ret = initstate_r(seed, m_state_array, sizeof(m_state_array), &m_data_blob);
     assert(ret == 0);
-#elif (defined HAVE_DRAND48)
+#elif (defined HAVE_DRAND48) || (defined MEMTIER_JRAND48_SHIM)
     memset(&m_data_blob, 0, sizeof(m_data_blob));
     size_t seed_size = sizeof(seed); // get MIN size between seed and m_data_blob
     if (seed_size > sizeof(m_data_blob)) seed_size = sizeof(m_data_blob);
@@ -72,7 +87,7 @@ unsigned long long random_generator::get_random()
     ret = random_r(&m_data_blob, &rn);
     assert(ret == 0);
     llrn |= rn;
-#elif (defined HAVE_DRAND48)
+#elif (defined HAVE_DRAND48) || (defined MEMTIER_JRAND48_SHIM)
     long rn;
     // jrand48's range is -2^31..+2^31 (i.e. all 32 bits)
     rn = jrand48(m_data_blob);
@@ -92,7 +107,7 @@ unsigned long long random_generator::get_random_max() const
 {
 #ifdef HAVE_RANDOM_R
     return 0x3fffffffffffffff; // 62 bits
-#elif (defined HAVE_DRAND48)
+#elif (defined HAVE_DRAND48) || (defined MEMTIER_JRAND48_SHIM)
     return 0x7fffffffffffffff; // 63 bits
 #endif
 }
@@ -130,9 +145,13 @@ unsigned long long gaussian_noise::gaussian_distribution_range(double stddev, do
     if (median == 0) median = len / 2.0 + min + 0.5;
     if (stddev == 0) stddev = len / 6.0;
     assert(median > min && median < max);
+    // max + 1 in double: in unsigned long long it wraps to 0 for
+    // max == ULLONG_MAX and every sample would be rejected.
     do {
         val = gaussian_distribution(stddev) + median;
-    } while (val < min || val > max + 1);
+    } while (val < min || val > (double) max + 1);
+    // Converting a double >= 2^64 to unsigned long long is undefined.
+    if (val >= (double) max) return max;
     return val;
 }
 
@@ -369,11 +388,18 @@ void object_generator::set_key_zipf_distribution(double key_exp)
     }
 }
 
-// return a random number between r_min and r_max
+// return a random number between r_min and r_max.  get_random() yields 62
+// bits (get_random_max()), so this is only uniform for spans up to 2^62:
+// above that the result never exceeds r_min + 2^62 - 1, and spans that do not
+// divide 2^62 are biased toward the low part (as they always were).
 unsigned long long object_generator::random_range(unsigned long long r_min, unsigned long long r_max)
 {
     unsigned long long rn = m_random.get_random();
-    return (rn % (r_max - r_min + 1)) + r_min;
+    unsigned long long span = r_max - r_min + 1;
+    // A full 0..ULLONG_MAX range wraps span to 0 (rn % 0 is SIGFPE); every
+    // rn is in range then.
+    if (span == 0) return rn;
+    return (rn % span) + r_min;
 }
 
 // return a random number between r_min and r_max using normal distribution according to r_stddev
@@ -381,6 +407,15 @@ unsigned long long object_generator::normal_distribution(unsigned long long r_mi
                                                          double r_stddev, double r_median)
 {
     return m_random.gaussian_distribution_range(r_stddev, r_median, r_min, r_max);
+}
+
+// Convert a Zipf sample to a key: with --key-maximum near ULLONG_MAX the
+// double can reach 2^64, and converting that to unsigned long long is
+// undefined, so clamp to the range maximum as the Gaussian path does.
+static unsigned long long zipf_key(double k, unsigned long long max)
+{
+    if (k >= (double) max) return max;
+    return (unsigned long long) k;
 }
 
 // following sampler is based on:
@@ -402,8 +437,8 @@ unsigned long long object_generator::zipf_distribution()
             if (x < m_key_zipf_min - 0.5) x = m_key_zipf_min + 0.5;
             if (x >= m_key_zipf_max + 0.5) x = m_key_zipf_max;
             double k = floor(x + 0.5);
-            if (k - x <= m_key_zipf_s) return k;
-            if (u > log(k + 0.5) - 1. / k) return k;
+            if (k - x <= m_key_zipf_s) return zipf_key(k, m_key_zipf_max);
+            if (u > log(k + 0.5) - 1. / k) return zipf_key(k, m_key_zipf_max);
         }
     } else {
         while (true) {
@@ -413,9 +448,9 @@ unsigned long long object_generator::zipf_distribution()
             if (x < m_key_zipf_min - 0.5) x = m_key_zipf_min + 0.5;
             if (x >= m_key_zipf_max + 0.5) x = m_key_zipf_max;
             double k = floor(x + 0.5);
-            if (k - x <= m_key_zipf_s) return k;
+            if (k - x <= m_key_zipf_s) return zipf_key(k, m_key_zipf_max);
             double t = (u - pow(k + 0.5, m_key_zipf_1mexp));
-            if (m_key_zipf_1mexpInv * t > -pow(k, -m_key_zipf_exp)) return k;
+            if (m_key_zipf_1mexpInv * t > -pow(k, -m_key_zipf_exp)) return zipf_key(k, m_key_zipf_max);
         }
     }
 }
@@ -461,7 +496,14 @@ const char *object_generator::get_value(unsigned long long key_index, unsigned i
         new_size = m_data_size.size_fixed;
     } else if (m_data_size_type == data_size_range) {
         if (m_data_size_pattern && *m_data_size_pattern == 'S') {
-            double a = (key_index - m_key_min) / static_cast<double>(m_key_max - m_key_min);
+            // Clamp into the key range: an index below m_key_min would wrap
+            // the unsigned subtraction, and a single-key range would divide
+            // 0 by 0. Either way the out-of-range double would then be
+            // converted to unsigned int (undefined behaviour).
+            if (key_index < m_key_min) key_index = m_key_min;
+            if (key_index > m_key_max) key_index = m_key_max;
+            double a = 0;
+            if (m_key_max > m_key_min) a = (key_index - m_key_min) / static_cast<double>(m_key_max - m_key_min);
             new_size = (m_data_size.size_range.size_max - m_data_size.size_range.size_min) * a +
                        m_data_size.size_range.size_min;
         } else {
@@ -510,23 +552,30 @@ imported_keylist::~imported_keylist()
     m_keys.clear();
 }
 
-bool imported_keylist::read_keys(void)
+bool imported_keylist::read_keys(bool keep_keys)
 {
     file_reader f(m_filename);
 
     if (!f.open_file()) return false;
-    while (!f.is_eof()) {
-        memcache_item *i = f.read_item();
-
-        if (i != NULL) {
+    // read_item() returns NULL both at the end of the file and on a malformed
+    // item, and it does not skip past the bad input. Stop at the first NULL.
+    unsigned int count = 0;
+    memcache_item *i;
+    while ((i = f.read_item()) != NULL) {
+        count++;
+        if (keep_keys) {
             key *k = (key *) malloc(i->get_nkey() + sizeof(key) + 1);
             assert(k != NULL);
             k->key_len = i->get_nkey();
             memcpy(k->key_data, i->get_key(), i->get_nkey());
-            delete i;
-
             m_keys.push_back(k);
         }
+        delete i;
+    }
+    if (f.has_error()) return false;
+    if (count == 0) {
+        fprintf(stderr, "%s: no items found.\n", m_filename);
+        return false;
     }
 
     return true;
@@ -568,6 +617,7 @@ import_object_generator::import_object_generator(const import_object_generator &
         m_keys(from.m_keys),
         m_reader(from.m_reader),
         m_cur_item(NULL),
+        m_reader_opened(from.m_reader_opened),
         m_no_expiry(from.m_no_expiry)
 {
     if (m_keys != NULL) {

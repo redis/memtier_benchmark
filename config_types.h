@@ -23,7 +23,7 @@
 #include <pthread.h>
 #endif
 
-#include <netinet/in.h>
+#include "platform_compat.h"
 
 #include <vector>
 #include <string>
@@ -138,7 +138,13 @@ enum command_arg_type
 struct command_arg
 {
     command_arg(const char *arg, unsigned int arg_len) :
-            type(undefined_type), data(arg, arg_len), monitor_index(0), has_key_affixes(false)
+            type(undefined_type),
+            data(arg, arg_len),
+            monitor_index(0),
+            data_key_index(0),
+            has_key_affixes(false),
+            resolved(false),
+            scan_cursor(false)
     {
         ;
     }
@@ -146,11 +152,34 @@ struct command_arg
     std::string data;
     // For monitor_type, stores the index (1-based)
     size_t monitor_index;
+    // __monitor_line@__ only: index of the most recent generated __key__
+    // before this argument (0 if none), which sizes a __data__ here under
+    // --data-size-pattern=S. Set by client::resolve_monitor_placeholders().
+    unsigned long long data_key_index;
     // the prefix and suffix strings are used for mixed key placeholder storing of substrings
     std::string data_prefix;
     std::string data_suffix;
     // optimization flag to avoid runtime checks
     bool has_key_affixes;
+    // data is final text, set by client::resolve_monitor_placeholders():
+    // format_arbitrary_command() frames it as a constant without scanning it
+    // for placeholders (a generated key can itself contain "__key__").
+    bool resolved;
+    // The cursor slot of the internal --scan-incremental-iteration
+    // continuation command, filled per request by
+    // client::create_scan_continuation_request(). A user-supplied
+    // "__scan_cursor__" never sets this and is sent as a constant (#663).
+    bool scan_cursor;
+};
+
+// What a --command does to the connection's MULTI block. Resolved once from
+// argv[0] by resolve_command_meta() so the per-request path needs no string
+// compare (--transaction tracks open MULTI blocks per connection, #569).
+enum multi_effect
+{
+    multi_effect_none,
+    multi_effect_opens, // MULTI
+    multi_effect_closes // EXEC, DISCARD
 };
 
 struct arbitrary_command
@@ -174,6 +203,11 @@ struct arbitrary_command
     unsigned int count_user_key_placeholders() const;
 
     std::vector<command_arg> command_args;
+    // __monitor_line@__ only: argument 1 after
+    // client::resolve_monitor_placeholders() (the text cluster mode routes
+    // by), recorded on the request for --failed-keys-file and
+    // --retry-on-error.
+    std::string resolved_key;
     std::string command;
     std::string command_name; // Display name (e.g., "SET (Line 1)" or "SET")
     std::string command_type; // Base command type for aggregation (e.g., "SET")
@@ -198,6 +232,8 @@ struct arbitrary_command
     //  1 = force treat as a read.
     // C++11-compatible replacement for std::optional<bool>.
     int is_read_override; // -1 / 0 / 1
+
+    enum multi_effect multi_effect;
 };
 
 struct arbitrary_command_list

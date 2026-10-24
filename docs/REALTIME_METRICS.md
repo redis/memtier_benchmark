@@ -107,8 +107,15 @@ The following metrics are sent approximately every 1 second during the benchmark
 
 | Metric | StatsD type | Graphite path | Description |
 |--------|-------------|---------------|-------------|
-| `connections` | gauge | `stats.gauges.<prefix>.<label>.connections` | Active connection count (`--clients` × active thread count) |
+| `connections` | gauge | `stats.gauges.<prefix>.<label>.connections` | Configured clients per unfinished worker × unfinished worker count; uses the scheduled count in staircase mode |
 | `connection_errors` | gauge | `stats.gauges.<prefix>.<label>.connection_errors` | Cumulative connection error count. **Only sent when the count is > 0** and not zeroed at run end — stale values may linger in Graphite after errors clear. Protocol-level command errors are not tracked here. |
+
+The `connections` gauge includes clients waiting for setup or reconnect, and clients
+that finished while their worker thread is still running. In staircase mode it
+uses the scheduled client count per worker; actual activation and metric sampling
+can occur at different times. On normal completion the gauge reaches zero when
+no workers remain. An interrupted StatsD run can leave its last sampled value;
+Prometheus explicitly publishes zero connections and threads at run end.
 
 ### Progress
 
@@ -180,7 +187,7 @@ The included dashboard provides:
 - **Operations per Second** - Current and average ops/sec over time
 - **Latency** - Current and average latency in milliseconds
 - **Throughput** - Current and average bytes/sec
-- **Connections** - Active connection count
+- **Connections** - Configured client concurrency in unfinished worker threads
 - **Progress** - Benchmark completion percentage
 - **Connection Errors** - Error count indicator
 
@@ -255,7 +262,7 @@ curl http://127.0.0.1:8080/metrics
 |--------|---------|-------------|
 | `--prometheus-port=PORT` | *(disabled)* | TCP port for `/metrics`. `0` selects an ephemeral port. Setting it enables the exporter. |
 | `--prometheus-bind-addr=ADDR` | `127.0.0.1` | Numeric IPv4/IPv6 address to bind to. Hostnames are not supported. A non-loopback address prints a one-shot warning. |
-| `--prometheus-run-label=KEY=VALUE` | *(none)* | Constant label applied to every sample; repeatable, max 16. |
+| `--prometheus-run-label=KEY=VALUE` | *(none)* | Constant label applied to every sample; repeatable, max 16. Invalid UTF-8 in a value is replaced with U+FFFD and a warning is printed. |
 | `--prometheus-latency-buckets=LIST` | *(26 built-in)* | Comma-separated, strictly ascending latency bucket bounds in seconds. Bounds within ~1% of each other collapse to one HDR slot and are rejected. |
 
 ### Ephemeral-port contract
@@ -283,10 +290,11 @@ differences from the StatsD names above:
 | `memtier_ops_total` | counter | `ops_sec` (rate) | Prometheus exports the cumulative total; rate is derived at query time. |
 | `memtier_sent_bytes_total` / `memtier_received_bytes_total` | counter | `bytes_sec` | Cumulative bytes since process start. |
 | `memtier_hits_total` / `memtier_misses_total` | counter | hits/misses | |
-| `memtier_errors_total` | counter | — | Errors after retries are exhausted. |
+| `memtier_errors_total` | counter | — | Requests that ultimately failed: errors after retries are exhausted, or requests given up on without a reply under `--retry-on-error`. |
 | `memtier_connection_errors_total` | counter | `connection_errors` | Accumulated across runs (StatsD reports the raw per-run value). |
 | `memtier_retry_attempts_total` / `memtier_retried_ops_total` | counter | — | Nonzero only with `--retry-on-error`. |
-| `memtier_connections` / `memtier_threads` | gauge | `connections` | |
+| `memtier_connections` | gauge | `connections` | Configured client concurrency; see [Connections and Errors](#connections-and-errors). |
+| `memtier_threads` | gauge | — | Worker threads that have not finished, including those waiting for setup or reconnect. |
 | `memtier_run` / `memtier_configured_runs` | gauge | — | Current run (1-based; 0 before the first run) and `--run-count`. |
 | `memtier_config_test_time_seconds` | gauge | — | Configured `--test-time` (0 when bounded by `--requests`). |
 | `memtier_latency_seconds` | histogram | `latency_ms` family | Seconds, not milliseconds; see the accuracy notes below. |
@@ -301,23 +309,23 @@ per-run reset that a naive exporter would emit.
 
 ### Latency accuracy (error model)
 
-`memtier_latency_seconds` is built from **1 Hz snapshots** of each connection's
-in-progress second of HDR-recorded latencies. Treat it as an operational signal,
-not the authoritative result:
+`memtier_latency_seconds` is built from each connection's per-second HDR
+latency histograms. Every completed operation is counted exactly once. Treat
+it as an operational signal, not the authoritative result:
 
-- **Phase-dependent capture (~50% in steady state).** Only the portion of each
-  connection's per-second histogram that is complete at snapshot time is folded
-  in, so in steady state roughly half of all operations are represented.
-  `memtier_latency_seconds_count` is therefore **not** comparable to
-  `memtier_ops_total` and must not be used to compute a hit fraction.
-- **Stall dedup + residuals.** A snapshot whose source histogram has not changed
-  since the previous tick is skipped, so a stalled server (every in-flight op
-  frozen) does **not** keep inflating `_count`; once traffic resumes the series
-  grows again. A small residual at the tail of a run can be lost this way.
-- **Run-tail loss.** The final fraction of a second at run end may not be
-  captured by the last tick.
-- **HDR quantization (≤1%).** Bucket placement carries up to 1% HDR
-  quantization; the `le` bound rendered is the user-supplied (µs-quantized)
+- **About 1 s behind, never ahead.** A connection's second is folded in when
+  that connection completes its first operation of the next second, and the
+  exporter collects folded seconds at its 1 Hz tick. So while a run is in
+  progress `memtier_latency_seconds_count` trails `memtier_ops_total` by about
+  one second of operations, and never exceeds it. The lag is longer for a
+  connection whose next operation is slow to complete: while the server is
+  stalled the gap stays open (and `_count` frozen), and with a low
+  `--rate-limiting` rate it can span several seconds. At run end the last
+  partial second is folded in, so `_count` catches up with the ops the clients
+  completed.
+- **HDR quantization.** Bucket placement carries up to 1% HDR quantization
+  above ~1 ms, and 8 µs absolute below ~2 ms (e.g. up to 8% at 100 µs); the
+  `le` bound rendered is the user-supplied (µs-quantized)
   bound, not the internal slot edge.
 
 For exact percentiles and totals, use the **end-of-run output** (or the full
@@ -337,6 +345,10 @@ is the operator's responsibility (there is no authentication on the endpoint).
 HTTP hardening rejects non-GET methods, oversized headers, and unknown paths.
 
 ### Mode interactions
+
+The connection gauges count logical clients. In cluster mode each client may open
+several physical connections to primaries and replicas; the gauges are not
+multiplied by the shard or replica count.
 
 - **`--cluster-mode`** is supported. Counters are cluster-wide totals summed
   across all shard connections; the exporter binds its own TCP socket

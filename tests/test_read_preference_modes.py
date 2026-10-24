@@ -42,7 +42,10 @@ Test matrix
 
 import json
 import os
+import socket
 import tempfile
+import threading
+import time
 
 from include import (
     add_required_env_arguments,
@@ -461,6 +464,204 @@ def test_read_preference_keyless_arbitrary_secondary(env):
             debugPrintMemtierOnError(run_config, env)
 
 
+def test_arbitrary_read_routing_duplicate_command_names(env):
+    """Two arbitrary GET lines with the same name must get distinct keys in
+    the "Arbitrary Read Routing" JSON block (#587). Previously both were
+    written as "GET" and JSON parsers kept only the last one. The first line
+    runs 3x as often, so a swapped numbering cannot pass."""
+    if not env.isCluster():
+        env.skip()
+        return
+    replica_conns = get_cluster_replica_connections(env)
+    if not replica_conns:
+        env.skip()
+        return
+
+    _pre_populate(env, key_count=100)
+
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--command=GET __key__",
+            "--command-ratio=3",
+            "--command=GET __key__",
+            "--key-prefix=rp-key-",
+            "--key-minimum=1",
+            "--key-maximum=99",
+            "--read-preference=secondary",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+
+    # 2 clients x 100 requests in rounds of 3 + 1.
+    config = get_default_memtier_config(threads=1, clients=2, requests=100)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    test_dir = tempfile.mkdtemp()
+    run_config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(run_config.results_dir)
+
+    ok = Benchmark.from_json(run_config, benchmark_specs).run()
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier exited non-zero")
+
+        duplicates = []
+
+        def no_duplicates(pairs):
+            keys = [k for k, _ in pairs]
+            duplicates.extend(sorted(set(k for k in keys if keys.count(k) > 1)))
+            return dict(pairs)
+
+        json_path = os.path.join(run_config.results_dir, "mb.json")
+        with open(json_path) as fh:
+            result = json.load(fh, object_pairs_hook=no_duplicates)
+        env.assertEqual(duplicates, [])
+
+        routing = result["ALL STATS"].get("Arbitrary Read Routing", {})
+        env.assertEqual(sorted(routing.keys()), ["GET #1", "GET #2"])
+        for key, count in (("GET #1", 150), ("GET #2", 50)):
+            if key in routing:
+                ops = int(routing[key]["Ops from Primary"]) + int(routing[key]["Ops from Replica"])
+                env.assertEqual(ops, count, message="{} routed ops".format(key))
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def _sum_readonly_errors(conns):
+    """Sum errorstat_READONLY counts across a list of Redis connections."""
+    total = 0
+    for conn in conns:
+        try:
+            stats = conn.execute_command("INFO", "ERRORSTATS")
+        except Exception:
+            continue
+        if isinstance(stats, dict):
+            total += int(stats.get("errorstat_READONLY", {}).get("count", 0))
+        else:
+            for line in stats.split("\n"):
+                line = line.strip()
+                if line.startswith("errorstat_READONLY:count="):
+                    total += int(line.split("=", 1)[1])
+    return total
+
+
+def _redis_version(conn):
+    """Return the server's (major, minor) from INFO server, or (0, 0)."""
+    info = conn.execute_command("INFO", "server")
+    if isinstance(info, dict):
+        version = str(info.get("redis_version", ""))
+    else:
+        if isinstance(info, bytes):
+            info = info.decode("utf-8", errors="replace")
+        version = ""
+        for line in info.splitlines():
+            if line.startswith("redis_version:"):
+                version = line.split(":", 1)[1].strip()
+    try:
+        return tuple(int(part) for part in version.split(".")[:2])
+    except ValueError:
+        return (0, 0)
+
+
+def test_read_preference_readonly_reply_counted(env):
+    """A read-routed request a replica rejects with -READONLY, and that is
+    not retried, is counted as an op. A write script without a shebang has
+    no write flag, so a replica runs it and the write inside fails with
+    -READONLY. Totals Count must equal the requested total, with the bytes
+    and latency of every op, and each -READONLY must be logged as a failure."""
+    if not env.isCluster():
+        env.skip()
+        return
+    replica_conns = get_cluster_replica_connections(env)
+    if not replica_conns:
+        env.skip()
+        return
+    # INFO ERRORSTATS, which counts the -READONLY replies, needs Redis 6.2.
+    if _redis_version(replica_conns[0]) < (6, 2):
+        env.skip()
+        return
+
+    for conn in replica_conns:
+        conn.execute_command("CONFIG", "RESETSTAT")
+
+    threads, clients, requests = 1, 2, 100
+    script = "return redis.call('set',KEYS[1],'x')"
+    test_dir = tempfile.mkdtemp()
+    failed_keys = os.path.join(test_dir, "failed-keys.csv")
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--command=EVAL \"{}\" 1 __key__".format(script),
+            "--failed-keys-file=" + failed_keys,
+            "--command-is-read",
+            "--read-preference=secondary",
+            # Fall back to the primary so that the per-error CLUSTER SLOTS
+            # refresh on a replica does not hold the run.
+            "--read-preference-fallback=primary",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+
+    config = get_default_memtier_config(threads=threads, clients=clients, requests=requests)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    run_config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(run_config.results_dir)
+
+    benchmark = Benchmark.from_json(run_config, benchmark_specs)
+    ok = benchmark.run()
+
+    # The smallest request memtier can send for this command: a one-byte key.
+    min_request = len("*4\r\n$4\r\nEVAL\r\n${}\r\n{}\r\n$1\r\n1\r\n$1\r\nk\r\n".format(len(script), script))
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier exited non-zero")
+        readonly_errors = _sum_readonly_errors(replica_conns)
+        env.assertGreater(
+            readonly_errors,
+            0,
+            message="no replica answered -READONLY; the test did not exercise the drop path",
+        )
+        stats = _load_mb_json(run_config)["ALL STATS"]
+        totals = stats["Totals"]
+        env.assertEqual(
+            int(totals["Count"]),
+            threads * clients * requests,
+            message="Totals Count {} != requested {} ({} -READONLY replies on replicas)".format(
+                totals["Count"], threads * clients * requests, readonly_errors
+            ),
+        )
+        # The ops are recorded under the command, not under Gets or Sets.
+        env.assertEqual(int(stats["Evals"]["Count"]), int(totals["Count"]), message="Evals Count != Totals Count")
+        bytes_tx = sum(second["Bytes TX"] for second in totals["Time-Serie"].values())
+        env.assertGreaterEqual(
+            bytes_tx,
+            int(totals["Count"]) * min_request,
+            message="Totals Bytes TX {} < {} ops x {} bytes".format(bytes_tx, totals["Count"], min_request),
+        )
+        # Every -READONLY memtier reads is a dropped request, logged once. A
+        # replica can count more: a slot map refresh may retire its connection
+        # before memtier reads the reply, and the request is then replayed on
+        # the primary instead.
+        with open(failed_keys) as fh:
+            rows = fh.readlines()[1:]
+        env.assertGreater(len(rows), 0, message="no dropped request in --failed-keys-file")
+        env.assertLessEqual(
+            len(rows), readonly_errors, message="failed-keys rows > {} -READONLY replies".format(readonly_errors)
+        )
+        for row in rows:
+            env.assertContains("READONLY", row)
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
 # ---------------------------------------------------------------------------
 # Test 6 - Endpoints / Read Routing JSON schema validation
 #
@@ -647,3 +848,247 @@ def test_endpoints_json_emitted(env):
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config_pri, env)
+
+
+_WAKE_THREADS = 2
+_WAKE_CLIENTS = 4
+
+
+def _run_read_pref_workload(env, args, requests, timeout=60):
+    """Run a --read-preference workload of _WAKE_THREADS x _WAKE_CLIENTS
+    clients; return (ok, run_config). A connection held in hold_pipeline()
+    is never woken again, so a regression hangs: keep the timeout short."""
+    benchmark_specs = {"name": env.testName, "args": list(args)}
+    addTLSArgs(benchmark_specs, env)
+
+    config = get_default_memtier_config(threads=_WAKE_THREADS, clients=_WAKE_CLIENTS, requests=requests)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    test_dir = tempfile.mkdtemp()
+    run_config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(run_config.results_dir)
+
+    benchmark = Benchmark.from_json(run_config, benchmark_specs)
+    ok = benchmark.run(timeout=timeout)
+    return ok, run_config
+
+
+def _wait_for_replicas_in_cluster_slots(env, replica_conns, timeout=30):
+    """Wait until every node's CLUSTER SLOTS lists every replica. Right
+    after the cluster starts, nodes can still disagree; memtier then sees
+    the topology change on every refresh and retires and reconnects
+    connections throughout the run, which also wakes held ones and hides
+    the bug these tests look for."""
+    nodes = env.getOSSMasterNodesConnectionList() + replica_conns
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        listed = set()
+        for conn in nodes:
+            listed.add(sum(len(entry) - 3 for entry in conn.execute_command("CLUSTER", "SLOTS")))
+        if listed == {len(replica_conns)}:
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def test_read_preference_replica_refresh_wakes_peers(env):
+    """Connections held while a replica refreshes its slot map must resume
+    once the refresh completes. Under --read-preference=secondary with GETs
+    in the ratio, hold_pipeline() holds every connection while any replica
+    is connected but not ready for reads, which includes a replica with a
+    CLUSTER SLOTS refresh in flight. If nothing wakes them afterwards,
+    requests already queued on them are never sent and the run stops short
+    of --requests (#602).
+
+    A write script without a shebang has no write flag, so a replica runs it
+    and the write inside fails with -READONLY. With no key to reroute by,
+    each rejection makes the replica connection refresh its slot map. The
+    SETs go to the primaries, so primary connections have queued work too."""
+    if not env.isCluster():
+        env.skip()
+        return
+    replica_conns = get_cluster_replica_connections(env)
+    if not replica_conns:
+        env.skip()
+        return
+
+    env.assertTrue(
+        _wait_for_replicas_in_cluster_slots(env, replica_conns),
+        message="nodes did not agree on the replicas in CLUSTER SLOTS",
+    )
+    requests = 2000
+    ok, run_config = _run_read_pref_workload(
+        env,
+        [
+            "--command=EVAL \"return redis.call('set',KEYS[1],'x')\" 1 __key__",
+            "--command-is-read",
+            "--command=SET __key__ y",
+            "--read-preference=secondary",
+            "--pipeline=4",
+        ],
+        requests,
+    )
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="memtier exited non-zero or timed out; a client stopped before reaching --requests")
+        if ok:
+            # Every request ends as an op, the -READONLY ones included.
+            totals = _load_mb_json(run_config)["ALL STATS"]["Totals"]
+            env.assertEqual(int(totals["Count"]), _WAKE_THREADS * _WAKE_CLIENTS * requests)
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+class _DroppingProxy(object):
+    """TCP proxy to a replica. After `after` chunks from the client side it
+    closes every connection and stops listening, so the replica's
+    connection drops and every reconnect is refused."""
+
+    def __init__(self, target_port, after):
+        self.target_port = target_port
+        self.after = after
+        self.chunks = 0
+        self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(64)
+        self.port = self.listener.getsockname()[1]
+        self.dropped = threading.Event()
+        self.lock = threading.Lock()
+        self.socks = []
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        while not self.dropped.is_set():
+            try:
+                client, _ = self.listener.accept()
+                server = socket.create_connection(("127.0.0.1", self.target_port))
+            except OSError:
+                return
+            with self.lock:
+                self.socks += [client, server]
+            threading.Thread(target=self._pump, args=(client, server, True), daemon=True).start()
+            threading.Thread(target=self._pump, args=(server, client, False), daemon=True).start()
+
+    def _pump(self, src, dst, from_client):
+        try:
+            while True:
+                data = src.recv(65536)
+                if not data:
+                    break
+                dst.sendall(data)
+                if from_client:
+                    with self.lock:
+                        self.chunks += 1
+                        drop = self.chunks >= self.after
+                    if drop:
+                        self.close()
+                        return
+        except OSError:
+            pass
+        for sock in (src, dst):
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def close(self):
+        self.dropped.set()
+        with self.lock:
+            socks = list(self.socks)
+        for sock in [self.listener] + socks:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def _replica_advertised_port(env, node_id):
+    """The client port every master's CLUSTER NODES advertises for node_id,
+    or None while the masters disagree."""
+    ports = set()
+    for conn in env.getOSSMasterNodesConnectionList():
+        raw = conn.execute_command("CLUSTER", "NODES")
+        if isinstance(raw, bytes):
+            raw = raw.decode()
+        for line in raw.splitlines():
+            fields = line.split()
+            if fields and fields[0] == node_id:
+                ports.add(int(fields[1].split("@")[0].rsplit(":", 1)[1]))
+    return ports.pop() if len(ports) == 1 else None
+
+
+def _announce_port(env, replica, node_id, port, expected):
+    replica.execute_command("CONFIG", "SET", "cluster-announce-port", str(port))
+    deadline = time.time() + 30
+    while _replica_advertised_port(env, node_id) != expected:
+        if time.time() > deadline:
+            return False
+        time.sleep(0.2)
+    return True
+
+
+def test_read_preference_replica_disconnect_wakes_peers(env):
+    """A replica connection that drops and fails to reconnect must wake the
+    connections hold_pipeline() held while it was not ready for reads
+    (reconnecting counts). The cluster advertises one replica at a proxy
+    that drops it mid-run and then refuses connections; the run must still
+    complete instead of hanging (#602)."""
+    # The proxy only relays plaintext ports.
+    if not env.isCluster() or env.useTLS:
+        env.skip()
+        return
+    replica_conns = get_cluster_replica_connections(env)
+    if not replica_conns:
+        env.skip()
+        return
+
+    replica = replica_conns[0]
+    node_id = replica.execute_command("CLUSTER", "MYID")
+    if isinstance(node_id, bytes):
+        node_id = node_id.decode()
+    real_port = int(replica.connection_pool.connection_kwargs["port"])
+    proxy = _DroppingProxy(real_port, after=200)
+    requests = 2000
+    try:
+        env.assertTrue(
+            _announce_port(env, replica, node_id, proxy.port, proxy.port),
+            message="cluster did not advertise the proxied replica port",
+        )
+        env.assertTrue(
+            _wait_for_replicas_in_cluster_slots(env, replica_conns),
+            message="nodes did not agree on the replicas in CLUSTER SLOTS",
+        )
+        ok, run_config = _run_read_pref_workload(
+            env,
+            [
+                "--ratio=1:1",
+                "--key-maximum=10000",
+                "--read-preference=secondary",
+                "--pipeline=4",
+                "--reconnect-on-error",
+            ],
+            requests,
+        )
+        failed = env.getNumberOfFailedAssertion()
+        try:
+            env.assertTrue(proxy.dropped.is_set(), message="the proxied replica connection was never dropped")
+            env.assertTrue(
+                ok, message="memtier exited non-zero or timed out; a client stopped before reaching --requests"
+            )
+            if ok:
+                totals = _load_mb_json(run_config)["ALL STATS"]["Totals"]
+                env.assertEqual(int(totals["Count"]), _WAKE_THREADS * _WAKE_CLIENTS * requests)
+        finally:
+            if env.getNumberOfFailedAssertion() > failed:
+                debugPrintMemtierOnError(run_config, env)
+    finally:
+        proxy.close()
+        if not _announce_port(env, replica, node_id, 0, real_port):
+            env.debugPrint("could not restore the cluster-announce-port of replica {}".format(real_port), True)

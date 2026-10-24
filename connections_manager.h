@@ -28,8 +28,14 @@ class connections_manager
 public:
     virtual unsigned long long get_reqs_processed(void) = 0;
     virtual void inc_reqs_processed(void) = 0;
+    virtual unsigned long long get_reqs_answered(void) = 0;
+    virtual void inc_reqs_answered(void) = 0;
     virtual unsigned long long get_reqs_generated(void) = 0;
     virtual void inc_reqs_generated(void) = 0;
+    virtual void dec_reqs_generated(unsigned long long count) = 0;
+    // Requests sent and then given up for good under --retry-on-error (never
+    // resent, never answered): uncount them and count each as an error.
+    virtual void abandon_requests(unsigned long long count) = 0;
     virtual bool finished(void) = 0;
     virtual bool all_connections_idle(void) = 0;
 
@@ -45,14 +51,28 @@ public:
     // worker enters steady-state routing with an empty topology and every
     // slot lookup returns UINT_MAX. Non-cluster clients (no override) return
     // false because they never produce a topology.
-    virtual bool handle_cluster_slots(protocol_response *r) = 0;
+    virtual bool handle_cluster_slots(unsigned int conn_id, protocol_response *r) = 0;
     virtual void handle_response(unsigned int conn_id, struct timeval timestamp, request *request,
                                  protocol_response *response) = 0;
 
     virtual void create_request(struct timeval timestamp, unsigned int conn_id) = 0;
     virtual bool hold_pipeline(unsigned int conn_id) = 0;
+    // Called only with a drained pipeline. Commit a planned transaction
+    // reconnect if its interval and full command-rotation boundary are due.
+    virtual bool prepare_transaction_reconnect() { return false; }
+
+    // Routed requests can be waiting on another connection's rate budget.
+    virtual void handle_rate_limit_refill(unsigned int) {}
+    virtual void handle_connection_disconnect(unsigned int) {}
 
     virtual int connect(void) = 0;
+    // Reconnect one dropped connection: returns 0 once a connect is issued,
+    // 1 if the reconnect was left to a later step, -1 on failure. Only the
+    // main connection exists outside cluster mode, so the default reconnects it.
+    virtual int reconnect(unsigned int) { return connect(); }
+    // --transaction: true while the given connection holds the pin of the
+    // in-flight command rotation, i.e. it will send the rotation's EXEC.
+    virtual bool is_transaction_pinned(unsigned int) { return false; }
     virtual void disconnect(void) = 0;
     virtual void disconnect_all(void) = 0;
 

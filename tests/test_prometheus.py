@@ -25,11 +25,13 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import tempfile
 import threading
 import time
+import urllib.request
 
 from include import (
     MEMTIER_BINARY,
@@ -216,13 +218,13 @@ def _promtool_validate(env, body, scrape_path):
     if not promtool:
         env.debugPrint("[SKIP] promtool not on PATH; gate uses docker promtool", True)
         return
-    with open(scrape_path, "w") as fh:
-        fh.write(body)
+    raw = body.encode("utf-8")
+    with open(scrape_path, "wb") as fh:
+        fh.write(raw)
     proc = subprocess.run(
         [promtool, "check", "metrics"],
-        input=body,
+        input=raw,
         capture_output=True,
-        text=True,
         timeout=30,
     )
     env.assertEqual(
@@ -523,6 +525,58 @@ def test_F8_run_label_propagation_and_escaping(env):
 
 
 # ---------------------------------------------------------------------------
+# F8b -- run-label values that are not valid UTF-8 (#753)
+# ---------------------------------------------------------------------------
+def test_F8b_run_label_invalid_utf8(env):
+    """The exposition advertises charset=utf-8, so the raw body must decode as
+    strict UTF-8: an invalid byte in a --prometheus-run-label value becomes
+    U+FFFD, and a valid UTF-8 value is emitted byte-identical.
+
+    prom_scrape() decodes with errors="replace", which would hide raw invalid
+    bytes, so this test reads the body as bytes.
+    """
+    rd = _new_results_dir()
+    proc, out_path, err_path = _popen_memtier(
+        env,
+        ["--test-time=4", "--prometheus-port=0",
+         b"--prometheus-run-label=env=x\xffy",
+         b"--prometheus-run-label=ok=caf\xc3\xa9 \xe2\x82\xac"],
+        rd,
+    )
+    try:
+        url = wait_for_prometheus_url(out_path, timeout=20)
+        env.assertFalse(url is None, message="no announce line")
+        time.sleep(1.0)
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            ctype = resp.headers.get("Content-Type", "")
+            raw = resp.read()
+        env.assertContains("charset=utf-8", ctype)
+        env.assertEqual(raw.count(b"\xff"), 0, message="raw 0xff byte in /metrics")
+        try:
+            body = raw.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as e:
+            env.assertTrue(False, message="/metrics is not valid UTF-8: {}".format(e))
+            return
+        # the valid UTF-8 value is passed through byte-identical
+        env.assertContains(b'ok="caf\xc3\xa9 \xe2\x82\xac"', raw)
+        env.assertContains(b'env="x\xef\xbf\xbdy"', raw)
+        parsed = prom_parse(body)
+        env.assertTrue(len(parsed) > 0, message="empty scrape")
+        for name, samples in parsed.items():
+            for s in samples:
+                env.assertEqual(s.labels.get("env"), "x\ufffdy",
+                                message="{} env label: {!r}".format(name, s.labels.get("env")))
+                env.assertEqual(s.labels.get("ok"), "caf\u00e9 \u20ac",
+                                message="{} ok label: {!r}".format(name, s.labels.get("ok")))
+        _promtool_validate(env, body, os.path.join(rd, "scrape_utf8.txt"))
+    finally:
+        _kill(proc)
+    err = _drain(err_path)
+    env.assertContains("value for 'env' is not valid UTF-8", err)
+    env.assertNotContains("value for 'ok'", err)
+
+
+# ---------------------------------------------------------------------------
 # F9 -- TTL clamp via the renders_total instrument
 # ---------------------------------------------------------------------------
 def test_F9_ttl_render_cache(env):
@@ -649,26 +703,78 @@ def test_F13_latency_unit_sanity(env):
     try:
         url = wait_for_prometheus_url(out_path, timeout=20)
         env.assertFalse(url is None, message="no announce line")
-        time.sleep(3.0)
-        parsed = prom_parse(prom_scrape(url).body)
-        s = prom_sample_value(parsed, "memtier_latency_seconds_sum")
-        c = prom_sample_value(parsed, "memtier_latency_seconds_count")
-        env.assertTrue(c and c > 0, message="empty histogram")
+        if url is None:
+            return
+        # Keep the last non-empty scrape before the exporter goes away, so the
+        # scraped window covers as much of the run as possible.
+        s = c = None
+        deadline = time.time() + 60
+        while proc.poll() is None and time.time() < deadline:
+            r = prom_scrape(url)
+            if r.status == 200:
+                parsed = prom_parse(r.body)
+                cc = prom_sample_value(parsed, "memtier_latency_seconds_count")
+                if cc and cc > 0:
+                    s, c = prom_sample_value(parsed, "memtier_latency_seconds_sum"), cc
+            time.sleep(0.2)
+        try:
+            rc = proc.wait(timeout=max(1.0, deadline - time.time()))
+            env.assertEqual(rc, 0, message="exit code {}".format(rc))
+        except subprocess.TimeoutExpired:
+            _kill(proc)
+            env.assertTrue(False, message="did not exit within 60s")
+            return
+        env.assertTrue(c is not None and c > 0, message="empty histogram")
+        env.assertTrue(s is not None, message="no memtier_latency_seconds_sum sample")
+        if c is None or c <= 0 or s is None:
+            return
         mean = s / c
-        env.assertTrue(1e-6 < mean < 0.05, message="mean latency out of range: {} s".format(mean))
-        proc.wait()
+        # Coarse unit guard only (a sum exported in ms or us instead of s is
+        # >= 1000x off); the same-window JSON cross-check below is the precise
+        # one. The mean on a loaded TLS/ASAN runner can exceed 50 ms, so the
+        # upper bound is 1 s.
+        env.assertTrue(1e-6 < mean < 1.0, message="mean latency out of range: {} s".format(mean))
         with open(json_path) as fh:
             js = json.load(fh)
-        # cross-check vs JSON avg latency (ms) within 50%
-        try:
-            avg_ms = js["ALL STATS"]["Totals"]["Latency"]
-            if avg_ms:
-                ratio = (mean * 1000.0) / avg_ms
-                env.assertTrue(0.5 <= ratio <= 2.0,
-                               message="latency cross-check off: prom {} ms vs json {} ms".format(
-                                   mean * 1000.0, avg_ms))
-        except (KeyError, TypeError):
-            pass
+        # Cross-check vs the JSON latency over the SAME requests. The scrape
+        # holds only the seconds each connection has completed, not the whole
+        # run. The first seconds (connection setup, TLS handshakes) are the
+        # slowest, so on slow TLS/ASAN runners an early scrape was about 2x
+        # the whole-run "Totals" average and this check flaked (#740).
+        # Instead, walk the JSON per-second series to the second k+1 where the
+        # cumulative op count reaches the scraped _count c, and interpolate:
+        #   expected = (latency of seconds 0..k + f * latency of second k+1) / c
+        # with f the fraction of second k+1's ops needed to reach c (f == 1
+        # when c matches a prefix exactly, the usual case on a fast runner).
+        # Connections roll their seconds independently, so on a slow one the
+        # scrape often falls between two prefixes. "Accumulated Latency" is
+        # the per-second latency sum (whole ms). Over the same requests the ratio
+        # is 1.000-1.06, so a 0.8-1.25x band catches an exporter-side unit or
+        # scaling bug down to 2x (and 0.5x). A scaling error at the shared
+        # latency source, which feeds both the JSON and the exporter, cancels
+        # out here and is out of F13's scope.
+        series = js["ALL STATS"]["Totals"]["Time-Serie"]
+        cum_count = 0
+        cum_lat_ms = 0.0
+        expected_ms = None
+        for _, sec in sorted(series.items(), key=lambda kv: int(kv[0])):
+            n = sec["Count"]
+            if n <= 0:
+                continue
+            acc = sec["Accumulated Latency"]
+            if cum_count + n >= c:
+                expected_ms = (cum_lat_ms + acc * float(c - cum_count) / n) / c
+                break
+            cum_count += n
+            cum_lat_ms += acc
+        env.assertTrue(expected_ms is not None and expected_ms > 0,
+                       message="JSON Time-Serie has fewer ops ({}) than the scrape ({})".format(cum_count, c))
+        if expected_ms is not None and expected_ms > 0:
+            prom_ms = mean * 1000.0
+            ratio = prom_ms / expected_ms
+            env.assertTrue(0.8 <= ratio <= 1.25,
+                           message="latency cross-check off: prom {} ms vs json {} ms over the same {} ops "
+                                   "(ratio {})".format(prom_ms, expected_ms, c, ratio))
     finally:
         _kill(proc)
 
@@ -718,6 +824,10 @@ def test_F15_teardown_race_window(env):
         import_file = alt if os.path.isfile(alt) else import_file
     env.assertTrue(os.path.isfile(import_file),
                    message="data-import fixture not found: {}".format(import_file))
+    # A teardown success requires a successful verification (#768).
+    conn = env.getConnection()
+    conn.set("key1", "xxxxxxxxxx")
+    conn.set("key2", "aaaaaaaaaaaa")
     for i in range(8):
         rd = _new_results_dir()
         proc, out_path, err_path = _popen_memtier(
@@ -872,7 +982,7 @@ def test_F17_monotonicity_under_churn(env):
         return
     rd = _new_results_dir()
     proc, out_path, err_path = _popen_memtier(
-        env, ["--test-time=5", "--prometheus-port=0"], rd
+        env, ["--test-time=5", "--prometheus-port=0", "--reconnect-on-error"], rd
     )
     stop = threading.Event()
 
@@ -908,7 +1018,8 @@ def test_F17_monotonicity_under_churn(env):
             time.sleep(0.25)
         stop.set()
         kt.join(timeout=5)
-        proc.wait()
+        rc = proc.wait(timeout=20)
+        env.assertEqual(rc, 0, message="churn workload exited {}: {}".format(rc, _drain(err_path)))
         env.assertTrue(last_ce > 0, message="no connection errors observed under CLIENT KILL")
     finally:
         stop.set()
@@ -1298,3 +1409,187 @@ def test_F24_arbitrary_misses_accumulate_across_runs(env):
                            run1[-1], run2[-1]))
     finally:
         _kill(proc)
+
+
+# ---------------------------------------------------------------------------
+# F25 -- memtier_latency_seconds tracks memtier_ops_total (issue #637).
+# The exporter used to read each client's per-second latency histogram at its
+# 1 Hz tick, which lands just after the worker's per-second reset, so _count
+# grew by a few dozen samples per second while ops_total grew by tens of
+# thousands. Every completed second is now exported, so over a multi-second
+# window _count must grow about as fast as ops_total (it lags by at most one
+# second), and never exceed it.
+# ---------------------------------------------------------------------------
+def test_F25_latency_count_tracks_ops(env):
+    rd = _new_results_dir()
+    proc, out_path, err_path = _popen_memtier(
+        env, ["--test-time=10", "-t", "2", "-c", "2", "--prometheus-port=0"], rd
+    )
+    samples = []  # (ops_total, latency_seconds_count)
+    try:
+        url = wait_for_prometheus_url(out_path, timeout=20)
+        env.assertFalse(url is None, message="no announce line")
+        deadline = time.time() + 60
+        while proc.poll() is None and time.time() < deadline:
+            r = prom_scrape(url, timeout=2)
+            if r.status == 200:
+                p = prom_parse(r.body)
+                ops = prom_sample_value(p, "memtier_ops_total")
+                count = prom_sample_value(p, "memtier_latency_seconds_count")
+                if ops and count is not None:
+                    samples.append((ops, count))
+            time.sleep(0.5)
+        rc = proc.wait()
+        env.assertEqual(rc, 0, message="memtier exit {}: {}".format(rc, _drain(err_path)))
+        for ops, count in samples:
+            env.assertTrue(count <= ops, message="_count {} > ops_total {}".format(count, ops))
+        # Skip the first two seconds (ramp-up), then compare the growth of
+        # both series across the rest of the run (about 7-8 s). _count trails
+        # ops_total by at most about one second of ops at either end, so the
+        # ratio stays near 1 and cannot drop much below 1 - 1/7 ~= 0.86; 0.7
+        # leaves room for a slow CI cell. Before #637 it was 0.0006-0.34.
+        env.assertTrue(len(samples) >= 10, message="too few samples: {}".format(samples))
+        first, last = samples[4], samples[-1]
+        d_ops, d_count = last[0] - first[0], last[1] - first[1]
+        env.assertTrue(d_ops > 0, message="ops_total did not grow: {}".format(samples))
+        env.assertTrue(
+            d_count >= 0.7 * d_ops,
+            message="_count grew {} while ops_total grew {}: {}".format(d_count, d_ops, samples),
+        )
+    finally:
+        _kill(proc)
+
+
+# ---------------------------------------------------------------------------
+# F26 -- a run's last latency samples are exported before the next run (#637).
+# Each client folds its last partial second at set_end_time(), after which its
+# thread is finished; the exporter must still drain finished threads (at the
+# loop's last tick and at the run-end publish). With --requests the run size
+# is exact, so every scrape taken during run 2 must already count all of run
+# 1's operations. The first render in run 2 lands before run 2's first 1 Hz
+# tick (renders are cached for 1 s), so a missed drain shows there.
+# ---------------------------------------------------------------------------
+def test_F26_run_end_drains_latency(env):
+    if _is_cluster(env):
+        env.skip()  # cluster run boundaries covered by F18
+        return
+    threads, clients, requests = 2, 2, 50000
+    run_ops = threads * clients * requests
+    rd = _new_results_dir()
+    proc, out_path, err_path = _popen_memtier(
+        env,
+        ["--requests={}".format(requests), "-t", str(threads), "-c", str(clients),
+         "--run-count=2", "--prometheus-port=0"],
+        rd,
+    )
+    run2 = []  # (ops_total, latency_seconds_count) scraped during run 2
+    try:
+        url = wait_for_prometheus_url(out_path, timeout=20)
+        env.assertFalse(url is None, message="no announce line")
+        deadline = time.time() + 120
+        while proc.poll() is None and time.time() < deadline:
+            r = prom_scrape(url, timeout=2)
+            if r.status == 200:
+                p = prom_parse(r.body)
+                run = prom_sample_value(p, "memtier_run")
+                ops = prom_sample_value(p, "memtier_ops_total")
+                count = prom_sample_value(p, "memtier_latency_seconds_count")
+                if run == 2 and ops is not None and count is not None:
+                    run2.append((ops, count))
+            time.sleep(0.05)
+        rc = proc.wait()
+        env.assertEqual(rc, 0, message="memtier exit {}: {}".format(rc, _drain(err_path)))
+        env.assertTrue(len(run2) > 0, message="no scrape during run 2")
+        for ops, count in run2:
+            env.assertTrue(ops >= run_ops, message="run 2 ops_total {} < run 1 ops {}".format(ops, run_ops))
+            env.assertTrue(
+                run_ops <= count <= ops,
+                message="run 2 _count {} not in [run 1 ops {}, ops_total {}]: {}".format(
+                    count, run_ops, ops, run2),
+            )
+    finally:
+        _kill(proc)
+
+
+# ---------------------------------------------------------------------------
+# F27 -- the run-end snapshot counts every op after Ctrl+C (#637, PR #665).
+# On Ctrl+C, client_group::interrupt() only stops the workers' loops, and the
+# end times are stamped after pthread_join() (#710); the run-end snapshot must
+# still count the ops of the read callbacks the workers finished after it.
+# Ctrl+C ends the whole --run-count series (#690), so the run-end snapshot
+# (run 1, 0 threads) is the last one before exit. To keep the exporter up
+# after it, results go to a FIFO shrunk to one page that the test does not
+# read: memtier blocks writing them until the test drains it. Renders are
+# cached for 1 s, so the test stops scraping for over 1 s before the SIGINT;
+# its next scrape then renders the run-end snapshot. There, _count must equal
+# memtier_ops_total.
+# ---------------------------------------------------------------------------
+def test_F27_interrupt_run_end_counts_every_op(env):
+    import fcntl
+    rd = _new_results_dir()
+    fifo = os.path.join(rd, "results.fifo")
+    os.mkfifo(fifo)
+    # Open the read end first (non-blocking), so memtier's fopen() does not block.
+    rfd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+    proc = None
+    try:
+        try:
+            pipe_size = fcntl.fcntl(rfd, getattr(fcntl, "F_SETPIPE_SZ", 1031), 4096)
+        except OSError:
+            pipe_size = None
+        if pipe_size is None or pipe_size > 4096:
+            # Cannot shrink the pipe to 4 KiB (no F_SETPIPE_SZ, or 64 KiB
+            # pages); the ~32 KB of results might then not block.
+            env.skip()
+            return
+        proc, out_path, err_path = _popen_memtier(
+            env,
+            ["--test-time=30", "-t", "4", "-c", "10", "--pipeline=16", "--ratio=1:1",
+             "--run-count=2", "--prometheus-port=0", "--out-file=" + fifo],
+            rd,
+        )
+        url = wait_for_prometheus_url(out_path, timeout=20)
+        env.assertFalse(url is None, message="no announce line")
+        live = False
+        deadline = time.time() + 30
+        while not live and proc.poll() is None and time.time() < deadline:
+            r = prom_scrape(url, timeout=2)
+            if r.status == 200:
+                p = prom_parse(r.body)
+                live = prom_sample_value(p, "memtier_run") == 1 and bool(prom_sample_value(p, "memtier_ops_total"))
+            time.sleep(0.02)
+        env.assertTrue(live, message="no live run-1 scrape: {}".format(_drain(err_path)))
+        time.sleep(1.2)  # let the render cache expire; traffic stays in flight
+        proc.send_signal(signal.SIGINT)
+        run_end = None  # (ops_total, latency_seconds_count) of run 1's run-end snapshot
+        deadline = time.time() + 30
+        while run_end is None and proc.poll() is None and time.time() < deadline:
+            r = prom_scrape(url, timeout=2)
+            if r.status == 200:
+                p = prom_parse(r.body)
+                run = prom_sample_value(p, "memtier_run")
+                threads = prom_sample_value(p, "memtier_threads")
+                ops = prom_sample_value(p, "memtier_ops_total")
+                count = prom_sample_value(p, "memtier_latency_seconds_count")
+                if run == 1 and threads == 0 and ops is not None and count is not None:
+                    run_end = (ops, count)
+            time.sleep(0.02)
+        env.assertTrue(run_end is not None,
+                       message="no run-end scrape (exit {}): {}".format(proc.poll(), _drain(err_path)))
+        # Unblock memtier: drain the results until it exits.
+        deadline = time.time() + 30
+        while proc.poll() is None and time.time() < deadline:
+            try:
+                if not os.read(rfd, 65536):
+                    time.sleep(0.01)
+            except BlockingIOError:
+                time.sleep(0.01)
+        env.assertEqual(proc.wait(timeout=10), 0, message=_drain(err_path))
+        if run_end is not None:  # env.assertTrue above records a failure but does not raise
+            ops, count = run_end
+            env.assertTrue(ops > 0, message="run 1 completed no ops")
+            env.assertEqual(count, ops, message="run-end _count {} != ops_total {}".format(count, ops))
+    finally:
+        os.close(rfd)
+        if proc is not None:
+            _kill(proc)

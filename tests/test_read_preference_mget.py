@@ -19,7 +19,11 @@ test_read_preference_mget
     - cmdstat_mget on masters  == 0
 """
 
+import json
+import os
+import subprocess
 import tempfile
+import time
 
 from include import (
     add_required_env_arguments,
@@ -124,6 +128,11 @@ def _run_mget_workload(env, extra_args, threads=2, clients=4, requests=100, time
     return ok, run_config
 
 
+def _read_stats(run_config):
+    with open(os.path.join(run_config.results_dir, "mb.json")) as output:
+        return json.load(output)["ALL STATS"]
+
+
 # ---------------------------------------------------------------------------
 # Test
 # ---------------------------------------------------------------------------
@@ -161,6 +170,13 @@ def test_read_preference_mget(env):
             message="memtier exited non-zero with --multi-key-get and "
                     "--read-preference=secondary",
         )
+
+        # Routing a single batch to each replica is not completion: producers
+        # must resume when those responses free destination pipeline capacity.
+        stats = _read_stats(run_config)
+        env.assertEqual(stats["Totals"]["Count"], 100)
+        env.assertEqual(stats["Gets"]["Count"], 100)
+        env.assertEqual(stats["Totals"]["Connection Errors"], 0)
 
         replica_mgets = _sum_mget_calls(replica_conns)
         env.assertGreater(
@@ -233,6 +249,11 @@ def test_read_preference_mget_strict_secondary_spin_guard(env):
                     "mixed SET+MGET --read-preference=secondary; possible "
                     "spin or hang in the MGET defer path",
         )
+        stats = _read_stats(run_config)
+        env.assertEqual(stats["Totals"]["Count"], 400)
+        env.assertGreater(stats["Gets"]["Count"], 0)
+        env.assertGreater(stats["Sets"]["Count"], 0)
+        env.assertEqual(stats["Totals"]["Connection Errors"], 0)
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)
@@ -248,10 +269,9 @@ def test_read_preference_mget_strict_secondary_spin_guard(env):
 # own pipeline never grows, so the only way to release the event loop is the
 # hold_pipeline yield.
 #
-# NOTE: smoke-only. Engineering a deterministic "slow replica" in a unit-test
-# Docker/RLTest environment is fragile, so we just assert the benchmark exits
-# within --test-time=5s. A timeout (hang or uncapped spin) means the spin
-# guard regressed. TODO: add a CPU-time sample if/when RLTest gains a portable
+# Check both bounded exit and the measured duration: an empty event loop after
+# one batch used to exit successfully without exercising the requested window.
+# TODO: add a CPU-time sample if/when RLTest gains a portable
 # resource-usage hook.
 # ---------------------------------------------------------------------------
 
@@ -294,6 +314,131 @@ def test_read_preference_mget_pure_pipeline_cap_spin_guard(env):
                     "possible spin or hang in the pipeline-cap defer path "
                     "(hold_pipeline yield-on-saturation regressed)",
         )
+        stats = _read_stats(run_config)
+        runtime = stats["Runtime"]
+        env.assertEqual(runtime["Time unit"], "MILLISECONDS")
+        env.assertGreaterEqual(runtime["Total duration"], 5000)
+        env.assertGreater(stats["Gets"]["Count"], 0)
+        env.assertEqual(stats["Totals"]["Connection Errors"], 0)
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_read_preference_mget_destination_rate_limit(env):
+    """Response wakeups must not bypass the destination replica's rate tokens."""
+    if not env.isCluster():
+        env.skip()
+        return
+    replica_conns = get_cluster_replica_connections(env)
+    if not replica_conns:
+        env.skip()
+        return
+
+    clients = 2
+    rate = 50
+    duration = 2
+    extra_args = [
+        "--ratio=0:{}".format(_MGET_BATCH),
+        "--multi-key-get={}".format(_MGET_BATCH),
+        "--pipeline=4",
+        "--key-minimum={}".format(_KEY_MIN),
+        "--key-maximum={}".format(_KEY_MAX),
+        "--read-preference=secondary",
+        "--rate-limiting={}".format(rate),
+        "--test-time={}".format(duration),
+    ]
+    ok, run_config = _run_mget_workload(
+        env, extra_args, threads=1, clients=clients, requests=None, timeout=20
+    )
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="rate-limited replica MGET did not complete")
+        stats = _read_stats(run_config)
+        runtime = stats["Runtime"]
+        env.assertEqual(runtime["Time unit"], "MILLISECONDS")
+        env.assertGreaterEqual(runtime["Total duration"], duration * 1000)
+        count = stats["Totals"]["Count"]
+        env.assertEqual(stats["Gets"]["Count"], count)
+        env.assertEqual(stats["Totals"]["Connection Errors"], 0)
+        # The rate applies per physical destination connection. Allow the
+        # initial token plus 250 ms of setup/drain timing per connection,
+        # but neither a pipeline-sized burst every tick nor unrestricted
+        # response-driven production. Also require multiple refill cycles.
+        connections = clients * len(replica_conns)
+        limit = connections * (1 + rate * (runtime["Total duration"] / 1000.0 + 0.25))
+        env.assertTrue(count <= limit, message="{} MGETs exceeded rate bound {}".format(count, limit))
+        env.assertGreater(count, clients * rate)
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_read_preference_mget_destination_disconnect_wakes_producer(env):
+    """A dropped replica must release its MGET producer before reconnecting."""
+    if not env.isCluster():
+        env.skip()
+        return
+    replica_conns = get_cluster_replica_connections(env)
+    if not replica_conns:
+        env.skip()
+        return
+
+    master_conns = env.getOSSMasterNodesConnectionList()
+    duration = 6
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--ratio=0:10", "--multi-key-get=10", "--pipeline=1",
+            # One key confines production to one primary with no local I/O.
+            "--key-minimum=1", "--key-maximum=1",
+            "--read-preference=secondaryPreferred", "--reconnect-on-error",
+            # Primary progress must occur while replica reconnect is pending.
+            "--reconnect-backoff-factor=30",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=1, clients=1, requests=None, test_time=duration)
+    add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+    run_config = RunConfig(tempfile.mkdtemp(), env.testName, config, {})
+    ensure_clean_benchmark_folder(run_config.results_dir)
+    benchmark = Benchmark.from_json(run_config, benchmark_specs)
+    initial_primary = _sum_mget_calls(master_conns)
+    initial_replica = _sum_mget_calls(replica_conns)
+    failed = env.getNumberOfFailedAssertion()
+
+    try:
+        with open(os.path.join(run_config.results_dir, "mb.process.stdout"), "w") as stdout_f, \
+                open(os.path.join(run_config.results_dir, "mb.stderr"), "w") as stderr_f:
+            proc = subprocess.Popen(benchmark.args, stdout=stdout_f, stderr=stderr_f)
+            try:
+                deadline = time.monotonic() + duration / 2
+                while _sum_mget_calls(replica_conns) - initial_replica < 100:
+                    if proc.poll() is not None or time.monotonic() >= deadline:
+                        raise AssertionError("replica MGET workload did not become active before disconnect")
+                    time.sleep(0.02)
+                env.assertEqual(_sum_mget_calls(master_conns), initial_primary)
+                killed = sum(conn.execute_command("CLIENT", "KILL", "TYPE", "normal", "SKIPME", "yes")
+                             for conn in replica_conns)
+                env.assertGreater(killed, 0)
+                deadline = time.monotonic() + 3
+                while _sum_mget_calls(master_conns) == initial_primary:
+                    if proc.poll() is not None or time.monotonic() >= deadline:
+                        raise AssertionError("MGET producer stayed parked after replica disconnect")
+                    time.sleep(0.02)
+                return_code = proc.wait(timeout=3 * duration)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait(timeout=10)
+        env.assertEqual(return_code, 0)
+        stats = _read_stats(run_config)
+        env.assertGreater(stats["Gets"]["Count"], 100)
+        env.assertEqual(stats["Totals"]["Count"], stats["Gets"]["Count"])
+        env.assertGreater(stats["Totals"]["Connection Errors"], 0)
+        env.assertEqual(stats["Runtime"]["Time unit"], "MILLISECONDS")
+        env.assertGreaterEqual(stats["Runtime"]["Total duration"], duration * 1000)
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)

@@ -114,9 +114,10 @@ public:
 
     // publish_run_start/_end: memset a snapshot, set ids, fill carried counter
     // totals from the accumulator, and publish() it (gauges/rates zero; run-end
-    // sets progress_pct = 100.0). PLAN.md section 3.7.
+    // sets progress_pct = 100.0). publish_run_end also folds `inst`, the
+    // run's last latency samples (may be NULL). PLAN.md section 3.7.
     void publish_run_start(uint32_t run_id, uint32_t run_count);
-    void publish_run_end(uint32_t run_id, uint32_t run_count);
+    void publish_run_end(uint32_t run_id, uint32_t run_count, const struct hdr_histogram *inst);
 
 private:
     // Non-copyable.

@@ -19,8 +19,8 @@
 /*
  * Unit tests U1-U10 for the pure metrics layer (PLAN.md section 10).
  * Assert-style main, no gtest. PURITY: no config.h / version.h / libevent.
- * Links prometheus_metrics.cpp + hdr_histogram (a leaf dep). U2 ships a clamp
- * replica pinned to run_stats.cpp:46-47 instead of linking run_stats.cpp.
+ * Links prometheus_metrics.cpp + hdr_histogram (a leaf dep). U2 uses the same latency
+ * recording policy as run_stats.cpp without linking run_stats.cpp.
  */
 
 #include <stdio.h>
@@ -33,7 +33,7 @@
 #include <map>
 
 #include "prometheus_metrics.h"
-#include "deps/hdr_histogram/hdr_histogram.h"
+#include "latency_histogram.h"
 
 static int g_failures = 0;
 static int g_checks = 0;
@@ -50,16 +50,6 @@ static int g_checks = 0;
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
-
-// U2 ground-truth replica of the file-static hdr_record_value_capped_atomic
-// clamp (run_stats.cpp:46-47). The clamp (never skip) IS the ground truth.
-// The S10 drift grep byte-pins those two upstream lines.
-static bool test_record_capped(struct hdr_histogram *h, int64_t value)
-{
-    int64_t capped = (value > h->highest_trackable_value) ? h->highest_trackable_value : value;
-    capped = (capped < h->lowest_trackable_value) ? h->lowest_trackable_value : capped;
-    return hdr_record_value(h, capped);
-}
 
 static struct hdr_histogram *new_hist()
 {
@@ -122,7 +112,7 @@ static void U1()
 {
     prom::text_renderer r = make_default_renderer();
     struct hdr_histogram *h = new_hist();
-    test_record_capped(h, 1000000); // 1 000 000 µs = 1 s
+    memtier_record_latency(h, 1000000); // 1 000 000 µs = 1 s
 
     metrics_snapshot s;
     zero_snapshot(s);
@@ -153,7 +143,7 @@ static void U1b()
 {
     prom::text_renderer r = make_default_renderer();
     struct hdr_histogram *h = new_hist();
-    test_record_capped(h, 100); // 100 µs = 0.0001 s
+    memtier_record_latency(h, 100); // 100 µs = 0.0001 s
 
     metrics_snapshot s;
     zero_snapshot(s);
@@ -167,7 +157,7 @@ static void U1b()
 }
 
 // ---------------------------------------------------------------------------
-// U2 — brute-force walk equivalence vs ground truth (clamp replica)
+// U2 — brute-force walk equivalence vs ground truth (application clamp)
 // ---------------------------------------------------------------------------
 static void U2()
 {
@@ -175,7 +165,7 @@ static void U2()
     const std::vector<int64_t> &edge = r.edge_us();
     struct hdr_histogram *h = new_hist();
 
-    // 100k log-uniform samples in [10 µs, 700e6 µs] via the replica.
+    // 100k log-uniform samples in [10 µs, 700e6 µs] via the production wrapper.
     const int N = 100000;
     std::vector<int64_t> samples(N);
     double lo = log((double) 10);
@@ -185,17 +175,17 @@ static void U2()
         double u = (double) rand_r(&seed) / (double) RAND_MAX;
         int64_t val = (int64_t) exp(lo + u * (hi - lo));
         samples[i] = val;
-        test_record_capped(h, val);
+        memtier_record_latency(h, val);
     }
 
     // Ground truth per bound j = count of samples whose slot edge <= edge_us[j].
     struct hdr_histogram *q = new_hist();
     std::vector<uint64_t> truth(edge.size(), 0);
     for (int i = 0; i < N; i++) {
-        // clamp into recordable range exactly as the replica did.
+        // clamp into recordable range exactly as the production wrapper did.
         int64_t cval = samples[i];
         if (cval > q->highest_trackable_value) cval = q->highest_trackable_value;
-        if (cval < q->lowest_trackable_value) cval = q->lowest_trackable_value;
+        if (cval < q->lowest_discernible_value) cval = q->lowest_discernible_value;
         int64_t se = hdr_next_non_equivalent_value(q, cval) - 1;
         for (size_t j = 0; j < edge.size(); j++)
             if (se <= edge[j]) truth[j]++;
@@ -228,7 +218,7 @@ static void U2()
 
     // capped 700 s -> le="60"=0, +Inf == _count
     struct hdr_histogram *h2 = new_hist();
-    test_record_capped(h2, 700000000LL); // 700 s in µs -> clamped to 600 s
+    memtier_record_latency(h2, 700000000LL); // 700 s in µs -> clamped to 600 s
     metrics_snapshot s2;
     zero_snapshot(s2);
     std::string body2;
@@ -284,6 +274,13 @@ static void U4()
     // escaping
     CHECK(escape_label_value("a\"b\\c") == "a\\\"b\\\\c", "U4: escape_label_value backslash+quote");
     CHECK(escape_label_value("a\nb") == "a\\nb", "U4: escape_label_value newline");
+    // #753: the exposition is UTF-8, so invalid bytes become U+FFFD; valid
+    // UTF-8 is unchanged and escaping still applies around the replacement.
+    CHECK(escape_label_value("x\xffy") == "x\xEF\xBF\xBDy", "U4: escape_label_value invalid byte -> U+FFFD");
+    CHECK(escape_label_value("caf\xC3\xA9 \xE2\x82\xAC") == "caf\xC3\xA9 \xE2\x82\xAC",
+          "U4: escape_label_value valid UTF-8 unchanged");
+    CHECK(escape_label_value("\"\xC3\\") == "\\\"\xEF\xBF\xBD\\\\",
+          "U4: escape_label_value truncated sequence + escapes");
     CHECK(escape_help("a\\b\nc") == "a\\\\b\\nc", "U4: escape_help backslash+newline");
     CHECK(escape_help("a\"b") == "a\"b", "U4: escape_help leaves quotes");
 
@@ -468,7 +465,7 @@ static void U6()
     prom::text_renderer r("1.4.0", "deadbeef", labels, ok);
     struct hdr_histogram *h = new_hist();
     for (int i = 0; i < 200; i++)
-        test_record_capped(h, 1000 + i * 37);
+        memtier_record_latency(h, 1000 + i * 37);
 
     std::string body;
     body.reserve(16384);
@@ -500,7 +497,7 @@ static void U7()
 {
     prom::text_renderer r = make_default_renderer();
     struct hdr_histogram *h = new_hist();
-    test_record_capped(h, 1500);
+    memtier_record_latency(h, 1500);
     metrics_snapshot s;
     zero_snapshot(s);
     s.counters[MT_OPS] = 123;
@@ -558,7 +555,7 @@ static void U7()
     std::string v_before;
     CHECK(find_line_value(body, "memtier_latency_seconds_count", v_before), "U7: count line");
     for (int i = 0; i < 50; i++)
-        test_record_capped(h, 2000 + i);
+        memtier_record_latency(h, 2000 + i);
     std::string body2;
     r.render(body2, s, h, 1700000000.0, 0.25, 6);
     std::string v_after;
@@ -617,77 +614,6 @@ static void U8()
     a.published_at.tv_sec = 123;
     b = a;
     CHECK(memcmp(&a, &b, sizeof(a)) == 0, "U8: metrics_snapshot trivial copy memcmp-equal");
-}
-
-// U9 — prom::hdr_add_positive_delta folds each sample at most once.
-// Regression guard for the gated-copy double-count fix (run_stats.cpp
-// copy_inst_histogram_if_changed). Before that fix the growing branch did
-// hdr_add(target, inst), re-counting samples already folded on the previous
-// 1 Hz tick when two ticks landed within one worker-second. Reverting to the
-// always-add behaviour makes U9b fail (target total would be 6, not 4).
-static void U9()
-{
-    // (a) basic: only positive per-bucket deltas are folded; buckets where cur
-    // shrank versus prev contribute nothing.
-    {
-        struct hdr_histogram *prev = new_hist();
-        struct hdr_histogram *cur = new_hist();
-        struct hdr_histogram *target = new_hist();
-        hdr_record_value(prev, 100);
-        hdr_record_values(prev, 200, 2);
-        hdr_record_value(prev, 300);    // cur will have fewer here
-        hdr_record_values(cur, 100, 2); // +1 over prev
-        hdr_record_values(cur, 200, 3); // +1 over prev
-        // value 300 absent in cur -> delta -1, must be ignored
-        hdr_record_value(cur, 500); // +1 (new bucket)
-        prom::hdr_add_positive_delta(target, cur, prev);
-        CHECK(hdr_total_count(target) == 3, "U9a: only positive per-bucket deltas folded (+1+1+1)");
-        CHECK(hdr_count_at_value(target, 100) == 1, "U9a: bucket 100 delta == 1");
-        CHECK(hdr_count_at_value(target, 200) == 1, "U9a: bucket 200 delta == 1");
-        CHECK(hdr_count_at_value(target, 300) == 0, "U9a: shrinking bucket 300 contributes 0");
-        CHECK(hdr_count_at_value(target, 500) == 1, "U9a: new bucket 500 delta == 1");
-        hdr_close(prev);
-        hdr_close(cur);
-        hdr_close(target);
-    }
-
-    // (b) two ticks within one worker-second with a growing (never-reset) inst
-    // histogram, mirroring copy_inst_histogram_if_changed's growing branch (add
-    // positive delta, then snapshot inst into last). The lifetime target must
-    // equal the true sample count, not double it.
-    {
-        struct hdr_histogram *inst = new_hist();   // per-second inst histogram
-        struct hdr_histogram *last = new_hist();   // m_prom_last_inst snapshot
-        struct hdr_histogram *target = new_hist(); // lifetime histogram
-        int64_t last_total = 0;
-
-        // tick 1: 2 samples this second
-        hdr_record_value(inst, 100);
-        hdr_record_value(inst, 200);
-        int64_t cur = hdr_total_count(inst);
-        if (cur != last_total) { // growing (cur > last_total)
-            prom::hdr_add_positive_delta(target, inst, last);
-            hdr_reset(last);
-            hdr_add(last, inst);
-            last_total = cur;
-        }
-        // tick 2: SAME worker-second, inst grew by 2 more (no reset)
-        hdr_record_values(inst, 300, 2);
-        cur = hdr_total_count(inst);
-        if (cur != last_total) {
-            prom::hdr_add_positive_delta(target, inst, last);
-            hdr_reset(last);
-            hdr_add(last, inst);
-            last_total = cur;
-        }
-        CHECK(hdr_total_count(target) == 4, "U9b: two same-second ticks fold 4 samples once (not 6)");
-        CHECK(hdr_count_at_value(target, 100) == 1, "U9b: value 100 folded once");
-        CHECK(hdr_count_at_value(target, 200) == 1, "U9b: value 200 folded once");
-        CHECK(hdr_count_at_value(target, 300) == 2, "U9b: value 300 folded twice (2 samples)");
-        hdr_close(inst);
-        hdr_close(last);
-        hdr_close(target);
-    }
 }
 
 // U10 — arbitrary-command hits/misses series (#483): structural counter/def
@@ -772,7 +698,6 @@ int main()
     U6();
     U7();
     U8();
-    U9();
     U10();
 
     if (g_failures == 0) {

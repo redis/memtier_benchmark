@@ -21,6 +21,7 @@ Run:
     TEST=test_monitor_cluster.py OSS_CLUSTER=1 SHARDS=3 ./tests/run_tests.sh
 """
 
+import csv
 import json
 import os
 import tempfile
@@ -116,7 +117,7 @@ def _require_multi_shard(env):
 
 
 def _run_monitor_cluster(env, monitor_file, command, monitor_pattern=None,
-                         threads=2, clients=4, requests=200, extra=None):
+                         threads=2, clients=4, requests=200, extra=None, timeout=240):
     """Run a monitor-input cluster workload; return (ok, run_config, json_dict)."""
     args = [
         "--monitor-input={}".format(monitor_file),
@@ -139,13 +140,15 @@ def _run_monitor_cluster(env, monitor_file, command, monitor_pattern=None,
     ensure_clean_benchmark_folder(run_config.results_dir)
 
     benchmark = Benchmark.from_json(run_config, benchmark_specs)
-    ok = benchmark.run()
+    ok = benchmark.run(timeout=timeout)
     # Note: callers print mb output via debugPrintMemtierOnError in their own
     # finally-on-failure blocks, so we don't print here (avoids double output).
 
     js = {}
     json_path = "{}/mb.json".format(run_config.results_dir)
-    if os.path.isfile(json_path):
+    # A hung (killed) or aborted run can leave a truncated JSON file; callers
+    # report it through `ok` ("did not complete"), not a JSONDecodeError.
+    if ok and os.path.isfile(json_path):
         with open(json_path) as fh:
             js = json.load(fh)
     return ok, run_config, js
@@ -300,6 +303,244 @@ def test_monitor_cluster_random_distributes_and_attributes_stats(env):
         _total, shards = _dbsize_total_and_shards(env)
         env.assertTrue(shards >= 2,
                        message="SET data reached only {} shard(s) — cross-shard routing not exercised".format(shards))
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+# ---------------------------------------------------------------------------
+# 4. __key__ / __data__ placeholders in a staged (__monitor_line@__) line
+# ---------------------------------------------------------------------------
+
+def _all_keys_by_port(env):
+    """{master_port: [keys]} across the cluster."""
+    out = {}
+    for conn in _master_conns(env):
+        port = int(conn.connection_pool.connection_kwargs["port"])
+        out[port] = [k.decode() for k in conn.execute_command("KEYS", "*")]
+    return out
+
+
+def test_monitor_cluster_line_placeholders_routed_by_full_key(env):
+    """Regression test for #654: a __monitor_line@__ line with __key__ (with
+    text around it) or __data__ must send every argument, and be routed by
+    the key actually sent (prefix + generated key + suffix).
+
+    Before the fix the cluster monitor send loops wrote only constant
+    arguments, so the RESP command was one argument short of its *N header,
+    the server never replied and the run hung."""
+    if not env.isCluster():
+        env.skip()
+        return
+    if not _require_multi_shard(env):
+        return
+
+    _flush_cluster(env)
+    test_dir = tempfile.mkdtemp()
+    lines = [
+        '[ proxy ] 1764031576.604009 [0 127.0.0.1:5000] "SET" "user:__key__" "v"',
+        '[ proxy ] 1764031576.604010 [0 127.0.0.1:5000] "SET" "{mtag}__key__" "__data__"',
+        # Only the first __key__ is replaced; routing hashes the full text.
+        '[ proxy ] 1764031576.604011 [0 127.0.0.1:5000] "SET" "a:__key__:b:__key__" "v"',
+    ]
+    monitor_file = _write_monitor_file(test_dir, lines)
+
+    requests = 60
+    ok, run_config, js = _run_monitor_cluster(
+        env, monitor_file, "__monitor_line@__", monitor_pattern="S",
+        threads=1, clients=2, requests=requests,
+        extra=["--key-prefix=mon-", "--key-maximum=200", "--data-size=20"],
+        timeout=60)
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="monitor-cluster run with key/data placeholders did not complete")
+        by_port = _all_keys_by_port(env)
+        user_keys = []
+        tag_keys = []
+        rep_keys = []
+        for port, keys in by_port.items():
+            for k in keys:
+                # Every key must sit on the shard that owns the full key's slot.
+                env.assertEqual(_owning_port(env, k), port,
+                                message="{} stored on {} but owned by {}".format(k, port, _owning_port(env, k)))
+                if k.startswith("user:mon-"):
+                    user_keys.append(k)
+                elif k.startswith("{mtag}mon-"):
+                    tag_keys.append(k)
+                elif k.startswith("a:mon-") and k.endswith(":b:__key__"):
+                    rep_keys.append(k)
+                else:
+                    env.assertTrue(False, message="unexpected key {!r} (affixes dropped?)".format(k))
+        env.assertTrue(len(user_keys) > 0, message="no user:mon-* keys written")
+        env.assertTrue(len(tag_keys) > 0, message="no {mtag}mon-* keys written")
+        env.assertTrue(len(rep_keys) > 0, message="no a:mon-*:b:__key__ keys written")
+        # user:__key__ keys hash across the cluster, so routing by the full
+        # key must spread them over more than one shard.
+        user_ports = set(p for p, keys in by_port.items() for k in keys if k.startswith("user:"))
+        env.assertTrue(len(user_ports) >= 2,
+                       message="user:mon-* keys on only {} shard(s)".format(len(user_ports)))
+        owner = _conn_for_port(env, _owning_port(env, tag_keys[0])) if tag_keys else None
+        if owner is not None:
+            # __data__ is replaced by a generated --data-size value.
+            env.assertEqual(len(owner.execute_command("GET", tag_keys[0])), 20)
+        sets_count = js.get("ALL STATS", {}).get("Sets", {}).get("Count", 0)
+        env.assertEqual(sets_count, requests * 2, message="Sets count {} != {}".format(sets_count, requests * 2))
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_monitor_cluster_line_data_first_arg_routed(env):
+    """A bare __data__ as the first argument of a __monitor_line@__ line is
+    the key cluster mode routes by, so it is filled in before routing: every
+    value-named key must sit on the shard that owns it. Variable value sizes
+    give keys x, xx, xxx, ... in many slots."""
+    if not env.isCluster():
+        env.skip()
+        return
+    if not _require_multi_shard(env):
+        return
+
+    _flush_cluster(env)
+    test_dir = tempfile.mkdtemp()
+    monitor_file = _write_monitor_file(
+        test_dir, ['[ proxy ] 1764031576.604009 [0 127.0.0.1:5000] "SET" "__data__" "v"'])
+    ok, run_config, _ = _run_monitor_cluster(
+        env, monitor_file, "__monitor_line@__", threads=1, clients=2, requests=60,
+        extra=["--data-size-range=1-40", "--data-size-pattern=R"], timeout=60)
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="monitor-cluster __data__ key run did not complete")
+        by_port = _all_keys_by_port(env)
+        ports = set()
+        for port, keys in by_port.items():
+            for k in keys:
+                env.assertEqual(set(k), {"x"}, message="unexpected key {!r}".format(k))
+                env.assertEqual(_owning_port(env, k), port,
+                                message="{} stored on {} but owned by {}".format(k, port, _owning_port(env, k)))
+                ports.add(port)
+        env.assertTrue(len(ports) >= 2, message="__data__ keys on only {} shard(s): {}".format(len(ports), by_port))
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+# ---------------------------------------------------------------------------
+# 5. __monitor_line@__: failed-keys key and multi-key lines
+# ---------------------------------------------------------------------------
+
+def test_monitor_cluster_line_failed_keys_file(env):
+    """--failed-keys-file records the routed key of a __monitor_line@__
+    request (affixes included), not an empty key. request::m_key is also what
+    --retry-on-error routes MOVED/ASK/-READONLY retries by, so it must be
+    argument 1 (the text the router hashes), even when __key__ is only in a
+    later argument: "INCRBY" "fixed" "x:__key__" logs "fixed"."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    _flush_cluster(env)
+    test_dir = tempfile.mkdtemp()
+    monitor_file = _write_monitor_file(
+        test_dir, ['[ proxy ] 1764031576.604009 [0 127.0.0.1:5000] "INCRBY" "user:__key__" "x"',
+                   '[ proxy ] 1764031576.604010 [0 127.0.0.1:5000] "INCRBY" "fixed" "x:__key__"'])
+    failed_log = os.path.join(test_dir, "failed_keys.csv")
+
+    requests = 20
+    ok, run_config, js = _run_monitor_cluster(
+        env, monitor_file, "__monitor_line@__", threads=1, clients=2, requests=requests,
+        extra=["--key-prefix=mon-", "--key-maximum=200", "--failed-keys-file={}".format(failed_log)],
+        timeout=60)
+
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="monitor-cluster failed-keys run did not complete")
+        with open(failed_log) as fh:
+            rows = [r for r in csv.reader(fh) if r and r[0] != "timestamp"]
+        env.assertEqual(len(rows), requests * 2, message="failed-keys rows: {}".format(rows[:5]))
+        keys = [r[2] for r in rows]
+        bad = [k for k in keys if not k.startswith("user:mon-") and k != "fixed"]
+        env.assertEqual(bad, [], message="logged keys other than user:mon-* / fixed: {}".format(bad[:5]))
+        # The default --monitor-pattern=S alternates the two lines.
+        env.assertTrue("fixed" in keys, message="no row for the fixed-key line: {}".format(keys[:10]))
+        env.assertTrue(any(k.startswith("user:mon-") for k in keys),
+                       message="no user:mon-* rows: {}".format(keys[:10]))
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_monitor_cluster_line_multi_key_needs_hash_tag(env):
+    """Cluster mode supports only single-key commands, so a __monitor_line@__
+    line with two __key__ arguments that can hash to different slots is
+    rejected at startup, as --command and __monitor_lineN__ are. A line whose
+    keys share one {hash tag} stays in one slot and runs."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    test_dir = tempfile.mkdtemp()
+    untagged = _write_monitor_file(
+        test_dir, ['[ proxy ] 1764031576.604009 [0 127.0.0.1:5000] "SET" "s:__key__" "v"',
+                   '[ proxy ] 1764031576.604010 [0 127.0.0.1:5000] "MSET" "__key__" "v" "__key__" "v"'])
+    _flush_cluster(env)
+    ok, run_config, _ = _run_monitor_cluster(
+        env, untagged, "__monitor_line@__", threads=1, clients=1, requests=10,
+        extra=["--key-prefix=mon-"], timeout=60)
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertFalse(ok, message="multi-key line without a hash tag was accepted")
+        with open("{}/mb.stderr".format(run_config.results_dir)) as fh:
+            err = fh.read()
+        env.assertTrue("monitor line 2 has 2 __key__ arguments" in err, message=err[-500:])
+        env.assertEqual(_dbsize_total_and_shards(env)[0], 0)
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+    # Same rule as Redis: an empty {} is not a hash tag, and --key-prefix is
+    # part of the key, so prefix "{" makes the tag of __key__{t} include the
+    # generated number ({NNN{t}).
+    for case, (line, prefix) in enumerate([
+            ('"MSET" "{}a:__key__" "v" "{}b:__key__" "v"', "mon-"),
+            ('"MSET" "__key__{t}" "v" "__key__{t}:b" "v"', "{"),
+    ]):
+        case_dir = os.path.join(test_dir, "reject{}".format(case))
+        os.makedirs(case_dir)
+        rejected = _write_monitor_file(case_dir, ['[ proxy ] 1764031576.604009 [0 127.0.0.1:5000] ' + line])
+        ok, run_config, _ = _run_monitor_cluster(
+            env, rejected, "__monitor_line@__", threads=1, clients=1, requests=10,
+            extra=["--key-prefix={}".format(prefix)], timeout=60)
+        failed = env.getNumberOfFailedAssertion()
+        try:
+            env.assertFalse(ok, message="accepted {} with --key-prefix={}".format(line, prefix))
+            with open("{}/mb.stderr".format(run_config.results_dir)) as fh:
+                err = fh.read()
+            env.assertTrue("monitor line 1 has 2 __key__ arguments" in err, message=err[-500:])
+        finally:
+            if env.getNumberOfFailedAssertion() > failed:
+                debugPrintMemtierOnError(run_config, env)
+
+    os.makedirs(os.path.join(test_dir, "tagged"))
+    tagged = _write_monitor_file(
+        os.path.join(test_dir, "tagged"),
+        ['[ proxy ] 1764031576.604009 [0 127.0.0.1:5000] "MSET" "{t}a:__key__" "__data__" "{t}b:__key__" "v"'])
+    _flush_cluster(env)
+    for conn in _master_conns(env):
+        conn.execute_command("CONFIG", "RESETSTAT")
+    ok, run_config, _ = _run_monitor_cluster(
+        env, tagged, "__monitor_line@__", threads=1, clients=2, requests=20,
+        extra=["--key-prefix=mon-", "--key-maximum=200", "--data-size=20"], timeout=60)
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(ok, message="tagged multi-key monitor run did not complete")
+        keys = [k for keys in _all_keys_by_port(env).values() for k in keys]
+        env.assertTrue(any(k.startswith("{t}a:mon-") for k in keys), message=str(keys[:10]))
+        env.assertTrue(any(k.startswith("{t}b:mon-") for k in keys), message=str(keys[:10]))
+        for conn in _master_conns(env):
+            errs = conn.execute_command("INFO", "errorstats")
+            env.assertEqual(errs, {}, message="server errors: {}".format(errs))
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)

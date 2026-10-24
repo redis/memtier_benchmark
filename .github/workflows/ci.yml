@@ -14,14 +14,47 @@ name: CI
 
 on:
   push:
-    branches: [master, main]
+    branches: [master, main, '2.*']
   pull_request:
-    branches: [master, main]
+    branches: [master, main, '2.*']
 
 permissions:
   contents: read
 
 jobs:
+  prefix-install-distcheck:
+    runs-on: ubuntu-latest
+    name: Non-root prefix install and distcheck
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install build dependencies and bash-completion metadata
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y build-essential autoconf automake pkg-config \
+          libevent-dev libssl-dev zlib1g-dev bash-completion
+    - name: Check completion options and non-root installation
+      run: |
+        test "$(id -u)" -ne 0
+        pkg-config --exists bash-completion
+        autoreconf -ivf
+        for invalid in '' relative/path; do
+          if ./configure --with-bash-completion-dir="$invalid" > configure-invalid.log 2>&1; then
+            echo "configure accepted invalid completion directory: '$invalid'" >&2
+            exit 1
+          fi
+          grep -F 'requires an absolute, non-empty directory' configure-invalid.log
+        done
+        ./configure --prefix="$RUNNER_TEMP/memtier-prefix"
+        make -j2
+        make install
+        test -f "$RUNNER_TEMP/memtier-prefix/share/bash-completion/completions/memtier_benchmark"
+        make uninstall
+        test ! -e "$RUNNER_TEMP/memtier-prefix/share/bash-completion/completions/memtier_benchmark"
+    - name: Check incremental version metadata
+      run: python3 tests/check_version_build.py
+    - name: Check distribution with the default completion directory
+      run: make -j2 distcheck
+
   smoketest-build-distros:
     runs-on: ubuntu-latest
     continue-on-error: true
@@ -33,7 +66,9 @@ jobs:
       DEBIAN_FRONTEND: noninteractive
     strategy:
       matrix:
-        image: ${{ fromJSON(vars.SMOKE_TEST_IMAGES) }}
+        # Repository variables may be unavailable for fork pull requests.
+        # Keep the default matrix equivalent to the configured upstream images.
+        image: ${{ fromJSON(vars.SMOKE_TEST_IMAGES || '["ubuntu:noble", "ubuntu:jammy", "ubuntu:focal", "ubuntu:resolute", "debian:bookworm", "debian:bullseye", "debian:trixie"]') }}
     container: ${{ matrix.image }}
     name: Build ${{ matrix.image }}
     steps:
@@ -210,8 +245,6 @@ jobs:
         sudo apt-get install lcov autoconf automake pkg-config libevent-dev libssl-dev
 
     - name: Build
-      # for coverage reports we need to use Ubuntu 22.04 or lower
-      # (given Ubuntu 24.04 uses lcov >= 2.0 which is not support on autoconf still)
       run: autoreconf -ivf && ./configure --enable-code-coverage && make -j
 
     - name: Upload build artifact
@@ -220,7 +253,6 @@ jobs:
         name: memtier-build-${{ matrix.platform }}
         path: |
           memtier_benchmark
-          .libs/
         retention-days: 1
 
   test-ubuntu:
@@ -231,16 +263,20 @@ jobs:
         platform: [ubuntu-22.04]
         test-config:
           - name: "Single Endpoint: TCP Plaintext"
-            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "0", VERBOSE: "1" }
+            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "0", VERBOSE: "1", PARALLELISM: "2" }
+            tls: false
+          - name: "Single Endpoint: Unix socket reconnects"
+            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", UNIX: "1", TLS: "0", VERBOSE: "1",
+                   TEST: "test_reconnections.py", REDIS_PORT: "22001", REDIS_PASSWORD: "unix-ci-dummy" }
             tls: false
           - name: "Single Endpoint: TCP TLS"
-            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", VERBOSE: "1" }
+            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", VERBOSE: "1", PARALLELISM: "2" }
             tls: true
           - name: "OSS TCP TLS v1.2"
-            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", TLS_PROTOCOLS: "TLSv1.2", VERBOSE: "1" }
+            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", TLS_PROTOCOLS: "TLSv1.2", VERBOSE: "1", PARALLELISM: "2" }
             tls: true
           - name: "OSS TCP TLS v1.3"
-            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", TLS_PROTOCOLS: "TLSv1.3", VERBOSE: "1" }
+            env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", TLS_PROTOCOLS: "TLSv1.3", VERBOSE: "1", PARALLELISM: "2" }
             tls: true
           - name: "OSS-CLUSTER API: TCP Plaintext"
             env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", VERBOSE: "1", PARALLELISM: "2" }
@@ -254,15 +290,22 @@ jobs:
           - name: "OSS-CLUSTER API 99 shards: TCP TLS"
             env: { RLTEST_DEBUG: "1", LOG_LEVEL: "notice", OSS_STANDALONE: "0", OSS_CLUSTER: "1", TLS: "1", VERBOSE: "1", SHARDS: "99", TEST: "tests_oss_simple_flow:test_rate_limited_completion_no_hang" }
             tls: true
+          # Also runs test_cluster_command_key_affixes.py, whose
+          # --read-preference=secondary key-routing case needs replicas.
           - name: "OSS-CLUSTER + replicas: read-preference (modes)"
             env: { LOG_LEVEL: "notice", OSS_STANDALONE: "0", OSS_CLUSTER: "0",
                    OSS_CLUSTER_REPLICAS: "1", TLS: "0", VERBOSE: "1", SHARDS: "3", PARALLELISM: "2",
-                   TEST: "test_read_preference_modes.py" }
+                   TEST: "test_read_preference_modes.py test_cluster_command_key_affixes.py" }
             tls: false
           - name: "OSS-CLUSTER + replicas: read-preference (failover)"
             env: { LOG_LEVEL: "notice", OSS_STANDALONE: "0", OSS_CLUSTER: "0",
                    OSS_CLUSTER_REPLICAS: "1", TLS: "0", VERBOSE: "1", SHARDS: "3", PARALLELISM: "2",
                    TEST: "test_read_preference_failover.py" }
+            tls: false
+          - name: "OSS-CLUSTER + replicas: primary failover with retries"
+            env: { LOG_LEVEL: "notice", OSS_STANDALONE: "0", OSS_CLUSTER: "0",
+                   OSS_CLUSTER_REPLICAS: "1", TLS: "0", VERBOSE: "1", SHARDS: "3",
+                   TEST: "test_cluster_failover_retry.py" }
             tls: false
           - name: "OSS-CLUSTER + replicas: read-preference (mget)"
             env: { LOG_LEVEL: "notice", OSS_STANDALONE: "0", OSS_CLUSTER: "0",
@@ -326,10 +369,31 @@ jobs:
           ./tests/gen-test-certs.sh
 
     - name: Run tests
-      timeout-minutes: 25
+      # The standalone and main cluster cells run the whole suite, so the
+      # standalone cells use PARALLELISM=2 like the cluster ones; the limit
+      # (shared by all cells) leaves headroom for slow runners. See #679.
+      timeout-minutes: 40
       env: ${{ matrix.test-config.env }}
       run: |
         ./tests/run_tests.sh
+
+    - name: Package Unix-socket failure logs
+      if: failure() && matrix.test-config.env.UNIX == '1'
+      run: |
+        # RLTest result directories contain colons, which upload-artifact rejects.
+        shopt -s nullglob
+        logs=(/tmp/memtier-unix.*)
+        if (( ${#logs[@]} )); then
+          tar -czf unix-socket-failure-logs.tar.gz "${logs[@]}"
+        fi
+
+    - name: Upload Unix-socket failure logs
+      if: failure() && matrix.test-config.env.UNIX == '1'
+      uses: actions/upload-artifact@v5
+      with:
+        name: unix-socket-failure-logs-${{ matrix.platform }}
+        path: unix-socket-failure-logs.tar.gz
+        retention-days: 7
 
   test-statsd:
     needs: build-ubuntu
@@ -396,8 +460,54 @@ jobs:
       if: always()
       run: docker compose -f docker-compose.statsd.yml down -v
 
-  coverage-ubuntu:
+  coverage-toolchains:
+    name: Coverage tools ${{ matrix.platform }} / ${{ matrix.compiler }}
+    runs-on: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-22.04
+            compiler: gcc
+          - platform: ubuntu-24.04
+            compiler: gcc
+          - platform: ubuntu-24.04
+            compiler: clang
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install dependencies
+      run: |
+        sudo apt-get -qq update
+        sudo apt-get install lcov autoconf automake pkg-config libevent-dev libssl-dev
+        if [ "${{ matrix.compiler }}" = clang ]; then
+          sudo apt-get install clang llvm libclang-rt-dev
+        fi
+    - name: Configure coverage build
+      env:
+        COVERAGE_COMPILER: ${{ matrix.compiler }}
+      run: |
+        autoreconf -ivf
+        mkdir "$RUNNER_TEMP/coverage-build"
+        cd "$RUNNER_TEMP/coverage-build"
+        if [ "$COVERAGE_COMPILER" = clang ]; then
+          printf '#!/bin/sh\nexec llvm-cov gcov "$@"\n' > "$RUNNER_TEMP/llvm-gcov"
+          chmod +x "$RUNNER_TEMP/llvm-gcov"
+          export CC=clang CXX=clang++ GCOV="$RUNNER_TEMP/llvm-gcov"
+        fi
+        "$GITHUB_WORKSPACE/configure" --enable-code-coverage
+    - name: Check coverage capture and cleanup
+      run: |
+        cd "$RUNNER_TEMP/coverage-build"
+        bash "$GITHUB_WORKSPACE/tests/check_code_coverage.sh"
+
+  coverage-shards:
+    name: Coverage shard ${{ matrix.shard }}/8
+    # Retain the lcov 1 baseline; coverage-toolchains also exercises lcov 2.
     runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
     - uses: actions/checkout@v6
 
@@ -407,9 +517,13 @@ jobs:
         sudo apt-get install lcov autoconf automake pkg-config libevent-dev libssl-dev
 
     - name: Build with coverage
-      # for coverage reports we need to use Ubuntu 22.04 or lower
-      # (given Ubuntu 24.04 uses lcov >= 2.0 which is not supported on autoconf still)
       run: autoreconf -ivf && ./configure --enable-code-coverage && make -j
+
+    - name: Run unit tests
+      # Unit tests reuse the instrumented objects and must link the gcov runtime.
+      # Include their coverage once in the merged report.
+      if: matrix.shard == 1
+      run: make check
 
     - name: Setup Python
       uses: actions/setup-python@v6
@@ -434,21 +548,81 @@ jobs:
         sudo sysctl -w net.ipv4.tcp_tw_reuse=1
         ulimit -n 40960
 
+    - name: Validate coverage shard selection
+      if: matrix.shard == 1
+      run: python3 utils/check_test_shards.py 8
+
     - name: Run tests for coverage
-      timeout-minutes: 25
+      # Each runner executes a disjoint file shard serially, with its own gcda files.
+      timeout-minutes: 20
       env:
         OSS_STANDALONE: "1"
         OSS_CLUSTER: "0"
         TLS: "0"
         VERBOSE: "1"
       run: |
+        TEST="$(python3 utils/select_test_shard.py ${{ matrix.shard }} 8)"
+        test -n "$TEST"
+        export TEST
         ./tests/run_tests.sh
 
     - name: Capture code coverage
       timeout-minutes: 6
       run: |
         make code-coverage-capture
-        bash <(curl -s https://codecov.io/bash) -f memtier_benchmark-*-coverage.info || echo "Codecov did not collect coverage reports"
+        mv memtier_benchmark-*-coverage.info coverage-shard-${{ matrix.shard }}.info
+
+    - name: Upload shard coverage
+      uses: actions/upload-artifact@v5
+      with:
+        name: coverage-shard-${{ matrix.shard }}
+        path: coverage-shard-${{ matrix.shard }}.info
+        if-no-files-found: error
+        retention-days: 1
+
+  coverage-ubuntu:
+    needs: coverage-shards
+    # Keep the existing check name and explicitly fail if any shard failed.
+    if: always()
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Require every coverage shard to pass
+      env:
+        SHARD_RESULT: ${{ needs.coverage-shards.result }}
+      run: test "$SHARD_RESULT" = success
+
+    - uses: actions/checkout@v6
+
+    - name: Download shard coverage
+      uses: actions/download-artifact@v8
+      with:
+        pattern: coverage-shard-*
+        merge-multiple: true
+        path: coverage
+
+    - name: Merge code coverage
+      timeout-minutes: 6
+      run: |
+        sudo apt-get -qq update
+        sudo apt-get install -y lcov
+        reports=()
+        for shard in 1 2 3 4 5 6 7 8; do
+          report="coverage/coverage-shard-${shard}.info"
+          test -s "$report"
+          reports+=(--add-tracefile "$report")
+        done
+        lcov "${reports[@]}" --output-file coverage.info
+
+    - name: Upload merged coverage artifact
+      uses: actions/upload-artifact@v5
+      with:
+        name: coverage-merged
+        path: coverage.info
+        if-no-files-found: error
+
+    - name: Publish code coverage
+      run: |
+        bash <(curl -s https://codecov.io/bash) -f coverage.info || echo "Codecov did not collect coverage reports"
 
   build-alpine:
     runs-on: ubuntu-latest
@@ -473,11 +647,27 @@ jobs:
     - name: Install build dependencies
       run: |
         apk add --no-cache \
-          make g++ autoconf automake libtool pkgconfig \
+          make g++ autoconf automake pkgconfig \
           libevent-dev zlib-dev openssl-dev
 
     - name: Build
-      run: autoreconf -ivf && ./configure && make -j
+      run: |
+        autoreconf -ivf
+        ./configure 2> configure.err || { cat configure.err >&2; exit 1; }
+        cat configure.err >&2
+        make -j
+
+    # This image has no libtool. An unexpanded macro (LT_INIT before #640) is
+    # left as a literal line in configure, which only prints "LT_INIT: not
+    # found" (busybox sh; bash says "command not found") and still exits 0.
+    - name: Check configure has no unexpanded macros
+      run: |
+        if grep -nE '^[[:space:]]*LT_[A-Z_]+' configure; then
+          echo "configure contains unexpanded libtool macros" >&2; exit 1
+        fi
+        if grep -nE '^\./configure: (line [0-9]+: )?[^ ]+: (command )?not found' configure.err; then
+          echo "configure ran an unknown command" >&2; exit 1
+        fi
 
     - name: Verify version
       run: ./memtier_benchmark --version
@@ -485,43 +675,67 @@ jobs:
   build-macos:
     strategy:
       matrix:
-        openssl: ["3.0", "3"]
+        # Every cell builds libevent from source against the cell's OpenSSL.
+        # Homebrew's libevent links whichever OpenSSL its current revision
+        # uses (openssl@3 or openssl@4, depending on the runner's Homebrew
+        # snapshot), and mixing OpenSSL versions in one process crashes TLS
+        # (#674).
+        openssl: ["3.0", "3", "4"]
     runs-on: macos-latest
     steps:
     - uses: actions/checkout@v6
     - name: Install dependencies
-      run: brew install autoconf automake libtool pkg-config cmake openssl@${{ matrix.openssl }}
-    - name: Install Homebrew libevent for the default OpenSSL
-      if: matrix.openssl == '3'
-      run: brew install libevent
+      run: brew install autoconf automake pkg-config cmake openssl@${{ matrix.openssl }}
     - name: Build libevent against the selected OpenSSL
-      if: matrix.openssl != '3'
       run: bash scripts/build-macos-libevent.sh "$(brew --prefix openssl@${{ matrix.openssl }})"
     - name: Build
       run: |
         autoreconf -ivf
-        if [ '${{ matrix.openssl }}' = '3' ]; then
-          event_prefix="$(brew --prefix libevent)"
-        else
-          event_prefix="$RUNNER_TEMP/libevent-memtier"
-        fi
-        PKG_CONFIG_PATH="$event_prefix/lib/pkgconfig:$(brew --prefix openssl@${{ matrix.openssl }})/lib/pkgconfig" ./configure
+        PKG_CONFIG_PATH="$RUNNER_TEMP/libevent-memtier/lib/pkgconfig:$(brew --prefix openssl@${{ matrix.openssl }})/lib/pkgconfig" ./configure
         make
+    # Run before the tests: a libevent linked against another OpenSSL
+    # crashes the TLS unit tests instead of failing with a clear message.
+    - name: Verify version, libevent, openssl
+      run: |
+        ./memtier_benchmark --version
+        bash scripts/check-macos-tls-links.sh "$(brew --prefix openssl@${{ matrix.openssl }})"
+    - name: Unix socket regression tests
+      run: MEMTIER_BINARY="$PWD/memtier_benchmark" python3 tests/test_unix_socket.py
     - name: Unit tests
       run: |
         if ! make check; then
           cat test-suite.log
           exit 1
         fi
+
+  # The DEVELOPMENT.md path: Homebrew libevent with whichever OpenSSL it
+  # depends on, so the pairing follows Homebrew automatically.
+  build-macos-homebrew-libevent:
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install dependencies
+      run: |
+        brew install autoconf automake pkg-config libevent
+        ssl="$(brew deps libevent | grep '^openssl@' | head -n 1)"
+        test -n "$ssl" || { echo "brew deps libevent lists no openssl@*" >&2; exit 1; }
+        brew install "$ssl"
+        echo "SSL_PREFIX=$(brew --prefix "$ssl")" >> "$GITHUB_ENV"
+        echo "Homebrew libevent depends on $ssl"
+    - name: Build
+      run: |
+        autoreconf -ivf
+        PKG_CONFIG_PATH="$SSL_PREFIX/lib/pkgconfig" ./configure
+        make
     - name: Verify version, libevent, openssl
       run: |
         ./memtier_benchmark --version
-        otool -L ./memtier_benchmark | grep libevent
-        otool -L ./memtier_benchmark | grep ssl
-        if [ '${{ matrix.openssl }}' = '3' ]; then
-          bash scripts/check-macos-tls-links.sh "$(brew --prefix openssl@3)" "$(brew --prefix libevent)"
-        else
-          bash scripts/check-macos-tls-links.sh "$(brew --prefix openssl@${{ matrix.openssl }})"
+        bash scripts/check-macos-tls-links.sh "$SSL_PREFIX" "$(brew --prefix libevent)"
+    - name: Unit tests
+      run: |
+        if ! make check; then
+          cat test-suite.log
+          exit 1
         fi
 
   # macos-13 has been retired as of December 2025, so use macos-14
@@ -531,7 +745,7 @@ jobs:
     steps:
     - uses: actions/checkout@v6
     - name: Install dependencies
-      run: brew install autoconf automake libtool pkg-config cmake openssl@1.1
+      run: brew install autoconf automake pkg-config cmake openssl@1.1
     - name: Build libevent against the selected OpenSSL
       run: bash scripts/build-macos-libevent.sh "$(brew --prefix openssl@1.1)"
     - name: Build
@@ -539,26 +753,23 @@ jobs:
         autoreconf -ivf
         PKG_CONFIG_PATH="$RUNNER_TEMP/libevent-memtier/lib/pkgconfig:$(brew --prefix openssl@1.1)/lib/pkgconfig" ./configure
         make
+    - name: Verify version, libevent, openssl
+      run: |
+        ./memtier_benchmark --version
+        bash scripts/check-macos-tls-links.sh "$(brew --prefix openssl@1.1)"
     - name: Unit tests
       run: |
         if ! make check; then
           cat test-suite.log
           exit 1
         fi
-    - name: Verify version, libevent, openssl
-      run: |
-        ./memtier_benchmark --version
-        otool -L ./memtier_benchmark | grep libevent
-        otool -L ./memtier_benchmark | grep ssl
-        bash scripts/check-macos-tls-links.sh "$(brew --prefix openssl@1.1)"
-
 
   build-macos-openssl-1-0-2:
     runs-on: macos-14
     steps:
     - uses: actions/checkout@v6
     - name: Install dependencies
-      run: brew install autoconf automake libtool pkg-config
+      run: brew install autoconf automake pkg-config
     - name: Install openssl v1.0.2
       run: brew install rbenv/tap/openssl@1.0
     # Retain the already-tested legacy libevent version; upgrading it is separate.
@@ -582,12 +793,6 @@ jobs:
         autoreconf -ivf
         PKG_CONFIG_PATH="$RUNNER_TEMP/libevent-openssl-1.0/lib/pkgconfig:$(brew --prefix openssl@1.0)/lib/pkgconfig" ./configure
         make
-    - name: Unit tests
-      run: |
-        if ! make check; then
-          cat test-suite.log
-          exit 1
-        fi
     - name: Verify version, libevent, openssl
       run: |
         set -euo pipefail
@@ -596,6 +801,12 @@ jobs:
         printf '%s\n' "$binary_links" | grep '/libssl\.1\.0\.0\.dylib '
         bash scripts/check-macos-tls-links.sh "$(brew --prefix openssl@1.0)" "$RUNNER_TEMP/libevent-openssl-1.0"
         otool -L "$RUNNER_TEMP/libevent-openssl-1.0/lib/libevent_openssl.dylib" | grep 'libssl.1.0.0'
+    - name: Unit tests
+      run: |
+        if ! make check; then
+          cat test-suite.log
+          exit 1
+        fi
 
   promtool-lint:
     runs-on: ubuntu-latest
@@ -628,27 +839,39 @@ jobs:
         set -euo pipefail
         redis-server --port 6399 --save '' --daemonize yes
         for i in $(seq 1 30); do redis-cli -p 6399 ping >/dev/null 2>&1 && break; sleep 0.2; done
-        ./memtier_benchmark -s 127.0.0.1 -p 6399 --test-time=8 --prometheus-port=0 \
-          >mb.out 2>mb.err &
-        MBPID=$!
-        URL=""
-        for i in $(seq 1 100); do
-          URL=$(grep -oP 'listening on \Khttp://[^ ]+/metrics' mb.out || true)
-          [ -n "$URL" ] && break
-          sleep 0.1
-        done
-        [ -n "$URL" ] || { echo "no announce line"; cat mb.out mb.err; exit 1; }
-        sleep 1
-        curl -fsS "$URL" > prom_scrape.txt
-        wait "$MBPID"
-        # rc != 0 OR any output = failure (PLAN.md §7.4e)
-        out=$(promtool check metrics < prom_scrape.txt 2>&1) || { echo "promtool rc != 0"; echo "$out"; exit 1; }
-        if [ -n "$out" ]; then echo "promtool produced output (lint warnings):"; echo "$out"; exit 1; fi
-        echo "promtool check metrics: clean"
+        # scrape_and_lint OUT [memtier args...]
+        scrape_and_lint() {
+          local out_file="$1"; shift
+          ./memtier_benchmark -s 127.0.0.1 -p 6399 --test-time=8 --prometheus-port=0 "$@" \
+            >mb.out 2>mb.err &
+          local MBPID=$!
+          local URL=""
+          for i in $(seq 1 100); do
+            URL=$(grep -oP 'listening on \Khttp://[^ ]+/metrics' mb.out || true)
+            [ -n "$URL" ] && break
+            sleep 0.1
+          done
+          [ -n "$URL" ] || { echo "no announce line"; cat mb.out mb.err; exit 1; }
+          sleep 1
+          curl -fsS "$URL" > "$out_file"
+          wait "$MBPID"
+          # rc != 0 OR any output = failure (PLAN.md §7.4e)
+          local out
+          out=$(promtool check metrics < "$out_file" 2>&1) || { echo "promtool rc != 0 ($out_file)"; echo "$out"; exit 1; }
+          if [ -n "$out" ]; then echo "promtool produced output (lint warnings) ($out_file):"; echo "$out"; exit 1; fi
+          echo "promtool check metrics: clean ($out_file)"
+        }
+        scrape_and_lint prom_scrape.txt
+        # #753: a run-label value with an invalid UTF-8 byte must be sanitized.
+        scrape_and_lint prom_scrape_utf8.txt "--prometheus-run-label=env=x"$'\xff'"y" \
+          "--prometheus-run-label=ok=caf"$'\xc3\xa9'
+        grep -q 'env="x'$'\xef\xbf\xbd''y"' prom_scrape_utf8.txt || { echo "U+FFFD missing"; exit 1; }
 
     - name: Upload scraped exposition
       if: always()
       uses: actions/upload-artifact@v4
       with:
         name: prom_scrape
-        path: prom_scrape.txt
+        path: |
+          prom_scrape.txt
+          prom_scrape_utf8.txt

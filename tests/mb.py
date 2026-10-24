@@ -3,6 +3,7 @@ Simple replacement for mbdirector package.
 Contains only the Benchmark and RunConfig classes needed for tests.
 """
 import os
+import re
 import subprocess
 import logging
 
@@ -28,8 +29,11 @@ class RunConfig(object):
         self.explicit_connect_args = bool(
             mbconfig.get('explicit_connect_args'))
 
+        # RLTest test names look like "file.py:test_name"; ':' (and other
+        # reserved characters) cannot appear in Windows directory names.
+        safe_name = re.sub(r'[<>:"/\\|?*]', '_', name) if os.name == 'nt' else name
         self.results_dir = os.path.join(base_results_dir,
-                                        '{:04}_{}'.format(self.id, name))
+                                        '{:04}_{}'.format(self.id, safe_name))
 
     def __repr__(self):
         return '<RunConfig id={}>'.format(self.id)
@@ -115,7 +119,15 @@ class Benchmark(object):
                 'memtier_benchmark timed out after {}s\n'.format(timeout).encode())
             return False
         if _stderr:
-            logging.debug('  >>> stderr <<<\n%s\n', _stderr)
+            # Preserve the original bytes before writing to the CI log. A bytes
+            # repr escapes newlines into one huge line, which can stall the
+            # GitHub Actions runner's log processing (#482).
             self.write_file('mb.stderr', _stderr)
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                logging.debug('  >>> stderr <<<')
+                for line in _stderr.decode('utf-8', errors='replace').splitlines():
+                    # Bound genuine long lines too, without truncating output.
+                    for start in range(0, max(1, len(line)), 2048):
+                        logging.debug('%s', line[start:start + 2048])
         return process.wait() == 0
 

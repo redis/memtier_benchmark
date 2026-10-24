@@ -18,7 +18,9 @@ broken-transaction error (`unwatch inside MULTI`, `EXEC without MULTI`,
 
 import json
 import os
+import subprocess
 import tempfile
+import time
 
 from include import (
     add_required_env_arguments,
@@ -826,6 +828,277 @@ def test_transaction_keyless_only_rotation(env):
     try:
         env.assertTrue(ok, message="memtier_benchmark exited non-zero (possible hang or crash)")
         _assert_no_transaction_breakage(env, stderr)
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def _run_with_shard_kills(env, commands, test_time=8, pipeline=1,
+                          threads=1, clients=1, extra_args=()):
+    """Run a --transaction rotation with --reconnect-on-error while
+    repeatedly killing one non-main shard's
+    client connections. Returns (rc, kills, stderr, run_config); rc is None
+    when memtier hung past --test-time + 30s."""
+    benchmark_specs = {"name": env.testName, "args": ["--transaction"]}
+    addTLSArgs(benchmark_specs, env)
+    # Entries starting with "--" are passed as is, so a per-command option
+    # such as --command-key-pattern can follow the command it applies to.
+    benchmark_specs["args"].extend([c if c.startswith('--') else '--command=' + c
+                                    for c in commands])
+    benchmark_specs["args"].extend(['--pipeline={}'.format(pipeline),
+                                    '--reconnect-on-error'])
+    benchmark_specs["args"].extend(extra_args)
+    config = get_default_memtier_config(threads=threads, clients=clients, requests=None,
+                                        test_time=test_time)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    test_dir = tempfile.mkdtemp()
+    run_config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(run_config.results_dir)
+    benchmark = Benchmark.from_json(run_config, benchmark_specs)
+
+    # Any shard but the main one: memtier's main connection goes to the
+    # first node, and its refreshes are what must not land inside a MULTI.
+    main_port = int(master_nodes_list[0]['port'])
+    victim = next(conn for port, conn in sorted(_master_conns_by_port(env).items())
+                  if port != main_port)
+
+    stdout_path = os.path.join(run_config.results_dir, "mb.stdout")
+    stderr_path = os.path.join(run_config.results_dir, "mb.stderr")
+    kills = 0
+    with open(stdout_path, "w") as stdout_f, open(stderr_path, "w") as stderr_f:
+        proc = subprocess.Popen(benchmark.args, stdout=stdout_f,
+                                stderr=stderr_f, cwd=run_config.results_dir)
+        try:
+            time.sleep(1)
+            deadline = time.time() + test_time - 2
+            while time.time() < deadline and proc.poll() is None:
+                try:
+                    kills += victim.execute_command("CLIENT", "KILL", "TYPE", "normal")
+                except Exception as e:
+                    env.debugPrint("CLIENT KILL failed: {}".format(e), True)
+                time.sleep(0.5)
+            try:
+                rc = proc.wait(timeout=test_time + 30)
+            except subprocess.TimeoutExpired:
+                rc = None
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+    return rc, kills, _read_stderr(run_config), run_config
+
+
+def _reset_discard_calls(env):
+    # CONFIG RESETSTAT also clears the errorstats that _error_count() reads.
+    for conn in env.getOSSMasterNodesConnectionList():
+        conn.execute_command("CONFIG", "RESETSTAT")
+
+
+def _discard_calls(env):
+    total = 0
+    for conn in env.getOSSMasterNodesConnectionList():
+        stats = conn.info("commandstats")
+        total += int(stats.get("cmdstat_discard", {}).get("calls", 0))
+    return total
+
+
+def _main_shard_hash_tag(env):
+    """A hash tag whose slot the main node (memtier's -p) owns."""
+    main_port = int(env.getMasterNodesList()[0]['port'])
+    for tag in ['b', 'c', 'a', 'f', 'g', 'd', 'j', 'k', 'h']:
+        if _owning_port(env, tag) == main_port:
+            return tag
+    raise AssertionError("no candidate hash tag lives on the main node")
+
+
+def _sequential_key_holes(env):
+    """Number of key indexes missing between the lowest and highest
+    memtier-<n> key in the cluster."""
+    indexes = sorted(int(key.decode().split('-', 1)[1])
+                     for conn in env.getOSSMasterNodesConnectionList()
+                     for key in conn.scan_iter(match='memtier-*', count=1000))
+    if not indexes:
+        return 0
+    return indexes[-1] - indexes[0] + 1 - len(indexes)
+
+
+def _error_count(env, error):
+    total = 0
+    for conn in env.getOSSMasterNodesConnectionList():
+        stats = conn.info("errorstats")
+        total += int(stats.get("errorstat_" + error, {}).get("count", 0))
+    return total
+
+
+def test_transaction_connection_kills_do_not_hang(env):
+    """Regression for #569: a CLUSTER SLOTS refresh must never be written on
+    a connection with an open MULTI. The server queues it (+QUEUED), the
+    reply handler treats that as a failed refresh, the connection never
+    finishes setup and the run hangs past --test-time.
+
+    Every key lives on the main node, so the main connection drives every
+    rotation and is inside a MULTI most of the time. Each kill of another
+    shard's connections makes cluster_client::reconnect() request a slot map
+    refresh on that main connection, which must wait for the rotation's
+    EXEC."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    _reset_discard_calls(env)
+    tag = _main_shard_hash_tag(env)
+    rc, kills, stderr, run_config = _run_with_shard_kills(
+        env, ['MULTI', 'SET {' + tag + '}__key__ __data__', 'EXEC'])
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(kills > 0, message="no connection was killed")
+        env.assertTrue(rc is not None,
+                       message="memtier_benchmark hung past --test-time")
+        env.assertEqual(rc, 0)
+        env.assertTrue("cluster slot failed" not in stderr,
+                       message="CLUSTER SLOTS was sent inside an open MULTI")
+        # The kills must have made the main connection refresh the slot map
+        # mid-run, otherwise this run proved nothing.
+        env.assertTrue("requested a cluster slot map refresh" in stderr,
+                       message="no reconnect slot map refresh was provoked")
+        # A rotation that closes its MULTI never needs the abandoned-MULTI
+        # DISCARD: the refresh waits for the rotation's EXEC instead. Sent
+        # inside the MULTI, the refresh would DISCARD it, and the rotation's
+        # EXEC would then fail with "EXEC without MULTI".
+        env.assertEqual(_discard_calls(env), 0)
+        env.assertEqual(_error_count(env, "ERR"), 0)
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_abandoned_multi_is_discarded_before_refresh(env):
+    """#569: a rotation that opens a MULTI and never closes it leaves that
+    MULTI open once the rotation wraps and pins another shard. A slot map
+    refresh later due on that connection must DISCARD it first: written
+    inside the MULTI, CLUSTER SLOTS is only queued and the run hangs."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    _reset_discard_calls(env)
+    rc, kills, stderr, run_config = _run_with_shard_kills(
+        env, ['MULTI', 'SET __key__ __data__'])
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(kills > 0, message="no connection was killed")
+        env.assertTrue(rc is not None,
+                       message="memtier_benchmark hung past --test-time")
+        env.assertEqual(rc, 0)
+        env.assertTrue("cluster slot failed" not in stderr,
+                       message="CLUSTER SLOTS was sent inside an open MULTI")
+        # memtier is the only client sending DISCARD, so this proves the
+        # fallback ran rather than the refresh path never being reached.
+        env.assertTrue(_discard_calls(env) > 0,
+                       message="no abandoned MULTI was discarded")
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_pipelined_connection_kills_preserve_key_pool(env):
+    """#580: an unsent lookahead key must not enter the routed command queue
+    when a pipelined transaction loses its pin."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    rc, kills, stderr, run_config = _run_with_shard_kills(
+        env, ['MULTI', 'SET __key__ __data__', 'EXEC'],
+        pipeline=16, clients=2)
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(kills > 0, message="no connection was killed")
+        env.assertTrue(rc is not None,
+                       message="memtier_benchmark hung past --test-time")
+        env.assertEqual(rc, 0)
+        env.assertTrue("caught exception" not in stderr,
+                       message="worker threw after transaction pin release")
+        env.assertTrue("vector::_M_range_check" not in stderr,
+                       message="staged key was interpreted as a command index")
+        with open(os.path.join(run_config.results_dir, "mb.json")) as f:
+            stats = json.load(f)['ALL STATS']
+        for command in ('Multis', 'Sets', 'Execs'):
+            env.assertTrue(stats[command]['Count'] > 0,
+                           message="no {} completed".format(command))
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_waits_for_reconnecting_key_owner(env):
+    """A rotation whose key belongs to a shard that is reconnecting must wait
+    for that shard. Pinned to any other shard, the keyed command gets -MOVED
+    and the server answers the rotation's EXEC with EXECABORT."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    _reset_discard_calls(env)
+    _flush_cluster(env)
+    pipeline = 1
+    rc, kills, stderr, run_config = _run_with_shard_kills(
+        env, ['MULTI', 'SET __key__ __data__', '--command-key-pattern=S', 'EXEC'],
+        pipeline=pipeline, extra_args=['--key-minimum=1', '--key-maximum=100000000'])
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(kills > 0, message="no connection was killed")
+        env.assertTrue(rc is not None,
+                       message="memtier_benchmark hung past --test-time")
+        env.assertEqual(rc, 0)
+        env.assertTrue("requested a cluster slot map refresh" in stderr,
+                       message="the killed shard was never reconnected")
+        # Holding the rotation keeps its key: only transactions in flight on
+        # a killed connection may leave a hole in the sequential range.
+        holes = _sequential_key_holes(env)
+        env.assertTrue(holes <= kills * pipeline,
+                       message="{} holes in the sequential key range for {} "
+                               "killed connections".format(holes, kills))
+        # The topology never changes, so the right shard never answers MOVED.
+        env.assertEqual(_error_count(env, "MOVED"), 0)
+        env.assertEqual(_error_count(env, "EXECABORT"), 0)
+        with open(os.path.join(run_config.results_dir, "mb.json")) as f:
+            stats = json.load(f)['ALL STATS']
+        env.assertTrue(stats['Execs']['Count'] > 0, message="no EXEC completed")
+    finally:
+        if env.getNumberOfFailedAssertion() > failed:
+            debugPrintMemtierOnError(run_config, env)
+
+
+def test_transaction_lost_multi_is_not_continued(env):
+    """Once the connection holding a rotation's MULTI drops it (the
+    connection is killed and reconnects, or the pin moves to another shard),
+    the rest of that block must not be sent: outside the MULTI its SET runs
+    untransacted and its EXEC fails with "EXEC without MULTI"."""
+    if not env.isCluster():
+        env.skip()
+        return
+
+    _reset_discard_calls(env)
+    rc, kills, stderr, run_config = _run_with_shard_kills(
+        env, ['MULTI', 'SET __key__ __data__', 'EXEC'],
+        pipeline=8, threads=2, clients=4)
+    failed = env.getNumberOfFailedAssertion()
+    try:
+        env.assertTrue(kills > 0, message="no connection was killed")
+        env.assertTrue(rc is not None,
+                       message="memtier_benchmark hung past --test-time")
+        env.assertEqual(rc, 0)
+        env.assertTrue("EXEC without MULTI" not in stderr,
+                       message="an EXEC was sent without its MULTI")
+        # memtier is the only client, so any -ERR reply is one of its own.
+        env.assertEqual(_error_count(env, "ERR"), 0)
+        with open(os.path.join(run_config.results_dir, "mb.json")) as f:
+            stats = json.load(f)['ALL STATS']
+        env.assertTrue(stats['Execs']['Count'] > 0, message="no EXEC completed")
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)

@@ -62,7 +62,7 @@ def test_pipeline_negative_rejected(env):
     _assert_reject(
         env,
         ["--pipeline=-1", "--test-time=1"],
-        "pipeline must be greater than zero",
+        "pipeline must be a positive integer",
         "--pipeline=-1",
     )
 
@@ -118,7 +118,7 @@ def test_data_size_negative_rejected(env):
     _assert_reject(
         env,
         ["--data-size=-1", "--test-time=1"],
-        "data-size must be greater than zero",
+        "data-size must be a positive integer",
         "--data-size=-1",
     )
 

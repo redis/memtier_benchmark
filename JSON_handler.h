@@ -23,6 +23,8 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <list>
+#include <string>
+#include "utf8.h"
 
 // enum for holding type of nesting
 typedef enum
@@ -36,6 +38,7 @@ class json_handler
 {
 protected:
     FILE *m_json_file;
+    bool m_error_written;
     // This list is used later for closing the nesting
     std::list<eJSON_NESTED_TYPE> m_nest_closer_types;
     void beutify(bool only_tabs = false);
@@ -44,8 +47,16 @@ public:
     json_handler(const char *jsonfilename);
     ~json_handler();
 
+    // Closes all the nesting and the file. Returns 0 if the whole document was
+    // written, otherwise an errno value. Further calls return 0.
+    int close();
+
     // Write a single object to JSON
     void write_obj(const char *objectname, const char *format, ...);
+
+    // Append one escaped, top-level fatal-error summary. Existing results are
+    // retained. Call only after all normal fields have been written.
+    void write_error(const char *message);
 
     // Starts nesting, the type is used for deciding which charecter to be used for opening and closing
     // the nesting ('{}','[]')

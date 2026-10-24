@@ -29,15 +29,13 @@
 #ifdef HAVE_SYS_TYPES_H
 #include <sys/types.h>
 #endif
-#ifdef HAVE_SYS_SOCKET_H
-#include <sys/socket.h>
-#endif
-#include <netdb.h>
+#include "platform_compat.h"
 
 #include <string>
 #include <iostream>
 #include <stdexcept>
 #include <climits>
+#include <cmath>
 #include <algorithm>
 
 #include "config_types.h"
@@ -47,15 +45,18 @@ config_range::config_range(const char *range_str) : min(0), max(0)
 {
     assert(range_str != NULL);
 
+    // Parse at 64 bits: 'unsigned long' is only 32 bits on LLP64 hosts
+    // (Windows), where strtoul() would saturate wide values instead of
+    // narrowing them the way LP64 hosts do.
     char *p = NULL;
-    min = strtoul(range_str, &p, 10);
+    min = (int) strtoull(range_str, &p, 10);
     if (!p || *p != '-') {
         min = max = 0;
         return;
     }
 
     char *q = NULL;
-    max = strtoul(p + 1, &q, 10);
+    max = (int) strtoull(p + 1, &q, 10);
     if (!q || *q != '\0') {
         min = max = 0;
         return;
@@ -97,7 +98,7 @@ config_quantiles::config_quantiles(const char *str)
         double quantile;
         char *p = NULL;
         quantile = strtod(str, &p);
-        if (!p || (*p != ',' && *p != '\0')) {
+        if (p == str || !std::isfinite(quantile) || quantile < 0.0 || quantile > 100.0 || (*p != ',' && *p != '\0')) {
             quantile_list.clear();
             return;
         }
@@ -309,7 +310,8 @@ arbitrary_command::arbitrary_command(const char *cmd) :
         stats_only(false),
         spec(NULL),
         miss_tracking_enabled(false),
-        is_read_override(-1)
+        is_read_override(-1),
+        multi_effect(multi_effect_none)
 {
     // command name is the first word in the command
     size_t pos = command.find(" ");
@@ -318,7 +320,8 @@ arbitrary_command::arbitrary_command(const char *cmd) :
     }
 
     command_name.assign(command.c_str(), pos);
-    std::transform(command_name.begin(), command_name.end(), command_name.begin(), ::toupper);
+    std::transform(command_name.begin(), command_name.end(), command_name.begin(),
+                   [](unsigned char c) { return static_cast<char>(toupper(c)); });
     // command_type is the same as command_name by default (used for aggregation)
     command_type = command_name;
 }
@@ -436,9 +439,16 @@ void arbitrary_command::resolve_command_meta()
     spec = NULL;
     spec_key_positions.clear();
     miss_tracking_enabled = false;
+    multi_effect = multi_effect_none;
 
     if (command_args.empty()) {
         return;
+    }
+    const char *verb = command_args[0].data.c_str();
+    if (strcasecmp(verb, "MULTI") == 0) {
+        multi_effect = multi_effect_opens;
+    } else if (strcasecmp(verb, "EXEC") == 0 || strcasecmp(verb, "DISCARD") == 0) {
+        multi_effect = multi_effect_closes;
     }
     // The canonical name for subcommand containers (XGROUP CREATE, OBJECT FREQ,
     // etc.) is the first two argv tokens uppercased and space-joined. Try both
@@ -448,7 +458,8 @@ void arbitrary_command::resolve_command_meta()
         two_word_name.assign(command_args[0].data);
         two_word_name.push_back(' ');
         two_word_name.append(command_args[1].data);
-        std::transform(two_word_name.begin(), two_word_name.end(), two_word_name.begin(), ::toupper);
+        std::transform(two_word_name.begin(), two_word_name.end(), two_word_name.begin(),
+                       [](unsigned char c) { return static_cast<char>(toupper(c)); });
         spec = lookup(two_word_name.c_str());
     }
     if (spec == NULL) {
@@ -558,7 +569,7 @@ bool arbitrary_command::split_command_to_args()
 
     while (1) {
         /* skip blanks */
-        while (*p && isspace(*p)) {
+        while (*p && isspace((unsigned char) *p)) {
             p++;
         }
 
@@ -614,7 +625,7 @@ bool arbitrary_command::split_command_to_args()
                     } else if (*p == '"') {
                         /* closing quote must be followed by a space or
                          * nothing at all. */
-                        if (*(p + 1) && !isspace(*(p + 1))) {
+                        if (*(p + 1) && !isspace((unsigned char) *(p + 1))) {
                             goto err;
                         }
 
@@ -634,7 +645,7 @@ bool arbitrary_command::split_command_to_args()
                     } else if (*p == '\'') {
                         /* closing quote must be followed by a space or
                          * nothing at all. */
-                        if (*(p + 1) && !isspace(*(p + 1))) {
+                        if (*(p + 1) && !isspace((unsigned char) *(p + 1))) {
                             goto err;
                         }
 
@@ -706,7 +717,8 @@ static std::string extract_command_type(const std::string &command_str)
     }
     std::string cmd_type = command_str.substr(start, end - start);
     // Convert to uppercase
-    std::transform(cmd_type.begin(), cmd_type.end(), cmd_type.begin(), ::toupper);
+    std::transform(cmd_type.begin(), cmd_type.end(), cmd_type.begin(),
+                   [](unsigned char c) { return static_cast<char>(toupper(c)); });
     return cmd_type;
 }
 
@@ -725,9 +737,33 @@ static bool is_unreplayable_monitor_command_type(const std::string &cmd_type_upp
     return cmd_type_upper == "HELLO";
 }
 
+#ifdef _WIN32
+// mingw-w64 does not provide POSIX getline(); minimal equivalent for load_from_file().
+static ssize_t getline(char **line, size_t *capacity, FILE *file)
+{
+    size_t length = 0;
+    int ch;
+    while ((ch = getc(file)) != EOF) {
+        if (length + 1 >= *capacity) {
+            size_t new_capacity = *capacity ? *capacity * 2 : 128;
+            if (new_capacity <= *capacity) return -1;
+            char *new_line = (char *) realloc(*line, new_capacity);
+            if (new_line == NULL) return -1;
+            *line = new_line;
+            *capacity = new_capacity;
+        }
+        (*line)[length++] = (char) ch;
+        if (ch == '\n') break;
+    }
+    if (length == 0) return -1;
+    (*line)[length] = '\0';
+    return (ssize_t) length;
+}
+#endif
+
 bool monitor_command_list::load_from_file(const char *filename)
 {
-    FILE *file = fopen(filename, "r");
+    FILE *file = fopen(filename, "rb");
     if (!file) {
         fprintf(stderr, "error: failed to open monitor input file: %s\n", filename);
         return false;

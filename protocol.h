@@ -86,7 +86,11 @@ public:
 
     virtual mbulk_size_el *as_mbulk_size() { return this; }
 
-    virtual bulk_el *as_bulk() { assert(0); }
+    virtual bulk_el *as_bulk()
+    {
+        assert(0);
+        return NULL;
+    }
 
     void add_new_element(mbulk_element *new_el)
     {
@@ -126,7 +130,11 @@ public:
 
     virtual bulk_el *as_bulk() { return this; }
 
-    virtual mbulk_size_el *as_mbulk_size() { assert(0); }
+    virtual mbulk_size_el *as_mbulk_size()
+    {
+        assert(0);
+        return NULL;
+    }
 
     char *value;
     unsigned int value_len;
@@ -207,7 +215,9 @@ protected:
 
     char *m_buffer;
     char *m_buffer_ptr;
-    unsigned int m_buffer_size;
+    size_t m_buffer_size;
+    // A 32-bit size wrapped to 0 past 2 GiB and add_key()'s growth never ended.
+    static_assert(sizeof(m_buffer_size) >= sizeof(size_t), "keylist buffer size must be size_t");
 
     key_entry *m_keys;
     unsigned int m_keys_size;
@@ -245,6 +255,7 @@ public:
     virtual abstract_protocol *clone(void) = 0;
     void set_buffers(struct evbuffer *read_buf, struct evbuffer *write_buf);
     void set_keep_value(bool flag);
+    bool get_keep_value() const { return m_keep_value; }
     void set_track_elem_misses(bool flag);
 
     // Drop any partial-parse state that would otherwise survive a
@@ -255,9 +266,8 @@ public:
     // drain flags, current mbulk tree) and clear m_last_response so
     // its mbulk children are freed.
     // The default implementation only clears m_last_response; redis_protocol
-    // overrides to also reset its parser fields. memcache subclasses keep
-    // the default for now (their state machine resets at every reply boundary
-    // and they have no RESP3-style push frame drain to leak).
+    // and memcache_meta_protocol override to also reset their parser fields.
+    // The legacy memcache text and binary implementations retain the default.
     // m_resp3 (negotiated protocol version) is intentionally NOT touched -- a
     // TCP flap should not roll back the HELLO 3 negotiation result.
     virtual void reset_state();
@@ -274,6 +284,9 @@ public:
     virtual int write_command_get(const char *key, int key_len, unsigned int offset) = 0;
     virtual int write_command_multi_get(const keylist *keylist) = 0;
     virtual int write_command_wait(unsigned int num_slaves, unsigned int timeout) = 0;
+    // Raw retries bypass the command writers. Protocols that keep reply
+    // expectations must restore them in the same order as the resent bytes.
+    virtual void prepare_request_replay(bool is_get, unsigned int keys) {}
     virtual int parse_response() = 0;
 
     // handle arbitrary command

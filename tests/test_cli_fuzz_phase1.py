@@ -8,10 +8,11 @@ HELLO-fail / response-parse-fail / WAIT-never-returns loop that ignores
 --test-time. The fix tracks the first connection-stage failure in a streak
 on the main thread and aborts the process with rc=2 (plus a diagnostic) if
 the streak — or, for the WAIT case, the simple absence of a steady-state
-hand-off — exceeds --connection-stage-timeout seconds. Each test here
-asserts:
+hand-off — exceeds --connection-stage-timeout seconds. A disconnected
+worker now fails immediately with rc=1 instead of restarting; the oversized
+bulk case checks that path explicitly. The remaining setup stalls assert:
 
-  * non-zero exit code (and not a negative signal like -SIGSEGV)
+  * the supervisor's exit code 2 (not a parser rejection or a signal)
   * stderr contains the new diagnostic prefix
   * the process exits well within --connection-stage-timeout + 5 s
     wall-budget — i.e. the supervisor really bounded the loop, the test
@@ -26,7 +27,7 @@ import subprocess
 import tempfile
 import time
 
-from include import MEMTIER_BINARY
+from include import MEMTIER_BINARY, addTLSArgs
 
 
 # Short timeout so the regression suite finishes in seconds, not 30 s per
@@ -97,24 +98,11 @@ def _assert_supervisor_tripped(env, args, label):
             f"stderr tail:\n{stderr_text[-2000:]}"
         ),
     )
-    # rc=2 is the dedicated abort code we documented for the supervisor;
-    # accept any non-zero (and non-signal-killed) value as "failure was
-    # reported", but include a stronger preference for 2.
-    env.assertTrue(
-        rc is not None and rc > 0,
+    env.assertEqual(
+        rc, 2,
         message=(
-            f"[{label}] expected non-zero exit; got rc={rc}. "
+            f"[{label}] expected supervisor exit 2; got rc={rc}. "
             f"stderr tail:\n{stderr_text[-2000:]}"
-        ),
-    )
-    # rc must not be a signal-kill code (those are < 0 from subprocess on
-    # POSIX). subprocess maps SIGSEGV to -11, SIGKILL to -9, etc.
-    env.assertTrue(
-        rc >= 0,
-        message=(
-            f"[{label}] memtier died from a signal (rc={rc}), not a clean abort. "
-            f"This typically means the supervisor never fired and the OS killed "
-            f"the process. stderr tail:\n{stderr_text[-2000:]}"
         ),
     )
     # Diagnostic must mention the supervisor — both the abort prefix and
@@ -146,7 +134,19 @@ def _assert_supervisor_tripped(env, args, label):
     )
 
 
-def _base_args(env, **extra):
+def _assert_worker_failed(env, args, label):
+    """A server disconnect must fail the worker without waiting for retries."""
+    rc, stderr_text, elapsed = _run_memtier(args)
+    env.assertEqual(rc, 1, message=f"[{label}] expected worker failure, got {rc}: {stderr_text[-2000:]}")
+    env.assertTrue("client(s) stopped before reaching their stop condition" in stderr_text,
+                   message=f"[{label}] missing worker failure diagnostic: {stderr_text[-2000:]}")
+    env.assertTrue("the results of this run are not valid" in stderr_text)
+    env.assertFalse(DIAGNOSTIC_PREFIX in stderr_text, message="disconnect waited for the supervisor")
+    env.assertFalse("Restarting thread" in stderr_text)
+    env.assertLess(elapsed, WALL_BUDGET_SECS, message=f"[{label}] worker failure took {elapsed:.1f}s")
+
+
+def _base_args(env, requests=None):
     """Build the common argv prefix; subtests append scenario-specific flags."""
     if env.isUnixSocket():
         env.skip()
@@ -167,9 +167,12 @@ def _base_args(env, **extra):
         "-c", "1",
         "-t", "1",
         f"--connection-stage-timeout={SUPERVISOR_TIMEOUT_SECS}",
-        "--test-time=1",
+        "--test-time=1" if requests is None else f"--requests={requests}",
         "--hide-histogram",
     ]
+    # Otherwise TLS cells only exercise a plaintext connection reset, hiding
+    # the AUTH/SELECT/parser/WAIT condition each test is supposed to reach.
+    addTLSArgs({"args": args}, env)
     return args
 
 
@@ -218,14 +221,17 @@ def test_426_3_memcache_binary_against_redis(env):
 # ---------------------------------------------------------------------------
 # Issue #426 item 8: --data-size-range 1-9999999999 → server replies
 # "-ERR Protocol error: invalid bulk length" and resets the connection;
-# memtier reconnects forever.
+# without recovery, memtier must fail the worker rather than retry forever.
 #
 # This is the most server-dependent of the six; it relies on the server
 # actually rejecting the oversized bulk. We temporarily lower
 # proto-max-bulk-len so the rejection is deterministic across CI images.
 # ---------------------------------------------------------------------------
 def test_426_8_data_size_range_too_large(env):
-    args = _base_args(env)
+    # Serializing the oversized SET can exceed a one-second test window on
+    # sanitizer builds. Keep work unfinished when Redis rejects that request,
+    # even though the error reply itself counts as a completed operation.
+    args = _base_args(env, requests=100)
     if args is None:
         return
 
@@ -238,8 +244,8 @@ def test_426_8_data_size_range_too_large(env):
         # Clamp below the data-size-range upper bound so the server rejects.
         for c in master_connections:
             c.config_set("proto-max-bulk-len", 100000000)
-        args.append("--data-size-range=1-9999999999")
-        _assert_supervisor_tripped(env, args, "#8 --data-size-range 1-9999999999")
+        args.extend(["--pipeline=1", "--ratio=1:0", "--data-size-range=1-9999999999"])
+        _assert_worker_failed(env, args, "#8 --data-size-range 1-9999999999")
     finally:
         if original_max is not None:
             for c in master_connections:

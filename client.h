@@ -21,12 +21,11 @@
 
 #include <stdlib.h>
 #include <stdio.h>
-#include <netdb.h>
-#include <sys/socket.h>
-#include <sys/un.h>
+#include "platform_compat.h"
 #include <vector>
 #include <queue>
 #include <atomic>
+#include <pthread.h>
 #include <iterator>
 #include <event2/event.h>
 #include <event2/buffer.h>
@@ -53,6 +52,15 @@ class object_generator;
 // Stack buffer size for key operations to avoid heap allocation
 #define KEY_BUFFER_STACK_SIZE 512
 
+// How long a --test-time run waits, past its deadline, for replies to requests
+// already sent. A client still waiting after that (the server stopped
+// replying) is ended; its unanswered requests are counted as errors, logged to
+// --failed-keys-file and reported as "Unanswered requests" in the JSON Runtime.
+#define TEST_TIME_DRAIN_GRACE_SECS 10
+
+// Short uppercase name of a request type, for --failed-keys-file rows.
+const char *request_type_to_name(request_type t);
+
 enum get_key_response
 {
     not_available,
@@ -68,13 +76,16 @@ protected:
     struct event_base *m_event_base;
     bool m_initialized;
     bool m_end_set;
+    // A connection ended the run as failed (see fail_run()).
+    bool m_run_failed;
 
     // test related
     benchmark_config *m_config;
     object_generator *m_obj_gen;
     run_stats m_stats;
 
-    unsigned long long m_reqs_processed;          // requests processed (responses received)
+    unsigned long long m_reqs_processed;          // requests processed (final responses received)
+    unsigned long long m_reqs_answered;           // responses received, including ones retried
     unsigned long long m_reqs_generated;          // requests generated (wait for responses)
     unsigned int m_set_ratio_count;               // number of sets counter (overlaps on ratio)
     unsigned int m_get_ratio_count;               // number of gets counter (overlaps on ratio)
@@ -96,6 +107,14 @@ protected:
     unsigned long long m_txn_rotation_key_index;
     bool m_txn_rotation_key_valid;
     unsigned long long m_txn_rotation_key_seq;
+    // --transaction (non-cluster path): this rotation's MULTI was sent and its
+    // EXEC/DISCARD was not yet. If the connection no longer has the MULTI open
+    // (it reconnected), the rest of the block is skipped.
+    bool m_txn_multi_sent;
+    // Processed requests at the last planned transaction reconnect. The next
+    // interval is measured from the actual (possibly deferred) boundary.
+    unsigned long long m_txn_reconnect_reqs_base;
+    bool transaction_reconnect_due() const;
 
     unsigned long long m_tot_set_ops;  // Total number of SET ops
     unsigned long long m_tot_wait_ops; // Total number of WAIT ops
@@ -145,10 +164,26 @@ public:
     int prepare(void);
     bool initialized(void);
     run_stats *get_stats(void) { return &m_stats; }
+    // True once set_end_time() ran: the client reached its stop condition
+    // (finished()) or was finalized by client_group::finalize_all_clients().
+    bool end_time_set(void) const { return m_end_set; }
+    // A connection found the run failed after it was over (a setup rejected
+    // since its last reply) while another connection was still busy: that
+    // one may still end the client normally, so the failure is recorded here.
+    void fail_run(void) { m_run_failed = true; }
+    bool run_failed(void) const { return m_run_failed; }
+    // Ends a client whose --test-time deadline passed TEST_TIME_DRAIN_GRACE_SECS
+    // ago with replies still pending, or with --retry-on-error retries it
+    // keeps resending; returns whether it did. Adds the workload requests
+    // that got no reply to *unanswered (setup commands are dropped but not
+    // counted) and the requests held for retry to *held.
+    bool abandon_unanswered_requests(unsigned long long *unanswered, unsigned long long *held);
 
     virtual get_key_response get_key_for_conn(unsigned int command_index, unsigned int conn_id,
                                               unsigned long long *key_index);
     virtual bool create_arbitrary_request(unsigned int command_index, struct timeval &timestamp, unsigned int conn_id);
+    void resolve_monitor_placeholders(arbitrary_command &cmd, unsigned int command_index, unsigned int conn_id);
+    int write_monitor_command_args(const arbitrary_command &cmd, unsigned int conn_id);
     virtual bool create_scan_continuation_request(struct timeval &timestamp, unsigned int conn_id,
                                                   unsigned int stats_index);
     virtual bool create_wait_request(struct timeval &timestamp, unsigned int conn_id);
@@ -161,11 +196,28 @@ public:
 
     void inc_reqs_processed() { m_reqs_processed++; }
 
+    unsigned long long get_reqs_answered() { return m_reqs_answered; }
+
+    void inc_reqs_answered() { m_reqs_answered++; }
+
     unsigned long long get_reqs_generated() { return m_reqs_generated; }
 
     void inc_reqs_generated() { m_reqs_generated++; }
+    // Uncount generated requests that will never be processed (dropped with
+    // their connection). Never go below m_reqs_processed: hold_pipeline()
+    // subtracts the two unguarded.
+    void dec_reqs_generated(unsigned long long count)
+    {
+        unsigned long long in_flight = m_reqs_generated > m_reqs_processed ? m_reqs_generated - m_reqs_processed : 0;
+        m_reqs_generated -= count < in_flight ? count : in_flight;
+    }
+    void abandon_requests(unsigned long long count)
+    {
+        dec_reqs_generated(count);
+        m_stats.inc_error(count);
+    }
 
-    virtual bool handle_cluster_slots(protocol_response *r)
+    virtual bool handle_cluster_slots(unsigned int conn_id, protocol_response *r)
     {
         assert(false && "handle_cluster_slots not supported");
         return false;
@@ -176,12 +228,23 @@ public:
     virtual bool finished(void);
     virtual bool all_connections_idle(void);
     virtual void set_start_time();
+    // set_start_time() at a given time, e.g. the benchmark's start.
+    void set_start_time_at(struct timeval *start_time) { m_stats.set_start_time(start_time); }
     virtual void set_end_time();
+    // set_end_time() at the time client_group::interrupt() was called, after
+    // the worker thread was joined.
+    void set_end_time_interrupted(struct timeval *end_time);
+    // set_end_time() at a given time, e.g. the --test-time deadline, on the
+    // worker thread.
+    void set_end_time_at(struct timeval *end_time);
     virtual void create_request(struct timeval timestamp, unsigned int conn_id);
     virtual bool hold_pipeline(unsigned int conn_id);
+    virtual bool prepare_transaction_reconnect();
     virtual int connect(void);
     virtual void disconnect(void);
     virtual void disconnect_all(void);
+    // disconnect_all() without the warning; returns the requests held for resend it abandoned.
+    unsigned long long disconnect_and_abandon_held(void);
     //
 
     /* Get current executed arbitrary command */
@@ -268,6 +331,7 @@ protected:
                                  protocol_response *response);
 
 public:
+    bool verification_complete() const;
     verify_client(struct event_base *event_base, benchmark_config *config, abstract_protocol *protocol,
                   object_generator *obj_gen);
     unsigned long long int get_verified_keys(void);
@@ -285,10 +349,28 @@ protected:
 
     // Client staircase ramp-up
     struct event *m_staircase_timer;
+    struct event *m_staircase_deadline_timer;
     std::atomic<unsigned int> m_staircase_active_clients;
+    unsigned int m_staircase_steps;
+    // Set by interrupt(), read after the worker thread was joined; both on
+    // the main thread.
+    bool m_interrupt_requested;
+    struct timeval m_interrupt_time;
+    // Only the worker thread that runs the loop may stamp the clients'
+    // run_stats until it has been joined (#710); check_stats_owner() checks it.
+    // m_worker_tid is written once by the worker before it publishes
+    // m_worker_tid_set (release); readers load the flag (acquire) first.
+    std::atomic<bool> m_worker_tid_set;
+    pthread_t m_worker_tid;
+    std::atomic<bool> m_joined;
+    void check_stats_owner(const char *what);
     void setup_staircase_timer(void);
     void handle_staircase_step(void);
     static void staircase_timer_cb(evutil_socket_t fd, short what, void *arg);
+    static void staircase_deadline_cb(evutil_socket_t fd, short what, void *arg);
+    void remove_staircase_timer(void);
+    static void end_stalled_clients_cb(evutil_socket_t fd, short what, void *arg);
+    void handle_end_stalled_clients(void);
     unsigned int active_client_count(void);
 
 public:
@@ -300,10 +382,16 @@ public:
     int prepare_count(unsigned int count);
     void run(void);
     void interrupt(void);
-    void finalize_all_clients(void);
+    void finalize_all_clients(struct timeval *end_time = NULL);
+    void finalize_interrupted_clients(void);
+    // Called after pthread_join() of the worker thread that ran run().
+    void mark_joined(void) { m_joined.store(true, std::memory_order_release); }
     void set_all_clients_interrupted(void);
+    unsigned int count_unended_clients(void);
+    unsigned int count_failed_clients(void);
+    void end_stalled_clients(void);
 
-    void write_client_stats(const char *prefix);
+    void write_client_stats(const char *prefix, unsigned int *failures);
 
     struct event_base *get_event_base(void) { return m_base; }
     benchmark_config *get_config(void) { return m_config; }
@@ -311,25 +399,25 @@ public:
     object_generator *get_obj_gen(void) { return m_obj_gen; }
     std::vector<client *> &get_clients(void) { return m_clients; }
 
-    unsigned long int get_total_bytes(void);
-    unsigned long int get_total_bytes_rx(void);
-    unsigned long int get_total_bytes_tx(void);
-    unsigned long int get_total_ops(void);
+    unsigned long long int get_total_bytes(void);
+    unsigned long long int get_total_bytes_rx(void);
+    unsigned long long int get_total_bytes_tx(void);
+    unsigned long long int get_total_ops(void);
     double get_total_latency(void);
-    unsigned long int get_duration_usec(void);
-    unsigned long int get_total_connection_errors(void);
-    unsigned long int get_total_hits(void);
-    unsigned long int get_total_misses(void);
+    unsigned long long int get_duration_usec(void);
+    unsigned long long int get_total_connection_errors(void);
+    unsigned long long int get_total_hits(void);
+    unsigned long long int get_total_misses(void);
     unsigned long long get_total_arbitrary_hits(void);
     unsigned long long get_total_arbitrary_misses(void);
     unsigned long long get_total_arbitrary_aborts(void);
-    unsigned long int get_total_retry_attempts(void);
-    unsigned long int get_total_retried_ops(void);
-    unsigned long int get_total_errors(void);
+    unsigned long long int get_total_retry_attempts(void);
+    unsigned long long int get_total_retried_ops(void);
+    unsigned long long int get_total_errors(void);
 
-    void merge_run_stats(run_stats *target);
+    void merge_run_stats(run_stats *target, unsigned int &iteration_counter);
     void aggregate_inst_histogram(hdr_histogram *target);
-    void aggregate_inst_histogram_if_changed(hdr_histogram *target);
+    void drain_prom_latency_histogram(hdr_histogram *target, bool run_end);
 };
 
 

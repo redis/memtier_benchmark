@@ -2,14 +2,21 @@ name: Code Style
 
 on:
   push:
-    branches: [master, main]
+    branches: [master, main, '2.*']
   pull_request:
-    branches: [master, main]
+    branches: [master, main, '2.*']
 
 permissions:
   contents: read
 
 jobs:
+  agent-parity:
+    name: Agent Configuration Parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: python3 utils/check_agent_parity.py
+
   cpp-format-check:
     name: C++ Format Check
     runs-on: ubuntu-latest

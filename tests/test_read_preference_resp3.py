@@ -35,6 +35,8 @@ Test matrix
    fresh primary succeeds.
 """
 
+import json
+import os
 import tempfile
 import time
 
@@ -280,6 +282,12 @@ def test_resp3_read_preference_mget_secondary(env):
             message="memtier exited non-zero with --protocol=resp3 "
                     "--multi-key-get --read-preference=secondary",
         )
+
+        with open(os.path.join(run_config.results_dir, "mb.json")) as output:
+            stats = json.load(output)["ALL STATS"]
+        env.assertEqual(stats["Totals"]["Count"], 100)
+        env.assertEqual(stats["Gets"]["Count"], 100)
+        env.assertEqual(stats["Totals"]["Connection Errors"], 0)
 
         replica_mgets = _sum_cmd_calls(replica_conns, "mget")
         env.assertGreater(

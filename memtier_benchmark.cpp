@@ -33,6 +33,7 @@
 
 #include "version.h"
 
+#include <chrono>
 #include <pthread.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -45,19 +46,25 @@
 #include <assert.h>
 #include <errno.h>
 #include <sys/time.h>
+#ifndef _WIN32
 #include <sys/resource.h>
+#endif
 #include <signal.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #ifdef HAVE_EXECINFO_H
 #include <execinfo.h>
 #endif
+#ifndef _WIN32
 #include <ucontext.h>
+#endif
 #include <time.h>
 #include <ctype.h>
+#ifndef _WIN32
 #include <sys/utsname.h>
+#endif
 #include <dirent.h>
-#include <arpa/inet.h>  // inet_pton, ntohl/ntohs for prometheus-bind-addr parsing
-#include <netinet/in.h> // struct in_addr / in6_addr / IN6_IS_ADDR_LOOPBACK
+#include "platform_compat.h"
 #include <event2/event.h>
 #include <event2/thread.h>
 
@@ -80,6 +87,10 @@
 #define REDIS_TLS_PROTO_DEFAULT (REDIS_TLS_PROTO_TLSv1_2)
 #endif
 
+#if OPENSSL_VERSION_NUMBER >= 0x40000000L
+static bool bitmask_is_contiguous(unsigned int mask);
+#endif
+
 #endif
 
 #include <cmath>
@@ -93,14 +104,57 @@
 #include <mach/mach.h>
 #endif
 
+#ifdef _WIN32
+// Windows has no getrusage(). Emulate the one call this file makes,
+// getrusage(RUSAGE_THREAD), with GetThreadTimes(). The values are scheduler
+// accounted, so they advance in clock ticks (~15.6 ms), not continuously.
+#define RUSAGE_THREAD 1
+
+struct rusage
+{
+    struct timeval ru_utime;
+    struct timeval ru_stime;
+};
+
+// FILETIME durations are in 100 ns units.
+static unsigned long long filetime_to_usec(const FILETIME &ft)
+{
+    return (((unsigned long long) ft.dwHighDateTime << 32) | ft.dwLowDateTime) / 10;
+}
+
+static int getrusage(int who, struct rusage *ru)
+{
+    if (who != RUSAGE_THREAD) {
+        errno = EINVAL;
+        return -1;
+    }
+    FILETIME creation_time, exit_time, kernel_time, user_time;
+    if (!GetThreadTimes(GetCurrentThread(), &creation_time, &exit_time, &kernel_time, &user_time)) {
+        errno = EINVAL;
+        return -1;
+    }
+    unsigned long long user_usec = filetime_to_usec(user_time);
+    unsigned long long kernel_usec = filetime_to_usec(kernel_time);
+    ru->ru_utime.tv_sec = (long) (user_usec / 1000000);
+    ru->ru_utime.tv_usec = (long) (user_usec % 1000000);
+    ru->ru_stime.tv_sec = (long) (kernel_usec / 1000000);
+    ru->ru_stime.tv_usec = (long) (kernel_usec % 1000000);
+    return 0;
+}
+#endif
+
 #include "client.h"
 #include "cluster_client.h"
 #include "JSON_handler.h"
+#include "utf8.h"
+#include "file_io.h"
 #include "obj_gen.h"
 #include "memtier_benchmark.h"
 #include "run_stats_types.h"
+#include "latency_percentiles.h"
 #include "retry_policy.h"
 #include "statsd.h"
+#include "crash_report.h"
 #include "prometheus_metrics.h"
 #include "prometheus_exporter.h"
 
@@ -117,6 +171,65 @@ static std::string basename_only(const char *p)
     return (i == std::string::npos) ? s : s.substr(i + 1);
 }
 
+// Cluster hash tag that every key generated for a monitor-line argument
+// containing __key__ shares: prefix + --key-prefix + <number> + suffix, with
+// only the first __key__ replaced. Same rule as Redis: the text between the
+// first '{' and the first '}' after it, if not empty. Returns false when the
+// tag would include the generated number, or there is none, so the slot
+// varies from key to key.
+static bool monitor_key_arg_fixed_tag(const std::string &arg, const char *key_prefix, std::string *tag)
+{
+    size_t pos = arg.find(KEY_PLACEHOLDER);
+    std::string before = arg.substr(0, pos) + (key_prefix ? key_prefix : "");
+    std::string after = arg.substr(pos + strlen(KEY_PLACEHOLDER));
+    // A '{' before the number: its '}' must come before the number too.
+    // No '{' before it: the number has no braces, so look in the suffix.
+    const std::string &part = before.find('{') != std::string::npos ? before : after;
+    size_t open = part.find('{');
+    if (open == std::string::npos) return false;
+    size_t close = part.find('}', open + 1);
+    if (close == std::string::npos || close == open + 1) return false;
+    tag->assign(part, open + 1, close - open - 1);
+    return true;
+}
+
+// --cluster-mode supports only single-key commands (see the --command check
+// in main()). A __monitor_line@__ line is resolved per request and routed by
+// its first key, so a line with several __key__ arguments is accepted only
+// when every generated key shares one {hash tag}, which keeps them in one
+// slot. Otherwise Redis would answer CROSSSLOT for every such request.
+static bool check_cluster_monitor_lines(const struct monitor_command_list *monitor_commands, const char *key_prefix)
+{
+    for (size_t line = 0; line < monitor_commands->size(); line++) {
+        arbitrary_command cmd(monitor_commands->get_command(line).c_str());
+        if (!cmd.split_command_to_args()) continue; // skipped with a warning at run time
+        unsigned int keys = 0;
+        bool same_slot = true;
+        std::string first_tag;
+        for (size_t i = 1; i < cmd.command_args.size(); i++) {
+            const std::string &data = cmd.command_args[i].data;
+            if (data.find(KEY_PLACEHOLDER) == std::string::npos) continue;
+            std::string tag;
+            if (!monitor_key_arg_fixed_tag(data, key_prefix, &tag)) {
+                same_slot = false;
+            } else if (keys == 0) {
+                first_tag = tag;
+            } else if (tag != first_tag) {
+                same_slot = false;
+            }
+            keys++;
+        }
+        if (keys > 1 && !same_slot) {
+            benchmark_error_log("error: Cluster mode supports only single-key commands: monitor line %zu has %u "
+                                "__key__ arguments that can hash to different slots (give them one {hash tag}, "
+                                "e.g. {t}__key__): %s\n",
+                                line + 1, keys, cmd.command.c_str());
+            return false;
+        }
+    }
+    return true;
+}
+
 // Upper bound for --run-count.  main() allocates several per-run vectors
 // (run_stats, cmd_stats histograms, HDR histograms) that grow linearly with
 // run_count; values in the tens of thousands push tens of MiB of metadata
@@ -126,13 +239,49 @@ static std::string basename_only(const char *p)
 // even on memory-constrained hosts.
 #define MAX_RUN_COUNT 1024
 
-// Global flag for signal handling
-static volatile sig_atomic_t g_interrupted = 0;
+// Global flag for signal handling: 0, or the number of the signal
+// (SIGINT / SIGTERM) that interrupted the run. Atomic, not a volatile
+// sig_atomic_t: the kernel may run the handler on a worker thread while the
+// main thread reads the flag.
+static std::atomic<int> g_interrupted(0);
 
 // Set when run_benchmark() aborts because --connection-stage-timeout
-// elapsed without any thread reaching steady state. main() reads it after
-// the run loop to decide between exit(0) and exit(2).
+// elapsed without any thread reaching steady state. Reset at the start of
+// every run (connection_stage_supervisor_reset()), so it describes the
+// current run only.
 static std::atomic<bool> g_connection_stage_aborted{false};
+
+// Set by run_benchmark() (main thread) together with
+// g_connection_stage_aborted, but never reset: with --run-count > 1, an abort
+// in any run, not only the last one, makes memtier exit 2. Atomic because
+// worker threads read it through failure_exit_code().
+static std::atomic<bool> g_any_run_connection_stage_aborted{false};
+
+// Set by run_benchmark() (main thread, after joining the workers) when any
+// worker thread ended on connection failures it could not recover from (or an
+// exception) instead of on the run's own stop condition (--test-time /
+// --requests). Such a run did not measure what was asked for; main() then
+// exits 1.
+static bool g_worker_failed = false;
+
+// Set (main thread only) when a requested output could not be opened or
+// written: --out-file, --json-out-file, stdout, the --hdr-file-prefix files,
+// the --client-stats CSVs or --failed-keys-file (e.g. a full disk). The
+// error has been printed; main() then exits 1.
+static bool g_output_failed = false;
+
+// main owns the JSON writer. Workers never write JSON, and main writes results
+// after joining them, so the exit callback sees a quiescent writer. Retain
+// content already emitted, without assuming which output stage was reached.
+static json_handler *g_json_out_file = NULL;
+
+static void close_json_out_file_at_exit(void)
+{
+    if (g_json_out_file != NULL) {
+        g_json_out_file->write_error("Benchmark terminated before normal finalization");
+        g_json_out_file->close();
+    }
+}
 
 // Forward declarations
 struct cg_thread;
@@ -178,8 +327,8 @@ void connection_stage_supervisor_reset(void)
     g_conn_stage_streak_start_sec.store(0, std::memory_order_release);
     // Must reset g_connection_stage_aborted as well: with --run-count > 1, a
     // run-1 abort would otherwise leave the flag latched into run 2,
-    // suppressing legitimate thread restarts in cg_thread_start() and
-    // forcing main() to exit with code 2 even after subsequent runs succeed.
+    // suppressing the worker-failure report in cg_thread_start(). The exit
+    // code uses g_any_run_connection_stage_aborted, which is not reset.
     g_connection_stage_aborted.store(false, std::memory_order_release);
     struct timeval now;
     gettimeofday(&now, NULL);
@@ -221,6 +370,16 @@ void report_connection_stage_success(void)
     if (g_conn_stage_steady_state.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
         g_conn_stage_streak_start_sec.store(0, std::memory_order_release);
     }
+}
+
+int failure_exit_code(void)
+{
+    return g_any_run_connection_stage_aborted.load(std::memory_order_acquire) ? 2 : 1;
+}
+
+bool connection_stage_steady_state_reached(void)
+{
+    return g_conn_stage_steady_state.load(std::memory_order_acquire);
 }
 
 bool connection_stage_should_abort(unsigned int timeout_secs, std::string *out_last_err, unsigned int *out_elapsed)
@@ -275,6 +434,7 @@ bool connection_stage_should_abort(unsigned int timeout_secs, std::string *out_l
 // allocating from the main heap. We also skip installation when something
 // upstream (e.g. ASan/LSan/UBSan's own runtime) has already registered an
 // alt stack for us; replacing theirs would break their crash reporting.
+#ifndef _WIN32
 #define MEMTIER_ALT_STACK_SIZE (64 * 1024)
 static __thread char tls_altstack_buf[MEMTIER_ALT_STACK_SIZE];
 static __thread bool tls_altstack_installed = false;
@@ -304,74 +464,69 @@ static void install_alt_signal_stack(void)
         tls_altstack_installed = true;
     }
 }
+#else
+static void install_alt_signal_stack(void) {}
+#endif
 
-// Signal handler for Ctrl+C
+// CLOCK_MONOTONIC time of the first SIGINT/SIGTERM, in ms modulo 2^32, and
+// never 0: 0 means no signal yet. Differences are taken modulo 2^32 too, so
+// the wrap every ~49.7 days does not matter.
+static std::atomic<unsigned int> g_first_interrupt_ms(0);
+
+// The handler uses only int-sized atomics; that is async-signal-safe only
+// when they are lock-free.
+static_assert(ATOMIC_INT_LOCK_FREE == 2, "sigint_handler needs lock-free int atomics");
+
+// Signal handler for Ctrl+C (SIGINT) and SIGTERM. The first signal stops
+// the run gracefully. A signal at least 1 s later terminates at once, as a
+// way out of a stuck shutdown. Signals within that second are duplicates of
+// the same action and are ignored: Ctrl+C under `timeout` delivers SIGINT
+// twice (terminal and timeout), and a process-group kill does the same.
 static void sigint_handler(int signum)
 {
-    (void) signum; // unused parameter
-    g_interrupted = 1;
+    int saved_errno = errno;
+    struct timespec ts;
+    // clock_gettime() is async-signal-safe (POSIX.1-2008).
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    unsigned int now = (unsigned int) ts.tv_sec * 1000u + (unsigned int) (ts.tv_nsec / 1000000);
+    if (now == 0) now = 1;
+    unsigned int first = 0;
+    if (g_first_interrupt_ms.compare_exchange_strong(first, now)) {
+        g_interrupted = signum;
+    } else if (now - first >= 1000u) {
+        signal(signum, SIG_DFL);
+        raise(signum);
+    }
+    errno = saved_errno;
 }
 
-// Crash handler - prints stack trace and other debugging information
-static void crash_handler(int sig, siginfo_t *info, void *secret)
+// Report tail shared by the POSIX signal handler and the Windows exception
+// filter: system and version information, the client list and the closing
+// banner.
+static void print_crash_report_tail(const char *timestr)
 {
-    (void) secret; // unused parameter
-    struct tm *tm;
-    time_t now;
-    char timestr[64];
-
-    // Watchdog: if the handler itself hangs (e.g. mid-print_client_list while
-    // iterating a torn vector under heap corruption), the process is killed
-    // after 5 s instead of leaving a half-written report indefinitely. The
-    // original signal will be re-raised on a fresh sigaction below, but if
-    // we never get there, SIGALRM provides the floor.
-    alarm(5);
-
-    // Get current time
-    now = time(NULL);
-    tm = localtime(&now);
-    strftime(timestr, sizeof(timestr), "%d %b %Y %H:%M:%S", tm);
-
-    // Print crash header
-    fprintf(stderr, "\n\n=== MEMTIER_BENCHMARK BUG REPORT START: Cut & paste starting from here ===\n");
-    fprintf(stderr, "[%d] %s # memtier_benchmark crashed by signal: %d\n", getpid(), timestr, sig);
-
-    // Print signal information
-    const char *signal_name = "UNKNOWN";
-    switch (sig) {
-    case SIGSEGV:
-        signal_name = "SIGSEGV";
-        break;
-    case SIGBUS:
-        signal_name = "SIGBUS";
-        break;
-    case SIGFPE:
-        signal_name = "SIGFPE";
-        break;
-    case SIGILL:
-        signal_name = "SIGILL";
-        break;
-    case SIGABRT:
-        signal_name = "SIGABRT";
-        break;
-    }
-    fprintf(stderr, "[%d] %s # Crashed running signal <%s>\n", getpid(), timestr, signal_name);
-
-    if (info) {
-        fprintf(stderr, "[%d] %s # Signal code: %d\n", getpid(), timestr, info->si_code);
-        fprintf(stderr, "[%d] %s # Fault address: %p\n", getpid(), timestr, info->si_addr);
-    }
-
-    // Print stack trace for all threads
-    print_all_threads_stack_trace(stderr, getpid(), timestr);
-
     // Print system information
     fprintf(stderr, "\n[%d] %s # --- INFO OUTPUT\n", getpid(), timestr);
 
+#ifdef _WIN32
+    // RtlGetVersion, unlike GetVersionEx, is not subject to manifest-based
+    // version lying.
+    typedef LONG(WINAPI * rtl_get_version_fn)(PRTL_OSVERSIONINFOW);
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    rtl_get_version_fn rtl_get_version = ntdll ? (rtl_get_version_fn) GetProcAddress(ntdll, "RtlGetVersion") : NULL;
+    RTL_OSVERSIONINFOW os_version;
+    memset(&os_version, 0, sizeof(os_version));
+    os_version.dwOSVersionInfoSize = sizeof(os_version);
+    if (rtl_get_version != NULL && rtl_get_version(&os_version) == 0) {
+        fprintf(stderr, "[%d] %s # os:Windows %lu.%lu.%lu\n", getpid(), timestr, os_version.dwMajorVersion,
+                os_version.dwMinorVersion, os_version.dwBuildNumber);
+    }
+#else
     struct utsname name;
     if (uname(&name) == 0) {
         fprintf(stderr, "[%d] %s # os:%s %s %s\n", getpid(), timestr, name.sysname, name.release, name.machine);
     }
+#endif
 
     fprintf(stderr, "[%d] %s # memtier_version:%s\n", getpid(), timestr, PACKAGE_VERSION);
     fprintf(stderr, "[%d] %s # memtier_git_sha1:%s\n", getpid(), timestr, MEMTIER_GIT_SHA1);
@@ -403,12 +558,173 @@ static void crash_handler(int sig, siginfo_t *info, void *secret)
     // Print client connection information
     print_client_list(stderr, getpid(), timestr);
 
+#ifdef _WIN32
+    fprintf(stderr, "[%d] %s # For more information, please check the crash dump if available.\n", getpid(), timestr);
+    fprintf(stderr, "[%d] %s # To enable crash dumps, configure Windows Error Reporting LocalDumps:\n", getpid(),
+            timestr);
+    fprintf(stderr, "[%d] %s # HKLM\\SOFTWARE\\Microsoft\\Windows\\Windows Error Reporting\\LocalDumps\n", getpid(),
+            timestr);
+#else
     fprintf(stderr, "[%d] %s # For more information, please check the core dump if available.\n", getpid(), timestr);
     fprintf(stderr, "[%d] %s # To enable core dumps: ulimit -c unlimited\n", getpid(), timestr);
     fprintf(stderr, "[%d] %s # Core pattern: /proc/sys/kernel/core_pattern\n", getpid(), timestr);
+#endif
 
     fprintf(stderr, "\n=== MEMTIER_BENCHMARK BUG REPORT END. Make sure to include from START to END. ===\n\n");
     fprintf(stderr, "       Please report this bug by opening an issue on github.com/redis/memtier_benchmark\n\n");
+}
+
+static const char *interrupt_source(void)
+{
+    return g_interrupted == SIGTERM ? "SIGTERM" : "user (Ctrl+C)";
+}
+
+// Offset of local time from UTC, in seconds, taken once at startup by
+// crash-handler setup with crash_utc_offset(). The crash handlers cannot
+// call localtime(); see crash_report.h (#681).
+static long g_crash_utc_offset = 0;
+
+#ifndef _WIN32
+
+// Begin a report line: "[pid] timestr # ".
+static void crash_line_prefix(crash_line &l, int pid, const char *timestr)
+{
+    l.str("[");
+    l.num((long long) pid);
+    l.str("] ");
+    l.str(timestr);
+    l.str(" # ");
+}
+
+// ThreadSanitizer runs a handler for an asynchronous signal only when the
+// receiving thread is in, or leaves, an intercepted call. A thread stuck on
+// a futex or in a blocked write never does, so the watchdog handler would
+// never run and the process would hang. TSan builds keep SIG_DFL for
+// SIGALRM, which the kernel applies directly, and have no INCOMPLETE line.
+#if defined(__SANITIZE_THREAD__)
+#define MEMTIER_THREAD_SANITIZER 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define MEMTIER_THREAD_SANITIZER 1
+#endif
+#endif
+
+#ifndef MEMTIER_THREAD_SANITIZER
+// SIGALRM handler armed by crash_handler(): say why the report stops, then
+// end the process with the default SIGALRM action as before. The write can
+// block too (stderr is a full pipe or a stopped tty), so first re-arm the
+// alarm: SA_RESETHAND already restored SIG_DFL, and SA_NODEFER leaves
+// SIGALRM unblocked, so the second alarm kills the process 1 s later.
+static void crash_watchdog_handler(int sig)
+{
+    alarm(1);
+    crash_line l;
+    l.str("\n=== MEMTIER_BENCHMARK BUG REPORT INCOMPLETE: crash handler timed out ===\n");
+    l.write_out();
+    // SA_RESETHAND already restored SIG_DFL, so this ends the process now.
+    raise(sig);
+}
+#endif
+
+// Crash handler - prints stack trace and other debugging information
+static void crash_handler(int sig, siginfo_t *info, void *secret)
+{
+    (void) secret; // unused parameter
+    char timestr[64];
+    int pid = getpid();
+
+    // Watchdog: if the handler itself hangs (e.g. mid-print_client_list while
+    // iterating a torn vector under heap corruption), the process is killed
+    // after 5 s instead of leaving a half-written report indefinitely. The
+    // original signal will be re-raised on a fresh sigaction below, but if
+    // we never get there, SIGALRM provides the floor. The watchdog first
+    // writes a line saying the report is incomplete. A second crash with the
+    // same signal takes the default action (SA_RESETHAND). A crash by a
+    // different signal re-enters this handler and re-arms alarm(5), so death
+    // can take up to about 11 s in that case, which is still bounded.
+#ifndef MEMTIER_THREAD_SANITIZER
+    struct sigaction alarm_act;
+    sigemptyset(&alarm_act.sa_mask);
+    alarm_act.sa_flags = SA_ONSTACK | SA_NODEFER | SA_RESETHAND;
+    alarm_act.sa_handler = crash_watchdog_handler;
+    // SIGALRM may land on any thread, not only this one. That is fine: the
+    // watchdog only calls alarm, write and raise, which are safe on any
+    // thread, and SA_RESETHAND resets the disposition for the whole process.
+    sigaction(SIGALRM, &alarm_act, NULL);
+#endif
+    alarm(5);
+
+    // The header and signal details use only async-signal-safe calls
+    // (time, getpid, write), so they reach stderr even when the crash
+    // interrupted a thread holding the malloc, stdio or time zone lock.
+    crash_format_time(timestr, sizeof(timestr), (long long) time(NULL), g_crash_utc_offset);
+
+    const char *signal_name = "UNKNOWN";
+    switch (sig) {
+    case SIGSEGV:
+        signal_name = "SIGSEGV";
+        break;
+    case SIGBUS:
+        signal_name = "SIGBUS";
+        break;
+    case SIGFPE:
+        signal_name = "SIGFPE";
+        break;
+    case SIGILL:
+        signal_name = "SIGILL";
+        break;
+    case SIGABRT:
+        signal_name = "SIGABRT";
+        break;
+    }
+
+    crash_line l;
+    l.str("\n\n=== MEMTIER_BENCHMARK BUG REPORT START: Cut & paste starting from here ===\n");
+    l.write_out();
+    crash_line_prefix(l, pid, timestr);
+    l.str("memtier_benchmark crashed by signal: ");
+    l.num((long long) sig);
+    l.str("\n");
+    l.write_out();
+    crash_line_prefix(l, pid, timestr);
+    l.str("Crashed running signal <");
+    l.str(signal_name);
+    l.str(">\n");
+    l.write_out();
+    if (info) {
+        crash_line_prefix(l, pid, timestr);
+        l.str("Signal code: ");
+        l.num((long long) info->si_code);
+        l.str("\n");
+        l.write_out();
+        crash_line_prefix(l, pid, timestr);
+        l.str("Fault address: ");
+        if (info->si_addr == NULL) {
+            l.str("(nil)");
+        } else {
+            l.str("0x");
+            l.num((unsigned long long) (uintptr_t) info->si_addr, 16, 1);
+        }
+        l.str("\n");
+        l.write_out();
+    }
+
+    // Everything below is best effort and is NOT async-signal-safe; it comes
+    // after the essential lines above so a hang here still leaves them, and
+    // the watchdog ends a hang after 5 s:
+    // - backtrace() can take the loader lock (dl_iterate_phdr) while
+    //   unwinding; its first-use malloc/dlopen is done by prewarm.
+    // - fprintf(stderr) takes the stderr FILE lock. It is recursive, so it
+    //   only blocks while another thread is inside a stderr call.
+    // - print_client_list() reads the worker's client and connection
+    //   vectors without synchronization; a torn vector can fault or hang.
+    // uname(), getpid(), sigaction() and raise() are async-signal-safe, and
+    // event_get_version() only returns a constant string.
+
+    // Print stack trace for all threads
+    print_all_threads_stack_trace(stderr, getpid(), timestr);
+
+    print_crash_report_tail(timestr);
 
     // Remove the handler and re-raise the signal to generate core dump
     struct sigaction act;
@@ -442,6 +758,10 @@ static void prewarm_crash_handler(void)
     fflush(stderr);
     // Resolve event_get_version too — used in the INFO section.
     (void) event_get_version();
+
+    // The handler formats its timestamp by hand from this offset, and this
+    // first localtime_r() call also loads the time zone data.
+    g_crash_utc_offset = crash_utc_offset(time(NULL));
 }
 
 // Setup crash handlers
@@ -469,16 +789,51 @@ static void setup_crash_handlers(void)
     sigaction(SIGFPE, &act, NULL);
     sigaction(SIGILL, &act, NULL);
     sigaction(SIGABRT, &act, NULL);
-    // SIGALRM is the handler's own watchdog; if alarm(5) fires we want the
-    // default action (terminate the process) rather than re-entering the
-    // handler. Explicitly request SIG_DFL so the user can't have overridden
-    // it inadvertently.
+    // SIGALRM is the crash handler's watchdog. SIG_DFL (terminate) is the
+    // baseline; crash_handler() installs crash_watchdog_handler, which
+    // prints an INCOMPLETE marker and falls back to SIG_DFL, before it calls
+    // alarm(5). Explicitly request SIG_DFL here so an inherited disposition
+    // cannot turn the watchdog off.
     struct sigaction alarm_act;
     sigemptyset(&alarm_act.sa_mask);
     alarm_act.sa_flags = 0;
     alarm_act.sa_handler = SIG_DFL;
     sigaction(SIGALRM, &alarm_act, NULL);
 }
+#else
+// Best-effort crash report for unhandled SEH exceptions (access violation,
+// illegal instruction, ...). abort() and assert() failures do not reach it.
+static LONG WINAPI crash_exception_filter(EXCEPTION_POINTERS *info)
+{
+    // One report per process: a fault inside this filter, or a second
+    // crashing thread, must not re-enter it.
+    static volatile LONG reporting = 0;
+    if (InterlockedExchange(&reporting, 1) != 0) return EXCEPTION_CONTINUE_SEARCH;
+
+    char timestr[64];
+    crash_format_time(timestr, sizeof(timestr), (long long) time(NULL), g_crash_utc_offset);
+
+    const EXCEPTION_RECORD *rec = info->ExceptionRecord;
+    fprintf(stderr, "\n\n=== MEMTIER_BENCHMARK BUG REPORT START: Cut & paste starting from here ===\n");
+    fprintf(stderr, "[%d] %s # memtier_benchmark crashed by unhandled exception\n", getpid(), timestr);
+    fprintf(stderr, "[%d] %s # Crashed running exception <0x%08lx>\n", getpid(), timestr, rec->ExceptionCode);
+    fprintf(stderr, "[%d] %s # Fault address: %p\n", getpid(), timestr, rec->ExceptionAddress);
+    if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2) {
+        fprintf(stderr, "[%d] %s # Access violation: %s address %p\n", getpid(), timestr,
+                rec->ExceptionInformation[0] == 0 ? "reading" : "writing", (void *) rec->ExceptionInformation[1]);
+    }
+
+    print_all_threads_stack_trace(stderr, getpid(), timestr);
+    print_crash_report_tail(timestr);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void setup_crash_handlers(void)
+{
+    g_crash_utc_offset = crash_utc_offset(time(NULL));
+    SetUnhandledExceptionFilter(crash_exception_filter);
+}
+#endif
 
 void benchmark_log_file_line(int level, const char *filename, unsigned int line, const char *fmt, ...)
 {
@@ -529,40 +884,21 @@ static const char *get_protocol_name(enum PROTOCOL_TYPE type)
         return "memcache_text";
     else if (type == PROTOCOL_MEMCACHE_BINARY)
         return "memcache_binary";
+    else if (type == PROTOCOL_MEMCACHE_META)
+        return "memcache_meta";
     else
         return "none";
 }
 
 #ifdef HAVE_EVHTTP
 // Comma-joined "key=value" run labels in insertion order (PLAN.md section 5).
-// With json_escape, applies JSON string escaping (\, ", and control chars as
-// \u00XX) because json_handler::write_obj is a raw vfprintf passthrough.
-static std::string prometheus_run_labels_str(struct benchmark_config *cfg, bool json_escape)
+// Unescaped: json_handler::write_obj escapes string values itself.
+static std::string prometheus_run_labels_str(struct benchmark_config *cfg)
 {
     std::string s;
     for (size_t i = 0; i < cfg->prometheus_run_labels.size(); i++) {
         if (i > 0) s += ",";
-        const std::string &k = cfg->prometheus_run_labels[i].first;
-        const std::string &v = cfg->prometheus_run_labels[i].second;
-        std::string kv = k + "=" + v;
-        if (json_escape) {
-            for (size_t j = 0; j < kv.size(); j++) {
-                unsigned char c = (unsigned char) kv[j];
-                if (c == '\\') {
-                    s += "\\\\";
-                } else if (c == '"') {
-                    s += "\\\"";
-                } else if (c < 0x20) {
-                    char buf[8];
-                    snprintf(buf, sizeof(buf), "\\u%04x", (unsigned int) c);
-                    s += buf;
-                } else {
-                    s += (char) c;
-                }
-            }
-        } else {
-            s += kv;
-        }
+        s += cfg->prometheus_run_labels[i].first + "=" + cfg->prometheus_run_labels[i].second;
     }
     return s;
 }
@@ -582,6 +918,61 @@ static std::string prometheus_buckets_str(struct benchmark_config *cfg)
     return s;
 }
 #endif // HAVE_EVHTTP
+
+// Secrets must not reach --show-config or --json-out-file (result files are
+// shared as CI artifacts). Keep the user name, which the redis and
+// memcache_binary authenticate() split off at the first ':', and replace the
+// password with "***": "user:pw" -> "user:***", "pw" -> "***".
+static std::string redact_credentials(const char *credentials)
+{
+    if (!credentials || !*credentials) return "";
+    const char *colon = strchr(credentials, ':');
+    if (!colon) return "***";
+    return std::string(credentials, colon - credentials + 1) + "***";
+}
+
+// End of the userinfo in a URI authority+path (the text after "scheme://"),
+// or NULL when there is none. The authority ends at a '/', '?' or '#'
+// (RFC 3986), so once credentials are present the search for '@' stops at
+// the first of those after the first '@': a later '@' in the db path, query
+// or fragment does not end the credentials, which would send them to another
+// host. It is the LAST '@' before that point, so a raw '@' in the password
+// works and no tail of it is taken for the host and echoed by --show-config
+// or a host/port error.
+// Ambiguous forms, kept as before for compatibility; parse_uri() warns about
+// them (a raw '/', '?' or '#' in the userinfo) and %2F, %3F, %23 and %40
+// spell them unambiguously (#732):
+// - A raw '/', '?' or '#' in the password works only when no '@' comes
+//   before it in the password: "u:a@b/c@host" is split as host "b".
+// - Without credentials, an '@' in the path still ends a "userinfo":
+//   "host:6379/1@other:6379" connects to "other", and "host:6379/1@" to the
+//   default server. Treating a '/', '?' or '#' before the first '@' as "no
+//   userinfo" would break a raw '/' in passwords.
+static const char *uri_userinfo_end(const char *s)
+{
+    const char *at = strchr(s, '@');
+    if (!at) return NULL;
+    const char *delim = strpbrk(at, "/?#");
+    const char *end = delim ? delim : at + strlen(at);
+    while (end > at && *(end - 1) != '@')
+        end--;
+    return end - 1;
+}
+
+// --uri with its userinfo password redacted: redis://user:pw@host:port/db ->
+// redis://user:***@host:port/db. Splits where parse_uri() does; it assumes a
+// URI parse_uri() has already validated (the no-"://" fallback is only a guard).
+static std::string redact_uri(const char *uri)
+{
+    if (!uri) return "";
+    std::string s(uri);
+    size_t start = s.find("://");
+    start = (start == std::string::npos) ? 0 : start + 3;
+    const char *at = uri_userinfo_end(s.c_str() + start);
+    if (!at) return s;
+    size_t at_pos = at - s.c_str();
+    return s.substr(0, start) + redact_credentials(s.substr(start, at_pos - start).c_str()) + s.substr(at_pos);
+}
 
 static void config_print(FILE *file, struct benchmark_config *cfg)
 {
@@ -605,6 +996,7 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             "out_file = %s\n"
             "client_stats = %s\n"
             "run_count = %u\n"
+            "progress_interval = %u\n"
             "debug = %u\n"
             "requests = %llu\n"
             "rate_limit = %u\n"
@@ -659,7 +1051,7 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             "prometheus-latency-buckets = %s\n"
 #endif
             ,
-            cfg->server, cfg->port, cfg->uri ? cfg->uri : "", cfg->unix_socket,
+            cfg->server, cfg->port, redact_uri(cfg->uri).c_str(), cfg->unix_socket,
             cfg->resolution == AF_UNSPEC ? "Unspecified"
             : cfg->resolution == AF_INET ? "AF_INET"
                                          : "AF_INET6",
@@ -668,8 +1060,8 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             cfg->tls ? "yes" : "no", cfg->tls_cert, cfg->tls_key, cfg->tls_cacert, cfg->tls_skip_verify ? "yes" : "no",
             cfg->tls_sni,
 #endif
-            cfg->out_file, cfg->client_stats, cfg->run_count, cfg->debug, cfg->requests, cfg->request_rate,
-            cfg->clients, cfg->threads, cfg->test_time, cfg->ratio.a, cfg->ratio.b, cfg->pipeline,
+            cfg->out_file, cfg->client_stats, cfg->run_count, cfg->progress_interval, cfg->debug, cfg->requests,
+            cfg->request_rate, cfg->clients, cfg->threads, cfg->test_time, cfg->ratio.a, cfg->ratio.b, cfg->pipeline,
             cfg->transaction ? "yes" : "no", cfg->data_size, cfg->data_offset, cfg->random_data ? "yes" : "no",
             cfg->data_size_range.min, cfg->data_size_range.max, cfg->data_size_list.print(tmpbuf, sizeof(tmpbuf) - 1),
             cfg->data_size_pattern, cfg->expiry_range.min, cfg->expiry_range.max, cfg->data_import,
@@ -679,15 +1071,24 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             cfg->retry_backoff_factor, cfg->retry_on_filter ? cfg->retry_on_filter : "", cfg->max_retry_queue,
             cfg->failed_keys_file ? cfg->failed_keys_file : "", cfg->connection_timeout, cfg->connection_stage_timeout,
             cfg->thread_conn_start_min_jitter_micros, cfg->thread_conn_start_max_jitter_micros, cfg->multi_key_get,
-            cfg->authenticate ? cfg->authenticate : "", cfg->select_db, cfg->no_expiry ? "yes" : "no",
+            redact_credentials(cfg->authenticate).c_str(), cfg->select_db, cfg->no_expiry ? "yes" : "no",
             cfg->wait_ratio.a, cfg->wait_ratio.b, cfg->num_slaves.min, cfg->num_slaves.max, cfg->wait_timeout.min,
             cfg->wait_timeout.max, cfg->json_out_file, cfg->print_all_runs ? "yes" : "no"
 #ifdef HAVE_EVHTTP
             ,
             cfg->prometheus_port, cfg->prometheus_bind_addr ? cfg->prometheus_bind_addr : "127.0.0.1",
-            prometheus_run_labels_str(cfg, false).c_str(), prometheus_buckets_str(cfg).c_str()
+            prometheus_run_labels_str(cfg).c_str(), prometheus_buckets_str(cfg).c_str()
 #endif
     );
+    fprintf(file,
+            "clients_start = %u\n"
+            "clients_step = %u\n"
+            "step_duration = %u\n"
+            "scan_incremental_max_iterations = %u\n"
+            "replica_clients = %u\n"
+            "replicas_per_shard = %u\n",
+            cfg->clients_start, cfg->clients_step, cfg->step_duration, cfg->scan_incremental_max_iterations,
+            cfg->replica_clients, cfg->replicas_per_shard);
 }
 
 static void config_print_to_json(json_handler *jsonhandler, struct benchmark_config *cfg)
@@ -698,7 +1099,7 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
 
     jsonhandler->write_obj("server", "\"%s\"", cfg->server);
     jsonhandler->write_obj("port", "%u", cfg->port);
-    jsonhandler->write_obj("uri", "\"%s\"", cfg->uri ? cfg->uri : "");
+    jsonhandler->write_obj("uri", "\"%s\"", redact_uri(cfg->uri).c_str());
     jsonhandler->write_obj("unix socket", "\"%s\"", cfg->unix_socket);
     jsonhandler->write_obj("address family", "\"%s\"",
                            cfg->resolution == AF_UNSPEC ? "Unspecified"
@@ -716,6 +1117,7 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
 #endif
     jsonhandler->write_obj("client_stats", "\"%s\"", cfg->client_stats);
     jsonhandler->write_obj("run_count", "%u", cfg->run_count);
+    jsonhandler->write_obj("progress_interval", "%u", cfg->progress_interval);
     jsonhandler->write_obj("debug", "%u", cfg->debug);
     jsonhandler->write_obj("requests", "%llu", cfg->requests);
     jsonhandler->write_obj("rate_limit", "%u", cfg->request_rate);
@@ -737,8 +1139,8 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
     jsonhandler->write_obj("verify_only", "\"%s\"", cfg->verify_only ? "true" : "false");
     jsonhandler->write_obj("generate_keys", "\"%s\"", cfg->generate_keys ? "true" : "false");
     jsonhandler->write_obj("key_prefix", "\"%s\"", cfg->key_prefix);
-    jsonhandler->write_obj("key_minimum", "%11u", cfg->key_minimum);
-    jsonhandler->write_obj("key_maximum", "%11u", cfg->key_maximum);
+    jsonhandler->write_obj("key_minimum", "%11llu", cfg->key_minimum);
+    jsonhandler->write_obj("key_maximum", "%11llu", cfg->key_maximum);
     jsonhandler->write_obj("key_pattern", "\"%s\"", cfg->key_pattern);
     jsonhandler->write_obj("key_stddev", "%f", cfg->key_stddev);
     jsonhandler->write_obj("key_median", "%f", cfg->key_median);
@@ -756,7 +1158,7 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
     jsonhandler->write_obj("thread_conn_start_min_jitter_micros", "%u", cfg->thread_conn_start_min_jitter_micros);
     jsonhandler->write_obj("thread_conn_start_max_jitter_micros", "%u", cfg->thread_conn_start_max_jitter_micros);
     jsonhandler->write_obj("multi_key_get", "%u", cfg->multi_key_get);
-    jsonhandler->write_obj("authenticate", "\"%s\"", cfg->authenticate ? cfg->authenticate : "");
+    jsonhandler->write_obj("authenticate", "\"%s\"", redact_credentials(cfg->authenticate).c_str());
     jsonhandler->write_obj("select-db", "%d", cfg->select_db);
     jsonhandler->write_obj("no-expiry", "\"%s\"", cfg->no_expiry ? "true" : "false");
     jsonhandler->write_obj("wait-ratio", "\"%u:%u\"", cfg->wait_ratio.a, cfg->wait_ratio.b);
@@ -768,6 +1170,8 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
         jsonhandler->write_obj("clients_step", "%u", cfg->clients_step);
         jsonhandler->write_obj("step_duration", "%u", cfg->step_duration);
     }
+    if (cfg->scan_incremental_iteration)
+        jsonhandler->write_obj("scan_incremental_max_iterations", "%u", cfg->scan_incremental_max_iterations);
 
     // Read-preference configuration
     {
@@ -821,21 +1225,208 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
 
 #ifdef HAVE_EVHTTP
     // Prometheus configuration (PLAN.md section 5). None of these are secrets.
-    // Run labels are JSON-escaped because write_obj is a raw vfprintf passthrough.
+    // Run labels are free-form; write_obj escapes quoted string values.
     jsonhandler->write_obj("prometheus-port", "%d", cfg->prometheus_port);
     jsonhandler->write_obj("prometheus-bind-addr", "\"%s\"",
                            cfg->prometheus_bind_addr ? cfg->prometheus_bind_addr : "127.0.0.1");
-    jsonhandler->write_obj("prometheus-run-labels", "\"%s\"", prometheus_run_labels_str(cfg, true).c_str());
+    jsonhandler->write_obj("prometheus-run-labels", "\"%s\"", prometheus_run_labels_str(cfg).c_str());
     jsonhandler->write_obj("prometheus-latency-buckets", "\"%s\"", prometheus_buckets_str(cfg).c_str());
 #endif
 
     jsonhandler->close_nesting();
 }
 
+// Parse an unsigned decimal option value in [0,max].  Like strtoull(), leading
+// whitespace and a single '+' are accepted, so existing command lines keep
+// working.  A single '-' is accepted only when the value is zero ("-0",
+// "-00"), which strtoull() never wrapped; any other negative value is
+// rejected, since strtoull() would negate it and wrap "-1" or
+// "\n-18446744073709551000" into the valid range.
+// Empty input, trailing junk, ERANGE and values above max are rejected BEFORE
+// the caller narrows the result, so values above UINT_MAX cannot wrap modulo
+// 2^32.  If too_large is given, it is set when the value is a well-formed
+// number above max.
+static bool parse_unsigned(const char *s, unsigned long long max, unsigned long long *out, bool *too_large = NULL)
+{
+    if (too_large) *too_large = false;
+    if (s == NULL) return false;
+    while (isspace((unsigned char) *s))
+        s++;
+    bool negative = false;
+    if (*s == '+')
+        s++;
+    else if (*s == '-') {
+        negative = true;
+        s++;
+    }
+    if (!isdigit((unsigned char) *s)) return false;
+    char *endptr = NULL;
+    errno = 0;
+    unsigned long long v = strtoull(s, &endptr, 10);
+    if (*endptr != '\0') return false;
+    if (negative && (errno == ERANGE || v != 0)) return false;
+    if (errno == ERANGE || v > max) {
+        if (too_large) *too_large = true;
+        return false;
+    }
+    *out = v;
+    return true;
+}
+
+// Signed counterpart of parse_unsigned(), for options with a negative
+// sentinel (--max-retries -1).  Leading whitespace and one '+' or '-' are
+// accepted; empty input, trailing junk, ERANGE and values outside [min,max]
+// are rejected before the caller narrows the result.  If too_large is
+// given, it is set when the value is a well-formed number above max.
+// Like parse_unsigned(), "-0" is accepted: strtoll() reads it as 0.
+static bool parse_signed(const char *s, long long min, long long max, long long *out, bool *too_large = NULL)
+{
+    if (too_large) *too_large = false;
+    if (s == NULL) return false;
+    while (isspace((unsigned char) *s))
+        s++;
+    const char *digits = s;
+    if (*digits == '+' || *digits == '-') digits++;
+    if (!isdigit((unsigned char) *digits)) return false;
+    char *endptr = NULL;
+    errno = 0;
+    long long v = strtoll(s, &endptr, 10);
+    if (*endptr != '\0') return false;
+    if ((errno == ERANGE && v > 0) || (errno != ERANGE && v > max)) {
+        if (too_large) *too_large = true;
+        return false;
+    }
+    if (errno == ERANGE || v < min) return false;
+    *out = v;
+    return true;
+}
+
+// Parse a TCP/UDP port number: the whole string must be a decimal number in
+// [1,65535] (see parse_unsigned()). Shared by -p/--port, --statsd-port,
+// --graphite-port, the --uri port and --read-server HOST:PORT.
+static bool parse_port(const char *s, unsigned short *out)
+{
+    unsigned long long v;
+    if (!parse_unsigned(s, 65535, &v) || v < 1) return false;
+    *out = (unsigned short) v;
+    return true;
+}
+
+// Error for a count option (-n, -c, -t, --pipeline, ...) that parse_unsigned()
+// rejected (parsed == false) or that was zero: say why, so "-1", "5x",
+// "99999..." and "0" are not all reported as "must be greater than zero".
+// unit, if given, follows the maximum (" bytes (512 MiB)").
+static void count_option_error(const char *name, bool parsed, bool too_large, unsigned long long max,
+                               const char *unit = "")
+{
+    if (too_large)
+        fprintf(stderr, "error: %s must be <= %llu%s.\n", name, max, unit);
+    else if (parsed)
+        fprintf(stderr, "error: %s must be greater than zero.\n", name);
+    else
+        fprintf(stderr, "error: %s must be a positive integer.\n", name);
+}
+
+// Error for an option where 0 is a valid value (--data-offset, --select-db,
+// ...) that parse_unsigned() rejected.
+static void non_negative_option_error(const char *name, bool too_large, unsigned long long max)
+{
+    if (too_large)
+        fprintf(stderr, "error: %s must be <= %llu.\n", name, max);
+    else
+        fprintf(stderr, "error: %s must be a non-negative integer.\n", name);
+}
+
+static int hex_digit_value(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+// RFC 3986 percent-decoding of a --uri user name or password, as redis-cli -u
+// does. A '%' not followed by two hex digits is kept as a literal '%' with a
+// warning instead of an error: master took the userinfo verbatim, so a
+// password such as "100%" kept working. %00 is rejected, since the
+// credentials are passed on as a C string and would be cut short. Neither
+// message echoes the value. Returns false on error.
+static bool uri_percent_decode(const char *s, const char *what, std::string &out)
+{
+    bool literal_percent = false;
+    out.clear();
+    for (; *s; s++) {
+        int hi, lo;
+        if (*s == '%' && (hi = hex_digit_value(s[1])) >= 0 && (lo = hex_digit_value(s[2])) >= 0) {
+            if (hi == 0 && lo == 0) {
+                fprintf(stderr, "error: --uri %s contains %%00, which cannot be sent to the server.\n", what);
+                return false;
+            }
+            out += (char) (hi * 16 + lo);
+            s += 2;
+        } else {
+            if (*s == '%') literal_percent = true;
+            out += *s;
+        }
+    }
+    if (literal_percent) {
+        fprintf(stderr,
+                "warning: --uri %s has a '%%' not followed by two hex digits; it is kept as a literal '%%'. "
+                "Write it as %%25.\n",
+                what);
+    }
+    return true;
+}
+
+// Decode the --uri userinfo into the -a/--authenticate form ("user:password",
+// or "password"), splitting at the first raw ':' before decoding so that %3A
+// can carry a ':' in the password. authenticate() splits user and password at
+// the first ':', so a decoded ':' cannot be part of the user name; a password
+// with no user that decodes to a ':' gets a leading ':', which authenticate()
+// reads as "password only"; password_only tells the caller there was no
+// user name, so the memcache_binary USER:PASSWORD check still applies. The
+// decoded user name is printed by --show-config and the JSON, so control
+// bytes are rejected there (Redis rejects such user names anyway); the
+// password is never printed and AUTH is length-prefixed, so it may hold
+// them. Returns false on error.
+static bool uri_decode_userinfo(const char *userinfo, std::string &out, bool &password_only)
+{
+    if (strpbrk(userinfo, "/?#")) {
+        fprintf(stderr, "note: --uri credentials contain a raw '/', '?' or '#'; this is accepted, but if the "
+                        "password is not being recognised, percent-encode them (%%2F, %%3F, %%23). Without "
+                        "credentials, an '@' after a '/', '?' or '#' is read as the credentials separator.\n");
+    }
+    const char *colon = strchr(userinfo, ':');
+    password_only = !colon;
+    if (!colon) {
+        std::string password;
+        if (!uri_percent_decode(userinfo, "password", password)) return false;
+        out = strchr(password.c_str(), ':') ? ":" + password : password;
+        return true;
+    }
+    std::string user, password;
+    if (!uri_percent_decode(std::string(userinfo, colon - userinfo).c_str(), "user name", user) ||
+        !uri_percent_decode(colon + 1, "password", password))
+        return false;
+    if (user.find(':') != std::string::npos) {
+        fprintf(stderr, "error: --uri user name contains ':' (%%3A), which AUTH credentials cannot carry.\n");
+        return false;
+    }
+    for (size_t i = 0; i < user.size(); i++) {
+        unsigned char c = (unsigned char) user[i];
+        if (c < 0x20 || c == 0x7f) {
+            fprintf(stderr, "error: --uri user name contains a control character.\n");
+            return false;
+        }
+    }
+    out = user + ":" + password;
+    return true;
+}
+
 // Parse URI and populate config fields
 // Returns 0 on success, -1 on error
 static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string &uri_authenticate,
-                     std::string &uri_server)
+                     std::string &uri_server, bool &uri_password_only)
 {
     if (!uri || strlen(uri) == 0) {
         fprintf(stderr, "error: empty URI provided.\n");
@@ -881,17 +1472,24 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
 
     ptr = scheme_end + 3; // Skip "://"
 
-    // Parse user:password@host:port/db
-    char *auth_end = strchr(ptr, '@');
+    // Parse user:password@host:port/db; see uri_userinfo_end() for where the
+    // userinfo ends (redact_uri() splits at the same place).
+    char *auth_end = (char *) uri_userinfo_end(ptr);
     char *host_start = ptr;
 
     if (auth_end) {
         if (cfg->authenticate) {
             fprintf(stderr, "warning: both URI and --authenticate specified, URI takes precedence.\n");
         }
-        // Own URI credentials separately from the borrowed --authenticate argument.
+        // Own URI credentials separately from the borrowed --authenticate
+        // argument. Only the userinfo is decoded: redis-cli -u decodes no
+        // other part, an IPv6 zone id ("[fe80::1%eth0]") passes through
+        // raw, and the port and db number are digits only.
         *auth_end = '\0';
-        uri_authenticate = ptr;
+        if (!uri_decode_userinfo(ptr, uri_authenticate, uri_password_only)) {
+            free(uri_copy);
+            return -1;
+        }
         cfg->authenticate = uri_authenticate.c_str();
         host_start = auth_end + 1;
     }
@@ -902,28 +1500,42 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
         *db_start = '\0';
         db_start++;
         if (strlen(db_start) > 0) {
-            char *endptr;
-            int db = (int) strtol(db_start, &endptr, 10);
-            if (*endptr != '\0' || db < 0) {
-                fprintf(stderr, "error: invalid database number '%s'.\n", db_start);
+            // Same rule as --select-db: parse_unsigned() with an INT_MAX bound.
+            unsigned long long db;
+            if (!parse_unsigned(db_start, INT_MAX, &db)) {
+                // An ambiguous raw URI password can extend into this substring.
+                fprintf(stderr, "error: invalid database number in URI.\n");
                 free(uri_copy);
                 return -1;
             }
             if (cfg->select_db) {
                 fprintf(stderr, "warning: both URI and --select-db specified, URI takes precedence.\n");
             }
-            cfg->select_db = db;
+            cfg->select_db = (int) db;
         }
     }
 
-    // Parse host:port
-    char *port_start = strchr(host_start, ':');
+    // Parse host:port. An IPv6 host is bracketed ([::1]:6379, as accepted by
+    // redis-cli -u): the port separator is the ':' right after the ']'.
+    char *port_start;
+    if (*host_start == '[') {
+        char *bracket = strchr(host_start, ']');
+        if (!bracket || bracket == host_start + 1 || (bracket[1] != '\0' && bracket[1] != ':')) {
+            fprintf(stderr, "error: invalid IPv6 host '%s' in URI.\n", host_start);
+            free(uri_copy);
+            return -1;
+        }
+        *bracket = '\0';
+        port_start = bracket[1] == ':' ? bracket + 1 : NULL;
+        host_start++;
+    } else {
+        port_start = strchr(host_start, ':');
+    }
     if (port_start) {
         *port_start = '\0';
         port_start++;
-        char *endptr;
-        unsigned long port = strtoul(port_start, &endptr, 10);
-        if (*endptr != '\0' || port == 0 || port > 65535) {
+        unsigned short port;
+        if (!parse_port(port_start, &port)) {
             fprintf(stderr, "error: invalid port number '%s'.\n", port_start);
             free(uri_copy);
             return -1;
@@ -931,7 +1543,18 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
         if (cfg->port) {
             fprintf(stderr, "warning: both URI and --port specified, URI takes precedence.\n");
         }
-        cfg->port = (unsigned short) port;
+        cfg->port = port;
+    }
+
+    // An empty host with no explicit --server/--unix-socket falls back to the
+    // default server, as before (parse_uri() runs before
+    // config_init_defaults(), so a non-NULL server or unix_socket here was
+    // given on the command line); say where the run goes. This includes a
+    // stray '@' after the path (redis://host:6379/1@), which reads as
+    // credentials "host:6379/1" with no host, as on master (#732).
+    if (strlen(host_start) == 0 && !cfg->server && !cfg->unix_socket) {
+        fprintf(stderr, "warning: --uri has no host; connecting to the default server localhost:%u.\n",
+                cfg->port ? cfg->port : 6379);
     }
 
     // Own URI hosts separately from a borrowed --server argument or the default.
@@ -954,6 +1577,7 @@ static void config_init_defaults(struct benchmark_config *cfg)
     if (!cfg->port && !cfg->unix_socket) cfg->port = 6379;
     if (!cfg->resolution) cfg->resolution = AF_UNSPEC;
     if (!cfg->run_count) cfg->run_count = 1;
+    if (!cfg->progress_interval) cfg->progress_interval = 1;
     if (!cfg->clients) cfg->clients = 50;
     if (!cfg->threads) cfg->threads = 4;
     if (!cfg->ratio.is_defined()) cfg->ratio = config_ratio("1:10");
@@ -1032,11 +1656,13 @@ static bool verify_cluster_option(struct benchmark_config *cfg)
 }
 
 // Returns true when `token` is one of the placeholder tokens that
-// arbitrary-command parsing recognises (__key__, __data__, __monitor_line*__,
-// __scan_cursor__). The first argv of --command must be a literal command
-// name; allowing a placeholder there is what triggers the runtime assert in
-// protocol.cpp ("first arg is not command name?"). We check at parse time so
-// the user gets a readable error instead of SIGABRT.
+// arbitrary-command parsing recognises (__key__, __data__, __monitor_line*__).
+// "__scan_cursor__" is not one: only memtier's own SCAN continuation has a
+// cursor slot, so a user token with that text is a literal (#663).
+// The first argv of --command must be a literal command name; allowing a
+// placeholder there is what triggers the runtime assert in protocol.cpp
+// ("first arg is not command name?"). We check at parse time so the user
+// gets a readable error instead of SIGABRT.
 static bool first_arg_is_placeholder(const std::string &token)
 {
     // The runtime assert in protocol.cpp ("first arg is not command name?")
@@ -1045,7 +1671,6 @@ static bool first_arg_is_placeholder(const std::string &token)
     // this guard. Mirror the same substring contract here at parse time so
     // the user gets a readable error instead of an abort.
     if (token.find(KEY_PLACEHOLDER) != std::string::npos || token.find(DATA_PLACEHOLDER) != std::string::npos ||
-        token.find(SCAN_CURSOR_PLACEHOLDER) != std::string::npos ||
         token.find(MONITOR_RANDOM_PLACEHOLDER) != std::string::npos) {
         return true;
     }
@@ -1092,20 +1717,33 @@ static bool verify_arbitrary_command_option(struct benchmark_config *cfg)
 //   DATA_SIZE_MAX: upper bound on --data-size (and per-entry size in
 //                  --data-size-list).  Matches Redis' default proto-max-bulk-len
 //                  (512 MiB), past which the server rejects the bulk anyway.
+//   MULTI_KEY_GET_MAX: upper bound on --multi-key-get, a memory sanity
+//                  limit.  Every client preallocates a keylist of
+//                  multi_key_get + 1 entries: 16 bytes of index plus 256 bytes
+//                  of key buffer each, about 4.3 GiB per client at this cap,
+//                  where the preallocated key buffer is just under 4 GiB.  The
+//                  sizes are size_t now, so nothing wraps above it; the cap is
+//                  where keylist's old 32-bit buffer size used to wrap, so every
+//                  value that ever worked still does.
 #define MEMTIER_PIPELINE_MAX 1024u
 #define MEMTIER_DATA_SIZE_MAX (512u * 1024u * 1024u)
+#define MEMTIER_MULTI_KEY_GET_MAX 16777214u
+//   DATA_OFFSET_MAX: upper bound on --data-offset (the SETRANGE/GETRANGE
+//                  offset), 2^29 - 1, which main() used to check after parsing.
+#define MEMTIER_DATA_OFFSET_MAX ((1u << 29) - 1)
 
-// True if optarg's first non-space character is '-'.  strtoul() silently
-// accepts a leading minus and underflows the result to a huge unsigned, which
-// then sails past the >0 check downstream and only manifests as a hang or
-// SIGABRT deep in the run loop.  Catching it at parse time keeps the error
-// message close to the offending flag.
-static bool optarg_is_negative(const char *s)
+// Parse a backoff factor: the whole string must be a finite, representable
+// number >= 0.  Rejects empty input, trailing junk, nan/inf and ERANGE
+// overflow/underflow.  Shared by --reconnect-backoff-factor and
+// --retry-backoff-factor so the two flags accept the same inputs.
+static bool parse_backoff_factor(const char *s, double *out)
 {
-    if (s == NULL) return false;
-    while (*s == ' ' || *s == '\t')
-        s++;
-    return *s == '-';
+    char *endptr = NULL;
+    errno = 0;
+    double v = strtod(s, &endptr);
+    if (endptr == s || !endptr || *endptr != '\0' || errno == ERANGE || !std::isfinite(v) || v < 0.0) return false;
+    *out = v;
+    return true;
 }
 
 #ifdef HAVE_EVHTTP
@@ -1157,6 +1795,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_key_zipf_exp,
         o_show_config,
         o_hide_histogram,
+        o_progress_interval,
         o_print_percentiles,
         o_print_all_runs,
         o_realtime_latencies,
@@ -1254,6 +1893,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         {"debug", 0, 0, 'D'},
         {"show-config", 0, 0, o_show_config},
         {"hide-histogram", 0, 0, o_hide_histogram},
+        {"progress-interval", 1, 0, o_progress_interval},
         {"print-percentiles", 1, 0, o_print_percentiles},
         {"print-all-runs", 0, 0, o_print_all_runs},
         {"realtime-latencies", 0, 0, o_realtime_latencies},
@@ -1348,6 +1988,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
     int option_index;
     int c;
     char *endptr;
+    unsigned long long val;
     while ((c = getopt_long(argc, argv, "vs:S:p:P:o:x:DRn:c:t:d:a:h:46u:", long_options, &option_index)) != -1) {
         switch (c) {
         case o_help:
@@ -1396,16 +2037,29 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             cfg->server = optarg;
             break;
         case 'S':
+#ifdef _WIN32
+            fprintf(stderr, "error: --unix-socket is not supported on Windows.\n");
+            return -1;
+#else
             cfg->unix_socket = optarg;
             break;
+#endif
         case 'p':
-            endptr = NULL;
-            cfg->port = (unsigned short) strtoul(optarg, &endptr, 10);
-            if (!cfg->port || cfg->port > 65535 || !endptr || *endptr != '\0') {
+            if (!parse_port(optarg, &cfg->port)) {
                 fprintf(stderr, "error: port must be a number in the range [1-65535].\n");
                 return -1;
             }
             break;
+        case o_progress_interval: {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, UINT_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("progress-interval", parsed, too_large, UINT_MAX, " seconds");
+                return -1;
+            }
+            cfg->progress_interval = (unsigned int) val;
+            break;
+        }
         case '4':
             cfg->resolution = AF_INET;
             break;
@@ -1423,9 +2077,11 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 cfg->protocol = PROTOCOL_MEMCACHE_TEXT;
             } else if (strcmp(optarg, "memcache_binary") == 0) {
                 cfg->protocol = PROTOCOL_MEMCACHE_BINARY;
+            } else if (strcmp(optarg, "memcache_meta") == 0) {
+                cfg->protocol = PROTOCOL_MEMCACHE_META;
             } else {
-                fprintf(stderr, "error: supported protocols are 'memcache_text', 'memcache_binary', 'redis', 'resp2' "
-                                "and resp3'.\n");
+                fprintf(stderr, "error: supported protocols are 'memcache_text', 'memcache_binary', "
+                                "'memcache_meta', 'redis', 'resp2' and 'resp3'.\n");
                 return -1;
             }
             break;
@@ -1490,22 +2146,22 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             cfg->distinct_client_seed++;
             break;
         case o_randomize:
+#ifdef _WIN32
+            cfg->randomize = (int) (generate_random_seed() & 0x7fffffff);
+#else
             srandom(generate_random_seed());
             cfg->randomize = random();
+#endif
             break;
         case 'n':
-            endptr = NULL;
             if (strcmp(optarg, "allkeys") == 0)
                 cfg->requests = -1;
             else {
-                if (optarg_is_negative(optarg)) {
-                    fprintf(stderr, "error: requests must be a positive integer.\n");
-                    return -1;
-                }
-                errno = 0;
-                cfg->requests = (unsigned long long) strtoull(optarg, &endptr, 10);
-                if (errno == ERANGE || !cfg->requests || !endptr || *endptr != '\0') {
-                    fprintf(stderr, "error: requests must be greater than zero.\n");
+                // ULLONG_MAX is the "allkeys" sentinel, so it is not a valid count.
+                bool too_large;
+                bool parsed = parse_unsigned(optarg, ULLONG_MAX - 1, &cfg->requests, &too_large);
+                if (!parsed || !cfg->requests) {
+                    count_option_error("requests", parsed, too_large, ULLONG_MAX - 1);
                     return -1;
                 }
                 if (cfg->test_time) {
@@ -1514,49 +2170,40 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 }
             }
             break;
-        case 'c':
-            endptr = NULL;
-            if (optarg_is_negative(optarg)) {
-                fprintf(stderr, "error: clients must be a positive integer.\n");
+        case 'c': {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, UINT_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("clients", parsed, too_large, UINT_MAX);
                 return -1;
             }
-            errno = 0;
-            cfg->clients = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (errno == ERANGE || !cfg->clients || !endptr || *endptr != '\0') {
-                fprintf(stderr, "error: clients must be greater than zero.\n");
-                return -1;
-            }
+            cfg->clients = (unsigned int) val;
             break;
-        case 't':
-            endptr = NULL;
-            if (optarg_is_negative(optarg)) {
-                fprintf(stderr, "error: threads must be a positive integer.\n");
+        }
+        case 't': {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, UINT_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("threads", parsed, too_large, UINT_MAX);
                 return -1;
             }
-            errno = 0;
-            cfg->threads = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (errno == ERANGE || !cfg->threads || !endptr || *endptr != '\0') {
-                fprintf(stderr, "error: threads must be greater than zero.\n");
-                return -1;
-            }
+            cfg->threads = (unsigned int) val;
             break;
-        case o_test_time:
-            endptr = NULL;
-            if (optarg_is_negative(optarg)) {
-                fprintf(stderr, "error: test time must be a positive integer.\n");
+        }
+        case o_test_time: {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, UINT_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("test time", parsed, too_large, UINT_MAX);
                 return -1;
             }
-            errno = 0;
-            cfg->test_time = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (errno == ERANGE || !cfg->test_time || !endptr || *endptr != '\0') {
-                fprintf(stderr, "error: test time must be greater than zero.\n");
-                return -1;
-            }
+            cfg->test_time = (unsigned int) val;
             if (cfg->requests) {
                 fprintf(stderr, "error: --test-time and --requests are mutually exclusive.\n");
                 return -1;
             }
             break;
+        }
         case o_ratio:
             cfg->ratio = config_ratio(optarg);
             if (!cfg->ratio.is_defined()) {
@@ -1565,52 +2212,37 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             }
             break;
         case o_pipeline: {
-            endptr = NULL;
-            if (optarg_is_negative(optarg)) {
-                fprintf(stderr, "error: pipeline must be greater than zero.\n");
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, MEMTIER_PIPELINE_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("pipeline", parsed, too_large, MEMTIER_PIPELINE_MAX);
                 return -1;
             }
-            unsigned long pipeline_val = strtoul(optarg, &endptr, 10);
-            if (!pipeline_val || !endptr || *endptr != '\0') {
-                fprintf(stderr, "error: pipeline must be greater than zero.\n");
-                return -1;
-            }
-            if (pipeline_val > MEMTIER_PIPELINE_MAX) {
-                fprintf(stderr, "error: pipeline must be <= %u.\n", MEMTIER_PIPELINE_MAX);
-                return -1;
-            }
-            cfg->pipeline = (unsigned int) pipeline_val;
+            cfg->pipeline = (unsigned int) val;
             break;
         }
         case 'd': {
-            endptr = NULL;
-            if (optarg_is_negative(optarg)) {
-                fprintf(stderr, "error: data-size must be greater than zero.\n");
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, MEMTIER_DATA_SIZE_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("data-size", parsed, too_large, MEMTIER_DATA_SIZE_MAX, " bytes (512 MiB)");
                 return -1;
             }
-            unsigned long data_size_val = strtoul(optarg, &endptr, 10);
-            if (!data_size_val || !endptr || *endptr != '\0') {
-                fprintf(stderr, "error: data-size must be greater than zero.\n");
-                return -1;
-            }
-            if (data_size_val > MEMTIER_DATA_SIZE_MAX) {
-                fprintf(stderr, "error: data-size must be <= %u bytes (512 MiB).\n", MEMTIER_DATA_SIZE_MAX);
-                return -1;
-            }
-            cfg->data_size = (unsigned int) data_size_val;
+            cfg->data_size = (unsigned int) val;
             break;
         }
         case 'R':
             cfg->random_data = true;
             break;
-        case o_data_offset:
-            endptr = NULL;
-            cfg->data_offset = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!endptr || *endptr != '\0') {
-                fprintf(stderr, "error: data-offset must be greater than or equal to zero.\n");
+        case o_data_offset: {
+            bool too_large;
+            if (!parse_unsigned(optarg, MEMTIER_DATA_OFFSET_MAX, &val, &too_large)) {
+                non_negative_option_error("data-offset", too_large, MEMTIER_DATA_OFFSET_MAX);
                 return -1;
             }
+            cfg->data_offset = (unsigned int) val;
             break;
+        }
         case o_data_size_range:
             cfg->data_size_range = config_range(optarg);
             if (!cfg->data_size_range.is_defined() || cfg->data_size_range.min < 1) {
@@ -1687,22 +2319,26 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         case o_key_prefix:
             cfg->key_prefix = optarg;
             break;
-        case o_key_minimum:
-            endptr = NULL;
-            cfg->key_minimum = strtoull(optarg, &endptr, 10);
-            if (cfg->key_minimum < 1 || !endptr || *endptr != '\0') {
-                fprintf(stderr, "error: key-minimum must be greater than zero.\n");
+        case o_key_minimum: {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, ULLONG_MAX, &val, &too_large);
+            if (!parsed) {
+                non_negative_option_error("key-minimum", too_large, ULLONG_MAX);
                 return -1;
             }
+            cfg->key_minimum = val;
             break;
-        case o_key_maximum:
-            endptr = NULL;
-            cfg->key_maximum = strtoull(optarg, &endptr, 10);
-            if (cfg->key_maximum < 1 || !endptr || *endptr != '\0') {
-                fprintf(stderr, "error: key-maximum must be greater than zero.\n");
+        }
+        case o_key_maximum: {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, ULLONG_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("key-maximum", parsed, too_large, ULLONG_MAX);
                 return -1;
             }
+            cfg->key_maximum = val;
             break;
+        }
         case o_key_stddev:
             endptr = NULL;
             cfg->key_stddev = strtod(optarg, &endptr);
@@ -1749,30 +2385,31 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 return -1;
             }
             break;
-        case o_reconnect_interval:
-            endptr = NULL;
-            cfg->reconnect_interval = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!cfg->reconnect_interval || !endptr || *endptr != '\0') {
-                fprintf(stderr, "error: reconnect-interval must be greater than zero.\n");
+        case o_reconnect_interval: {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, UINT_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("reconnect-interval", parsed, too_large, UINT_MAX);
                 return -1;
             }
+            cfg->reconnect_interval = (unsigned int) val;
             break;
+        }
         case o_reconnect_on_error:
             cfg->reconnect_on_error = true;
             break;
         case o_max_reconnect_attempts:
-            endptr = NULL;
-            cfg->max_reconnect_attempts = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!endptr || *endptr != '\0') {
+            if (!parse_unsigned(optarg, UINT_MAX, &val)) {
                 fprintf(stderr, "error: max-reconnect-attempts must be a valid number.\n");
                 return -1;
             }
+            cfg->max_reconnect_attempts = (unsigned int) val;
             break;
         case o_reconnect_backoff_factor:
-            endptr = NULL;
-            cfg->reconnect_backoff_factor = strtod(optarg, &endptr);
-            if (cfg->reconnect_backoff_factor <= 0.0 || !endptr || *endptr != '\0') {
-                fprintf(stderr, "error: reconnect-backoff-factor must be greater than zero.\n");
+            if (!parse_backoff_factor(optarg, &cfg->reconnect_backoff_factor)) {
+                fprintf(
+                    stderr,
+                    "error: reconnect-backoff-factor must be a finite, representable number >= 0 (0 = no backoff).\n");
                 return -1;
             }
             break;
@@ -1780,28 +2417,29 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             cfg->retry_on_error = true;
             break;
         case o_max_retries: {
-            endptr = NULL;
-            long parsed = strtol(optarg, &endptr, 10);
-            if (!endptr || *endptr != '\0' || parsed < -1) {
-                fprintf(stderr, "error: max-retries must be an integer >= -1 (-1 means unlimited).\n");
+            long long parsed;
+            bool too_large;
+            if (!parse_signed(optarg, -1, INT_MAX, &parsed, &too_large)) {
+                if (too_large)
+                    fprintf(stderr, "error: max-retries must be <= %d.\n", INT_MAX);
+                else
+                    fprintf(stderr, "error: max-retries must be an integer >= -1 (-1 means unlimited).\n");
                 return -1;
             }
             cfg->max_retries = (int) parsed;
             break;
         }
         case o_retry_backoff_ms:
-            endptr = NULL;
-            cfg->retry_backoff_ms = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!endptr || *endptr != '\0') {
+            if (!parse_unsigned(optarg, UINT_MAX, &val)) {
                 fprintf(stderr, "error: retry-backoff-ms must be a valid number.\n");
                 return -1;
             }
+            cfg->retry_backoff_ms = (unsigned int) val;
             break;
         case o_retry_backoff_factor:
-            endptr = NULL;
-            cfg->retry_backoff_factor = strtod(optarg, &endptr);
-            if (cfg->retry_backoff_factor < 0.0 || !endptr || *endptr != '\0') {
-                fprintf(stderr, "error: retry-backoff-factor must be >= 0 (0 = no exponential, constant backoff).\n");
+            if (!parse_backoff_factor(optarg, &cfg->retry_backoff_factor)) {
+                fprintf(stderr, "error: retry-backoff-factor must be a finite, representable number >= 0 (0 = no "
+                                "exponential, constant backoff).\n");
                 return -1;
             }
             break;
@@ -1809,12 +2447,11 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             cfg->retry_on_filter = optarg;
             break;
         case o_max_retry_queue:
-            endptr = NULL;
-            cfg->max_retry_queue = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!endptr || *endptr != '\0') {
+            if (!parse_unsigned(optarg, UINT_MAX, &val)) {
                 fprintf(stderr, "error: max-retry-queue must be a valid number.\n");
                 return -1;
             }
+            cfg->max_retry_queue = (unsigned int) val;
             break;
         case o_failed_keys_file:
             if (!optarg || !*optarg) {
@@ -1824,50 +2461,53 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             cfg->failed_keys_file = optarg;
             break;
         case o_connection_timeout:
-            endptr = NULL;
-            cfg->connection_timeout = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!endptr || *endptr != '\0') {
+            if (!parse_unsigned(optarg, UINT_MAX, &val)) {
                 fprintf(stderr, "error: connection-timeout must be a valid number.\n");
                 return -1;
             }
+            cfg->connection_timeout = (unsigned int) val;
             break;
         case o_connection_stage_timeout:
-            endptr = NULL;
-            cfg->connection_stage_timeout = (unsigned int) strtoul(optarg, &endptr, 10);
             // 0 is allowed and disables the supervisor (opt-out for users
             // running long pre-warmed handshakes against slow servers).
-            if (!endptr || *endptr != '\0') {
+            // UINT_MAX is the "not set" sentinel (defaults to 30 s).
+            if (!parse_unsigned(optarg, UINT_MAX - 1, &val)) {
                 fprintf(stderr, "error: connection-stage-timeout must be a valid number (seconds, 0 disables).\n");
                 return -1;
             }
+            cfg->connection_stage_timeout = (unsigned int) val;
             break;
-        case o_thread_conn_start_min_jitter_micros:
-            endptr = NULL;
-            cfg->thread_conn_start_min_jitter_micros = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!endptr || *endptr != '\0') {
-                fprintf(stderr, "error: thread-conn-start-min-jitter-micros must be a valid number.\n");
+        case o_thread_conn_start_min_jitter_micros: {
+            bool too_large;
+            if (!parse_unsigned(optarg, UINT_MAX, &val, &too_large)) {
+                non_negative_option_error("thread-conn-start-min-jitter-micros", too_large, UINT_MAX);
                 return -1;
             }
+            cfg->thread_conn_start_min_jitter_micros = (unsigned int) val;
             break;
-        case o_thread_conn_start_max_jitter_micros:
-            endptr = NULL;
-            cfg->thread_conn_start_max_jitter_micros = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!endptr || *endptr != '\0') {
-                fprintf(stderr, "error: thread-conn-start-max-jitter-micros must be a valid number.\n");
+        }
+        case o_thread_conn_start_max_jitter_micros: {
+            bool too_large;
+            if (!parse_unsigned(optarg, UINT_MAX, &val, &too_large)) {
+                non_negative_option_error("thread-conn-start-max-jitter-micros", too_large, UINT_MAX);
                 return -1;
             }
+            cfg->thread_conn_start_max_jitter_micros = (unsigned int) val;
             break;
+        }
         case o_generate_keys:
             cfg->generate_keys = 1;
             break;
-        case o_multi_key_get:
-            endptr = NULL;
-            cfg->multi_key_get = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (cfg->multi_key_get < 1 || !endptr || *endptr != '\0') {
-                fprintf(stderr, "error: multi-key-get must be greater than zero.\n");
+        case o_multi_key_get: {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, MEMTIER_MULTI_KEY_GET_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("multi-key-get", parsed, too_large, MEMTIER_MULTI_KEY_GET_MAX);
                 return -1;
             }
+            cfg->multi_key_get = (int) val;
             break;
+        }
         case 'a':
             cfg->authenticate = optarg;
             break;
@@ -1875,13 +2515,15 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         case o_uri:
             cfg->uri = optarg;
             break;
-        case o_select_db:
-            cfg->select_db = (int) strtoul(optarg, &endptr, 10);
-            if (cfg->select_db < 0 || !endptr || *endptr != '\0') {
-                fprintf(stderr, "error: select-db must be greater or equal zero.\n");
+        case o_select_db: {
+            bool too_large;
+            if (!parse_unsigned(optarg, INT_MAX, &val, &too_large)) {
+                non_negative_option_error("select-db", too_large, INT_MAX);
                 return -1;
             }
+            cfg->select_db = (int) val;
             break;
+        }
         case o_no_expiry:
             cfg->no_expiry = true;
             break;
@@ -2064,12 +2706,13 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             break;
         }
         case o_rate_limiting: {
-            endptr = NULL;
-            cfg->request_rate = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!cfg->request_rate || !endptr || *endptr != '\0') {
-                fprintf(stderr, "error: rate must be greater than zero.\n");
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, UINT_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("rate-limiting", parsed, too_large, UINT_MAX);
                 return -1;
             }
+            cfg->request_rate = (unsigned int) val;
             break;
         }
 #ifdef USE_TLS
@@ -2138,9 +2781,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             cfg->statsd_host = optarg;
             break;
         case o_statsd_port:
-            endptr = NULL;
-            cfg->statsd_port = (unsigned short) strtoul(optarg, &endptr, 10);
-            if (cfg->statsd_port == 0 || !endptr || *endptr != '\0') {
+            if (!parse_port(optarg, &cfg->statsd_port)) {
                 fprintf(stderr, "error: statsd-port must be a valid port number.\n");
                 return -1;
             }
@@ -2152,31 +2793,24 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             cfg->statsd_run_label = optarg;
             break;
         case o_graphite_port:
-            endptr = NULL;
-            cfg->graphite_port = (unsigned short) strtoul(optarg, &endptr, 10);
-            if (cfg->graphite_port == 0 || !endptr || *endptr != '\0') {
+            if (!parse_port(optarg, &cfg->graphite_port)) {
                 fprintf(stderr, "error: graphite-port must be a valid port number.\n");
                 return -1;
             }
             break;
 #ifdef HAVE_EVHTTP
         case o_prometheus_port: {
-            // strtoul pattern (statsd-port) with three deltas: accept 0,
-            // reject a leading '-' before strtoul wraps it, and bound the
-            // value to [0,65535] BEFORE any narrowing cast (a cast would
-            // silently wrap 70000 -> 4464). PLAN.md section 5 / E1.
+            // Unlike --statsd-port this accepts 0. parse_unsigned() accepts
+            // leading whitespace and one '+', rejects negatives other than
+            // "-0", and bounds the
+            // value to [0,65535] BEFORE the narrowing cast (a cast would
+            // silently wrap 70000 -> 4464).
             static const char *E1 = "error: prometheus-port must be a number in the range [0-65535] (0 = ephemeral).\n";
-            if (!optarg || !*optarg || optarg_is_negative(optarg)) {
+            if (!parse_unsigned(optarg, 65535, &val)) {
                 fprintf(stderr, "%s", E1);
                 return -1;
             }
-            endptr = NULL;
-            unsigned long pport = strtoul(optarg, &endptr, 10);
-            if (!endptr || *endptr != '\0' || pport > 65535) {
-                fprintf(stderr, "%s", E1);
-                return -1;
-            }
-            cfg->prometheus_port = (int) pport;
+            cfg->prometheus_port = (int) val;
             break;
         }
         case o_prometheus_bind_addr: {
@@ -2263,6 +2897,12 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 fprintf(stderr, "error: --prometheus-run-label: too many labels (max 16).\n");
                 return -1;
             }
+            if (utf8_sanitize(value.c_str()) != value) {
+                fprintf(stderr,
+                        "warning: --prometheus-run-label: value for '%s' is not valid UTF-8; "
+                        "invalid bytes are replaced with U+FFFD on /metrics.\n",
+                        key.c_str());
+            }
             cfg->prometheus_run_labels.push_back(std::make_pair(key, value));
             break;
         }
@@ -2284,38 +2924,44 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             cfg->scan_incremental_iteration = true;
             break;
         case o_scan_incremental_max_iterations: {
-            endptr = NULL;
-            cfg->scan_incremental_max_iterations = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!endptr || *endptr != '\0') {
-                fprintf(stderr, "error: scan-incremental-max-iterations must be a positive number.\n");
+            bool too_large;
+            if (!parse_unsigned(optarg, UINT_MAX, &val, &too_large)) {
+                non_negative_option_error("scan-incremental-max-iterations", too_large, UINT_MAX);
                 return -1;
             }
+            cfg->scan_incremental_max_iterations = (unsigned int) val;
             break;
         }
-        case o_clients_start:
-            endptr = NULL;
-            cfg->clients_start = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!cfg->clients_start || !endptr || *endptr != '\0') {
-                fprintf(stderr, "error: clients-start must be greater than zero.\n");
+        case o_clients_start: {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, UINT_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("clients-start", parsed, too_large, UINT_MAX);
                 return -1;
             }
+            cfg->clients_start = (unsigned int) val;
             break;
-        case o_clients_step:
-            endptr = NULL;
-            cfg->clients_step = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!cfg->clients_step || !endptr || *endptr != '\0') {
-                fprintf(stderr, "error: clients-step must be greater than zero.\n");
+        }
+        case o_clients_step: {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, UINT_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("clients-step", parsed, too_large, UINT_MAX);
                 return -1;
             }
+            cfg->clients_step = (unsigned int) val;
             break;
-        case o_step_duration:
-            endptr = NULL;
-            cfg->step_duration = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!cfg->step_duration || !endptr || *endptr != '\0') {
-                fprintf(stderr, "error: step-duration must be greater than zero.\n");
+        }
+        case o_step_duration: {
+            bool too_large;
+            bool parsed = parse_unsigned(optarg, UINT_MAX, &val, &too_large);
+            if (!parsed || !val) {
+                count_option_error("step-duration", parsed, too_large, UINT_MAX);
                 return -1;
             }
+            cfg->step_duration = (unsigned int) val;
             break;
+        }
         case o_read_preference: {
             if (!optarg) {
                 fprintf(stderr, "error: --read-preference requires a value.\n");
@@ -2361,9 +3007,8 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 fprintf(stderr, "error: --read-server: expected HOST:PORT, got '%s'.\n", optarg);
                 return -1;
             }
-            endptr = NULL;
-            unsigned long rport = strtoul(rscolon + 1, &endptr, 10);
-            if (!endptr || *endptr != '\0' || rport == 0 || rport > 65535) {
+            unsigned short rport;
+            if (!parse_port(rscolon + 1, &rport)) {
                 fprintf(stderr, "error: --read-server: invalid port in '%s'.\n", optarg);
                 return -1;
             }
@@ -2372,7 +3017,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             if (!rhost.empty() && rhost[0] == '[' && rhost[rhost.size() - 1] == ']') {
                 rhost = rhost.substr(1, rhost.size() - 2);
             }
-            cfg->read_servers.push_back(read_server_spec(rhost, (unsigned short) rport));
+            cfg->read_servers.push_back(read_server_spec(rhost, rport));
             break;
         }
         case o_command_is_read: {
@@ -2385,21 +3030,21 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             break;
         }
         case o_replica_clients: {
-            endptr = NULL;
-            cfg->replica_clients = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!endptr || *endptr != '\0') {
-                fprintf(stderr, "error: --replica-clients must be a non-negative integer.\n");
+            bool too_large;
+            if (!parse_unsigned(optarg, UINT_MAX, &val, &too_large)) {
+                non_negative_option_error("replica-clients", too_large, UINT_MAX);
                 return -1;
             }
+            cfg->replica_clients = (unsigned int) val;
             break;
         }
         case o_replicas_per_shard: {
-            endptr = NULL;
-            cfg->replicas_per_shard = (unsigned int) strtoul(optarg, &endptr, 10);
-            if (!endptr || *endptr != '\0') {
-                fprintf(stderr, "error: --replicas-per-shard must be a non-negative integer.\n");
+            bool too_large;
+            if (!parse_unsigned(optarg, UINT_MAX, &val, &too_large)) {
+                non_negative_option_error("replicas-per-shard", too_large, UINT_MAX);
                 return -1;
             }
+            cfg->replicas_per_shard = (unsigned int) val;
             break;
         }
         case o_read_preference_fallback: {
@@ -2484,10 +3129,10 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
     }
 
     // --transaction needs at least one --command to operate on. In
-    // --cluster-mode the flag changes routing; in standalone it is a no-op
-    // (each client has a single connection, so the rotation already runs
-    // through one socket in order), but we accept it so scripts that toggle
-    // --cluster-mode don't have to also toggle --transaction.
+    // --cluster-mode it also pins each rotation to one shard connection; in
+    // standalone each client already has a single connection, so it only
+    // keeps every __key__ of a rotation on the same key and skips the rest
+    // of a MULTI block after a reconnect.
     if (cfg->transaction && !cfg->arbitrary_commands->is_defined()) {
         fprintf(stderr, "error: --transaction requires at least one --command.\n");
         return -1;
@@ -2495,6 +3140,12 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
 
     if ((cfg->cluster_mode && !verify_cluster_option(cfg)) ||
         (cfg->arbitrary_commands->is_defined() && !verify_arbitrary_command_option(cfg))) {
+        return -1;
+    }
+
+    if (cfg->protocol == PROTOCOL_MEMCACHE_META &&
+        (cfg->wait_ratio.is_defined() || cfg->arbitrary_commands->is_defined())) {
+        fprintf(stderr, "error: memcache_meta does not support --wait-ratio or --command.\n");
         return -1;
     }
 
@@ -2548,12 +3199,16 @@ void usage()
         "  -h, --host=ADDR                Server address (default: localhost)\n"
         "  -s, --server=ADDR              Same as --host\n"
         "  -p, --port=PORT                Server port (default: 6379)\n"
-        "  -S, --unix-socket=SOCKET       UNIX Domain socket name (default: none)\n"
+        "  -S, --unix-socket=SOCKET       UNIX Domain socket name, POSIX only (default: none)\n"
+        "                                Linux: @NAME selects an abstract socket\n"
         "  -4, --ipv4                     Force IPv4 address resolution.\n"
         "  -6  --ipv6                     Force IPv6 address resolution.\n"
         "  -P, --protocol=PROTOCOL        Protocol to use (default: redis).\n"
-        "                                 other supported protocols are resp2, resp3, memcache_text and "
-        "memcache_binary.\n"
+        "                                 other supported protocols are resp2, resp3, memcache_text, "
+        "memcache_binary and memcache_meta.\n"
+        "                                 memcache_meta is the modern Memcached meta-command protocol "
+        "(memcached 1.6.10+).\n"
+        "                                 Each meta operation includes an mn no-op terminator.\n"
         "                                 when using one of resp2 or resp3 the redis protocol version will be set via "
         "HELLO command.\n"
         "  -a, --authenticate=CREDENTIALS Authenticate using specified credentials.\n"
@@ -2564,7 +3219,10 @@ void usage()
         "  -u, --uri=URI                  Server URI on format redis://user:password@host:port/dbnum\n"
         "                                 User, password and dbnum are optional. For authentication\n"
         "                                 without a username, use username 'default'. For TLS, use\n"
-        "                                 the scheme 'rediss'.\n"
+        "                                 the scheme 'rediss'. Bracket IPv6 hosts: [::1]:6379.\n"
+        "                                 User and password are percent-decoded, as by\n"
+        "                                 redis-cli -u: write '@' as %%40, '/' as %%2F, '%%' as\n"
+        "                                 %%25 and, in the password, ':' as %%3A.\n"
 #ifdef USE_TLS
         "      --tls                      Enable SSL/TLS transport security\n"
         "      --cert=FILE                Use specified client certificate for TLS\n"
@@ -2575,7 +3233,8 @@ void usage()
         "of 'TLSv1', 'TLSv1.1', 'TLSv1.2' and 'TLSv1.3'.\n"
         "      --sni=STRING               Add an SNI header\n"
 #endif
-        "  -x, --run-count=NUMBER         Number of full-test iterations to perform\n"
+        "  -x, --run-count=NUMBER         Number of full-test iterations to perform. Ctrl+C or SIGTERM\n"
+        "                                 ends the series after the current run\n"
         "  -D, --debug                    Print debug output\n"
         "      --cluster-mode             Run client in cluster mode\n"
         "      --transaction              Treat one full rotation of --command entries as a transactional\n"
@@ -2596,9 +3255,19 @@ void usage()
         "                                 --pipeline > 1 is supported: in --cluster-mode each rotation is\n"
         "                                 sent contiguously on its pinned connection, so multiple whole\n"
         "                                 transactions can be in flight without interleaving MULTI/EXEC.\n"
-        "                                 Note: if --reconnect-on-error triggers mid-rotation, the\n"
-        "                                 interrupted rotation's stats will be inaccurate (server-side\n"
-        "                                 WATCH/MULTI state is lost on reconnect).\n"
+        "                                 --reconnect-interval waits for the next full weighted command\n"
+        "                                 rotation and its replies before reconnecting. The next interval\n"
+        "                                 starts there; request/time limits still end the run as usual.\n"
+        "                                 Counts and latencies inside MULTI describe QUEUED acknowledgements,\n"
+        "                                 not execution; EXEC reports the transaction outcome.\n"
+        "                                 Note: an unplanned reconnect (--reconnect-on-error) loses the\n"
+        "                                 server-side WATCH/MULTI state. If it happens inside a MULTI\n"
+        "                                 block, the rest of that block, through its EXEC/DISCARD, is\n"
+        "                                 skipped and not counted, so the per-command counts no longer\n"
+        "                                 follow the command ratio. Replies already received for that\n"
+        "                                 block stay counted.\n"
+        "                                 --retry-on-error does not retry or replay --transaction\n"
+        "                                 commands.\n"
         "  -h, --help                     Display this help\n"
         "  -v, --version                  Display version information\n"
         "\n"
@@ -2610,8 +3279,14 @@ void usage()
         "latency histogram files\n"
         "      --show-config              Print detailed configuration before running\n"
         "      --hide-histogram           Don't print detailed latency histogram\n"
-        "      --print-percentiles        Specify which percentiles info to print on the results table (by default "
-        "prints percentiles: 50,99,99.9)\n"
+        "      --progress-interval=SECONDS  Progress display interval in positive whole seconds (default: 1).\n"
+        "                                 A final update is printed on normal completion; separate error diagnostics "
+        "are not throttled.\n"
+        "                                 Supervision and metric sampling keep their existing cadence.\n"
+        "                                 Instantaneous rates describe the most recent sample, not the display "
+        "interval.\n"
+        "      --print-percentiles        Comma-separated finite percentiles from 0 through 100 for the results "
+        "table (default: 50,99,99.9)\n"
         "      --print-all-runs           When performing multiple test iterations, print and save results for all "
         "iterations\n"
         "      --realtime-latencies       Replace the periodic single-line progress output with a per-tick block: "
@@ -2663,7 +3338,10 @@ void usage()
         "met, memtier will do as many requests as possible per second.\n"
         "  -c, --clients=NUMBER           Number of clients per thread (default: 50)\n"
         "  -t, --threads=NUMBER           Number of threads (default: 4)\n"
-        "      --test-time=SECS           Number of seconds to run the test\n"
+        "      --test-time=SECS           Number of seconds to run the test. Replies to requests already sent\n"
+        "                                 are waited for at most 10 more seconds; requests still unanswered\n"
+        "                                 then are abandoned and counted as errors, and so are\n"
+        "                                 --retry-on-error retries still being resent.\n"
         "      --clients-start=NUMBER     Starting number of clients per thread for staircase ramp-up.\n"
         "                                 Must be less than --clients. Requires --clients-step and --step-duration.\n"
         "      --clients-step=NUMBER      Number of clients to add per step in staircase ramp-up.\n"
@@ -2671,27 +3349,48 @@ void usage()
         "      --ratio=RATIO              Set:Get ratio (default: 1:10)\n"
         "      --pipeline=NUMBER          Number of concurrent pipelined requests (default: 1)\n"
         "      --reconnect-interval=NUM   Number of requests after which re-connection is performed\n"
-        "      --reconnect-on-error       Enable automatic reconnection on connection errors (default: disabled)\n"
+        "      --reconnect-on-error       Enable automatic reconnection on connection errors (default: disabled).\n"
+        "                                 Without it, a lost connection ends its thread and the run exits 1.\n"
         "      --max-reconnect-attempts=NUM Maximum number of reconnection attempts (default: 0, unlimited)\n"
-        "      --reconnect-backoff-factor=NUM Backoff factor for reconnection delays (default: 0, no backoff)\n"
+        "                                 Running out of attempts fails the run.\n"
+        "      --reconnect-backoff-factor=NUM Non-negative backoff factor for reconnection delays (default: 0, no "
+        "backoff)\n"
+        "                                 Zero keeps the delay at one second. Positive values multiply the\n"
+        "                                 delay on each attempt; values below 1 shrink it, but never\n"
+        "                                 below 0.1 seconds. The delay is capped at 60 seconds.\n"
         "      --retry-on-error           Resend a request when the server returns a transient error or the\n"
         "                                 connection drops mid-flight. Excludes permanent errors (WRONGTYPE,\n"
         "                                 NOAUTH, NOPERM, syntax/argcount/unknown-command). Default: disabled.\n"
+        "                                 A retried request counts once toward --requests, when it succeeds\n"
+        "                                 or runs out of retries. --transaction commands are never retried\n"
+        "                                 or replayed.\n"
         "      --max-retries=N            Maximum retries per request when --retry-on-error is set.\n"
         "                                 -1 = unlimited (default), 0 = disable retries even with the master\n"
         "                                 switch on, N>0 = bounded. MOVED/ASK redirects count toward this.\n"
+        "                                 Unlimited retries with --requests may run indefinitely; use a\n"
+        "                                 finite limit or --test-time to bound repeated rejections.\n"
         "      --retry-backoff-ms=NUM     Delay between retries in milliseconds (default: 0, immediate).\n"
-        "      --retry-backoff-factor=NUM Exponential multiplier applied to retry-backoff-ms on each\n"
-        "                                 successive retry (default: 0, constant backoff).\n"
+        "      --retry-backoff-factor=NUM Multiply the delay by NUM on each retry of the same request:\n"
+        "                                 with NUM > 0 the Nth resend waits retry-backoff-ms * NUM^(N-1),\n"
+        "                                 at most 60 s or retry-backoff-ms if larger (default: 0,\n"
+        "                                 constant retry-backoff-ms). Values below 1 shrink it, but\n"
+        "                                 never below 100 ms or retry-backoff-ms if smaller.\n"
         "      --retry-on=LIST            Restrict retries to error-status prefixes in this comma list\n"
         "                                 (e.g. LOADING,BUSY,TRYAGAIN). Default: retry everything not\n"
         "                                 classified as permanent.\n"
-        "      --max-retry-queue=NUM      Hard cap on per-connection retry queue depth. When full, the\n"
-        "                                 pipeline stops accepting new work until the queue drains.\n"
+        "      --max-retry-queue=NUM      Hard cap on per-connection retry queue depth. No new request is\n"
+        "                                 sent while queued retries plus requests in flight reach it (or\n"
+        "                                 --pipeline, if larger), so with NUM >= --pipeline a request that\n"
+        "                                 fails in flight always has room to retry.\n"
         "                                 Default: 0 (auto = max(pipeline * 4, 64)).\n"
         "      --failed-keys-file=PATH    Append every request that ultimately fails (retries exhausted or\n"
         "                                 permanent error) as CSV: timestamp,command,key,status,retries.\n"
-        "                                 Off by default. The benchmark continues if the file is unwritable.\n"
+        "                                 The key is the one sent, with any {tag} and prefix/suffix; a\n"
+        "                                 multi-key command (MGET, or several __key__ args) logs only its\n"
+        "                                 first key. key and status are quoted, with \" doubled,\n"
+        "                                 \\ written as \\\\ and non-printable bytes as \\xHH.\n"
+        "                                 Off by default. Exits 1 at startup if the file cannot be opened;\n"
+        "                                 a later write error stops logging and the run exits 1.\n"
         "      --connection-timeout=SECS  Connection timeout in seconds, 0 to disable (default: 0)\n"
         "      --connection-stage-timeout=SECS\n"
         "                                 Abort with exit code 2 if no thread reaches steady state within\n"
@@ -2699,12 +3398,15 @@ void usage()
         "                                 CLUSTER SLOTS / -ERR during initial probe) persist for SECS\n"
         "                                 without a successful handshake. Bounds the *startup* phase;\n"
         "                                 --test-time still bounds the steady-state run. Default: 30,\n"
-        "                                 0 disables the supervisor.\n"
+        "                                 0 disables the supervisor (at startup, a failed CLUSTER SLOTS\n"
+        "                                 is then retried every second). With --run-count, an abort in\n"
+        "                                 any run exits 2.\n"
         "      --thread-conn-start-min-jitter-micros=NUM Minimum jitter in microseconds between connection creation "
         "(default: 0)\n"
         "      --thread-conn-start-max-jitter-micros=NUM Maximum jitter in microseconds between connection creation "
         "(default: 0)\n"
-        "      --multi-key-get=NUM        Enable multi-key get commands, up to NUM keys (default: 0).\n"
+        "      --multi-key-get=NUM        Enable multi-key get commands, up to NUM keys (default: 0, max: 16777214).\n"
+        "                                 Each client preallocates about 272 bytes per key.\n"
         "                                 In cluster mode, keys are probed from the key space so that all\n"
         "                                 keys in one batch route to the same shard (no hash-tag prefix).\n"
         "      --select-db=DB             DB number to select, when testing a redis server\n"
@@ -2720,6 +3422,8 @@ void usage()
         "                                 To use a generated key or object, enter:\n"
         "                                   __key__: Use key generated from Key Options.\n"
         "                                   __data__: Use data generated from Object Options.\n"
+        "                                     With --data-size-pattern=S, sized by the most recent __key__\n"
+        "                                     before it (minimum size if there is none).\n"
         "      --command-ratio            The number of times the command is sent in sequence.(default: 1)\n"
         "      --command-key-pattern      Key pattern for the command (default: R):\n"
         "                                 G for Gaussian distribution.\n"
@@ -2794,6 +3498,8 @@ void usage()
         "Imported Data Options:\n"
         "      --data-import=FILE         Read object data from file\n"
         "      --data-verify              Enable data verification when test is complete\n"
+        "                                 (exit status 1 if verification fails, is incomplete,\n"
+        "                                 or verifies no key)\n"
         "      --verify-only              Only perform --data-verify, without any other test\n"
         "      --generate-keys            Generate keys for imported objects\n"
         "      --no-expiry                Ignore expiry information in imported data\n"
@@ -2837,16 +3543,20 @@ struct cg_thread
     abstract_protocol *m_protocol;
     pthread_t m_thread;
     std::atomic<bool> m_finished; // Atomic to prevent data race between worker thread write and main thread read
-    bool m_restart_requested;
-    unsigned int m_restart_count;
+    // Set by the worker, before m_finished, when some of its clients were cut
+    // off by connection failures it could not recover from (or it threw),
+    // rather than all ending on the run's stop condition. Read by the main
+    // thread only after join(). The worker is NOT re-run: a replacement
+    // client_group would start a fresh --test-time window and fresh stats,
+    // silently stretching the run and discarding what was measured.
+    bool m_failed;
 
     // Per-thread CPU accounting via getrusage(RUSAGE_THREAD), captured inside
-    // the worker. A restart() spawns a NEW native thread, so RUSAGE_THREAD
-    // resets to 0 each segment; m_cpu_*_usec_acc accumulate completed segments
-    // so the reported total spans all restarts. m_wall_usec_acc is the WALL time
-    // of those same segments, captured at the exact same points as the CPU
-    // snapshots, so cores_used = cpu/wall divides two values over the identical
-    // interval (no setup-vs-serving skew). Only read post-join (race-free).
+    // the worker. m_cpu_*_usec_acc hold the worker's CPU time and
+    // m_wall_usec_acc the WALL time of the same interval, captured at the exact
+    // same points as the CPU snapshots, so cores_used = cpu/wall divides two
+    // values over the identical interval (no setup-vs-serving skew). Only read
+    // post-join (race-free).
     struct rusage m_cpu_start_ru;   // CPU snapshot at the current segment's start
     struct timeval m_wall_start_tv; // wall snapshot at the same point
     unsigned long long m_cpu_user_usec_acc;
@@ -2862,8 +3572,7 @@ struct cg_thread
             m_cg(NULL),
             m_protocol(NULL),
             m_finished(false),
-            m_restart_requested(false),
-            m_restart_count(0),
+            m_failed(false),
             m_cpu_user_usec_acc(0),
             m_cpu_sys_usec_acc(0),
             m_wall_usec_acc(0),
@@ -2907,45 +3616,15 @@ struct cg_thread
 
         ret = pthread_join(m_thread, (void **) &retval);
         assert(ret == 0);
-    }
-
-    int restart(void)
-    {
-        // Clean up existing client group
-        if (m_cg != NULL) {
-            delete m_cg;
-        }
-
-        // Create new client group
-        m_cg = new client_group(m_config, m_protocol, m_obj_gen);
-
-        // Create all clients upfront, prepare initial batch
-        if (m_cg->create_clients(m_config->clients) < (int) m_config->clients) return -1;
-        if (m_config->clients_start > 0) {
-            if (m_cg->prepare_count(m_config->clients_start) < 0) return -1;
-        } else {
-            if (m_cg->prepare() < 0) return -1;
-        }
-
-        // Reset state
-        m_finished = false;
-        m_restart_requested = false;
-        m_restart_count++;
-
-        // CPU accumulators (m_cpu_*_usec_acc) intentionally persist across
-        // restarts. The new native thread re-snapshots m_cpu_start_ru on entry,
-        // so clear only the per-segment "started" flag.
-        m_cpu_started = false;
-
-        // Start new thread
-        return pthread_create(&m_thread, NULL, cg_thread_start, (void *) this);
+        m_cg->mark_joined();
     }
 };
 
 // Cumulative CPU time (user+system, microseconds) consumed by an arbitrary
 // thread, read WITHOUT perturbing that thread. Used by the live per-second
 // sampler in the monitor loop. On Linux this is pthread_getcpuclockid +
-// clock_gettime (a per-thread CPU clock); on macOS it is Mach thread_info.
+// clock_gettime (a per-thread CPU clock); on macOS it is Mach thread_info; on
+// Windows it is GetThreadTimes().
 // Returns 0 if the thread's CPU clock cannot be read (treated as no delta).
 static unsigned long long get_thread_cpu_usec(pthread_t thread)
 {
@@ -2956,6 +3635,11 @@ static unsigned long long get_thread_cpu_usec(pthread_t thread)
     if (thread_info(mt, THREAD_BASIC_INFO, (thread_info_t) &info, &count) != KERN_SUCCESS) return 0;
     return (unsigned long long) info.user_time.seconds * 1000000ULL + info.user_time.microseconds +
            (unsigned long long) info.system_time.seconds * 1000000ULL + info.system_time.microseconds;
+#elif defined(_WIN32)
+    FILETIME creation_time, exit_time, kernel_time, user_time;
+    if (!GetThreadTimes((HANDLE) pthread_gethandle(thread), &creation_time, &exit_time, &kernel_time, &user_time))
+        return 0;
+    return filetime_to_usec(kernel_time) + filetime_to_usec(user_time);
 #else
     clockid_t cid;
     if (pthread_getcpuclockid(thread, &cid) != 0) return 0;
@@ -2965,12 +3649,12 @@ static unsigned long long get_thread_cpu_usec(pthread_t thread)
 #endif
 }
 
-// Fold this worker's current-segment CPU usage (getrusage delta) AND the wall
-// time of the same segment into its across-restart accumulators. Called from
-// inside the worker on every exit path, BEFORE m_finished is set, so the
-// segment is accounted before the monitor loop can observe completion and
-// trigger a restart. The wall bracket is captured at the same two points as the
-// CPU bracket so cores_used = cpu/wall covers one identical interval.
+// Fold this worker's CPU usage (getrusage delta) AND the wall time of the same
+// interval into its accumulators. Called from inside the worker on every exit
+// path, BEFORE m_finished is set, so the interval is accounted before the
+// monitor loop can observe completion. The wall bracket is captured at the same
+// two points as the CPU bracket so cores_used = cpu/wall covers one identical
+// interval.
 static void cg_thread_capture_cpu_end(cg_thread *thread)
 {
 #if defined(RUSAGE_THREAD)
@@ -2999,8 +3683,8 @@ static void cg_thread_capture_cpu_end(cg_thread *thread)
 // delta to "% of a core" over the real wall window, emits a de-duped live
 // high-CPU warning (once per thread, on first crossing), tracks the peak
 // whole-process utilization, and appends a per-second snapshot to a history
-// vector. Finished/restarting workers are skipped so their pthread_t is never
-// read while joined or mid-restart.
+// vector. Finished workers are skipped so their pthread_t is never read while
+// joined.
 struct cpu_live_sampler
 {
     std::vector<unsigned long long> thread_prev;
@@ -3043,8 +3727,7 @@ struct cpu_live_sampler
         double whole_pct = snap.m_main_thread_cpu_pct;
         for (size_t t = 0; t < threads.size(); t++) {
             double pct = 0.0;
-            // Skip finished/restarting workers: a reset clock on a new pthread_t
-            // would yield a bogus delta, and a joined handle is unsafe to read.
+            // Skip finished workers: a joined handle is unsafe to read.
             if (!threads[t]->m_finished) {
                 unsigned long long cur = get_thread_cpu_usec(threads[t]->m_thread);
                 unsigned long long delta = (cur > thread_prev[t]) ? cur - thread_prev[t] : 0;
@@ -3077,9 +3760,8 @@ static void *cg_thread_start(void *t)
     // stack rather than re-faulting on the exhausted one.
     install_alt_signal_stack();
 
-    // Snapshot this segment's starting CPU time and wall time (per-thread) at
-    // the same instant. Accumulators on cg_thread carry prior segments forward
-    // across restarts.
+    // Snapshot this worker's starting CPU time and wall time (per-thread) at
+    // the same instant.
 #if defined(RUSAGE_THREAD)
     if (getrusage(RUSAGE_THREAD, &thread->m_cpu_start_ru) == 0) {
         gettimeofday(&thread->m_wall_start_tv, NULL);
@@ -3091,38 +3773,58 @@ static void *cg_thread_start(void *t)
     try {
         thread->m_cg->run();
 
-        // Check if we should restart due to connection failures
-        // If the thread finished but still has time left and connection errors, request restart
+        // A completed client stamps its end time when its stop condition is
+        // reached. Recovered connection errors do not invalidate that window.
+        // An unended client means incomplete work, but does not identify the
+        // cause: connection loss and an event loop with no pending events can
+        // both leave clients unfinished. Fail the run without restarting it.
         //
-        // Exception: do NOT request restart if the connection-stage
-        // supervisor already gave up. Restarting would re-enter the same
-        // doomed handshake (AUTH against no-auth server, SELECT against
-        // missing DB, etc.) and silently re-trigger the same failure mode
-        // we just aborted on, masking the abort code from exit.
-        if (thread->m_cg->get_total_connection_errors() > 0 &&
-            !g_connection_stage_aborted.load(std::memory_order_acquire)) {
-            benchmark_error_log("Thread %u finished due to connection failures, requesting restart.\n",
-                                thread->m_thread_id);
-            thread->m_restart_requested = true;
+        // Ctrl+C and the connection-stage supervisor end the loop through
+        // client_group::interrupt(); the main thread stamps the end times
+        // after pthread_join(). Neither is a worker failure (the latter
+        // exits 2 itself).
+        if (!g_interrupted && !g_connection_stage_aborted.load(std::memory_order_acquire)) {
+            unsigned int unended = thread->m_cg->count_unended_clients();
+            if (unended > 0) {
+                benchmark_error_log("Thread %u: %u client(s) stopped before reaching their stop condition.\n",
+                                    thread->m_thread_id, unended);
+                thread->m_failed = true;
+            }
+            unsigned int failed = thread->m_cg->count_failed_clients();
+            if (failed > 0) {
+                benchmark_error_log("Thread %u: %u client(s) failed once the run was over (see errors above).\n",
+                                    thread->m_thread_id, failed);
+                thread->m_failed = true;
+            }
         }
-
-        cg_thread_capture_cpu_end(thread);
-        thread->m_finished = true;
     } catch (const std::exception &e) {
         benchmark_error_log("Thread %u caught exception: %s\n", thread->m_thread_id, e.what());
-        cg_thread_capture_cpu_end(thread);
-        thread->m_finished = true;
         if (!g_connection_stage_aborted.load(std::memory_order_acquire)) {
-            thread->m_restart_requested = true;
+            thread->m_failed = true;
         }
     } catch (...) {
         benchmark_error_log("Thread %u caught unknown exception\n", thread->m_thread_id);
-        cg_thread_capture_cpu_end(thread);
-        thread->m_finished = true;
         if (!g_connection_stage_aborted.load(std::memory_order_acquire)) {
-            thread->m_restart_requested = true;
+            thread->m_failed = true;
         }
     }
+
+    // Retain the measured window on every failure path, including exceptions:
+    // finalization stamps end times and commits each client's last partial bucket.
+    if (thread->m_failed) {
+        try {
+            thread->m_cg->finalize_all_clients();
+        } catch (...) {
+            // Finalization can allocate. If it fails too, do not merge or print
+            // unfinalized statistics, and do not throw across the pthread entry.
+            // Other workers may still be using globals and TLS libraries, so
+            // terminate without running process-wide destructors/atexit handlers.
+            benchmark_error_log("Thread %u: unable to finalize statistics; aborting benchmark.\n", thread->m_thread_id);
+            _Exit(EXIT_FAILURE);
+        }
+    }
+    cg_thread_capture_cpu_end(thread);
+    thread->m_finished = true;
 
     return t;
 }
@@ -3131,14 +3833,14 @@ static void *cg_thread_start(void *t)
 // 1234567 -> "1,234,567". Falls back to bare digits if the destination
 // buffer is too small. Used by --realtime-latencies to make per-second
 // throughput readable at a glance.
-static void format_with_commas(unsigned long int n, char *out, size_t sz)
+static void format_with_commas(unsigned long long int n, char *out, size_t sz)
 {
     char raw[32];
-    snprintf(raw, sizeof(raw), "%lu", n);
+    snprintf(raw, sizeof(raw), "%llu", n);
     size_t len = strlen(raw);
     size_t commas = (len > 0) ? (len - 1) / 3 : 0;
     if (len + commas + 1 > sz) {
-        snprintf(out, sz, "%lu", n);
+        snprintf(out, sz, "%llu", n);
         return;
     }
     char *w = out + len + commas;
@@ -3151,7 +3853,7 @@ static void format_with_commas(unsigned long int n, char *out, size_t sz)
     }
 }
 
-void size_to_str(unsigned long int size, char *buf, int buf_len)
+void size_to_str(unsigned long long int size, char *buf, int buf_len)
 {
     if (size >= 1024 * 1024 * 1024) {
         snprintf(buf, buf_len, "%.2fGB", (float) size / (1024 * 1024 * 1024));
@@ -3240,6 +3942,15 @@ static void print_all_threads_stack_trace(FILE *fp, int pid, const char *timestr
     if (trace_size > 1) {
         backtrace_symbols_fd(trace + 1, trace_size - 1, fileno(fp));
     }
+#elif defined(_WIN32)
+    // Raw return addresses only. Subtract the image base printed first to get
+    // an RVA, add the PE ImageBase and resolve with addr2line against the exe.
+    void *frames[62];
+    USHORT frame_count = CaptureStackBackTrace(0, 62, frames, NULL);
+    fprintf(fp, "[%d] %s #   image base: %p\n", pid, timestr, (void *) GetModuleHandleA(NULL));
+    for (USHORT i = 0; i < frame_count; i++) {
+        fprintf(fp, "[%d] %s #   %p\n", pid, timestr, frames[i]);
+    }
 #else
     fprintf(fp, "[%d] %s #   (backtrace not available on this platform)\n", pid, timestr);
 #endif
@@ -3323,11 +4034,11 @@ static void print_staircase_pattern(int run_id, benchmark_config *cfg)
 // can later share the exact same source. This is statsd-ONLY and lives OUTSIDE
 // any HAVE_EVHTTP guard. The byte-identical UDP wire is preserved: the snapshot
 // carries cur/avg_ops_sec et al. as `long` (cast at the fill site), so they
-// route through gauge(long) ("%ld"|g) exactly as before, while progress_pct is
+// route through gauge(long long) ("%lld"|g) exactly as before, while progress_pct is
 // `double` (gauge(double), "%.6f"|g) and the latencies go through timing(double)
 // ("%.3f"|ms). The >0 send condition for connection_errors is unchanged.
-static void statsd_publish_tick(statsd_client *statsd, const metrics_snapshot &snap, hdr_histogram *inst_hist_agg,
-                                const std::vector<double> &quantiles)
+static void statsd_publish_tick(statsd_client *statsd, const metrics_snapshot &snap, bool has_samples,
+                                const std::vector<double> &quantiles, const std::vector<int64_t> &values)
 {
     statsd->gauge("ops_sec", snap.cur_ops_sec);
     statsd->gauge("ops_sec_avg", snap.avg_ops_sec);
@@ -3335,18 +4046,18 @@ static void statsd_publish_tick(statsd_client *statsd, const metrics_snapshot &s
     statsd->gauge("bytes_sec_avg", snap.avg_bytes_sec);
     statsd->timing("latency_ms", snap.cur_latency_ms);
     statsd->timing("latency_avg_ms", snap.avg_latency_ms);
-    statsd->gauge("connections", (long) snap.connections);
+    statsd->gauge("connections", (long long) snap.connections);
     statsd->gauge("progress_pct", snap.progress_pct);
     if (snap.run_connection_errors > 0) {
-        statsd->gauge("connection_errors", (long) snap.run_connection_errors);
+        statsd->gauge("connection_errors", (long long) snap.run_connection_errors);
     }
 
     // Send percentile metrics derived from the aggregated instantaneous
     // histogram (allocated by the caller; shared with the TUI renderer when enabled).
-    if (inst_hist_agg != NULL && hdr_total_count(inst_hist_agg) > 0) {
+    if (has_samples) {
         for (std::size_t i = 0; i < quantiles.size(); i++) {
             double percentile = quantiles[i];
-            int64_t value = hdr_value_at_percentile(inst_hist_agg, percentile);
+            int64_t value = values[i];
             double value_ms = value / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
 
             // Format the metric name (e.g., "latency_p50", "latency_p99", "latency_p99_9",
@@ -3419,26 +4130,32 @@ static void prom_observe_and_fill(benchmark_config *cfg, std::vector<cg_thread *
 }
 
 // Exact post-join fold of one thread's final totals into the accumulator basis,
-// BEFORE its client_group is destroyed (restart or run end). Race-free.
+// BEFORE its client_group is destroyed at run end. Race-free.
 static void prom_fold_thread(benchmark_config *cfg, size_t t, client_group *cg)
 {
     cfg->prometheus->accumulator().fold_final(t, prom_read_cg_counters(cg));
 }
 
-// 1 Hz publish: reset the exporter's scratch tick histogram, run the gated
-// per-client aggregation walk over non-finished threads (mirrors the statsd
-// !m_finished gate), then publish the fully-filled snapshot + the tick
-// histogram. PLAN.md section 3.7.
-static void prom_publish_tick(benchmark_config *cfg, const metrics_snapshot &snap, std::vector<cg_thread *> &threads)
+// Drain the latency samples of every second the clients completed since the
+// previous drain into the exporter's scratch tick histogram. Finished threads
+// are drained too (their last partial second is folded by set_end_time): the
+// drain is mutex-protected and every m_cg lives until after the run-end
+// publish. run_end (post-join only) also drains the live histograms.
+static hdr_histogram *prom_drain_latency(benchmark_config *cfg, std::vector<cg_thread *> &threads, bool run_end)
 {
     hdr_histogram *tick = cfg->prometheus->tick_histogram();
     hdr_reset(tick);
     for (size_t t = 0; t < threads.size(); t++) {
-        if (!threads[t]->m_finished) {
-            threads[t]->m_cg->aggregate_inst_histogram_if_changed(tick);
-        }
+        threads[t]->m_cg->drain_prom_latency_histogram(tick, run_end);
     }
-    cfg->prometheus->publish(snap, tick);
+    return tick;
+}
+
+// 1 Hz publish: the fully-filled snapshot + the tick histogram drained by
+// prom_drain_latency. PLAN.md section 3.7.
+static void prom_publish_tick(benchmark_config *cfg, const metrics_snapshot &snap, const hdr_histogram *latency)
+{
+    cfg->prometheus->publish(snap, latency);
 }
 
 static void prom_publish_run_start(benchmark_config *cfg, uint32_t run_id)
@@ -3446,9 +4163,13 @@ static void prom_publish_run_start(benchmark_config *cfg, uint32_t run_id)
     cfg->prometheus->publish_run_start(run_id, cfg->run_count);
 }
 
-static void prom_publish_run_end(benchmark_config *cfg, uint32_t run_id)
+// Post-join: drain every thread once more, including its live histogram. The
+// loop's last tick normally has drained everything already; this covers exits
+// that skip it or stop a worker mid-callback (Ctrl+C, the connection-stage
+// abort), so the run-end snapshot always counts every op.
+static void prom_publish_run_end(benchmark_config *cfg, uint32_t run_id, std::vector<cg_thread *> &threads)
 {
-    cfg->prometheus->publish_run_end(run_id, cfg->run_count);
+    cfg->prometheus->publish_run_end(run_id, cfg->run_count, prom_drain_latency(cfg, threads, true));
 }
 
 #else // !HAVE_EVHTTP — empty stubs keep the run loop ifdef-free.
@@ -3459,9 +4180,13 @@ static inline bool prom_enabled(benchmark_config *)
 }
 static inline void prom_observe_and_fill(benchmark_config *, std::vector<cg_thread *> &, metrics_snapshot &) {}
 static inline void prom_fold_thread(benchmark_config *, size_t, client_group *) {}
-static inline void prom_publish_tick(benchmark_config *, const metrics_snapshot &, std::vector<cg_thread *> &) {}
+static inline hdr_histogram *prom_drain_latency(benchmark_config *, std::vector<cg_thread *> &, bool)
+{
+    return NULL;
+}
+static inline void prom_publish_tick(benchmark_config *, const metrics_snapshot &, const hdr_histogram *) {}
 static inline void prom_publish_run_start(benchmark_config *, uint32_t) {}
-static inline void prom_publish_run_end(benchmark_config *, uint32_t) {}
+static inline void prom_publish_run_end(benchmark_config *, uint32_t, std::vector<cg_thread *> &) {}
 
 #endif // HAVE_EVHTTP
 
@@ -3492,7 +4217,7 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             benchmark_error_log("error: failed to prepare thread %u for test.\n", i);
             delete cfg->mget_cache;
             cfg->mget_cache = NULL;
-            exit(1);
+            exit(failure_exit_code());
         }
         threads.push_back(t);
     }
@@ -3522,6 +4247,8 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
         (*i)->start();
     }
+    struct timeval launch_time;
+    gettimeofday(&launch_time, NULL);
 
     // Send "run started" annotation to Graphite
     if (cfg->statsd != NULL && cfg->statsd->is_enabled()) {
@@ -3536,17 +4263,17 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     // the first 1 Hz tick). Mirrors statsd's zeroing convention.
     if (prom_enabled(cfg)) prom_publish_run_start(cfg, run_id);
 
-    unsigned long int prev_ops = 0;
-    unsigned long int prev_bytes = 0;
-    unsigned long int prev_duration = 0;
+    unsigned long long int prev_ops = 0;
+    unsigned long long int prev_bytes = 0;
+    unsigned long long int prev_duration = 0;
     double prev_latency = 0, cur_latency = 0;
-    unsigned long int cur_ops_sec = 0;
-    unsigned long int cur_bytes_sec = 0;
-    unsigned long int prev_hits = 0;
-    unsigned long int prev_misses = 0;
-    unsigned long int prev_aborts = 0;
-    unsigned long int prev_errors = 0;
-    unsigned long int prev_retry_attempts = 0;
+    unsigned long long int cur_ops_sec = 0;
+    unsigned long long int cur_bytes_sec = 0;
+    unsigned long long int prev_hits = 0;
+    unsigned long long int prev_misses = 0;
+    unsigned long long int prev_aborts = 0;
+    unsigned long long int prev_errors = 0;
+    unsigned long long int prev_retry_attempts = 0;
 
     // Detect once whether stderr is a real terminal. --realtime-latencies uses
     // this to choose between in-place cursor-up redraw and plain-append output.
@@ -3561,6 +4288,14 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         hdr_init(LATENCY_HDR_MIN_VALUE, LATENCY_HDR_SEC_MAX_VALUE, LATENCY_HDR_SEC_SIGDIGTS, &rtl_totals_hist);
     }
 
+    // Keep query scratch across ticks and share instantaneous values with StatsD.
+    const std::vector<double> no_quantiles;
+    const bool live_percentiles_enabled = cfg->realtime_latencies || (cfg->statsd != NULL && cfg->statsd->is_enabled());
+    const std::vector<double> &live_quantiles =
+        live_percentiles_enabled ? cfg->print_percentiles.quantile_list : no_quantiles;
+    latency_percentiles inst_percentiles(live_quantiles);
+    latency_percentiles overall_percentiles(cfg->realtime_latencies ? live_quantiles : no_quantiles);
+
     // Live (advisory) per-second CPU sampler. The main thread reads each worker's
     // CPU clock without perturbing it, so this adds no overhead to the workers.
     // Feeds the per-second JSON detail, the de-duped live high-CPU warning, and
@@ -3574,23 +4309,21 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     // These stats are only for progress display and are approximate. Final results are
     // collected after pthread_join() when all threads have finished (race-free).
     unsigned int active_threads = 0;
+    auto last_progress_time = std::chrono::steady_clock::now();
     do {
         active_threads = 0;
         sleep(1);
 
         // Check for Ctrl+C interrupt
         if (g_interrupted) {
-            // Calculate elapsed time before interrupting
-            unsigned long int elapsed_duration = 0;
-            unsigned int thread_counter = 0;
-            for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
-                thread_counter++;
-                float factor = ((float) (thread_counter - 1) / thread_counter);
-                elapsed_duration = factor * elapsed_duration + (float) (*i)->m_cg->get_duration_usec() / thread_counter;
-            }
-            fprintf(stderr, "\n[RUN #%u] Interrupted by user (Ctrl+C) after %.1f secs, stopping threads...\n", run_id,
-                    (float) elapsed_duration / 1000000);
-            // Interrupt all threads (marks clients as interrupted, breaks event loops, and finalizes stats)
+            // Wall time since the run started: the client durations stay 0
+            // for clients that have not connected yet.
+            struct timeval now;
+            gettimeofday(&now, NULL);
+            fprintf(stderr, "\n[RUN #%u] Interrupted by %s after %.1f secs, stopping threads...\n", run_id,
+                    interrupt_source(), (float) ts_diff(cfg->benchmark_start_time, now) / 1000000);
+            // Interrupt all threads (marks clients as interrupted and breaks event loops; the stats are
+            // finalized after the join)
             for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
                 (*i)->m_cg->interrupt();
             }
@@ -3614,6 +4347,7 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
                         "(last error: %s). See --connection-stage-timeout.\n",
                         elapsed, last_err.c_str());
                 g_connection_stage_aborted.store(true, std::memory_order_release);
+                g_any_run_connection_stage_aborted.store(true, std::memory_order_release);
                 for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
                     (*i)->m_cg->interrupt();
                 }
@@ -3621,43 +4355,37 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             }
         }
 
-        unsigned long int total_ops = 0;
-        unsigned long int total_bytes = 0;
-        unsigned long int duration = 0;
+        unsigned long long int total_ops = 0;
+        unsigned long long int total_bytes = 0;
+        unsigned long long int duration = 0;
         unsigned int thread_counter = 0;
         double total_latency = 0;
-        unsigned long int total_connection_errors = 0;
-        unsigned long int total_hits = 0;
-        unsigned long int total_misses = 0;
-        unsigned long int total_aborts = 0;
-        unsigned long int total_errors = 0;
-        unsigned long int total_retry_attempts = 0;
-        unsigned long int total_retried_ops = 0;
+        unsigned long long int total_connection_errors = 0;
+        unsigned long long int total_hits = 0;
+        unsigned long long int total_misses = 0;
+        unsigned long long int total_aborts = 0;
+        unsigned long long int total_errors = 0;
+        unsigned long long int total_retry_attempts = 0;
+        unsigned long long int total_retried_ops = 0;
+
+        // Replies still pending well after --test-time (the server stopped
+        // replying) would otherwise keep the run waiting forever. Each client
+        // checks its own deadline (its own start, or the staircase start), so
+        // one that connected late is ended a tick or two later; this only says
+        // when to start asking.
+        bool end_stalled = false;
+        if (cfg->test_time > 0) {
+            struct timeval now;
+            gettimeofday(&now, NULL);
+            end_stalled =
+                ts_diff(launch_time, now) >= (long long) (cfg->test_time + TEST_TIME_DRAIN_GRACE_SECS) * 1000000;
+        }
 
         for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
-            // Check if thread needs restart
-            if ((*i)->m_finished && (*i)->m_restart_requested && (*i)->m_restart_count < 5) {
-                benchmark_error_log("Restarting thread %u (restart #%u)...\n", (*i)->m_thread_id,
-                                    (*i)->m_restart_count + 1);
-
-                // Join the failed thread first
-                (*i)->join();
-
-                // Prometheus restart fold (PLAN section 3.6b): fold this
-                // thread's exact post-join totals into the accumulator basis
-                // BEFORE restart() deletes m_cg, so the monotonic counters
-                // survive the client_group replacement.
-                if (prom_enabled(cfg)) prom_fold_thread(cfg, (size_t) (i - threads.begin()), (*i)->m_cg);
-
-                // Attempt to restart
-                if ((*i)->restart() == 0) {
-                    benchmark_error_log("Thread %u restarted successfully.\n", (*i)->m_thread_id);
-                } else {
-                    benchmark_error_log("Failed to restart thread %u.\n", (*i)->m_thread_id);
-                }
+            if (!(*i)->m_finished) {
+                active_threads++;
+                if (end_stalled) (*i)->m_cg->end_stalled_clients();
             }
-
-            if (!(*i)->m_finished) active_threads++;
 
             total_ops += (*i)->m_cg->get_total_ops();
             total_bytes += (*i)->m_cg->get_total_bytes();
@@ -3687,26 +4415,26 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             duration = factor * duration + (float) (*i)->m_cg->get_duration_usec() / thread_counter;
         }
 
-        unsigned long int cur_ops = total_ops - prev_ops;
-        unsigned long int cur_bytes = total_bytes - prev_bytes;
-        unsigned long int cur_duration = duration - prev_duration;
+        unsigned long long int cur_ops = total_ops - prev_ops;
+        unsigned long long int cur_bytes = total_bytes - prev_bytes;
+        unsigned long long int cur_duration = duration - prev_duration;
         double cur_total_latency = total_latency - prev_latency;
         prev_ops = total_ops;
         prev_bytes = total_bytes;
         prev_latency = total_latency;
         prev_duration = duration;
 
-        unsigned long int ops_sec = 0;
-        unsigned long int bytes_sec = 0;
+        unsigned long long int ops_sec = 0;
+        unsigned long long int bytes_sec = 0;
         double avg_latency = 0;
         if (duration > 1) {
-            ops_sec = (long) ((double) total_ops / duration * 1000000);
-            bytes_sec = (long) ((double) total_bytes / duration * 1000000);
+            ops_sec = (unsigned long long) ((double) total_ops / duration * 1000000);
+            bytes_sec = (unsigned long long) ((double) total_bytes / duration * 1000000);
             avg_latency = ((double) total_latency / 1000 / total_ops);
         }
         if (cur_duration > 1 && active_threads == cfg->threads) {
-            cur_ops_sec = (long) ((double) cur_ops / cur_duration * 1000000);
-            cur_bytes_sec = (long) ((double) cur_bytes / cur_duration * 1000000);
+            cur_ops_sec = (unsigned long long) ((double) cur_ops / cur_duration * 1000000);
+            cur_bytes_sec = (unsigned long long) ((double) cur_bytes / cur_duration * 1000000);
             cur_latency = ((double) cur_total_latency / 1000 / cur_ops);
         }
 
@@ -3719,8 +4447,12 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         if (cfg->clients_start > 0) {
             struct timeval now;
             gettimeofday(&now, NULL);
-            unsigned int elapsed_secs = now.tv_sec - cfg->benchmark_start_time.tv_sec;
+            unsigned int elapsed_secs = ts_diff(cfg->benchmark_start_time, now) / 1000000;
             unsigned int steps_done = elapsed_secs / cfg->step_duration;
+            // As in the JSON "Active Clients": only steps k with
+            // k * step_duration < test_time ever run.
+            if (cfg->test_time > 0 && steps_done > (cfg->test_time - 1) / cfg->step_duration)
+                steps_done = (cfg->test_time - 1) / cfg->step_duration;
             display_clients = cfg->clients_start + steps_done * cfg->clients_step;
             if (display_clients > cfg->clients) display_clients = cfg->clients;
         }
@@ -3753,174 +4485,184 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             }
         }
 
-        if (cfg->realtime_latencies) {
-            // Two-line, time-series-friendly block. On a TTY we move the cursor
-            // back up 2 lines so the block redraws in place; on a non-TTY (file
-            // capture / piped log) we just keep appending, which turns the
-            // stderr stream into a clean 2-rows-per-second time series.
-            char tag[40];
-            snprintf(tag, sizeof(tag), "[RUN #%u %3.0f%% %3lus]", run_id, progress,
-                     (unsigned long) (duration / 1000000));
+        bool inst_samples = inst_hist_agg != NULL && hdr_total_count(inst_hist_agg) > 0;
+        if (inst_samples) inst_percentiles.calculate(inst_hist_agg);
+        const std::vector<int64_t> &inst_values = inst_percentiles.values();
 
-            char cur_ops_str[32], avg_ops_str[32];
-            format_with_commas(cur_ops_sec, cur_ops_str, sizeof(cur_ops_str));
-            format_with_commas(ops_sec, avg_ops_str, sizeof(avg_ops_str));
+        // Keep all samples in the run-lifetime histogram, including ticks
+        // whose progress frame is suppressed by --progress-interval.
+        if (rtl_totals_hist != NULL && inst_samples) hdr_add(rtl_totals_hist, inst_hist_agg);
 
-            // Miss ratio: per-second (delta) and cumulative.
-            unsigned long int cur_lookups = (total_hits - prev_hits) + (total_misses - prev_misses);
-            unsigned long int tot_lookups = total_hits + total_misses;
-            char cur_miss_str[16], avg_miss_str[16];
-            if (cur_lookups > 0)
-                snprintf(cur_miss_str, sizeof(cur_miss_str), "%5.2f%%",
-                         100.0 * (double) (total_misses - prev_misses) / (double) cur_lookups);
-            else
-                snprintf(cur_miss_str, sizeof(cur_miss_str), "  -  ");
-            if (tot_lookups > 0)
-                snprintf(avg_miss_str, sizeof(avg_miss_str), "%5.2f%%",
-                         100.0 * (double) total_misses / (double) tot_lookups);
-            else
-                snprintf(avg_miss_str, sizeof(avg_miss_str), "  -  ");
+        // Only rendering is throttled. Keep supervisor deadlines, metric
+        // exports and per-second sampling on their existing cadence.
+        auto progress_now = std::chrono::steady_clock::now();
+        if (active_threads == 0 || progress_now - last_progress_time >= std::chrono::seconds(cfg->progress_interval)) {
+            last_progress_time = progress_now;
+            if (cfg->realtime_latencies) {
+                // Two-line, time-series-friendly block. On a TTY we move the cursor
+                // back up 2 lines so the block redraws in place; on a non-TTY (file
+                // capture / piped log) we just keep appending, which turns the
+                // stderr stream into a time series at the selected display interval.
+                char tag[40];
+                snprintf(tag, sizeof(tag), "[RUN #%u %3.0f%% %3lus]", run_id, progress,
+                         (unsigned long) (duration / 1000000));
 
-            // Abort ratio (--transaction only): EXEC optimistic-lock aborts as a
-            // share of the same lookup denominator. Aborts are a subset of misses,
-            // so abort% <= miss%. It's a blended live indicator across all
-            // arbitrary commands; the authoritative per-command abort rate is in
-            // the final table / "abort rate" warning.
-            char cur_abort_str[16], avg_abort_str[16];
-            if (cur_lookups > 0)
-                snprintf(cur_abort_str, sizeof(cur_abort_str), "%5.2f%%",
-                         100.0 * (double) (total_aborts - prev_aborts) / (double) cur_lookups);
-            else
-                snprintf(cur_abort_str, sizeof(cur_abort_str), "  -  ");
-            if (tot_lookups > 0)
-                snprintf(avg_abort_str, sizeof(avg_abort_str), "%5.2f%%",
-                         100.0 * (double) total_aborts / (double) tot_lookups);
-            else
-                snprintf(avg_abort_str, sizeof(avg_abort_str), "  -  ");
+                char cur_ops_str[32], avg_ops_str[32];
+                format_with_commas(cur_ops_sec, cur_ops_str, sizeof(cur_ops_str));
+                format_with_commas(ops_sec, avg_ops_str, sizeof(avg_ops_str));
 
-            char line1[640];
-            int line1_used = 0;
-            if (total_connection_errors > 0) {
-                line1_used = snprintf(
-                    line1, sizeof(line1),
-                    "%s throughput %s (avg: %s) ops/sec   %s/sec (avg: %s/sec)   miss %s (avg: %s)   conn_err %lu", tag,
-                    cur_ops_str, avg_ops_str, cur_bytes_str, bytes_str, cur_miss_str, avg_miss_str,
-                    total_connection_errors);
-            } else {
-                line1_used =
-                    snprintf(line1, sizeof(line1),
-                             "%s throughput %s (avg: %s) ops/sec   %s/sec (avg: %s/sec)   miss %s (avg: %s)", tag,
-                             cur_ops_str, avg_ops_str, cur_bytes_str, bytes_str, cur_miss_str, avg_miss_str);
-            }
-            // Abort tail: only under --transaction so default arbitrary-command
-            // output is unchanged for existing log-scraping.
-            if (cfg->transaction && line1_used > 0 && (size_t) line1_used < sizeof(line1)) {
-                int n = snprintf(line1 + line1_used, sizeof(line1) - line1_used, "   abort %s (avg: %s)", cur_abort_str,
-                                 avg_abort_str);
-                if (n > 0) line1_used += n;
-            }
-            // Retry/error tail: only printed when --retry-on-error is enabled
-            // so existing CI / log-scraping is unaffected by default.
-            if (cfg->retry_on_error && line1_used > 0 && (size_t) line1_used < sizeof(line1)) {
-                unsigned long int cur_errors = total_errors - prev_errors;
-                unsigned long int cur_retries = total_retry_attempts - prev_retry_attempts;
-                snprintf(line1 + line1_used, sizeof(line1) - line1_used,
-                         "   errors %lu (+%lu)   retries %lu (+%lu)   retried_ops %lu", total_errors, cur_errors,
-                         total_retry_attempts, cur_retries, total_retried_ops);
-            }
+                // Miss ratio: per-second (delta) and cumulative.
+                unsigned long long int cur_lookups = (total_hits - prev_hits) + (total_misses - prev_misses);
+                unsigned long long int tot_lookups = total_hits + total_misses;
+                char cur_miss_str[16], avg_miss_str[16];
+                if (cur_lookups > 0)
+                    snprintf(cur_miss_str, sizeof(cur_miss_str), "%5.2f%%",
+                             100.0 * (double) (total_misses - prev_misses) / (double) cur_lookups);
+                else
+                    snprintf(cur_miss_str, sizeof(cur_miss_str), "  -  ");
+                if (tot_lookups > 0)
+                    snprintf(avg_miss_str, sizeof(avg_miss_str), "%5.2f%%",
+                             100.0 * (double) total_misses / (double) tot_lookups);
+                else
+                    snprintf(avg_miss_str, sizeof(avg_miss_str), "  -  ");
 
-            // Accumulate this tick's instantaneous percentile samples into the
-            // run-lifetime histogram so '(avg: X.XXX)' on the latency line covers
-            // the whole run so far, not just the last second.
-            if (rtl_totals_hist != NULL && inst_hist_agg != NULL && hdr_total_count(inst_hist_agg) > 0) {
-                hdr_add(rtl_totals_hist, inst_hist_agg);
-            }
+                // Abort ratio (--transaction only): EXEC optimistic-lock aborts as a
+                // share of the same lookup denominator. Aborts are a subset of misses,
+                // so abort% <= miss%. It's a blended live indicator across all
+                // arbitrary commands; the authoritative per-command abort rate is in
+                // the final table / "abort rate" warning.
+                char cur_abort_str[16], avg_abort_str[16];
+                if (cur_lookups > 0)
+                    snprintf(cur_abort_str, sizeof(cur_abort_str), "%5.2f%%",
+                             100.0 * (double) (total_aborts - prev_aborts) / (double) cur_lookups);
+                else
+                    snprintf(cur_abort_str, sizeof(cur_abort_str), "  -  ");
+                if (tot_lookups > 0)
+                    snprintf(avg_abort_str, sizeof(avg_abort_str), "%5.2f%%",
+                             100.0 * (double) total_aborts / (double) tot_lookups);
+                else
+                    snprintf(avg_abort_str, sizeof(avg_abort_str), "  -  ");
 
-            // Latency lines: per-configured-percentile "cur (avg: avg)", chunked
-            // to at most kPctPerLine entries per line so a long --print-percentiles
-            // list (e.g. 50,99,99.9,99.99,99.99999,99.999999) doesn't blow out the
-            // terminal. Line count is deterministic given the configured list,
-            // which keeps the in-place cursor-up redraw stable across ticks.
-            const std::vector<double> &quantiles = cfg->print_percentiles.quantile_list;
-            const size_t kPctPerLine = 3;
-            size_t num_latency_lines = quantiles.empty() ? 1 : ((quantiles.size() + kPctPerLine - 1) / kPctPerLine);
-            std::vector<std::string> lat_chunks(num_latency_lines);
-            bool any_samples = (rtl_totals_hist != NULL && hdr_total_count(rtl_totals_hist) > 0);
-            bool cur_samples = (inst_hist_agg != NULL && hdr_total_count(inst_hist_agg) > 0);
-            for (std::size_t i = 0; i < quantiles.size(); i++) {
-                char cur_p[16], avg_p[16];
-                if (cur_samples) {
-                    double ms =
-                        hdr_value_at_percentile(inst_hist_agg, quantiles[i]) / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
-                    snprintf(cur_p, sizeof(cur_p), "%6.3f", ms);
+                char line1[640];
+                int line1_used = 0;
+                if (total_connection_errors > 0) {
+                    line1_used = snprintf(
+                        line1, sizeof(line1),
+                        "%s throughput %s (avg: %s) ops/sec   %s/sec (avg: %s/sec)   miss %s (avg: %s)   conn_err %llu",
+                        tag, cur_ops_str, avg_ops_str, cur_bytes_str, bytes_str, cur_miss_str, avg_miss_str,
+                        total_connection_errors);
                 } else {
-                    snprintf(cur_p, sizeof(cur_p), "   -  ");
+                    line1_used =
+                        snprintf(line1, sizeof(line1),
+                                 "%s throughput %s (avg: %s) ops/sec   %s/sec (avg: %s/sec)   miss %s (avg: %s)", tag,
+                                 cur_ops_str, avg_ops_str, cur_bytes_str, bytes_str, cur_miss_str, avg_miss_str);
                 }
-                if (any_samples) {
-                    double ms = hdr_value_at_percentile(rtl_totals_hist, quantiles[i]) /
-                                (double) LATENCY_HDR_RESULTS_MULTIPLIER;
-                    snprintf(avg_p, sizeof(avg_p), "%6.3f", ms);
-                } else {
-                    snprintf(avg_p, sizeof(avg_p), "   -  ");
+                // Abort tail: only under --transaction so default arbitrary-command
+                // output is unchanged for existing log-scraping.
+                if (cfg->transaction && line1_used > 0 && (size_t) line1_used < sizeof(line1)) {
+                    int n = snprintf(line1 + line1_used, sizeof(line1) - line1_used, "   abort %s (avg: %s)",
+                                     cur_abort_str, avg_abort_str);
+                    if (n > 0) line1_used += n;
                 }
-                char entry[96];
-                snprintf(entry, sizeof(entry), "  p%.10g %s (avg: %s)", quantiles[i], cur_p, avg_p);
-                lat_chunks[i / kPctPerLine] += entry;
-            }
-            if (quantiles.empty()) lat_chunks[0] = "  (no samples this tick)";
+                // Retry/error tail: only printed when --retry-on-error is enabled
+                // so existing CI / log-scraping is unaffected by default.
+                if (cfg->retry_on_error && line1_used > 0 && (size_t) line1_used < sizeof(line1)) {
+                    unsigned long long int cur_errors = total_errors - prev_errors;
+                    unsigned long long int cur_retries = total_retry_attempts - prev_retry_attempts;
+                    snprintf(line1 + line1_used, sizeof(line1) - line1_used,
+                             "   errors %llu (+%llu)   retries %llu (+%llu)   retried_ops %llu", total_errors,
+                             cur_errors, total_retry_attempts, cur_retries, total_retried_ops);
+                }
 
-            size_t total_lines = 1 + num_latency_lines;
-            // The ms unit applies to every value on the latency lines (both cur
-            // and avg are in milliseconds), so we always append it to the last
-            // chunk — even when the last tick had no fresh samples.
-            bool show_ms = cur_samples || any_samples;
-            if (stderr_is_tty && !first_rtl_frame) {
-                // Move cursor up the number of lines we last emitted, then
-                // overwrite each with \033[K to wipe residue from a wider frame.
-                fprintf(stderr, "\033[%zuA\r", total_lines);
-                fprintf(stderr, "%s\033[K\n", line1);
-                for (size_t k = 0; k < num_latency_lines; k++) {
-                    const char *unit_suffix = (k + 1 == num_latency_lines && show_ms) ? " ms" : "";
-                    fprintf(stderr, "%s latency%s%s\033[K\n", tag, lat_chunks[k].c_str(), unit_suffix);
+                // Latency lines: per-configured-percentile "cur (avg: avg)", chunked
+                // to at most kPctPerLine entries per line so a long --print-percentiles
+                // list (e.g. 50,99,99.9,99.99,99.99999,99.999999) doesn't blow out the
+                // terminal. Line count is deterministic given the configured list,
+                // which keeps the in-place cursor-up redraw stable across ticks.
+                const std::vector<double> &quantiles = cfg->print_percentiles.quantile_list;
+                const size_t kPctPerLine = 3;
+                size_t num_latency_lines = quantiles.empty() ? 1 : ((quantiles.size() + kPctPerLine - 1) / kPctPerLine);
+                std::vector<std::string> lat_chunks(num_latency_lines);
+                bool any_samples = (rtl_totals_hist != NULL && hdr_total_count(rtl_totals_hist) > 0);
+                bool cur_samples = inst_samples;
+                const std::vector<int64_t> *overall_values =
+                    any_samples ? &overall_percentiles.calculate(rtl_totals_hist) : NULL;
+                for (std::size_t i = 0; i < quantiles.size(); i++) {
+                    char cur_p[16], avg_p[16];
+                    if (cur_samples) {
+                        double ms = inst_values[i] / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
+                        snprintf(cur_p, sizeof(cur_p), "%6.3f", ms);
+                    } else {
+                        snprintf(cur_p, sizeof(cur_p), "   -  ");
+                    }
+                    if (any_samples) {
+                        double ms = (*overall_values)[i] / (double) LATENCY_HDR_RESULTS_MULTIPLIER;
+                        snprintf(avg_p, sizeof(avg_p), "%6.3f", ms);
+                    } else {
+                        snprintf(avg_p, sizeof(avg_p), "   -  ");
+                    }
+                    char entry[96];
+                    snprintf(entry, sizeof(entry), "  p%.10g %s (avg: %s)", quantiles[i], cur_p, avg_p);
+                    lat_chunks[i / kPctPerLine] += entry;
                 }
-            } else {
-                fprintf(stderr, "%s\n", line1);
-                for (size_t k = 0; k < num_latency_lines; k++) {
-                    const char *unit_suffix = (k + 1 == num_latency_lines && show_ms) ? " ms" : "";
-                    fprintf(stderr, "%s latency%s%s\n", tag, lat_chunks[k].c_str(), unit_suffix);
+                if (quantiles.empty()) lat_chunks[0] = "  (no samples this tick)";
+
+                size_t total_lines = 1 + num_latency_lines;
+                // The ms unit applies to every value on the latency lines (both cur
+                // and avg are in milliseconds), so we always append it to the last
+                // chunk — even when the last tick had no fresh samples.
+                bool show_ms = cur_samples || any_samples;
+                if (stderr_is_tty && !first_rtl_frame) {
+                    // Move cursor up the number of lines we last emitted, then
+                    // overwrite each with \033[K to wipe residue from a wider frame.
+                    fprintf(stderr, "\033[%zuA\r", total_lines);
+                    fprintf(stderr, "%s\033[K\n", line1);
+                    for (size_t k = 0; k < num_latency_lines; k++) {
+                        const char *unit_suffix = (k + 1 == num_latency_lines && show_ms) ? " ms" : "";
+                        fprintf(stderr, "%s latency%s%s\033[K\n", tag, lat_chunks[k].c_str(), unit_suffix);
+                    }
+                } else {
+                    fprintf(stderr, "%s\n", line1);
+                    for (size_t k = 0; k < num_latency_lines; k++) {
+                        const char *unit_suffix = (k + 1 == num_latency_lines && show_ms) ? " ms" : "";
+                        fprintf(stderr, "%s latency%s%s\n", tag, lat_chunks[k].c_str(), unit_suffix);
+                    }
                 }
-            }
-            first_rtl_frame = false;
-        } else if (total_connection_errors > 0) {
-            // Only show connection errors if there are any (backwards compatible output)
-            fprintf(stderr,
-                    "[RUN #%u %.0f%%, %3u secs] %2u threads %2u conns %lu conn errors: %11lu ops, %7lu (avg: %7lu) "
+                first_rtl_frame = false;
+            } else if (total_connection_errors > 0) {
+                // Only show connection errors if there are any (backwards compatible output)
+                fprintf(
+                    stderr,
+                    "[RUN #%u %.0f%%, %3u secs] %2u threads %2u conns %llu conn errors: %11llu ops, %7llu (avg: %7llu) "
                     "ops/sec, %s/sec (avg: %s/sec), %5.2f (avg: %5.2f) msec latency",
                     run_id, progress, (unsigned int) (duration / 1000000), active_threads, display_clients,
                     total_connection_errors, total_ops, cur_ops_sec, ops_sec, cur_bytes_str, bytes_str, cur_latency,
                     avg_latency);
-            if (cfg->retry_on_error) {
-                fprintf(stderr, "   errors %lu (+%lu)   retries %lu (+%lu)   retried_ops %lu", total_errors,
-                        total_errors - prev_errors, total_retry_attempts, total_retry_attempts - prev_retry_attempts,
-                        total_retried_ops);
-            }
-            fprintf(stderr, "\r");
-        } else if (cfg->retry_on_error && (total_errors > 0 || total_retry_attempts > 0)) {
-            // Quick path when only request-level errors / retries are non-zero.
-            fprintf(stderr,
-                    "[RUN #%u %.0f%%, %3u secs] %2u threads %2u conns: %11lu ops, %7lu (avg: %7lu) ops/sec, %s/sec "
-                    "(avg: %s/sec), %5.2f (avg: %5.2f) msec latency   errors %lu (+%lu)   retries %lu (+%lu)   "
-                    "retried_ops %lu\r",
+                if (cfg->retry_on_error) {
+                    fprintf(stderr, "   errors %llu (+%llu)   retries %llu (+%llu)   retried_ops %llu", total_errors,
+                            total_errors - prev_errors, total_retry_attempts,
+                            total_retry_attempts - prev_retry_attempts, total_retried_ops);
+                }
+                fprintf(stderr, "\r");
+            } else if (cfg->retry_on_error && (total_errors > 0 || total_retry_attempts > 0)) {
+                // Quick path when only request-level errors / retries are non-zero.
+                fprintf(
+                    stderr,
+                    "[RUN #%u %.0f%%, %3u secs] %2u threads %2u conns: %11llu ops, %7llu (avg: %7llu) ops/sec, %s/sec "
+                    "(avg: %s/sec), %5.2f (avg: %5.2f) msec latency   errors %llu (+%llu)   retries %llu (+%llu)   "
+                    "retried_ops %llu\r",
                     run_id, progress, (unsigned int) (duration / 1000000), active_threads, display_clients, total_ops,
                     cur_ops_sec, ops_sec, cur_bytes_str, bytes_str, cur_latency, avg_latency, total_errors,
                     total_errors - prev_errors, total_retry_attempts, total_retry_attempts - prev_retry_attempts,
                     total_retried_ops);
-        } else {
-            fprintf(stderr,
-                    "[RUN #%u %.0f%%, %3u secs] %2u threads %2u conns: %11lu ops, %7lu (avg: %7lu) ops/sec, %s/sec "
+            } else {
+                fprintf(
+                    stderr,
+                    "[RUN #%u %.0f%%, %3u secs] %2u threads %2u conns: %11llu ops, %7llu (avg: %7llu) ops/sec, %s/sec "
                     "(avg: %s/sec), %5.2f (avg: %5.2f) msec latency\r",
                     run_id, progress, (unsigned int) (duration / 1000000), active_threads, display_clients, total_ops,
                     cur_ops_sec, ops_sec, cur_bytes_str, bytes_str, cur_latency, avg_latency);
+            }
         }
 
         prev_hits = total_hits;
@@ -3944,16 +4686,22 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
             snap.active_threads = active_threads;
             snap.connections = display_clients * active_threads; // :3227 parity, uint32 product
             snap.progress_pct = progress;
-            snap.cur_ops_sec = (long) cur_ops_sec;
-            snap.avg_ops_sec = (long) ops_sec;
-            snap.cur_bytes_sec = (long) cur_bytes_sec;
-            snap.avg_bytes_sec = (long) bytes_sec;
+            snap.cur_ops_sec = (long long) cur_ops_sec;
+            snap.avg_ops_sec = (long long) ops_sec;
+            snap.cur_bytes_sec = (long long) cur_bytes_sec;
+            snap.avg_bytes_sec = (long long) bytes_sec;
             snap.cur_latency_ms = cur_latency;
             snap.avg_latency_ms = avg_latency;
             snap.run_connection_errors = total_connection_errors; // RAW per-run (Decisions #11)
+            // Drain the latency histograms BEFORE reading the op counters: a
+            // second is folded (under the drain's mutex) only after its ops
+            // were counted, so memtier_latency_seconds_count never exceeds
+            // memtier_ops_total, even when a thread finishes or a connection
+            // rolls its second between the two reads.
+            hdr_histogram *prom_latency = prom_enabled(cfg) ? prom_drain_latency(cfg, threads, false) : NULL;
             if (prom_enabled(cfg)) prom_observe_and_fill(cfg, threads, snap);
-            if (statsd_on) statsd_publish_tick(cfg->statsd, snap, inst_hist_agg, cfg->print_percentiles.quantile_list);
-            if (prom_enabled(cfg)) prom_publish_tick(cfg, snap, threads); // gated walk + publish (PLAN 3.7)
+            if (statsd_on) statsd_publish_tick(cfg->statsd, snap, inst_samples, live_quantiles, inst_values);
+            if (prom_enabled(cfg)) prom_publish_tick(cfg, snap, prom_latency); // PLAN 3.7
         }
 
         // Per-second CPU sampling (advisory).
@@ -3971,11 +4719,11 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         cfg->statsd->event("Benchmark Completed", event_data, "memtier,end");
 
         // Zero out gauges so the graph shows the run has ended
-        cfg->statsd->gauge("ops_sec", (long) 0);
-        cfg->statsd->gauge("ops_sec_avg", (long) 0);
-        cfg->statsd->gauge("bytes_sec", (long) 0);
-        cfg->statsd->gauge("bytes_sec_avg", (long) 0);
-        cfg->statsd->gauge("progress_pct", (long) 0);
+        cfg->statsd->gauge("ops_sec", (long long) 0);
+        cfg->statsd->gauge("ops_sec_avg", (long long) 0);
+        cfg->statsd->gauge("bytes_sec", (long long) 0);
+        cfg->statsd->gauge("bytes_sec_avg", (long long) 0);
+        cfg->statsd->gauge("progress_pct", (long long) 0);
     }
 
     fprintf(stderr, "\n\n");
@@ -3983,20 +4731,44 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     // join all threads back and unify stats
     run_stats stats(cfg);
 
+    unsigned int failed_threads = 0;
+    unsigned int merge_iteration = 1;
     for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
         (*i)->join();
-        (*i)->m_cg->merge_run_stats(&stats);
+        // After interrupt() (Ctrl+C, connection-stage abort): end the clients
+        // that were still running at the interrupt time. Done here, not in
+        // interrupt(), because the worker records into the same run_stats.
+        (*i)->m_cg->finalize_interrupted_clients();
+        if ((*i)->m_failed) failed_threads++;
+        (*i)->m_cg->merge_run_stats(&stats, merge_iteration);
+    }
+
+    // A failed worker stopped before the run's stop condition, so this run
+    // did not measure the requested window: its clients' durations differ from
+    // the others', and the merged duration and rates mix them. Say so, and fail
+    // the invocation (main() exits 1) rather than pass the numbers off as a
+    // normal result. --reconnect-on-error makes dropped connections part of
+    // the workload instead.
+    if (failed_threads > 0) {
+        fprintf(stderr,
+                "error: [RUN #%u] %u of %u thread(s) ended before the requested %s was reached (see errors "
+                "above); the results of this run are not valid.\n",
+                run_id, failed_threads, (unsigned int) threads.size(),
+                cfg->requests > 0 ? "request count" : "test time");
+        g_worker_failed = true;
+        // Keep this run's invalidity with its results, including BEST/WORST
+        // selection and the aggregate, rather than only in the process status.
+        stats.set_interrupted(true);
     }
 
     // -----------------------------------------------------------------
     // CPU utilization aggregate (memtier's own usage).
     //
-    // Fold each worker's authoritative getrusage(RUSAGE_THREAD) totals (already
-    // accumulated across restarts inside the worker) into the run_stats. Each
-    // worker's cores_used divides its CPU by ITS OWN wall bracket (captured at
-    // the same points as the CPU snapshots), so there is no setup-vs-serving or
-    // across-restart skew. The whole-process aggregate divides total CPU (all
-    // workers + the main thread) by the longest summed active-serving wall time
+    // Fold each worker's authoritative getrusage(RUSAGE_THREAD) totals (captured
+    // inside the worker) into the run_stats. Each worker's cores_used divides
+    // its CPU by ITS OWN wall bracket (captured at the same points as the CPU
+    // snapshots), so there is no setup-vs-serving skew. The whole-process
+    // aggregate divides total CPU (all workers + the main thread) by the longest summed active-serving wall time
     // across workers, so the aggregate and per-thread figures stay consistent:
     // the denominator is the window during which work actually happened, not the
     // main thread's launch->join span which also covers idle teardown. Done
@@ -4132,18 +4904,24 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         for (size_t t = 0; t < threads.size(); t++) {
             prom_fold_thread(cfg, t, threads[t]->m_cg);
         }
-        prom_publish_run_end(cfg, run_id);
+        prom_publish_run_end(cfg, run_id, threads);
     }
 
     // Do we need to produce client stats?
     if (cfg->client_stats != NULL) {
         unsigned int cg_id = 0;
+        unsigned int failures = 0;
         fprintf(stderr, "[RUN %u] Writing client stats files...\n", run_id);
         for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
             char prefix[PATH_MAX];
 
             snprintf(prefix, sizeof(prefix) - 1, "%s-%u-%u", cfg->client_stats, run_id, cg_id++);
-            (*i)->m_cg->write_client_stats(prefix);
+            (*i)->m_cg->write_client_stats(prefix, &failures);
+        }
+        if (failures > 0) {
+            if (failures > 1)
+                fprintf(stderr, "error: %u more --client-stats files could not be written\n", failures - 1);
+            g_output_failed = true;
         }
     }
 
@@ -4271,8 +5049,204 @@ static void cleanup_openssl(void)
 
 #endif
 
+// --hdr-file-prefix and --client-stats files are only created when a run
+// ends. Check at startup that the directory they go into is a writable
+// directory (without creating anything), so a typo does not cost a whole run.
+// This is best-effort: access() uses the real UID, so as root or on an NFS
+// root_squash mount an unwritable directory can pass, and a full disk is only
+// seen at the end anyway. Exits 1 on failure.
+static void check_output_prefix_dir(const char *option, const char *prefix)
+{
+    std::string dir(prefix);
+#ifdef _WIN32
+    size_t slash = dir.find_last_of("/\\");
+    // Keep a separator only for a root; UCRT stat rejects trailing separators
+    // on ordinary directories.
+    bool root = slash == 0 || (slash == 2 && dir[1] == ':');
+    dir = slash == std::string::npos ? "." : dir.substr(0, slash + (root ? 1 : 0));
+#else
+    size_t slash = dir.rfind('/');
+    dir = slash == std::string::npos ? "." : (slash == 0 ? "/" : dir.substr(0, slash));
+#endif
+    struct stat st;
+    int err = 0;
+    if (stat(dir.c_str(), &st) != 0) {
+        err = errno;
+    } else if (!S_ISDIR(st.st_mode)) {
+        err = ENOTDIR;
+#ifdef _WIN32
+    } else if (access(dir.c_str(), W_OK) != 0) {
+#else
+    } else if (access(dir.c_str(), W_OK | X_OK) != 0) {
+#endif
+        err = errno;
+    }
+    if (err != 0) {
+        fprintf(stderr, "error: cannot write %s directory %s: %s\n", option, dir.c_str(), strerror(err));
+        exit(1);
+    }
+}
+
+// Make sure fds 0, 1 and 2 are open before anything else opens a file.
+// If one of them was closed when memtier was started (e.g. `memtier >&-`),
+// the next open() gets that fd: --json-out-file or --out-file would become
+// fd 1 (or 2), and the text results (or the stderr log lines) would be
+// written into it. Reopen each closed fd on /dev/null instead, which keeps
+// the numbering safe. Returns a mask with bit (1 << fd) set for each fd that
+// was closed.
+#ifdef _WIN32
+// Probing a closed CRT descriptor otherwise invokes UCRT's default invalid-
+// parameter handler. Restore it before startup creates any worker threads.
+static void closed_fd_invalid_parameter(const wchar_t *, const wchar_t *, const wchar_t *, unsigned int, uintptr_t) {}
+#endif
+
+static unsigned int reopen_closed_std_fds(void)
+{
+#ifdef _WIN32
+    _invalid_parameter_handler previous_handler = _set_invalid_parameter_handler(closed_fd_invalid_parameter);
+#endif
+    unsigned int closed_mask = 0;
+    for (int fd = STDIN_FILENO; fd <= STDERR_FILENO; fd++) {
+#ifdef _WIN32
+        if (_get_osfhandle(fd) != -1 && _get_osfhandle(fd) != -2) continue;
+#else
+        if (fcntl(fd, F_GETFD) != -1 || errno != EBADF) continue;
+#endif
+        // open() returns the lowest free fd, which is this one, since the
+        // lower ones are open by now.
+        int nfd;
+        do {
+#ifdef _WIN32
+            nfd = open("NUL", O_RDWR);
+#else
+            nfd = open("/dev/null", O_RDWR);
+#endif
+        } while (nfd < 0 && errno == EINTR);
+#ifdef _WIN32
+        // A detached process can have an allocated CRT descriptor whose OS
+        // handle is -2. open() then chooses another slot; duplicate onto the
+        // original descriptor rather than assuming the lowest slot was free.
+        if (nfd >= 0 && nfd != fd) {
+            int result = _dup2(nfd, fd);
+            int err = errno;
+            close(nfd);
+            nfd = result == 0 ? fd : -1;
+            errno = err;
+        }
+#endif
+        if (nfd != fd) {
+            int err = nfd < 0 ? errno : EBADF;
+            // Report it only if stderr is open (it may be the closed fd).
+#ifdef _WIN32
+            if (_get_osfhandle(STDERR_FILENO) != -1 && _get_osfhandle(STDERR_FILENO) != -2)
+#else
+            if (fcntl(STDERR_FILENO, F_GETFD) != -1)
+#endif
+                fprintf(stderr, "error: fd %d is closed and cannot be reopened on /dev/null: %s\n", fd, strerror(err));
+            exit(1);
+        }
+        closed_mask |= 1u << fd;
+    }
+#ifdef _WIN32
+    _set_invalid_parameter_handler(previous_handler);
+#endif
+    return closed_mask;
+}
+
+static const char *std_fd_name(int fd)
+{
+    return fd == STDIN_FILENO ? "stdin" : (fd == STDOUT_FILENO ? "stdout" : "stderr");
+}
+
+// True if path is exactly task_prefix + "<tid>" + fd_suffix, with <tid> all
+// digits: e.g. "/proc/123/task/" + "124" + "/fd/1", which /proc/thread-self/fd/1
+// resolves to.
+#ifndef _WIN32
+static bool is_task_fd_path(const std::string &path, const std::string &task_prefix, const std::string &fd_suffix)
+{
+    if (path.compare(0, task_prefix.size(), task_prefix) != 0) return false;
+    std::string rest = path.substr(task_prefix.size()); // "<tid>/fd/N"
+    size_t slash = rest.find('/');
+    if (slash == 0 || slash == std::string::npos || rest.substr(slash) != fd_suffix) return false;
+    for (size_t i = 0; i < slash; i++) {
+        if (!isdigit((unsigned char) rest[i])) return false;
+    }
+    return true;
+}
+
+// With fd 0-2 closed at startup and reopened on /dev/null, an output path
+// that goes through that fd (/dev/stdout, /dev/fd/1, /proc/self/fd/1, or a
+// symlink to one of them; likewise for stdin and stderr) now resolves to
+// /dev/null, and what is written there would be thrown away. Comparing
+// inodes cannot tell such a path from an explicit /dev/null (which is the
+// user's choice and must keep working), so follow the path one symlink at a
+// time and check whether it names this process's fd.
+static bool path_is_closed_fd(const char *path, int fd)
+{
+    char buf[64];
+    snprintf(buf, sizeof(buf), "/dev/%s", std_fd_name(fd));
+    const std::string dev_name(buf);
+    snprintf(buf, sizeof(buf), "/dev/fd/%d", fd);
+    const std::string dev_fd(buf);
+    snprintf(buf, sizeof(buf), "/fd/%d", fd);
+    const std::string fd_suffix(buf);
+    // /proc/self and /proc/thread-self resolve to /proc/<pid> and
+    // /proc/<pid>/task/<tid>. Another process's fd (e.g. /proc/1/fd/1 in a
+    // container) is a different file and is not matched.
+    snprintf(buf, sizeof(buf), "/proc/%d", (int) getpid());
+    const std::string own_proc(buf);
+    const std::string own_task = own_proc + "/task/";
+
+    std::string p(path);
+    for (int depth = 0; depth < 40; depth++) {
+        // Resolve the directory part only, so the last component is kept.
+        size_t slash = p.rfind('/');
+        std::string dir = slash == std::string::npos ? "." : (slash == 0 ? "/" : p.substr(0, slash));
+        std::string base = slash == std::string::npos ? p : p.substr(slash + 1);
+        // If realpath() or readlink() below fails for another reason
+        // (ENOENT, EACCES, ...), the path is treated as not naming a closed
+        // fd on purpose: the later open() then reports the real error.
+        char *rdir = realpath(dir.c_str(), NULL);
+        if (rdir == NULL) return false;
+        std::string resolved_dir(rdir);
+        free(rdir);
+        std::string full = (resolved_dir == "/" ? "" : resolved_dir) + "/" + base;
+
+        // /dev/stdout and /dev/fd/N are device nodes on macOS; on Linux
+        // /dev/fd resolves to /proc/<pid>/fd.
+        if (full == dev_name || full == dev_fd || full == own_proc + fd_suffix) return true;
+        if (is_task_fd_path(full, own_task, fd_suffix)) return true;
+
+        char target[PATH_MAX];
+        ssize_t n = readlink(full.c_str(), target, sizeof(target) - 1);
+        if (n < 0) return false; // not a symlink (EINVAL), or see above
+        target[n] = '\0';
+        p = target[0] == '/' ? std::string(target) : resolved_dir + "/" + target;
+    }
+    return false;
+}
+
+#else
+static bool path_is_closed_fd(const char *, int)
+{
+    return false;
+}
+#endif
+
 int main(int argc, char *argv[])
 {
+    // Must run first, before any file or socket is opened.
+    unsigned int closed_std_fds = reopen_closed_std_fds();
+
+#ifdef _WIN32
+    WSADATA winsock_data;
+    int wsa_error = WSAStartup(MAKEWORD(2, 2), &winsock_data);
+    if (wsa_error != 0) {
+        fprintf(stderr, "error: WSAStartup failed: %d\n", wsa_error);
+        return 1;
+    }
+    // Winsock remains initialized until process exit; process teardown releases it.
+#endif
     // Enable libevent's pthreads bindings so event_base_loopbreak() /
     // event_base_loopexit() called from the main thread reliably wake a
     // worker thread that is blocked in epoll_wait() with no live events.
@@ -4281,12 +5255,21 @@ int main(int argc, char *argv[])
     // --connection-stage-timeout abort (Phase 1 of #426) or a Ctrl+C.
     // Must run before any event_base is created so the locking callbacks
     // are installed for every subsequent base.
+#ifdef _WIN32
+    if (evthread_use_windows_threads() < 0) {
+        fprintf(stderr, "warning: evthread_use_windows_threads() failed; cross-thread loop wakeups may stall.\n");
+    }
+#else
     if (evthread_use_pthreads() < 0) {
         fprintf(stderr, "warning: evthread_use_pthreads() failed; cross-thread loop wakeups may stall.\n");
     }
+#endif
 
-    // Install signal handler for Ctrl+C
+    // Install signal handler for Ctrl+C. SIGTERM (kill, timeout, docker stop,
+    // CI runners) takes the same graceful path, so results are printed and
+    // --json-out-file is closed as valid JSON instead of left truncated.
     signal(SIGINT, sigint_handler);
+    signal(SIGTERM, sigint_handler);
 
     // Ignore SIGPIPE so a peer-initiated TCP/TLS close mid-write returns
     // EPIPE from send()/SSL_write() instead of killing the process. Without
@@ -4296,12 +5279,15 @@ int main(int argc, char *argv[])
     // on plain-TCP send(), but TLS writes via OpenSSL's SSL_write() do not
     // (and ARM Linux ignores MSG_NOSIGNAL on writev in some configurations),
     // so a process-wide SIG_IGN is the robust fix. See PERF-501 / GH #382.
+#ifdef SIGPIPE
     signal(SIGPIPE, SIG_IGN);
+#endif
 
     // Install crash handlers for debugging
     setup_crash_handlers();
 
     // Enable core dumps
+#ifndef _WIN32
     struct rlimit core_limit;
     core_limit.rlim_cur = RLIM_INFINITY;
     core_limit.rlim_max = RLIM_INFINITY;
@@ -4309,10 +5295,12 @@ int main(int argc, char *argv[])
         fprintf(stderr, "warning: failed to set core dump limit: %s\n", strerror(errno));
         fprintf(stderr, "warning: core dumps may not be generated on crash\n");
     }
+#endif
 
     // Keep URI storage alive for cfg and its workers; neither string changes after parsing.
     std::string uri_authenticate;
     std::string uri_server;
+    bool uri_password_only = false;
     benchmark_config cfg = benchmark_config();
     cfg.arbitrary_commands = new arbitrary_command_list();
     cfg.monitor_commands = new monitor_command_list();
@@ -4340,6 +5328,39 @@ int main(int argc, char *argv[])
         usage();
     }
 
+    // An fd 0-2 was closed at startup and reopened on /dev/null (see
+    // reopen_closed_std_fds()). A path option that names that fd would now
+    // silently use /dev/null: an output file would be thrown away and an
+    // input file would read as empty. Fail right after option parsing,
+    // before any of these files is opened or read and before connecting.
+    if (closed_std_fds != 0) {
+        const struct
+        {
+            const char *opt;
+            const char *path;
+        } path_opts[] = {
+            {"--out-file", cfg.out_file},
+            {"--json-out-file", cfg.json_out_file},
+            {"--failed-keys-file", cfg.failed_keys_file},
+            {"--data-import", cfg.data_import},
+            {"--monitor-input", cfg.monitor_input},
+#ifdef USE_TLS
+            {"--cert", cfg.tls_cert},
+            {"--key", cfg.tls_key},
+            {"--cacert", cfg.tls_cacert},
+#endif
+        };
+        for (size_t i = 0; i < sizeof(path_opts) / sizeof(path_opts[0]); i++) {
+            for (int fd = STDIN_FILENO; path_opts[i].path != NULL && fd <= STDERR_FILENO; fd++) {
+                if ((closed_std_fds & (1u << fd)) && path_is_closed_fd(path_opts[i].path, fd)) {
+                    fprintf(stderr, "error: %s %s resolves to %s, which was closed at startup\n", path_opts[i].opt,
+                            path_opts[i].path, std_fd_name(fd));
+                    exit(1);
+                }
+            }
+        }
+    }
+
     // Load monitor input file if specified
     if (cfg.monitor_input) {
         // Monitor input only works with Redis protocols
@@ -4357,60 +5378,65 @@ int main(int argc, char *argv[])
                             "the monitor file will be ignored and a standard SET/GET benchmark will run.\n");
         }
 
+        // Random placeholders share the monitor list's single per-type stats mapping.
+        bool monitor_stats_initialized = false;
         // Expand monitor placeholders in commands
         for (unsigned int i = 0; i < cfg.arbitrary_commands->size(); i++) {
             arbitrary_command &cmd = cfg.arbitrary_commands->at(i);
 
             // Check if command is a random monitor placeholder
             if (strcmp(cmd.command.c_str(), MONITOR_RANDOM_PLACEHOLDER) == 0) {
-                // Get unique command types from the monitor file
-                std::vector<std::string> unique_types = cfg.monitor_commands->get_unique_command_types();
+                if (!monitor_stats_initialized) {
+                    // Get unique command types from the monitor file
+                    std::vector<std::string> unique_types = cfg.monitor_commands->get_unique_command_types();
 
-                if (unique_types.empty()) {
-                    fprintf(stderr, "error: no valid commands found in monitor input file\n");
-                    exit(1);
-                }
+                    if (unique_types.empty()) {
+                        fprintf(stderr, "error: no valid commands found in monitor input file\n");
+                        exit(1);
+                    }
 
-                // The current command index is where we'll add the stats slots
-                // Add new arbitrary_command entries for each unique command type
-                size_t base_stats_index = cfg.arbitrary_commands->size();
+                    // The current command index is where we'll add the stats slots
+                    // Add new arbitrary_command entries for each unique command type
+                    size_t base_stats_index = cfg.arbitrary_commands->size();
 
-                for (const auto &cmd_type : unique_types) {
-                    // Create a placeholder command for stats tracking
-                    std::string placeholder = "MONITOR_" + cmd_type;
-                    arbitrary_command stats_cmd(placeholder.c_str());
-                    stats_cmd.command_name = cmd_type;
-                    stats_cmd.command_type = cmd_type;
-                    // Mark it as a stats-only slot (no actual command to send)
-                    stats_cmd.command_args.clear();
-                    stats_cmd.stats_only = true;
-                    // resolve_command_meta() returns early for empty argv, so look up
-                    // spec directly and stamp miss_tracking_enabled so runtime hit/miss
-                    // accounting actually fires for this slot.
-                    {
-                        using memtier::command_meta::ReplyShape;
-                        const memtier::command_meta::CommandSpec *cmd_spec =
-                            memtier::command_meta::lookup(cmd_type.c_str());
-                        stats_cmd.spec = cmd_spec;
-                        if (cmd_spec != nullptr) {
-                            switch (cmd_spec->reply_shape) {
-                            case ReplyShape::SingleNullBulk:
-                            case ReplyShape::ArrayPerElementNulls:
-                            case ReplyShape::EmptyCollection:
-                            case ReplyShape::IntegerMembership:
-                                stats_cmd.miss_tracking_enabled = true;
-                                break;
-                            default:
-                                stats_cmd.miss_tracking_enabled = false;
-                                break;
+                    for (const auto &cmd_type : unique_types) {
+                        // Create a placeholder command for stats tracking
+                        std::string placeholder = "MONITOR_" + cmd_type;
+                        arbitrary_command stats_cmd(placeholder.c_str());
+                        stats_cmd.command_name = cmd_type;
+                        stats_cmd.command_type = cmd_type;
+                        // Mark it as a stats-only slot (no actual command to send)
+                        stats_cmd.command_args.clear();
+                        stats_cmd.stats_only = true;
+                        // resolve_command_meta() returns early for empty argv, so look up
+                        // spec directly and stamp miss_tracking_enabled so runtime hit/miss
+                        // accounting actually fires for this slot.
+                        {
+                            using memtier::command_meta::ReplyShape;
+                            const memtier::command_meta::CommandSpec *cmd_spec =
+                                memtier::command_meta::lookup(cmd_type.c_str());
+                            stats_cmd.spec = cmd_spec;
+                            if (cmd_spec != nullptr) {
+                                switch (cmd_spec->reply_shape) {
+                                case ReplyShape::SingleNullBulk:
+                                case ReplyShape::ArrayPerElementNulls:
+                                case ReplyShape::EmptyCollection:
+                                case ReplyShape::IntegerMembership:
+                                    stats_cmd.miss_tracking_enabled = true;
+                                    break;
+                                default:
+                                    stats_cmd.miss_tracking_enabled = false;
+                                    break;
+                                }
                             }
                         }
+                        cfg.arbitrary_commands->add_command(stats_cmd);
                     }
-                    cfg.arbitrary_commands->add_command(stats_cmd);
-                }
 
-                // Set up the stats index mapping in monitor_command_list
-                cfg.monitor_commands->setup_stats_indices(base_stats_index);
+                    // Set up the stats index mapping in monitor_command_list
+                    cfg.monitor_commands->setup_stats_indices(base_stats_index);
+                    monitor_stats_initialized = true;
+                }
 
                 // Re-get the reference since vector may have reallocated
                 arbitrary_command &placeholder_cmd = cfg.arbitrary_commands->at(i);
@@ -4484,7 +5510,8 @@ int main(int argc, char *argv[])
                 if (cmd.command_name.length() > 0 && cmd.command_name[cmd.command_name.length() - 1] == '"') {
                     cmd.command_name = cmd.command_name.substr(0, cmd.command_name.length() - 1);
                 }
-                std::transform(cmd.command_name.begin(), cmd.command_name.end(), cmd.command_name.begin(), ::toupper);
+                std::transform(cmd.command_name.begin(), cmd.command_name.end(), cmd.command_name.begin(),
+                               [](unsigned char c) { return static_cast<char>(toupper(c)); });
                 // Set command_type for aggregation (base command without line number)
                 cmd.command_type = cmd.command_name;
                 // Append line number to display name for --command-stats-breakdown=line mode
@@ -4539,7 +5566,7 @@ int main(int argc, char *argv[])
 
     // Process URI if provided
     if (cfg.uri) {
-        if (parse_uri(cfg.uri, &cfg, uri_authenticate, uri_server) < 0) {
+        if (parse_uri(cfg.uri, &cfg, uri_authenticate, uri_server, uri_password_only) < 0) {
             exit(1);
         }
 
@@ -4588,12 +5615,6 @@ int main(int argc, char *argv[])
                     cfg.key_median, cfg.key_minimum, cfg.key_maximum);
             exit(2);
         }
-    }
-
-    // Open the failed-keys log if requested. Failure is reported but doesn't
-    // abort the benchmark.
-    if (cfg.failed_keys_file) {
-        global_failed_keys_logger().open(cfg.failed_keys_file);
     }
 
     // Validate staircase options (after defaults are applied)
@@ -4667,7 +5688,11 @@ int main(int argc, char *argv[])
         // Only the cursor changes; generated arguments are retained by each client.
         cfg.scan_continuation_command = new arbitrary_command(scan_cmd);
         // The separate formatting pass below classifies this as scan_cursor_type.
+        // The flag alone marks the cursor slot, whatever its text; the text is
+        // replaced only so --debug logs show the slot (a user-supplied
+        // "__scan_cursor__" never gets the flag and is sent as a constant).
         cfg.scan_continuation_command->command_args[cursor_index].data = SCAN_CURSOR_PLACEHOLDER;
+        cfg.scan_continuation_command->command_args[cursor_index].scan_cursor = true;
         cfg.scan_continuation_command->command_name = command_type + " <cursor>";
         cfg.scan_continuation_command->command_type = command_type + " <cursor>";
         scan_cmd.command_name = command_type + " 0";
@@ -4727,11 +5752,16 @@ int main(int argc, char *argv[])
     }
 
     // if user configure arbitrary commands, format and prepare it
+    bool monitor_lines_checked = false;
     for (unsigned int i = 0; i < cfg.arbitrary_commands->size(); i++) {
         arbitrary_command &cmd = cfg.arbitrary_commands->at(i);
 
         // Skip formatting for random monitor commands - they will be formatted at runtime
         if (cmd.command_args.size() == 1 && cmd.command_args[0].type == monitor_random_type) {
+            if (cfg.cluster_mode && !monitor_lines_checked) {
+                if (!check_cluster_monitor_lines(cfg.monitor_commands, cfg.key_prefix)) exit(1);
+                monitor_lines_checked = true;
+            }
             continue;
         }
 
@@ -4747,9 +5777,9 @@ int main(int argc, char *argv[])
             exit(1);
         }
 
-        // Cluster mode supports only a single key commands
+        // Cluster mode supports only single-key commands
         if (cfg.cluster_mode && cmd.keys_count > 1) {
-            benchmark_error_log("error: Cluster mode supports only a single key commands\n");
+            benchmark_error_log("error: Cluster mode supports only single-key commands\n");
             exit(1);
         }
         delete tmp_protocol;
@@ -4772,7 +5802,8 @@ int main(int argc, char *argv[])
         /* Our event resolution is (at least) 50 events per second (event every >= 20 ml).
          * When we calculate the number of request per interval, we are taking
          * the upper bound and adjust the interval accordingly to get more accuracy */
-        cfg.request_per_interval = (cfg.request_rate + 50 - 1) / 50;
+        // 64-bit: request_rate + 49 wraps to 0 for rates near UINT_MAX.
+        cfg.request_per_interval = (unsigned int) (((unsigned long long) cfg.request_rate + 50 - 1) / 50);
         unsigned int events_per_second = cfg.request_rate / cfg.request_per_interval;
         cfg.request_interval_microsecond = 1000000 / events_per_second;
         benchmark_debug_log("Rate limiting configured to send %u requests per %u millisecond\n",
@@ -4869,19 +5900,13 @@ int main(int argc, char *argv[])
     }
 #endif
 
-    // JSON file initiation
-    json_handler *jsonhandler = NULL;
-    if (cfg.json_out_file != NULL) {
-        jsonhandler = new json_handler((const char *) cfg.json_out_file);
-        // We allways print the configuration to the JSON file
-        config_print_to_json(jsonhandler, &cfg);
-    }
-
+#ifndef _WIN32
     struct rlimit rlim;
     if (getrlimit(RLIMIT_NOFILE, &rlim) != 0) {
         benchmark_error_log("error: getrlimit failed: %s\n", strerror(errno));
         exit(1);
     }
+#endif
 
     if (cfg.unix_socket != NULL && (cfg.server != NULL || cfg.port > 0)) {
         benchmark_error_log("error: UNIX domain socket and TCP cannot be used together.\n");
@@ -4897,6 +5922,7 @@ int main(int argc, char *argv[])
         }
     }
 
+#ifndef _WIN32
     unsigned int fds_needed = (cfg.threads * cfg.clients) + (cfg.threads * 10) + 10;
     if (fds_needed > rlim.rlim_cur) {
         if (fds_needed > rlim.rlim_max && getuid() != 0) {
@@ -4910,6 +5936,7 @@ int main(int argc, char *argv[])
             exit(1);
         }
     }
+#endif
 
     // create and configure object generator
     object_generator *obj_gen = NULL;
@@ -4952,7 +5979,15 @@ int main(int argc, char *argv[])
             exit(1);
         }
 
-        if (!cfg.generate_keys) {
+        if (cfg.generate_keys) {
+            // Nothing else reads the file before the run starts; validate it
+            // now so a malformed or empty file fails before connecting.
+            imported_keylist check(cfg.data_import);
+            if (!check.read_keys(false)) {
+                fprintf(stderr, "error: %s: invalid --data-import file.\n", cfg.data_import);
+                exit(1);
+            }
+        } else {
             // read keys
             fprintf(stderr, "Reading keys from %s...", cfg.data_import);
             keylist = new imported_keylist(cfg.data_import);
@@ -4976,11 +6011,13 @@ int main(int argc, char *argv[])
     }
 
     if (cfg.authenticate) {
-        if (cfg.protocol == PROTOCOL_MEMCACHE_TEXT) {
+        if (cfg.protocol == PROTOCOL_MEMCACHE_TEXT || cfg.protocol == PROTOCOL_MEMCACHE_META) {
             fprintf(stderr, "error: authenticate can only be used with redis or memcache_binary.\n");
             usage();
         }
-        if (cfg.protocol == PROTOCOL_MEMCACHE_BINARY && strchr(cfg.authenticate, ':') == NULL) {
+        // A password-only --uri may carry a decoded ':' (behind a leading ':'),
+        // but it still has no user name.
+        if (cfg.protocol == PROTOCOL_MEMCACHE_BINARY && (strchr(cfg.authenticate, ':') == NULL || uri_password_only)) {
             fprintf(stderr, "error: binary_memcache credentials must be in the form of USER:PASSWORD.\n");
             usage();
         }
@@ -5002,10 +6039,6 @@ int main(int argc, char *argv[])
         usage();
     }
     if (cfg.data_offset > 0) {
-        if (cfg.data_offset > (1 << 29) - 1) {
-            fprintf(stderr, "error: data-offset too long\n");
-            usage();
-        }
         if (cfg.expiry_range.min || cfg.expiry_range.max || !is_redis_protocol(cfg.protocol)) {
             fprintf(stderr,
                     "error: data-offset can only be used with redis protocol, and cannot be used with expiry\n");
@@ -5070,32 +6103,105 @@ int main(int argc, char *argv[])
         obj_gen->set_key_zipf_distribution(cfg.key_zipf_exp);
     }
 
-    // Prepare output file
-    FILE *outfile;
+    // stdout was closed at startup and reopened on /dev/null, and the text
+    // results go to stdout unless --out-file is given: they would be lost.
+    // Fail here, after the option validation (so a bad option still reports
+    // its own error) and before connecting, as for an --out-file that cannot
+    // be opened below.
+    if ((closed_std_fds & (1u << STDOUT_FILENO)) && cfg.out_file == NULL) {
+        fprintf(stderr, "error: stdout was closed at startup, so the results would not be written; use --out-file\n");
+        exit(1);
+    }
+
+    // --verify-only writes no HDR or --client-stats files.
+    if (!cfg.verify_only) {
+        if (cfg.hdr_prefix[0] != '\0') check_output_prefix_dir("--hdr-file-prefix", cfg.hdr_prefix);
+        if (cfg.client_stats != NULL) check_output_prefix_dir("--client-stats", cfg.client_stats);
+    }
+
+    // Open the output files after option validation and data import, so a
+    // startup error leaves existing files untouched. Retry on EINTR, as
+    // json_handler does.
+    FILE *outfile = stdout;
+    if (cfg.out_file != NULL) {
+        int fd;
+        do {
+            fd = open(cfg.out_file, O_WRONLY | O_CREAT, 0666);
+        } while (fd < 0 && errno == EINTR);
+        if (fd < 0 || (outfile = fdopen(fd, "w")) == NULL) {
+            fprintf(stderr, "error: cannot open --out-file %s: %s\n", cfg.out_file, strerror(errno));
+            exit(1);
+        }
+    }
+
+    // A --failed-keys-file that cannot be opened (or whose header cannot be
+    // written) fails now, as --out-file does, rather than after a whole run
+    // whose log would be lost. --out-file is not truncated yet, and
+    // --json-out-file not opened. A path that names a closed fd 0-2 was
+    // rejected after option parsing, because it opens fine (on /dev/null)
+    // and the log would be lost without any message.
+    if (cfg.failed_keys_file && !global_failed_keys_logger().open(cfg.failed_keys_file)) {
+        exit(1);
+    }
+
+    // JSON file initiation
+    json_handler *jsonhandler = NULL;
+    if (cfg.json_out_file != NULL) {
+        jsonhandler = new json_handler((const char *) cfg.json_out_file);
+        // We always print the configuration to the JSON file
+        config_print_to_json(jsonhandler, &cfg);
+        if (atexit(close_json_out_file_at_exit) != 0) {
+            fprintf(stderr, "error: cannot register JSON output cleanup.\n");
+            delete jsonhandler;
+            exit(1);
+        }
+        g_json_out_file = jsonhandler;
+    }
+
     if (cfg.out_file != NULL) {
         fprintf(stderr, "Writing results to %s...\n", cfg.out_file);
-        outfile = fopen(cfg.out_file, "w");
-        if (!outfile) {
-            perror(cfg.out_file);
+        // --out-file was opened without O_TRUNC and is truncated only now that
+        // --json-out-file is open too, so an error opening either one leaves the
+        // other untouched. Only regular files can be truncated (not e.g.
+        // /dev/stdout or a FIFO).
+        struct stat st;
+        if (fstat(fileno(outfile), &st) == 0 && S_ISREG(st.st_mode) && ftruncate(fileno(outfile), 0) != 0) {
+            fprintf(stderr, "error: cannot truncate --out-file %s: %s\n", cfg.out_file, strerror(errno));
+            // The exit handler finishes the JSON nesting.
+            exit(1);
         }
     } else {
         fprintf(stderr, "Writing results to stdout\n");
-        outfile = stdout;
     }
 
     if (!cfg.verify_only) {
         std::vector<run_stats> all_stats;
         all_stats.reserve(cfg.run_count);
 
+        // Ctrl+C (or SIGTERM) ends the whole --run-count series, not only the current run:
+        // no later run starts. g_interrupted is checked before and after the
+        // settle pause, since the signal can arrive during it. The interrupted
+        // run itself is kept, marked Interrupted. Run 1 always runs, so
+        // all_stats is never empty.
         for (unsigned int run_id = 1; run_id <= cfg.run_count; run_id++) {
-            if (run_id > 1) sleep(1); // let connections settle
+            if (run_id > 1) {
+                if (g_interrupted) break;
+                sleep(1); // let connections settle
+                if (g_interrupted) break;
+            }
 
             run_stats stats = run_benchmark(run_id, &cfg, obj_gen);
             all_stats.push_back(stats);
-            stats.save_hdr_full_run(&cfg, run_id);
-            stats.save_hdr_get_command(&cfg, run_id);
-            stats.save_hdr_set_command(&cfg, run_id);
-            stats.save_hdr_arbitrary_commands(&cfg, run_id);
+            // Each writer prints its own error; write the remaining files anyway.
+            if (!stats.save_hdr_full_run(&cfg, run_id)) g_output_failed = true;
+            if (!stats.save_hdr_get_command(&cfg, run_id)) g_output_failed = true;
+            if (!stats.save_hdr_set_command(&cfg, run_id)) g_output_failed = true;
+            if (!stats.save_hdr_arbitrary_commands(&cfg, run_id)) g_output_failed = true;
+        }
+        const bool series_cut = all_stats.size() < cfg.run_count;
+        if (series_cut) {
+            fprintf(stderr, "Interrupted by %s, skipping the remaining runs (%zu of %u done).\n", interrupt_source(),
+                    all_stats.size(), cfg.run_count);
         }
         //
         // Print some run information.
@@ -5152,6 +6258,8 @@ int main(int argc, char *argv[])
 
         fprintf(outfile, "%-9llu %s\n", (unsigned long long) (cfg.requests > 0 ? cfg.requests : cfg.test_time),
                 cfg.requests > 0 ? "Requests per client" : "Seconds");
+        if (series_cut)
+            fprintf(outfile, "%-9zu Runs completed (of %u, interrupted)\n", all_stats.size(), cfg.run_count);
 
         if (jsonhandler != NULL) {
             jsonhandler->open_nesting("run information");
@@ -5166,6 +6274,7 @@ int main(int argc, char *argv[])
             }
             jsonhandler->write_obj(cfg.requests > 0 ? "Requests per client" : "Seconds", "%llu",
                                    cfg.requests > 0 ? cfg.requests : (unsigned long long) cfg.test_time);
+            jsonhandler->write_obj("Runs completed", "%zu", all_stats.size());
             jsonhandler->write_obj("Format version", "%d", 2);
             jsonhandler->close_nesting();
         }
@@ -5184,7 +6293,9 @@ int main(int argc, char *argv[])
 #endif
 
         // If more than 1 run was used, compute best, worst and average
-        // Furthermore, if print_all_runs is enabled we save separate histograms per run
+        // Furthermore, if print_all_runs is enabled we save separate histograms per run.
+        // The section names follow --run-count, so JSON keys stay stable; their
+        // contents use only the runs that happened ("Runs completed" above).
         if (cfg.run_count > 1) {
             // User wants to see a separate histogram per run
             if (cfg.print_all_runs) {
@@ -5193,14 +6304,19 @@ int main(int argc, char *argv[])
                     all_stats[i].print(outfile, &cfg, run_title.c_str(), jsonhandler);
                 }
             }
+            // Prefer complete measurement windows for both rankings. Keep the
+            // partial runs in per-run output and in the aggregate average.
+            const bool have_complete_run = std::any_of(all_stats.begin(), all_stats.end(),
+                                                       [](const run_stats &stats) { return !stats.get_interrupted(); });
             // User wants the best and worst
-            unsigned int min_ops_sec = (unsigned int) -1;
-            unsigned int max_ops_sec = 0;
+            double min_ops_sec = 0;
+            double max_ops_sec = 0;
             run_stats *worst = NULL;
             run_stats *best = NULL;
             for (std::vector<run_stats>::iterator i = all_stats.begin(); i != all_stats.end(); i++) {
-                unsigned long usecs = i->get_duration_usec();
-                unsigned int ops_sec = (int) (((double) i->get_total_ops() / (usecs > 0 ? usecs : 1)) * 1000000);
+                if (have_complete_run && i->get_interrupted()) continue;
+                unsigned long long usecs = i->get_duration_usec();
+                double ops_sec = usecs > 0 ? (double) i->get_total_ops() / usecs * 1000000 : 0.0;
                 if (ops_sec < min_ops_sec || worst == NULL) {
                     min_ops_sec = ops_sec;
                     worst = &(*i);
@@ -5217,6 +6333,10 @@ int main(int argc, char *argv[])
             // average results:
             run_stats average(&cfg);
             average.aggregate_average(all_stats);
+            // Each run (and BEST/WORST, which are runs) keeps its own flag. The
+            // average is interrupted if any run was, or if Ctrl+C cut the
+            // series short, even between runs where no single run saw it.
+            if (series_cut) average.set_interrupted(true);
             char average_header[50];
             snprintf(average_header, sizeof(average_header), "AGGREGATED AVERAGE RESULTS (%u runs)", cfg.run_count);
             average.print(outfile, &cfg, average_header, jsonhandler);
@@ -5226,6 +6346,7 @@ int main(int argc, char *argv[])
     }
 
     // If needed, data verification is done now...
+    bool verify_failed = false;
     if (cfg.data_verify) {
         struct event_base *verify_event_base = event_base_new();
         abstract_protocol *verify_protocol = protocol_factory(cfg.protocol);
@@ -5250,14 +6371,41 @@ int main(int argc, char *argv[])
             jsonhandler->close_nesting();
         }
 
+        const unsigned long long verified_keys = client->get_verified_keys();
+        const unsigned long long failed_keys = client->get_errors();
+        if (failed_keys > 0) {
+            fprintf(stderr, "error: %llu of %llu keys failed verification\n", failed_keys, verified_keys + failed_keys);
+            verify_failed = true;
+        } else if (verified_keys == 0) {
+            fprintf(stderr, "error: no keys were verified\n");
+            verify_failed = true;
+        } else if (!client->verification_complete()) {
+            fprintf(stderr, "error: data verification did not complete\n");
+            verify_failed = true;
+        }
+
         // Clean up...
         delete client;
         delete verify_protocol;
         event_base_free(verify_event_base);
     }
 
-    if (outfile != stdout) {
-        fclose(outfile);
+    // A results file that could not be written (disk full, quota, I/O error)
+    // fails the run, with one exception: stdout (or an --out-file that is
+    // stdout, e.g. /dev/stdout) on a pipe or socket whose reader went away,
+    // e.g. `| head`. That is the reader's choice, not a lost result.
+    // Keep this check after the last write to outfile.
+    int out_err = finish_output_file(outfile, false);
+    // Checked before fclose(), while the fd is still open.
+    bool reader_gone = out_err != 0 && stdout_reader_gone(outfile, out_err);
+    if (outfile != stdout && fclose(outfile) != 0 && out_err == 0) out_err = errno;
+    if (out_err != 0 && !reader_gone) {
+        if (outfile == stdout) {
+            fprintf(stderr, "error: failed writing results to stdout: %s\n", strerror(out_err));
+        } else {
+            fprintf(stderr, "error: failed writing --out-file %s: %s\n", cfg.out_file, strerror(out_err));
+        }
+        g_output_failed = true;
     }
 
     if (cfg.server_addr) {
@@ -5265,11 +6413,33 @@ int main(int argc, char *argv[])
         cfg.server_addr = NULL;
     }
 
+    // Workers have joined, so close the failed-key log before finalizing JSON
+    // to include any late write failure in its fatal-error summary.
+    if (cfg.failed_keys_file && global_failed_keys_logger().close() != 0) {
+        g_output_failed = true;
+    }
+
     if (jsonhandler != NULL) {
-        // Log message for saving JSON file
-        fprintf(stderr, "Saving JSON output file: %s\n", cfg.json_out_file);
+        // Summaries are fixed strings: detailed diagnostics remain on stderr,
+        // and server replies or credentials are not copied into the artifact.
+        if (g_any_run_connection_stage_aborted.load(std::memory_order_acquire)) {
+            jsonhandler->write_error("Connection setup failed");
+        } else if (g_worker_failed) {
+            jsonhandler->write_error("Benchmark worker stopped before completion");
+        } else if (g_output_failed) {
+            jsonhandler->write_error("A requested output could not be written");
+        } else if (verify_failed) {
+            jsonhandler->write_error("Data verification failed or did not complete");
+        }
+        benchmark_debug_log("Saving JSON output file: %s\n", cfg.json_out_file);
 
         // closing the JSON
+        int json_err = jsonhandler->close();
+        if (json_err != 0) {
+            fprintf(stderr, "error: failed writing --json-out-file %s: %s\n", cfg.json_out_file, strerror(json_err));
+            g_output_failed = true;
+        }
+        g_json_out_file = NULL;
         delete jsonhandler;
     }
 
@@ -5325,8 +6495,20 @@ int main(int argc, char *argv[])
     // operator can read why the abort fired. exit(2) keeps the failure
     // distinguishable from a successful test (0) and from --help (also 2 via
     // usage(), but those exits happen before main reaches this point).
-    if (g_connection_stage_aborted.load(std::memory_order_acquire)) {
+    // With --run-count > 1 an abort in any run counts, and it takes
+    // precedence over a worker failure or output error (exit 1) in another
+    // run or in the same one.
+    if (g_any_run_connection_stage_aborted.load(std::memory_order_acquire)) {
         return 2;
+    }
+    // A worker thread ended before the run's stop condition (see
+    // run_benchmark()); the results above do not cover the requested run.
+    if (g_worker_failed) {
+        return 1;
+    }
+    // An output could not be written, or data verification failed.
+    if (g_output_failed || verify_failed) {
+        return 1;
     }
     return 0;
 }

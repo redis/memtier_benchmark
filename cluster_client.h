@@ -38,6 +38,9 @@ struct staged_monitor_cmd
 // forward decleration
 class shard_connection;
 
+// Hash slot of a key, honouring Redis Cluster hash tags.
+uint32_t calc_hslot_crc16_cluster(const char *str, size_t length);
+
 // Topology grouping: one shard_group per primary, plus the list of replicas
 // (zero-length when the primary has no replicas, or when CLUSTER SLOTS only
 // returned the primary tuple). Per-thread state (replica_rr_cursor) — no
@@ -121,6 +124,15 @@ protected:
     // Set when we emit the "pin connection lost mid-rotation" warning so we
     // don't spam it on every hold_pipeline() call during the outage.
     bool m_txn_pin_lost_warned;
+    // Slot of the staged rotation key while its owning shard connection is
+    // reconnecting, -1 otherwise. The rotation waits for that connection:
+    // sent anywhere else, the keyed command gets -MOVED and the transaction
+    // ends in EXECABORT.
+    int m_txn_wait_slot;
+    // Connection that carries this rotation's open MULTI, -1 when none is
+    // open. If the pin moves off it, or it reconnects, that MULTI is gone and
+    // the rest of the block must not be sent on another socket.
+    int m_txn_multi_conn_id;
     // Consecutive read-routing failures under strict rp_secondary with no live
     // replica. Incremented in get_key_for_conn each time select_target_conn
     // returns UINT_MAX for a read; reset on any successful routing. When the
@@ -144,6 +156,10 @@ protected:
     std::vector<size_t> m_mget_slot_cursor;                    // [slot] → per-thread round-robin cursor
     std::vector<std::vector<unsigned int> > m_mget_conn_slots; // [conn] → owned slot list
     std::vector<size_t> m_mget_conn_slot_cursor;               // [conn] → slot round-robin cursor
+    // Producers waiting for capacity on another connection. A routed MGET
+    // leaves no response on its producer to restart that producer's pipeline.
+    std::vector<std::vector<unsigned int> > m_mget_waiting_producers;
+    void wake_mget_producers(unsigned int conn_id);
     void build_mget_slot_cache();
 
     // Per-arbitrary-command-index routing counters (sized to the number of
@@ -154,6 +170,7 @@ protected:
     read_routing_counters m_get_routing_counters;
 
     virtual int connect(void);
+    virtual int reconnect(unsigned int conn_id);
     virtual void disconnect(void);
 
     // Primaries-only slot lookup. Resolves a hash slot through the
@@ -206,23 +223,43 @@ protected:
 
     shard_connection *create_shard_connection(abstract_protocol *abs_protocol);
     bool connect_shard_connection(shard_connection *sc, char *address, char *port);
-    void handle_moved(unsigned int conn_id, struct timeval timestamp, request *request, protocol_response *response);
-    void handle_ask(unsigned int conn_id, struct timeval timestamp, request *request, protocol_response *response);
+    void handle_moved(unsigned int conn_id);
+    void update_redirect_stats(struct timeval timestamp, request *req, protocol_response *response, bool moved,
+                               bool completed);
     bool create_monitor_request_cluster(unsigned int command_index, struct timeval &timestamp, unsigned int conn_id);
     void process_staged_monitor_command(struct timeval timestamp, unsigned int conn_id);
     // Resend the request on the slot-owning connection (or same connection if
     // routing info isn't available yet). Returns true if ownership of `req`
     // transferred to a retry queue.
     bool retry_after_redirect(unsigned int conn_id, request *req);
+    // Resend the request to the primary named by the -MOVED reply, falling
+    // back to retry_after_redirect if there is no usable connection to it.
+    bool retry_after_moved(unsigned int conn_id, request *req, protocol_response *response);
+    // Resend the request after ASKING on the connection named by the -ASK
+    // reply, falling back to retry_after_redirect if there is none.
+    bool retry_after_ask(unsigned int conn_id, request *req, protocol_response *response);
+    // The primary connection to the node a -MOVED/-ASK reply names, or
+    // UINT_MAX if there is none.
+    unsigned int redirect_target_conn(unsigned int conn_id, protocol_response *response);
+    // Queue the resend on connection `target` and count the retry.
+    bool enqueue_redirect_retry(unsigned int target, request *req);
     // Terminal accounting for a MOVED/ASK request whose retry was refused
     // (e.g. max_retries exhausted, retry queue full, no captured bytes). Logs
     // to --failed-keys-file if configured and increments the error counter,
     // so the request doesn't silently disappear from the stats.
     void finalize_dropped_redirect(struct timeval timestamp, request *req, protocol_response *response);
-    // Release the transaction pin and return any staged key to the pool so the
-    // key index is not silently burned when a mid-rotation MOVED or disconnect
-    // forces the rotation to restart.
+    // Same for a request rejected with -READONLY and not retried; also counts
+    // it as an op, since no redirect stats record it.
+    void finalize_dropped_readonly(struct timeval timestamp, request *req, protocol_response *response);
+    // Hand the requests a retired connection holds for resend to the
+    // connections that now own their slots, so they still complete.
+    void hand_off_replay_requests(unsigned int conn_id);
+    // Release the transaction pin, retaining any unconsumed lookahead key so
+    // re-pinning can resolve its owner again without burning a key index.
     void txn_release_pin();
+    // Slot of the generated key as cmd sends it, including any text around
+    // __key__ in its key argument.
+    unsigned int calc_arbitrary_key_hslot(const arbitrary_command &cmd);
 
 public:
     cluster_client(client_group *group);
@@ -261,9 +298,15 @@ public:
     void print_topology_summary() const;
 
     // client manager api's
-    virtual bool handle_cluster_slots(protocol_response *r);
+    virtual bool handle_cluster_slots(unsigned int conn_id, protocol_response *r);
     virtual void create_request(struct timeval timestamp, unsigned int conn_id);
     virtual bool hold_pipeline(unsigned int conn_id);
+    virtual void handle_rate_limit_refill(unsigned int conn_id);
+    virtual void handle_connection_disconnect(unsigned int conn_id);
+    virtual bool is_transaction_pinned(unsigned int conn_id)
+    {
+        return m_config->transaction && m_txn_pinned_conn_id == (int) conn_id;
+    }
     virtual void handle_response(unsigned int conn_id, struct timeval timestamp, request *request,
                                  protocol_response *response);
 };

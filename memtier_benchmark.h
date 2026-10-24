@@ -56,6 +56,7 @@ enum PROTOCOL_TYPE
     PROTOCOL_RESP3,
     PROTOCOL_MEMCACHE_TEXT,
     PROTOCOL_MEMCACHE_BINARY,
+    PROTOCOL_MEMCACHE_META,
 };
 
 // ---------------------------------------------------------------------------
@@ -120,6 +121,7 @@ struct benchmark_config
     int debug;
     int show_config;
     int hide_histogram;
+    unsigned int progress_interval;
     config_quantiles print_percentiles;
     bool print_all_runs;
     bool realtime_latencies;
@@ -311,6 +313,12 @@ bool is_redis_protocol(enum PROTOCOL_TYPE type);
 void connection_stage_supervisor_reset(void);
 void report_connection_stage_failure(const char *err);
 void report_connection_stage_success(void);
+// Whether any connection has reached steady state in this run, i.e. the
+// supervisor is disarmed.
+bool connection_stage_steady_state_reached(void);
 bool connection_stage_should_abort(unsigned int timeout_secs, std::string *out_last_err, unsigned int *out_elapsed);
+// Exit code for a failure that ends memtier before main() returns: 2 if a
+// run of this --run-count series was aborted by the supervisor, else 1.
+int failure_exit_code(void);
 
 #endif /* _MEMTIER_BENCHMARK_H */

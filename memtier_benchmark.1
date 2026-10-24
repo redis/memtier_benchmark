@@ -19,7 +19,8 @@ Same as \fB\-\-host\fR
 Server port (default: 6379)
 .TP
 \fB\-S\fR, \fB\-\-unix\-socket\fR=\fI\,SOCKET\/\fR
-UNIX Domain socket name (default: none)
+UNIX Domain socket name, POSIX only (default: none)
+Linux: @NAME selects an abstract socket
 .TP
 \fB\-4\fR, \fB\-\-ipv4\fR
 Force IPv4 address resolution.
@@ -29,7 +30,9 @@ Force IPv6 address resolution.
 .TP
 \fB\-P\fR, \fB\-\-protocol\fR=\fI\,PROTOCOL\/\fR
 Protocol to use (default: redis).
-other supported protocols are resp2, resp3, memcache_text and memcache_binary.
+other supported protocols are resp2, resp3, memcache_text, memcache_binary and memcache_meta.
+memcache_meta is the modern Memcached meta-command protocol (memcached 1.6.10+).
+Each meta operation includes an mn no-op terminator.
 when using one of resp2 or resp3 the redis protocol version will be set via HELLO command.
 .TP
 \fB\-a\fR, \fB\-\-authenticate\fR=\fI\,CREDENTIALS\/\fR Authenticate using specified credentials.
@@ -42,7 +45,10 @@ or newer with ACL user support.
 Server URI on format redis://user:password@host:port/dbnum
 User, password and dbnum are optional. For authentication
 without a username, use username 'default'. For TLS, use
-the scheme 'rediss'.
+the scheme 'rediss'. Bracket IPv6 hosts: [::1]:6379.
+User and password are percent\-decoded, as by
+redis\-cli \-u: write '@' as %40, '/' as %2F, '%' as
+%25 and, in the password, ':' as %3A.
 .TP
 \fB\-\-tls\fR
 Enable SSL/TLS transport security
@@ -66,7 +72,8 @@ Specify the tls protocol version to use, comma delemited. Use a combination of '
 Add an SNI header
 .TP
 \fB\-x\fR, \fB\-\-run\-count\fR=\fI\,NUMBER\/\fR
-Number of full\-test iterations to perform
+Number of full\-test iterations to perform. Ctrl+C or SIGTERM
+ends the series after the current run
 .TP
 \fB\-D\fR, \fB\-\-debug\fR
 Print debug output
@@ -75,19 +82,37 @@ Print debug output
 Run client in cluster mode
 .TP
 \fB\-\-transaction\fR
-In \fB\-\-cluster\-mode\fR, pin one full rotation of \fB\-\-command\fR entries to
-a single shard connection so that keyless commands (MULTI/EXEC/
-UNWATCH) stay on the same connection as the keyed ones. Hash\-tag
-your keys so they map to the same slot, otherwise the cross\-slot
-keyed commands of the same rotation will get MOVED back. In
-standalone mode this flag is a no\-op (each client already runs
-through a single connection). Requires at least one \fB\-\-command\fR.
-\fB\-\-pipeline\fR > 1 is supported: each rotation is sent contiguously
-on its pinned connection, so multiple whole transactions can be
-in flight without interleaving MULTI/EXEC blocks.
-Note: if \fB\-\-reconnect\-on\-error\fR triggers mid\-rotation, the
-interrupted rotation's stats will be inaccurate (server\-side
-WATCH/MULTI state is lost on reconnect).
+Treat one full rotation of \fB\-\-command\fR entries as a transactional
+unit (e.g. WATCH/GET/MULTI/SETEX/EXEC/UNWATCH). Every __key__ in
+a rotation resolves to the same key (taken from the first keyed
+command's \fB\-\-command\-key\-pattern\fR), so all keyed commands hit one
+key and one slot: the WATCH guards the key the SETEX writes and
+the unit runs without CROSSSLOT errors \fB\-\-\fR no hash\-tag needed.
+This same\-key behavior applies in every mode, so it also works
+against a single endpoint fronting a sharded backend (e.g. a
+Redis Enterprise proxy) where keyed commands must share a slot.
+In \fB\-\-cluster\-mode\fR it additionally pins the whole rotation to the
+owning shard connection so the keyless commands (MULTI/EXEC/
+UNWATCH) stay with the keyed ones. Caveat: keep the literal text
+around __key__ (including any {tag}) identical across keyed
+commands; differing affixes still hash to different slots.
+Requires at least one \fB\-\-command\fR.
+\fB\-\-pipeline\fR > 1 is supported: in \fB\-\-cluster\-mode\fR each rotation is
+sent contiguously on its pinned connection, so multiple whole
+transactions can be in flight without interleaving MULTI/EXEC.
+\fB\-\-reconnect\-interval\fR waits for the next full weighted command
+rotation and its replies before reconnecting. The next interval
+starts there; request/time limits still end the run as usual.
+Counts and latencies inside MULTI describe QUEUED acknowledgements,
+not execution; EXEC reports the transaction outcome.
+Note: an unplanned reconnect (\fB\-\-reconnect\-on\-error\fR) loses the
+server\-side WATCH/MULTI state. If it happens inside a MULTI
+block, the rest of that block, through its EXEC/DISCARD, is
+skipped and not counted, so the per\-command counts no longer
+follow the command ratio. Replies already received for that
+block stay counted.
+\fB\-\-retry\-on\-error\fR does not retry or replay \fB\-\-transaction\fR
+commands.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Display this help
@@ -113,6 +138,12 @@ Print detailed configuration before running
 .TP
 \fB\-\-hide\-histogram\fR
 Don't print detailed latency histogram
+.TP
+\fB\-\-progress\-interval\fR=\fI\,SECONDS\/\fR
+Progress display interval in positive whole seconds (default: 1).
+A final update is printed on normal completion; separate error diagnostics are not throttled.
+Supervision and metric sampling keep their existing cadence.
+Instantaneous rates describe the most recent sample, not the display interval.
 .TP
 \fB\-\-print\-percentiles\fR
 Specify which percentiles info to print on the results table (by default prints percentiles: 50,99,99.9)
@@ -181,7 +212,10 @@ Number of clients per thread (default: 50)
 Number of threads (default: 4)
 .TP
 \fB\-\-test\-time\fR=\fI\,SECS\/\fR
-Number of seconds to run the test
+Number of seconds to run the test. Replies to requests already sent
+are waited for at most 10 more seconds; requests still unanswered
+then are abandoned and counted as errors, and so are
+\fB\-\-retry\-on\-error\fR retries still being resent.
 .TP
 \fB\-\-clients\-start\fR=\fI\,NUMBER\/\fR
 Starting number of clients per thread for staircase ramp\-up.
@@ -203,11 +237,16 @@ Number of concurrent pipelined requests (default: 1)
 Number of requests after which re\-connection is performed
 .TP
 \fB\-\-reconnect\-on\-error\fR
-Enable automatic reconnection on connection errors (default: disabled)
+Enable automatic reconnection on connection errors (default: disabled).
+Without it, a lost connection ends its thread and the run exits 1.
 .HP
 \fB\-\-max\-reconnect\-attempts\fR=\fI\,NUM\/\fR Maximum number of reconnection attempts (default: 0, unlimited)
+Running out of attempts fails the run.
 .HP
-\fB\-\-reconnect\-backoff\-factor\fR=\fI\,NUM\/\fR Backoff factor for reconnection delays (default: 0, no backoff)
+\fB\-\-reconnect\-backoff\-factor\fR=\fI\,NUM\/\fR Non\-negative backoff factor for reconnection delays (default: 0, no backoff)
+Zero keeps the delay at one second. Positive values multiply the
+delay on each attempt; values below 1 shrink it, but never
+below 0.1 seconds. The delay is capped at 60 seconds.
 .TP
 \fB\-\-retry\-on\-error\fR
 Resend a request when the server returns a transient error or the
@@ -218,12 +257,17 @@ NOAUTH, NOPERM, syntax/argcount/unknown\-command). Default: disabled.
 Maximum retries per request when \fB\-\-retry\-on\-error\fR is set.
 \fB\-1\fR = unlimited (default), 0 = disable retries even with the master
 switch on, N>0 = bounded. MOVED/ASK redirects count toward this.
+Unlimited retries with \fB\-\-requests\fR may run indefinitely; use a
+finite limit or \fB\-\-test\-time\fR to bound repeated rejections.
 .TP
 \fB\-\-retry\-backoff\-ms\fR=\fI\,NUM\/\fR
 Delay between retries in milliseconds (default: 0, immediate).
 .TP
-\fB\-\-retry\-backoff\-factor\fR=\fI\,NUM\/\fR Exponential multiplier applied to retry\-backoff\-ms on each
-successive retry (default: 0, constant backoff).
+\fB\-\-retry\-backoff\-factor\fR=\fI\,NUM\/\fR Multiply the delay by NUM on each retry of the same request:
+with NUM > 0 the Nth resend waits retry\-backoff\-ms * NUM^(N\-1),
+at most 60 s or retry\-backoff\-ms if larger (default: 0,
+constant retry\-backoff\-ms). Values below 1 shrink it, but
+never below 100 ms or retry\-backoff\-ms if smaller.
 .TP
 \fB\-\-retry\-on\fR=\fI\,LIST\/\fR
 Restrict retries to error\-status prefixes in this comma list
@@ -231,14 +275,17 @@ Restrict retries to error\-status prefixes in this comma list
 classified as permanent.
 .TP
 \fB\-\-max\-retry\-queue\fR=\fI\,NUM\/\fR
-Hard cap on per\-connection retry queue depth. When full, the
-pipeline stops accepting new work until the queue drains.
+Hard cap on per\-connection retry queue depth. No new request is
+sent while queued retries plus requests in flight reach it (or
+\fB\-\-pipeline\fR, if larger), so with NUM >= \fB\-\-pipeline\fR a request that
+fails in flight always has room to retry.
 Default: 0 (auto = max(pipeline * 4, 64)).
 .TP
 \fB\-\-failed\-keys\-file\fR=\fI\,PATH\/\fR
 Append every request that ultimately fails (retries exhausted or
 permanent error) as CSV: timestamp,command,key,status,retries.
-Off by default. The benchmark continues if the file is unwritable.
+Off by default. Exits 1 at startup if the file cannot be opened;
+a later write error stops logging and the run exits 1.
 .TP
 \fB\-\-connection\-timeout\fR=\fI\,SECS\/\fR
 Connection timeout in seconds, 0 to disable (default: 0)
@@ -249,14 +296,16 @@ SECS, or if connection\-setup failures (AUTH / HELLO / SELECT /
 CLUSTER SLOTS / \fB\-ERR\fR during initial probe) persist for SECS
 without a successful handshake. Bounds the *startup* phase;
 \fB\-\-test\-time\fR still bounds the steady\-state run. Default: 30,
-0 disables the supervisor.
+0 disables the supervisor. With \fB\-\-run\-count\fR, an abort in
+any run exits 2.
 .HP
 \fB\-\-thread\-conn\-start\-min\-jitter\-micros\fR=\fI\,NUM\/\fR Minimum jitter in microseconds between connection creation (default: 0)
 .HP
 \fB\-\-thread\-conn\-start\-max\-jitter\-micros\fR=\fI\,NUM\/\fR Maximum jitter in microseconds between connection creation (default: 0)
 .TP
 \fB\-\-multi\-key\-get\fR=\fI\,NUM\/\fR
-Enable multi\-key get commands, up to NUM keys (default: 0).
+Enable multi\-key get commands, up to NUM keys (default: 0, max: 16777214).
+Each client preallocates about 272 bytes per key.
 In cluster mode, keys are probed from the key space so that all
 keys in one batch route to the same shard (no hash\-tag prefix).
 .TP
@@ -278,6 +327,8 @@ To use a generated key or object, enter:
 .TP
 __key__: Use key generated from Key Options.
 __data__: Use data generated from Object Options.
+With \fB\-\-data\-size\-pattern\fR=\fI\,S\/\fR, sized by the most recent __key__
+before it (minimum size if there is none).
 .TP
 \fB\-\-command\-ratio\fR
 The number of times the command is sent in sequence.(default: 1)
@@ -392,6 +443,7 @@ Read object data from file
 .TP
 \fB\-\-data\-verify\fR
 Enable data verification when test is complete
+(exit status 1 if verification fails, is incomplete, or verifies no key)
 .TP
 \fB\-\-verify\-only\fR
 Only perform \fB\-\-data\-verify\fR, without any other test

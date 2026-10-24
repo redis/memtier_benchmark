@@ -2,6 +2,22 @@
 
 This document provides guidance for AI agents working with the memtier_benchmark codebase.
 
+## Claude and Codex interoperability
+
+`AGENTS.md` is the shared guide; `CLAUDE.md` links to this file so both agents load
+identical instructions. Skills are maintained under `.claude/skills/` and exposed
+to Codex through `.agents/skills`, which links to the same directory. Keep each
+skill's references and scripts beside its `SKILL.md` so both clients resolve them.
+
+Use `/adversarial-review` or `/memtier-maintainer-review` in Claude, and
+`$adversarial-review` or `$memtier-maintainer-review` in Codex. Both entry points
+load the same workflow. Add new skills to the shared directory, not a separate copy.
+
+This repository does not require an MCP server. Personal or parent-workspace MCP
+connections are configured separately in each client; do not commit credentials or
+machine-specific server settings here. Run `python3 utils/check_agent_parity.py`
+after changing agent instructions or skills to verify the shared entry points.
+
 ## Project Overview
 
 memtier_benchmark is a high-performance load generation and benchmarking tool for NoSQL databases (Redis and Memcached) developed by Redis. It is written in C++ and uses libevent for async I/O.
@@ -17,6 +33,7 @@ memtier_benchmark is a high-performance load generation and benchmarking tool fo
 ├── obj_gen.cpp/h          # Object/key generation
 ├── run_stats.cpp/h        # Statistics collection and reporting
 ├── JSON_handler.cpp/h     # JSON output support
+├── utf8.cpp/h             # UTF-8 sanitizer (U+FFFD) shared by JSON and /metrics
 ├── file_io.cpp/h          # File I/O operations
 ├── config_types.cpp/h     # Configuration types
 ├── deps/hdr_histogram/    # HdrHistogram library (vendored)
@@ -221,11 +238,13 @@ Patch releases live on a release branch (e.g. `2.3` for the 2.3.x line). The flo
 `configure.ac + memtier_benchmark.1` as a single `Release <version>` commit.
 Watch out for:
 
-- **Stale `version.h` corrupts the man page.** The Makefile rule
-  `version.h: $(SHELL) $(srcdir)/version.sh` has **no dependencies**, so once
-  `version.h` exists `make` won't re-run `version.sh`. The script then bakes an
-  outdated git SHA into `memtier_benchmark.1` via `help2man`. **Always
-  `rm -f version.h` before running the script** so the SHA matches HEAD.
+- **Version metadata follows the source checkout.** The build rechecks Git
+  metadata on every invocation and updates `version.h` only when it changes.
+  Older branches with the dependencyless header rule still require removing
+  `version.h` before running this script, or `help2man` can embed a stale SHA.
+  A Git metadata error warns and uses unknown provenance; correct repository
+  access/ownership to recover the SHA. Installation also rechecks metadata and
+  can rebuild its consumers if the SHA, dirty state or Git access changed.
 - **No branch sanity check.** The script doesn't verify the current branch.
   Confirm `git branch --show-current` matches the intended release branch
   before running.

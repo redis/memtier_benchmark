@@ -152,6 +152,10 @@ awk '$2==1{l1=$1+0} $2==2 && !d{d=1; exit !($1+0 >= l1)}' /tmp/mono.txt || fail 
 rc=0; wait "$MBPID" || rc=$?; assert_eq "$rc" 0 "memtier exit code"
 promtool_check < /tmp/prom_scrape.txt                  || fail "promtool lint"
 curl -s --max-time 2 "$URL" >/dev/null 2>&1 && fail "port not released after exit (F14)" || true
+# A successful verify-only teardown requires matching data (#768).
+timeout 30 "$MB" -s 127.0.0.1 -p "$RPORT" --data-import=tests/data-import-2-keys.txt \
+  --ratio=1:0 --key-pattern=P:P -t 1 -c 1 -n 2 >/tmp/mbv-preload.out 2>&1 \
+  || fail "verify-only preload"
 for i in $(seq 1 10); do
   timeout 30 "$MB" -s 127.0.0.1 -p "$RPORT" --verify-only \
     --data-import=tests/data-import-2-keys.txt --prometheus-port=0 >/tmp/mbv.out 2>&1 \
@@ -220,7 +224,7 @@ for f in --prometheus-port --prometheus-bind-addr --prometheus-run-label --prome
 done
 MEMTIER_FUZZ=1 MEMTIER_FUZZ_MAX_EXAMPLES=100 OSS_STANDALONE=1 ./tests/run_tests.sh
 grep -nE '#include[[:space:]]*[<"](event2/|event\.h|evhttp)|#include[[:space:]]*"(config|version)\.h"|PACKAGE_VERSION|MEMTIER_GIT_SHA1' \
-  prometheus_metrics.cpp prometheus_metrics.h tests/unit/prometheus_metrics_test.cpp \
+  prometheus_metrics.cpp prometheus_metrics.h utf8.cpp utf8.h tests/unit/prometheus_metrics_test.cpp \
   && fail "purity breach: config/version/libevent reference in the unconditional metrics layer" || true
 grep -q -- '--disable-prometheus' DEVELOPMENT.md || fail "DEVELOPMENT.md missing --disable-prometheus"
 grep -qE 'evhttp >= 2\.1\.1|libevent 2\.1\.1' DEVELOPMENT.md || fail "DEVELOPMENT.md missing the 2.1.1 floor"
@@ -230,9 +234,8 @@ n=$(grep -c '1e6' prometheus_metrics.cpp prometheus_metrics.h | awk -F: '{s+=$2}
 [ "$(grep -c 'USECS_PER_SEC' prometheus_metrics.cpp)" -ge 3 ] || fail "conversion sites < 3"
 grep -q 'LATENCY_HDR_RESULTS_MULTIPLIER' prometheus_metrics.cpp prometheus_metrics.h \
   && fail "ms constant leaked into exporter" || true
-grep -qF 'int64_t capped = (value > h->highest_trackable_value) ? h->highest_trackable_value : value;' run_stats.cpp \
-  && grep -qF 'capped = (capped < h->lowest_trackable_value) ? h->lowest_trackable_value : capped;' run_stats.cpp \
-  || fail "capped-record clamp drifted from the U2 test replica"
+# The unit tests now exercise latency_histogram.h's actual recording policy,
+# including lower/upper clamping, instead of a source-pinned replica.
 tr -s '[:space:]' ' ' < prometheus_exporter.cpp \
   | grep -q 'hdr_init(LATENCY_HDR_MIN_VALUE, LATENCY_HDR_SEC_MAX_VALUE, LATENCY_HDR_SEC_SIGDIGTS, ' \
   || fail "exporter hdr_init drifted from :3058 triplet"
