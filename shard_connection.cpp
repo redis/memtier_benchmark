@@ -542,7 +542,9 @@ bool shard_connection::setup_event(evutil_socket_t sockfd)
             // where libevent failed (see libevent_ssl_failure_keeps_socket()),
             // which cannot be told from here: leak it rather than risk closing
             // a descriptor another thread has just been given. Under repeated
-            // failure (cluster mode retries) that is one descriptor per attempt.
+            // failure that is one descriptor (and possibly one SSL) per
+            // connect attempt, bounded by --max-reconnect-attempts and the run
+            // length; this only happens when libevent cannot allocate.
             benchmark_error_log("error: bufferevent_openssl_socket_new() failed; cannot create the TLS "
                                 "connection.\n");
             if (libevent_ssl_failure_keeps_socket(event_get_version_number())) evutil_closesocket(sockfd);

@@ -106,7 +106,7 @@ def test_crash_handler_with_active_connections(env):
     for field in ("libevent_version:", "libevent_build_version:"):
         if "# " + field not in crash_output:
             errors.append(f"Missing {field} in info output")
-    version = subprocess.run([benchmark.args[0], "--version"], capture_output=True, text=True, timeout=30).stdout
+    version = subprocess.run([MEMTIER_BINARY, "--version"], capture_output=True, text=True, timeout=30).stdout
     if " openssl=" in version:
         for field in ("openssl_version:", "openssl_runtime_version:"):
             if "# " + field not in crash_output:
