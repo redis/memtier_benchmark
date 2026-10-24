@@ -146,7 +146,7 @@ def test_libevent_series_mismatch_warns_on_stderr(env):
         child_env = _shim_env(env, directory)
         child_env["MEMTIER_TEST_LIBEVENT_VERSION"] = "2.99.1-fake:0x02630100"
         if _has_tls():
-            child_env["MEMTIER_TEST_OPENSSL_VERSION"] = "OpenSSL 99.0.0-fake:0xf6300000"
+            child_env["MEMTIER_TEST_OPENSSL_VERSION"] = "OpenSSL 15.99.0-fake:0xf6300000"
         rc, stderr, stdout, info = _run(env, directory, child_env=child_env)
         version = subprocess.run([MEMTIER_BINARY, "--version"], capture_output=True, text=True, timeout=30,
                                  env=child_env)
@@ -155,7 +155,7 @@ def test_libevent_series_mismatch_warns_on_stderr(env):
     env.assertEqual(len(warnings), 2 if _has_tls() else 1, message=stderr[-2000:])
     env.assertTrue(any("running with libevent 2.99.1-fake" in l for l in warnings), message=warnings)
     if _has_tls():
-        env.assertTrue(any("running with OpenSSL 99.0.0-fake" in l for l in warnings), message=warnings)
+        env.assertTrue(any("running with OpenSSL 15.99.0-fake" in l for l in warnings), message=warnings)
     env.assertFalse(_MISMATCH in stdout, message=stdout[-2000:])
     env.assertEqual((info or {}).get("libevent runtime version"), "2.99.1-fake")
     # --version stays quiet on stderr.

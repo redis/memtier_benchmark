@@ -548,7 +548,12 @@ bool shard_connection::setup_event(evutil_socket_t sockfd)
             // length; this only happens when libevent cannot allocate.
             benchmark_error_log("error: bufferevent_openssl_socket_new() failed; cannot create the TLS "
                                 "connection.\n");
-            if (libevent_ssl_failure_socket_is_ours(event_get_version_number())) evutil_closesocket(sockfd);
+            if (libevent_ssl_failure_socket_is_ours(event_get_version_number())) {
+                evutil_closesocket(sockfd);
+            } else {
+                benchmark_error_log("error: socket %d left open on purpose: libevent %s may already have closed it.\n",
+                                    (int) sockfd, event_get_version());
+            }
             return false;
         }
     } else {
