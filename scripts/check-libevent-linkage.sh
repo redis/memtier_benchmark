@@ -10,7 +10,8 @@
 #   - pkg-config in PREFIX reports that release (numeric part) for every component;
 #   - every libevent library memtier loads, directly or through another
 #     libevent library, resolves under PREFIX/lib (Linux: ldd);
-#   - with TLS, libevent_openssl loads the same libssl as memtier.
+#   - with TLS, the process loads exactly one libssl and one libcrypto, so
+#     libevent_openssl and memtier share one OpenSSL.
 # On macOS the library checks are delegated to check-macos-tls-links.sh.
 set -euo pipefail
 
@@ -74,8 +75,8 @@ if [[ "$(uname -s)" == Darwin ]]; then
 fi
 
 # 3. Every libevent object loaded at runtime comes from the private prefix.
-resolved() { # ldd output -> "soname path" for libevent/libssl lines
-    ldd "$1" | awk '$2 == "=>" && $1 ~ /^lib(event|ssl)/ { print $1, $3 }'
+resolved() { # ldd output -> "soname path" for libevent/libssl/libcrypto lines
+    ldd "$1" | awk '$2 == "=>" && $1 ~ /^lib(event|ssl|crypto)/ { print $1, $3 }'
 }
 binary_links="$(resolved "$binary")"
 printf '%s\n' "$binary_links"
@@ -107,21 +108,19 @@ for library in "$libdir"/libevent*.so; do
     done < <(resolved "$library")
 done
 
-# 4. libevent_openssl and memtier must share one libssl.
+# 4. libevent_openssl and memtier must share one OpenSSL. memtier's ldd set
+# already contains what libevent_openssl needs, resolved the way the process
+# resolves it (a private OpenSSL found through RUNPATH included), so it must
+# hold exactly one libssl and one libcrypto; two sonames such as libssl.so.3
+# and libssl.so.1.1 mean the two were built against different OpenSSLs.
 if [[ "$tls" == yes ]]; then
-    memtier_ssl="$(printf '%s\n' "$binary_links" | awk '$1 ~ /^libssl/ { print $2; exit }')"
-    event_openssl="$(printf '%s\n' "$binary_links" | awk '$1 ~ /^libevent_openssl/ { print $2; exit }')"
-    event_ssl=
-    if [[ -n "$event_openssl" ]]; then
-        event_ssl="$(resolved "$event_openssl" | awk '$1 ~ /^libssl/ { print $2; exit }')"
-    fi
-    [[ -n "$memtier_ssl" ]] || fail "$binary does not load libssl"
-    if [[ -n "$memtier_ssl" && -n "$event_ssl" ]]; then
-        [[ "$(readlink -f "$memtier_ssl")" == "$(readlink -f "$event_ssl")" ]] ||
-            fail "libevent_openssl uses $event_ssl, memtier uses $memtier_ssl"
-    else
-        fail "could not resolve libssl for libevent_openssl ('${event_openssl:-missing}')"
-    fi
+    for component in libssl libcrypto; do
+        found="$(printf '%s\n' "$binary_links" | awk -v c="$component" 'index($1, c ".") == 1 || index($1, c "-") == 1')"
+        count="$(printf '%s' "$found" | grep -c . || true)"
+        if [[ "$count" -ne 1 ]]; then
+            fail "$binary loads $count $component libraries (expected 1): $(printf '%s' "$found" | tr '\n' ' ')"
+        fi
+    done
 fi
 
 if [[ "$status" -eq 0 ]]; then
