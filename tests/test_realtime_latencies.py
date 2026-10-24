@@ -30,6 +30,7 @@ import math
 import os
 import re
 import tempfile
+from fractions import Fraction
 
 from include import (
     get_default_memtier_config,
@@ -294,8 +295,9 @@ def test_default_progress_line_unchanged(env):
 
 
 def test_latency_window_row_reports_values(env):
-    """A short window (2s) over a 5s run must produce several [win2s] rows with
-    a positive p99: the ring is populated and computed, not silently empty."""
+    """A short window (2s) over a 5s run must produce at least two [win2s] rows,
+    at least one with a positive p99: the ring is populated and computed, not
+    silently empty."""
     benchmark_specs = {
         "name": env.testName,
         "args": [
@@ -354,7 +356,9 @@ def _parse_count(text):
 
 
 def _min_samples(p):
-    return 1 if p >= 100 else math.ceil(100.0 / (100.0 - p) * (1 - 1e-9))
+    """Exact ceil(100 / (100 - p)) for p as written in the output."""
+    p = Fraction(repr(p))
+    return 1 if p >= 100 else math.ceil(100 / (100 - p))
 
 
 def _frames(stderr):
@@ -383,6 +387,31 @@ def _run(env, args, threads, clients, requests=None, test_time=None):
     ensure_clean_benchmark_folder(config.results_dir)
     benchmark = Benchmark.from_json(config, benchmark_specs)
     return config, benchmark.run()
+
+
+def test_percentile_sample_thresholds(env):
+    """The threshold is exactly ceil(100 / (100 - p)) for the percentile as
+    typed, despite the binary rounding of p: p99.9999 needs 1e6 (not 1e6 + 1),
+    p99.99991 needs 1111112 (not the 1111111 a 7-digit rounding gives) and 12
+    nines need 1e12. A one-request run warns about each with its threshold."""
+    percentiles = ["99.9", "99.97", "99.9999", "99.99991", "99.9999999999"]
+    config, memtier_ok = _run(
+        env,
+        ["--ratio=1:0", "--print-percentiles=" + ",".join(percentiles)],
+        threads=1,
+        clients=1,
+        requests=1,
+    )
+    try:
+        env.assertTrue(memtier_ok)
+        stderr = _read_stderr(config)
+        for p in percentiles:
+            need = _min_samples(float(p))
+            expected = "warning: p%s needs at least %d latency samples, but this run records at most 1," % (p, need)
+            env.assertTrue(expected in stderr, message="%s\n%s" % (expected, stderr[:2000]))
+    finally:
+        if not memtier_ok:
+            debugPrintMemtierOnError(config, env)
 
 
 def test_latency_window_counts_every_sample_and_marks_unresolved(env):

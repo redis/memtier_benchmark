@@ -3309,10 +3309,9 @@ void usage()
         "      --realtime-latencies       Replace the periodic single-line progress output with a per-tick block: "
         "line 1 = throughput + miss ratio, then labeled latency rows carrying the percentiles configured by "
         "--print-percentiles: inst (each client's current second), win<N>s (sliding window, see --latency-window) "
-        "and overall (full run). Each row shows its sample count n; a percentile p with fewer than 100/(100-p) samples "
-        "(1M "
-        "for p99.9999) is not resolved and is marked '*'. Redraws in place on a TTY; appends cleanly when "
-        "stderr is redirected to a file.\n"
+        "and overall (full run). Each row shows its sample count n; a percentile p with fewer than 100/(100-p) "
+        "samples (1M for p99.9999) is not resolved and is marked '*'. Redraws in place on a TTY; appends cleanly "
+        "when stderr is redirected to a file.\n"
         "      --latency-window=SECS      Sliding-window size for the win<N>s row of --realtime-latencies: "
         "percentiles over every sample completed in the last SECS seconds. Default: 60. Set to 0 to disable the "
         "row. Max: 3600.\n"
@@ -4121,8 +4120,8 @@ static unsigned long long percentile_min_samples(double p)
 {
     if (p >= 100.0) return 1;
     double n = 100.0 / (100.0 - p);
-    // p parsed from decimal is off by at most half an ulp of 100 (32 epsilon),
-    // which 100 / (100 - p) amplifies. When n is within that error of a value
+    // p parsed from decimal is off by at most half an ulp of 100 (32 epsilon,
+    // doubled here for margin), which 100 / (100 - p) amplifies. When n is within that error of a value
     // the user plausibly meant (an integer, or for many nines the significant
     // digits that survive), use it: p99.9999 needs 1e6, not 1e6 + 1, and
     // p99.9999999999 1e12. Otherwise round up: p99.99991 needs 1111112.
@@ -4179,12 +4178,12 @@ static void warn_unresolvable_percentiles(const benchmark_config *cfg, unsigned 
         if (run_max && run_max < need) {
             // --requests is an exact bound; the rate-limit bound is approximate.
             fprintf(stderr,
-                    "warning: p%.10g needs at least %llu latency samples, but this run records at most %s%.0f, "
+                    "warning: p%.15g needs at least %llu latency samples, but this run records at most %s%.0f, "
                     "so it will not be resolved.\n",
                     quantiles[i], need, cfg->requests ? "" : "about ", run_max);
         } else if (window_max && window_max < need) {
             fprintf(stderr,
-                    "warning: p%.10g needs at least %llu latency samples, but the %us latency window holds at "
+                    "warning: p%.15g needs at least %llu latency samples, but the %us latency window holds at "
                     "most about %.0f; the win%us row marks it with '*'.\n",
                     quantiles[i], need, window, window_max, window);
         }
@@ -4811,7 +4810,7 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
                             snprintf(val_p, sizeof(val_p), "   -   ");
                         }
                         char entry[64];
-                        snprintf(entry, sizeof(entry), "  p%.10g %s", quantiles[i], val_p);
+                        snprintf(entry, sizeof(entry), "  p%.15g %s", quantiles[i], val_p);
                         chunks[i / kPctPerLine] += entry;
                     }
                     if (quantiles.empty()) chunks[0] = "  (no percentiles configured)";
