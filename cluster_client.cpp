@@ -2815,8 +2815,10 @@ bool cluster_client::create_monitor_request_cluster(unsigned int command_index, 
                 // are rejected above before this command is counted.
                 if (shard < m_connections.size()) target_conn = shard;
             } else if (shard != UINT_MAX && shard < m_connections.size() &&
-                       m_connections[shard]->get_connection_state() != conn_disconnected &&
-                       m_connections[shard]->get_cluster_slots_state() == setup_done) {
+                       m_connections[shard]->get_connection_state() != conn_disconnected) {
+                // The selected key still belongs to this primary while it
+                // refreshes SLOTS. Stage there until setup completes instead
+                // of sending the already-selected command on a replica.
                 target_conn = shard;
             }
         }

@@ -703,3 +703,27 @@ def test_replica_promotion_does_not_drain_secondary_reads(env):
         env.assertEqual(promoted, True, message="fixture must close and promote the selected replica")
         env.assertEqual(stats["Totals"]["Count"], 1000)
         env.assertEqual(primary_reads, [], message="staged strict-secondary reads reached a promoted primary")
+
+
+def test_owned_monitor_waits_for_primary_refresh(env):
+    """Owned replay must stay on its primary while that primary refreshes SLOTS."""
+    for pipeline in (1, 4):
+        node = _Node([(0, 16383)], replica=True, drop_after=1, disconnect_on_drop=False)
+        node.slots_delay = 0.2
+        with tempfile.TemporaryDirectory() as directory:
+            monitor = os.path.join(directory, "monitor.txt")
+            expected = [(b"SET", f"memtier-{1 + index % 2}".encode(), f"value-{index}".encode())
+                        for index in range(20)]
+            with open(monitor, "w") as target:
+                for _, key, value in expected:
+                    target.write(f'1.000000 [0 127.0.0.1:12345] "SET" "{key.decode()}" "{value.decode()}"\n')
+            stats, _, _ = _run(
+                env, node,
+                ["--requests=40", "--pipeline=" + str(pipeline),
+                 "--read-preference=secondaryPreferred", "--monitor-input=" + monitor,
+                 "--monitor-pattern=S", "--command=PING", "--command=__monitor_line@__"],
+                seed_replica=True,
+            )
+        env.assertEqual(node.replica.requests, [])
+        env.assertEqual(stats["Totals"]["Count"], 40)
+        env.assertEqual([command for command in node.workload if command[0] == b"SET"], expected)
