@@ -20,6 +20,7 @@
 #include "config.h"
 #endif
 #include <assert.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -99,16 +100,24 @@ static void check_length_limits()
 {
     // Bulk lengths whose payload plus CRLF (len + 2) cannot be represented
     // are protocol errors; strtol clamps the out-of-range one to LONG_MAX.
-    check(parse_reply(PROTOCOL_RESP2, "$9223372036854775807\r\n") == -1, "reject LONG_MAX bulk length");
-    check(parse_reply(PROTOCOL_RESP2, "$9223372036854775806\r\n") == -1, "reject LONG_MAX - 1 bulk length");
+    // long is 64-bit on LP64 and 32-bit on Windows; build the boundaries from LONG_MAX.
+    char wire[64];
+    snprintf(wire, sizeof(wire), "$%ld\r\n", LONG_MAX);
+    check(parse_reply(PROTOCOL_RESP2, wire) == -1, "reject LONG_MAX bulk length");
+    snprintf(wire, sizeof(wire), "$%ld\r\n", LONG_MAX - 1);
+    check(parse_reply(PROTOCOL_RESP2, wire) == -1, "reject LONG_MAX - 1 bulk length");
+    snprintf(wire, sizeof(wire), "$%ld\r\n", LONG_MAX - 2);
+    check(parse_reply(PROTOCOL_RESP2, wire) == 0, "LONG_MAX - 2 bulk length waits for data");
+    snprintf(wire, sizeof(wire), "!%ld\r\n", LONG_MAX);
+    check(parse_reply(PROTOCOL_RESP3, wire) == -1, "reject LONG_MAX blob error length");
+    snprintf(wire, sizeof(wire), "=%ld\r\n", LONG_MAX);
+    check(parse_reply(PROTOCOL_RESP3, wire) == -1, "reject LONG_MAX verbatim length");
+    snprintf(wire, sizeof(wire), "*1\r\n$%ld\r\n", LONG_MAX);
+    check(parse_reply(PROTOCOL_RESP2, wire) == -1, "reject LONG_MAX nested bulk length");
     check(parse_reply(PROTOCOL_RESP2, "$99999999999999999999\r\n") == -1, "reject out-of-range bulk length");
-    check(parse_reply(PROTOCOL_RESP3, "!9223372036854775807\r\n") == -1, "reject LONG_MAX blob error length");
-    check(parse_reply(PROTOCOL_RESP3, "=9223372036854775807\r\n") == -1, "reject LONG_MAX verbatim length");
-    check(parse_reply(PROTOCOL_RESP2, "$9223372036854775805\r\n") == 0, "LONG_MAX - 2 bulk length waits for data");
     check(parse_reply(PROTOCOL_RESP2, "$3\r\nfoo\r\n") == 1, "regular bulk completes");
     check(parse_reply(PROTOCOL_RESP2, "$0\r\n\r\n") == 1, "empty bulk completes");
     check(parse_reply(PROTOCOL_RESP2, "$-1\r\n") == 1, "null bulk completes");
-    check(parse_reply(PROTOCOL_RESP2, "*1\r\n$9223372036854775807\r\n") == -1, "reject LONG_MAX nested bulk length");
 
     // Aggregate counts are tracked as int; reject what cannot be represented.
     check(parse_reply(PROTOCOL_RESP2, "*2147483647\r\n") == 0, "INT_MAX array count waits for elements");

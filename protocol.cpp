@@ -683,7 +683,7 @@ int redis_protocol::parse_response(void)
             m_response_len += res_len + 2;
 
             if (aggregate_type(line[0])) {
-                long declared = strtol(line + 1, NULL, 10);
+                long long declared = strtoll(line + 1, NULL, 10);
 
                 // from bulks counter perspective every count < 0 is equal to 0, because it's not followed by bulks.
                 if (declared < 0) {
@@ -691,15 +691,16 @@ int redis_protocol::parse_response(void)
                 }
 
                 // Map or Attribute contain key-value pair
-                long per_entry = (line[0] == '%' || line[0] == '|') ? 2 : 1;
+                long long per_entry = (line[0] == '%' || line[0] == '|') ? 2 : 1;
 
                 // Reject a count whose elements, together with the ones still
                 // outstanding, cannot be represented as int: the map doubling
                 // and the m_nested_remaining bookkeeping below are int
-                // arithmetic and would overflow (strtol clamps out-of-range
-                // counts to LONG_MAX). A nested aggregate fills one of the
-                // outstanding slots of its parent.
-                long outstanding = m_total_bulks_count > 0 ? (long) m_total_bulks_count - 1 : 0;
+                // arithmetic and would overflow. strtoll (not strtol: long is
+                // 32-bit on Windows) keeps counts above INT_MAX distinguishable
+                // and clamps out-of-range ones to LLONG_MAX. A nested aggregate
+                // fills one of the outstanding slots of its parent.
+                long long outstanding = m_total_bulks_count > 0 ? (long long) m_total_bulks_count - 1 : 0;
                 if (declared > (INT_MAX - outstanding) / per_entry) {
                     benchmark_debug_log("invalid aggregate count: '%s'.\n", line);
                     free(line);
