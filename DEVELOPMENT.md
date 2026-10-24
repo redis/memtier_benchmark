@@ -235,7 +235,7 @@ in CI (`.github/workflows/libevent-compat.yml` for the source-built ones):
 | libevent | How CI gets it | Coverage |
 |---|---|---|
 | 2.1.12-stable (Ubuntu 22.04–26.04, Debian 12, Amazon Linux 2023) | Ubuntu `libevent-dev`; source build | All PR suites (incl. ASan/UBSan/TSan) on the distro build; nightly full plaintext/TLS suites on the source build |
-| 2.1.13-stable | Source build; macOS, Alpine, Debian trixie/sid, MSYS2, el9/el10 | Every PR: full standalone + cluster TLS suites; nightly plaintext and `--disable-tls` |
+| 2.1.13-stable (RHEL 9/10, Debian 13, Fedora, Alpine ≥ 3.21, Homebrew, MSYS2) | Source build; also the distro package in the Alpine, Debian trixie/sid, MSYS2 and el9/el10 build jobs | Every PR: full standalone + cluster TLS suites; nightly plaintext and `--disable-tls` |
 | 2.2.2-alpha | Source build | Every PR: full TLS suites, plaintext suites with ASan+UBSan in memtier **and** libevent, `--disable-tls` + `make check`; nightly plaintext and macOS (OpenSSL 3 and 4) |
 | libevent `master` (pinned commit) | Source build | Weekly canary; allowed to fail, never required |
 
