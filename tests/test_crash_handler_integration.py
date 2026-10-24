@@ -79,6 +79,11 @@ def test_crash_handler_with_active_connections(env):
         proc.kill()
         proc.wait()
         env.assertTrue(False, message="Process did not exit after SEGV signal")
+    finally:
+        # The TSan signal helper can raise; do not leave memtier running.
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
     
     # Read the crash log
     with open(log_file, 'r') as f:
@@ -224,7 +229,6 @@ def test_crash_handler_worker_thread(env):
 
         # Send SEGV signal to the first worker thread
         target_tid = thread_ids[0]
-        print(f"Sending SEGV signal to worker thread TID {target_tid} (main PID: {proc.pid})")
         _signal_thread(proc.pid, target_tid, signal.SIGSEGV)
 
         # Wait for process to crash
@@ -446,9 +450,15 @@ def _wait_stopped(pid, timeout=2.0):
     """Wait until the main thread of pid is stopped (state T after SIGSTOP)."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        with open(f"/proc/{pid}/task/{pid}/stat") as f:
-            if f.read().rsplit(")", 1)[1].split()[0] == "T":
-                return True
+        try:
+            with open(f"/proc/{pid}/task/{pid}/stat") as f:
+                state = f.read().rsplit(")", 1)[1].split()[0]
+        except FileNotFoundError:
+            state = "X"
+        if state in ("Z", "X"):
+            raise RuntimeError(f"process {pid} exited before the signal was sent")
+        if state == "T":
+            return True
         time.sleep(0.001)
     return False
 
@@ -493,8 +503,10 @@ def _signal_thread(pid, tid, sig):
     can be inside the TSan runtime too, where the handler can deadlock.
     """
     if _tsan_build():
+        print(f"Sending {signal.Signals(sig).name} to the main thread of {pid} (TSan build)")
         _signal_tsan_main(pid, sig)
         return
+    print(f"Sending {signal.Signals(sig).name} to worker thread TID {tid} (main PID: {pid})")
     if not _tgkill(pid, tid, sig):
         print("falling back to kill")
         os.kill(tid, sig)
@@ -534,7 +546,6 @@ def _crash_worker(env, child_env, stderr=None, wait_timeout=15, before_crash=Non
         env.assertTrue(len(worker_tids) > 0, message="no worker threads found")
         if before_crash is not None:
             before_crash()
-        print(f"Sending SEGV to worker thread TID {worker_tids[0]} (main PID: {proc.pid})")
         start = time.monotonic()
         sent_at = datetime.datetime.now(datetime.timezone.utc)
         _signal_thread(proc.pid, worker_tids[0], signal.SIGSEGV)
