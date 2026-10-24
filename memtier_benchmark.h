@@ -125,6 +125,11 @@ struct benchmark_config
     config_quantiles print_percentiles;
     bool print_all_runs;
     bool realtime_latencies;
+    // Sliding window, in seconds, for the --realtime-latencies 'win' row: the
+    // completed seconds of the last N ticks are merged before computing the
+    // percentiles. 0 disables the row.
+    unsigned int latency_window_secs;
+    bool latency_window_set;
     int distinct_client_seed;
     int randomize;
     int next_client_idx;
