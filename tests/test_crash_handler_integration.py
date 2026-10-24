@@ -447,7 +447,7 @@ def _main_thread_sleeping(pid):
             parts = line.split()
             low, high = (int(x, 16) for x in parts[0].split("-"))
             if low <= pc < high:
-                return len(parts) > 5 and os.path.basename(parts[5]).startswith("libc.so")
+                return len(parts) > 5 and os.path.basename(parts[5]).startswith(("libc.so", "libc-"))
     return False
 
 
@@ -468,7 +468,7 @@ def _wait_stopped(pid, timeout=2.0):
     return False
 
 
-def _signal_tsan_main(pid, sig, timeout=10.0):
+def _signal_tsan_main(pid, sig, timeout=10.0, while_stopped=None):
     """
     Send sig to the main thread of TSan process pid while it sleeps in libc.
 
@@ -482,12 +482,16 @@ def _signal_tsan_main(pid, sig, timeout=10.0):
     arrive inside the runtime.
     So stop the process, and send the signal only when the main thread is
     asleep between progress lines; otherwise let it run and try again.
+    while_stopped, if given, runs just before the signal, while the main
+    thread is held in that sleep.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
             os.kill(pid, signal.SIGSTOP)
             if _wait_stopped(pid) and _main_thread_sleeping(pid):
+                if while_stopped is not None:
+                    while_stopped()
                 if not _tgkill(pid, pid, sig):
                     raise RuntimeError("tgkill is needed to signal a TSan build's main thread")
                 return
@@ -497,7 +501,7 @@ def _signal_tsan_main(pid, sig, timeout=10.0):
     raise RuntimeError(f"the main thread of {pid} was not seen asleep within {timeout} s")
 
 
-def _signal_thread(pid, tid, sig):
+def _signal_thread(pid, tid, sig, before_signal=None):
     """
     Send sig to thread tid of process pid. os.kill(tid) is kill(2): it sends a
     process-directed signal that any thread may take, so use tgkill(2) when
@@ -506,11 +510,16 @@ def _signal_thread(pid, tid, sig):
     TSan builds get the signal on the main thread instead, sent by
     _signal_tsan_main() while it sleeps between progress lines: a busy worker
     can be inside the TSan runtime too, where the handler can deadlock.
+
+    before_signal, if given, runs just before the signal is sent; on TSan
+    builds, while the main thread is held asleep.
     """
     if _tsan_build():
         print(f"Sending {signal.Signals(sig).name} to the main thread of {pid} (TSan build)")
-        _signal_tsan_main(pid, sig)
+        _signal_tsan_main(pid, sig, while_stopped=before_signal)
         return
+    if before_signal is not None:
+        before_signal()
     print(f"Sending {signal.Signals(sig).name} to worker thread TID {tid} (main PID: {pid})")
     if not _tgkill(pid, tid, sig):
         print("falling back to kill")
@@ -549,11 +558,11 @@ def _crash_worker(env, child_env, stderr=None, wait_timeout=15, before_crash=Non
         worker_tids = workers() if proc.poll() is None else []
         env.assertIsNone(proc.poll(), message="memtier_benchmark exited before the SEGV")
         env.assertTrue(len(worker_tids) > 0, message="no worker threads found")
-        if before_crash is not None:
-            before_crash()
         start = time.monotonic()
         sent_at = datetime.datetime.now(datetime.timezone.utc)
-        _signal_thread(proc.pid, worker_tids[0], signal.SIGSEGV)
+        # On TSan, before_crash runs with the main thread held in its sleep:
+        # filling stderr earlier could block main on a progress write first.
+        _signal_thread(proc.pid, worker_tids[0], signal.SIGSEGV, before_signal=before_crash)
         proc.wait(timeout=wait_timeout)
         elapsed = time.monotonic() - start
         print(f"Exit status {proc.returncode}, {elapsed:.1f} s after the SEGV")
