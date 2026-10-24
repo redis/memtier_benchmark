@@ -128,6 +128,12 @@ static void check_length_limits()
     check(parse_reply(PROTOCOL_RESP3, "%1073741824\r\n") == -1, "reject map count whose doubling overflows");
     check(parse_reply(PROTOCOL_RESP3, "|1073741824\r\n") == -1, "reject attribute count whose doubling overflows");
     check(parse_reply(PROTOCOL_RESP3, "%1\r\n+k\r\n+v\r\n") == 1, "regular map completes");
+    // A map nested under outstanding elements: both the doubling and the
+    // parent's remaining slots count toward the bound.
+    check(parse_reply(PROTOCOL_RESP3, "*2\r\n%1073741823\r\n") == 0, "nested map at the bound waits");
+    check(parse_reply(PROTOCOL_RESP3, "*2\r\n%1073741824\r\n") == -1, "reject nested map above the bound");
+    check(parse_reply(PROTOCOL_RESP3, "*3\r\n%1073741823\r\n") == -1,
+          "reject nested map above the bound with two outstanding");
     check(parse_reply(PROTOCOL_RESP2, "*2\r\n*1\r\n+a\r\n$1\r\nb\r\n", true) == 1, "nested array completes");
 
     // Nested counts add to the outstanding elements; with miss tracking the
@@ -136,6 +142,12 @@ static void check_length_limits()
           "nested counts up to INT_MAX outstanding wait");
     check(parse_reply(PROTOCOL_RESP2, "*2\r\n*2147483646\r\n*3\r\n", true) == -1,
           "reject nested counts above INT_MAX outstanding");
+    // A nested attribute takes a parent slot without being tracked, so the
+    // tracked nested bookkeeping can exceed the outstanding element count.
+    check(parse_reply(PROTOCOL_RESP3, "*1\r\n*2\r\n|0\r\n*2147483647\r\n", true) == -1,
+          "reject nested count overflowing tracked elements after a nested attribute");
+    check(parse_reply(PROTOCOL_RESP3, "*1\r\n*2\r\n|0\r\n*2147483646\r\n", true) == 0,
+          "nested count at the tracked bound after a nested attribute waits");
 }
 
 int main()
