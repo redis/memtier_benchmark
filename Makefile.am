@@ -111,6 +111,13 @@ if MEMTIER_WINDOWS
 prometheus_metrics_test_CPPFLAGS += -D_POSIX_THREAD_SAFE_FUNCTIONS
 endif
 
+# Exact Redis command framing through the production serializer.
+check_PROGRAMS += redis_protocol_test
+redis_protocol_test_SOURCES = tests/unit/redis_protocol_test.cpp protocol.cpp protocol.h
+redis_protocol_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
+redis_protocol_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+redis_protocol_test_LDADD = $(memtier_benchmark_LDADD)
+
 memcache_meta_test_SOURCES = tests/unit/memcache_meta_test.cpp protocol.cpp protocol.h
 memcache_meta_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
 memcache_meta_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g

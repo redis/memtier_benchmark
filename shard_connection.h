@@ -162,6 +162,7 @@ public:
 
     int connect(struct connect_info *addr);
     void disconnect();
+    bool reconnect_transaction_interval();
     // Count a connection error and disconnect. If --reconnect-on-error
     // allows another attempt, schedule a reconnect with backoff; otherwise
     // end this thread.

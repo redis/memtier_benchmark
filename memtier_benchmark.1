@@ -100,7 +100,12 @@ Requires at least one \fB\-\-command\fR.
 \fB\-\-pipeline\fR > 1 is supported: in \fB\-\-cluster\-mode\fR each rotation is
 sent contiguously on its pinned connection, so multiple whole
 transactions can be in flight without interleaving MULTI/EXEC.
-Note: a reconnect (e.g. \fB\-\-reconnect\-on\-error\fR) loses the
+\fB\-\-reconnect\-interval\fR waits for the next full weighted command
+rotation and its replies before reconnecting. The next interval
+starts there; request/time limits still end the run as usual.
+Counts and latencies inside MULTI describe QUEUED acknowledgements,
+not execution; EXEC reports the transaction outcome.
+Note: an unplanned reconnect (\fB\-\-reconnect\-on\-error\fR) loses the
 server\-side WATCH/MULTI state. If it happens inside a MULTI
 block, the rest of that block, through its EXEC/DISCARD, is
 skipped and not counted, so the per\-command counts no longer
@@ -147,7 +152,10 @@ Specify which percentiles info to print on the results table (by default prints 
 When performing multiple test iterations, print and save results for all iterations
 .TP
 \fB\-\-realtime\-latencies\fR
-Replace the periodic single\-line progress output with a per\-tick block: line 1 = throughput + miss ratio, then one or more latency lines carrying the percentiles configured by \fB\-\-print\-percentiles\fR (immediate and overall, side\-by\-side). Redraws in place on a TTY; appends cleanly when stderr is redirected to a file.
+Replace the periodic single\-line progress output with a per\-tick block: line 1 = throughput + miss ratio, then labeled latency rows carrying the percentiles configured by \fB\-\-print\-percentiles\fR: inst (each client's current second), win<N>s (sliding window, see \fB\-\-latency\-window\fR) and overall (full run). Each row shows its sample count n; a percentile p with fewer than 100/(100\-p) samples (1M for p99.9999) is not resolved and is marked '*'. Redraws in place on a TTY; appends cleanly when stderr is redirected to a file.
+.TP
+\fB\-\-latency\-window\fR=\fI\,SECS\/\fR
+Sliding\-window size for the win<N>s row of \fB\-\-realtime\-latencies\fR: percentiles over every sample completed in the last SECS seconds. Default: 60. Set to 0 to disable the row. Max: 3600.
 .TP
 \fB\-\-command\-stats\-breakdown\fR=\fI\,command\/\fR|line
 How to group command statistics in the output (default: command)

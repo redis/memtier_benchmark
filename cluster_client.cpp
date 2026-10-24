@@ -133,13 +133,12 @@ cluster_client::cluster_client(client_group *group) :
         m_txn_wait_slot(-1),
         m_txn_multi_conn_id(-1),
         m_strict_no_route_attempts(0),
+        m_last_clusterdown_refresh(),
         m_last_no_replica_warning_ts(0)
 {
     // Initialize slot map to the UINT_MAX sentinel; m_shard_groups starts empty
-    // and is populated by handle_cluster_slots(). Every reader bails on
-    // UINT_MAX (slot_primary_conn_id, select_target_conn, get_key_for_conn,
-    // retry_after_redirect, create_monitor_request_cluster, create_mget_request),
-    // so the pre-bootstrap window cannot silently route to a stale group index.
+    // and is populated by handle_cluster_slots(). Readers check the sentinel
+    // before dereferencing a group, including during bootstrap and refresh.
     // cluster_client::connect() still forces the bootstrap CLUSTER SLOTS before
     // user traffic flows; the sentinel is belt-and-braces against a topology
     // refresh leaving stale entries for slots absent from the new reply.
@@ -283,13 +282,12 @@ int cluster_client::reconnect(unsigned int conn_id)
     return 1;
 }
 
-bool cluster_client::connect_shard_connection(shard_connection *sc, char *address, char *port)
+void cluster_client::reset_shard_queues(unsigned int conn_id)
 {
-    // empty key index queue and staged monitor commands
-    if (m_key_index_pools[sc->get_id()]->size()) {
+    if (m_key_index_pools[conn_id]->size()) {
         // Cross-shard reads that were routed to this connection (via
         // create_request_for_other) push a (command_index, key_index) pair into
-        // m_key_index_pools[sc->get_id()] AFTER client::create_request has
+        // m_key_index_pools[conn_id] AFTER client::create_request has
         // already incremented m_reqs_generated (client.cpp:656 for GET, the
         // arbitrary path at create_request_for_other for --command). Clearing
         // the pool here without compensating leaves m_reqs_processed < m_reqs_generated
@@ -298,7 +296,7 @@ bool cluster_client::connect_shard_connection(shard_connection *sc, char *addres
         // Defensive clamp guards against accounting underflow. Transaction
         // lookahead stays in transaction state and never enters this queue.
         key_index_pool empty_queue;
-        std::swap(*m_key_index_pools[sc->get_id()], empty_queue);
+        std::swap(*m_key_index_pools[conn_id], empty_queue);
         {
             const size_t n = empty_queue.size() / 2;
             m_reqs_generated -= (m_reqs_generated >= n) ? n : m_reqs_generated;
@@ -306,7 +304,7 @@ bool cluster_client::connect_shard_connection(shard_connection *sc, char *addres
     }
     {
         std::queue<staged_monitor_cmd> empty_staged;
-        std::swap(m_staged_monitor_commands[sc->get_id()], empty_staged);
+        std::swap(m_staged_monitor_commands[conn_id], empty_staged);
         // Commands in the cleared staged queue were already counted in m_reqs_generated at
         // staging time. Compensate so a --requests run is not left waiting for responses
         // that will never arrive.
@@ -318,6 +316,31 @@ bool cluster_client::connect_shard_connection(shard_connection *sc, char *addres
             m_reqs_generated -= (m_reqs_generated >= n) ? n : m_reqs_generated;
         }
     }
+}
+
+void cluster_client::set_shard_role(shard_connection *sc, enum shard_role role)
+{
+    // A replica's queued reads were selected under the old role. The pooled
+    // drain bypasses routing, so retaining them on promotion could send strict
+    // secondary reads to a primary. Reset and compensate before changing role,
+    // including when its reconnect timer is pending or its socket is still live.
+    if (sc->is_replica() && role == role_primary) reset_shard_queues(sc->get_id());
+    sc->set_role(role);
+}
+
+bool cluster_client::connect_shard_connection(shard_connection *sc, char *address, char *port)
+{
+    // Routed keys and monitor lines have already been selected and counted,
+    // but have not reached the wire. Redialing the same primary retains them:
+    // clearing and compensating would replace the selected identities.
+    // Replicas keep their existing reset/compensation policy so a permanently
+    // unavailable replica cannot strand counted reads while other shards
+    // continue (#602). A fresh/different endpoint also resets its queues;
+    // connection IDs alone do not establish queue ownership. The topology
+    // caller sets the current role before reconnecting, including demotions.
+    const bool same_endpoint = sc->get_address() != NULL && sc->get_port() != NULL &&
+                               strcmp(sc->get_address(), address) == 0 && strcmp(sc->get_port(), port) == 0;
+    if (!same_endpoint || sc->is_replica()) reset_shard_queues(sc->get_id());
 
     // save address and port
     sc->set_address_port(address, port);
@@ -425,14 +448,11 @@ void cluster_client::build_mget_slot_cache()
 
     for (unsigned int slot = 0; slot <= MAX_CLUSTER_HSLOT; slot++) {
         if (cache->slot_keys[slot].empty()) continue;
-        // Resolve slot -> shard_group -> primary -> conn_id. Behavior identical
-        // to the prior `m_slot_to_shard[slot]` lookup; the indirection through
-        // m_shard_groups is the prep for replica-aware routing.
-        unsigned int gidx = m_slot_to_shard_group[slot];
-        if (gidx >= m_shard_groups.size()) continue;
-        shard_connection *primary = m_shard_groups[gidx].primary;
-        if (primary == NULL) continue;
-        unsigned int cid = primary->get_id();
+        // Resolve the slot to the primary producer.
+        unsigned int cid = slot_primary_conn_id(slot);
+        // Missing-owner slots still need a producer: omitting them silently
+        // removes their keys from the MGET workload.
+        if (cid == UINT_MAX) cid = fallback_primary_conn_id();
         if (cid < num_conns) m_mget_conn_slots[cid].push_back(slot);
 
         // Slot ownership is intentionally primary-only: exactly one producer
@@ -471,11 +491,77 @@ static inline bool conn_is_live_for_routing(shard_connection *sc)
     return sc->is_ready_for_reads();
 }
 
+bool cluster_client::slot_is_unowned(unsigned int slot) const
+{
+    // An absent slot in a committed partial map is not a bootstrap failure.
+    return !m_shard_groups.empty() && slot < m_slot_to_shard_group.size() &&
+           m_slot_to_shard_group[slot] >= m_shard_groups.size();
+}
+
+unsigned int cluster_client::fallback_primary_conn_id() const
+{
+    // Deliberately use the first connected primary: there is no owner to hash
+    // to, and the server supplies the authoritative routing response.
+    unsigned int pending = UINT_MAX;
+    // A shard reconnect timer hands the redial to a SLOTS refresh over the
+    // seed. The timer is already cleared while that reply is in flight.
+    const bool refreshing = MAIN_CONNECTION->get_connection_state() != conn_disconnected &&
+                            MAIN_CONNECTION->get_cluster_slots_state() != setup_done;
+    for (const shard_group &group : m_shard_groups) {
+        if (group.primary == NULL) continue;
+        if (group.primary->get_connection_state() == conn_connected) return group.primary->get_id();
+        if (pending == UINT_MAX && (group.primary->get_connection_state() != conn_disconnected ||
+                                    group.primary->is_reconnect_pending() || refreshing)) {
+            pending = group.primary->get_id();
+        }
+    }
+    // Preserve work while setup or an armed reconnect can make progress. A
+    // permanently disconnected primary cannot drain a staged request.
+    return pending;
+}
+
+bool cluster_client::requires_replica(bool is_read) const
+{
+    return is_read && m_config->read_preference == rp_secondary && m_config->read_preference_fallback != rpf_primary;
+}
+
+bool cluster_client::check_unowned_slot(unsigned int slot, bool is_read)
+{
+    if (!slot_is_unowned(slot)) return true;
+    if (requires_replica(is_read)) {
+        // queue is reserved and currently has the documented error policy.
+        // No replica can own a slot with no authoritative primary; do not
+        // discard the generated key or silently send the read to a primary.
+        benchmark_error_log("error: cluster slot %u has no owner; cannot route a strict-secondary read.\n", slot);
+        fail_run();
+        MAIN_CONNECTION->set_thread_end_reason("unowned-slot-strict-secondary");
+        event_base_loopbreak(m_event_base);
+        return false;
+    }
+    if (fallback_primary_conn_id() == UINT_MAX) {
+        benchmark_error_log("error: cluster slot %u has no owner and no reachable primary.\n", slot);
+        fail_run();
+        MAIN_CONNECTION->set_thread_end_reason("unowned-slot-no-primary");
+        event_base_loopbreak(m_event_base);
+        return false;
+    }
+    static std::atomic<bool> warned(false);
+    if (!warned.exchange(true, std::memory_order_relaxed)) {
+        benchmark_error_log("warning: cluster slot %u has no owner; sending requests to a primary for the server's "
+                            "routing response.\n",
+                            slot);
+    }
+    return true;
+}
+
 unsigned int cluster_client::select_target_conn(unsigned int slot, bool is_read)
 {
     if (slot >= m_slot_to_shard_group.size()) return UINT_MAX;
     unsigned int gidx = m_slot_to_shard_group[slot];
-    if (gidx >= m_shard_groups.size()) return UINT_MAX;
+    if (gidx >= m_shard_groups.size()) {
+        if (requires_replica(is_read)) return UINT_MAX;
+        return fallback_primary_conn_id();
+    }
     shard_group &group = m_shard_groups[gidx];
     if (group.primary == NULL) return UINT_MAX;
 
@@ -777,6 +863,13 @@ std::vector<cluster_endpoint_info> cluster_client::build_topology_snapshot() con
     return out;
 }
 
+static std::atomic<unsigned long long> s_rate_limited_connections(0);
+
+unsigned long long cluster_client::rate_limited_connections()
+{
+    return s_rate_limited_connections.load();
+}
+
 void cluster_client::print_topology_summary() const
 {
     std::vector<cluster_endpoint_info> eps = build_topology_snapshot();
@@ -884,6 +977,16 @@ void cluster_client::print_topology_summary() const
                                              (unsigned long long) m_config->clients * traffic_eps;
         fprintf(stderr, "[RUN #%u] Rate limit: %u req/s/conn -> %llu req/s aggregate target%s\n", rid,
                 m_config->request_rate, aggregate, ramp);
+    }
+
+    // Publish the same connection fan-out for the main thread's
+    // unresolvable-percentile check (first topology only).
+    if (s_rate_limited_connections.load() == 0) {
+        const unsigned long long traffic_eps =
+            (unsigned long long) primaries +
+            (m_config->read_preference != rp_primary ? (unsigned long long) replicas : 0);
+        s_rate_limited_connections.store((unsigned long long) m_config->threads *
+                                         (unsigned long long) m_config->clients * traffic_eps);
     }
 
     pthread_mutex_unlock(&s_mtx);
@@ -1093,7 +1196,7 @@ bool cluster_client::handle_cluster_slots(unsigned int conn_id, protocol_respons
                     // it as group.primary while it still presents replica-side
                     // setup state. Mirrors the set_role-before-connect order
                     // used for replicas below.
-                    sc->set_role(role_primary);
+                    set_shard_role(sc, role_primary);
                     connect_shard_connection(sc, addr, port);
                 }
 
@@ -1106,7 +1209,7 @@ bool cluster_client::handle_cluster_slots(unsigned int conn_id, protocol_respons
             sc = create_shard_connection(MAIN_CONNECTION->get_protocol());
             // Set the role before connect() so the setup ladder is armed at
             // connect time (primary path: no READONLY ladder).
-            sc->set_role(role_primary);
+            set_shard_role(sc, role_primary);
             connect_shard_connection(sc, addr, port);
         }
 
@@ -1115,7 +1218,7 @@ bool cluster_client::handle_cluster_slots(unsigned int conn_id, protocol_respons
         // set_role is idempotent; already-correct for newly-created and
         // reconnected primaries; covers the already-connected role-flip case
         // where the previous label was role_replica.
-        sc->set_role(role_primary);
+        set_shard_role(sc, role_primary);
 
         free(addr);
         free(port);
@@ -1271,7 +1374,7 @@ bool cluster_client::handle_cluster_slots(unsigned int conn_id, protocol_respons
                         // Nor is a replica closed because it rejected its
                         // setup under --read-preference primary (#737).
                         if (!rsc->is_reconnect_pending() && !rsc->is_setup_rejected_replica()) {
-                            rsc->set_role(role_replica);
+                            set_shard_role(rsc, role_replica);
                             connect_shard_connection(rsc, r_addr, r_port);
                         }
                     } else if (rsc->get_role() != role_replica) {
@@ -1290,7 +1393,7 @@ bool cluster_client::handle_cluster_slots(unsigned int conn_id, protocol_respons
                         // is_ready_for_reads() until the next ack, briefly
                         // dropping a stable replica out of read routing on
                         // every periodic topology refresh.
-                        rsc->set_role(role_replica);
+                        set_shard_role(rsc, role_replica);
                         rsc->rearm_readonly();
                     }
                     break;
@@ -1346,7 +1449,7 @@ bool cluster_client::handle_cluster_slots(unsigned int conn_id, protocol_respons
                 rsc = create_shard_connection(MAIN_CONNECTION->get_protocol());
                 // Set the role before connect() so the READONLY ladder is
                 // armed at connect time.
-                rsc->set_role(role_replica);
+                set_shard_role(rsc, role_replica);
                 connect_shard_connection(rsc, r_addr, r_port);
                 // Defensive invariant: a freshly created rsc cannot already
                 // be a primary in this reply (it was just allocated).
@@ -1489,6 +1592,10 @@ bool cluster_client::handle_cluster_slots(unsigned int conn_id, protocol_respons
 
 bool cluster_client::hold_pipeline(unsigned int conn_id)
 {
+    // A routing-policy failure requests an event-loop break. Stop the current
+    // producer too, so it can return control to libevent.
+    if (run_failed()) return true;
+
     if (m_connections[conn_id]->get_connection_state() == conn_disconnected) {
         if (m_config->transaction && m_txn_pinned_conn_id == (int) conn_id && !m_txn_pin_lost_warned) {
             m_txn_pin_lost_warned = true;
@@ -1826,9 +1933,29 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         }
     }
 
+    // Do not select a monitor line during primary reconnect backoff. Let the
+    // seed's SLOTS refresh choose a live destination before staging more work.
+    // Already-staged lines survive same-endpoint redial; setup gates draining.
+    // This also waits for owned monitor keys instead of sending them on a
+    // replica producer while every primary is disconnected.
+    if (m_config->monitor_commands != NULL && m_config->arbitrary_commands->is_defined() &&
+        m_staged_monitor_commands[conn_id].empty()) {
+        const arbitrary_command &cmd = get_arbitrary_command(m_executed_command_index);
+        if (cmd.command_args.size() == 1 && cmd.command_args[0].type == monitor_random_type) {
+            unsigned int primary = fallback_primary_conn_id();
+            if (primary < m_connections.size() && m_connections[primary]->get_connection_state() == conn_disconnected)
+                return true;
+        }
+    }
+
     /* The next rotation waits for its key's owner to reconnect. */
     if (m_config->transaction && m_txn_pinned_conn_id == -1 && m_txn_wait_slot != -1) {
-        unsigned int owner = slot_primary_conn_id((unsigned int) m_txn_wait_slot);
+        const unsigned int slot = (unsigned int) m_txn_wait_slot;
+        unsigned int owner = slot_primary_conn_id(slot);
+        if (slot_is_unowned(slot)) {
+            if (!check_unowned_slot(slot, false)) return true;
+            owner = fallback_primary_conn_id();
+        }
         if (owner < m_connections.size() && m_connections[owner]->get_connection_state() == conn_disconnected) {
             return true;
         }
@@ -1928,6 +2055,7 @@ get_key_response cluster_client::get_key_for_conn(unsigned int command_index, un
     // is live -- both cases fall through to "not_available" so the next tick
     // retries or the caller applies a fallback.
     const bool is_read = is_read_command_index(command_index);
+    if (!check_unowned_slot(hslot, is_read)) return not_available;
     unsigned int target_conn_id = select_target_conn(hslot, is_read);
 
     if (target_conn_id == UINT_MAX) {
@@ -2203,6 +2331,10 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
                     // below routes to the current conn_id; matches the prior
                     // behavior where m_slot_to_shard was zero-initialized.
                     unsigned int pcid = slot_primary_conn_id(hslot);
+                    if (slot_is_unowned(hslot)) {
+                        if (!check_unowned_slot(hslot, false)) return false;
+                        pcid = fallback_primary_conn_id();
+                    }
                     target_conn = (pcid == UINT_MAX) ? -1 : (int) pcid;
                 }
                 break;
@@ -2462,7 +2594,16 @@ bool cluster_client::create_mget_request(struct timeval &timestamp, unsigned int
     // --read-preference != primary we redirect this MGET to the configured
     // node class. If routing returns a different conn, hand it the work via
     // a tiny per-conn outbound queue (see m_pending_mget_send below).
-    const unsigned int routed = select_target_conn(target_slot, true /* MGET is always a read */);
+    if (!check_unowned_slot(target_slot, true)) {
+        m_mget_defer = true;
+        return false;
+    }
+    // A missing slot has no authoritative read target. Keep using the primary
+    // producer assigned by the cache until topology changes. Re-selecting the
+    // first connected primary can move this send to a different primary that
+    // is still setting up, and primary-mode pipeline deferral cannot yield that
+    // cross-connection producer. This connection has completed its own setup.
+    const unsigned int routed = slot_is_unowned(target_slot) ? conn_id : select_target_conn(target_slot, true);
     if (routed == UINT_MAX) {
         // Strict-secondary with no live replica and rpf_error/queue. The
         // routing policy has no eligible replica right now, but may have one
@@ -2681,9 +2822,20 @@ bool cluster_client::create_monitor_request_cluster(unsigned int command_index, 
             // Same primaries-only resolution as the prior m_slot_to_shard
             // read; the shard_group indirection is invisible at this site.
             unsigned int shard = slot_primary_conn_id(slot);
-            if (shard != UINT_MAX && shard < m_connections.size() &&
-                m_connections[shard]->get_connection_state() != conn_disconnected &&
-                m_connections[shard]->get_cluster_slots_state() == setup_done) {
+            if (slot_is_unowned(slot)) {
+                if (!check_unowned_slot(slot, false)) return false;
+                shard = fallback_primary_conn_id();
+                // The producer may be a replica seed. Stage on the primary
+                // during setup; the backoff gate above holds generation until
+                // redial, and fill_pipeline drains only after AUTH and SLOTS
+                // finish. Terminal disconnections
+                // are rejected above before this command is counted.
+                if (shard < m_connections.size()) target_conn = shard;
+            } else if (shard != UINT_MAX && shard < m_connections.size() &&
+                       m_connections[shard]->get_connection_state() != conn_disconnected) {
+                // The selected key still belongs to this primary while it
+                // refreshes SLOTS. Stage there until setup completes instead
+                // of sending the already-selected command on a replica.
                 target_conn = shard;
             }
         }
@@ -3136,6 +3288,19 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
     if (response->is_error()) {
         benchmark_debug_log("server %s handle response: %s\n", m_connections[conn_id]->get_readable_id(),
                             response->get_status());
+        // CLUSTERDOWN has no MOVED destination. Even a previously full map
+        // can be stale. Poll at most once per second, without flushing any
+        // staged keys. The setup ladder defers SLOTS while MULTI is open.
+        // Like READONLY below, this recognizes Redis's simple-error form.
+        static const char CLUSTERDOWN_MSG_PREFIX[] = "-CLUSTERDOWN ";
+        if (strncmp(response->get_status(), CLUSTERDOWN_MSG_PREFIX, sizeof(CLUSTERDOWN_MSG_PREFIX) - 1) == 0 &&
+            (m_last_clusterdown_refresh.tv_sec == 0 || ts_diff(m_last_clusterdown_refresh, timestamp) >= 1000000) &&
+            m_connections[conn_id]->get_cluster_slots_state() == setup_done) {
+            m_last_clusterdown_refresh = timestamp;
+            m_connections[conn_id]->set_cluster_slots();
+            m_connections[conn_id]->schedule_fill();
+        }
+
         // handle "-READONLY"
         // Server signals "you sent a write to a replica". We misclassified
         // this request as a read (or the topology changed mid-flight, e.g.

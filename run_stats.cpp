@@ -201,7 +201,8 @@ void run_stats::summarize_current_second(void)
     hdr_reset(inst_m_set_latency_histogram);
     hdr_reset(inst_m_wait_latency_histogram);
     pthread_mutex_lock(&m_inst_histogram_mutex.mtx);
-    if (m_config->prometheus != NULL) hdr_add(m_prom_pending_latency_histogram, inst_m_totals_latency_histogram);
+    if (m_config->prometheus != NULL || m_config->realtime_latencies)
+        hdr_add(m_prom_pending_latency_histogram, inst_m_totals_latency_histogram);
     hdr_reset(inst_m_totals_latency_histogram);
     pthread_mutex_unlock(&m_inst_histogram_mutex.mtx);
 }
@@ -1164,9 +1165,9 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
     m_totals.m_bytes_sec_rx /= all_stats.size();
     m_totals.m_bytes_sec_tx /= all_stats.size();
     m_totals.m_connection_errors_sec /= all_stats.size();
-    m_totals.m_latency /= all_stats.size();
+    m_totals.m_latency = m_totals.m_ops ? (double) m_totals.m_total_latency / m_totals.m_ops / 1000.0 : 0.0;
 
-    // Every value in the AVERAGE section is a per-run value (#703). The counts
+    // Counts in the AVERAGE section are per-run values (#703). The counts
     // (ops, accumulated latency, connection errors, unanswered requests, hits
     // and misses) stay summed here, and so does the duration set below.
     // Dividing a summed count by the summed duration, count /
@@ -1232,7 +1233,7 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
     }
 }
 
-void run_stats::merge(const run_stats &other, int iteration)
+void run_stats::merge(const run_stats &other, int iteration, bool include_duration)
 {
     bool new_stats = false;
 
@@ -1251,12 +1252,14 @@ void run_stats::merge(const run_stats &other, int iteration)
         return;
     }
 
-    m_start_time = timeval_factorial_average(m_start_time, other.m_start_time, iteration);
-    m_end_time = timeval_factorial_average(m_end_time, other.m_end_time, iteration);
-
-    // The merged times are valid once any started run is merged in;
-    // get_duration_usec() returns 0 until m_started is set.
-    if (other.has_started()) m_started.flag.store(true, std::memory_order_release);
+    // A connected client can generate/stage requests or fail during setup
+    // without submitting workload. Retain all its counters below, but do not
+    // let its setup clock weight the final workload duration.
+    if (include_duration) {
+        m_start_time = timeval_factorial_average(m_start_time, other.m_start_time, iteration);
+        m_end_time = timeval_factorial_average(m_end_time, other.m_end_time, iteration);
+        m_started.flag.store(true, std::memory_order_release);
+    }
 
     // If any run was interrupted, mark the merged result as interrupted
     if (other.get_interrupted()) {
@@ -2330,8 +2333,8 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
                              0,   // connection_errors (not tracked per command)
                              quantiles_list, m_get_latency_histogram, timestamps, get_stats);
         result_print_to_json(jsonhandler, "Waits", m_totals.m_wait_cmd.m_ops_sec, 0.0, 0.0, cluster_mode ? 0.0 : -1,
-                             cluster_mode ? 0.0 : -1, 0.0, 0.0, 0.0, 0.0, row_latency(0),
-                             row_ops(m_totals.m_wait_cmd.m_ops),
+                             cluster_mode ? 0.0 : -1, 0.0, 0.0, 0.0, m_totals.m_wait_cmd.m_latency,
+                             row_latency(m_totals.m_wait_cmd.m_total_latency), row_ops(m_totals.m_wait_cmd.m_ops),
                              0.0, // connection_errors_sec (not tracked per command)
                              0,   // connection_errors (not tracked per command)
                              quantiles_list, m_wait_latency_histogram, timestamps, wait_stats);

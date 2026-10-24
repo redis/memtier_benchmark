@@ -133,10 +133,7 @@ def test_progress_interval_keeps_latency_samples_from_hidden_ticks(env):
                     parts.append(self.rfile.read(size))
                     self.rfile.read(2)
                 if parts[0].upper() == b"SET":
-                    # Keep slow samples available across several hidden ticks.
-                    # A single early sample can legitimately disappear from
-                    # the worker's per-second histogram before a delayed
-                    # supervisor takes its first snapshot (notably under TSAN).
+                    # Slow samples spanning several hidden ticks.
                     time.sleep(0.3)
                 self.wfile.write(b"+OK\r\n")
                 self.wfile.flush()
@@ -154,10 +151,13 @@ def test_progress_interval_keeps_latency_samples_from_hidden_ticks(env):
                      "--realtime-latencies", "--print-percentiles=100", "--json-out-file=" + path],
                     capture_output=True, text=True, timeout=15)
                 env.assertEqual(result.returncode, 0, message=result.stderr)
-                latencies = re.findall(r"latency\s+p100\s+[^\n]*?\(avg:\s*([\d.]+)\)", result.stderr)
+                # The overall row is built from drained completed seconds, so
+                # it counts every one of the 12 samples exactly once.
+                latencies = re.findall(r"latency \[overall \] n=(\d+)\s+p100\s+([\d.]+)", result.stderr)
                 env.assertEqual(len(latencies), 1, message=result.stderr)
                 if latencies:
-                    env.assertGreater(float(latencies[0]), 200, message=result.stderr)
+                    env.assertEqual(int(latencies[0][0]), 12, message=result.stderr)
+                    env.assertGreater(float(latencies[0][1]), 200, message=result.stderr)
                 with open(path) as source:
                     env.assertEqual(json.load(source)["ALL STATS"]["Totals"]["Count"], 12)
         finally:

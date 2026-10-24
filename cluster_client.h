@@ -142,6 +142,7 @@ protected:
     // workloads where writes succeed (primary is live) but every GET routing
     // attempt fails because no replica is available yet.
     unsigned int m_strict_no_route_attempts;
+    struct timeval m_last_clusterdown_refresh;
     // Monotonic timestamp (CLOCK_MONOTONIC seconds) of the last "all replicas
     // unreachable under read-only workload" warning emitted from
     // hold_pipeline. Rate-limited to once per 60s so a stalled benchmark
@@ -197,12 +198,18 @@ protected:
     // setup_done (the READONLY ladder having lit setup_done is implicit in
     // setup_done for replicas because the readonly ladder is checked alongside).
     //
-    // Returns UINT_MAX when the slot is unmapped (bootstrap window) or when
+    // A missing owner in a committed partial map uses another primary when
+    // the read preference permits it; Redis supplies the routing error.
+    // Returns UINT_MAX before bootstrap or when
     // strict `rp_secondary` has no live replicas. Callers must handle the
     // UINT_MAX case explicitly (typically by treating as not_available and
     // letting the next tick retry, or applying --read-preference-fallback for
     // the strict-secondary case).
     unsigned int select_target_conn(unsigned int slot, bool is_read);
+    bool slot_is_unowned(unsigned int slot) const;
+    unsigned int fallback_primary_conn_id() const;
+    bool check_unowned_slot(unsigned int slot, bool is_read);
+    bool requires_replica(bool is_read) const;
 
     // True if the request should be classified as a read for routing
     // purposes (see select_target_conn). Inspects request type plus
@@ -222,6 +229,8 @@ protected:
     void record_builtin_read_routing(request_type rt, bool from_replica);
 
     shard_connection *create_shard_connection(abstract_protocol *abs_protocol);
+    void reset_shard_queues(unsigned int conn_id);
+    void set_shard_role(shard_connection *sc, enum shard_role role);
     bool connect_shard_connection(shard_connection *sc, char *address, char *port);
     void handle_moved(unsigned int conn_id);
     void update_redirect_stats(struct timeval timestamp, request *req, protocol_response *response, bool moved,
@@ -296,6 +305,11 @@ public:
     // aggregate rate-limit target when --rate-limiting is set). Guarded to fire
     // exactly once per run across all worker threads.
     void print_topology_summary() const;
+
+    // Request-generating connections (threads x clients x traffic endpoints)
+    // of the first committed topology, for the main thread's percentile
+    // sample-bound check; 0 until a topology summary has been printed.
+    static unsigned long long rate_limited_connections();
 
     // client manager api's
     virtual bool handle_cluster_slots(unsigned int conn_id, protocol_response *r);
