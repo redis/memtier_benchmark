@@ -424,6 +424,7 @@ private:
     void push_req(request *req);
 
     void process_response(void);
+    void read_past_libevent_cap(void);
     void process_subsequent_requests(void);
     void process_first_request();
     void fill_pipeline(void);
@@ -572,6 +573,10 @@ private:
     // conditional. Invariant: m_bev_paused == true iff m_bev is currently in
     // the EV_READ|EV_WRITE-disabled state.
     bool m_bev_paused;
+
+    // Bytes the last read added to a plaintext connection's input when
+    // libevent caps socket reads; see read_past_libevent_cap().
+    size_t m_last_input_added;
 
     // Bumped by every disconnect(). process_response() compares it against
     // the value it started with and stops parsing once the connection was

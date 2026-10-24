@@ -32,6 +32,9 @@
 #ifdef HAVE_NETINET_TCP_H
 #include <netinet/tcp.h>
 #endif
+#ifndef _WIN32
+#include <sys/ioctl.h>
+#endif
 #ifdef HAVE_LIMITS_H
 #include <limits.h>
 #endif
@@ -164,7 +167,29 @@ void cluster_client_read_handler(bufferevent *bev, void *ctx)
 {
     shard_connection *sc = (shard_connection *) ctx;
     assert(sc != NULL);
+    sc->read_past_libevent_cap();
     sc->process_response();
+}
+
+// libevent before 2.2 reads at most 4 KiB (EVBUFFER_MAX_READ) from a socket
+// per read event; 2.2 reads up to 16 KiB. See read_past_libevent_cap().
+static const size_t libevent_read_cap = 4096;
+static const size_t libevent_2_2_read_size = 16384;
+
+static bool libevent_caps_reads(void)
+{
+#ifdef _WIN32
+    return false;
+#else
+    static const bool caps = event_get_version_number() < 0x02020000;
+    return caps;
+#endif
+}
+
+// Records how much the last read added to a plaintext connection's input.
+static void input_added_handler(struct evbuffer *, const struct evbuffer_cb_info *info, void *ctx)
+{
+    if (info->n_added > 0) *(size_t *) ctx = info->n_added;
 }
 
 void cluster_client_event_handler(bufferevent *bev, short events, void *ctx)
@@ -320,7 +345,8 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_deferred_fill_timer(NULL),
         m_cluster_slots_retry_timer(NULL),
         m_setup_rejected_timer(NULL),
-        m_bev_paused(false)
+        m_bev_paused(false),
+        m_last_input_added(0)
 {
     m_id = id;
     m_conns_manager = conns_man;
@@ -502,6 +528,7 @@ void shard_connection::setup_event(evutil_socket_t sockfd)
     // bufferevent_enable in handle_event on BEV_EVENT_CONNECTED); reset the
     // pause flag so we don't carry stale state from a prior socket.
     m_bev_paused = false;
+    m_last_input_added = 0;
 
 #ifdef USE_TLS
     if (m_config->openssl_ctx) {
@@ -517,6 +544,9 @@ void shard_connection::setup_event(evutil_socket_t sockfd)
     } else {
 #endif
         m_bev = bufferevent_socket_new(m_event_base, sockfd, BEV_OPT_CLOSE_ON_FREE);
+        if (m_bev != NULL && libevent_caps_reads()) {
+            evbuffer_add_cb(bufferevent_get_input(m_bev), input_added_handler, &m_last_input_added);
+        }
 #ifdef USE_TLS
     }
 #endif
@@ -1559,6 +1589,44 @@ static bool is_redis_connection_rejection(const char *status)
     return status && (strncmp(status, protocol, sizeof(protocol) - 1) == 0 ||
                       strncmp(status, maxclients, sizeof(maxclients) - 1) == 0 ||
                       strncmp(status, protected_mode, sizeof(protected_mode) - 1) == 0);
+}
+
+// With libevent before 2.2, pipelined replies are read and parsed 4 KiB at a
+// time (issue #535). When libevent's read filled exactly that much, more data
+// is usually queued: read on up to the 16 KiB that libevent 2.2 reads at once,
+// so a read event takes the same amount of data on both series. TLS
+// bufferevents read whole records and are left alone.
+void shard_connection::read_past_libevent_cap(void)
+{
+#ifndef _WIN32
+    if (m_last_input_added != libevent_read_cap) return;
+    m_last_input_added = 0;
+
+    // Read only what is already queued, as libevent does, so that a pending
+    // EOF or socket error is left for libevent's next read to report.
+    static const int extra_read = (int) (libevent_2_2_read_size - libevent_read_cap);
+    evutil_socket_t fd = bufferevent_getfd(m_bev);
+    int saved_errno = errno;
+    int queued = 0;
+    if (ioctl(fd, FIONREAD, &queued) < 0 || queued <= 0) {
+        errno = saved_errno;
+        return;
+    }
+    if (queued > extra_read) queued = extra_read;
+
+    struct evbuffer *input = bufferevent_get_input(m_bev);
+    struct evbuffer_iovec vec;
+    // The socket bufferevent keeps the end of its input frozen except while
+    // it reads into it (bufferevent_readcb); do the same around this read.
+    evbuffer_unfreeze(input, 0);
+    if (evbuffer_reserve_space(input, queued, &vec, 1) == 1) {
+        ssize_t n = recv(fd, vec.iov_base, queued, 0);
+        vec.iov_len = n > 0 ? (size_t) n : 0;
+        evbuffer_commit_space(input, &vec, 1);
+    }
+    evbuffer_freeze(input, 0);
+    errno = saved_errno;
+#endif
 }
 
 void shard_connection::process_response(void)
