@@ -1148,8 +1148,11 @@ def _run_transaction_with_kills(env, extra_args, requests=None, test_time=None, 
         nothing was held by end.
         """
         try:
+            # Hold writes for as long as this wave may wait; the finally
+            # unpauses as soon as it is done.
+            pause_ms = max(1000, int((end - time.time() + 1) * 1000))
             for conn in conns:
-                conn.execute_command("CLIENT", "PAUSE", 60000, "WRITE")
+                conn.execute_command("CLIENT", "PAUSE", pause_ms, "WRITE")
             while not blocked():
                 if proc.poll() is not None or time.time() >= end:
                     return None
