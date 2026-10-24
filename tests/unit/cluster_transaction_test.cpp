@@ -338,7 +338,7 @@ static void check_repin_routes_to_staged_owner(unsigned long long first_key)
     // A listening socket keeps the dial to the second shard pending; the
     // event loop never runs, so the connection stays conn_in_progress.
     evutil_socket_t listener = socket(AF_INET, SOCK_STREAM, 0);
-    check(listener != EVUTIL_INVALID_SOCKET, "listener socket");
+    check(listener != static_cast<evutil_socket_t>(-1), "listener socket");
     sockaddr_in address = {};
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
