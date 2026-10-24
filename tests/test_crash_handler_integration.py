@@ -463,7 +463,8 @@ def _signal_tsan_main(pid, sig, timeout=10.0):
     example reporting the progress counters' known race, and holding its
     internal locks. The first race report or trace switch in the handler
     then waits for those locks forever and the watchdog kills the process
-    halfway through the report. A real crash cannot interrupt the runtime.
+    halfway through the report. A fault in memtier's own code does not
+    arrive inside the runtime.
     So stop the process, and send the signal only when the main thread is
     asleep between progress lines; otherwise let it run and try again.
     """
@@ -636,17 +637,17 @@ def test_crash_handler_header_survives_stderr_lock(env):
     the process. The shim takes the lock from a helper thread when the crash
     handler arms its alarm.
 
-    Skipped on TSan builds. There the crash signal reaches memtier's handler
-    only through TSan's deferred delivery, which waits for the thread to pass
-    an intercepted call, and the scenario parks a helper thread in a stdio
-    lock while the handler spins waiting for it. That is not deterministic:
-    in CI (job 117257659823) nothing after the SEGV was printed and the
-    process did not exit, while local runs passed. On TSan the
-    write(2) header is still checked by test_crash_handler_time_zone_lock_held
-    and the watchdog exit by the other two watchdog tests.
+    Skipped on TSan builds, where this scenario is not deterministic: in CI
+    (job 117257659823) nothing after the SEGV was printed and the process did
+    not exit, while local runs passed. TSan runs a SIGSEGV handler at once,
+    on whatever the thread was doing, so the handler can wait for runtime
+    locks the interrupted thread holds (see _signal_tsan_main()); whether
+    that explains this hang has not been verified. On TSan the write(2)
+    header is still checked by test_crash_handler_time_zone_lock_held and the
+    watchdog exit by the other two watchdog tests.
     """
     if _tsan_build():
-        print("SKIP: the stderr lock scenario is not deterministic under TSan's deferred signal delivery")
+        print("SKIP: the stderr lock scenario is not deterministic under TSan")
         env.skip()
     with tempfile.TemporaryDirectory() as directory:
         child_env = _crash_shim_env(env, directory, shutil.which(MEMTIER_BINARY) or MEMTIER_BINARY)
