@@ -122,6 +122,24 @@ static void check_nested_push_keep_value()
     check(value && len == 2 && memcmp(value, "hi", 2) == 0, "bulk reply after nested push keeps its value");
     delete protocol;
     evbuffer_free(input);
+
+    // Same, with the first reply ending on a status rather than a bulk.
+    protocol = parse_two_resp3_kept_replies("%1\r\n*2\r\n>0\r\n%0\r\n+s\r\n+t\r\n$2\r\nhi\r\n", &input);
+    r = protocol->get_response();
+    value = r->get_value(&len);
+    check(value && len == 2 && memcmp(value, "hi", 2) == 0,
+          "bulk reply after status-ended nested push keeps its value");
+    delete protocol;
+    evbuffer_free(input);
+
+    // Same, with an aggregate second reply: it must start a new tree.
+    protocol = parse_two_resp3_kept_replies("%1\r\n*2\r\n>0\r\n%0\r\n+s\r\n$2\r\nab\r\n*1\r\n$2\r\nhi\r\n", &input);
+    r = protocol->get_response();
+    mbulk_size_el *root = r->get_mbulk_value();
+    check(root && root->upper_level == NULL && root->mbulks_elements.size() == 1,
+          "aggregate reply after nested push starts a new tree");
+    delete protocol;
+    evbuffer_free(input);
 }
 
 int main()
