@@ -424,7 +424,10 @@ private:
     void push_req(request *req);
 
     void process_response(void);
-    void read_past_libevent_cap(void);
+    // Whether this plaintext connection's reads are tracked with
+    // track_libevent_reads() (libevent_read_cap.h).
+    bool tracks_libevent_reads(void) const { return m_tracks_libevent_reads; }
+    size_t *last_input_added(void) { return &m_last_input_added; }
     void process_subsequent_requests(void);
     void process_first_request();
     void fill_pipeline(void);
@@ -574,8 +577,9 @@ private:
     // the EV_READ|EV_WRITE-disabled state.
     bool m_bev_paused;
 
-    // Bytes the last read added to a plaintext connection's input when
-    // libevent caps socket reads; see read_past_libevent_cap().
+    // Set when libevent caps socket reads and m_bev is a plaintext socket
+    // bufferevent; m_last_input_added is then what its last read added.
+    bool m_tracks_libevent_reads;
     size_t m_last_input_added;
 
     // Bumped by every disconnect(). process_response() compares it against

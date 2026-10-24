@@ -1,8 +1,9 @@
 """Pipelined replies larger than one socket read must reach the parser intact.
 
-libevent before 2.2 reads at most 4 KiB per read event, and memtier reads the
-rest of what is queued itself (issue #535); every byte must still arrive once
-and in order.
+libevent before 2.2 reads at most 4 KiB per read event, and memtier reads on
+from what is queued, up to 16 KiB in all (issue #535); every byte must still
+arrive once and in order. tests/unit/libevent_read_cap_test.cpp checks the
+read sizes.
 """
 import json
 import os
@@ -38,7 +39,12 @@ def test_pipelined_large_replies_verify(env):
                 f.write("dumpflags, time, exptime, nbytes, nsuffix, it_flags, clsid, nkey, key, data\n")
                 for i, key in enumerate(keys):
                     f.write("0, 0, 0, {}, 0, 0, 0, {}, {}, {}\n".format(VALUE_SIZE + 2, len(key), key, _value(i)))
-            args = [MEMTIER_BINARY, "-s", "127.0.0.1", "-p", str(env.getMasterNodesList()[0]["port"]),
+            node = env.getMasterNodesList()[0]
+            if env.isUnixSocket():
+                target = ["--unix-socket", node["unix_socket_path"]]
+            else:
+                target = ["-s", "127.0.0.1", "-p", str(node["port"])]
+            args = [MEMTIER_BINARY] + target + [
                     "--data-import", source, "--json-out-file", output, "--verify-only", "--ratio=1:0",
                     "--key-pattern=P:P", "-t", "1", "-c", "1", "-n", str(KEYS),
                     "--pipeline", "16", "--hide-histogram"]
@@ -51,9 +57,12 @@ def test_pipelined_large_replies_verify(env):
             except subprocess.TimeoutExpired as e:
                 # A lost or extra byte leaves the parser waiting for a reply
                 # that never completes.
-                env.assertTrue(False, message="memtier hung: {}".format(e.stderr))
+                stderr = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else e.stderr
+                env.assertTrue(False, message="memtier hung: {}".format(stderr))
                 return
             env.assertEqual(result.returncode, 0, message=result.stderr)
+            if result.returncode != 0:
+                return
             env.assertNotContains("response parsing failed", result.stderr, message=result.stderr)
             with open(output) as f:
                 counts = json.load(f)["client verifications results"]
