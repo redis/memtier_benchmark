@@ -2068,7 +2068,8 @@ void shard_connection::handle_event(short events)
 
     if (events & BEV_EVENT_ERROR) {
         bool ssl_error = false;
-        // Read it before logging anything: the Windows deferred refusal sets it.
+        // Read the socket error before logging anything: logging may change
+        // it, and the Windows deferred refusal reports through it.
         int socket_error = EVUTIL_SOCKET_ERROR();
 #ifdef USE_TLS
         // Only TLS connections have an OpenSSL bufferevent (see setup_event()).
@@ -2105,7 +2106,7 @@ void shard_connection::handle_event(short events)
                     benchmark_error_log("TLS connection error: certificate verify failed: %s\n",
                                         X509_verify_cert_error_string(verify_result));
                 } else if (!socket_error) {
-                    benchmark_error_log("TLS connection error: libevent %s reported no OpenSSL reason\n",
+                    benchmark_error_log("TLS connection error: no OpenSSL reason reported (libevent %s)\n",
                                         event_get_version());
                 }
             }

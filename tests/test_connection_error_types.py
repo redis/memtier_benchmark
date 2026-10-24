@@ -74,7 +74,7 @@ def test_plaintext_connection_refused(env):
 
 def test_tls_connection_refused(env):
     # The TCP connect fails before any TLS record is sent: that is not a TLS
-    # failure, even when libevent 2.2.2 reports no OpenSSL reason.
+    # failure, even when libevent reports no OpenSSL reason.
     if not _tls_enabled():
         env.skip()
         return
@@ -82,7 +82,7 @@ def test_tls_connection_refused(env):
         reserved.bind(("127.0.0.1", 0))
         stderr = _run_failure(env, reserved.getsockname()[1],
                               ["--tls", "--tls-skip-verify"])
-    env.assertNotContains("reported no OpenSSL reason", stderr, message=stderr)
+    env.assertNotContains("no OpenSSL reason reported", stderr, message=stderr)
     # libevent 2.1 also queues SSL_ERROR_SYSCALL, which has no reason string.
     env.assertNotContains("(null)", stderr, message=stderr)
     env.assertContains("Connection error: Connection refused", stderr, message=stderr)
@@ -156,8 +156,19 @@ def test_tls_skip_verify_failure_not_blamed_on_certificate(env):
     context.maximum_version = ssl.TLSVersion.TLSv1_2
 
     def handshake(conn):
-        with context.wrap_socket(conn, server_side=True) as tls:
+        tls = context.wrap_socket(conn, server_side=True, do_handshake_on_connect=False)
+        try:
+            tls.do_handshake()
             tls.recv(4096)
+        except ssl.SSLError:
+            # Read the client's remaining flight before closing; closing with
+            # unread data sends an RST, which memtier rightly reports as a
+            # socket error and not as a TLS failure.
+            socket.socket.shutdown(tls, socket.SHUT_WR)
+            while socket.socket.recv(tls, 4096):
+                pass
+        finally:
+            tls.close()
 
     with _listener() as listener:
         stop, worker, accepted = _serve(listener, handshake)
