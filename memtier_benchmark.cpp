@@ -65,6 +65,7 @@
 #endif
 #include <dirent.h>
 #include "platform_compat.h"
+#include "library_versions.h"
 #include <event2/event.h>
 #include <event2/thread.h>
 
@@ -91,7 +92,47 @@
 static bool bitmask_is_contiguous(unsigned int mask);
 #endif
 
+// The OpenSSL library actually loaded; OPENSSL_VERSION_* are the headers'.
+static const char *openssl_runtime_version_text(void)
+{
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+    return OpenSSL_version(OPENSSL_VERSION);
+#else
+    return SSLeay_version(SSLEAY_VERSION);
 #endif
+}
+
+static unsigned long openssl_runtime_version_number(void)
+{
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+    return OpenSSL_version_num();
+#else
+    return SSLeay();
+#endif
+}
+
+#endif
+
+// Warn (stderr only) when the libevent or OpenSSL library loaded at run time
+// is from another release series than the headers memtier was compiled
+// with, e.g. headers of one installation and the library of another.
+static void warn_on_library_version_mismatch(void)
+{
+    if (libevent_series_differs(LIBEVENT_VERSION_NUMBER, event_get_version_number())) {
+        fprintf(stderr,
+                "warning: memtier_benchmark was built with libevent %s headers but is running with libevent %s; "
+                "rebuild it against the libevent it runs with.\n",
+                LIBEVENT_VERSION, event_get_version());
+    }
+#ifdef USE_TLS
+    if (openssl_series_differs(OPENSSL_VERSION_NUMBER, openssl_runtime_version_number())) {
+        fprintf(stderr,
+                "warning: memtier_benchmark was built with %s headers but is running with %s; "
+                "rebuild it against the OpenSSL it runs with.\n",
+                OPENSSL_VERSION_TEXT, openssl_runtime_version_text());
+    }
+#endif
+}
 
 #include <cfloat>
 #include <cmath>
@@ -551,9 +592,11 @@ static void print_crash_report_tail(const char *timestr)
 #endif
 
     fprintf(stderr, "[%d] %s # libevent_version:%s\n", getpid(), timestr, event_get_version());
+    fprintf(stderr, "[%d] %s # libevent_build_version:%s\n", getpid(), timestr, LIBEVENT_VERSION);
 
 #ifdef USE_TLS
     fprintf(stderr, "[%d] %s # openssl_version:%s\n", getpid(), timestr, OPENSSL_VERSION_TEXT);
+    fprintf(stderr, "[%d] %s # openssl_runtime_version:%s\n", getpid(), timestr, openssl_runtime_version_text());
 #endif
 
     // Print client connection information
@@ -720,7 +763,7 @@ static void crash_handler(int sig, siginfo_t *info, void *secret)
     // - print_client_list() reads the worker's client and connection
     //   vectors without synchronization; a torn vector can fault or hang.
     // uname(), getpid(), sigaction() and raise() are async-signal-safe, and
-    // event_get_version() only returns a constant string.
+    // event_get_version() and OpenSSL_version() only return constant strings.
 
     // Print stack trace for all threads
     print_all_threads_stack_trace(stderr, getpid(), timestr);
@@ -759,6 +802,9 @@ static void prewarm_crash_handler(void)
     fflush(stderr);
     // Resolve event_get_version too — used in the INFO section.
     (void) event_get_version();
+#ifdef USE_TLS
+    (void) openssl_runtime_version_text();
+#endif
 
     // The handler formats its timestamp by hand from this offset, and this
     // first localtime_r() call also loads the time zone data.
@@ -5470,14 +5516,12 @@ int main(int argc, char *argv[])
     // --connection-stage-timeout abort (Phase 1 of #426) or a Ctrl+C.
     // Must run before any event_base is created so the locking callbacks
     // are installed for every subsequent base.
+    // Without them a shutdown or timeout could hang, so a failure is fatal,
+    // but only once options are parsed: --help and --version still work.
 #ifdef _WIN32
-    if (evthread_use_windows_threads() < 0) {
-        fprintf(stderr, "warning: evthread_use_windows_threads() failed; cross-thread loop wakeups may stall.\n");
-    }
+    const bool evthread_failed = evthread_use_windows_threads() < 0;
 #else
-    if (evthread_use_pthreads() < 0) {
-        fprintf(stderr, "warning: evthread_use_pthreads() failed; cross-thread loop wakeups may stall.\n");
-    }
+    const bool evthread_failed = evthread_use_pthreads() < 0;
 #endif
 
     // Install signal handler for Ctrl+C. SIGTERM (kill, timeout, docker stop,
@@ -5542,6 +5586,17 @@ int main(int argc, char *argv[])
     if (config_parse_args(argc, argv, &cfg) < 0) {
         usage();
     }
+    if (evthread_failed) {
+#ifdef _WIN32
+        fprintf(stderr, "error: evthread_use_windows_threads() failed; libevent's Windows threading support is "
+                        "required to stop worker threads.\n");
+#else
+        fprintf(stderr, "error: evthread_use_pthreads() failed; libevent's pthreads support (libevent_pthreads) "
+                        "is required to stop worker threads.\n");
+#endif
+        exit(1);
+    }
+    warn_on_library_version_mismatch();
 
     // An fd 0-2 was closed at startup and reopened on /dev/null (see
     // reopen_closed_std_fds()). A path option that names that fd would now
@@ -6495,6 +6550,13 @@ int main(int argc, char *argv[])
                                    cfg.requests > 0 ? cfg.requests : (unsigned long long) cfg.test_time);
             jsonhandler->write_obj("Runs completed", "%zu", all_stats.size());
             jsonhandler->write_obj("Format version", "%d", 2);
+            // Library provenance: the run-time library and the build headers.
+            jsonhandler->write_obj("libevent runtime version", "\"%s\"", event_get_version());
+            jsonhandler->write_obj("libevent build version", "\"%s\"", LIBEVENT_VERSION);
+#ifdef USE_TLS
+            jsonhandler->write_obj("OpenSSL runtime version", "\"%s\"", openssl_runtime_version_text());
+            jsonhandler->write_obj("OpenSSL build version", "\"%s\"", OPENSSL_VERSION_TEXT);
+#endif
             jsonhandler->close_nesting();
         }
 

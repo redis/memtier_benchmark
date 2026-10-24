@@ -8,9 +8,35 @@ This document provides information for developers working on memtier_benchmark.
 
 The following libraries are required for building:
 
-* libevent 2.1.1 or newer (the default-on Prometheus exporter requires evhttp >= 2.1.1; libevent 2.0.10 suffices with ./configure --disable-prometheus).
+* libevent (2.1.8 or newer is supported, 2.1.12 or newer is recommended; see [Supported libevent versions](#supported-libevent-versions)).
 * OpenSSL (unless TLS support is disabled by `./configure --disable-tls`).
 * Prometheus /metrics exporter support can be disabled by ./configure --disable-prometheus.
+
+#### Supported libevent versions
+
+| libevent | Status |
+|---|---|
+| 2.1.8 | Oldest release known to work (RHEL 8): memtier builds with TLS and the Prometheus exporter and `make check` passes on Rocky Linux 8. CI does not build it yet. If libevent fails to allocate a TLS connection, memtier leaks that connection's socket (and possibly its SSL) rather than risk closing a reused descriptor; 2.1.9 and newer don't need this. |
+| 2.1.12 | Recommended minimum (Ubuntu 22.04/24.04, Debian 12, Amazon Linux 2023). The main CI test suite runs on it. |
+| 2.1.13 | Current stable release, with security fixes (RHEL 9/10, Debian 13, Fedora, Alpine, Homebrew, MSYS2). |
+| 2.2.2-alpha | Supported experimentally. 2.2 is not a stable series yet. |
+
+`configure` itself accepts older releases: the Prometheus exporter needs
+libevent_extra 2.1.4 or newer (`evhttp_request_set_on_complete_cb()`), and
+`./configure --disable-prometheus` accepts the minimum checked in
+`configure.ac`. Those older releases are not tested.
+
+Build against the libevent (and OpenSSL) you run with. memtier prints a
+warning on stderr at startup when the library loaded at run time is from
+another release series than the headers it was built with (libevent
+major.minor; OpenSSL major.minor before 3.0, and from 3.0 on another major
+version or an older minor version than the headers). Other differences, such
+as patch levels, are compatible and are not reported. The JSON
+`run information` section records `libevent runtime version` and
+`libevent build version` (and `OpenSSL runtime version` and
+`OpenSSL build version` when TLS is compiled in). Results from different
+libevent series are not directly comparable: 2.1 reads at most 4 KiB per
+socket read, 2.2 up to 16 KiB (#535).
 
 The following tools are required:
 * autoconf
@@ -351,9 +377,10 @@ default** — no extra configure flag is needed:
 
     $ ./configure && make
 
-The exporter is built on libevent's `evhttp`, which requires **libevent 2.1.1 or
-newer**. `configure` performs an explicit **LINK test** for `evhttp_new` (not just
-a header check); if your libevent is too old, the build fails loudly at configure
+The exporter is built on libevent's `evhttp`, which requires **libevent 2.1.4 or
+newer**. `configure` performs an explicit **LINK test** for
+`evhttp_request_set_on_complete_cb` (not just a header check); if your libevent
+is too old, the build fails loudly at configure
 time with a message pointing at `--disable-prometheus`. To build without the
 exporter (e.g. on a host pinned to libevent 2.0.x):
 
@@ -437,8 +464,10 @@ When a crash occurs, memtier_benchmark will automatically:
      - `memtier_git_dirty`: Whether working directory had uncommitted changes (0=clean, 1=dirty)
      - `arch_bits`: CPU architecture (32 or 64 bit)
      - `gcc_version`: GCC compiler version used to build
-     - `libevent_version`: libevent library version
-     - `openssl_version`: OpenSSL library version (if TLS enabled)
+     - `libevent_version`: libevent library version (the one loaded at run time)
+     - `libevent_build_version`: libevent headers memtier was built with
+     - `openssl_version`: OpenSSL headers memtier was built with (if TLS enabled)
+     - `openssl_runtime_version`: OpenSSL library loaded at run time (if TLS enabled)
    - Client connection information (if benchmark is running):
      - For each thread, client, and connection:
        - Connection address and port (remote endpoint)
@@ -482,7 +511,9 @@ When a crash occurs, memtier_benchmark will automatically:
 [12345] 16 Dec 2025 11:46:18 # arch_bits:64
 [12345] 16 Dec 2025 11:46:18 # gcc_version:13.3.0
 [12345] 16 Dec 2025 11:46:18 # libevent_version:2.1.12-stable
+[12345] 16 Dec 2025 11:46:18 # libevent_build_version:2.1.12-stable
 [12345] 16 Dec 2025 11:46:18 # openssl_version:OpenSSL 3.0.13 30 Jan 2024
+[12345] 16 Dec 2025 11:46:18 # openssl_runtime_version:OpenSSL 3.0.13 30 Jan 2024
 
 [12345] 16 Dec 2025 11:46:18 # --- CLIENT LIST OUTPUT
 [12345] 16 Dec 2025 11:46:18 # thread=0 client=0 conn=0 addr=127.0.0.1:6379 local_port=37934 state=connected pending=10 last_cmd=GET
