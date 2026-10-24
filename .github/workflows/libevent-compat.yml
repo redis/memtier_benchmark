@@ -268,8 +268,6 @@ jobs:
           VERBOSE: '1'
           PARALLELISM: '2'
         run: |
-          # ulimit only lasts for this step's shell.
-          ulimit -n 40960
           # Some tests compile helpers against libevent: use the same one.
           PKG_CONFIG_PATH="$LIBEVENT_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" ./tests/run_tests.sh
 
