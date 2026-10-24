@@ -838,3 +838,28 @@ Only display rendering is throttled. Timeouts, interruption, StatsD/Prometheus
 exports and CPU/latency sampling retain their existing cadence. Instantaneous
 rates and latencies describe the most recent sample, not the whole display
 interval. JSON configuration records the interval as `progress_interval`.
+
+### Sliding-window tail latency
+
+`--realtime-latencies` prints three latency rows per tick: `inst` (the current
+second), `win<N>s` (every sample completed in the last N seconds, set by
+`--latency-window=N`, default 60, 0 disables, max 3600) and `overall` (the whole
+run). For example, the last 60 seconds' p99.9999:
+
+```
+memtier_benchmark ... --realtime-latencies --latency-window=60 --print-percentiles=50,99,99.9999
+[RUN #1  50%  90s] latency [inst    ] n=31.2K   p50  0.111   p99  0.223   p99.9999  0.912*
+[RUN #1  50%  90s] latency [win60s  ] n=1.87M   p50  0.119   p99  0.239   p99.9999  1.733
+[RUN #1  50%  90s] latency [overall ] n=2.81M   p50  0.119   p99  0.239   p99.9999  2.104  ms
+```
+
+`n` is the row's sample count. A percentile p needs at least `1/(1-p)` samples
+(100 for p99, 1,000,000 for p99.9999); with fewer, it is just the largest
+sample, so the value is marked `*`. When `--requests` or `--rate-limiting`
+bound the number of samples, memtier warns before the run about percentiles
+the run or the window can never resolve, e.g. `--rate-limiting=100` on 160
+connections gives at most 960,000 samples per 60 second window.
+
+The window and overall rows merge the per-second histograms each client has
+completed, so every sample is counted exactly once and they lag the `inst` row
+by up to one second. Each window second keeps one histogram (about 21 KB).

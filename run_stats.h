@@ -208,10 +208,12 @@ protected:
     reinit_mutex_t m_inst_histogram_mutex;
 
     // Completed seconds of inst_m_totals_latency_histogram not yet drained by
-    // the Prometheus exporter. The worker folds each second into it just before
-    // the per-second reset (only when the exporter is enabled), and the main
-    // thread drains it (add + reset) in drain_prom_latency_histogram. Both sides
-    // hold m_inst_histogram_mutex, so every sample is exported exactly once.
+    // the main thread, for the Prometheus exporter and the --realtime-latencies
+    // window/overall rows. The worker folds each second into it just before
+    // the per-second reset (only when one of them is enabled), and the main
+    // thread drains it (add + reset) once per tick in
+    // drain_prom_latency_histogram. Both sides hold m_inst_histogram_mutex, so
+    // every sample is drained exactly once.
     safe_hdr_histogram m_prom_pending_latency_histogram;
 
     // Cumulative hits/misses bookkeeping for arbitrary commands. Indexed by
