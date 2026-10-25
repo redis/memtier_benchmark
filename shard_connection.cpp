@@ -2059,8 +2059,10 @@ void shard_connection::handle_event(short events)
         }
 
         // Any response, even one being retried, means the run has started:
-        // a reconnect after it must not restart the clock.
-        if (!m_conns_manager->get_reqs_answered()) {
+        // a reconnect after it must not restart the clock. Neither must one
+        // after this client sent workload that was never answered (#833): it
+        // takes part in the run's duration (#819), timed from its first start.
+        if (!m_conns_manager->get_reqs_answered() && !m_conns_manager->has_submitted_workload()) {
             process_first_request();
         } else {
             benchmark_debug_log("reconnection complete, proceeding with test\n");
@@ -2602,9 +2604,9 @@ void shard_connection::handle_cluster_slots_retry_event()
     m_cluster_slots = setup_none;
     // The run has not started: don't charge the time spent waiting for the
     // slot map to --test-time or to the throughput figures. Once any
-    // connection of this client has had a reply, the run's clock is running
-    // and must not be moved.
-    if (!m_conns_manager->get_reqs_answered()) {
+    // connection of this client has had a reply or sent workload, the run's
+    // clock is running and must not be moved.
+    if (!m_conns_manager->get_reqs_answered() && !m_conns_manager->has_submitted_workload()) {
         m_conns_manager->set_start_time();
     }
     fill_pipeline();
