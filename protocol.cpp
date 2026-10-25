@@ -661,21 +661,17 @@ bool redis_protocol::response_ended()
     }
 
     bool was_push = m_push;
-    bool was_attribute = m_attribute;
 
-    if (was_attribute) m_attribute = false;
     // A RESP3 push frame just finished draining. The actual reply to
     // the in-flight command (if any) is still pending — keep reading
-    // and do NOT signal a complete reply for the push.
-    // Also handles the case where an attribute (|) is nested inside a
-    // push frame (>) and both complete at the same call: clear BOTH
-    // flags together so m_push does not remain set and eat the next reply.
+    // and do NOT signal a complete reply for the push. (An attribute is
+    // always drained in a nested scope, handled above.)
     if (was_push) {
         m_push = false;
         m_response_len = 0; // reset: push bytes don't count toward the next reply
     }
 
-    if (was_push || was_attribute) return false;
+    if (was_push) return false;
     return true;
 }
 

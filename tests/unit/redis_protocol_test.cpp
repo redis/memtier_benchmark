@@ -236,6 +236,9 @@ static void check_attribute_frames()
         check_reply_pair("|1 $1 k $1 v $2 hi", "|1\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nhi\r\n", "+OK\r\n", 1, false, keep);
         check_reply_pair("%1 +key |1 +k +v +val", "%1\r\n+key\r\n|1\r\n+k\r\n+v\r\n+val\r\n", "+OK\r\n", 0, false,
                          keep);
+        // An error inside an attribute is not the reply's error; one after it is.
+        check_reply_pair("|1 +k -ERR x +OK", "|1\r\n+k\r\n-ERR x\r\n+OK\r\n", "+OK\r\n", 0, false, keep);
+        check_reply_pair("|1 +k +v -ERR x", "|1\r\n+k\r\n+v\r\n-ERR x\r\n", "+OK\r\n", 0, true, keep);
     }
 
     evbuffer *input = evbuffer_new();
