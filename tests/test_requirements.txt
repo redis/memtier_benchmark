@@ -16,7 +16,7 @@ redis>=6.0.0
 # test_harness_auth.py's test_guard_is_installed_in_rltest and
 # test_noauth_guard_raises_on_an_unexpected_error fail if a pin move drops
 # either API.
-git+https://github.com/fcostaoliveira/RLTest.git@73c10b759042f23770d102d13e72a23285f0ffec
+git+https://github.com/fcostaoliveira/RLTest.git@09176c88541ae201125efceba61ab95c4dbfd229
 # pytest + hypothesis power the CLI argument fuzzer (tests/test_cli_fuzz.py,
 # issue #410). The fuzzer is gated by MEMTIER_FUZZ=1 so it's only pulled in
 # on demand; pinning them here keeps the bootstrap reproducible.
