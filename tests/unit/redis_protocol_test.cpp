@@ -73,6 +73,80 @@ static void check_readonly(PROTOCOL_TYPE mode)
     evbuffer_free(output);
 }
 
+// The top-level count of a tracked reply comes from the server, before any
+// element arrives, so the up-front reservation is capped (#837). Elements
+// past the cap still get their own positions.
+static void check_elem_hits_reserve_cap()
+{
+    abstract_protocol *protocol = protocol_factory(PROTOCOL_RESP2);
+    evbuffer *input = evbuffer_new();
+    evbuffer *output = evbuffer_new();
+    if (!protocol || !input || !output) {
+        fprintf(stderr, "FAIL: cannot allocate protocol fixture\n");
+        exit(1);
+    }
+    protocol->set_buffers(input, output);
+    protocol->set_track_elem_misses(true);
+    const std::vector<uint8_t> &hits = protocol->get_response()->get_elem_hits();
+
+    evbuffer_add(input, "*2147483647\r\n", 13);
+    check(protocol->parse_response() == 0, "huge declared count waits for elements");
+    // Exactly the cap: not the declared size, and not nothing (a missing
+    // reserve would still reach capacity 4 for the small reply below).
+    check(hits.capacity() == protocol_response::ELEM_HITS_RESERVE_MAX,
+          "huge declared count reserves only up to the cap");
+    delete protocol;
+    evbuffer_free(input);
+    evbuffer_free(output);
+
+    protocol = protocol_factory(PROTOCOL_RESP2);
+    input = evbuffer_new();
+    output = evbuffer_new();
+    if (!protocol || !input || !output) {
+        fprintf(stderr, "FAIL: cannot allocate protocol fixture\n");
+        exit(1);
+    }
+    protocol->set_buffers(input, output);
+    protocol->set_track_elem_misses(true);
+    const std::vector<uint8_t> &elem_hits = protocol->get_response()->get_elem_hits();
+
+    // MGET-like reply: value, null bulk, empty array, non-empty array.
+    const char reply[] = "*4\r\n$1\r\na\r\n$-1\r\n*0\r\n*1\r\n$1\r\nb\r\n";
+    evbuffer_add(input, reply, strlen(reply));
+    check(protocol->parse_response() == 1, "tracked reply completes");
+    check(elem_hits.size() == 4 && elem_hits[0] == 1 && elem_hits[1] == 0 && elem_hits[2] == 0 && elem_hits[3] == 1,
+          "tracked reply keeps per-element positions");
+    check(elem_hits.capacity() == 4, "tracked reply reserves its declared count");
+
+    // A reply past the cap: every element is tracked at its own position.
+    const int count = (int) protocol_response::ELEM_HITS_RESERVE_MAX * 2 + 1;
+    char header[32];
+    snprintf(header, sizeof(header), "*%d\r\n", count);
+    evbuffer_add(input, header, strlen(header));
+    for (int i = 0; i < count; ++i) {
+        const char *element = (i % 3 == 0) ? "$-1\r\n" : "$1\r\nv\r\n";
+        evbuffer_add(input, element, strlen(element));
+    }
+    check(protocol->parse_response() == 1, "reply past the reservation cap completes");
+    bool positions = elem_hits.size() == (size_t) count;
+    for (int i = 0; positions && i < count; ++i)
+        positions = elem_hits[i] == (i % 3 == 0 ? 0 : 1);
+    check(positions, "reply past the reservation cap keeps per-element positions");
+
+    // The next reply reuses the grown storage instead of reallocating.
+    const uint8_t *storage = elem_hits.data();
+    size_t capacity = elem_hits.capacity();
+    evbuffer_add(input, reply, strlen(reply));
+    check(protocol->parse_response() == 1, "tracked reply after a large one completes");
+    check(elem_hits.size() == 4 && elem_hits[1] == 0 && elem_hits[3] == 1,
+          "tracked reply after a large one keeps per-element positions");
+    check(elem_hits.data() == storage && elem_hits.capacity() == capacity,
+          "tracked replies reuse the element flags storage");
+    delete protocol;
+    evbuffer_free(input);
+    evbuffer_free(output);
+}
+
 // Feeds `wire` to a fresh RESP3 keep_value parser and parses two replies,
 // returning the parser so the caller can inspect the second reply.
 static abstract_protocol *parse_two_resp3_kept_replies(const char *wire, evbuffer **input_out)
@@ -241,6 +315,7 @@ static void check_nested_push_keep_value()
 
 int main()
 {
+    check_elem_hits_reserve_cap();
     check_readonly(PROTOCOL_REDIS_DEFAULT);
     check_readonly(PROTOCOL_RESP2);
     check_readonly(PROTOCOL_RESP3);
