@@ -388,28 +388,30 @@ def server_supports_resp3(env):
     as "not supported" (R5 round-18 caused 3 RESP3 read-preference tests to
     silent-skip on Redis 6+). Parse ``redis_version`` from ``INFO server``
     instead — that reply stays RESP2 and tells us exactly what we need.
+
+    Errors are deliberately not caught: a probe that cannot decide must fail
+    the test rather than turn it into a silent skip.
     """
-    try:
-        conn = env.getConnection()
-        info = conn.execute_command("INFO", "server")
-        version = None
-        if isinstance(info, dict):
-            version = info.get("redis_version")
-        else:
-            # Raw bulk string fallback (older redis-py / decode_responses=True).
-            if isinstance(info, bytes):
-                info = info.decode("utf-8", errors="replace")
-            for line in info.splitlines():
-                line = line.strip()
-                if line.startswith("redis_version:"):
-                    version = line.split(":", 1)[1].strip()
-                    break
-        if not version:
-            return False
-        major = int(version.split(".")[0])
-        return major >= 6
-    except Exception:
-        return False
+    conn = env.getConnection()
+    info = conn.execute_command("INFO", "server")
+    version = None
+    if isinstance(info, dict):
+        version = info.get("redis_version")
+    else:
+        # Raw bulk string fallback (older redis-py / decode_responses=True).
+        if isinstance(info, bytes):
+            info = info.decode("utf-8", errors="replace")
+        for line in info.splitlines():
+            line = line.strip()
+            if line.startswith("redis_version:"):
+                version = line.split(":", 1)[1].strip()
+                break
+    if not version:
+        raise AssertionError(
+            "server_supports_resp3: no redis_version in INFO server reply: "
+            "{!r}".format(info))
+    major = int(str(version).split(".")[0])
+    return major >= 6
 
 
 def get_get_call_count(conn):
