@@ -222,10 +222,12 @@ protected:
     mbulk_size_el *m_current_mbulk;
     bool m_resp3;
     bool m_attribute;
-    // Drain mode for RESP3 server-pushed frames ('>'). Pushes are
+    // Drain mode for RESP3 server-pushed frames ('>') and attributes ('|',
+    // always nested, with m_attribute set; #458). Pushes are
     // out-of-band (pubsub, keyspace notifications, client tracking
     // invalidations) and must not be delivered as a reply to any
-    // in-flight command. While true the parser still walks the frame
+    // in-flight command; attributes only decorate the element after them.
+    // While true the parser still walks the frame
     // to advance the read buffer, but suppresses all writes into
     // m_last_response (status, mbulk tree, value, hits).
     // TODO: full out-of-band routing — surface push frames to a
