@@ -1682,6 +1682,11 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         // routed by slot either, so it must stay off replicas too.
         if (cmd.keys_count == 0 && !monitor &&
             !(m_config->read_preference != rp_primary && is_read_command_index(m_executed_command_index))) {
+            // A primary may itself be parked (e.g. by the in-flight budget
+            // above) with nothing in flight; this replica no longer produces,
+            // so wake one, or the event loop runs dry and the thread ends.
+            unsigned int primary = fallback_primary_conn_id();
+            if (primary < m_connections.size()) m_connections[primary]->schedule_fill();
             return true;
         }
     }
@@ -2509,6 +2514,10 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
             return false;
         }
         client::create_arbitrary_request(command_index, timestamp, send_conn_id);
+        // The destination may be paused (bufferevent disabled when it went
+        // idle, e.g. a replica held for a keyless write): re-enable it so the
+        // request is flushed, as the keyed path does after pushing to a pool.
+        if (send_conn_id != conn_id) m_connections[send_conn_id]->schedule_fill();
         if (is_read) {
             m_strict_no_route_attempts = 0;
             record_read_routing(command_index, m_connections[send_conn_id]->is_replica());

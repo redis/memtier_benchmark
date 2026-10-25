@@ -1123,3 +1123,40 @@ def test_read_preference_keyless_commands_skip_replicas(env):
             env.assertGreater(replica.commands[verb], 0, message=message)
         else:
             env.assertEqual(replica.commands[verb], 0, message=message)
+
+
+def test_read_preference_keyless_hold_keeps_traffic_flowing(env):
+    """A replica held off a keyless command (#676) must not stall the run:
+    a keyless read routed onto the idle replica must still be flushed, and
+    keyed reads queued for the replica must keep flowing while the primary
+    produces the keyless writes. A stall ends the thread before --requests."""
+    cases = [
+        # (args, workers, clients, requests, primary counts, replica counts)
+        (["--command=FLUSHDB", "--command=DBSIZE", "--read-preference=secondary"], 1, 1, 2,
+         {b"FLUSHDB": 1}, {b"DBSIZE": 1}),
+        (["--command=FLUSHDB", "--command=DBSIZE", "--read-preference=secondary"], 1, 1, 100,
+         {b"FLUSHDB": 50}, {b"DBSIZE": 50}),
+        (["--command=FLUSHDB", "--command=PING", "--command-is-read", "--read-preference=nearest"], 2, 2, 100,
+         {b"FLUSHDB": 200}, {b"PING": 200}),
+        (["--command=GET __key__", "--command=PING", "--read-preference=secondary"], 2, 2, 200,
+         {b"PING": 400}, {b"GET": 400}),
+        (["--command=SET __key__ v", "--command=GET __key__", "--command=PING",
+          "--read-preference=secondaryPreferred"], 2, 2, 300,
+         {b"SET": 400, b"PING": 400}, {b"GET": 400}),
+        (["--command=SET __key__ v", "--command=GET __key__", "--command=PING",
+          "--read-preference=primary"], 2, 2, 300,
+         {b"SET": 400, b"GET": 400, b"PING": 400}, {}),
+    ]
+    data = (b"FLUSHDB", b"DBSIZE", b"PING", b"GET", b"SET")
+    for args, workers, clients, requests, want_primary, want_replica in cases:
+        replica = _Node(0)
+        node = _Node(0, replica=replica)
+        # The default --pipeline=1: deeper pipelines can hide a parked primary.
+        rc, stderr, _ = _run(node, args + ["--requests={}".format(requests)], workers=workers, clients=clients)
+        got_primary = {v: n for v, n in node.commands.items() if v in data}
+        got_replica = {v: n for v, n in replica.commands.items() if v in data}
+        message = "{}: primary={} replica={}\n{}".format(" ".join(args), got_primary, got_replica, stderr[-2000:])
+        env.assertEqual(rc, 0, message=message)
+        env.assertEqual(node.errors + replica.errors, [], message=message)
+        env.assertEqual(got_primary, want_primary, message=message)
+        env.assertEqual(got_replica, want_replica, message=message)
