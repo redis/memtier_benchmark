@@ -718,6 +718,7 @@ int shard_connection::connect(struct connect_info *addr)
     if (m_reconnect_timer != NULL) {
         event_free(m_reconnect_timer);
         m_reconnect_timer = NULL;
+        m_reconnect_deadline.tv_sec = m_reconnect_deadline.tv_usec = 0;
     }
     m_reconnecting = false;
     m_setup_rejected = false;
@@ -790,6 +791,7 @@ void shard_connection::disconnect()
     if (m_reconnect_timer != NULL) {
         event_free(m_reconnect_timer);
         m_reconnect_timer = NULL;
+        m_reconnect_deadline.tv_sec = m_reconnect_deadline.tv_usec = 0;
     }
 
     if (m_connection_timeout_timer != NULL) {
