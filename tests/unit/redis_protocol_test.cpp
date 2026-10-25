@@ -91,8 +91,10 @@ static void check_elem_hits_reserve_cap()
 
     evbuffer_add(input, "*2147483647\r\n", 13);
     check(protocol->parse_response() == 0, "huge declared count waits for elements");
-    check(hits.capacity() <= protocol_response::ELEM_HITS_RESERVE_MAX,
-          "huge declared count does not reserve its declared size");
+    // Exactly the cap: not the declared size, and not nothing (a missing
+    // reserve would still reach capacity 4 for the small reply below).
+    check(hits.capacity() == protocol_response::ELEM_HITS_RESERVE_MAX,
+          "huge declared count reserves only up to the cap");
     delete protocol;
     evbuffer_free(input);
     evbuffer_free(output);
