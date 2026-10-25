@@ -37,6 +37,7 @@ from include import (
     get_cluster_replica_connections,
     get_default_memtier_config,
     reset_commandstats,
+    shutdown_nosave,
 )
 from mb import Benchmark, RunConfig
 
@@ -185,14 +186,10 @@ def _stop_one_replica(env, replica_conns):
     """
     for conn in replica_conns:
         killed_port = _conn_port(conn)
-        try:
-            # SHUTDOWN NOSAVE will close the connection; ignore the error.
-            conn.execute_command("SHUTDOWN", "NOSAVE")
-        except Exception:
-            # The connection is expected to close; treat this as success.
-            pass
-        # Give the OS a moment to reap the process.
-        time.sleep(0.5)
+        # Mark only a replica that really stopped: RLTest does not stop the
+        # ones marked dead, so a refused SHUTDOWN would leak the process.
+        if not shutdown_nosave(conn):
+            continue
         if killed_port is not None:
             _mark_dead_in_rltest(env, {killed_port})
         return True

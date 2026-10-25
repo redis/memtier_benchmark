@@ -27,7 +27,7 @@ import subprocess
 import tempfile
 import time
 
-from include import MEMTIER_BINARY, addTLSArgs, memtier_auth_args
+from include import MEMTIER_BINARY, addTLSArgs, allow_noauth, env_password, memtier_auth_args
 
 
 # Short timeout so the regression suite finishes in seconds, not 30 s per
@@ -180,7 +180,7 @@ def _base_args(env, requests=None):
 # Issue #426 item 1: --authenticate '' against no-auth Redis hangs.
 # ---------------------------------------------------------------------------
 def test_426_1_authenticate_empty_password_against_no_auth(env):
-    if env.getMasterNodesList()[0].get("password"):
+    if env_password(env):
         env.skip()  # the server requires a password: not the case under test
         return
     args = _base_args(env)
@@ -205,6 +205,7 @@ def test_426_2_cluster_mode_against_standalone(env):
 # Issue #426 item 3: memcache_{text,binary} protocol against a Redis server
 # (response parser never aligns → tight spin in process_response).
 # ---------------------------------------------------------------------------
+@allow_noauth("memcache_text cannot AUTH to Redis; the test sends it to Redis on purpose")
 def test_426_3_memcache_text_against_redis(env):
     args = _base_args(env)
     if args is None:
@@ -213,6 +214,7 @@ def test_426_3_memcache_text_against_redis(env):
     _assert_supervisor_tripped(env, args, "#3 --protocol memcache_text vs redis")
 
 
+@allow_noauth("memcache_binary cannot AUTH to Redis; the test sends it to Redis on purpose")
 def test_426_3_memcache_binary_against_redis(env):
     args = _base_args(env)
     if args is None:
