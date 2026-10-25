@@ -1563,13 +1563,12 @@ static bool is_redis_connection_rejection(const char *status)
 }
 
 // A server without HELLO (Redis < 6.0, or another RESP server) answers it as
-// an unknown command. Redis quotes the name with ' (or ` in 5.x).
+// an unknown command. The reply is to our own HELLO, so the command name it
+// quotes (' in Redis 6+, ` in 5.x, or none) does not need checking.
 static bool is_unknown_hello_error(const char *status)
 {
-    static const char prefix[] = "-ERR unknown command ";
-    if (!status || strncmp(status, prefix, sizeof(prefix) - 1) != 0) return false;
-    const char *name = status + sizeof(prefix) - 1;
-    return (name[0] == '\'' || name[0] == '`') && strncasecmp(name + 1, "hello", 5) == 0 && name[6] == name[0];
+    static const char prefix[] = "-ERR unknown command";
+    return status && strncasecmp(status, prefix, sizeof(prefix) - 1) == 0;
 }
 
 void shard_connection::process_response(void)
@@ -1698,7 +1697,7 @@ void shard_connection::process_response(void)
             } else if (r->is_error()) {
                 if (m_config->protocol == PROTOCOL_RESP3 && is_unknown_hello_error(r->get_status()))
                     benchmark_error_log("error: server does not support HELLO, so RESP3 is unavailable "
-                                        "(requires Redis >= 6.0)\n");
+                                        "(Redis added HELLO in 6.0)\n");
                 benchmark_error_log("error: HELLO failed [%s]\n", r->get_status());
                 {
                     char buf[256];

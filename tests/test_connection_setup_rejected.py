@@ -305,7 +305,8 @@ def test_standalone_auth_rejected_on_some_connections_fails_run(env):
 
 _UNKNOWN_HELLO = (b"-ERR unknown command 'HELLO', with args beginning with: '2' \r\n",
                   b"-ERR unknown command 'hello'\r\n",
-                  b"-ERR unknown command `hello`, with args beginning with: `2`, \r\n")
+                  b"-ERR unknown command `hello`, with args beginning with: `2`, \r\n",
+                  b"-ERR unknown command\r\n")
 
 
 def test_resp2_without_hello_support_runs(env):
@@ -325,12 +326,12 @@ def test_resp2_without_hello_support_runs(env):
 
 
 def test_resp3_without_hello_support_fails_clearly(env):
-    node = _Node(bad_slots_replies=0, hello_error=_UNKNOWN_HELLO[0])
+    node = _Node(bad_slots_replies=0, hello_error=b"-ERR unknown command 'HELLO', with args beginning with: '3' \r\n")
     returncode, stderr, elapsed = _run(node, ["--protocol=resp3", "--requests=200",
                                               "--connection-stage-timeout=2"], cluster=False)
     env.assertEqual(node.errors, [])
     env.assertNotEqual(returncode, 0, message=stderr[-2000:])
-    env.assertContains("server does not support HELLO, so RESP3 is unavailable (requires Redis >= 6.0)", stderr)
+    env.assertContains("server does not support HELLO, so RESP3 is unavailable (Redis added HELLO in 6.0)", stderr)
     env.assertEqual(node.data_requests, 0)
     env.assertLess(elapsed, 8)
 
