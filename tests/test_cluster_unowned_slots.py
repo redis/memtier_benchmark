@@ -916,9 +916,9 @@ class _Failover(_Node):
     A closes its first two connections during AUTH instead, and the refresh
     after the second one returns the new map, so A is still redialing when
     it changes role. With pending=True A closes instead of answering that
-    refresh, and R answers a PING with CLUSTERDOWN once the CLUSTERDOWN poll
-    allows another refresh, so the map is committed while A's reconnect
-    timer is still pending. A SET sent to a node that does not own its slot
+    refresh once R's PING is held, and that PING gets CLUSTERDOWN, so the map
+    is committed while A's reconnect timer is still pending (see ping_reply).
+    A SET sent to a node that does not own its slot
     gets -MOVED, or with moved=False is accepted, as by a demoted primary.
     """
 
@@ -934,8 +934,11 @@ class _Failover(_Node):
         self.triggered = redial
         self.pending = pending
         self.held = False
-        self.pings = 0
-        self.triggered_at = None
+        self.r_pings = 0
+        self.refreshed_at = None
+        self.sent = set()
+        # Shares the lock, so every change below can wake a waiting handler.
+        self.cond = threading.Condition(self.lock)
         self.closed = threading.Event()
         if redial:
             self.auth_closes = 2
@@ -958,12 +961,18 @@ class _Failover(_Node):
             if server is self and self.triggered and not self.changed:
                 self.apply_change()
             if server is self and self.changed:
+                if not self.refreshed:
+                    self.refreshed_at = time.monotonic()
                 self.refreshed = True
-        if (server is self and self.changed) or (self.redial and self.auth_attempts and self.slots_calls):
-            time.sleep(0.3)
+                self.cond.notify_all()
         if self.pending and server is self and self.refreshed and not self.closed.is_set():
+            # Close only once R's PING is held, so the commit comes from it.
+            with self.cond:
+                self.cond.wait_for(lambda: self.held, timeout=10)
             self.closed.set()
             return None
+        if (server is self and self.changed) or (self.redial and self.auth_attempts and self.slots_calls):
+            time.sleep(0.3)
         with self.lock:
             self.slots_calls += 1
             shards = list(self.map)
@@ -988,9 +997,10 @@ class _Failover(_Node):
             # Whether A was asked for the new map before this SET arrived:
             # one sent earlier can only be stale.
             self.log.append((server.name, args[1], int(args[2].split(b"-")[1]), owned, self.refreshed))
+            self.sent.add(self.log[-1][2])
+            self.cond.notify_all()
             if server is self and not self.triggered:
                 self.triggered = True
-                self.triggered_at = time.monotonic()
                 if self.silent:
                     self.apply_change()
                 else:
@@ -1002,16 +1012,30 @@ class _Failover(_Node):
         return b"-MOVED %d 127.0.0.1:%d\r\n" % (slot, owner.server_address[1])
 
     def ping_reply(self, server):
-        if not (self.pending and server is self.replica and self.refreshed and not self.held):
+        if not (self.pending and server is self.replica):
             return b"+PONG\r\n"
-        # Hold R's third PING since A was asked for the map, so R stages lines on A first.
-        self.pings += 1
-        if self.pings < 3:
-            return b"+PONG\r\n"
-        self.held = True
-        self.closed.wait(5)
-        # memtier polls CLUSTERDOWN at most once a second.
-        time.sleep(max(0.0, self.triggered_at + 1.3 - time.monotonic()))
+        # The client alternates PING and monitor line, so lines 0..n-2 were
+        # selected before R's n-th PING. While A refreshes, A sends nothing,
+        # so a selected line that no node has received is staged on A.
+        with self.cond:
+            self.r_pings += 1
+            n = self.r_pings
+            if self.held:
+                return b"+PONG\r\n"
+            # Before the refresh, answer only once A has those lines, so R
+            # cannot fill the in-flight budget with lines A has not answered
+            # and stall with nothing on R left to hold.
+            self.cond.wait_for(lambda: self.refreshed or self.sent.issuperset(range(n - 1)), timeout=10)
+            # Hold the first PING behind which an unowned line (memtier-1,
+            # even index) is staged on A; answer the others so R stages more.
+            if not (self.refreshed and any(i not in self.sent for i in range(0, n - 1, 2))):
+                return b"+PONG\r\n"
+            self.held = True
+            self.cond.notify_all()
+        self.closed.wait(10)
+        # memtier acts on CLUSTERDOWN at most once a second. Its last poll
+        # was A's, before A sent the SLOTS request seen at refreshed_at.
+        time.sleep(max(0.0, self.refreshed_at + 1.05 - time.monotonic()))
         return b"-CLUSTERDOWN The cluster is down\r\n"
 
 
