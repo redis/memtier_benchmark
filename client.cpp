@@ -1204,7 +1204,8 @@ void client::handle_response(unsigned int conn_id, struct timeval timestamp, req
                 break;
             }
             case ReplyShape::IntegerMembership: {
-                // Reply is ":N\r\n" where N is the count of present keys.
+                // Reply is ":N\r\n" where N is the count of present keys,
+                // or a RESP3 boolean ("#t"/"#f") for a single-key probe (#459).
                 // Per-position attribution is impossible from this reply, so
                 // we mark the first N buckets as hits and the rest as misses;
                 // the aggregate is correct, the per-position is conventional.
@@ -1213,6 +1214,8 @@ void client::handle_response(unsigned int conn_id, struct timeval timestamp, req
                 if (status != NULL && status[0] == ':') {
                     long v = strtol(status + 1, NULL, 10);
                     if (v > 0) n = (unsigned int) v;
+                } else if (status != NULL && status[0] == '#') {
+                    n = status[1] == 't' ? num_keys : 0;
                 }
                 if (n > num_keys) n = num_keys;
                 hits = n;

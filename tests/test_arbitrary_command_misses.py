@@ -672,3 +672,59 @@ def test_arbitrary_mget_resp3_nulls_and_literal_underscore(env):
     for i, hit in enumerate([True, True, False, False]):
         env.assertEqual(cmd_stats["key[{}] Hits".format(i)], calls if hit else 0)
         env.assertEqual(cmd_stats["key[{}] Misses".format(i)], 0 if hit else calls)
+
+
+def test_arbitrary_sismember_resp3_boolean(env):
+    """SISMEMBER answered with RESP3 booleans (#t/#f) counts hits (#459).
+
+    Redis still answers membership probes with :0/:1, so a scripted RESP3
+    peer answers SISMEMBER with #t and #f in turn: half the requests are hits.
+    """
+    env.skipOnCluster()
+    import socketserver
+    import subprocess
+    import threading
+
+    from include import MEMTIER_BINARY
+
+    class _Handler(socketserver.StreamRequestHandler):
+        def handle(self):
+            answered = 0
+            while True:
+                line = self.rfile.readline()
+                if not line:
+                    return
+                args = []
+                for _ in range(int(line[1:])):
+                    size = self.rfile.readline()
+                    args.append(self.rfile.read(int(size[1:]) + 2)[:-2])
+                verb = args[0].upper()
+                if verb == b"HELLO":
+                    reply = b"%1\r\n+proto\r\n:3\r\n"
+                elif verb == b"SISMEMBER":
+                    reply = b"#t\r\n" if answered % 2 == 0 else b"#f\r\n"
+                    answered += 1
+                else:
+                    reply = b"+OK\r\n"
+                self.wfile.write(reply)
+                self.wfile.flush()
+
+    server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), _Handler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    json_path = os.path.join(tempfile.mkdtemp(), "mb.json")
+    try:
+        result = subprocess.run(
+            [MEMTIER_BINARY, "--server=127.0.0.1", "--port={}".format(server.server_address[1]),
+             "--protocol=resp3", "--command=SISMEMBER memtier-set __key__", "--threads=1",
+             "--clients=1", "--requests=20", "--hide-histogram", "--json-out-file={}".format(json_path)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, text=True)
+    finally:
+        server.shutdown()
+        server.server_close()
+    env.assertEqual(result.returncode, 0, message=result.stderr[-500:])
+    with open(json_path) as fh:
+        stats = json.load(fh)["ALL STATS"]["Per-Key Misses"]["SISMEMBER"]
+    env.assertEqual(stats["Total Hits"], 10)
+    env.assertEqual(stats["Total Misses"], 10)
