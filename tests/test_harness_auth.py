@@ -4,8 +4,8 @@ from types import SimpleNamespace
 import redis
 from RLTest import loader
 
-from include import (allow_noauth, env_password, memtier_auth_args, noauth_guard,
-                     shutdown_nosave)
+from include import (allow_noauth, bounded_client, env_password, memtier_auth_args,
+                     noauth_guard, shutdown_nosave)
 
 
 class _Env:
@@ -234,3 +234,19 @@ def test_shutdown_nosave_reports_only_a_real_stop(env):
     env.assertFalse(shutdown_nosave(_ShutdownConn(closed, pings_before_down=None), timeout=0.3))
     # Answering NOAUTH to PING means it is still running.
     env.assertFalse(shutdown_nosave(_ShutdownConn(closed, ping_error=noauth), timeout=0.3))
+
+
+def test_bounded_client_turns_off_retries_on_open_connections(env):
+    # No server needed: port 1 is never connected to.
+    conn = redis.Redis(host="localhost", port=1)
+    pool = conn.connection_pool
+    # A connection the client already opened, back in the pool, with
+    # redis-py's default retries.
+    opened = pool.make_connection()
+    pool._available_connections.append(opened)
+    env.assertGreater(opened.retry.get_retries(), 0)
+    bounded_client(conn, timeout=2.0)
+    env.assertEqual(opened.retry.get_retries(), 0)
+    env.assertEqual(pool.connection_kwargs["socket_timeout"], 2.0)
+    # A connection made afterwards has retries off too.
+    env.assertEqual(pool.make_connection().retry.get_retries(), 0)

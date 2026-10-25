@@ -142,8 +142,9 @@ def bounded_client(conn, timeout=5.0):
     pool = getattr(conn, "connection_pool", None)
     if pool is not None:
         # set_retry also reaches the pool's existing connections, which keep
-        # their own retry; disconnecting them makes the next command reconnect
-        # with the new socket timeout.
+        # their own retry. Those connections keep the socket timeout they were
+        # made with (redis-py's default is 5 s, as is ours); disconnecting
+        # them still drops a socket a command may have left mid-reply.
         pool.set_retry(Retry(NoBackoff(), 0))
         pool.connection_kwargs["socket_timeout"] = timeout
         if "socket_connect_timeout" in pool.connection_kwargs:
