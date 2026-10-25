@@ -650,11 +650,14 @@ bool redis_protocol::response_ended()
     if (m_push && m_push_nested) {
         // A nested push ended: resume the enclosing aggregate. Its bytes are
         // part of this reply, so m_response_len is kept.
+        // An attribute ended the same way: it only prefixes the element that
+        // follows, so the reply goes on even at top level.
+        bool was_attribute = m_attribute;
         m_push = false;
         m_push_nested = false;
         m_attribute = m_push_outer_attribute;
         m_total_bulks_count = m_push_outer_bulks;
-        if (m_total_bulks_count != 0) return false;
+        if (m_total_bulks_count != 0 || was_attribute) return false;
     }
 
     bool was_push = m_push;
@@ -722,8 +725,9 @@ int redis_protocol::parse_response(void)
                 // a reply at all.
                 bool top_level_aggregate = (m_total_bulks_count == 0);
 
-                // in case of nested mbulk, the mbulk is one of the total bulks
-                if (m_total_bulks_count > 0) {
+                // in case of nested mbulk, the mbulk is one of the total bulks.
+                // An attribute (|) is not: it decorates the element after it.
+                if (m_total_bulks_count > 0 && line[0] != '|') {
                     m_total_bulks_count--;
                 }
 
@@ -733,10 +737,18 @@ int redis_protocol::parse_response(void)
                 }
 
                 if (line[0] == '|') {
-                    // Nested attribute?
-                    assert(!m_attribute);
-
-                    m_attribute = true;
+                    // Attribute: drain it like a nested push, in its own scope,
+                    // so it never reaches the reply (status, kept mbulk tree,
+                    // hits, miss tracking) and the element it decorates parses
+                    // as if it were not there (#458). Anything inside it,
+                    // including another attribute or a push, is drained with it.
+                    if (!m_push) {
+                        m_attribute = true;
+                        m_push = true;
+                        m_push_nested = true;
+                        m_push_outer_bulks = m_total_bulks_count;
+                        m_total_bulks_count = 0;
+                    }
                 }
 
                 if (line[0] == '>' && !m_push) {
