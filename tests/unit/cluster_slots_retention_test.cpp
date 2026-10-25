@@ -263,6 +263,53 @@ static void exercise(bool prior, int path)
     event_base_free(base);
 }
 
+// A CLUSTER SLOTS retry (an empty reply without --reconnect-on-error) restarts
+// the clock of a client that has not started, but not of one that has sent
+// workload that is still unanswered (#833).
+static void check_slots_retry_start_time(bool submitted)
+{
+    arbitrary_command_list commands;
+    benchmark_config cfg = {};
+    cfg.arbitrary_commands = &commands;
+    cfg.clients = cfg.threads = 1;
+    cfg.key_pattern = "S:S";
+    cfg.pipeline = 0;
+    cfg.protocol = PROTOCOL_REDIS_DEFAULT;
+    cfg.cluster_mode = true;
+    cfg.test_time = 60;
+    cfg.authenticate = "dummy-833";
+    event_base *base = event_base_new();
+    require(base != NULL, "event base");
+    abstract_protocol *prototype = protocol_factory(cfg.protocol);
+    {
+        object_generator generator;
+        generator.set_data_size_fixed(1);
+        retention_client manager(base, &cfg, prototype, &generator);
+        shard_connection &connection = *manager.get_connections()[1];
+        connection.disconnect();
+        peer server(base);
+        connection.set_cluster_slots();
+        server.connect(connection);
+        server.expect("*2\r\n$4\r\nAUTH\r\n$9\r\ndummy-833\r\n"
+                      "*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n");
+        server.reply("+OK\r\n*0\r\n");
+        server.drain(connection);
+        require(connection.get_cluster_slots_state() == setup_sent, "empty map leaves a retry pending");
+        timeval start = {1000, 0};
+        manager.set_start_time_at(&start);
+        if (submitted) manager.mark_workload_submitted();
+        require(manager.get_reqs_answered() == 0, "no workload reply");
+        connection.handle_cluster_slots_retry_event();
+        timeval stamped = manager.get_stats()->get_start_time();
+        require((stamped.tv_sec == start.tv_sec && stamped.tv_usec == start.tv_usec) == submitted,
+                submitted ? "retry keeps a submitting client's start time" : "retry restarts an idle client's clock");
+        server.expect("*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n");
+        connection.disconnect();
+    }
+    delete prototype;
+    event_base_free(base);
+}
+
 int main()
 {
 #ifdef _WIN32
@@ -275,6 +322,8 @@ int main()
         for (int path = 0; path < 7; ++path)
             exercise(prior != 0, path);
     }
-    puts("cluster slot retention tests passed (14 cases, two refresh cycles each)");
+    check_slots_retry_start_time(false);
+    check_slots_retry_start_time(true);
+    puts("cluster slot retention tests passed (14 cases, two refresh cycles each; 2 retry start-time cases)");
     return 0;
 }

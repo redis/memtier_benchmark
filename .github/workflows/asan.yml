@@ -66,6 +66,28 @@ jobs:
     - name: Verify HDR C instrumentation
       run: nm -u deps/hdr_histogram/memtier_benchmark-hdr_histogram.o | grep -E '__asan_report_'
 
+    # Unit tests inherit the sanitizer CXXFLAGS/LDFLAGS set by configure.
+    - name: Run unit tests
+      env:
+        ASAN_OPTIONS: detect_leaks=1
+      timeout-minutes: 15
+      run: |
+        if ! make -j check; then
+          cat test-suite.log
+          exit 1
+        fi
+
+    - name: Upload unit test logs
+      if: failure()
+      uses: actions/upload-artifact@v5
+      with:
+        name: memtier-asan-unit-test-logs
+        path: |
+          test-suite.log
+          *_test.log
+        if-no-files-found: ignore
+        retention-days: 7
+
     - name: Upload build artifact
       uses: actions/upload-artifact@v5
       with:

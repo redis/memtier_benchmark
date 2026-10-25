@@ -155,6 +155,7 @@ int protocol_response::get_top_array_len(void)
 
 void protocol_response::elem_hits_reserve(size_t n)
 {
+    if (n > ELEM_HITS_RESERVE_MAX) n = ELEM_HITS_RESERVE_MAX;
     m_elem_hits.reserve(n);
 }
 
@@ -230,6 +231,13 @@ protected:
     // TODO: full out-of-band routing — surface push frames to a
     // listener instead of silently dropping them.
     bool m_push;
+    // A push nested in an aggregate (not valid RESP3, which only sends pushes
+    // at top level) fills one slot of the enclosing aggregate and is drained
+    // in its own scope: the enclosing slot count and attribute flag are saved
+    // here and restored when the push ends (#847).
+    bool m_push_nested;
+    bool m_push_outer_attribute;
+    unsigned int m_push_outer_bulks;
     // Per-response state for alloc-free ArrayPerElementNulls miss tracking
     // (m_track_elem_misses). m_tracking turns true once the reply's top-level
     // array header is seen. m_nested_remaining counts leaf/element slots still
@@ -267,6 +275,9 @@ public:
             m_resp3(false),
             m_attribute(false),
             m_push(false),
+            m_push_nested(false),
+            m_push_outer_attribute(false),
+            m_push_outer_bulks(0),
             m_tracking(false),
             m_nested_remaining(0)
     {
@@ -314,6 +325,9 @@ void redis_protocol::reset_state()
     m_total_bulks_count = 0;
     m_attribute = false;
     m_push = false;
+    m_push_nested = false;
+    m_push_outer_attribute = false;
+    m_push_outer_bulks = 0;
     m_bulk_len = 0;
     m_response_len = 0;
     m_current_mbulk = NULL;
@@ -633,6 +647,16 @@ bool redis_protocol::response_ended()
 {
     if (m_total_bulks_count != 0) return false;
 
+    if (m_push && m_push_nested) {
+        // A nested push ended: resume the enclosing aggregate. Its bytes are
+        // part of this reply, so m_response_len is kept.
+        m_push = false;
+        m_push_nested = false;
+        m_attribute = m_push_outer_attribute;
+        m_total_bulks_count = m_push_outer_bulks;
+        if (m_total_bulks_count != 0) return false;
+    }
+
     bool was_push = m_push;
     bool was_attribute = m_attribute;
 
@@ -661,15 +685,15 @@ int redis_protocol::parse_response(void)
         switch (m_response_state) {
         case rs_initial:
             // clear last response; this frees the kept mbulk tree, so the
-            // cursor into it must go too. A reply can complete with the
-            // cursor still set (e.g. a nested RESP3 push drained the slots
-            // of an enclosing kept aggregate), see #839.
+            // cursor into it must go too, in case a reply completed with the
+            // cursor still set (#839).
             m_last_response.clear();
             m_current_mbulk = NULL;
             m_response_len = 0;
             m_total_bulks_count = 0;
             m_attribute = 0;
             m_push = 0;
+            m_push_nested = false;
             m_tracking = false;
             m_nested_remaining = 0;
             m_response_state = rs_read_line;
@@ -715,10 +739,27 @@ int redis_protocol::parse_response(void)
                     m_attribute = true;
                 }
 
-                if (line[0] == '>') {
-                    // Top-level push frame: enter drain mode. Nested
-                    // pushes (push inside push) are not defined by RESP3
-                    // and not expected; only set the flag once.
+                if (line[0] == '>' && !m_push) {
+                    // Push frame: enter drain mode. A push inside a push is
+                    // drained as part of the outer one.
+                    if (!top_level_aggregate) {
+                        // Nested push: it fills the slot taken above, as any
+                        // aggregate element would; its contents are counted
+                        // apart so they cannot consume the enclosing
+                        // aggregate's slots (#847). The slot holds no value.
+                        track_leaf(false);
+                        if (m_keep_value && m_current_mbulk) {
+                            bulk_el *new_bulk = new bulk_el();
+                            new_bulk->is_resp3_null = true;
+                            m_current_mbulk->add_new_element(new_bulk);
+                            m_current_mbulk = m_current_mbulk->get_next_mbulk();
+                        }
+                        m_push_nested = true;
+                        m_push_outer_attribute = m_attribute;
+                        m_push_outer_bulks = m_total_bulks_count;
+                        m_attribute = false;
+                        m_total_bulks_count = 0;
+                    }
                     m_push = true;
                 }
 

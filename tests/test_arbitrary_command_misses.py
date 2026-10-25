@@ -17,6 +17,7 @@ from include import (
     debugPrintMemtierOnError,
     ensure_clean_benchmark_folder,
     get_default_memtier_config,
+    server_supports_resp3,
 )
 from mb import Benchmark, RunConfig
 
@@ -45,7 +46,7 @@ def _preload_sets(env, prefix):
 
 
 def _run_benchmark(env, command, miss_tracking="auto", key_prefix=_KEY_PREFIX, requests=_REQUESTS,
-                   key_max=_KEY_RANGE_MAX):
+                   key_max=_KEY_RANGE_MAX, extra_args=()):
     """Run memtier with the given --command and return the parsed mb.json."""
     test_dir = tempfile.mkdtemp()
     benchmark_specs = {
@@ -59,7 +60,7 @@ def _run_benchmark(env, command, miss_tracking="auto", key_prefix=_KEY_PREFIX, r
             "--key-minimum=1",
             "--key-maximum={}".format(key_max),
             "--hide-histogram",
-        ],
+        ] + list(extra_args),
     }
     addTLSArgs(benchmark_specs, env)
 
@@ -449,29 +450,16 @@ def test_arbitrary_xread_keyword_spec_evaluates_correctly(env):
                    message="expected XREAD misses on missing streams")
 
 
-def _server_supports_resp3(env):
-    """Return True if the Redis server accepts HELLO 3 (Redis 6+)."""
-    try:
-        conn = env.getConnection()
-        # HELLO 3 switches the connection to RESP3 and returns a server map.
-        # Older servers return an error.  We reset back to RESP2 afterwards.
-        resp = conn.execute_command("HELLO", "3")
-        conn.execute_command("HELLO", "2")
-        return resp is not None
-    except Exception:
-        return False
-
-
 def test_arbitrary_get_resp3_nil_counted_as_miss(env):
     """GET under --protocol=resp3 returns '_\\r\\n' (RESP3 null) for missing
     keys.  Before the fix the SingleNullBulk sentinel did not include '_' so
     every RESP3 nil was counted as a hit, silently understating the miss rate.
 
-    Gated by capability detection: the test is skipped when the test Redis
-    does not support HELLO 3 (Redis < 6).
+    Gated by capability detection: the test is skipped only when the test
+    Redis predates RESP3 (Redis < 6).
     """
     env.skipOnCluster()
-    if not _server_supports_resp3(env):
+    if not server_supports_resp3(env):
         env.skip()
         return
 
@@ -560,23 +548,20 @@ def test_arbitrary_eval_keynum_spec_runs_cleanly(env):
 def test_arbitrary_get_resp3_literal_underscore_not_counted_as_miss(env):
     """GET under --protocol=resp3 must NOT count a literal '_' value as a miss.
 
-    Bugbot LOW on PR #435: the ArrayPerElementNulls walker used a content
-    heuristic (value_len==1 && value[0]=='_') that could not distinguish
-    a RESP3 null (parsed by single_type as strdup("_")) from a legitimate
-    bulk string whose content is the single character '_' (parsed via
-    blob_type from '$1\\r\\n_\\r\\n').  Both produced identical bulk_el
-    value/value_len before the fix.
+    A RESP3 null is the reply '_\\r\\n'; a string whose content is the single
+    character '_' arrives as the bulk '$1\\r\\n_\\r\\n'.  GET uses the
+    SingleNullBulk shape, which classifies the reply by its header line, so
+    this test guards against treating the bulk's content as a null.
 
-    The fix adds a bulk_el::is_resp3_null flag set only by single_type when
-    the type byte is '_', so blob_type-constructed elements (real data) are
-    never mistaken for nulls.
+    GET never reaches the ArrayPerElementNulls walker or
+    bulk_el::is_resp3_null; that path is covered by
+    test_arbitrary_mget_resp3_nulls_and_literal_underscore.
 
     This test pre-populates keys with the literal value '_', then runs GET
-    under resp3 and asserts that Total Misses < total operations (i.e. at
-    least the pre-populated keys are counted as hits, not as nulls).
+    under resp3 and asserts that every reply is counted as a hit.
     """
     env.skipOnCluster()
-    if not _server_supports_resp3(env):
+    if not server_supports_resp3(env):
         env.skip()
         return
 
@@ -626,18 +611,13 @@ def test_arbitrary_get_resp3_literal_underscore_not_counted_as_miss(env):
     total_ops = cmd_stats["Total Hits"] + cmd_stats["Total Misses"]
     env.assertEqual(total_ops, _REQUESTS * 2)
 
-    # Every key in [1, KEY_RANGE_MAX] was populated with "_".  With the
-    # content-heuristic bug, all of these would be counted as RESP3 nulls
-    # (misses).  With the is_resp3_null flag fix, the blob_type-constructed
-    # bulk_el carries is_resp3_null=false, so they are correctly counted as
-    # hits.  Assert that Total Misses is strictly less than total_ops
-    # (i.e. at least one hit was observed) and that Total Hits > 0.
+    # Every key in [1, KEY_RANGE_MAX] was populated with "_", so every GET
+    # gets a '$1' bulk reply and must count as a hit, never as a RESP3 null.
     env.assertTrue(
         cmd_stats["Total Hits"] > 0,
         message=(
             "GET resp3 with literal '_' values: Total Hits=0 — the content "
-            "heuristic is falsely counting real '_' values as RESP3 nulls "
-            "(is_resp3_null flag fix not applied or not working)"
+            "heuristic is falsely counting real '_' values as RESP3 nulls"
         ),
     )
     env.assertEqual(
@@ -649,3 +629,46 @@ def test_arbitrary_get_resp3_literal_underscore_not_counted_as_miss(env):
             "RESP3 null misses".format(cmd_stats["Total Misses"])
         ),
     )
+
+
+def test_arbitrary_mget_resp3_nulls_and_literal_underscore(env):
+    """MGET under --protocol=resp3 counts each '_' element as a miss.
+
+    MGET uses the ArrayPerElementNulls shape: the parser records a hit or
+    miss for every element of the reply.  Under RESP3 a missing key is the
+    null '_\\r\\n', which must be a miss, while a stored value that is the
+    single character '_' arrives as the bulk '$1\\r\\n_\\r\\n' and must
+    be a hit.  The GET tests above take the SingleNullBulk path and cannot
+    see either case.
+
+    The keys are named literally, so every MGET gets the same reply
+    [v1, "_", null, null] and the split is exact.
+    """
+    env.skipOnCluster()
+    if not server_supports_resp3(env):
+        env.skip()
+        return
+
+    env.flush()
+    conn = env.getConnection()
+    conn.set("{}1".format(_KEY_PREFIX), "v1")
+    conn.set("{}2".format(_KEY_PREFIX), "_")
+    command = "MGET {p}1 {p}2 {p}8 {p}9".format(p=_KEY_PREFIX)
+
+    result = _run_benchmark(env, command, extra_args=["--protocol=resp3"])
+    per_key = result["ALL STATS"].get("Per-Key Misses", {})
+    env.assertContains("MGET", per_key,
+                       message="Per-Key Misses section missing MGET entry under resp3")
+    cmd_stats = per_key["MGET"]
+
+    calls = _REQUESTS * 2
+    env.assertTrue(cmd_stats["Total Misses"] > 0,
+                   message="MGET resp3: Total Misses=0 (RESP3 null '_' elements counted as hits)")
+    env.assertTrue(cmd_stats["Total Hits"] > 0,
+                   message="MGET resp3: Total Hits=0 (stored values counted as misses)")
+    env.assertEqual(cmd_stats["Total Hits"], 2 * calls)
+    env.assertEqual(cmd_stats["Total Misses"], 2 * calls)
+    # key[1] holds the literal value '_': a hit, not a RESP3 null.
+    for i, hit in enumerate([True, True, False, False]):
+        env.assertEqual(cmd_stats["key[{}] Hits".format(i)], calls if hit else 0)
+        env.assertEqual(cmd_stats["key[{}] Misses".format(i)], 0 if hit else calls)
