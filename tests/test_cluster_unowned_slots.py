@@ -263,6 +263,23 @@ def test_unowned_timed_run_ends_and_refresh_is_bounded(env):
     env.assertLessEqual(node.slots_calls, 2 + int(node.run_elapsed))
 
 
+def test_sustained_clusterdown_refresh_backs_off(env):
+    """Each client's CLUSTERDOWN refreshes back off 1, 2, 4, 8 s (#834)."""
+    node = _hole()
+    clients = 2
+    stats, failures, _ = _run(
+        env, node, ["--test-time=6", "--rate-limiting=100", "--clients=" + str(clients)], timeout=15
+    )
+    env.assertGreater(stats["Totals"]["Count"], 0)
+    env.assertEqual(len(failures), len(node.requests))
+    # Per client: bootstrap, then refreshes at 0, 1, 3, 7, 15, ... s. A fixed
+    # 1 s interval allowed 2 + elapsed per client (16 here).
+    schedule = [0, 1, 3, 7, 15]
+    per_client = 1 + sum(1 for at in schedule if at <= node.run_elapsed)
+    env.assertGreaterEqual(node.slots_calls, clients * 3)
+    env.assertLessEqual(node.slots_calls, clients * per_client)
+
+
 def test_partial_map_preserves_sequential_key_identity(env):
     for pattern in ("S:S", "P:P"):
         node = _Node([(0, 8191)])

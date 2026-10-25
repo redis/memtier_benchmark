@@ -133,7 +133,7 @@ cluster_client::cluster_client(client_group *group) :
         m_txn_wait_slot(-1),
         m_txn_multi_conn_id(-1),
         m_strict_no_route_attempts(0),
-        m_last_clusterdown_refresh(),
+        m_clusterdown_refresh(),
         m_last_no_replica_warning_ts(0)
 {
     // Initialize slot map to the UINT_MAX sentinel; m_shard_groups starts empty
@@ -3285,18 +3285,23 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
         }
     }
 
+    // CLUSTERDOWN has no MOVED destination. Even a previously full map can be
+    // stale. Poll with a 1 s to 8 s backoff (#834), without flushing any staged
+    // keys. Only workload replies get here, so the refresh's own CLUSTER SLOTS
+    // reply does not end the backoff; any other workload reply does. The setup
+    // ladder defers SLOTS while MULTI is open. Like READONLY below, this
+    // recognizes Redis's simple-error form.
+    static const char CLUSTERDOWN_MSG_PREFIX[] = "-CLUSTERDOWN ";
+    const bool clusterdown = response->is_error() && strncmp(response->get_status(), CLUSTERDOWN_MSG_PREFIX,
+                                                             sizeof(CLUSTERDOWN_MSG_PREFIX) - 1) == 0;
+    if (!clusterdown) m_clusterdown_refresh.reset();
+
     if (response->is_error()) {
         benchmark_debug_log("server %s handle response: %s\n", m_connections[conn_id]->get_readable_id(),
                             response->get_status());
-        // CLUSTERDOWN has no MOVED destination. Even a previously full map
-        // can be stale. Poll at most once per second, without flushing any
-        // staged keys. The setup ladder defers SLOTS while MULTI is open.
-        // Like READONLY below, this recognizes Redis's simple-error form.
-        static const char CLUSTERDOWN_MSG_PREFIX[] = "-CLUSTERDOWN ";
-        if (strncmp(response->get_status(), CLUSTERDOWN_MSG_PREFIX, sizeof(CLUSTERDOWN_MSG_PREFIX) - 1) == 0 &&
-            (m_last_clusterdown_refresh.tv_sec == 0 || ts_diff(m_last_clusterdown_refresh, timestamp) >= 1000000) &&
+        if (clusterdown && m_clusterdown_refresh.due(timestamp) &&
             m_connections[conn_id]->get_cluster_slots_state() == setup_done) {
-            m_last_clusterdown_refresh = timestamp;
+            m_clusterdown_refresh.refreshed(timestamp);
             m_connections[conn_id]->set_cluster_slots();
             m_connections[conn_id]->schedule_fill();
         }
