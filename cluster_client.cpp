@@ -3418,6 +3418,7 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
             // dropped command is never retried elsewhere (no block split).
             if (m_config->transaction) {
                 if ((int) conn_id == m_txn_pinned_conn_id) {
+                    m_txn_pin_lost_warned = true; // as on master: skips the disconnect-site release
                     if (!g_txn_pin_moved_warned.exchange(true)) {
                         benchmark_error_log("warning: --transaction pin connection (id=%u) received MOVED "
                                             "mid-rotation; topology changed; transaction stats for the "
@@ -3460,6 +3461,7 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
             bool retried = false;
             if (m_config->transaction) {
                 if ((int) conn_id == m_txn_pinned_conn_id) {
+                    m_txn_pin_lost_warned = true; // as on master: skips the disconnect-site release
                     if (!g_txn_pin_ask_warned.exchange(true)) {
                         benchmark_error_log("warning: --transaction pin connection (id=%u) received ASK "
                                             "mid-rotation; topology changed; transaction stats for the "
