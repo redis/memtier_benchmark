@@ -124,7 +124,7 @@ public:
         shard_connection *second = create_shard_connection(protocol);
         check(second->get_address() == NULL && second->get_port() == NULL, "new endpoint is uninitialized");
         const unsigned long long generated = get_reqs_generated();
-        stage_unsent(second->get_id());
+        stage_unsent(second->get_id(), slot);
         check(connect_shard_connection(second, (char *) "127.0.0.1", (char *) port), "second shard dialed");
         check(second->get_connection_state() != conn_disconnected, "second shard is not disconnected");
         check(pool_empty(second->get_id()) && staged_monitor_count(second->get_id()) == 0,
@@ -150,14 +150,16 @@ public:
         m_slot_to_shard_group[slot] = UINT_MAX;
     }
     bool can_route_unowned(unsigned int slot) { return check_unowned_slot(slot, false); }
+    void unown_slot(unsigned int slot) { m_slot_to_shard_group[slot] = UINT_MAX; }
     bool pool_empty(unsigned int conn_id) const { return m_key_index_pools[conn_id]->empty(); }
-    void stage_unsent(unsigned int conn_id)
+    // A routed key and a monitor line for `slot`, both unsent on conn_id.
+    void stage_unsent(unsigned int conn_id, unsigned int slot)
     {
         m_key_index_pools[conn_id]->push(SET_CMD_IDX);
         m_key_index_pools[conn_id]->push(42);
         arbitrary_command cmd("SET unit-key unit-value");
         check(cmd.split_command_to_args(), "parse staged monitor command");
-        m_staged_monitor_commands[conn_id].push(staged_monitor_cmd{std::move(cmd), 0, timeval{}, 1});
+        m_staged_monitor_commands[conn_id].push(staged_monitor_cmd{std::move(cmd), 0, timeval{}, 1, slot});
         m_reqs_generated += 2;
     }
     // One counted monitor line for `slot`, staged on conn_id.
@@ -375,7 +377,7 @@ static void check_repin_routes_to_staged_owner(unsigned long long first_key)
         client.get_connections()[0]->get_protocol()->set_buffers(input, output);
         client.route_slot_to_second_shard(protocol, staged_slot, port.c_str());
 
-        client.stage_unsent(1);
+        client.stage_unsent(1, staged_slot);
         const unsigned long long generated = client.get_reqs_generated();
         check(client.redial(1, "127.0.0.1", port.c_str()), "same endpoint redial starts");
         check(!client.pool_empty(1) && client.staged_monitor_count(1) == 1, "same endpoint retains both unsent queues");
@@ -393,19 +395,19 @@ static void check_repin_routes_to_staged_owner(unsigned long long first_key)
         // the map moves them to their slot's primary (#836).
         client.change_role(1, role_replica);
         for (unsigned int attempt = 0; attempt < 2; attempt++) {
-            client.stage_unsent(1);
+            client.stage_unsent(1, staged_slot);
             check(client.redial(1, "localhost", port.c_str()), "same replica endpoint redial starts");
             check(client.pool_empty(1) && client.staged_monitor_count(1) == attempt + 1,
                   "replica redial clears routed keys and keeps monitor lines, including demotion");
             check(client.get_reqs_generated() == generated - 2 + attempt + 1,
                   "replica reset compensates routed keys once and keeps monitor lines counted");
         }
-        client.stage_unsent(1);
+        client.stage_unsent(1, staged_slot);
         client.change_role(1, role_primary);
         check(client.pool_empty(1) && client.staged_monitor_count(1) == 3,
               "promotion discards old replica keys before its role changes");
         check(client.get_reqs_generated() == generated + 1, "promotion compensates old replica keys exactly once");
-        client.stage_unsent(1);
+        client.stage_unsent(1, staged_slot);
         check(client.redial(1, "localhost", port.c_str()), "promoted primary redial starts");
         check(!client.pool_empty(1) && client.staged_monitor_count(1) == 4,
               "primary retains work staged after promotion");
@@ -507,6 +509,41 @@ static void check_repin_routes_to_staged_owner(unsigned long long first_key)
         check(logged, "failed-keys file has a record");
         check(strstr(record, ",ARBITRARY,\"unit-key\",\"slot-owner-down-for-monitor-line\",0\n") != NULL,
               "dropped line is logged to --failed-keys-file");
+    }
+    // The same, for a line already on that primary: nothing would send it or
+    // uncount it, so it would hold a --requests run open.
+    {
+        client_group group(&config, protocol, &generator);
+        transaction_client client(&group);
+        client.route_slot_to_second_shard(protocol, staged_slot, port.c_str());
+        client.get_connections()[1]->disconnect();
+        const unsigned long long generated = client.get_reqs_generated();
+        const unsigned long long errors = client.get_stats()->get_total_errors();
+        client.stage_line(1, staged_slot);
+        client.reroute_staged_monitor_commands();
+        check(client.staged_monitor_count(0) == 0 && client.staged_monitor_count(1) == 0,
+              "line on its given-up owner is dropped");
+        check(client.get_reqs_generated() == generated, "line on its given-up owner is uncounted");
+        check(client.get_stats()->get_total_errors() == errors + 1, "line on its given-up owner counts as an error");
+    }
+    // An unowned line on a given-up primary moves to a primary that is still
+    // dialing, instead of staying or being dropped.
+    {
+        client_group group(&config, protocol, &generator);
+        transaction_client client(&group);
+        client.route_slot_to_second_shard(protocol, staged_slot, port.c_str());
+        client.unown_slot(staged_slot);
+        check(client.get_connections()[0]->get_connection_state() == conn_disconnected &&
+                  !client.get_connections()[0]->is_reconnect_pending(),
+              "main primary was given up on");
+        const unsigned long long generated = client.get_reqs_generated();
+        const unsigned long long errors = client.get_stats()->get_total_errors();
+        client.stage_line(0, staged_slot);
+        client.reroute_staged_monitor_commands();
+        check(client.staged_monitor_count(0) == 0 && client.staged_monitor_count(1) == 1,
+              "unowned line leaves its given-up primary for a live one");
+        check(client.get_reqs_generated() == generated + 1 && client.get_stats()->get_total_errors() == errors,
+              "moved unowned line stays counted and is not an error");
     }
     delete protocol;
     evutil_closesocket(listener);

@@ -2924,11 +2924,19 @@ void cluster_client::reroute_staged_monitor_commands()
     for (const shard_group &group : m_shard_groups) {
         if (group.primary != NULL && group.primary->get_id() < primary.size()) primary[group.primary->get_id()] = true;
     }
+    // A primary left disconnected without a reconnect timer was given up on
+    // (see hand_off_replay_requests()): nothing would send a line there, not
+    // even one already queued on it.
+    auto given_up = [this](unsigned int conn_id) {
+        return conn_id >= m_connections.size() ||
+               (m_connections[conn_id]->get_connection_state() == conn_disconnected &&
+                !m_connections[conn_id]->is_reconnect_pending());
+    };
     std::vector<unsigned int> woken;
     unsigned long long dropped = 0;
     for (unsigned int i = 0; i < m_staged_monitor_commands.size(); i++) {
         if (m_staged_monitor_commands[i].empty()) continue;
-        const bool keeps = i < primary.size() && primary[i];
+        const bool keeps = i < primary.size() && primary[i] && !given_up(i);
         std::queue<staged_monitor_cmd> staged;
         std::swap(m_staged_monitor_commands[i], staged);
         for (; !staged.empty(); staged.pop()) {
@@ -2942,31 +2950,24 @@ void cluster_client::reroute_staged_monitor_commands()
             } else {
                 target = slot_primary_conn_id(staged.front().slot);
             }
-            if (target != i) {
-                // A primary left disconnected without a reconnect timer was
-                // given up on (see hand_off_replay_requests()): nothing would
-                // send the line there.
-                const char *drop_reason = NULL;
-                if (target >= m_connections.size() ||
-                    (m_connections[target]->get_connection_state() == conn_disconnected &&
-                     !m_connections[target]->is_reconnect_pending())) {
-                    drop_reason = "slot-owner-down-for-monitor-line";
-                } else if (m_staged_monitor_commands[target].size() >= STAGED_MONITOR_QUEUE_MAX_SIZE) {
-                    drop_reason = "staged-monitor-queue-full";
-                }
-                if (drop_reason != NULL) {
-                    const std::vector<command_arg> &args = staged.front().parsed_cmd.command_args;
-                    const std::string key = args.size() >= 2 ? args[1].data : std::string();
-                    struct timeval now;
-                    gettimeofday(&now, NULL);
-                    // Labeled like the same line failing after it is sent.
-                    global_failed_keys_logger().log_failure(now, request_type_to_name(rt_arbitrary), key.c_str(),
-                                                            key.size(), drop_reason, 0);
-                    dropped++;
-                    continue;
-                }
-                if (std::find(woken.begin(), woken.end(), target) == woken.end()) woken.push_back(target);
+            const char *drop_reason = NULL;
+            if (given_up(target)) {
+                drop_reason = "slot-owner-down-for-monitor-line";
+            } else if (target != i && m_staged_monitor_commands[target].size() >= STAGED_MONITOR_QUEUE_MAX_SIZE) {
+                drop_reason = "staged-monitor-queue-full";
             }
+            if (drop_reason != NULL) {
+                const std::vector<command_arg> &args = staged.front().parsed_cmd.command_args;
+                const std::string key = args.size() >= 2 ? args[1].data : std::string();
+                struct timeval now;
+                gettimeofday(&now, NULL);
+                // Labeled like the same line failing after it is sent.
+                global_failed_keys_logger().log_failure(now, request_type_to_name(rt_arbitrary), key.c_str(),
+                                                        key.size(), drop_reason, 0);
+                dropped++;
+                continue;
+            }
+            if (target != i && std::find(woken.begin(), woken.end(), target) == woken.end()) woken.push_back(target);
             m_staged_monitor_commands[target].push(std::move(staged.front()));
         }
     }

@@ -611,9 +611,9 @@ after a `-MOVED`), its unsent lines move to the slot's current primary. A slot
 that had an owner whenever its lines were staged keeps their selection order;
 lines staged while it had no owner can sit on different primaries, and then
 merge in connection order. A line already sent gets `-MOVED` and is resent only
-with `--retry-on-error`. A line whose new primary is down with no reconnect
-pending, or whose queue is full, is dropped: it no longer counts toward
-`--requests`, counts as an error, and is logged to `--failed-keys-file`.
+with `--retry-on-error`. A line whose slot's primary is down with no reconnect
+pending, or whose new primary's queue is full, is dropped: it no longer counts
+toward `--requests`, counts as an error, and is logged to `--failed-keys-file`.
 Strict `secondary` reads with `error` or `queue` fallback fail the run because no
 authoritative replica can be chosen, including for a transient hole discovered
 by a mid-run refresh.

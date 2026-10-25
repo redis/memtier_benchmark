@@ -1033,8 +1033,11 @@ class _Failover(_Node):
             self.held = True
             self.cond.notify_all()
         self.closed.wait(10)
-        # memtier acts on CLUSTERDOWN at most once a second. Its last poll
-        # was A's, before A sent the SLOTS request seen at refreshed_at.
+        # memtier acts on CLUSTERDOWN at most once a second: the
+        # m_last_clusterdown_refresh check against 1000000 us in
+        # cluster_client::handle_response(). Its last poll was A's, before A
+        # sent the SLOTS request seen at refreshed_at. If that throttle
+        # changes, change this wait too.
         time.sleep(max(0.0, self.refreshed_at + 1.05 - time.monotonic()))
         return b"-CLUSTERDOWN The cluster is down\r\n"
 
