@@ -8,8 +8,9 @@ promoted, the CLUSTER SLOTS refresh retires that connection: it no longer
 owns any slot, so it never reconnects. Those requests were counted as
 generated, so a --requests run used to stop a few requests short of its
 count and exit 1. They are now resent on the connection that owns their
-slot. Needs a cluster with replicas that take part in failover (skipped
-otherwise):
+slot. Needs a cluster with replicas that take part in failover: skipped on
+a cluster started without replicas, failed on one started with them that
+has none:
 
   OSS_STANDALONE=0 OSS_CLUSTER_REPLICAS=1 \\
       TEST=test_cluster_failover_retry.py ./tests/run_tests.sh
@@ -37,6 +38,7 @@ import redis
 from include import (
     add_required_env_arguments,
     addTLSArgs,
+    cluster_replicas_expected,
     ensure_clean_benchmark_folder,
     get_default_memtier_config,
 )
@@ -109,8 +111,12 @@ def test_requests_complete_after_primary_failover(env):
             victim, replica = node, replicas[0]
             break
     if victim is None:
-        # No replica takes part in cluster failover (see the RLTest
-        # --use-slaves note in get_cluster_replica_connections).
+        # No primary but the seed has a replica in the cluster. Expected on a
+        # cluster started without replicas; with them, the setup is broken.
+        # An assertion would be lost to the skip, so raise to fail the test.
+        if cluster_replicas_expected(env):
+            raise AssertionError("the cluster was started with replicas, but no primary "
+                                 "other than the seed has one: " + str(nodes))
         env.skip()
         return
 

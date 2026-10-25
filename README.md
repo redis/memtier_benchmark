@@ -635,24 +635,16 @@ new top-level blocks (emitted only when `--cluster-mode` is on AND
   `Latency Samples`. `conn_id` is the shard_connection vector index
   (NOT a stable cluster shard identity).
 
-### Testing limitations
+### Testing with replicas
 
-The `OSS-CLUSTER + replicas: read-preference` CI matrix cell exercises the
-RLTest harness with `--use-slaves`, which starts replicas using `--slaveof`
-without `--cluster-enabled yes`. The resulting slave nodes are not part of
-cluster gossip - `CLUSTER SLOTS` returns empty replica arrays from each
-master, so memtier_benchmark cannot discover them. The test helper's
-`get_cluster_replica_connections()` gate detects this and skips the tests
-with a stderr warning.
-
-The production read-routing code was verified empirically against real
-`redis-cli --cluster create` clusters with cluster-aware replicas under
-both RESP2 and RESP3. See PR #456 round-18 reviewer reports for the
-measurements: all four modes (primary, secondary, secondaryPreferred,
-nearest) route reads correctly to replicas, with zero leakage to primaries.
-
-A follow-up fixture that bootstraps a real `redis-cli --cluster create`
-cluster within the test harness is tracked in issue #462 (filed by this PR).
+The `OSS-CLUSTER + replicas` CI cells start the cluster with RLTest's
+`--use-slaves`. The RLTest fork pinned in `tests/test_requirements.txt` adds
+each replica to the cluster with `CLUSTER MEET` and `CLUSTER REPLICATE`, so
+replicas are cluster members that `CLUSTER SLOTS` reports and
+memtier_benchmark can discover. On those cells, the test helper
+`get_cluster_replica_connections()` fails the test when `CLUSTER NODES`
+lists no replicas or cannot be read (#462). Cells without replicas skip the
+replica tests.
 
 ### Reconnecting after connection errors
 

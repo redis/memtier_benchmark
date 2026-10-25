@@ -4,8 +4,11 @@ With --retry-on-error, cluster_client::handle_response resends a request
 rejected with -READONLY to the slot's current primary, when that is a live
 connection other than the one that rejected it. The tests in
 test_cluster_readonly_drop.py cover the cases where it cannot (#592, #651).
-These cover the resend itself, under RESP2 and RESP3, with two scripted
-peers A and B and no failover timing:
+These cover the resend itself, under RESP2 and RESP3, with scripted peers
+A, B, C and D and no failover timing. C and D each own one slot that no key
+maps to. C is the seed, and D comes last in the map, so their connections
+are first and last; they are up but must get no SET, and a resend to a
+connection other than the slot primary B fails the tests.
 
 - "stale": the map names A the primary of every slot but one, which B owns.
   B answers the first SET it gets with -CLUSTERDOWN, as during a failover,
@@ -22,7 +25,8 @@ peers A and B and no failover timing:
   requests until A is ready, so every one reaches A first.
 
 Each key is a separate request. The tests check that every key is accepted
-exactly once, by B, after at most one rejection by A; that the JSON counts
+exactly once, by B, after at most one rejection by A, and none reaches C or D;
+that the JSON counts
 each request once and every resend as a retry, with no errors; and that the
 --requests run ends with exit code 0.
 """
@@ -78,17 +82,40 @@ def _range(first, last, *nodes):
     return b"*%d\r\n:%d\r\n:%d\r\n" % (2 + len(nodes), first, last) + b"".join(nodes)
 
 
+def _slots_reply(owners, rest):
+    """A CLUSTER SLOTS reply: each slot in owners goes to its nodes, every
+    other slot to the nodes in rest."""
+    ranges = []
+    first = 0
+    for slot in sorted(owners):
+        if slot > first:
+            ranges.append(_range(first, slot - 1, *rest))
+        ranges.append(_range(slot, slot, *owners[slot]))
+        first = slot + 1
+    if first <= 16383:
+        ranges.append(_range(first, 16383, *rest))
+    return b"*%d\r\n" % len(ranges) + b"".join(ranges)
+
+
+# C and D own the lowest and the highest slot that no key maps to.
+_FREE_SLOTS = set(range(16384)) - {_slot(_key(i)) for i in range(1, _REQUESTS + 1)}
+_C_SLOT = min(_FREE_SLOTS)
+_D_SLOT = max(_FREE_SLOTS)
+
+
 class _Cluster(object):
     def __init__(self, mode):
         self.mode = mode
         self.lock = threading.Lock()
         self.a = _Peer(self, "A")
         self.b = _Peer(self, "B")
+        self.c = _Peer(self, "C")
+        self.d = _Peer(self, "D")
         self.failed_over = False  # "stale": B answered -CLUSTERDOWN, the map is the new one
         self.a_got_set = threading.Event()
-        self.sets = {"A": collections.Counter(), "B": collections.Counter()}
-        self.cluster_slots = {"A": 0, "B": 0}
-        self.readonly_cmds = {"A": 0, "B": 0}
+        self.sets = {name: collections.Counter() for name in "ABCD"}
+        self.cluster_slots = {name: 0 for name in "ABCD"}
+        self.readonly_cmds = {name: 0 for name in "ABCD"}
         self.clusterdown = 0
         self.held = 0  # SETs A held until READONLY
         self.late = 0  # SETs A got after READONLY
@@ -98,25 +125,23 @@ class _Cluster(object):
     def slots_reply(self):
         a = _node(self.a.server_address[1], b"a")
         b = _node(self.b.server_address[1], b"b")
+        decoys = {_C_SLOT: (_node(self.c.server_address[1], b"c"),),
+                  _D_SLOT: (_node(self.d.server_address[1], b"d"),)}
         if self.mode == "replica" or self.failed_over:
-            return b"*1\r\n" + _range(0, 16383, b, a)
+            return _slots_reply(decoys, (b, a))
         # Before the failover: B owns only the slot of the first key.
-        owned = _slot(_key(1))
-        ranges = [_range(owned, owned, b)]
-        if owned > 0:
-            ranges.append(_range(0, owned - 1, a))
-        if owned < 16383:
-            ranges.append(_range(owned + 1, 16383, a))
-        return b"*%d\r\n" % len(ranges) + b"".join(ranges)
+        decoys[_slot(_key(1))] = (b,)
+        return _slots_reply(decoys, (a,))
 
     def __enter__(self):
-        self.threads = [threading.Thread(target=peer.serve_forever, daemon=True) for peer in (self.a, self.b)]
+        self.peers = (self.a, self.b, self.c, self.d)
+        self.threads = [threading.Thread(target=peer.serve_forever, daemon=True) for peer in self.peers]
         for thread in self.threads:
             thread.start()
         return self
 
     def __exit__(self, *exc):
-        for peer in (self.a, self.b):
+        for peer in self.peers:
             peer.shutdown()
             peer.server_close()
         for thread in self.threads:
@@ -198,6 +223,8 @@ class _Handler(socketserver.StreamRequestHandler):
         with cluster.lock:
             cluster.sets[name][key] += 1
             failed_over = cluster.failed_over
+        if name in ("C", "D"):
+            return _OK_REPLY  # the tests fail on any SET C or D gets
         if name == "B":
             if cluster.mode == "stale" and not failed_over:
                 # Fail over only once A holds a SET, so at least one is
@@ -229,9 +256,8 @@ def _run(env, mode, protocol):
     with _Cluster(mode) as cluster, tempfile.TemporaryDirectory() as directory:
         path = os.path.join(directory, "stats.json")
         failed_keys = os.path.join(directory, "failed-keys.csv")
-        seed = cluster.a if mode == "stale" else cluster.b
         args = [MEMTIER_BINARY, "--server=127.0.0.1",
-                "--port={}".format(seed.server_address[1]), "--cluster-mode",
+                "--port={}".format(cluster.c.server_address[1]), "--cluster-mode",
                 "--protocol=" + protocol,
                 "--threads=1", "--clients=1", "--pipeline={}".format(_PIPELINE),
                 "--requests={}".format(_REQUESTS),
@@ -255,10 +281,14 @@ def _run(env, mode, protocol):
         if result.returncode:
             return
 
-        # Both connections negotiate the requested protocol.
+        # All four connections negotiate the requested protocol.
         version = [protocol[-1:].encode()]
         env.assertEqual(cluster.hello, [version] * len(cluster.hello), message=label + " HELLO")
-        env.assertGreaterEqual(len(cluster.hello), 2, message=label + " HELLO")
+        env.assertGreaterEqual(len(cluster.hello), 4, message=label + " HELLO")
+        # No key maps to C's or D's slot: a SET there is a resend that went
+        # to a connection other than the slot primary.
+        env.assertEqual(dict(cluster.sets["C"]), {}, message=label + " C")
+        env.assertEqual(dict(cluster.sets["D"]), {}, message=label + " D")
 
         keys = [_key(i) for i in range(1, _REQUESTS + 1)]
         a_sets = cluster.sets["A"]
@@ -269,7 +299,8 @@ def _run(env, mode, protocol):
         env.assertEqual(set(a_sets) - set(keys), set(), message=label)
         if mode == "stale":
             # The first key went to B, which answered -CLUSTERDOWN and then
-            # accepted the retry; every SET A got was held until READONLY.
+            # accepted the retry; every SET A got was rejected after READONLY:
+            # held until it, or sent after it.
             env.assertEqual(cluster.clusterdown, 1, message=label)
             env.assertGreaterEqual(len(a_sets), 1, message=label)
             env.assertGreaterEqual(cluster.held, 1, message=label)
