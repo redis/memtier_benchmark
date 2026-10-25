@@ -1167,3 +1167,35 @@ def test_read_preference_keyless_hold_keeps_traffic_flowing(env):
         env.assertEqual(node.errors + replica.errors, [], message=message)
         env.assertEqual(got_primary, want_primary, message=message)
         env.assertEqual(got_replica, want_replica, message=message)
+
+    # Two shards: the held replicas wake only one primary. It produces the
+    # whole rotation, and keyed work for the other shard reaches its pool
+    # with a fill scheduled, so the other primary is never needed to wake.
+    def endpoint(n):
+        return b"*2\r\n$9\r\n127.0.0.1\r\n:%d\r\n" % n.server_address[1]
+
+    for args, workers, clients, verbs in [
+        (["--command=GET __key__", "--command=FLUSHDB", "--read-preference=secondary"], 2, 2,
+         (b"FLUSHDB", b"GET")),
+        (["--command=FLUSHDB", "--command=DBSIZE", "--read-preference=secondaryPreferred"], 1, 4,
+         (b"FLUSHDB", b"DBSIZE")),
+    ]:
+        a, a_replica, b, b_replica = _Node(0), _Node(0), _Node(0), _Node(0)
+        a.replica = a_replica
+        a.extra = [b, b_replica]
+        reply = (b"*2\r\n*4\r\n:0\r\n:8191\r\n" + endpoint(a) + endpoint(a_replica) +
+                 b"*4\r\n:8192\r\n:16383\r\n" + endpoint(b) + endpoint(b_replica))
+        for n in (a, a_replica, b, b_replica):
+            n.slots_fn = lambda _n: reply
+        rc, stderr, _ = _run(a, args + ["--requests=200"], workers=workers, clients=clients)
+        message = "{}: A={} A'={} B={} B'={}\n{}".format(
+            " ".join(args), *[{v: n.commands[v] for v in verbs} for n in (a, a_replica, b, b_replica)],
+            stderr[-2000:])
+        env.assertEqual(rc, 0, message=message)
+        env.assertEqual(a.errors + a_replica.errors + b.errors + b_replica.errors, [], message=message)
+        writes, reads = verbs
+        half = workers * clients * 100
+        env.assertEqual(a.commands[writes] + b.commands[writes], half, message=message)
+        env.assertEqual(a_replica.commands[reads] + b_replica.commands[reads], half, message=message)
+        env.assertEqual(a.commands[reads] + b.commands[reads] + a_replica.commands[writes] +
+                        b_replica.commands[writes], 0, message=message)
