@@ -135,6 +135,7 @@ cluster_client::cluster_client(client_group *group) :
         m_strict_no_route_attempts(0),
         m_last_clusterdown_refresh(),
         m_parsing_slot_map(false),
+        m_reroute_after_refresh(false),
         m_last_no_replica_warning_ts(0)
 {
     // Initialize slot map to the UINT_MAX sentinel; m_shard_groups starts empty
@@ -505,15 +506,20 @@ bool cluster_client::slot_is_unowned(unsigned int slot) const
            m_slot_to_shard_group[slot] >= m_shard_groups.size();
 }
 
+bool cluster_client::slots_refresh_in_flight() const
+{
+    // A shard reconnect timer hands the redial to a SLOTS refresh over the
+    // seed. The timer is already cleared while that reply is in flight.
+    return MAIN_CONNECTION->get_connection_state() != conn_disconnected &&
+           MAIN_CONNECTION->get_cluster_slots_state() != setup_done;
+}
+
 unsigned int cluster_client::fallback_primary_conn_id() const
 {
     // Deliberately use the first connected primary: there is no owner to hash
     // to, and the server supplies the authoritative routing response.
     unsigned int pending = UINT_MAX;
-    // A shard reconnect timer hands the redial to a SLOTS refresh over the
-    // seed. The timer is already cleared while that reply is in flight.
-    const bool refreshing = MAIN_CONNECTION->get_connection_state() != conn_disconnected &&
-                            MAIN_CONNECTION->get_cluster_slots_state() != setup_done;
+    const bool refreshing = slots_refresh_in_flight();
     for (const shard_group &group : m_shard_groups) {
         if (group.primary == NULL) continue;
         if (group.primary->get_connection_state() == conn_connected) return group.primary->get_id();
@@ -1521,6 +1527,7 @@ bool cluster_client::handle_cluster_slots(unsigned int conn_id, protocol_respons
     print_topology_summary();
 
     // Before retiring connections: their staged lines move too.
+    m_reroute_after_refresh = false;
     reroute_staged_monitor_commands();
 
     // check if some connections left with no slots, and need to be closed
@@ -3341,9 +3348,27 @@ void cluster_client::handle_connection_given_up(unsigned int conn_id)
     // failing while handle_cluster_slots() parses a reply leaves that to its
     // commit: the map in place is about to be replaced.
     if (m_parsing_slot_map) return;
-    if (conn_id < m_staged_monitor_commands.size() && !m_staged_monitor_commands[conn_id].empty()) {
+    // A re-route left to a refresh that was lost with the main connection
+    // runs at the next give-up, which may be the main connection's own.
+    if (m_reroute_after_refresh ||
+        (conn_id < m_staged_monitor_commands.size() && !m_staged_monitor_commands[conn_id].empty())) {
+        // A primary whose reconnect timer handed its redial to the refresh in
+        // flight looks given up on until that reply comes: wait for it.
+        if (slots_refresh_in_flight()) {
+            m_reroute_after_refresh = true;
+            return;
+        }
+        m_reroute_after_refresh = false;
         reroute_staged_monitor_commands();
     }
+}
+
+void cluster_client::handle_cluster_slots_rejected()
+{
+    // No map came to redial anyone: re-route as the give-up would have.
+    if (!m_reroute_after_refresh) return;
+    m_reroute_after_refresh = false;
+    reroute_staged_monitor_commands();
 }
 
 void cluster_client::handle_response(unsigned int conn_id, struct timeval timestamp, request *request,

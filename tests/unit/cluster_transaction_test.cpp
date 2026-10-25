@@ -799,14 +799,15 @@ static void check_give_up_during_slots_parse()
         check(client.staged_monitor_count(1) == 0 && client.staged_monitor_count(0) == 1,
               "the commit moves the deferred line");
     }
-    // A reply with no usable shard dials nothing and commits nothing; the
-    // hook re-routes again afterwards.
+    // A reply with no usable shard dials nothing and commits nothing; a
+    // give-up after it re-routes once the rejection is handled.
     {
         client_group group(&config, protocol, &generator);
         transaction_client client(&group);
         given_up_owner(client);
         check(!client.handle_cluster_slots(0, parse("*1\r\n*1\r\n:0\r\n")), "malformed reply ignored");
         client.handle_connection_given_up(1);
+        client.handle_cluster_slots_rejected();
         check(client.staged_monitor_count(1) == 0 && client.staged_monitor_count(0) == 0,
               "hook re-routes after an uncommitted reply");
     }
@@ -816,6 +817,123 @@ static void check_give_up_during_slots_parse()
     evbuffer_free(output);
     delete protocol;
     evutil_closesocket(listener);
+}
+
+static evutil_socket_t listen_any(std::string &port)
+{
+    evutil_socket_t listener = socket(AF_INET, SOCK_STREAM, 0);
+    check(listener != static_cast<evutil_socket_t>(-1), "listener socket");
+    sockaddr_in address = {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t address_len = sizeof(address);
+    check(bind(listener, (sockaddr *) &address, sizeof(address)) == 0 && listen(listener, 4) == 0 &&
+              getsockname(listener, (sockaddr *) &address, &address_len) == 0,
+          "listener bound");
+    port = std::to_string(ntohs(address.sin_port));
+    return listener;
+}
+
+// A primary whose reconnect timer handed its redial to a SLOTS refresh is
+// disconnected with no timer until that reply comes, like one given up on.
+// A give-up elsewhere in that window must not drop its lines: the commit
+// redials it and keeps them.
+static void check_give_up_during_refresh()
+{
+    std::string seed_port, owner_port;
+    evutil_socket_t seed_listener = listen_any(seed_port);
+    evutil_socket_t owner_listener = listen_any(owner_port);
+
+    arbitrary_command_list commands;
+    abstract_protocol *protocol = protocol_factory(PROTOCOL_REDIS_DEFAULT);
+    make_transaction_commands(commands, protocol);
+    benchmark_config config = {};
+    make_transaction_config(config, commands);
+    config.transaction = false;
+    object_generator generator(commands.size());
+    generator.set_data_size_fixed(1);
+    generator.set_key_prefix("key-");
+    generator.set_key_range(1, 10);
+    const unsigned int staged_slot = key_slot("key-1");
+    check(staged_slot != 0, "refresh fixture leaves slot 0 to the seed");
+    evbuffer *input = evbuffer_new();
+    evbuffer *output = evbuffer_new();
+    abstract_protocol *reply = protocol_factory(PROTOCOL_REDIS_DEFAULT);
+    reply->set_buffers(input, output);
+    reply->set_keep_value(true);
+    // Slot 0 to the seed, every other slot to connection 1's node.
+    const std::string slots = "*2\r\n*3\r\n:0\r\n:0\r\n*2\r\n$9\r\n127.0.0.1\r\n:" + seed_port +
+                              "\r\n*3\r\n:1\r\n:16383\r\n*2\r\n$9\r\n127.0.0.1\r\n:" + owner_port + "\r\n";
+    {
+        client_group group(&config, protocol, &generator);
+        transaction_client client(&group);
+        // Connection 1 owns staged_slot and waits for the seed's refresh to
+        // redial it; connection 2 holds a line for the same slot.
+        client.route_slot_to_second_shard(protocol, staged_slot, owner_port.c_str());
+        client.dial_peer(protocol, seed_port.c_str());
+        client.refresh_over_seed(seed_port.c_str());
+        client.get_connections()[1]->disconnect();
+        client.stage_line(1, staged_slot);
+        client.stage_line(2, staged_slot);
+        client.get_connections()[2]->disconnect();
+        const unsigned long long generated = client.get_reqs_generated();
+        const unsigned long long errors = client.get_stats()->get_total_errors();
+        client.handle_connection_given_up(2);
+        check(client.staged_monitor_count(1) + client.staged_monitor_count(2) == 2,
+              "a give-up during a refresh leaves lines for the commit");
+        evbuffer_add(input, slots.data(), slots.size());
+        check(reply->parse_response() == 1, "SLOTS reply parsed");
+        check(client.handle_cluster_slots(0, reply->get_response()), "SLOTS reply committed");
+        check(client.get_connections()[1]->get_connection_state() != conn_disconnected,
+              "the commit redials the slot's owner");
+        check(client.staged_monitor_count(1) == 2, "both lines wait on the redialed owner");
+        check(client.get_reqs_generated() == generated && client.get_stats()->get_total_errors() == errors,
+              "lines stay counted and are not errors");
+    }
+    // If the refresh is rejected, nothing redials the owner: the lines are
+    // dropped then, as the give-up would have dropped them.
+    {
+        client_group group(&config, protocol, &generator);
+        transaction_client client(&group);
+        client.route_slot_to_second_shard(protocol, staged_slot, owner_port.c_str());
+        client.dial_peer(protocol, seed_port.c_str());
+        client.refresh_over_seed(seed_port.c_str());
+        client.get_connections()[1]->disconnect();
+        client.stage_line(1, staged_slot);
+        client.stage_line(2, staged_slot);
+        client.get_connections()[2]->disconnect();
+        const unsigned long long generated = client.get_reqs_generated();
+        client.handle_connection_given_up(2);
+        client.handle_cluster_slots_rejected();
+        check(client.staged_monitor_count(1) + client.staged_monitor_count(2) == 0,
+              "a rejected refresh drops the lines it left");
+        check(client.get_reqs_generated() == generated - 2, "dropped lines are uncounted");
+    }
+    // If the main connection is lost with the request, its own give-up, with
+    // nothing staged on it, runs the re-route left to the refresh.
+    {
+        client_group group(&config, protocol, &generator);
+        transaction_client client(&group);
+        client.route_slot_to_second_shard(protocol, staged_slot, owner_port.c_str());
+        client.dial_peer(protocol, seed_port.c_str());
+        client.refresh_over_seed(seed_port.c_str());
+        client.get_connections()[1]->disconnect();
+        client.stage_line(1, staged_slot);
+        client.stage_line(2, staged_slot);
+        client.get_connections()[2]->disconnect();
+        client.handle_connection_given_up(2);
+        client.get_connections()[0]->disconnect();
+        check(client.staged_monitor_count(0) == 0, "main connection holds no line");
+        client.handle_connection_given_up(0);
+        check(client.staged_monitor_count(1) + client.staged_monitor_count(2) == 0,
+              "the main connection's give-up runs the re-route left to its refresh");
+    }
+    delete reply;
+    evbuffer_free(input);
+    evbuffer_free(output);
+    delete protocol;
+    evutil_closesocket(owner_listener);
+    evutil_closesocket(seed_listener);
 }
 
 int main()
@@ -832,6 +950,7 @@ int main()
     check_drop_wakes_producers(false);
     check_drop_wakes_producers(true);
     check_give_up_during_slots_parse();
+    check_give_up_during_refresh();
     puts("transaction pin release tests passed");
     return 0;
 }
