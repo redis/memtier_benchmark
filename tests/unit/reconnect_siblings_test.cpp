@@ -45,6 +45,10 @@
 // end_client_after_run() is the path both a failed connect after the run and
 // a rejected setup after the run take to end the client.
 
+// Defined in shard_connection.cpp: runs fill_pipeline() as its deferred-fill
+// timer does.
+void deferred_fill_pipeline_cb(evutil_socket_t, short, void *ctx);
+
 void benchmark_log_file_line(int, const char *, unsigned int, const char *, ...) {}
 void benchmark_log(int, const char *, ...) {}
 void report_connection_stage_failure(const char *) {}
@@ -159,6 +163,96 @@ static void test_sibling_with_replay(const char *path)
 
         second.disconnect();
         check(first.siblings_done(), "a disconnected sibling with no reconnect pending does not");
+        event_base_loop(base, EVLOOP_NONBLOCK);
+    }
+    delete protocol;
+    event_base_free(base);
+    evutil_closesocket(listener);
+#ifndef _WIN32
+    unlink(path);
+#endif
+}
+
+// Past its own deadline with nothing pending, a connection ends its client
+// in fill_pipeline() only once the client's other connections are done too
+// (siblings_done(), not all_connections_idle(), which counts pending replies
+// only): a sibling with a reconnect or slot map refresh due at the deadline
+// must still get to run it, so a rejected setup there fails the run (#630)
+// and a one-off slot error is retried (#666).
+static void test_deadline_end_waits_for_busy_sibling(const char *path)
+{
+#ifndef _WIN32
+    evutil_socket_t listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    sockaddr_un address = {};
+    address.sun_family = AF_UNIX;
+    snprintf(address.sun_path, sizeof(address.sun_path), "%s", path);
+    check(listener >= 0 && bind(listener, (sockaddr *) &address, sizeof(address)) == 0 && listen(listener, 4) == 0,
+          "unix listener");
+
+    connect_info endpoint = {};
+
+#else
+    evutil_socket_t listener = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in address = {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t address_len = sizeof(address);
+    check(listener >= 0 && bind(listener, (sockaddr *) &address, sizeof(address)) == 0 && listen(listener, 4) == 0 &&
+              getsockname(listener, (sockaddr *) &address, &address_len) == 0,
+          "loopback listener");
+    connect_info endpoint = {};
+    endpoint.ci_family = AF_INET;
+    endpoint.ci_socktype = SOCK_STREAM;
+    endpoint.ci_protocol = IPPROTO_TCP;
+    endpoint.ci_addr = (sockaddr *) &address;
+    endpoint.ci_addrlen = address_len;
+
+#endif
+    arbitrary_command_list commands;
+    benchmark_config config = {};
+    config.arbitrary_commands = &commands;
+    config.clients = config.threads = 1;
+    config.key_pattern = "S:S";
+    config.pipeline = 1;
+    config.protocol = PROTOCOL_REDIS_DEFAULT;
+    config.unix_socket = path;
+    config.test_time = 10;
+    config.reconnect_on_error = true;
+
+    event_base *base = event_base_new();
+    abstract_protocol *protocol = protocol_factory(config.protocol);
+    {
+        object_generator generator;
+        generator.set_data_size_fixed(1);
+        two_connection_client manager(base, &config, protocol, &generator);
+        shard_connection &first = *manager.get_connections()[0];
+        shard_connection &second = *manager.get_connections()[1];
+
+        first.set_address_port("127.0.0.1", "0");
+        check(first.connect(&endpoint) == 0, "the first connection connects");
+        // The sibling dropped and has a reconnect due (armed during startup,
+        // so its delay is not capped at a deadline: the timer never runs here).
+        second.attempt_reconnect("Connection dropped");
+        check(second.is_reconnect_pending(), "the sibling has a reconnect due");
+        // Started (one reply, at its start) a second past its deadline, as
+        // when no reply moved the run's clock since: finished() is false.
+        struct timeval start;
+        gettimeofday(&start, NULL);
+        start.tv_sec -= config.test_time + 1;
+        manager.mark_started(&start);
+        manager.mark_workload_submitted();
+        check(!manager.finished(), "the run's clock has not reached the deadline");
+        check(manager.all_connections_idle(), "no reply is pending anywhere");
+
+        deferred_fill_pipeline_cb(-1, 0, &first);
+        check(!manager.end_time_set(), "an idle connection past the deadline waits for a busy sibling");
+        check(second.is_reconnect_pending(), "the sibling's reconnect is left alone");
+
+        second.disconnect();
+        deferred_fill_pipeline_cb(-1, 0, &first);
+        check(manager.end_time_set(), "past the deadline the client ends once the sibling is done");
+        check(manager.get_stats()->get_duration_usec() == config.test_time * 1000000ULL,
+              "it ends at its deadline, its last reply being before it");
         event_base_loop(base, EVLOOP_NONBLOCK);
     }
     delete protocol;
@@ -343,6 +437,7 @@ int main()
     WSADATA data;
     check(WSAStartup(MAKEWORD(2, 2), &data) == 0, "Winsock startup");
     test_sibling_with_replay(NULL);
+    test_deadline_end_waits_for_busy_sibling(NULL);
 #else
     char directory[] = "/tmp/memtier-reconnect-siblings-XXXXXX";
     if (mkdtemp(directory) == NULL) {
@@ -351,6 +446,7 @@ int main()
     }
     std::string path = std::string(directory) + "/socket";
     test_sibling_with_replay(path.c_str());
+    test_deadline_end_waits_for_busy_sibling(path.c_str());
     rmdir(directory);
 #endif
     test_interrupted_deadline();

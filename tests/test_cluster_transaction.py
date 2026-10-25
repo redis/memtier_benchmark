@@ -1163,10 +1163,10 @@ class _HeldRefreshHandler(socketserver.StreamRequestHandler):
 
 
 def test_transaction_deadline_mid_multi_with_held_refresh_ends(env):
-    """#892 review: a --test-time deadline that lands inside a MULTI, while a
-    slot map refresh is held for that MULTI's EXEC (#569), must still end the
-    run. No new workload goes out past the deadline (#879), EXEC included,
-    so the held refresh never goes out; the client must not wait for it.
+    """A --test-time deadline that lands inside a MULTI, while a slot map
+    refresh is held for that MULTI's EXEC (#569), must still end the run. No
+    new workload goes out past the deadline (#879), EXEC included, so the
+    held refresh never goes out; the client must not wait for it.
     The rotation (MULTI, 10 SETs, EXEC at 5 commands/s) outlasts the 2 s
     --test-time, and --rate-limiting keeps the worker's loop alive, so
     waiting for the refresh hung the run."""

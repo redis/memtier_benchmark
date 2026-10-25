@@ -1749,6 +1749,9 @@ void shard_connection::process_response(void)
                                 r->get_status(), r->get_hits(), req->m_keys - r->get_hits());
 
             m_conns_manager->handle_response(m_id, now, req, r);
+            // After handle_response(): that is where a retryable error claims
+            // the request for retry (m_claimed_by_retry), and a reply being
+            // retried must not move the last reply time.
             m_conns_manager->inc_reqs_answered(now, !req->m_claimed_by_retry);
             // Any workload reply, even an error, shows the connection serves
             // requests again: a setup rejected before it no longer counts.
