@@ -34,7 +34,6 @@ class _Peer(socketserver.ThreadingTCPServer):
         # "repeat": every B connection authenticates and is closed on its SET.
         # "first": only B's first one gets that far; the later ones are closed
         # on AUTH, before they can send workload.
-        # "setup": every B connection is closed on AUTH (never submits, #819).
         self.mode = mode
         self.cluster = cluster
         self.lock = threading.Lock()
@@ -70,7 +69,7 @@ class _Handler(socketserver.StreamRequestHandler):
                         peer.first_auth.setdefault(role, time.monotonic())
                         if role == "B":
                             peer.b_connections += 1
-                            close = peer.mode == "setup" or (peer.mode == "first" and peer.b_connections > 1)
+                            close = peer.mode == "first" and peer.b_connections > 1
                     if role == "B" and close:
                         return
                     reply = b"+OK\r\n"
@@ -84,11 +83,15 @@ class _Handler(socketserver.StreamRequestHandler):
                         with peer.lock:
                             peer.b_sets += 1
                         return  # received, never answered
-                    reply = b"+OK\r\n"
                     with peer.lock:
+                        if peer.a_replies == _REPLIES:
+                            # Hold A's later requests, so Count is exact
+                            # however long SIGINT takes to land.
+                            continue
                         peer.a_replies += 1
                         if peer.a_replies == _REPLIES:
                             peer.ready.set()
+                    reply = b"+OK\r\n"
                 self.wfile.write(reply)
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
@@ -153,9 +156,10 @@ def _check(env, mode, cluster):
     env.assertLess(abs(duration - expected_ms), 250, message="duration %s, expected %.0f" % (duration, expected_ms))
     # Only A completes work, so the rate is A's alone (~200/s, not ~350/s).
     count = stats["Totals"]["Count"]
-    # SIGINT can land before A's last reply is processed.
+    # The peer answers A exactly _REPLIES times; SIGINT can land before the
+    # last of them is processed.
     env.assertGreaterEqual(count, _REPLIES - 1)
-    env.assertLessEqual(count, _REPLIES + 2)
+    env.assertLessEqual(count, _REPLIES)
     expected_ops = count * 1000.0 / expected_ms
     env.assertLess(abs(stats["Totals"]["Ops/sec"] - expected_ops), expected_ops * 0.08,
                    message="ops/sec %s, expected %.1f" % (stats["Totals"]["Ops/sec"], expected_ops))
