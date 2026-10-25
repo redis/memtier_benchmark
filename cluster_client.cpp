@@ -1668,20 +1668,21 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
     }
 
     /* A keyless --command has no slot, so create_arbitrary_request() sends it
-     * on the connection that produces it. A replica connection may produce
-     * it only when it is a read and --read-preference allows replica reads;
-     * otherwise (a keyless write, or any keyless command under rp_primary) it
-     * would reach a replica, where a write gets -READONLY. Leave it to the
-     * primaries, as 2.4 did (#676). Pooled keys and staged monitor commands
-     * are still drained, and --monitor-input lines route themselves. */
+     * on the connection that produces it. Under rp_primary nothing goes to a
+     * replica; under the other preferences a replica may produce any keyless
+     * command except one that may write (or is unknown), which the replica
+     * would reject with -READONLY. Leave those to the primaries, as 2.4 did
+     * (#676). Pooled keys and staged monitor commands are still drained, and
+     * --monitor-input lines route themselves. */
     if (m_connections[conn_id]->is_replica() && m_config->arbitrary_commands->is_defined() &&
         m_key_index_pools[conn_id]->empty() && m_staged_monitor_commands[conn_id].empty()) {
         const arbitrary_command &cmd = get_arbitrary_command(m_executed_command_index);
         const bool monitor = cmd.command_args.size() == 1 && cmd.command_args[0].type == monitor_random_type;
         // keys_count, not has_keys(): a literal key (no __key__) is not
         // routed by slot either, so it must stay off replicas too.
-        if (cmd.keys_count == 0 && !monitor &&
-            !(m_config->read_preference != rp_primary && is_read_command_index(m_executed_command_index))) {
+        const bool may_write =
+            !is_read_command_index(m_executed_command_index) && (cmd.spec == NULL || cmd.spec->may_write);
+        if (cmd.keys_count == 0 && !monitor && (m_config->read_preference == rp_primary || may_write)) {
             // A primary may itself be parked (e.g. by the in-flight budget
             // above) with nothing in flight; this replica no longer produces,
             // so wake one, or the event loop runs dry and the thread ends.

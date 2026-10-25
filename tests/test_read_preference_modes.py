@@ -1097,16 +1097,21 @@ def test_read_preference_replica_disconnect_wakes_peers(env):
 
 def test_read_preference_keyless_commands_skip_replicas(env):
     """A keyless --command (no __key__) goes out on the connection that
-    produces it. Replica connections must not send one unless it is a read
-    and --read-preference allows replica reads (#676): a keyless write gets
-    -READONLY there, and rp_primary promises that reads stay on primaries.
-    Scripted one-shard cluster (primary + replica) that counts commands."""
+    produces it. Replica connections must not send one under rp_primary, nor
+    one that may write under any preference (#676): a replica rejects it with
+    -READONLY. Other keyless commands may still use replicas under a
+    replica-allowing preference. Scripted one-shard cluster (primary +
+    replica) that counts commands."""
     cases = [
         (["--command=PING"], b"PING", False),
         (["--command=PING", "--command-is-read", "--read-preference=primary"], b"PING", False),
         (["--command=DBSIZE", "--read-preference=primary"], b"DBSIZE", False),
         (["--command=FLUSHDB", "--read-preference=secondary"], b"FLUSHDB", False),
-        (["--command=PING", "--read-preference=secondaryPreferred"], b"PING", False),
+        (["--command=FLUSHDB", "--read-preference=secondaryPreferred"], b"FLUSHDB", False),
+        # MAY_REPLICATE, not WRITE: a script can write.
+        (["--command=EVAL return 0", "--read-preference=secondary"], b"EVAL", False),
+        (["--command=EVAL return 0", "--command-is-read", "--read-preference=secondary"], b"EVAL", True),
+        (["--command=PING", "--read-preference=secondaryPreferred"], b"PING", True),
         (["--command=PING", "--command-is-read", "--read-preference=secondaryPreferred"], b"PING", True),
         (["--command=DBSIZE", "--read-preference=secondary"], b"DBSIZE", True),
     ]
@@ -1138,11 +1143,11 @@ def test_read_preference_keyless_hold_keeps_traffic_flowing(env):
          {b"FLUSHDB": 50}, {b"DBSIZE": 50}),
         (["--command=FLUSHDB", "--command=PING", "--command-is-read", "--read-preference=nearest"], 2, 2, 100,
          {b"FLUSHDB": 200}, {b"PING": 200}),
-        (["--command=GET __key__", "--command=PING", "--read-preference=secondary"], 2, 2, 200,
-         {b"PING": 400}, {b"GET": 400}),
-        (["--command=SET __key__ v", "--command=GET __key__", "--command=PING",
+        (["--command=GET __key__", "--command=FLUSHDB", "--read-preference=secondary"], 2, 2, 200,
+         {b"FLUSHDB": 400}, {b"GET": 400}),
+        (["--command=SET __key__ v", "--command=GET __key__", "--command=FLUSHDB",
           "--read-preference=secondaryPreferred"], 2, 2, 300,
-         {b"SET": 400, b"PING": 400}, {b"GET": 400}),
+         {b"SET": 400, b"FLUSHDB": 400}, {b"GET": 400}),
         (["--command=SET __key__ v", "--command=GET __key__", "--command=PING",
           "--read-preference=primary"], 2, 2, 300,
          {b"SET": 400, b"GET": 400, b"PING": 400}, {}),
