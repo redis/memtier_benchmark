@@ -4519,7 +4519,19 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         // --connection-stage-timeout seconds, abort the run rather than
         // letting the reconnect / "stuck WAIT" loop ignore --test-time.
         // 0 = supervisor disabled.
-        {
+        //
+        // Workers that have all ended leave nothing to bound: the loop below
+        // then sees no active thread and the run reports how they ended. A
+        // worker that failed during the sleep above would otherwise also be
+        // reported as an abort, and memtier would exit 2 instead of 1.
+        bool any_thread_running = false;
+        for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
+            if (!(*i)->m_finished) {
+                any_thread_running = true;
+                break;
+            }
+        }
+        if (any_thread_running) {
             std::string last_err;
             unsigned int elapsed = 0;
             if (connection_stage_should_abort(cfg->connection_stage_timeout, &last_err, &elapsed)) {
