@@ -1931,12 +1931,15 @@ void shard_connection::fill_pipeline(void)
     // run has finished while responses are still pending. Retries are
     // resent beyond --pipeline and, after a MOVED, keep going to the node
     // the stale slot map names until a CLUSTER SLOTS refresh lands, so
-    // holding the refresh back would loop on MOVED forever. No new workload
-    // goes out once the deadline has passed by now, even if no reply has
-    // moved the run's clock past it yet (a reconnect setup that stalled past
-    // it, say: #879). now is fixed here, so this is checked once.
+    // holding the refresh back would loop on MOVED forever. The setup of a
+    // reconnect or a slot map refresh due at the deadline also goes out, so
+    // a rejected setup still fails the run (#630) and a one-off slot error
+    // is retried. Only new workload stops once the deadline has passed by
+    // now, even if no reply has moved the run's clock past it yet (a
+    // reconnect setup that stalled past it, say: #879). now is fixed here,
+    // so this is checked once.
     const bool deadline_passed = m_conns_manager->deadline_passed_by(now);
-    while (!(deadline_passed || m_conns_manager->finished()) || (!is_conn_setup_done() && get_pending_resp() > 0)) {
+    while (!m_conns_manager->finished() || (!is_conn_setup_done() && get_pending_resp() > 0)) {
         // A CLUSTER SLOTS refresh requested while this connection drives
         // the pinned --transaction rotation inside an open MULTI waits for
         // the rotation's EXEC/DISCARD: sent now it would only be queued.
@@ -1982,12 +1985,14 @@ void shard_connection::fill_pipeline(void)
         if ((m_pending_resp == 0) && (evbuffer_get_length(bufferevent_get_output(m_bev)) == 0)) {
             benchmark_debug_log("%s Done, no requests to send no response to wait for\n", get_readable_id());
 
-            // Past the deadline by now, a client ends here even if no reply
-            // moved the run's clock past it (#879), unless it holds retries:
-            // those are still resent until the drain grace (#715).
-            if (m_conns_manager->all_connections_idle() &&
-                (m_conns_manager->finished() ||
-                 (deadline_passed && !static_cast<client *>(m_conns_manager)->holds_retries()))) {
+            // Past the deadline by now, a client whose setup is done ends
+            // here even if no reply moved the run's clock past it (#879),
+            // unless another connection is still busy (a reconnect or slot
+            // map refresh due at the deadline, see above) or it holds
+            // retries: those are still resent until the drain grace (#715).
+            if ((m_conns_manager->finished() && m_conns_manager->all_connections_idle()) ||
+                (deadline_passed && is_conn_setup_done() && siblings_done() &&
+                 !static_cast<client *>(m_conns_manager)->holds_retries())) {
                 m_conns_manager->set_end_time();
                 m_conns_manager->disconnect_all();
             } else if (!m_config->request_rate) {

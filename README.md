@@ -686,7 +686,8 @@ run's stop condition:
     Ctrl+C or at the drain grace. With `--retry-on-error`, a resent request
     answered after the reconnect is such a reply; an error reply that is
     retried is not. No new request is sent past the deadline, also when a
-    reconnect's setup (AUTH, say) completes only then.
+    reconnect's setup (AUTH, say) completes only then; the setup itself
+    still goes out, so a rejected one still fails the run.
   - In cluster mode this holds for the main connection only: another shard's
     connection is reconnected through a slot map refresh. Once the run is
     over, a refresh still redials it; if that dial fails, the connection is
