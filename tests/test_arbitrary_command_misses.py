@@ -9,9 +9,13 @@ under the "Per-Key Misses" section nested in "ALL STATS".
 
 import json
 import os
+import socketserver
+import subprocess
 import tempfile
+import threading
 
 from include import (
+    MEMTIER_BINARY,
     addTLSArgs,
     add_required_env_arguments,
     debugPrintMemtierOnError,
@@ -681,39 +685,38 @@ def test_arbitrary_sismember_resp3_boolean(env):
     peer answers SISMEMBER with #t and #f in turn: half the requests are hits.
     """
     env.skipOnCluster()
-    import socketserver
-    import subprocess
-    import threading
-
-    from include import MEMTIER_BINARY
 
     class _Handler(socketserver.StreamRequestHandler):
         def handle(self):
             answered = 0
-            while True:
-                line = self.rfile.readline()
-                if not line:
-                    return
-                args = []
-                for _ in range(int(line[1:])):
-                    size = self.rfile.readline()
-                    args.append(self.rfile.read(int(size[1:]) + 2)[:-2])
-                verb = args[0].upper()
-                if verb == b"HELLO":
-                    reply = b"%1\r\n+proto\r\n:3\r\n"
-                elif verb == b"SISMEMBER":
-                    reply = b"#t\r\n" if answered % 2 == 0 else b"#f\r\n"
-                    answered += 1
-                else:
-                    reply = b"+OK\r\n"
-                self.wfile.write(reply)
-                self.wfile.flush()
+            try:
+                while True:
+                    line = self.rfile.readline()
+                    if not line:
+                        return
+                    args = []
+                    for _ in range(int(line[1:])):
+                        size = self.rfile.readline()
+                        args.append(self.rfile.read(int(size[1:]) + 2)[:-2])
+                    verb = args[0].upper()
+                    if verb == b"HELLO":
+                        reply = b"%1\r\n+proto\r\n:3\r\n"
+                    elif verb == b"SISMEMBER":
+                        reply = b"#t\r\n" if answered % 2 == 0 else b"#f\r\n"
+                        answered += 1
+                    else:
+                        reply = b"+OK\r\n"
+                    self.wfile.write(reply)
+                    self.wfile.flush()
+            except (ConnectionResetError, BrokenPipeError):
+                pass  # memtier closed the connection when it exited
 
     server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), _Handler)
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    json_path = os.path.join(tempfile.mkdtemp(), "mb.json")
+    results = tempfile.TemporaryDirectory()
+    json_path = os.path.join(results.name, "mb.json")
     try:
         result = subprocess.run(
             [MEMTIER_BINARY, "--server=127.0.0.1", "--port={}".format(server.server_address[1]),
@@ -726,5 +729,6 @@ def test_arbitrary_sismember_resp3_boolean(env):
     env.assertEqual(result.returncode, 0, message=result.stderr[-500:])
     with open(json_path) as fh:
         stats = json.load(fh)["ALL STATS"]["Per-Key Misses"]["SISMEMBER"]
+    results.cleanup()
     env.assertEqual(stats["Total Hits"], 10)
     env.assertEqual(stats["Total Misses"], 10)
