@@ -1111,6 +1111,8 @@ def test_read_preference_keyless_commands_skip_replicas(env):
         # MAY_REPLICATE, not WRITE: a script can write.
         (["--command=EVAL return 0", "--read-preference=secondary"], b"EVAL", False),
         (["--command=EVAL return 0", "--command-is-read", "--read-preference=secondary"], b"EVAL", True),
+        # No write flag, but a replica rejects WAIT.
+        (["--command=WAIT 0 0", "--read-preference=secondary"], b"WAIT", False),
         (["--command=PING", "--read-preference=secondaryPreferred"], b"PING", True),
         (["--command=PING", "--command-is-read", "--read-preference=secondaryPreferred"], b"PING", True),
         (["--command=DBSIZE", "--read-preference=secondary"], b"DBSIZE", True),

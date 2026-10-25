@@ -1680,8 +1680,11 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         const bool monitor = cmd.command_args.size() == 1 && cmd.command_args[0].type == monitor_random_type;
         // keys_count, not has_keys(): a literal key (no __key__) is not
         // routed by slot either, so it must stay off replicas too.
-        const bool may_write =
-            !is_read_command_index(m_executed_command_index) && (cmd.spec == NULL || cmd.spec->may_write);
+        // WAIT/WAITAOF carry no write flag, but a replica rejects them too.
+        const bool primary_only =
+            cmd.spec != NULL && (strcmp(cmd.spec->name, "WAIT") == 0 || strcmp(cmd.spec->name, "WAITAOF") == 0);
+        const bool may_write = !is_read_command_index(m_executed_command_index) &&
+                               (cmd.spec == NULL || cmd.spec->may_write || primary_only);
         if (cmd.keys_count == 0 && !monitor && (m_config->read_preference == rp_primary || may_write)) {
             // A primary may itself be parked (e.g. by the in-flight budget
             // above) with nothing in flight; this replica no longer produces,
