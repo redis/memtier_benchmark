@@ -147,29 +147,35 @@ static void check_nested_push_framing()
     }
 
     // The kept tree gets a null element for the push slot, so later elements
-    // land in the right aggregate: `*2 *2 >1 +x +a +b` keeps [[null, +a], +b].
-    abstract_protocol *protocol = protocol_factory(PROTOCOL_RESP3);
-    evbuffer *input = evbuffer_new();
+    // land in the right aggregate: `*2 *2 >1 +x +a +b` keeps [[null, +a], +b]
+    // and `*2 *2 +a >0 +b` keeps [[+a, null], +b].
+    const char *kept[] = {"*2\r\n*2\r\n>1\r\n+x\r\n+a\r\n+b\r\n", "*2\r\n*2\r\n+a\r\n>0\r\n+b\r\n"};
+    abstract_protocol *protocol;
+    evbuffer *input;
     evbuffer *output = evbuffer_new();
-    protocol->set_buffers(input, output);
-    protocol->configure_protocol(PROTOCOL_RESP3);
-    protocol->set_keep_value(true);
-    const char kept[] = "*2\r\n*2\r\n>1\r\n+x\r\n+a\r\n+b\r\n";
-    evbuffer_add(input, kept, strlen(kept));
-    check(protocol->parse_response() == 1, "kept reply with nested push completes");
-    mbulk_size_el *root = protocol->get_response()->get_mbulk_value();
-    bool shape = root && root->mbulks_elements.size() == 2 && root->mbulks_elements[0]->is_mbulk_size() &&
-                 root->mbulks_elements[1]->is_bulk();
-    if (shape) {
-        mbulk_size_el *inner = root->mbulks_elements[0]->as_mbulk_size();
-        shape = inner->mbulks_elements.size() == 2 && inner->mbulks_elements[0]->is_bulk() &&
-                inner->mbulks_elements[0]->as_bulk()->is_resp3_null &&
-                strcmp(inner->mbulks_elements[1]->as_bulk()->value, "+a") == 0 &&
-                strcmp(root->mbulks_elements[1]->as_bulk()->value, "+b") == 0;
+    for (int null_at = 0; null_at < 2; null_at++) {
+        protocol = protocol_factory(PROTOCOL_RESP3);
+        input = evbuffer_new();
+        protocol->set_buffers(input, output);
+        protocol->configure_protocol(PROTOCOL_RESP3);
+        protocol->set_keep_value(true);
+        evbuffer_add(input, kept[null_at], strlen(kept[null_at]));
+        check(protocol->parse_response() == 1, "kept reply with nested push completes");
+        mbulk_size_el *root = protocol->get_response()->get_mbulk_value();
+        bool shape = root && root->mbulks_elements.size() == 2 && root->mbulks_elements[0]->is_mbulk_size() &&
+                     root->mbulks_elements[1]->is_bulk();
+        if (shape) {
+            mbulk_size_el *inner = root->mbulks_elements[0]->as_mbulk_size();
+            int a_at = 1 - null_at;
+            shape = inner->mbulks_elements.size() == 2 && inner->mbulks_elements[0]->is_bulk() &&
+                    inner->mbulks_elements[1]->is_bulk() && inner->mbulks_elements[null_at]->as_bulk()->is_resp3_null &&
+                    strcmp(inner->mbulks_elements[a_at]->as_bulk()->value, "+a") == 0 &&
+                    strcmp(root->mbulks_elements[1]->as_bulk()->value, "+b") == 0;
+        }
+        check(shape, "nested push slot is kept as a null element");
+        delete protocol;
+        evbuffer_free(input);
     }
-    check(shape, "nested push slot is kept as a null element");
-    delete protocol;
-    evbuffer_free(input);
 
     // Alloc-free miss tracking counts the push slot as a miss and keeps the
     // top-level element positions: `*3 *2 >0 +a >0 +b` -> hit, miss, hit.
@@ -189,11 +195,10 @@ static void check_nested_push_framing()
     evbuffer_free(output);
 }
 
-// Issue #839: a RESP3 push frame nested in a kept aggregate used to drain the
-// aggregate's remaining slots, so the reply completed with the mbulk cursor
-// still pointing into the tree. The next reply frees that tree in rs_initial
-// and must not write through the stale cursor (heap-use-after-free under ASan).
-// Since #847 the push fills one slot, so `%1 *2 >0 %0 X` is one whole reply.
+// Issue #839: a reply that completes with the mbulk cursor still set must not
+// let the next reply write through it once rs_initial frees the tree. A nested
+// push used to cause that; it now fills one slot (#847), so these replies end
+// with the cursor at NULL and check that the next kept reply parses cleanly.
 static void check_nested_push_keep_value()
 {
     evbuffer *input;
