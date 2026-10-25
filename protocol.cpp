@@ -233,10 +233,10 @@ protected:
     bool m_push;
     // A push nested in an aggregate (not valid RESP3, which only sends pushes
     // at top level) fills one slot of the enclosing aggregate and is drained
-    // in its own scope: the enclosing slot count and attribute flag are saved
-    // here and restored when the push ends (#847).
+    // in its own scope: the enclosing slot count is saved here and restored
+    // when the push ends (#847). An attribute is drained the same way (#458),
+    // so no attribute can enclose a nested scope.
     bool m_push_nested;
-    bool m_push_outer_attribute;
     unsigned int m_push_outer_bulks;
     // Per-response state for alloc-free ArrayPerElementNulls miss tracking
     // (m_track_elem_misses). m_tracking turns true once the reply's top-level
@@ -276,7 +276,6 @@ public:
             m_attribute(false),
             m_push(false),
             m_push_nested(false),
-            m_push_outer_attribute(false),
             m_push_outer_bulks(0),
             m_tracking(false),
             m_nested_remaining(0)
@@ -326,7 +325,6 @@ void redis_protocol::reset_state()
     m_attribute = false;
     m_push = false;
     m_push_nested = false;
-    m_push_outer_attribute = false;
     m_push_outer_bulks = 0;
     m_bulk_len = 0;
     m_response_len = 0;
@@ -655,7 +653,7 @@ bool redis_protocol::response_ended()
         bool was_attribute = m_attribute;
         m_push = false;
         m_push_nested = false;
-        m_attribute = m_push_outer_attribute;
+        m_attribute = false;
         m_total_bulks_count = m_push_outer_bulks;
         if (m_total_bulks_count != 0 || was_attribute) return false;
     }
@@ -763,7 +761,6 @@ int redis_protocol::parse_response(void)
                             m_current_mbulk = m_current_mbulk->get_next_mbulk();
                         }
                         m_push_nested = true;
-                        m_push_outer_attribute = m_attribute;
                         m_push_outer_bulks = m_total_bulks_count;
                         m_attribute = false;
                         m_total_bulks_count = 0;
