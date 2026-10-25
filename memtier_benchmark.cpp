@@ -4146,15 +4146,31 @@ static void format_sample_count(unsigned long long n, char *buf, size_t len)
         snprintf(buf, len, "%.2fG", (double) (n / 10000000) / 100.0);
 }
 
+// What warn_unresolvable_percentiles last said about a percentile.
+enum percentile_warning
+{
+    pw_none,
+    pw_run,
+    pw_window
+};
+
 // Warn up front about --print-percentiles values a bounded run can never
 // resolve (see percentile_min_samples). Only --requests and --rate-limiting
 // bound the sample count; otherwise the realtime rows flag them live.
 // rate_conns is the number of request-generating connections, each limited to
 // --rate-limiting: clients x threads, times the traffic endpoints in cluster
-// mode, which is only known once the first topology is committed. The check
-// runs once per process, so a later topology with more endpoints can exceed
-// the bound it reported.
-static void warn_unresolvable_percentiles(const benchmark_config *cfg, unsigned long long rate_conns)
+// mode, which is only known once the first topology is committed.
+//
+// issued holds what was said about each percentile. When it is empty this is
+// the first check and it is filled in. Otherwise rate_conns has grown (a
+// cluster run that started on a partial slot map opened more endpoint
+// connections), which only raises the bounds: each percentile warned about
+// before is warned about again with the new bound, or the warning is
+// withdrawn, so the bound stated last always holds for the whole run.
+// end_line ends a '\r'-terminated progress line before the first output.
+// Returns whether anything was printed.
+static bool warn_unresolvable_percentiles(const benchmark_config *cfg, unsigned long long rate_conns,
+                                          std::vector<percentile_warning> &issued, bool end_line)
 {
     // Upper bounds on recorded latency samples; 0 means unbounded. A
     // rate-limited connection sends at most rate x T plus the burst of
@@ -4173,21 +4189,55 @@ static void warn_unresolvable_percentiles(const benchmark_config *cfg, unsigned 
     if (window && run_max && (!window_max || run_max < window_max)) window_max = run_max;
 
     const std::vector<double> &quantiles = cfg->print_percentiles.quantile_list;
+    const bool update = !issued.empty();
+    if (!update) issued.assign(quantiles.size(), pw_none);
+    bool printed = false;
     for (size_t i = 0; i < quantiles.size(); i++) {
         unsigned long long need = percentile_min_samples(quantiles[i]);
-        if (run_max && run_max < need) {
+        percentile_warning now = pw_none;
+        if (run_max && run_max < need)
+            now = pw_run;
+        else if (window_max && window_max < need)
+            now = pw_window;
+        // A raised bound never adds a warning, so an update only revisits
+        // the percentiles already warned about. The --requests bound does not
+        // depend on the connections, so its warning stands as printed.
+        if (update && (issued[i] == pw_none || (now == pw_run && cfg->requests))) continue;
+        if (!update && now == pw_none) continue;
+        if (!printed) {
+            if (end_line) fputc('\n', stderr);
+            if (update)
+                fprintf(stderr,
+                        "warning: the cluster topology grew to %llu rate-limited connections, so the percentile "
+                        "sample bounds above are raised:\n",
+                        rate_conns);
+            printed = true;
+        }
+        if (update && issued[i] == pw_run && now != pw_run)
+            fprintf(stderr,
+                    "note: p%.15g needs at least %llu latency samples and this run may now record up to about "
+                    "%.0f, so it may be resolved.\n",
+                    quantiles[i], need, run_max);
+        if (now == pw_run) {
             // --requests is an exact bound; the rate-limit bound is approximate.
             fprintf(stderr,
                     "warning: p%.15g needs at least %llu latency samples, but this run records at most %s%.0f, "
                     "so it will not be resolved.\n",
                     quantiles[i], need, cfg->requests ? "" : "about ", run_max);
-        } else if (window_max && window_max < need) {
+        } else if (now == pw_window) {
             fprintf(stderr,
                     "warning: p%.15g needs at least %llu latency samples, but the %us latency window holds at "
                     "most about %.0f; the win%us row marks it with '*'.\n",
                     quantiles[i], need, window, window_max, window);
+        } else if (update && issued[i] == pw_window) {
+            fprintf(stderr,
+                    "note: p%.15g needs at least %llu latency samples and the %us latency window may now hold up "
+                    "to about %.0f, so the win%us row may resolve it.\n",
+                    quantiles[i], need, window, window_max, window);
         }
+        issued[i] = now;
     }
+    return printed;
 }
 
 // ---------------------------------------------------------------------------
@@ -4621,16 +4671,21 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         const std::vector<int64_t> &inst_values = inst_percentiles.values();
 
         // Cluster mode knows its rate-limited connection fan-out only after
-        // the first topology commit, so check the percentile bounds here,
-        // once per process. Restart the realtime frame so the warning is not
+        // the first topology commit, so check the percentile bounds here:
+        // once per process, and again each time the fan-out grows (a partial
+        // slot map healed), which happens at most once per topology change.
+        // The last tick runs after every worker has finished, so it sees the
+        // final fan-out. Restart the realtime frame so the warning is not
         // overwritten by the TTY redraw.
-        static bool cluster_percentiles_checked = false;
-        if (cfg->cluster_mode && !cluster_percentiles_checked && cluster_client::rate_limited_connections() > 0) {
-            cluster_percentiles_checked = true;
+        static unsigned long long cluster_percentiles_conns = 0;
+        static std::vector<percentile_warning> cluster_percentiles_issued;
+        const unsigned long long rate_conns = cfg->cluster_mode ? cluster_client::rate_limited_connections() : 0;
+        if (rate_conns > cluster_percentiles_conns) {
+            cluster_percentiles_conns = rate_conns;
             // The single-line progress display ends with '\r'.
-            if (progress_printed && !cfg->realtime_latencies) fputc('\n', stderr);
-            warn_unresolvable_percentiles(cfg, cluster_client::rate_limited_connections());
-            first_rtl_frame = true;
+            if (warn_unresolvable_percentiles(cfg, rate_conns, cluster_percentiles_issued,
+                                              progress_printed && !cfg->realtime_latencies))
+                first_rtl_frame = true;
         }
 
         // Drain the seconds completed since the previous tick, once, for both
@@ -6403,7 +6458,10 @@ int main(int argc, char *argv[])
         if (cfg.latency_window_set && !cfg.realtime_latencies)
             fprintf(stderr, "warning: --latency-window only applies to --realtime-latencies.\n");
         // Cluster mode checks once the topology gives its connection fan-out.
-        if (!cfg.cluster_mode) warn_unresolvable_percentiles(&cfg, (unsigned long long) cfg.clients * cfg.threads);
+        if (!cfg.cluster_mode) {
+            std::vector<percentile_warning> issued;
+            warn_unresolvable_percentiles(&cfg, (unsigned long long) cfg.clients * cfg.threads, issued, false);
+        }
         for (unsigned int run_id = 1; run_id <= cfg.run_count; run_id++) {
             if (run_id > 1) {
                 if (g_interrupted) break;

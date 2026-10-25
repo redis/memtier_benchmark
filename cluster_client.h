@@ -307,8 +307,9 @@ public:
     void print_topology_summary() const;
 
     // Request-generating connections (threads x clients x traffic endpoints)
-    // of the first committed topology, for the main thread's percentile
-    // sample-bound check; 0 until a topology summary has been printed.
+    // of the largest topology committed so far, for the main thread's
+    // percentile sample-bound check; 0 until a topology summary has been
+    // printed. Grows when a partial slot map heals.
     static unsigned long long rate_limited_connections();
 
     // client manager api's

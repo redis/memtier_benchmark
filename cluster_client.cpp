@@ -980,14 +980,15 @@ void cluster_client::print_topology_summary() const
     }
 
     // Publish the same connection fan-out for the main thread's
-    // unresolvable-percentile check (first topology only).
-    if (s_rate_limited_connections.load() == 0) {
-        const unsigned long long traffic_eps =
-            (unsigned long long) primaries +
-            (m_config->read_preference != rp_primary ? (unsigned long long) replicas : 0);
-        s_rate_limited_connections.store((unsigned long long) m_config->threads *
-                                         (unsigned long long) m_config->clients * traffic_eps);
-    }
+    // unresolvable-percentile check. A run can start on a partial slot map and
+    // open more endpoint connections once it heals, so keep the largest
+    // fan-out seen: the main thread updates its warning when this grows. Only
+    // written here, under s_mtx, so the load-compare-store cannot race.
+    const unsigned long long traffic_eps =
+        (unsigned long long) primaries + (m_config->read_preference != rp_primary ? (unsigned long long) replicas : 0);
+    const unsigned long long rate_conns =
+        (unsigned long long) m_config->threads * (unsigned long long) m_config->clients * traffic_eps;
+    if (rate_conns > s_rate_limited_connections.load()) s_rate_limited_connections.store(rate_conns);
 
     pthread_mutex_unlock(&s_mtx);
 }
