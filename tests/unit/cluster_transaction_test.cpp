@@ -96,6 +96,7 @@ public:
         m_staged_monitor_commands.emplace_back();
     }
     using cluster_client::disconnect;
+    using cluster_client::fallback_primary_conn_id;
     using cluster_client::reroute_staged_monitor_commands;
     using cluster_client::txn_release_pin;
     bool staged() const { return m_txn_has_staged_key; }
@@ -156,6 +157,21 @@ public:
     {
         shard_connection *peer = create_shard_connection(protocol);
         check(connect_shard_connection(peer, (char *) "127.0.0.1", (char *) port), "peer dialed");
+    }
+    // The seed dials and asks for CLUSTER SLOTS: a refresh is in flight.
+    void refresh_over_seed(const char *port)
+    {
+        check(connect_shard_connection(m_connections[0], (char *) "127.0.0.1", (char *) port), "seed dialed");
+        m_connections[0]->set_cluster_slots();
+    }
+    // Primaries a then b, and `slot` owned by neither.
+    void primaries_with_hole(unsigned int a, unsigned int b, unsigned int slot)
+    {
+        m_shard_groups.clear();
+        m_shard_groups.push_back(shard_group{0, m_connections[a], {}, 0});
+        m_shard_groups.push_back(shard_group{1, m_connections[b], {}, 0});
+        m_slot_to_shard_group.assign(m_slot_to_shard_group.size(), 0);
+        m_slot_to_shard_group[slot] = UINT_MAX;
     }
     bool pool_empty(unsigned int conn_id) const { return m_key_index_pools[conn_id]->empty(); }
     // A routed key and a monitor line for `slot`, both unsent on conn_id.
@@ -557,6 +573,26 @@ static void check_repin_routes_to_staged_owner(unsigned long long first_key)
         check(client.get_reqs_generated() == generated, "given-up primary's staged line is uncounted");
         check(client.get_stats()->get_total_errors() == errors + 1,
               "given-up primary's staged line counts as an error");
+    }
+    // While the seed refreshes SLOTS, an unowned line on a given-up primary
+    // still moves to the live one, even when the given-up one comes first.
+    {
+        client_group group(&config, protocol, &generator);
+        transaction_client client(&group);
+        client.route_slot_to_second_shard(protocol, staged_slot, port.c_str());
+        client.dial_peer(protocol, port.c_str());
+        client.refresh_over_seed(port.c_str());
+        client.get_connections()[1]->disconnect();
+        client.primaries_with_hole(1, 2, staged_slot);
+        check(client.fallback_primary_conn_id() == 1, "fallback counts the given-up primary while the seed refreshes");
+        const unsigned long long generated = client.get_reqs_generated();
+        const unsigned long long errors = client.get_stats()->get_total_errors();
+        client.stage_line(1, staged_slot);
+        client.reroute_staged_monitor_commands();
+        check(client.staged_monitor_count(1) == 0 && client.staged_monitor_count(2) == 1,
+              "unowned line skips the given-up primary for the dialing one");
+        check(client.get_reqs_generated() == generated + 1 && client.get_stats()->get_total_errors() == errors,
+              "unowned line moved during a refresh stays counted and is not an error");
     }
     // An unowned line on a given-up primary moves to a primary that is still
     // dialing, instead of staying or being dropped.

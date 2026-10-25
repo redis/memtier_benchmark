@@ -2932,6 +2932,19 @@ void cluster_client::reroute_staged_monitor_commands()
                (m_connections[conn_id]->get_connection_state() == conn_disconnected &&
                 !m_connections[conn_id]->is_reconnect_pending());
     };
+    // An unowned line goes to a primary of this map that will send it:
+    // connected first, then dialing or reconnect-pending. Not by
+    // fallback_primary_conn_id(), which while the seed refreshes SLOTS also
+    // counts a primary given up on and can return it ahead of a live one.
+    unsigned int fallback = UINT_MAX;
+    for (const shard_group &group : m_shard_groups) {
+        if (group.primary == NULL || given_up(group.primary->get_id())) continue;
+        if (group.primary->get_connection_state() == conn_connected) {
+            fallback = group.primary->get_id();
+            break;
+        }
+        if (fallback == UINT_MAX) fallback = group.primary->get_id();
+    }
     std::vector<unsigned int> woken;
     unsigned long long dropped = 0;
     for (unsigned int i = 0; i < m_staged_monitor_commands.size(); i++) {
@@ -2946,7 +2959,7 @@ void cluster_client::reroute_staged_monitor_commands()
             unsigned int target;
             if (slot_is_unowned(staged.front().slot)) {
                 // Any primary gives the server's routing response.
-                target = keeps ? i : fallback_primary_conn_id();
+                target = keeps ? i : fallback;
             } else {
                 target = slot_primary_conn_id(staged.front().slot);
             }
