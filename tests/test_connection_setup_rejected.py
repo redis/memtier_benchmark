@@ -11,6 +11,10 @@ disarmed and nothing ended the run.
   steady state, so the run fails (exit 1). Before that it is still left to
   --connection-stage-timeout (exit 2).
 
+A server without HELLO (Redis < 6.0) answers it as an unknown command
+(#488): under --protocol=resp2 the run goes on as RESP2, the wire default;
+under --protocol=resp3 it fails with an actionable error.
+
 The peers are the scripted nodes of test_cluster_slots_bad_reply.
 """
 import json
@@ -296,4 +300,47 @@ def test_standalone_auth_rejected_on_some_connections_fails_run(env):
     env.assertTrue(1 <= rejected <= 4, message=stderr[-2000:])
     env.assertEqual(returncode, 1, message=stderr[-2000:])
     env.assertContains("AUTH error and --reconnect-on-error is not set, ending this thread", stderr)
+    env.assertLess(elapsed, 8)
+
+
+_UNKNOWN_HELLO = (b"-ERR unknown command 'HELLO', with args beginning with: '2' \r\n",
+                  b"-ERR unknown command 'hello'\r\n",
+                  b"-ERR unknown command `hello`, with args beginning with: `2`, \r\n")
+
+
+def test_resp2_without_hello_support_runs(env):
+    for hello_error in _UNKNOWN_HELLO:
+        node = _Node(bad_slots_replies=0, hello_error=hello_error)
+        returncode, stderr, elapsed = _run(node, ["--protocol=resp2", "--requests=200",
+                                                  "--connection-stage-timeout=5"],
+                                           clients=2, workers=2, cluster=False)
+        env.assertEqual(node.errors, [])
+        env.assertEqual(returncode, 0, message=stderr[-2000:])
+        env.assertEqual(node.data_requests, 800)
+        # One warning per process, not per connection.
+        env.assertEqual(stderr.count("server does not support HELLO, so RESP2 was assumed"), 1,
+                        message=stderr[-2000:])
+        env.assertFalse("HELLO failed" in stderr, message=stderr[-2000:])
+        env.assertLess(elapsed, 8)
+
+
+def test_resp3_without_hello_support_fails_clearly(env):
+    node = _Node(bad_slots_replies=0, hello_error=_UNKNOWN_HELLO[0])
+    returncode, stderr, elapsed = _run(node, ["--protocol=resp3", "--requests=200",
+                                              "--connection-stage-timeout=2"], cluster=False)
+    env.assertEqual(node.errors, [])
+    env.assertNotEqual(returncode, 0, message=stderr[-2000:])
+    env.assertContains("server does not support HELLO, so RESP3 is unavailable (requires Redis >= 6.0)", stderr)
+    env.assertEqual(node.data_requests, 0)
+    env.assertLess(elapsed, 8)
+
+
+def test_resp2_other_hello_error_still_fails(env):
+    node = _Node(bad_slots_replies=0, hello_error=b"-NOPROTO unsupported protocol version\r\n")
+    returncode, stderr, elapsed = _run(node, ["--protocol=resp2", "--requests=200",
+                                              "--connection-stage-timeout=2"], cluster=False)
+    env.assertEqual(node.errors, [])
+    env.assertNotEqual(returncode, 0, message=stderr[-2000:])
+    env.assertContains("HELLO failed [-NOPROTO", stderr)
+    env.assertFalse("RESP2 was assumed" in stderr, message=stderr[-2000:])
     env.assertLess(elapsed, 8)
