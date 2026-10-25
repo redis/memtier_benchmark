@@ -2634,6 +2634,7 @@ void shard_connection::handle_reconnect_timer_event()
 
     m_reconnecting = false;
     if (m_reconnect_deadline.tv_sec) m_fired_reconnect_deadline = m_reconnect_deadline;
+    m_reconnect_deadline.tv_sec = m_reconnect_deadline.tv_usec = 0;
 
     // The server rejected a setup step on the last connection and the run's
     // time is up: stop retrying. With unlimited attempts the setup would keep

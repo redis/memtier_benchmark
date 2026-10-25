@@ -353,8 +353,9 @@ static void test_deadline_retry_fires_early()
         object_generator generator;
         counting_reconnect_client manager(base, &config, protocol, &generator);
         shard_connection &connection = *manager.get_connections()[0];
-        // The deadline is 100 ms away: the 1 s backoff is clamped to it.
-        timeval now, ahead = {0, 100000};
+        // The deadline is 500 ms away: the 1 s backoff is clamped to it, with
+        // room for a slow (sanitized, loaded) runner to reach the handler.
+        timeval now, ahead = {0, 500000};
         gettimeofday(&now, NULL);
         now.tv_sec -= config.test_time;
         evutil_timeradd(&now, &ahead, &config.benchmark_start_time);
