@@ -314,7 +314,7 @@ static prometheus_exporter *g_prom_exporter = NULL;
 //   - reset by connection_stage_supervisor_reset() at the start of every
 //     run_benchmark() invocation; --run-count > 1 must restart the policy
 //     because a previous run's success latch is meaningless for the next.
-//   - g_conn_stage_run_start tracks the time of that reset; we measure
+//   - g_conn_stage_run_start_usec tracks the time of that reset; we measure
 //     "elapsed in setup phase" from there, NOT from each individual
 //     failure, so a single late failure can still trigger the timeout.
 static std::atomic<bool> g_conn_stage_steady_state{false};

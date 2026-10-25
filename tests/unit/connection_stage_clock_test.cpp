@@ -55,6 +55,11 @@ int main(void)
     check(!connection_stage_timed_out(0, usec(100.0), 2, NULL), "no phase start");
     // Timeout 0 is handled by the caller (disabled); here it trips at once.
     check(connection_stage_timed_out(usec(10.5), usec(10.5), 0, &elapsed), "zero timeout");
+    // The timeout is converted to microseconds in 64 bits: 5000 s is past
+    // a 32-bit microsecond count.
+    check(!connection_stage_timed_out(usec(100.0), usec(4999.0), 5000, NULL), "5000 s timeout not yet");
+    check(connection_stage_timed_out(usec(100.0), usec(5100.0), 5000, &elapsed), "5000 s timeout");
+    check(elapsed == 5000, "5000 whole seconds elapsed");
     // Far from the epoch the microsecond count still fits.
     check(!connection_stage_timed_out(usec(4102444800.9), usec(4102444801.95), 2, NULL), "year-2100 timestamps");
 
