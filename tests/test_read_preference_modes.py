@@ -57,6 +57,7 @@ from include import (
     reset_commandstats,
 )
 from mb import Benchmark, RunConfig
+from test_cluster_slots_bad_reply import _Node, _run
 
 # ---------------------------------------------------------------------------
 # Env override: every test in this module needs replicas
@@ -1092,3 +1093,33 @@ def test_read_preference_replica_disconnect_wakes_peers(env):
         proxy.close()
         if not _announce_port(env, replica, node_id, 0, real_port):
             env.debugPrint("could not restore the cluster-announce-port of replica {}".format(real_port), True)
+
+
+def test_read_preference_keyless_commands_skip_replicas(env):
+    """A keyless --command (no __key__) goes out on the connection that
+    produces it. Replica connections must not send one unless it is a read
+    and --read-preference allows replica reads (#676): a keyless write gets
+    -READONLY there, and rp_primary promises that reads stay on primaries.
+    Scripted one-shard cluster (primary + replica) that counts commands."""
+    cases = [
+        (["--command=PING"], b"PING", False),
+        (["--command=PING", "--command-is-read", "--read-preference=primary"], b"PING", False),
+        (["--command=DBSIZE", "--read-preference=primary"], b"DBSIZE", False),
+        (["--command=FLUSHDB", "--read-preference=secondary"], b"FLUSHDB", False),
+        (["--command=PING", "--read-preference=secondaryPreferred"], b"PING", False),
+        (["--command=PING", "--command-is-read", "--read-preference=secondaryPreferred"], b"PING", True),
+        (["--command=DBSIZE", "--read-preference=secondary"], b"DBSIZE", True),
+    ]
+    for args, verb, replica_reads in cases:
+        replica = _Node(0)
+        node = _Node(0, replica=replica)
+        rc, stderr, _ = _run(node, args + ["--requests=200", "--pipeline=4"], workers=2, clients=2)
+        message = "{}: primary={} replica={}\n{}".format(" ".join(args), node.commands[verb],
+                                                        replica.commands[verb], stderr[-2000:])
+        env.assertEqual(rc, 0, message=message)
+        env.assertEqual(node.errors + replica.errors, [], message=message)
+        env.assertEqual(node.commands[verb] + replica.commands[verb], 2 * 2 * 200, message=message)
+        if replica_reads:
+            env.assertGreater(replica.commands[verb], 0, message=message)
+        else:
+            env.assertEqual(replica.commands[verb], 0, message=message)

@@ -1667,6 +1667,23 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         }
     }
 
+    /* A keyless --command has no slot, so create_arbitrary_request() sends it
+     * on the connection that produces it. A replica connection may produce
+     * it only when it is a read and --read-preference allows replica reads;
+     * otherwise (a keyless write, or any keyless command under rp_primary) it
+     * would reach a replica, where a write gets -READONLY. Leave it to the
+     * primaries, as 2.4 did (#676). Pooled keys and staged monitor commands
+     * are still drained, and --monitor-input lines route themselves. */
+    if (m_connections[conn_id]->is_replica() && m_config->arbitrary_commands->is_defined() &&
+        m_key_index_pools[conn_id]->empty() && m_staged_monitor_commands[conn_id].empty()) {
+        const arbitrary_command &cmd = get_arbitrary_command(m_executed_command_index);
+        const bool monitor = cmd.command_args.size() == 1 && cmd.command_args[0].type == monitor_random_type;
+        if (cmd.keys_count == 0 && !monitor &&
+            !(m_config->read_preference != rp_primary && is_read_command_index(m_executed_command_index))) {
+            return true;
+        }
+    }
+
     /* In GET-only MGET mode, a connection whose slots own no keys in the
      * configured key range can never generate a request.  Returning true here
      * breaks the fill_pipeline while-loop for that connection so it does not
