@@ -896,7 +896,9 @@ applies to the final results table too, so it is printed with or without
 `--realtime-latencies`; it checks the total sample count, and per-command rows
 have fewer samples. In cluster mode the limit applies to each endpoint
 connection, so the check runs once the first topology is known, after the
-threads start.
+threads start. If the run then opens more endpoint connections (for example
+when a partial slot map heals), memtier prints the warnings again with the
+raised bounds, or a note when a percentile may now be resolved.
 
 The window and overall rows merge the per-second histograms each client has
 completed, so every sample is counted exactly once. A client's second is
