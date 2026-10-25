@@ -1132,7 +1132,15 @@ bool cluster_client::handle_cluster_slots(unsigned int conn_id, protocol_respons
     }
 
     // run over response and create connections
+    // Not nested: no reply is handled while the node loop dials.
+    assert(!m_parsing_slot_map);
     m_parsing_slot_map = true;
+    // Cleared before the commit below; this also clears it on any return.
+    struct parse_window
+    {
+        bool &parsing;
+        ~parse_window() { parsing = false; }
+    } window{m_parsing_slot_map};
     for (unsigned int i = 0; i < r->get_mbulk_value()->mbulks_elements.size(); i++) {
         mbulk_element *shard_el = r->get_mbulk_value()->mbulks_elements[i];
         if (shard_el == NULL || !shard_el->is_mbulk_size()) {
@@ -2973,26 +2981,28 @@ void cluster_client::reroute_staged_monitor_commands()
         const bool keeps = i < primary.size() && primary[i] && !given_up(i);
         std::queue<staged_monitor_cmd> staged;
         std::swap(m_staged_monitor_commands[i], staged);
+        // A line moved to a later connection is seen again when the loop gets
+        // there. That second pass is idempotent: the map is the same, and the
+        // line stays (target == i is never queue-full).
         for (; !staged.empty(); staged.pop()) {
+            const unsigned int slot = staged.front().slot;
             // Only keyed lines are staged (create_monitor_request_cluster()), so
-            // the keyless UINT_MAX slot never gets here; it would be dropped
-            // as unroutable.
-            assert(staged.front().slot != UINT_MAX);
-            unsigned int target;
-            if (slot_is_unowned(staged.front().slot)) {
-                // Any primary gives the server's routing response.
-                target = keeps ? i : fallback;
-            } else {
-                target = slot_primary_conn_id(staged.front().slot);
-            }
+            // the keyless UINT_MAX slot never gets here.
+            assert(slot != UINT_MAX);
+            unsigned int target = UINT_MAX;
             const char *drop_reason = NULL;
-            if (staged.front().slot == UINT_MAX) {
+            if (slot == UINT_MAX) {
                 // Not a failover: a staging bug, if the assert is compiled out.
                 drop_reason = "unroutable-monitor-line";
-            } else if (given_up(target)) {
-                drop_reason = "slot-owner-down-for-monitor-line";
-            } else if (target != i && m_staged_monitor_commands[target].size() >= STAGED_MONITOR_QUEUE_MAX_SIZE) {
-                drop_reason = "staged-monitor-queue-full";
+            } else {
+                // An unowned slot can go to any primary: it gives the
+                // server's routing response.
+                target = slot_is_unowned(slot) ? (keeps ? i : fallback) : slot_primary_conn_id(slot);
+                if (given_up(target)) {
+                    drop_reason = "slot-owner-down-for-monitor-line";
+                } else if (target != i && m_staged_monitor_commands[target].size() >= STAGED_MONITOR_QUEUE_MAX_SIZE) {
+                    drop_reason = "staged-monitor-queue-full";
+                }
             }
             if (drop_reason != NULL) {
                 const std::vector<command_arg> &args = staged.front().parsed_cmd.command_args;
