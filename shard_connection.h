@@ -463,8 +463,14 @@ private:
     // async-signal-safe.
     std::atomic<int> m_pending_resp;
     // Replies already received for the pipeline front, when it expects
-    // several (request::m_replies). Reset by pop_req().
+    // several (request::m_replies), the replies its EXEC adds from queued
+    // commands, and the bytes of those already received. Reset by pop_req().
     unsigned int m_front_replies;
+    unsigned int m_front_extra_replies;
+    unsigned int m_front_bytes;
+    // Replies still due from commands answered +QUEUED in an open MULTI,
+    // owed to the EXEC that runs them.
+    unsigned int m_queued_replies;
 
     // Snapshot of the most recently pushed request's type. Updated on every
     // push_req() and read by get_last_request_type() from the crash-handler

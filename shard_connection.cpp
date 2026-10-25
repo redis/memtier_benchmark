@@ -287,6 +287,9 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_request_rate_phase_pending(request_rate_phase_microsecond > 0),
         m_pending_resp(0),
         m_front_replies(0),
+        m_front_extra_replies(0),
+        m_front_bytes(0),
+        m_queued_replies(0),
         m_last_pushed_req_type(-1),
         m_connection_state(conn_disconnected),
         m_role(role_primary),
@@ -640,6 +643,7 @@ int shard_connection::connect(struct connect_info *addr)
                            ? setup_none
                            : setup_done;
     m_multi_open = false;
+    m_queued_replies = 0;
 
     // setup socket
     evutil_socket_t sockfd = setup_socket(addr);
@@ -909,6 +913,7 @@ void shard_connection::disconnect()
     m_hello = setup_done;
     m_readonly_state = setup_done;
     m_multi_open = false;
+    m_queued_replies = 0;
 
     // Drop any partial RESP parser state. A TCP RST received mid-bulk
     // (especially while draining a RESP3 push frame) would otherwise leave
@@ -1027,6 +1032,8 @@ request *shard_connection::pop_req()
     request *req = m_pipeline->front();
     m_pipeline->pop();
     m_front_replies = 0;
+    m_front_extra_replies = 0;
+    m_front_bytes = 0;
 
     // Worker-thread mutation; relaxed is sufficient because all mutations
     // happen on the connection's owning event-loop thread. The signal-handler
@@ -1579,9 +1586,32 @@ void shard_connection::process_response(void)
         protocol_response *r = m_protocol->get_response();
 
         // A request answered several times (a multi-channel SUBSCRIBE) is
-        // completed by its last reply. An error is its only reply.
-        if (!m_pipeline->empty() && ++m_front_replies < m_pipeline->front()->m_replies && !r->is_error()) {
-            continue;
+        // completed by its last reply. An error is its only reply. Queued in a
+        // MULTI it is answered +QUEUED, and under RESP2 its other replies
+        // follow the array that answers EXEC (RESP3 sends them as pushes). A
+        // DISCARD, an aborted or WATCH-failed EXEC, or any other reply that is
+        // not an error ends the transaction without them. Other errors (WATCH
+        // or MULTI inside MULTI) leave the transaction open.
+        if (!m_pipeline->empty()) {
+            unsigned int replies = m_pipeline->front()->m_replies;
+            if (m_front_replies == 0) {
+                const char *status = r->get_status();
+                if (status != NULL && strcmp(status, "+QUEUED") == 0) {
+                    m_queued_replies += replies - 1;
+                    replies = 1;
+                } else if (!r->is_error()) {
+                    if (m_config->protocol != PROTOCOL_RESP3 && r->get_top_array_len() > 0)
+                        m_front_extra_replies = m_queued_replies;
+                    m_queued_replies = 0;
+                } else if (status != NULL && strncmp(status, "-EXECABORT", 10) == 0) {
+                    m_queued_replies = 0;
+                }
+            }
+            if (++m_front_replies < replies + m_front_extra_replies && !r->is_error()) {
+                m_front_bytes += r->get_total_len();
+                continue;
+            }
+            r->set_total_len(r->get_total_len() + m_front_bytes);
         }
 
         request *req = pop_req();

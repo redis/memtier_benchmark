@@ -1594,9 +1594,9 @@ def test_monitor_input_scan_cursor_literal_is_sent(env):
                         message="{} did not write the literal value".format(command))
 
 
-def _pubsub_run(env, args, requests=20):
+def _pubsub_run(env, args, requests=20, pipeline=4):
     """Run memtier with a hard timeout; return (ok, stderr, answered requests)."""
-    benchmark_specs = {"name": env.testName, "args": args + ["--hide-histogram", "--pipeline=4"]}
+    benchmark_specs = {"name": env.testName, "args": args + ["--hide-histogram", "--pipeline={}".format(pipeline)]}
     addTLSArgs(benchmark_specs, env)
     config = get_default_memtier_config(threads=1, clients=1, requests=requests)
     add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
@@ -1624,7 +1624,10 @@ def test_multi_channel_subscribe_replies(env):
     a request, so with two channels the second reply popped one that was
     never sent and memtier aborted on the m_pending_resp >= 0 assert. The
     replies to one request now complete that request, through --command and
-    --monitor-input. RESP2 only: under RESP3 the confirmations are push
+    --monitor-input. Queued in a MULTI, the SUBSCRIBE is answered +QUEUED
+    and its second confirmation follows the EXEC reply, so it belongs to the
+    EXEC: expecting it on the SUBSCRIBE hung the run at --pipeline=1 before
+    EXEC was sent. RESP2 only: under RESP3 the confirmations are push
     frames, which memtier drops.
     """
     commands = ["SUBSCRIBE c515a c515b", "PSUBSCRIBE p515a* p515b*", "UNSUBSCRIBE c515a c515b",
@@ -1644,3 +1647,22 @@ def test_multi_channel_subscribe_replies(env):
             env, ["--monitor-input={}".format(monitor_file), "--command={}".format(command)])
         env.assertTrue(memtier_ok == True, message="{} failed: {}".format(command, stderr[-500:]))
         env.assertEqual(count, 20, message="{}: answered requests".format(command))
+
+    # After the first EXEC the connection is in subscribed mode: MULTI and
+    # EXEC are rejected and the SUBSCRIBE is answered twice.
+    # DISCARD, and an EXEC failed by WATCH (a null array), run no SUBSCRIBE.
+    sub = ["--command=MULTI", "--command=SUBSCRIBE c515a c515b"]
+    runs = [(sub + ["--command=EXEC"], 3, 1), (sub + ["--command=EXEC"], 20, 1), (sub + ["--command=EXEC"], 20, 4),
+            (sub + ["--command=DISCARD"], 20, 1)]
+    # Standalone only: in cluster mode the keyed WATCH/SET can trigger a slot
+    # map refresh on a connection that is subscribed or inside the MULTI.
+    if not env.isCluster():
+        runs.append((["--command=WATCH w515", "--command=SET w515 v"] + sub + ["--command=EXEC"], 20, 1))
+    for txn, requests, pipeline in runs:
+        memtier_ok, stderr, count = _pubsub_run(env, txn, requests=requests, pipeline=pipeline)
+        what = "{} -n {} --pipeline={}".format(" ".join(a.split("=", 1)[1] for a in txn), requests, pipeline)
+        env.assertTrue(memtier_ok == True, message="{} failed or hung: {}".format(what, stderr[-500:]))
+        env.assertEqual(count, requests, message="{}: answered requests".format(what))
+    # The rejected MULTI/EXEC/DISCARD replies above are counted in the
+    # server's errorstats, which later tests on this server expect clean.
+    reset_commandstats(env.getOSSMasterNodesConnectionList())
