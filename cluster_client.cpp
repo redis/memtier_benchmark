@@ -3246,6 +3246,18 @@ void cluster_client::handle_connection_disconnect(unsigned int conn_id)
     wake_mget_producers(conn_id);
 }
 
+// Whether a successful reply to this request shows the cluster serves keys.
+// During CLUSTERDOWN Redis still answers keyless commands (PING, MULTI, WAIT).
+// m_keys does not tell: arbitrary_request sets it to 1 for keyless commands.
+static bool request_carries_key(const request *req)
+{
+    if (req == NULL) return false;
+    if (req->m_type == rt_set || req->m_type == rt_get) return true;
+    if (req->m_type != rt_arbitrary) return false;
+    const arbitrary_command *meta = static_cast<const arbitrary_request *>(req)->m_cmd_meta;
+    return meta != NULL && (!meta->spec_key_positions.empty() || meta->keys_count > 0);
+}
+
 void cluster_client::handle_response(unsigned int conn_id, struct timeval timestamp, request *request,
                                      protocol_response *response)
 {
@@ -3288,14 +3300,15 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
     // CLUSTERDOWN has no MOVED destination. Even a previously full map can be
     // stale. Poll with a 1 s to 8 s backoff (#834), without flushing any staged
     // keys. Only workload replies get here, so the refresh's own CLUSTER SLOTS
-    // reply does not end the backoff; a successful workload reply does (other
-    // errors, e.g. TRYAGAIN or LOADING during a failover, do not). The setup
+    // reply does not end the backoff; a successful reply to a keyed request
+    // does (other errors, e.g. TRYAGAIN or LOADING during a failover, and
+    // keyless replies such as PING or MULTI do not). The setup
     // ladder defers SLOTS while MULTI is open. Like READONLY below, this
     // recognizes Redis's simple-error form.
     static const char CLUSTERDOWN_MSG_PREFIX[] = "-CLUSTERDOWN ";
     const bool clusterdown = response->is_error() && strncmp(response->get_status(), CLUSTERDOWN_MSG_PREFIX,
                                                              sizeof(CLUSTERDOWN_MSG_PREFIX) - 1) == 0;
-    if (!response->is_error()) m_clusterdown_refresh.reset();
+    if (!response->is_error() && request_carries_key(request)) m_clusterdown_refresh.reset();
 
     if (response->is_error()) {
         benchmark_debug_log("server %s handle response: %s\n", m_connections[conn_id]->get_readable_id(),
