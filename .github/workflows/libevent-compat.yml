@@ -66,7 +66,7 @@ jobs:
             workflow_dispatch) scope="${SCOPE:-full+canary}" ;;
             *)
               base="${PR_BASE:-$PUSH_BEFORE}"
-              harness='^(\.github/workflows/libevent-compat\.yml|scripts/(build-libevent|check-libevent-linkage|build-macos-libevent|check-macos-tls-links)\.sh|utils/(select_test_shard|check_test_shards)\.py|utils/install_test_requirements\.sh)$'
+              harness='^(\.github/workflows/libevent-compat\.yml|scripts/(build-libevent|check-libevent-linkage|build-macos-libevent|check-macos-tls-links)\.sh|utils/(select_test_shard|check_test_shards)\.py|utils/(install_test_requirements|apt_install)\.sh)$'
               if [[ -z "$base" || "$base" =~ ^0+$ ]] ||
                  ! changed="$(git diff --name-only "$base" HEAD)" ||
                  grep -Eq "$harness" <<<"$changed"; then
@@ -156,8 +156,7 @@ jobs:
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get -qq update
-          sudo apt-get install -y build-essential autoconf automake pkg-config cmake libssl-dev zlib1g-dev
+          ./utils/apt_install.sh -y build-essential autoconf automake pkg-config cmake libssl-dev zlib1g-dev
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
@@ -238,8 +237,7 @@ jobs:
         run: |
           curl -fsSL https://packages.redis.io/gpg | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/redis.list
-          sudo apt-get -qq update
-          sudo apt-get install redis
+          ./utils/apt_install.sh redis
           sudo service redis-server stop
 
       - name: Shorten TCP TIME_WAIT
