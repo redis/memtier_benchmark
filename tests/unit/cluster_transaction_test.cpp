@@ -70,6 +70,9 @@ static void check(bool condition, const char *message)
 // generation, not on network timing. Connections write into protocol
 // buffers; the routing test only dials a local socket so that its second
 // shard counts as connected.
+// shard_connection.cpp; schedule_fill() arms it.
+void deferred_fill_pipeline_cb(evutil_socket_t, short, void *ctx);
+
 class transaction_client : public cluster_client
 {
 public:
@@ -97,6 +100,7 @@ public:
     }
     using cluster_client::disconnect;
     using cluster_client::fallback_primary_conn_id;
+    using cluster_client::hold_pipeline;
     using cluster_client::reroute_staged_monitor_commands;
     using cluster_client::txn_release_pin;
     bool staged() const { return m_txn_has_staged_key; }
@@ -193,6 +197,34 @@ public:
         m_reqs_generated++;
     }
     size_t staged_monitor_count(unsigned int conn_id) const { return m_staged_monitor_commands[conn_id].size(); }
+    // Run the event loop until conn_id's dial completes, then until its
+    // deferred fill, if one was armed, has run.
+    void finish_dial(unsigned int conn_id)
+    {
+        for (int i = 0; i < 1000 && m_connections[conn_id]->get_connection_state() != conn_connected; i++) {
+            event_base_loop(m_event_base, EVLOOP_NONBLOCK);
+            usleep(1000);
+        }
+        check(m_connections[conn_id]->get_connection_state() == conn_connected, "peer connected");
+        for (int i = 0; i < 10; i++)
+            event_base_loop(m_event_base, EVLOOP_NONBLOCK);
+    }
+    // Whether schedule_fill() has armed conn_id's deferred fill.
+    bool fill_scheduled(unsigned int conn_id)
+    {
+        std::pair<void *, bool> found(m_connections[conn_id], false);
+        event_base_foreach_event(
+            m_event_base,
+            [](const event_base *, const event *ev, void *arg) {
+                std::pair<void *, bool> *found = static_cast<std::pair<void *, bool> *>(arg);
+                if (event_get_callback(ev) == deferred_fill_pipeline_cb && event_get_callback_arg(ev) == found->first &&
+                    event_pending(ev, EV_TIMEOUT, NULL))
+                    found->second = true;
+                return 0;
+            },
+            &found);
+        return found.second;
+    }
     void change_role(unsigned int conn_id, enum shard_role role) { set_shard_role(m_connections[conn_id], role); }
     bool redial(unsigned int conn_id, const char *address, const char *port)
     {
@@ -617,6 +649,62 @@ static void check_repin_routes_to_staged_owner(unsigned long long first_key)
     evutil_closesocket(listener);
 }
 
+// A dropped staged line is uncounted, so a producer that paused at the
+// --requests cap may produce again. Nothing else wakes it: its replies are in,
+// and a primary given up on wakes no peer.
+static void check_drop_wakes_producers(bool through_give_up_hook)
+{
+    evutil_socket_t listener = socket(AF_INET, SOCK_STREAM, 0);
+    check(listener != static_cast<evutil_socket_t>(-1), "wake listener socket");
+    sockaddr_in address = {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t address_len = sizeof(address);
+    check(bind(listener, (sockaddr *) &address, sizeof(address)) == 0 && listen(listener, 4) == 0 &&
+              getsockname(listener, (sockaddr *) &address, &address_len) == 0,
+          "wake listener bound");
+    const std::string port = std::to_string(ntohs(address.sin_port));
+
+    arbitrary_command_list commands;
+    abstract_protocol *protocol = protocol_factory(PROTOCOL_REDIS_DEFAULT);
+    make_transaction_commands(commands, protocol);
+    benchmark_config config = {};
+    make_transaction_config(config, commands);
+    config.transaction = false;
+    object_generator generator(commands.size());
+    generator.set_data_size_fixed(1);
+    generator.set_key_prefix("key-");
+    generator.set_key_range(1, 10);
+    const unsigned int producer_slot = key_slot("key-1");
+    const unsigned int dropped_slot = key_slot("key-2");
+    check(producer_slot != dropped_slot, "wake fixture uses two slots");
+    {
+        client_group group(&config, protocol, &generator);
+        transaction_client client(&group);
+        client.route_slot_to_second_shard(protocol, producer_slot, port.c_str());
+        client.finish_dial(1);
+        check(client.get_connections()[0]->get_connection_state() == conn_disconnected &&
+                  !client.get_connections()[0]->is_reconnect_pending(),
+              "main primary was given up on");
+        client.stage_line(0, dropped_slot);
+        config.requests = client.get_reqs_generated();
+        check(client.hold_pipeline(1), "producer pauses at the --requests cap");
+        check(!client.fill_scheduled(1), "paused producer has no fill pending");
+        if (through_give_up_hook) {
+            client.handle_connection_given_up(0);
+        } else {
+            client.reroute_staged_monitor_commands();
+        }
+        check(client.staged_monitor_count(0) == 0 && client.get_reqs_generated() < config.requests,
+              "dropped line frees --requests");
+        check(!client.hold_pipeline(1), "producer may produce again");
+        check(client.fill_scheduled(1), "dropping a line wakes the paused producer");
+        config.requests = 0;
+    }
+    delete protocol;
+    evutil_closesocket(listener);
+}
+
 int main()
 {
 #ifdef _WIN32
@@ -628,6 +716,8 @@ int main()
     check_pin_release(1221322);
     check_repin_routes_to_staged_owner(1);
     check_repin_routes_to_staged_owner(1221322);
+    check_drop_wakes_producers(false);
+    check_drop_wakes_producers(true);
     puts("transaction pin release tests passed");
     return 0;
 }

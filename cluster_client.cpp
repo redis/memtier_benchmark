@@ -2992,8 +2992,11 @@ void cluster_client::reroute_staged_monitor_commands()
                             dropped);
         abandon_requests(dropped);
     }
-    for (unsigned int target : woken) {
-        if (m_connections[target]->get_connection_state() != conn_disconnected) m_connections[target]->schedule_fill();
+    // Uncounting frees --requests, so then wake every connection: a producer
+    // that paused at the cap has no reply left to wake it.
+    for (unsigned int i = 0; i < m_connections.size(); i++) {
+        if (!dropped && std::find(woken.begin(), woken.end(), i) == woken.end()) continue;
+        if (m_connections[i]->get_connection_state() != conn_disconnected) m_connections[i]->schedule_fill();
     }
 }
 
