@@ -53,10 +53,18 @@ jobs:
         with:
           ref: ${{ matrix.branch != '__default__' && matrix.branch || '' }}
 
+      # Maintenance branches checked out above may predate the apt helper,
+      # so take it from the workflow revision.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: .apt-helper
+          sparse-checkout: utils/apt_install.sh
+          sparse-checkout-cone-mode: false
+
       - name: Install build deps
         run: |
-          sudo apt-get -qq update
-          sudo apt-get install -y \
+          ./.apt-helper/utils/apt_install.sh -y \
             build-essential autoconf automake pkg-config \
             libevent-dev libssl-dev zlib1g-dev
 

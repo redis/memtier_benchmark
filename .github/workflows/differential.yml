@@ -44,14 +44,13 @@ jobs:
 
       - name: Install build deps
         run: |
-          sudo apt-get -qq update
-          sudo apt-get install -y \
+          ./utils/apt_install.sh -y \
             build-essential autoconf automake pkg-config \
             libevent-dev libssl-dev zlib1g-dev
 
       - name: Install redis-server + redis-tools (for redis-benchmark / redis-cli)
         run: |
-          sudo apt-get install -y redis-server redis-tools
+          ./utils/apt_install.sh --no-update -y redis-server redis-tools
           sudo service redis-server stop || true
 
       - uses: actions/setup-python@v5
