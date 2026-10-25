@@ -33,6 +33,7 @@ struct staged_monitor_cmd
     size_t stats_index;
     struct timeval enqueue_time; // latency measured from selection, not drain
     size_t source_line;          // original monitor file line (1-based) for error messages
+    unsigned int slot;           // hash slot of the first key; re-routes the line when the map changes
 };
 
 // forward decleration
@@ -229,10 +230,16 @@ protected:
     void record_builtin_read_routing(request_type rt, bool from_replica);
 
     shard_connection *create_shard_connection(abstract_protocol *abs_protocol);
-    void reset_shard_queues(unsigned int conn_id);
+    // Clear and uncount the routed keys of conn_id, and its staged monitor
+    // lines too when `staged` is set.
+    void reset_shard_queues(unsigned int conn_id, bool staged);
     void set_shard_role(shard_connection *sc, enum shard_role role);
     bool connect_shard_connection(shard_connection *sc, char *address, char *port);
     void handle_moved(unsigned int conn_id);
+    // Move staged monitor lines to the primary that owns their slot in the
+    // map just committed, keeping each slot's selection order. retired[i] is
+    // true for a connection the map no longer lists.
+    void reroute_staged_monitor_commands(const std::vector<bool> &retired);
     void update_redirect_stats(struct timeval timestamp, request *req, protocol_response *response, bool moved,
                                bool completed);
     bool create_monitor_request_cluster(unsigned int command_index, struct timeval &timestamp, unsigned int conn_id);

@@ -601,10 +601,15 @@ reconnect backoff, including for owned keys. Already-selected monitor lines and
 routed keys stay queued across redials to the same primary endpoint, including
 repeated setup failures, without changing their generated-request counts. Replica
 redials, including a primary demoted to replica, keep the existing policy of
-clearing unsent queues and compensating their generated-request counts so other
-shards can continue. Promotion also clears previously staged replica work before
+clearing unsent routed keys and compensating their generated-request counts so other
+shards can continue. Promotion also clears previously routed replica keys before
 changing its role, so strict-secondary reads cannot drain on the new primary.
-This does not guarantee request identity across replica redials or promotion.
+This does not guarantee routed-key identity across replica redials or promotion.
+Selected monitor lines follow their slot instead: when a committed map moves the
+slot, drops the primary holding the line, or demotes it to a replica (including
+after a `-MOVED`), the line moves to the slot's current primary, in selection
+order, so each selected line is sent once. A line whose new primary is down with
+no reconnect pending is dropped and uncounted.
 Strict `secondary` reads with `error` or `queue` fallback fail the run because no
 authoritative replica can be chosen, including for a transient hole discovered
 by a mid-run refresh.

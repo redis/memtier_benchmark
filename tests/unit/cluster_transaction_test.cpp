@@ -377,26 +377,28 @@ static void check_repin_routes_to_staged_owner(unsigned long long first_key)
         check(client.get_reqs_generated() == generated - 2, "reset compensates both counted requests");
 
         // The topology assigns the new role before redial. A demoted primary
-        // and a repeated replica redial retain the existing reset policy,
-        // preventing counted reads from stranding completion on a dead replica.
+        // and a repeated replica redial retain the existing reset policy for
+        // routed keys, preventing counted reads from stranding completion on
+        // a dead replica. Staged monitor lines stay, still counted: committing
+        // the map moves them to their slot's primary (#836).
         client.change_role(1, role_replica);
         for (unsigned int attempt = 0; attempt < 2; attempt++) {
             client.stage_unsent(1);
             check(client.redial(1, "localhost", port.c_str()), "same replica endpoint redial starts");
-            check(client.pool_empty(1) && client.staged_monitor_count(1) == 0,
-                  "replica redial clears both unsent queues, including demotion");
-            check(client.get_reqs_generated() == generated - 2, "replica reset compensates exactly once");
+            check(client.pool_empty(1) && client.staged_monitor_count(1) == attempt + 1,
+                  "replica redial clears routed keys and keeps monitor lines, including demotion");
+            check(client.get_reqs_generated() == generated - 2 + attempt + 1, "replica reset compensates exactly once");
         }
         client.stage_unsent(1);
         client.change_role(1, role_primary);
-        check(client.pool_empty(1) && client.staged_monitor_count(1) == 0,
-              "promotion discards old replica work before its role changes");
-        check(client.get_reqs_generated() == generated - 2, "promotion compensates old replica work exactly once");
+        check(client.pool_empty(1) && client.staged_monitor_count(1) == 3,
+              "promotion discards old replica keys before its role changes");
+        check(client.get_reqs_generated() == generated + 1, "promotion compensates old replica keys exactly once");
         client.stage_unsent(1);
         check(client.redial(1, "localhost", port.c_str()), "promoted primary redial starts");
-        check(!client.pool_empty(1) && client.staged_monitor_count(1) == 1,
+        check(!client.pool_empty(1) && client.staged_monitor_count(1) == 4,
               "primary retains work staged after promotion");
-        check(client.get_reqs_generated() == generated, "promoted primary preserves generated count");
+        check(client.get_reqs_generated() == generated + 3, "promoted primary preserves generated count");
         check(client.redial(1, "127.0.0.1", port.c_str()), "reset unit fixture endpoint");
         check(client.get_reqs_generated() == generated - 2, "fixture reset compensates retained work");
 

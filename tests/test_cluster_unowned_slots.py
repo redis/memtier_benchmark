@@ -135,6 +135,8 @@ class _Handler(socketserver.StreamRequestHandler):
                         )
                         multi = dirty = False
                         queued = []
+                    elif verb == b"SET" and getattr(root, "set_reply", None) is not None:
+                        reply = root.set_reply(node, args)
                     else:
                         assert verb in (b"SET", b"GET", b"MGET"), args
                         keys = args[1:] if verb == b"MGET" else args[1:2]
@@ -892,3 +894,193 @@ def test_percentile_requests_bound_is_not_repeated_on_growth(env):
         ],
         message=stderr[-3000:],
     )
+
+
+class _Failover(_Node):
+    """Primary A (self) with replica R, the seed, plus spare primary B.
+
+    A answers its first SET with CLUSTERDOWN, so it refreshes CLUSTER SLOTS.
+    The server map becomes `change` when that refresh reaches A, and A's
+    SLOTS replies are delayed from then on. Meanwhile R stages monitor lines
+    on A (#799), and they are still queued when the new map is committed
+    (#835, #836). With silent=True the map changes on A's first SET instead,
+    which succeeds, and memtier learns of it from a -MOVED. With redial=True
+    A closes its first two connections during AUTH instead, and the refresh
+    after the second one returns the new map, so A is still redialing when
+    it changes role. A SET sent to a node that does not own its slot gets
+    -MOVED, or with moved=False is accepted, as by a demoted primary.
+    """
+
+    def __init__(self, change, moved=True, silent=False, redial=False, initial=None):
+        super().__init__([(0, 16383)])
+        self.replica = _Node([])
+        self.b = _Node([])
+        self.extra = [self.b]
+        self.moved = moved
+        self.silent = silent
+        self.redial = redial
+        self.refreshed = False
+        self.triggered = redial
+        if redial:
+            self.auth_closes = 2
+            self.auth_delay = 0.02
+        self.log = []
+        self.change = initial or [(0, 16383, ["A", "R"])]
+        self.apply_change()
+        self.changed = False
+        self.change = change
+        for name, server in (("A", self), ("R", self.replica), ("B", self.b)):
+            server.root = self
+            server.name = name
+            server.topology = lambda server=server: self.slots_reply(server)
+
+    def slots_reply(self, server):
+        with self.lock:
+            if self.redial and self.auth_attempts >= 2 and not self.changed:
+                self.apply_change()
+                self.refreshed = True
+            if server is self and self.triggered and not self.changed:
+                self.apply_change()
+            if server is self and self.changed:
+                self.refreshed = True
+        if (server is self and self.changed) or (self.redial and self.auth_attempts and self.slots_calls):
+            time.sleep(0.3)
+        with self.lock:
+            self.slots_calls += 1
+            shards = list(self.map)
+        reply = b"*" + str(len(shards)).encode() + b"\r\n"
+        for low, high, servers in shards:
+            reply += b"*%d\r\n:%d\r\n:%d\r\n" % (2 + len(servers), low, high)
+            for s in servers:
+                reply += b"*2\r\n$9\r\n127.0.0.1\r\n:%d\r\n" % s.server_address[1]
+        return reply
+
+    def apply_change(self):
+        self.changed = True
+        servers = {"A": self, "R": self.replica, "B": self.b}
+        self.map = [(low, high, [servers[n] for n in names]) for low, high, names in self.change]
+
+    def set_reply(self, server, args):
+        slot = _slot(args[1])
+        with self.lock:
+            owner = next((servers[0] for low, high, servers in self.map if low <= slot <= high), None)
+            # An unowned slot belongs on any primary, for its routing error.
+            owned = owner is server or (owner is None and any(server is servers[0] for _, _, servers in self.map))
+            # Whether A was asked for the new map before this SET arrived:
+            # one sent earlier can only be stale.
+            self.log.append((server.name, args[1], int(args[2].split(b"-")[1]), owned, self.refreshed))
+            if server is self and not self.triggered:
+                self.triggered = True
+                if self.silent:
+                    self.apply_change()
+                else:
+                    return b"-CLUSTERDOWN Hash slot not served\r\n"
+        if owner is None:
+            return b"-CLUSTERDOWN Hash slot not served\r\n"
+        if owner is server or not self.moved:
+            return b"+OK\r\n"
+        return b"-MOVED %d 127.0.0.1:%d\r\n" % (slot, owner.server_address[1])
+
+
+# New server map per scenario, as (low, high, [primary, replicas...]).
+_FAILOVERS = {
+    # #835: memtier-2 (slot 15817) moves from A to B.
+    "move": [(0, 8191, ["A", "R"]), (8192, 16383, ["B"])],
+    # #836: A leaves the map; B takes over its slots and R.
+    "retire": [(0, 16383, ["B", "R"])],
+    # #836: R is promoted and A demoted to its replica.
+    "demote": [(0, 16383, ["R", "A"])],
+    # The same, with memtier-1 (slot 3498) left without an owner.
+    "demote-hole": [(0, 3497, ["R", "A"]), (3499, 16383, ["R", "A"])],
+}
+
+# Server map before the change, where it is not A owning every slot with R.
+_INITIAL = {
+    # B is connected, and idle, before it takes memtier-2 over.
+    "move-live": [(0, 16000, ["A", "R"]), (16001, 16383, ["B"])],
+}
+
+
+def _check_failover_replay(env, scenario, pipeline, moved=True, silent=False, redial=False):
+    node = _Failover(
+        _FAILOVERS[scenario.replace("-live", "")],
+        moved=moved,
+        silent=silent,
+        redial=redial,
+        initial=_INITIAL.get(scenario),
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        monitor = os.path.join(directory, "monitor.txt")
+        with open(monitor, "w") as target:
+            for index in range(20):
+                target.write(f'1.000000 [0 127.0.0.1:12345] "SET" "memtier-{1 + index % 2}" "value-{index}"\n')
+        stats, _, stderr = _run(
+            env,
+            node,
+            [
+                "--requests=40",
+                "--pipeline=" + str(pipeline),
+                "--read-preference=secondaryPreferred",
+                "--monitor-input=" + monitor,
+                "--monitor-pattern=S",
+                "--command=PING",
+                "--command=__monitor_line@__",
+            ]
+            + (["--reconnect-on-error", "--max-reconnect-attempts=3", "--reconnect-backoff-factor=0.5"] if redial else []),
+            seed_replica=True,
+            timeout=15,
+        )
+    label = "%s pipeline=%d moved=%s silent=%s redial=%s" % (scenario, pipeline, moved, silent, redial)
+    values = [entry[2] for entry in node.log]
+    counts = {value: values.count(value) for value in values}
+    result = {
+        "missing": sorted(set(range(20)) - set(values)),
+        "duplicated": sorted(value for value, count in counts.items() if count > 1),
+        # Sent to a node that did not own the slot after A was asked for the
+        # new map; with silent=True, the SETs A sent before learning of the
+        # change are in-flight casualties and are listed apart.
+        "misrouted": [(name, value) for name, _, value, owned, refreshed in node.log if not owned and refreshed],
+    }
+    in_flight = [(name, value) for name, _, value, owned, refreshed in node.log if not owned and not refreshed]
+    env.debugPrint("%s: %s in-flight=%s sequence=%s" % (label, result, in_flight, values), force=True)
+    env.assertTrue(node.changed, message=label)
+    env.assertEqual(stats["Totals"]["Count"], 40, message=label)
+    env.assertEqual(result, {"missing": [], "duplicated": [], "misrouted": []}, message=label + stderr[-2000:])
+    if silent:
+        env.assertLessEqual(len(in_flight), pipeline, message=label)
+        env.assertTrue(all(name == "A" for name, _ in in_flight), message=label)
+    else:
+        env.assertEqual(in_flight, [], message=label)
+    if scenario.startswith("move"):
+        # Two primaries drain concurrently, so only each key's order is fixed.
+        for key in (b"memtier-1", b"memtier-2"):
+            sent = [entry[2] for entry in node.log if entry[1] == key]
+            env.assertEqual(sent, sorted(sent), message=label)
+        env.assertEqual(sorted(values), list(range(20)), message=label)
+    else:
+        # One primary at a time: the file order, each line once.
+        env.assertEqual(values, list(range(20)), message=label)
+
+
+def test_staged_monitor_follows_moved_slot(env):
+    """A slot moved by the committed map takes its staged lines along (#835)."""
+    for silent in (False, True):
+        for pipeline in (1, 4):
+            _check_failover_replay(env, "move", pipeline, silent=silent)
+    for pipeline in (1, 4):
+        _check_failover_replay(env, "move-live", pipeline)
+
+
+def test_staged_monitor_survives_retired_primary(env):
+    """A retired primary hands its staged lines to the slot's new owner (#836)."""
+    for pipeline in (1, 4):
+        _check_failover_replay(env, "retire", pipeline)
+
+
+def test_staged_monitor_leaves_demoted_primary(env):
+    """A demoted primary's staged lines go to the promoted one (#836)."""
+    for moved, silent, redial in ((True, False, False), (False, False, False), (True, True, False), (True, False, True)):
+        for pipeline in (1, 4):
+            _check_failover_replay(env, "demote", pipeline, moved=moved, silent=silent, redial=redial)
+    for pipeline in (1, 4):
+        _check_failover_replay(env, "demote-hole", pipeline)
