@@ -234,6 +234,9 @@ struct arbitrary_command
     int is_read_override; // -1 / 0 / 1
 
     enum multi_effect multi_effect;
+
+    // Replies Redis sends for one request; set by split_command_to_args().
+    unsigned int replies;
 };
 
 struct arbitrary_command_list

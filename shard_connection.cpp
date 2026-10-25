@@ -181,6 +181,7 @@ request::request(request_type type, unsigned int size, struct timeval *sent_time
         m_retries(0),
         m_claimed_by_retry(false),
         m_asking(false),
+        m_replies(1),
         m_serialized(NULL),
         m_serialized_len(0),
         m_key(NULL),
@@ -285,6 +286,7 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_request_rate_phase_microsecond(request_rate_phase_microsecond),
         m_request_rate_phase_pending(request_rate_phase_microsecond > 0),
         m_pending_resp(0),
+        m_front_replies(0),
         m_last_pushed_req_type(-1),
         m_connection_state(conn_disconnected),
         m_role(role_primary),
@@ -1024,6 +1026,7 @@ request *shard_connection::pop_req()
 {
     request *req = m_pipeline->front();
     m_pipeline->pop();
+    m_front_replies = 0;
 
     // Worker-thread mutation; relaxed is sufficient because all mutations
     // happen on the connection's owning event-loop thread. The signal-handler
@@ -1574,6 +1577,12 @@ void shard_connection::process_response(void)
     while ((ret = m_protocol->parse_response()) > 0) {
         bool error = false;
         protocol_response *r = m_protocol->get_response();
+
+        // A request answered several times (a multi-channel SUBSCRIBE) is
+        // completed by its last reply. An error is its only reply.
+        if (!m_pipeline->empty() && ++m_front_replies < m_pipeline->front()->m_replies && !r->is_error()) {
+            continue;
+        }
 
         request *req = pop_req();
         switch (req->m_type) {
@@ -2878,7 +2887,8 @@ void shard_connection::set_arbitrary_command_key(const char *key, unsigned int k
     if (wants_request_key() && key_len > 0 && m_arbitrary_log_key.empty()) m_arbitrary_log_key.assign(key, key_len);
 }
 
-void shard_connection::send_arbitrary_command_end(size_t command_index, struct timeval *sent_time, int cmd_size)
+void shard_connection::send_arbitrary_command_end(size_t command_index, struct timeval *sent_time, int cmd_size,
+                                                  unsigned int replies)
 {
     // Look up the source command's metadata so the reply handler can route
     // per-key miss accounting. Safe to be NULL (we tolerate it downstream).
@@ -2895,6 +2905,7 @@ void shard_connection::send_arbitrary_command_end(size_t command_index, struct t
         }
     }
     arbitrary_request *req = new arbitrary_request(command_index, rt_arbitrary, cmd_size, sent_time, meta);
+    req->m_replies = replies;
     if (!m_arbitrary_log_key.empty()) {
         req->set_key_for_log(m_arbitrary_log_key.data(), (unsigned int) m_arbitrary_log_key.size());
         m_arbitrary_log_key.clear();

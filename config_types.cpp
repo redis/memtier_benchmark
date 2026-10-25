@@ -311,7 +311,8 @@ arbitrary_command::arbitrary_command(const char *cmd) :
         spec(NULL),
         miss_tracking_enabled(false),
         is_read_override(-1),
-        multi_effect(multi_effect_none)
+        multi_effect(multi_effect_none),
+        replies(1)
 {
     // command name is the first word in the command
     size_t pos = command.find(" ");
@@ -551,6 +552,21 @@ bool arbitrary_command::set_ratio(const char *ratio_str)
     return true;
 }
 
+// Redis answers a (P|S)SUBSCRIBE or (P|S)UNSUBSCRIBE once per channel or
+// pattern argument (#515). An UNSUBSCRIBE without arguments answers once per
+// subscription held, or once when there is none; subscriptions are not
+// tracked, so it is expected to answer once.
+static unsigned int count_replies(const std::vector<command_arg> &args)
+{
+    if (args.size() < 3) return 1;
+    static const char *const per_channel[] = {"SUBSCRIBE",   "PSUBSCRIBE",   "SSUBSCRIBE",
+                                              "UNSUBSCRIBE", "PUNSUBSCRIBE", "SUNSUBSCRIBE"};
+    for (size_t i = 0; i < sizeof(per_channel) / sizeof(per_channel[0]); i++) {
+        if (strcasecmp(args[0].data.c_str(), per_channel[i]) == 0) return (unsigned int) (args.size() - 1);
+    }
+    return 1;
+}
+
 bool arbitrary_command::split_command_to_args()
 {
     // command.c_str() yields a NUL-terminated view: any embedded \0 bytes
@@ -691,6 +707,7 @@ bool arbitrary_command::split_command_to_args()
             command_arg arg(buffer.data(), buffer_len);
             command_args.push_back(arg);
         } else {
+            replies = count_replies(command_args);
             return true;
         }
     }
