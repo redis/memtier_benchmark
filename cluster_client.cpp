@@ -1515,7 +1515,7 @@ bool cluster_client::handle_cluster_slots(unsigned int conn_id, protocol_respons
     print_topology_summary();
 
     // Before retiring connections: their staged lines move too.
-    reroute_staged_monitor_commands(close_sc);
+    reroute_staged_monitor_commands();
 
     // check if some connections left with no slots, and need to be closed
     bool retired_any = false;
@@ -2909,16 +2909,23 @@ void cluster_client::handle_moved(unsigned int conn_id)
 // as staged, the line would get -MOVED or land on a replica. Move it to the
 // slot's current primary instead, as hand_off_replay_requests() does for
 // held replays. It stays counted in m_reqs_generated, so the replay cursor
-// and --requests are unaffected. All of a slot's staged lines are on one
-// queue (the one this map's predecessor routed them to), and they move
+// and --requests are unaffected. All of an owned slot's staged lines are on
+// one queue (the one this map's predecessor routed them to), and they move
 // together in order, so each slot keeps its selection order.
-void cluster_client::reroute_staged_monitor_commands(const std::vector<bool> &retired)
+void cluster_client::reroute_staged_monitor_commands()
 {
+    // Unowned lines stay on any primary of this map. Not by get_role(): a
+    // node demoted while its reconnect timer is pending is still labeled a
+    // primary until it is redialed.
+    std::vector<bool> primary(m_connections.size(), false);
+    for (const shard_group &group : m_shard_groups) {
+        if (group.primary != NULL && group.primary->get_id() < primary.size()) primary[group.primary->get_id()] = true;
+    }
     std::vector<unsigned int> woken;
-    size_t dropped = 0;
+    unsigned long long dropped = 0;
     for (unsigned int i = 0; i < m_staged_monitor_commands.size(); i++) {
         if (m_staged_monitor_commands[i].empty()) continue;
-        const bool keeps = (i >= retired.size() || !retired[i]) && m_connections[i]->get_role() == role_primary;
+        const bool keeps = i < primary.size() && primary[i];
         std::queue<staged_monitor_cmd> staged;
         std::swap(m_staged_monitor_commands[i], staged);
         for (; !staged.empty(); staged.pop()) {
@@ -2933,10 +2940,20 @@ void cluster_client::reroute_staged_monitor_commands(const std::vector<bool> &re
                 // A primary left disconnected without a reconnect timer was
                 // given up on (see hand_off_replay_requests()): nothing would
                 // send the line there.
+                const char *drop_reason = NULL;
                 if (target >= m_connections.size() ||
                     (m_connections[target]->get_connection_state() == conn_disconnected &&
-                     !m_connections[target]->is_reconnect_pending()) ||
-                    m_staged_monitor_commands[target].size() >= STAGED_MONITOR_QUEUE_MAX_SIZE) {
+                     !m_connections[target]->is_reconnect_pending())) {
+                    drop_reason = "slot-owner-down-for-monitor-line";
+                } else if (m_staged_monitor_commands[target].size() >= STAGED_MONITOR_QUEUE_MAX_SIZE) {
+                    drop_reason = "staged-monitor-queue-full";
+                }
+                if (drop_reason != NULL) {
+                    const std::vector<command_arg> &args = staged.front().parsed_cmd.command_args;
+                    const std::string key = args.size() >= 2 ? args[1].data : std::string();
+                    struct timeval now;
+                    gettimeofday(&now, NULL);
+                    global_failed_keys_logger().log_failure(now, "MONITOR", key.c_str(), key.size(), drop_reason, 0);
                     dropped++;
                     continue;
                 }
@@ -2945,9 +2962,12 @@ void cluster_client::reroute_staged_monitor_commands(const std::vector<bool> &re
             m_staged_monitor_commands[target].push(std::move(staged.front()));
         }
     }
-    // Lines that cannot be sent are uncounted, so a --requests run does not
-    // wait for their replies.
-    m_reqs_generated -= (m_reqs_generated >= dropped) ? dropped : m_reqs_generated;
+    // Dropped lines are never sent: uncount them and count them as errors,
+    // as hand_off_replay_requests() does.
+    if (dropped) {
+        benchmark_error_log("warning: dropped %llu staged monitor line(s) that no primary can send.\n", dropped);
+        abandon_requests(dropped);
+    }
     for (unsigned int target : woken) {
         if (m_connections[target]->get_connection_state() != conn_disconnected) m_connections[target]->schedule_fill();
     }

@@ -237,9 +237,8 @@ protected:
     bool connect_shard_connection(shard_connection *sc, char *address, char *port);
     void handle_moved(unsigned int conn_id);
     // Move staged monitor lines to the primary that owns their slot in the
-    // map just committed, keeping each slot's selection order. retired[i] is
-    // true for a connection the map no longer lists.
-    void reroute_staged_monitor_commands(const std::vector<bool> &retired);
+    // map just committed, keeping each owned slot's selection order.
+    void reroute_staged_monitor_commands();
     void update_redirect_stats(struct timeval timestamp, request *req, protocol_response *response, bool moved,
                                bool completed);
     bool create_monitor_request_cluster(unsigned int command_index, struct timeval &timestamp, unsigned int conn_id);

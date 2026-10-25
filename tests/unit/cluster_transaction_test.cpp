@@ -95,6 +95,7 @@ public:
         m_staged_monitor_commands.emplace_back();
     }
     using cluster_client::disconnect;
+    using cluster_client::reroute_staged_monitor_commands;
     using cluster_client::txn_release_pin;
     bool staged() const { return m_txn_has_staged_key; }
     unsigned long long staged_key() const { return m_txn_staged_key_index; }
@@ -157,6 +158,14 @@ public:
         check(cmd.split_command_to_args(), "parse staged monitor command");
         m_staged_monitor_commands[conn_id].push(staged_monitor_cmd{std::move(cmd), 0, timeval{}, 1});
         m_reqs_generated += 2;
+    }
+    // One counted monitor line for `slot`, staged on conn_id.
+    void stage_line(unsigned int conn_id, unsigned int slot)
+    {
+        arbitrary_command cmd("SET unit-key unit-value");
+        check(cmd.split_command_to_args(), "parse staged monitor command");
+        m_staged_monitor_commands[conn_id].push(staged_monitor_cmd{std::move(cmd), 0, timeval{}, 1, slot});
+        m_reqs_generated++;
     }
     size_t staged_monitor_count(unsigned int conn_id) const { return m_staged_monitor_commands[conn_id].size(); }
     void change_role(unsigned int conn_id, enum shard_role role) { set_shard_role(m_connections[conn_id], role); }
@@ -387,7 +396,8 @@ static void check_repin_routes_to_staged_owner(unsigned long long first_key)
             check(client.redial(1, "localhost", port.c_str()), "same replica endpoint redial starts");
             check(client.pool_empty(1) && client.staged_monitor_count(1) == attempt + 1,
                   "replica redial clears routed keys and keeps monitor lines, including demotion");
-            check(client.get_reqs_generated() == generated - 2 + attempt + 1, "replica reset compensates exactly once");
+            check(client.get_reqs_generated() == generated - 2 + attempt + 1,
+                  "replica reset compensates routed keys once and keeps monitor lines counted");
         }
         client.stage_unsent(1);
         client.change_role(1, role_primary);
@@ -467,6 +477,21 @@ static void check_repin_routes_to_staged_owner(unsigned long long first_key)
         client.get_connections()[0]->disconnect();
         check(!client.can_route_unowned(staged_slot) && client.run_failed(),
               "disconnected seed is not a pending topology refresh");
+    }
+    // A staged line whose slot moved to a primary that was given up on is
+    // dropped and uncounted when the map is committed.
+    {
+        client_group group(&config, protocol, &generator);
+        transaction_client client(&group);
+        client.route_slot_to_second_shard(protocol, staged_slot, port.c_str());
+        client.get_connections()[1]->disconnect();
+        check(!client.get_connections()[1]->is_reconnect_pending(), "second shard was given up on");
+        const unsigned long long generated = client.get_reqs_generated();
+        client.stage_line(0, staged_slot);
+        client.reroute_staged_monitor_commands();
+        check(client.staged_monitor_count(0) == 0 && client.staged_monitor_count(1) == 0,
+              "line for a given-up primary is dropped");
+        check(client.get_reqs_generated() == generated, "dropped line is uncounted");
     }
     delete protocol;
     evutil_closesocket(listener);

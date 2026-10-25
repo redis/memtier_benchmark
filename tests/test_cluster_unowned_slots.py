@@ -115,8 +115,10 @@ class _Handler(socketserver.StreamRequestHandler):
                     if verb == b"CLUSTER":
                         assert not multi, "CLUSTER SLOTS injected into MULTI"
                         reply = node.topology()
+                        if reply is None:
+                            return
                     elif verb == b"PING":
-                        reply = b"+PONG\r\n"
+                        reply = root.ping_reply(node) if hasattr(root, "ping_reply") else b"+PONG\r\n"
                     elif verb in (b"READONLY", b"WATCH", b"DISCARD"):
                         if verb == b"READONLY":
                             time.sleep(node.readonly_delay)
@@ -907,11 +909,14 @@ class _Failover(_Node):
     which succeeds, and memtier learns of it from a -MOVED. With redial=True
     A closes its first two connections during AUTH instead, and the refresh
     after the second one returns the new map, so A is still redialing when
-    it changes role. A SET sent to a node that does not own its slot gets
-    -MOVED, or with moved=False is accepted, as by a demoted primary.
+    it changes role. With pending=True A closes instead of answering that
+    refresh, and R answers a PING with CLUSTERDOWN once the CLUSTERDOWN poll
+    allows another refresh, so the map is committed while A's reconnect
+    timer is still pending. A SET sent to a node that does not own its slot
+    gets -MOVED, or with moved=False is accepted, as by a demoted primary.
     """
 
-    def __init__(self, change, moved=True, silent=False, redial=False, initial=None):
+    def __init__(self, change, moved=True, silent=False, redial=False, initial=None, pending=False):
         super().__init__([(0, 16383)])
         self.replica = _Node([])
         self.b = _Node([])
@@ -921,6 +926,11 @@ class _Failover(_Node):
         self.redial = redial
         self.refreshed = False
         self.triggered = redial
+        self.pending = pending
+        self.held = False
+        self.pings = 0
+        self.triggered_at = None
+        self.closed = threading.Event()
         if redial:
             self.auth_closes = 2
             self.auth_delay = 0.02
@@ -945,6 +955,9 @@ class _Failover(_Node):
                 self.refreshed = True
         if (server is self and self.changed) or (self.redial and self.auth_attempts and self.slots_calls):
             time.sleep(0.3)
+        if self.pending and server is self and self.refreshed and not self.closed.is_set():
+            self.closed.set()
+            return None
         with self.lock:
             self.slots_calls += 1
             shards = list(self.map)
@@ -971,6 +984,7 @@ class _Failover(_Node):
             self.log.append((server.name, args[1], int(args[2].split(b"-")[1]), owned, self.refreshed))
             if server is self and not self.triggered:
                 self.triggered = True
+                self.triggered_at = time.monotonic()
                 if self.silent:
                     self.apply_change()
                 else:
@@ -980,6 +994,19 @@ class _Failover(_Node):
         if owner is server or not self.moved:
             return b"+OK\r\n"
         return b"-MOVED %d 127.0.0.1:%d\r\n" % (slot, owner.server_address[1])
+
+    def ping_reply(self, server):
+        if not (self.pending and server is self.replica and self.refreshed and not self.held):
+            return b"+PONG\r\n"
+        # Hold R's third PING since A was asked for the map, so R stages lines on A first.
+        self.pings += 1
+        if self.pings < 3:
+            return b"+PONG\r\n"
+        self.held = True
+        self.closed.wait(5)
+        # memtier polls CLUSTERDOWN at most once a second.
+        time.sleep(max(0.0, self.triggered_at + 1.3 - time.monotonic()))
+        return b"-CLUSTERDOWN The cluster is down\r\n"
 
 
 # New server map per scenario, as (low, high, [primary, replicas...]).
@@ -1001,13 +1028,14 @@ _INITIAL = {
 }
 
 
-def _check_failover_replay(env, scenario, pipeline, moved=True, silent=False, redial=False):
+def _check_failover_replay(env, scenario, pipeline, moved=True, silent=False, redial=False, pending=False):
     node = _Failover(
         _FAILOVERS[scenario.replace("-live", "")],
         moved=moved,
         silent=silent,
         redial=redial,
         initial=_INITIAL.get(scenario),
+        pending=pending,
     )
     with tempfile.TemporaryDirectory() as directory:
         monitor = os.path.join(directory, "monitor.txt")
@@ -1026,11 +1054,16 @@ def _check_failover_replay(env, scenario, pipeline, moved=True, silent=False, re
                 "--command=PING",
                 "--command=__monitor_line@__",
             ]
-            + (["--reconnect-on-error", "--max-reconnect-attempts=3", "--reconnect-backoff-factor=0.5"] if redial else []),
+            # With pending=True, A's 4 s reconnect timer outlasts the refresh R triggers.
+            + (
+                ["--reconnect-on-error", "--max-reconnect-attempts=3", "--reconnect-backoff-factor=" + ("4" if pending else "0.5")]
+                if redial or pending
+                else []
+            ),
             seed_replica=True,
             timeout=15,
         )
-    label = "%s pipeline=%d moved=%s silent=%s redial=%s" % (scenario, pipeline, moved, silent, redial)
+    label = "%s pipeline=%d moved=%s silent=%s redial=%s pending=%s" % (scenario, pipeline, moved, silent, redial, pending)
     values = [entry[2] for entry in node.log]
     counts = {value: values.count(value) for value in values}
     result = {
@@ -1044,6 +1077,8 @@ def _check_failover_replay(env, scenario, pipeline, moved=True, silent=False, re
     in_flight = [(name, value) for name, _, value, owned, refreshed in node.log if not owned and not refreshed]
     env.debugPrint("%s: %s in-flight=%s sequence=%s" % (label, result, in_flight, values), force=True)
     env.assertTrue(node.changed, message=label)
+    if pending:
+        env.assertTrue(node.held, message=label)
     env.assertEqual(stats["Totals"]["Count"], 40, message=label)
     env.assertEqual(result, {"missing": [], "duplicated": [], "misrouted": []}, message=label + stderr[-2000:])
     if silent:
@@ -1084,3 +1119,6 @@ def test_staged_monitor_leaves_demoted_primary(env):
             _check_failover_replay(env, "demote", pipeline, moved=moved, silent=silent, redial=redial)
     for pipeline in (1, 4):
         _check_failover_replay(env, "demote-hole", pipeline)
+    # Unowned lines leave A while its reconnect timer is pending too. At
+    # pipeline=1 no unowned line is staged on A before it closes.
+    _check_failover_replay(env, "demote-hole", 4, pending=True)
