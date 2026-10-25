@@ -132,17 +132,23 @@ def bounded_client(conn, timeout=5.0):
     Make a redis-py client fail fast: no retries and a socket timeout, so a
     stopped server costs one refused connect rather than redis-py's retry
     backoff, and a hung one cannot block for longer than `timeout`. Changes
-    the client's own pool settings, so use it on a client of your own (RLTest
-    returns a new one from every getConnection()).
+    the client's own pool settings and drops connections it already opened
+    with the old ones, so use it on a client of your own (RLTest returns a new
+    one from every getConnection()).
     """
     from redis.backoff import NoBackoff
     from redis.retry import Retry
 
     pool = getattr(conn, "connection_pool", None)
     if pool is not None:
-        pool.connection_kwargs.update(retry=Retry(NoBackoff(), 0), socket_timeout=timeout)
+        # set_retry also reaches the pool's existing connections, which keep
+        # their own retry; disconnecting them makes the next command reconnect
+        # with the new socket timeout.
+        pool.set_retry(Retry(NoBackoff(), 0))
+        pool.connection_kwargs["socket_timeout"] = timeout
         if "socket_connect_timeout" in pool.connection_kwargs:
             pool.connection_kwargs["socket_connect_timeout"] = timeout
+        pool.disconnect()
     return conn
 
 
