@@ -1749,7 +1749,7 @@ void shard_connection::process_response(void)
                                 r->get_status(), r->get_hits(), req->m_keys - r->get_hits());
 
             m_conns_manager->handle_response(m_id, now, req, r);
-            m_conns_manager->inc_reqs_answered(now);
+            m_conns_manager->inc_reqs_answered(now, !req->m_claimed_by_retry);
             // Any workload reply, even an error, shows the connection serves
             // requests again: a setup rejected before it no longer counts.
             m_setup_failed_since_reply = false;
@@ -1854,7 +1854,8 @@ void shard_connection::process_first_request()
     // (it was dropped before its first reply, e.g. by a server killing
     // connections, and reconnected at the deadline) is timed from the
     // benchmark's start, like the run: started now, it would run a whole
-    // --test-time after the deadline. It ends at its first reply.
+    // --test-time after the deadline. It sends no new request
+    // (deadline_passed_by()) and ends at once.
     if (stops_at_deadline() && run_is_over()) {
         static_cast<client *>(m_conns_manager)->set_start_time_at(&m_config->benchmark_start_time);
     } else {
@@ -1930,8 +1931,12 @@ void shard_connection::fill_pipeline(void)
     // run has finished while responses are still pending. Retries are
     // resent beyond --pipeline and, after a MOVED, keep going to the node
     // the stale slot map names until a CLUSTER SLOTS refresh lands, so
-    // holding the refresh back would loop on MOVED forever.
-    while (!m_conns_manager->finished() || (!is_conn_setup_done() && get_pending_resp() > 0)) {
+    // holding the refresh back would loop on MOVED forever. No new workload
+    // goes out once the deadline has passed by now, even if no reply has
+    // moved the run's clock past it yet (a reconnect setup that stalled past
+    // it, say: #879). now is fixed here, so this is checked once.
+    const bool deadline_passed = m_conns_manager->deadline_passed_by(now);
+    while (!(deadline_passed || m_conns_manager->finished()) || (!is_conn_setup_done() && get_pending_resp() > 0)) {
         // A CLUSTER SLOTS refresh requested while this connection drives
         // the pinned --transaction rotation inside an open MULTI waits for
         // the rotation's EXEC/DISCARD: sent now it would only be queued.
@@ -1940,7 +1945,7 @@ void shard_connection::fill_pipeline(void)
             return;
         }
 
-        if (m_conns_manager->finished() || m_pipeline->size() >= m_config->pipeline) {
+        if (deadline_passed || m_conns_manager->finished() || m_pipeline->size() >= m_config->pipeline) {
             break;
         }
 
@@ -1977,7 +1982,12 @@ void shard_connection::fill_pipeline(void)
         if ((m_pending_resp == 0) && (evbuffer_get_length(bufferevent_get_output(m_bev)) == 0)) {
             benchmark_debug_log("%s Done, no requests to send no response to wait for\n", get_readable_id());
 
-            if (m_conns_manager->finished() && m_conns_manager->all_connections_idle()) {
+            // Past the deadline by now, a client ends here even if no reply
+            // moved the run's clock past it (#879), unless it holds retries:
+            // those are still resent until the drain grace (#715).
+            if (m_conns_manager->all_connections_idle() &&
+                (m_conns_manager->finished() ||
+                 (deadline_passed && !static_cast<client *>(m_conns_manager)->holds_retries()))) {
                 m_conns_manager->set_end_time();
                 m_conns_manager->disconnect_all();
             } else if (!m_config->request_rate) {
@@ -2387,9 +2397,10 @@ double shard_connection::next_reconnect_delay(void)
 // as errors.
 //
 // A rejected setup step is left to handle_reconnect_timer_event(). A started
-// client's stats end at the deadline, not at the failed connect, so the
-// duration and throughput reflect --test-time. Requests held for replay are
-// counted as errors by disconnect_all().
+// client's stats end at its deadline or last reply (client::test_time_end()),
+// not at the failed connect, so the duration and throughput reflect
+// --test-time. Requests held for replay are counted as errors by
+// disconnect_all().
 bool shard_connection::stop_reconnecting_if_run_over(void)
 {
     if (!stops_at_deadline()) return false;
@@ -2409,9 +2420,10 @@ bool shard_connection::stop_reconnecting_if_run_over(void)
 
 // Once the run is over and this connection is done: if the client's other
 // connections are done too (siblings_done()), end the client. With end_stats,
-// a started client's stats end at the deadline (or now, if --requests ended
-// the run); without, the run fails: the client is left unended and marked
-// failed (client::fail_run()). disconnect_all() counts requests held for replay as errors.
+// a started client's stats end at its deadline or last reply (or now, if
+// --requests ended the run); without, the run fails: the client is left
+// unended and marked failed (client::fail_run()). disconnect_all() counts
+// requests held for replay as errors.
 void shard_connection::end_client_after_run(bool end_stats)
 {
     // Without end_stats the run failed: record it, as a busy sibling may still
@@ -2421,13 +2433,9 @@ void shard_connection::end_client_after_run(bool end_stats)
     // A client that never started has no stats to end.
     if (end_stats && m_conns_manager->get_reqs_answered()) {
         client *c = static_cast<client *>(m_conns_manager);
-        struct timeval deadline, now;
+        struct timeval now, end;
         gettimeofday(&now, NULL);
-        if (run_deadline(&deadline) && timercmp(&deadline, &now, <)) {
-            c->set_end_time_at(&deadline);
-        } else {
-            c->set_end_time();
-        }
+        c->set_end_time_at(c->test_time_end(now, &end) ? &end : &now);
     }
     m_conns_manager->disconnect_all();
 }

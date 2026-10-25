@@ -295,7 +295,11 @@ static void check_slots_retry_start_time(bool submitted)
         server.reply("+OK\r\n*0\r\n");
         server.drain(connection);
         require(connection.get_cluster_slots_state() == setup_sent, "empty map leaves a retry pending");
-        timeval start = {1000, 0};
+        // Recent enough that the --test-time deadline has not passed: past
+        // it, the client would send nothing more and end.
+        timeval start;
+        gettimeofday(&start, NULL);
+        start.tv_sec -= 1;
         manager.set_start_time_at(&start);
         if (submitted) manager.mark_workload_submitted();
         require(manager.get_reqs_answered() == 0, "no workload reply");

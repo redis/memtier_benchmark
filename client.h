@@ -86,7 +86,7 @@ protected:
 
     unsigned long long m_reqs_processed;          // requests processed (final responses received)
     unsigned long long m_reqs_answered;           // responses received, including ones retried
-    struct timeval m_last_reply_time = {0, 0};    // when the last of them was read
+    struct timeval m_last_reply_time = {0, 0};    // when the last final one was read
     unsigned long long m_reqs_generated;          // requests generated (wait for responses)
     unsigned int m_set_ratio_count;               // number of sets counter (overlaps on ratio)
     unsigned int m_get_ratio_count;               // number of gets counter (overlaps on ratio)
@@ -199,10 +199,10 @@ public:
 
     unsigned long long get_reqs_answered() { return m_reqs_answered; }
 
-    void inc_reqs_answered(const struct timeval &timestamp)
+    void inc_reqs_answered(const struct timeval &timestamp, bool is_final)
     {
         m_reqs_answered++;
-        m_last_reply_time = timestamp;
+        if (is_final) m_last_reply_time = timestamp;
     }
 
     unsigned long long get_reqs_generated() { return m_reqs_generated; }
@@ -231,7 +231,18 @@ public:
     virtual void handle_response(unsigned int conn_id, struct timeval timestamp, request *request,
                                  protocol_response *response);
     virtual bool finished(void);
+    virtual bool deadline_passed_by(const struct timeval &now);
     virtual bool all_connections_idle(void);
+    // Whether a connection holds --retry-on-error retries for their backoff.
+    bool holds_retries(void);
+    // The end of a started --test-time client whose deadline, its own start
+    // plus --test-time, lies before now: the deadline or its last reply,
+    // whichever is later, and no later than now. Replies drained after the
+    // deadline count; the idle time after the last one does not. False if
+    // the deadline has not passed by now. (run_deadline() times a client
+    // with no reply from the benchmark's start: a client that started late
+    // would get a shorter interval and an inflated Ops/sec.)
+    bool test_time_end(const struct timeval &now, struct timeval *end);
     virtual void set_start_time();
     // set_start_time() at a given time, e.g. the benchmark's start.
     void set_start_time_at(struct timeval *start_time) { m_stats.set_start_time(start_time); }

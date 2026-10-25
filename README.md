@@ -681,13 +681,12 @@ run's stop condition:
     about twice that delay past `--test-time`. In the report's duration, a
     client that sent requests ends at its own deadline (its start plus
     `--test-time`) or at its last reply, whichever is later: replies drained
-    after the deadline count, and the idle time after the last one does not
-    (a failed reconnect, Ctrl+C or the drain grace still end it at its
-    deadline, #880).
-    With `--retry-on-error`, a resent request answered after the reconnect
-    is such a reply, so the end moves to it. A client whose reconnect setup
-    (AUTH, say) stalls past its deadline can still send new requests once
-    the setup completes, and their replies extend its end (#879).
+    after the deadline count, and the idle time after the last one does not.
+    This holds whether the run ends normally, at a failed reconnect, at
+    Ctrl+C or at the drain grace. With `--retry-on-error`, a resent request
+    answered after the reconnect is such a reply; an error reply that is
+    retried is not. No new request is sent past the deadline, also when a
+    reconnect's setup (AUTH, say) completes only then.
   - In cluster mode this holds for the main connection only: another shard's
     connection is reconnected through a slot map refresh. Once the run is
     over, a refresh still redials it; if that dial fails, the connection is
@@ -698,7 +697,7 @@ run's stop condition:
     prevented from starting by repeated TLS-handshake failures. One whose
     first connection only completes after the deadline (e.g. a server killing
     connections before their first reply) is timed from the start of the run,
-    so it ends at its first reply instead of running a whole `--test-time`.
+    so it ends at once instead of running a whole `--test-time`.
   - The deadline is measured from the start of the run, so it does not cover
     a server that is gone before any connection got a reply: that startup
     phase is bounded by `--connection-stage-timeout` (default 30 s), which

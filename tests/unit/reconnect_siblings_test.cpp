@@ -85,10 +85,11 @@ public:
     {
         m_connections.push_back(new shard_connection(1, this, config, base, protocol));
     }
+    // Started, with one reply, at the start.
     void mark_started(struct timeval *start)
     {
-        m_reqs_answered = 1;
         m_stats.set_start_time(start);
+        inc_reqs_answered(*start, true);
     }
 };
 
@@ -218,6 +219,26 @@ static void test_interrupted_deadline()
         manager.set_end_time_at(&early);
         manager.set_end_time_interrupted(&late);
         check(manager.get_stats()->get_duration_usec() == 250000, "interrupt does not refinalize an ended client");
+    }
+    // An answered client ends at its last reply if that was drained past the
+    // deadline, but no later than the interrupt (#880).
+    struct
+    {
+        timeval reply;
+        unsigned long long duration;
+        const char *name;
+    } replies[] = {
+        {{101, 750000}, 2000000, "a reply before the deadline leaves the cap at the deadline"},
+        {{103, 750000}, 3000000, "interrupt after a drained reply ends at the reply"},
+        {{105, 500000}, 4500000, "a reply after the interrupt time is capped at the interrupt"},
+    };
+    for (unsigned int i = 0; i < sizeof(replies) / sizeof(replies[0]); ++i) {
+        object_generator generator;
+        client manager(base, &config, protocol, &generator);
+        manager.set_start_time_at(&config.benchmark_start_time);
+        manager.inc_reqs_answered(replies[i].reply, true);
+        manager.set_end_time_interrupted(&late);
+        check(manager.get_stats()->get_duration_usec() == replies[i].duration, replies[i].name);
     }
     {
         config.clients_start = 1;
@@ -461,6 +482,37 @@ int main()
             check(manager.end_time_set(), "the client was finalized");
             check(manager.run_failed() == required, "all completion paths preserve required replica setup failure");
         }
+    }
+    // A failed connect, or drain-grace expiry, after a reply that was drained
+    // past the deadline ends the client at that reply (#880).
+    config.read_preference = rp_primary;
+    for (unsigned int end_path = 0; end_path < 2; ++end_path) {
+        object_generator generator;
+        generator.set_data_size_fixed(1);
+        two_connection_client manager(base, &config, protocol, &generator);
+        shard_connection &first = *manager.get_connections()[0];
+        // Started long enough ago for the drain grace to expire.
+        struct timeval start = config.benchmark_start_time;
+        start.tv_sec -= 30;
+        manager.mark_started(&start);
+        struct timeval reply = start;
+        reply.tv_sec += config.test_time + 1;
+        manager.inc_reqs_answered(reply, true);
+        if (end_path == 0) {
+            first.end_client_after_run(true);
+        } else {
+            request *req = new request(rt_set, 0, NULL, 1);
+            req->m_serialized = strdup("*1\r\n$4\r\nPING\r\n");
+            req->m_serialized_len = strlen(req->m_serialized);
+            bool queued = first.enqueue_retry(req);
+            check(queued, "a held retry keeps the client waiting through drain grace");
+            if (!queued) delete req;
+            unsigned long long unanswered = 0, held = 0;
+            check(manager.abandon_unanswered_requests(&unanswered, &held), "drain grace expires");
+        }
+        check(manager.end_time_set(), "the client was finalized");
+        check(manager.get_stats()->get_duration_usec() == (config.test_time + 1) * 1000000ULL,
+              "reconnect and drain-grace endings include a reply drained past the deadline");
     }
     delete protocol;
     event_base_free(base);
