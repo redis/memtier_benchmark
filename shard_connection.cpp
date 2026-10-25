@@ -1749,7 +1749,7 @@ void shard_connection::process_response(void)
                                 r->get_status(), r->get_hits(), req->m_keys - r->get_hits());
 
             m_conns_manager->handle_response(m_id, now, req, r);
-            m_conns_manager->inc_reqs_answered();
+            m_conns_manager->inc_reqs_answered(now);
             // Any workload reply, even an error, shows the connection serves
             // requests again: a setup rejected before it no longer counts.
             m_setup_failed_since_reply = false;

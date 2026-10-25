@@ -36,7 +36,8 @@ public:
     virtual unsigned long long get_reqs_processed(void) = 0;
     virtual void inc_reqs_processed(void) = 0;
     virtual unsigned long long get_reqs_answered(void) = 0;
-    virtual void inc_reqs_answered(void) = 0;
+    // timestamp: when the reply was read, as passed to handle_response().
+    virtual void inc_reqs_answered(const struct timeval &timestamp) = 0;
     virtual unsigned long long get_reqs_generated(void) = 0;
     virtual void inc_reqs_generated(void) = 0;
     virtual void dec_reqs_generated(unsigned long long count) = 0;

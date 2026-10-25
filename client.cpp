@@ -390,24 +390,27 @@ void client::set_end_time()
     if (!m_end_set) {
         benchmark_debug_log("nothing else to do, test is finished.\n");
 
-        // A --test-time client that sent workload but never had a reply takes
-        // part in the duration average (#819), yet has no op past its
-        // deadline to account for: end it there, not at a post-deadline
-        // reconnect or at its thread's end (#867). A client with replies ends
-        // now, as the time past its deadline may cover replies it drained.
-        // The deadline is the client's own start plus --test-time, not
-        // run_deadline(): that times an unanswered client from the
-        // benchmark's start, which would shorten the interval of a client
-        // that started late and inflate Ops/sec.
+        // A --test-time client that sent workload ends no later than its
+        // deadline or its last reply, whichever is later: the time past the
+        // deadline counts only while it drains replies, not while it waits
+        // for a stalled server or for a reconnect after the deadline (#867,
+        // #870). A client that never had a reply takes part in the duration
+        // average (#819) and ends at its deadline. The deadline is the
+        // client's own start plus --test-time, not run_deadline(): that times
+        // an unanswered client from the benchmark's start, which would
+        // shorten the interval of a client that started late and inflate
+        // Ops/sec.
         struct timeval now;
         gettimeofday(&now, NULL);
-        if (m_config->test_time > 0 && m_reqs_answered == 0 && has_submitted_workload() && m_stats.has_started()) {
-            struct timeval deadline = m_stats.get_start_time();
+        if (m_config->test_time > 0 && has_submitted_workload() && m_stats.has_started()) {
+            struct timeval end = m_stats.get_start_time();
             // As in set_end_time_interrupted(): only construct a deadline
             // that lies before now, so a large test time cannot overflow.
-            if (ts_diff(deadline, now) > (long long) m_config->test_time * 1000000) {
-                deadline.tv_sec = (long long) deadline.tv_sec + m_config->test_time;
-                set_end_time_at(&deadline);
+            if (ts_diff(end, now) > (long long) m_config->test_time * 1000000) {
+                end.tv_sec = (long long) end.tv_sec + m_config->test_time;
+                if (m_reqs_answered && timercmp(&m_last_reply_time, &end, >)) end = m_last_reply_time;
+                if (timercmp(&end, &now, >)) end = now;
+                set_end_time_at(&end);
                 return;
             }
         }

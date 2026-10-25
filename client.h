@@ -86,6 +86,7 @@ protected:
 
     unsigned long long m_reqs_processed;          // requests processed (final responses received)
     unsigned long long m_reqs_answered;           // responses received, including ones retried
+    struct timeval m_last_reply_time = {0, 0};    // when the last of them was read
     unsigned long long m_reqs_generated;          // requests generated (wait for responses)
     unsigned int m_set_ratio_count;               // number of sets counter (overlaps on ratio)
     unsigned int m_get_ratio_count;               // number of gets counter (overlaps on ratio)
@@ -198,7 +199,11 @@ public:
 
     unsigned long long get_reqs_answered() { return m_reqs_answered; }
 
-    void inc_reqs_answered() { m_reqs_answered++; }
+    void inc_reqs_answered(const struct timeval &timestamp)
+    {
+        m_reqs_answered++;
+        m_last_reply_time = timestamp;
+    }
 
     unsigned long long get_reqs_generated() { return m_reqs_generated; }
 
