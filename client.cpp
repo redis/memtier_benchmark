@@ -390,16 +390,18 @@ void client::set_end_time()
     if (!m_end_set) {
         benchmark_debug_log("nothing else to do, test is finished.\n");
 
-        // A --test-time client that sent workload ends no later than its
-        // deadline or its last reply, whichever is later: the time past the
-        // deadline counts only while it drains replies, not while it waits
-        // for a stalled server or for a reconnect after the deadline (#867,
-        // #870). A client that never had a reply takes part in the duration
-        // average (#819) and ends at its deadline. The deadline is the
-        // client's own start plus --test-time, not run_deadline(): that times
-        // an unanswered client from the benchmark's start, which would
-        // shorten the interval of a client that started late and inflate
-        // Ops/sec.
+        // A --test-time client that sent workload ends at its deadline or its
+        // last reply, whichever is later, and no later than now: replies
+        // drained after the deadline count; the idle time after the last one,
+        // waiting for a stalled server or a reconnect, does not (#867, #870).
+        // A request resent after a reconnect (--retry-on-error) and answered
+        // is such a reply. So are the replies to new requests sent once a
+        // reconnect setup stalled past the deadline completes (#879).
+        // A client that never had a reply takes part in the duration average
+        // (#819) and ends at its deadline. The deadline is the client's own
+        // start plus --test-time, not run_deadline(): that times an
+        // unanswered client from the benchmark's start, which would shorten
+        // the interval of a client that started late and inflate Ops/sec.
         struct timeval now;
         gettimeofday(&now, NULL);
         if (m_config->test_time > 0 && has_submitted_workload() && m_stats.has_started()) {

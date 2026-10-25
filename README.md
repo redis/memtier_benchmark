@@ -678,9 +678,14 @@ run's stop condition:
     reconnected once, so requests held for replay are resent; if that
     reconnect fails or is dropped again, the run ends. So a peer that accepts
     connections and closes them after a delay can extend the run by up to
-    about twice that delay past `--test-time`. That extra time is not in the
-    report's duration: a client that sent requests ends at its deadline, or
-    at its last reply if it drained replies past the deadline.
+    about twice that delay past `--test-time`. In the report's duration, a
+    client that sent requests ends at its own deadline (its start plus
+    `--test-time`) or at its last reply, whichever is later: replies drained
+    after the deadline count, and the idle time after the last one does not.
+    With `--retry-on-error`, a resent request answered after the reconnect
+    is such a reply, so the end moves to it. A client whose reconnect setup
+    (AUTH, say) stalls past its deadline can still send new requests once
+    the setup completes, and their replies extend its end (#879).
   - In cluster mode this holds for the main connection only: another shard's
     connection is reconnected through a slot map refresh. Once the run is
     over, a refresh still redials it; if that dial fails, the connection is

@@ -17,6 +17,12 @@ a reply; this covers the one that had some.
 - "late": with --pipeline=2, B's held SET is answered past its deadline, then
   the one behind it is held and B is closed. B ends at that late reply: the
   time spent draining it counts, the idle time after it does not.
+- "split": two shards, with B's keys alternating between them. The first
+  shard's connection is closed and its reconnect's AUTH held past the
+  deadline, while B's next SET on the second shard is answered past the
+  deadline. B ends from the first shard once its setup completes, at the late
+  reply on the second: the last reply is the client's, whichever shard it came
+  on, and a setup reply is not one.
 
 The peer sets the pace: it holds and closes B relative to A's close, so the
 timing is past the deadline however slowly memtier starts. No SIGINT is sent.
@@ -65,7 +71,7 @@ class _Peer:
         self.a_closed = threading.Event()
         # Cluster mode: A's connection to the second shard authenticated.
         self.a_second = threading.Event()
-        self.servers = [_Server(self) for _ in range(2 if mode == "cluster" else 1)]
+        self.servers = [_Server(self) for _ in range(1 if mode in ("stalled", "late") else 2)]
         self.ports = [server.server_address[1] for server in self.servers]
         self.auths = {port: 0 for port in self.ports}
         self.a_open = 0
@@ -74,6 +80,8 @@ class _Peer:
         self.b_held = 0
         self.b_late = 0
         self.b_connections = 0
+        # "split": B's connection to the first shard was closed.
+        self.b_dropped = False
         self.errors = []
 
     def slots(self):
@@ -83,12 +91,19 @@ class _Peer:
             reply += b"*3\r\n:%d\r\n:%d\r\n*2\r\n$9\r\n127.0.0.1\r\n:%d\r\n" % (first, last, port)
         return reply
 
-    def hold_then_close(self):
+    def hold(self):
         # Held until A has ended (so past the deadline), then some more.
         with self.lock:
             self.b_held += 1
         if self.a_closed.wait(30):
             self.stop.wait(_OVERRUN_S)
+
+    def answer_late(self):
+        # Answered, but only past the deadline.
+        with self.lock:
+            self.b_late += 1
+        if self.a_closed.wait(30):
+            self.stop.wait(_LATE_S)
 
 
 class _Handler(socketserver.StreamRequestHandler):
@@ -120,9 +135,12 @@ class _Handler(socketserver.StreamRequestHandler):
                                 peer.a_second.set()
                         else:
                             peer.b_connections += 1
+                    if peer.b_dropped and port == peer.ports[0]:
+                        # "split": B's reconnect to the first shard.
+                        peer.hold()
                     reply = b"+OK\r\n"
                 elif args == [b"CLUSTER", b"SLOTS"]:
-                    assert peer.mode == "cluster" and role is not None, args
+                    assert len(peer.ports) == 2 and role is not None, args
                     # Hold B's slot map until A has connected to the second
                     # shard, so the first AUTH on each port is always A's.
                     if role == "B":
@@ -134,16 +152,18 @@ class _Handler(socketserver.StreamRequestHandler):
                         with peer.lock:
                             peer.a_replies += 1
                     elif peer.mode == "cluster" and port != peer.ports[0]:
-                        peer.hold_then_close()
+                        peer.hold()
                         return
-                    elif peer.mode != "cluster" and peer.b_replies >= _ANSWERED:
+                    elif peer.mode == "split" and peer.b_replies >= _ANSWERED:
+                        if port == peer.ports[0] or peer.b_late:
+                            peer.b_dropped = True
+                            return
+                        peer.answer_late()
+                    elif peer.mode in ("stalled", "late") and peer.b_replies >= _ANSWERED:
                         if peer.mode == "late" and peer.b_late == 0:
-                            # Answered, but only past the deadline.
-                            peer.b_late += 1
-                            if peer.a_closed.wait(30):
-                                peer.stop.wait(_LATE_S)
+                            peer.answer_late()
                         else:
-                            peer.hold_then_close()
+                            peer.hold()
                             return
                     if role == "B":
                         with peer.lock:
@@ -178,7 +198,7 @@ def _scenario(mode, extra, binary=MEMTIER_BINARY):
                     "--pipeline=" + ("2" if mode == "late" else "1"), "--ratio=1:0",
                     "--rate-limiting=" + str(_RATE), "--reconnect-on-error", "--hide-histogram",
                     "--json-out-file=" + path] + extra
-            if mode == "cluster":
+            if len(peer.ports) == 2:
                 args.append("--cluster-mode")
             child = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             stdout, stderr = child.communicate(timeout=30)
@@ -246,4 +266,15 @@ def test_answered_client_ends_at_last_reply_past_deadline(env):
     # B's interval runs to its late reply, _LATE_S past A's end: about 3500
     # ms. A cap at the deadline gives ~3000 ms, an end at B's reconnect ~4500.
     peer = _check(env, "late", [], _TEST_TIME * 1000 + _LATE_S * 1000 / 2)
+    env.assertEqual(peer["b_late"], 1)
+
+
+def test_cluster_answered_client_ends_at_last_reply_on_another_shard(env):
+    # memtier-1 is in slot 3498 (first shard), memtier-2 in 15817 (second), so
+    # B's SETs alternate between the shards. Its interval runs to the late
+    # reply on the second shard, though the end comes from the first: about
+    # 3500 ms. Taking the first shard's last reply gives ~3000 ms, counting
+    # its reconnect's AUTH reply ~4000.
+    peer = _check(env, "split", ["--key-pattern=S:S", "--key-minimum=1", "--key-maximum=2"],
+                  _TEST_TIME * 1000 + _LATE_S * 1000 / 2)
     env.assertEqual(peer["b_late"], 1)
