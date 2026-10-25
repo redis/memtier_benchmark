@@ -774,9 +774,9 @@ int redis_protocol::parse_response(void)
                 }
 
                 // Record the reply body's declared element count (count is now
-                // null-clamped to >=0 and map-doubled). '|' is the attribute
-                // prefix, not the reply body; '>' (m_push) is out-of-band.
-                if (top_level_aggregate && !m_push && line[0] != '|') {
+                // null-clamped to >=0 and map-doubled). An attribute ('|') or a
+                // push ('>') has set m_push: neither is the reply body.
+                if (top_level_aggregate && !m_push) {
                     m_last_response.set_top_array_len(count);
                 }
 
@@ -784,7 +784,7 @@ int redis_protocol::parse_response(void)
                 // The top-level array container starts tracking; a nested
                 // aggregate is itself an element -- a hit iff it is non-empty
                 // (count>0). See the m_tracking/m_nested_remaining contract.
-                if (m_track_elem_misses && !m_push && line[0] != '|') {
+                if (m_track_elem_misses && !m_push) {
                     if (top_level_aggregate) {
                         m_tracking = true;
                         m_nested_remaining = 0;
