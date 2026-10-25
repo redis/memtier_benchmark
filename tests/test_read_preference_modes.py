@@ -1113,6 +1113,7 @@ def test_read_preference_keyless_commands_skip_replicas(env):
         (["--command=EVAL return 0", "--command-is-read", "--read-preference=secondary"], b"EVAL", True),
         # No write flag, but a replica rejects WAIT.
         (["--command=WAIT 0 0", "--read-preference=secondary"], b"WAIT", False),
+        (["--command=WAITAOF 0 0 0", "--read-preference=secondary"], b"WAITAOF", False),
         (["--command=PING", "--read-preference=secondaryPreferred"], b"PING", True),
         (["--command=PING", "--command-is-read", "--read-preference=secondaryPreferred"], b"PING", True),
         (["--command=DBSIZE", "--read-preference=secondary"], b"DBSIZE", True),
@@ -1168,9 +1169,10 @@ def test_read_preference_keyless_hold_keeps_traffic_flowing(env):
         env.assertEqual(got_primary, want_primary, message=message)
         env.assertEqual(got_replica, want_replica, message=message)
 
-    # Two shards: the held replicas wake only one primary. It produces the
-    # whole rotation, and keyed work for the other shard reaches its pool
-    # with a fill scheduled, so the other primary is never needed to wake.
+    # Two shards: a held replica wakes one primary, which can produce the
+    # rotation on its own (the other primary sends some of it too), and keyed
+    # work for the other shard reaches its pool with a fill scheduled, so no
+    # primary is left waiting to be woken.
     def endpoint(n):
         return b"*2\r\n$9\r\n127.0.0.1\r\n:%d\r\n" % n.server_address[1]
 
