@@ -3311,6 +3311,16 @@ void cluster_client::handle_connection_disconnect(unsigned int conn_id)
     wake_mget_producers(conn_id);
 }
 
+void cluster_client::handle_connection_given_up(unsigned int conn_id)
+{
+    // No commit may come to move this connection's staged monitor lines, and
+    // nothing sends from it now. The re-route drops those of its own slots
+    // and moves the rest, so they don't keep a --requests run open.
+    if (conn_id < m_staged_monitor_commands.size() && !m_staged_monitor_commands[conn_id].empty()) {
+        reroute_staged_monitor_commands();
+    }
+}
+
 void cluster_client::handle_response(unsigned int conn_id, struct timeval timestamp, request *request,
                                      protocol_response *response)
 {

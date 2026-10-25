@@ -151,6 +151,12 @@ public:
     }
     bool can_route_unowned(unsigned int slot) { return check_unowned_slot(slot, false); }
     void unown_slot(unsigned int slot) { m_slot_to_shard_group[slot] = UINT_MAX; }
+    // A third connection, still dialing: a peer in the middle of its setup.
+    void dial_peer(abstract_protocol *protocol, const char *port)
+    {
+        shard_connection *peer = create_shard_connection(protocol);
+        check(connect_shard_connection(peer, (char *) "127.0.0.1", (char *) port), "peer dialed");
+    }
     bool pool_empty(unsigned int conn_id) const { return m_key_index_pools[conn_id]->empty(); }
     // A routed key and a monitor line for `slot`, both unsent on conn_id.
     void stage_unsent(unsigned int conn_id, unsigned int slot)
@@ -525,6 +531,32 @@ static void check_repin_routes_to_staged_owner(unsigned long long first_key)
               "line on its given-up owner is dropped");
         check(client.get_reqs_generated() == generated, "line on its given-up owner is uncounted");
         check(client.get_stats()->get_total_errors() == errors + 1, "line on its given-up owner counts as an error");
+    }
+    // A primary given up on while a peer is still in setup is left dead and
+    // the thread goes on (--read-preference other than primary). Its staged
+    // lines are dropped then, not left counted for a commit that may never
+    // come: a --requests run would wait on them forever.
+    {
+        client_group group(&config, protocol, &generator);
+        transaction_client client(&group);
+        client.route_slot_to_second_shard(protocol, staged_slot, port.c_str());
+        client.dial_peer(protocol, port.c_str());
+        const bool reconnect_on_error = config.reconnect_on_error;
+        config.reconnect_on_error = false;
+        config.read_preference = rp_secondary_preferred;
+        const unsigned long long generated = client.get_reqs_generated();
+        const unsigned long long errors = client.get_stats()->get_total_errors();
+        client.stage_line(1, staged_slot);
+        client.get_connections()[1]->attempt_reconnect("unit-test primary drop");
+        config.read_preference = rp_primary;
+        config.reconnect_on_error = reconnect_on_error;
+        check(client.get_connections()[1]->get_connection_state() == conn_disconnected &&
+                  !client.get_connections()[1]->is_reconnect_pending() && !client.run_failed(),
+              "primary is left dead while the thread goes on");
+        check(client.staged_monitor_count(1) == 0, "given-up primary's staged line is dropped");
+        check(client.get_reqs_generated() == generated, "given-up primary's staged line is uncounted");
+        check(client.get_stats()->get_total_errors() == errors + 1,
+              "given-up primary's staged line counts as an error");
     }
     // An unowned line on a given-up primary moves to a primary that is still
     // dialing, instead of staying or being dropped.

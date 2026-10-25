@@ -71,6 +71,8 @@ public:
     // Routed requests can be waiting on another connection's rate budget.
     virtual void handle_rate_limit_refill(unsigned int) {}
     virtual void handle_connection_disconnect(unsigned int) {}
+    // A connection was given up on (no reconnect timer) while the thread goes on.
+    virtual void handle_connection_given_up(unsigned int) {}
 
     virtual int connect(void) = 0;
     // Reconnect one dropped connection: returns 0 once a connect is issued,
