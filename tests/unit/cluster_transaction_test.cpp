@@ -65,12 +65,12 @@ static void check(bool condition, const char *message)
     }
 }
 
-// Drive request generation directly and never run the event loop: the
-// failures depend on the order of staging, pin release and request
-// generation, not on network timing. Connections write into protocol
-// buffers; the routing test only dials a local socket so that its second
-// shard counts as connected.
-// shard_connection.cpp; schedule_fill() arms it.
+// Drive request generation directly: the failures depend on the order of
+// staging, pin release and request generation, not on network timing.
+// Connections write into protocol buffers. Only finish_dial() runs the event
+// loop, to complete a local dial so that a shard counts as connected.
+
+// Defined in shard_connection.cpp; schedule_fill() arms it.
 void deferred_fill_pipeline_cb(evutil_socket_t, short, void *ctx);
 
 class transaction_client : public cluster_client
