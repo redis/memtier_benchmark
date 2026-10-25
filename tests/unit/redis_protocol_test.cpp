@@ -97,15 +97,112 @@ static abstract_protocol *parse_two_resp3_kept_replies(const char *wire, evbuffe
     return protocol;
 }
 
-// Issue #839: a RESP3 push frame nested in a kept aggregate drains the
-// aggregate's remaining slots, so the reply completes with the mbulk cursor
-// still pointing into the tree. The next reply frees that tree in rs_initial
-// and must not write through the stale cursor (heap-use-after-free under ASan).
+// Feeds reply1+reply2 to a fresh RESP3 parser and checks that reply 1 ends at
+// its own last byte with the expected hits/error, and that reply 2 then parses.
+static void check_reply_pair(const char *name, const char *reply1, const char *reply2, unsigned int hits, bool error,
+                             bool keep)
+{
+    abstract_protocol *protocol = protocol_factory(PROTOCOL_RESP3);
+    evbuffer *input = evbuffer_new();
+    evbuffer *output = evbuffer_new();
+    if (!protocol || !input || !output) {
+        fprintf(stderr, "FAIL: cannot allocate protocol fixture\n");
+        exit(1);
+    }
+    protocol->set_buffers(input, output);
+    protocol->configure_protocol(PROTOCOL_RESP3);
+    protocol->set_keep_value(keep);
+    evbuffer_add(input, reply1, strlen(reply1));
+    evbuffer_add(input, reply2, strlen(reply2));
+
+    bool ok = protocol->parse_response() == 1;
+    protocol_response *r = protocol->get_response();
+    ok = ok && evbuffer_get_length(input) == strlen(reply2);
+    ok = ok && r->get_total_len() == strlen(reply1);
+    ok = ok && r->get_hits() == hits && r->is_error() == error;
+    ok = ok && protocol->parse_response() == 1 && evbuffer_get_length(input) == 0;
+    if (!ok) fprintf(stderr, "FAIL: %s (keep=%d)\n", name, keep);
+    check(ok, "reply with nested push ends at its own last byte, next reply parses");
+    delete protocol;
+    evbuffer_free(input);
+    evbuffer_free(output);
+}
+
+// Issue #847: a push frame nested in an aggregate (not valid RESP3, which only
+// sends pushes at top level) fills one slot of the enclosing aggregate and is
+// drained without touching that aggregate's counters, so reply/request
+// pairing holds. Its contents are not counted as hits.
+static void check_nested_push_framing()
+{
+    for (int keep = 0; keep <= 1; ++keep) {
+        check_reply_pair("*2 +a +b", "*2\r\n+a\r\n+b\r\n", "+OK\r\n", 0, false, keep);
+        check_reply_pair("*2 +a >0", "*2\r\n+a\r\n>0\r\n", "$2\r\nhi\r\n", 0, false, keep);
+        check_reply_pair("*2 >0 +a", "*2\r\n>0\r\n+a\r\n", "+OK\r\n", 0, false, keep);
+        check_reply_pair("*1 *2 >1 +x +a", "*1\r\n*2\r\n>1\r\n+x\r\n+a\r\n", "+OK\r\n", 0, false, keep);
+        check_reply_pair("*2 >0 -ERR x", "*2\r\n>0\r\n-ERR x\r\n", "+OK\r\n", 0, true, keep);
+        // Push inside a nested push is drained with it; only $2 ab is a hit.
+        check_reply_pair("*2 >2 $1 x >0 $2 ab", "*2\r\n>2\r\n$1\r\nx\r\n>0\r\n$2\r\nab\r\n", "+OK\r\n", 1, false, keep);
+        // Push as an attribute value: the attribute still prefixes +v.
+        check_reply_pair("|1 +k >0 +v", "|1\r\n+k\r\n>0\r\n+v\r\n", "+OK\r\n", 0, false, keep);
+    }
+
+    // The kept tree gets a null element for the push slot, so later elements
+    // land in the right aggregate: `*2 *2 >1 +x +a +b` keeps [[null, +a], +b]
+    // and `*2 *2 +a >0 +b` keeps [[+a, null], +b].
+    const char *kept[] = {"*2\r\n*2\r\n>1\r\n+x\r\n+a\r\n+b\r\n", "*2\r\n*2\r\n+a\r\n>0\r\n+b\r\n"};
+    abstract_protocol *protocol;
+    evbuffer *input;
+    evbuffer *output = evbuffer_new();
+    for (int null_at = 0; null_at < 2; null_at++) {
+        protocol = protocol_factory(PROTOCOL_RESP3);
+        input = evbuffer_new();
+        protocol->set_buffers(input, output);
+        protocol->configure_protocol(PROTOCOL_RESP3);
+        protocol->set_keep_value(true);
+        evbuffer_add(input, kept[null_at], strlen(kept[null_at]));
+        check(protocol->parse_response() == 1, "kept reply with nested push completes");
+        mbulk_size_el *root = protocol->get_response()->get_mbulk_value();
+        bool shape = root && root->mbulks_elements.size() == 2 && root->mbulks_elements[0]->is_mbulk_size() &&
+                     root->mbulks_elements[1]->is_bulk();
+        if (shape) {
+            mbulk_size_el *inner = root->mbulks_elements[0]->as_mbulk_size();
+            int a_at = 1 - null_at;
+            shape = inner->mbulks_elements.size() == 2 && inner->mbulks_elements[0]->is_bulk() &&
+                    inner->mbulks_elements[1]->is_bulk() && inner->mbulks_elements[null_at]->as_bulk()->is_resp3_null &&
+                    strcmp(inner->mbulks_elements[a_at]->as_bulk()->value, "+a") == 0 &&
+                    strcmp(root->mbulks_elements[1]->as_bulk()->value, "+b") == 0;
+        }
+        check(shape, "nested push slot is kept as a null element");
+        delete protocol;
+        evbuffer_free(input);
+    }
+
+    // Alloc-free miss tracking counts the push slot as a miss and keeps the
+    // top-level element positions: `*3 *2 >0 +a >0 +b` -> hit, miss, hit.
+    protocol = protocol_factory(PROTOCOL_RESP3);
+    input = evbuffer_new();
+    protocol->set_buffers(input, output);
+    protocol->configure_protocol(PROTOCOL_RESP3);
+    protocol->set_track_elem_misses(true);
+    const char tracked[] = "*3\r\n*2\r\n>0\r\n+a\r\n>0\r\n+b\r\n";
+    evbuffer_add(input, tracked, strlen(tracked));
+    check(protocol->parse_response() == 1, "tracked reply with nested push completes");
+    const std::vector<uint8_t> &hits = protocol->get_response()->get_elem_hits();
+    check(hits.size() == 3 && hits[0] == 1 && hits[1] == 0 && hits[2] == 1,
+          "nested push slot is tracked as a miss at its own position");
+    delete protocol;
+    evbuffer_free(input);
+    evbuffer_free(output);
+}
+
+// Issue #839: a reply that completes with the mbulk cursor still set must not
+// let the next reply write through it once rs_initial frees the tree. A nested
+// push used to cause that; it now fills one slot (#847), so these replies end
+// with the cursor at NULL and check that the next kept reply parses cleanly.
 static void check_nested_push_keep_value()
 {
     evbuffer *input;
-    abstract_protocol *protocol =
-        parse_two_resp3_kept_replies("%1\r\n*2\r\n>0\r\n%0\r\n+s\r\n$2\r\nab\r\n+OK\r\n", &input);
+    abstract_protocol *protocol = parse_two_resp3_kept_replies("%1\r\n*2\r\n>0\r\n%0\r\n$2\r\nab\r\n+OK\r\n", &input);
     protocol_response *r = protocol->get_response();
     check(r->get_mbulk_value() == NULL, "status reply after nested push has no mbulk tree");
     check(r->get_status() && strcmp(r->get_status(), "+OK") == 0, "status reply after nested push is +OK");
@@ -114,7 +211,7 @@ static void check_nested_push_keep_value()
 
     // Same, with a bulk second reply: it must be kept as the reply value, not
     // appended to the previous reply's freed aggregate.
-    protocol = parse_two_resp3_kept_replies("%1\r\n*2\r\n>0\r\n%0\r\n+s\r\n$2\r\nab\r\n$2\r\nhi\r\n", &input);
+    protocol = parse_two_resp3_kept_replies("%1\r\n*2\r\n>0\r\n%0\r\n$2\r\nab\r\n$2\r\nhi\r\n", &input);
     r = protocol->get_response();
     unsigned int len = 0;
     const char *value = r->get_value(&len);
@@ -124,7 +221,7 @@ static void check_nested_push_keep_value()
     evbuffer_free(input);
 
     // Same, with the first reply ending on a status rather than a bulk.
-    protocol = parse_two_resp3_kept_replies("%1\r\n*2\r\n>0\r\n%0\r\n+s\r\n+t\r\n$2\r\nhi\r\n", &input);
+    protocol = parse_two_resp3_kept_replies("%1\r\n*2\r\n>0\r\n%0\r\n+s\r\n$2\r\nhi\r\n", &input);
     r = protocol->get_response();
     value = r->get_value(&len);
     check(value && len == 2 && memcmp(value, "hi", 2) == 0,
@@ -133,7 +230,7 @@ static void check_nested_push_keep_value()
     evbuffer_free(input);
 
     // Same, with an aggregate second reply: it must start a new tree.
-    protocol = parse_two_resp3_kept_replies("%1\r\n*2\r\n>0\r\n%0\r\n+s\r\n$2\r\nab\r\n*1\r\n$2\r\nhi\r\n", &input);
+    protocol = parse_two_resp3_kept_replies("%1\r\n*2\r\n>0\r\n%0\r\n$2\r\nab\r\n*1\r\n$2\r\nhi\r\n", &input);
     r = protocol->get_response();
     mbulk_size_el *root = r->get_mbulk_value();
     check(root && root->upper_level == NULL && root->mbulks_elements.size() == 1,
@@ -148,5 +245,6 @@ int main()
     check_readonly(PROTOCOL_RESP2);
     check_readonly(PROTOCOL_RESP3);
     check_nested_push_keep_value();
+    check_nested_push_framing();
     return failures ? 1 : 0;
 }
