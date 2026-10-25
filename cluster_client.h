@@ -237,7 +237,8 @@ protected:
     bool connect_shard_connection(shard_connection *sc, char *address, char *port);
     void handle_moved(unsigned int conn_id);
     // Move staged monitor lines to the primary that owns their slot in the
-    // map just committed, keeping each owned slot's selection order.
+    // map just committed, keeping the selection order of each slot that had
+    // an owner whenever its lines were staged.
     void reroute_staged_monitor_commands();
     void update_redirect_stats(struct timeval timestamp, request *req, protocol_response *response, bool moved,
                                bool completed);

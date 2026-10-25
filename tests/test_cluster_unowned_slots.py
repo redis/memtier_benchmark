@@ -51,6 +51,12 @@ class _Node(socketserver.ThreadingTCPServer):
         self.errors = []
         self.lock = threading.Lock()
 
+    # Reply hooks, overridden by _Failover; set_reply=None takes the default path.
+    set_reply = None
+
+    def ping_reply(self, server):
+        return b"+PONG\r\n"
+
     def topology(self):
         root = self.root
         if root.slots_calls:
@@ -118,7 +124,7 @@ class _Handler(socketserver.StreamRequestHandler):
                         if reply is None:
                             return
                     elif verb == b"PING":
-                        reply = root.ping_reply(node) if hasattr(root, "ping_reply") else b"+PONG\r\n"
+                        reply = root.ping_reply(node)
                     elif verb in (b"READONLY", b"WATCH", b"DISCARD"):
                         if verb == b"READONLY":
                             time.sleep(node.readonly_delay)
@@ -137,7 +143,7 @@ class _Handler(socketserver.StreamRequestHandler):
                         )
                         multi = dirty = False
                         queued = []
-                    elif verb == b"SET" and getattr(root, "set_reply", None) is not None:
+                    elif verb == b"SET" and root.set_reply is not None:
                         reply = root.set_reply(node, args)
                     else:
                         assert verb in (b"SET", b"GET", b"MGET"), args

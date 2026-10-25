@@ -607,8 +607,10 @@ changing its role, so strict-secondary reads cannot drain on the new primary.
 This does not guarantee routed-key identity across replica redials or promotion.
 Selected monitor lines follow their slot instead: when a committed map moves the
 slot, drops the primary holding the line, or demotes it to a replica (including
-after a `-MOVED`), its unsent lines move to the slot's current primary, keeping
-each slot's selection order. A line already sent gets `-MOVED` and is resent only
+after a `-MOVED`), its unsent lines move to the slot's current primary. A slot
+that had an owner whenever its lines were staged keeps their selection order;
+lines staged while it had no owner can sit on different primaries, and then
+merge in connection order. A line already sent gets `-MOVED` and is resent only
 with `--retry-on-error`. A line whose new primary is down with no reconnect
 pending, or whose queue is full, is dropped: it no longer counts toward
 `--requests`, counts as an error, and is logged to `--failed-keys-file`.

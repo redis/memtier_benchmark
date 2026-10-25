@@ -2909,9 +2909,12 @@ void cluster_client::handle_moved(unsigned int conn_id)
 // as staged, the line would get -MOVED or land on a replica. Move it to the
 // slot's current primary instead, as hand_off_replay_requests() does for
 // held replays. It stays counted in m_reqs_generated, so the replay cursor
-// and --requests are unaffected. All of an owned slot's staged lines are on
-// one queue (the one this map's predecessor routed them to), and they move
-// together in order, so each slot keeps its selection order.
+// and --requests are unaffected. A slot that had an owner whenever its lines
+// were staged has them all on one queue (the one this map's predecessor routed
+// them to), and they move together in order, so it keeps its selection order.
+// Lines staged while their slot had no owner went to fallback_primary_conn_id(),
+// which can change between selections; once the slot has an owner they merge
+// in connection order instead.
 void cluster_client::reroute_staged_monitor_commands()
 {
     // Unowned lines stay on any primary of this map. Not by get_role(): a
@@ -2929,6 +2932,9 @@ void cluster_client::reroute_staged_monitor_commands()
         std::queue<staged_monitor_cmd> staged;
         std::swap(m_staged_monitor_commands[i], staged);
         for (; !staged.empty(); staged.pop()) {
+            // Only keyed lines are staged (create_monitor_request_cluster()), so
+            // the keyless UINT_MAX slot never gets here; it would be dropped.
+            assert(staged.front().slot != UINT_MAX);
             unsigned int target;
             if (slot_is_unowned(staged.front().slot)) {
                 // Any primary gives the server's routing response.
