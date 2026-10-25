@@ -41,8 +41,7 @@ jobs:
 
     - name: Install build dependencies
       run: |
-        sudo apt-get -qq update
-        sudo apt-get install -y \
+        ./utils/apt_install.sh -y \
           build-essential \
           autoconf \
           automake \
@@ -197,8 +196,7 @@ jobs:
 
     - name: Install dependencies
       run: |
-        sudo apt-get -qq update
-        sudo apt-get install -y pkg-config libevent-dev libssl-dev
+        ./utils/apt_install.sh -y pkg-config libevent-dev libssl-dev
 
     - name: Setup Python
       uses: actions/setup-python@v6
@@ -213,8 +211,7 @@ jobs:
       run: |
         curl -fsSL https://packages.redis.io/gpg | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
         echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/redis.list
-        sudo apt-get -qq update
-        sudo apt-get install redis
+        ./utils/apt_install.sh redis
         sudo service redis-server stop
 
     - name: Increase connection limit
