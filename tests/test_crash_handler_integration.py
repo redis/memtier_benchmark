@@ -428,21 +428,43 @@ def _tgkill(pid, tid, sig):
 _SYS_SLEEP = {"x86_64": (35, 230), "aarch64": (101, 115)}
 
 
-def _main_thread_sleeping(pid):
+def _main_thread_syscall(pid):
     """
-    True when the main thread of stopped process pid is in a nanosleep or
-    clock_nanosleep call made from libc. The sanitizer runtime makes its own
-    raw system calls, so the call must come from libc's code.
+    (system call number, pc) of the main thread of pid, from
+    /proc/<pid>/task/<pid>/syscall; None while it runs. The number is -1
+    when it is not in a system call.
     """
     try:
         with open(f"/proc/{pid}/task/{pid}/syscall") as f:
             fields = f.read().split()
-        number, pc = int(fields[0]), int(fields[-1], 16)
+        return int(fields[0]), int(fields[-1], 16)
     except PermissionError as e:
         # Reading it needs ptrace access; retrying would only time out.
         raise RuntimeError(f"cannot read the main thread's system call: {e}") from e
     except (OSError, ValueError, IndexError):
-        return False  # "running", or not in a system call ("-1 sp pc")
+        return None  # "running"
+
+
+def _main_thread_sleeping(pid, before=None):
+    """
+    True when the main thread of stopped process pid is in a nanosleep or
+    clock_nanosleep call made from libc. The sanitizer runtime makes its own
+    raw system calls, so the call must come from libc's code.
+
+    before is what _main_thread_syscall() read just before the SIGSTOP. arm64
+    clears the system call number before a group stop (do_signal() calls
+    forget_syscall() before get_signal()), so a thread stopped in a sleep
+    reads "-1 sp pc", with pc moved back to its svc instruction to restart
+    the call. So on arm64 a stop at the svc that before saw in a sleep
+    counts as that sleep.
+    """
+    current = _main_thread_syscall(pid)
+    if current is None:
+        return False
+    number, pc = current
+    if (number == -1 and platform.machine() == "aarch64" and before is not None
+            and pc == before[1] - 4):
+        number = before[0]
     if number not in _SYS_SLEEP.get(platform.machine(), ()):
         return False
     with open(f"/proc/{pid}/maps") as maps:
@@ -491,8 +513,9 @@ def _signal_tsan_main(pid, sig, timeout=10.0, while_stopped=None):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
+            before = _main_thread_syscall(pid)
             os.kill(pid, signal.SIGSTOP)
-            if _wait_stopped(pid) and _main_thread_sleeping(pid):
+            if _wait_stopped(pid) and _main_thread_sleeping(pid, before):
                 if while_stopped is not None:
                     while_stopped()
                 if not _tgkill(pid, pid, sig):
