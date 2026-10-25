@@ -194,6 +194,10 @@ public:
     void set_top_array_len(int len);
     int get_top_array_len(void);
 
+    // Reserves room for at most ELEM_HITS_RESERVE_MAX flags. n is the
+    // server-declared element count, so a larger reply grows the vector as its
+    // elements arrive. m_elem_hits keeps its capacity across replies.
+    static const size_t ELEM_HITS_RESERVE_MAX = 1024;
     void elem_hits_reserve(size_t n);
     void elem_hit_push(bool hit);
     const std::vector<uint8_t> &get_elem_hits(void);

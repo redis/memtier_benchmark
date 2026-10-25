@@ -155,6 +155,7 @@ int protocol_response::get_top_array_len(void)
 
 void protocol_response::elem_hits_reserve(size_t n)
 {
+    if (n > ELEM_HITS_RESERVE_MAX) n = ELEM_HITS_RESERVE_MAX;
     m_elem_hits.reserve(n);
 }
 
