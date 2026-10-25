@@ -66,7 +66,7 @@ jobs:
             workflow_dispatch) scope="${SCOPE:-full+canary}" ;;
             *)
               base="${PR_BASE:-$PUSH_BEFORE}"
-              harness='^(\.github/workflows/libevent-compat\.yml|scripts/(build-libevent|check-libevent-linkage|build-macos-libevent|check-macos-tls-links)\.sh|utils/(select_test_shard|check_test_shards)\.py)$'
+              harness='^(\.github/workflows/libevent-compat\.yml|scripts/(build-libevent|check-libevent-linkage|build-macos-libevent|check-macos-tls-links)\.sh|utils/(select_test_shard|check_test_shards)\.py|utils/install_test_requirements\.sh)$'
               if [[ -z "$base" || "$base" =~ ^0+$ ]] ||
                  ! changed="$(git diff --name-only "$base" HEAD)" ||
                  grep -Eq "$harness" <<<"$changed"; then
@@ -230,7 +230,7 @@ jobs:
 
       - name: Install Python dependencies
         if: matrix.topology != 'build'
-        run: pip install -r ./tests/test_requirements.txt
+        run: ./utils/install_test_requirements.sh
 
       # Same Redis source as ci.yml.
       - name: Install Redis
