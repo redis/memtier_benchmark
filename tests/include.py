@@ -256,7 +256,7 @@ def noauth_guard(test):
 
 def _install_noauth_guard():
     # include.py is imported while RLTest loads the test files, before any
-    # test starts; add_test_hook ignores a hook it already has.
+    # test starts; add_test_hook keeps one copy of a hook added again.
     try:
         from RLTest import add_test_hook
     except ImportError:
