@@ -902,6 +902,62 @@ static void check_awaiting_slots_redial()
               "the seed waits on its reconnect timer");
         client.handle_connection_given_up(2);
         check(client.staged_monitor_count(1) == 2, "a give-up keeps lines while the seed reconnects");
+        // Staging counts the waiting shard as a primary that will send, too.
+        client.primaries_with_hole(1, 2, staged_slot);
+        check(client.fallback_primary_conn_id() == 1, "the unowned fallback counts the waiting shard");
+    }
+    // The seed is down when the shard's timer fires: reconnect() redials the
+    // seed, and the shard waits on that refresh just the same.
+    {
+        client_group group(&config, protocol, &generator);
+        transaction_client client(&group);
+        client.route_slot_to_second_shard(protocol, staged_slot, owner_port.c_str());
+        client.dial_peer(protocol, seed_port.c_str());
+        client.refresh_over_seed(seed_port.c_str());
+        client.get_connections()[0]->disconnect();
+        client.get_connections()[1]->disconnect();
+        server_addr seed_addr("127.0.0.1", atoi(seed_port.c_str()), AF_INET);
+        config.server_addr = &seed_addr;
+        config.port = atoi(seed_port.c_str());
+        check(client.reconnect(1) == 1 && client.get_connections()[1]->is_awaiting_slots_redial(),
+              "seed down: the shard leaves its redial to the redialed seed");
+        check(client.get_connections()[0]->get_connection_state() != conn_disconnected,
+              "seed down: reconnect() redialed the seed");
+        client.stage_line(1, staged_slot);
+        client.stage_line(2, staged_slot);
+        client.get_connections()[2]->disconnect();
+        client.handle_connection_given_up(2);
+        check(client.staged_monitor_count(1) == 2, "seed down: a give-up keeps lines on the waiting shard");
+        commit(client, slots);
+        check(client.get_connections()[1]->get_connection_state() != conn_disconnected &&
+                  !client.get_connections()[1]->is_awaiting_slots_redial() && client.staged_monitor_count(1) == 2,
+              "seed down: the commit redials the shard and keeps its lines");
+        client.get_connections()[0]->disconnect();
+        config.server_addr = NULL;
+        config.port = 0;
+    }
+    // A primary waiting on its own reconnect timer (no mark) keeps its lines
+    // through a give-up elsewhere.
+    {
+        client_group group(&config, protocol, &generator);
+        transaction_client client(&group);
+        client.route_slot_to_second_shard(protocol, staged_slot, owner_port.c_str());
+        client.dial_peer(protocol, seed_port.c_str());
+        client.refresh_over_seed(seed_port.c_str());
+        config.reconnect_on_error = true;
+        config.max_reconnect_attempts = 5;
+        client.get_connections()[1]->attempt_reconnect("unit-test shard drop");
+        config.reconnect_on_error = false;
+        config.max_reconnect_attempts = 0;
+        check(client.get_connections()[1]->get_connection_state() == conn_disconnected &&
+                  client.get_connections()[1]->is_reconnect_pending() &&
+                  !client.get_connections()[1]->is_awaiting_slots_redial(),
+              "own timer: the shard waits on its own reconnect timer");
+        client.stage_line(1, staged_slot);
+        client.stage_line(2, staged_slot);
+        client.get_connections()[2]->disconnect();
+        client.handle_connection_given_up(2);
+        check(client.staged_monitor_count(1) == 2, "own timer: a give-up keeps lines on a reconnect-pending shard");
     }
     // A map that no longer lists the shard retires it: its lines move to the
     // slot's new primary.

@@ -228,7 +228,7 @@ public:
 
     const char *get_port() { return m_port; }
 
-    enum connection_state get_connection_state() { return m_connection_state; }
+    enum connection_state get_connection_state() const { return m_connection_state; }
     bool is_reconnect_pending() const { return m_reconnecting; }
     // cluster_client::reconnect() left this connection's redial to a SLOTS
     // refresh, so it has no reconnect timer but is not given up on.

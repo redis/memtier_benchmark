@@ -73,6 +73,10 @@ struct cluster_endpoint_info
     std::vector<std::pair<int, int> > slot_ranges; // contiguous [start,end] runs, primary-owned
 };
 
+// cluster_client::handle_response() asks for CLUSTER SLOTS after -CLUSTERDOWN
+// at most this often. tests/test_cluster_unowned_slots.py reads it.
+#define CLUSTERDOWN_REFRESH_INTERVAL_USEC 1000000
+
 class cluster_client : public client
 {
 public:
@@ -212,6 +216,10 @@ protected:
     unsigned int select_target_conn(unsigned int slot, bool is_read);
     bool slot_is_unowned(unsigned int slot) const;
     unsigned int fallback_primary_conn_id() const;
+    // Nothing will dial conn_id again: it is disconnected with no reconnect
+    // timer (attempt_reconnect() gave up on it), and its redial was not left
+    // to a SLOTS refresh (reconnect()). Out-of-range ids count as given up.
+    bool primary_given_up(unsigned int conn_id) const;
     bool check_unowned_slot(unsigned int slot, bool is_read);
     bool requires_replica(bool is_read) const;
 

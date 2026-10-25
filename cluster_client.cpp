@@ -515,20 +515,28 @@ bool cluster_client::slot_is_unowned(unsigned int slot) const
            m_slot_to_shard_group[slot] >= m_shard_groups.size();
 }
 
+bool cluster_client::primary_given_up(unsigned int conn_id) const
+{
+    if (conn_id >= m_connections.size()) return true;
+    const shard_connection *sc = m_connections[conn_id];
+    return sc->get_connection_state() == conn_disconnected && !sc->is_reconnect_pending() &&
+           !sc->is_awaiting_slots_redial();
+}
+
 unsigned int cluster_client::fallback_primary_conn_id() const
 {
     // Deliberately use the first connected primary: there is no owner to hash
     // to, and the server supplies the authoritative routing response.
     unsigned int pending = UINT_MAX;
-    // A shard reconnect timer hands the redial to a SLOTS refresh over the
-    // seed. The timer is already cleared while that reply is in flight.
+    // Unlike the re-route, staging also counts a primary given up on while
+    // the seed refreshes SLOTS: that refresh's commit redials every
+    // disconnected primary it lists, and re-routes the line if it does not.
     const bool refreshing = MAIN_CONNECTION->get_connection_state() != conn_disconnected &&
                             MAIN_CONNECTION->get_cluster_slots_state() != setup_done;
     for (const shard_group &group : m_shard_groups) {
         if (group.primary == NULL) continue;
         if (group.primary->get_connection_state() == conn_connected) return group.primary->get_id();
-        if (pending == UINT_MAX && (group.primary->get_connection_state() != conn_disconnected ||
-                                    group.primary->is_reconnect_pending() || refreshing)) {
+        if (pending == UINT_MAX && (!primary_given_up(group.primary->get_id()) || refreshing)) {
             pending = group.primary->get_id();
         }
     }
@@ -2941,15 +2949,10 @@ void cluster_client::reroute_staged_monitor_commands()
     for (const shard_group &group : m_shard_groups) {
         if (group.primary != NULL && group.primary->get_id() < primary.size()) primary[group.primary->get_id()] = true;
     }
-    // A primary left disconnected without a reconnect timer was given up on
-    // (see hand_off_replay_requests()): nothing would send a line there, not
-    // even one already queued on it. One whose redial was left to a SLOTS
-    // refresh is not: that refresh's map redials or retires it.
-    auto given_up = [this](unsigned int conn_id) {
-        return conn_id >= m_connections.size() ||
-               (m_connections[conn_id]->get_connection_state() == conn_disconnected &&
-                !m_connections[conn_id]->is_reconnect_pending() && !m_connections[conn_id]->is_awaiting_slots_redial());
-    };
+    // Nothing would send a line on a primary given up on, not even one
+    // already queued on it. One whose redial was left to a SLOTS refresh is
+    // not given up on: that refresh's map redials or retires it.
+    auto given_up = [this](unsigned int conn_id) { return primary_given_up(conn_id); };
     // An unowned line goes to a primary of this map that will send it:
     // connected first, then dialing or reconnect-pending. Not by
     // fallback_primary_conn_id(), which while the seed refreshes SLOTS also
@@ -2972,7 +2975,8 @@ void cluster_client::reroute_staged_monitor_commands()
         std::swap(m_staged_monitor_commands[i], staged);
         for (; !staged.empty(); staged.pop()) {
             // Only keyed lines are staged (create_monitor_request_cluster()), so
-            // the keyless UINT_MAX slot never gets here; it would be dropped.
+            // the keyless UINT_MAX slot never gets here; it would be dropped
+            // as unroutable.
             assert(staged.front().slot != UINT_MAX);
             unsigned int target;
             if (slot_is_unowned(staged.front().slot)) {
@@ -2982,7 +2986,10 @@ void cluster_client::reroute_staged_monitor_commands()
                 target = slot_primary_conn_id(staged.front().slot);
             }
             const char *drop_reason = NULL;
-            if (given_up(target)) {
+            if (staged.front().slot == UINT_MAX) {
+                // Not a failover: a staging bug, if the assert is compiled out.
+                drop_reason = "unroutable-monitor-line";
+            } else if (given_up(target)) {
                 drop_reason = "slot-owner-down-for-monitor-line";
             } else if (target != i && m_staged_monitor_commands[target].size() >= STAGED_MONITOR_QUEUE_MAX_SIZE) {
                 drop_reason = "staged-monitor-queue-full";
@@ -3238,15 +3245,15 @@ void cluster_client::hand_off_replay_requests(unsigned int conn_id)
             }
             if (target >= m_connections.size() || target == conn_id) {
                 drop_reason = "no-slot-owner-for-replay";
-            } else if (m_connections[target]->get_connection_state() == conn_disconnected &&
-                       !m_connections[target]->is_reconnect_pending()) {
+            } else if (primary_given_up(target)) {
                 // Every primary of the topology just committed is connected,
                 // connecting, or waiting on a reconnect timer: the refresh
                 // dials the ones without a timer, and a dial that fails
                 // schedules one. A primary left disconnected with no timer
                 // is one attempt_reconnect() gave up on (no
                 // --reconnect-on-error, or --max-reconnect-attempts reached),
-                // so nothing would replay the request.
+                // so nothing would replay the request. Having just been
+                // redialed, none is still awaiting a SLOTS redial.
                 drop_reason = "slot-owner-down-for-replay";
             }
         }
@@ -3351,7 +3358,11 @@ void cluster_client::handle_connection_given_up(unsigned int conn_id)
     // nothing sends from it now. The re-route drops those of its own slots
     // and moves the rest, so they don't keep a --requests run open. A dial
     // failing while handle_cluster_slots() parses a reply leaves that to its
-    // commit: the map in place is about to be replaced.
+    // commit: the map in place is about to be replaced. That holds for the
+    // main connection too: every dial in the parse is followed by that
+    // commit (see handle_cluster_slots()), whose node loop redials each
+    // disconnected primary it lists, clearing its awaiting mark, and whose
+    // retire loop clears the mark of each one it does not.
     if (m_parsing_slot_map) return;
     if (conn_id < m_connections.size()) m_connections[conn_id]->set_awaiting_slots_redial(false);
     bool reroute = conn_id < m_staged_monitor_commands.size() && !m_staged_monitor_commands[conn_id].empty();
@@ -3415,7 +3426,8 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
         // Like READONLY below, this recognizes Redis's simple-error form.
         static const char CLUSTERDOWN_MSG_PREFIX[] = "-CLUSTERDOWN ";
         if (strncmp(response->get_status(), CLUSTERDOWN_MSG_PREFIX, sizeof(CLUSTERDOWN_MSG_PREFIX) - 1) == 0 &&
-            (m_last_clusterdown_refresh.tv_sec == 0 || ts_diff(m_last_clusterdown_refresh, timestamp) >= 1000000) &&
+            (m_last_clusterdown_refresh.tv_sec == 0 ||
+             ts_diff(m_last_clusterdown_refresh, timestamp) >= CLUSTERDOWN_REFRESH_INTERVAL_USEC) &&
             m_connections[conn_id]->get_cluster_slots_state() == setup_done) {
             m_last_clusterdown_refresh = timestamp;
             m_connections[conn_id]->set_cluster_slots();
