@@ -996,6 +996,7 @@ def test_F16b_bind_failure_message(env):
         finally:
             _kill(proc)
         err = _drain(err_path)
+        shutil.rmtree(rd, ignore_errors=True)
         lines = [l for l in err.splitlines() if "failed to bind" in l]
         if addr == "::1" and not lines:
             continue  # ::1 bound on this host; nothing to check
@@ -1006,7 +1007,6 @@ def test_F16b_bind_failure_message(env):
                        message="IPv6 bind address not bracketed: {!r}".format(line))
         env.assertFalse(line.rstrip().endswith("Success"),
                         message="bind failure reported as Success: {!r}".format(line))
-        shutil.rmtree(rd, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
