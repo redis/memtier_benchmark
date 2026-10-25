@@ -2450,13 +2450,16 @@ void shard_connection::end_client_after_run(bool end_stats)
 }
 
 // Whether this client's other connections are done too, so it can be ended:
-// none has a reply pending, a reconnect pending, or requests held for replay
-// on a live connection. all_connections_idle() only checks the first: a
-// sibling (e.g. another cluster shard) whose own reconnect is due would be
-// torn down, and the requests it was to resend abandoned. Such a sibling ends
-// the client itself, on its last reply or through this check when its connect
-// fails. A disconnected sibling with no reconnect pending will never resend
-// what it holds, so it does not keep the client going. A connected sibling's
+// none has a reply pending, a connect in progress, a reconnect pending, or
+// requests held for replay on a live connection. all_connections_idle() only
+// checks the first: a sibling (e.g. another cluster shard) whose own reconnect
+// is due, or whose connect has started (connect() clears the pending
+// reconnect) but not completed, would be torn down before sending its setup,
+// so neither a rejected setup would fail the run (#630) nor the requests it
+// was to resend be sent. Such a sibling ends the client itself, on its last
+// reply or through this check when its connect fails (or times out, with
+// --connection-timeout). A disconnected sibling with no reconnect pending will
+// never resend what it holds, so it does not keep the client going. A connected sibling's
 // retry queue (--retry-on-error backoff) is not checked either: if the client
 // ends first, those requests are counted as abandoned by disconnect_all().
 bool shard_connection::siblings_done(void)
@@ -2465,7 +2468,8 @@ bool shard_connection::siblings_done(void)
     for (unsigned int i = 0; i < conns.size(); i++) {
         shard_connection *sc = conns[i];
         if (sc == NULL || sc == this) continue;
-        if (sc->get_pending_resp() > 0 || sc->is_reconnect_pending()) return false;
+        if (sc->get_pending_resp() > 0 || sc->is_reconnect_pending() || sc->get_connection_state() == conn_in_progress)
+            return false;
         if (sc->get_connection_state() != conn_disconnected && sc->has_requests_to_replay()) return false;
     }
     return true;

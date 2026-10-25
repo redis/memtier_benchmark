@@ -15,8 +15,14 @@ The peers are the scripted nodes of test_cluster_slots_bad_reply.
 """
 import json
 import os
+import socket
+import subprocess
+import sys
 import tempfile
+import threading
+import time
 
+from include import MEMTIER_BINARY
 from test_cluster_slots_bad_reply import _Node, _run
 
 _NO_PASSWORD = b"-ERR AUTH <password> called without any password configured for the default user\r\n"
@@ -297,3 +303,147 @@ def test_standalone_auth_rejected_on_some_connections_fails_run(env):
     env.assertEqual(returncode, 1, message=stderr[-2000:])
     env.assertContains("AUTH error and --reconnect-on-error is not set, ending this thread", stderr)
     env.assertLess(elapsed, 8)
+
+
+class _SlowRedialNode:
+    """One of two scripted cluster nodes (port 0) that RESP-serves every
+    connection it accepts. With a listen backlog of 0, pause() stops accepting
+    and fills the accept queue, so a new connect's SYN is dropped by the
+    kernel and that connect stays in progress until release()."""
+
+    def __init__(self, backlog, reject_auth_after_first=False):
+        self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(backlog)
+        self.listener.settimeout(0.05)
+        self.port = self.listener.getsockname()[1]
+        self.reject_auth_after_first = reject_auth_after_first
+        self.slots = b""
+        self.lock = threading.Lock()
+        self.accepted = 0
+        self.auths_after_first = 0
+        self.conns = []
+        self.fillers = []
+        self.paused = threading.Event()
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._accept, daemon=True)
+        self.thread.start()
+
+    def _accept(self):
+        while not self.stop.is_set():
+            if self.paused.is_set():
+                time.sleep(0.01)
+                continue
+            try:
+                conn, _ = self.listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            with self.lock:
+                self.accepted += 1
+                self.conns.append(conn)
+                index = self.accepted
+            threading.Thread(target=self._serve, args=(conn, index), daemon=True).start()
+
+    def _serve(self, conn, index):
+        reader = conn.makefile("rb")
+        try:
+            while True:
+                line = reader.readline()
+                if not line:
+                    return
+                args = []
+                for _ in range(int(line[1:])):
+                    length = int(reader.readline()[1:])
+                    args.append(reader.read(length + 2)[:-2])
+                verb = args[0].upper()
+                if verb == b"CLUSTER":
+                    reply = self.slots
+                elif verb == b"AUTH" and index > 1 and self.reject_auth_after_first:
+                    with self.lock:
+                        self.auths_after_first += 1
+                    reply = b"-WRONGPASS invalid username-password pair or user is disabled.\r\n"
+                else:
+                    reply = b"+OK\r\n"
+                conn.sendall(reply)
+        except (OSError, ValueError):
+            pass
+
+    def pause_and_drop(self):
+        self.paused.set()
+        time.sleep(0.1)
+        for _ in range(2):  # a backlog of 0 queues one connect: fill it
+            filler = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            filler.setblocking(False)
+            try:
+                filler.connect(("127.0.0.1", self.port))
+            except BlockingIOError:
+                pass
+            self.fillers.append(filler)
+        time.sleep(0.1)
+        with self.lock:
+            for conn in self.conns:
+                try:
+                    conn.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                conn.close()
+
+    def release(self):
+        while True:  # drain the fillers, so memtier's retransmitted SYN gets in
+            try:
+                conn, _ = self.listener.accept()
+            except (socket.timeout, OSError):
+                break
+            conn.close()
+        self.paused.clear()
+
+    def close(self):
+        self.stop.set()
+        self.thread.join(timeout=5)
+        for sock in self.fillers + [self.listener]:
+            sock.close()
+
+
+def test_rejected_setup_after_slow_redial_past_deadline_fails_run(env):
+    # Two primaries, each with half the slots. The second drops its
+    # connection at 1 s of a 3 s run, and its listen queue is then kept full
+    # until 3.5 s, so memtier's redial (connect() cleared the pending
+    # reconnect) is still in progress at the deadline, with nothing pending.
+    # The first connection, idle past its deadline, must not end the client
+    # then: once the connect completes, the redial's AUTH goes out, is
+    # rejected, and fails the run (#630).
+    if sys.platform != "linux":
+        env.skip()  # relies on Linux dropping the SYN when the accept queue is full
+    first = _SlowRedialNode(16)
+    second = _SlowRedialNode(0, reject_auth_after_first=True)
+    slots = b"*2\r\n"
+    for node, low, high in ((first, 0, 8191), (second, 8192, 16383)):
+        slots += b"*3\r\n:%d\r\n:%d\r\n*2\r\n$9\r\n127.0.0.1\r\n:%d\r\n" % (low, high, node.port)
+    first.slots = second.slots = slots
+    timer = threading.Timer(1.0, second.pause_and_drop)
+    releaser = threading.Timer(3.5, second.release)
+    args = [MEMTIER_BINARY, "--server=127.0.0.1", "--port={}".format(first.port), "--cluster-mode",
+            "--authenticate=pw", "--threads=1", "--clients=1", "--test-time=3", "--rate-limiting=50",
+            "--ratio=1:0", "--key-maximum=1000", "--reconnect-on-error", "--hide-histogram"]
+    start = time.time()
+    timer.start()
+    releaser.start()
+    try:
+        result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20, text=True)
+        returncode, stderr = result.returncode, result.stderr
+    except subprocess.TimeoutExpired as expired:
+        returncode, stderr = "timeout", expired.stderr or ""
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors="replace")
+    finally:
+        elapsed = time.time() - start
+        timer.cancel()
+        releaser.cancel()
+        first.close()
+        second.close()
+    env.assertEqual(second.auths_after_first, 1, message=stderr[-2000:])
+    env.assertEqual(returncode, 1, message=stderr[-2000:])
+    env.assertContains("authentication failed", stderr)
+    env.assertLess(elapsed, 10)

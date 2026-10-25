@@ -176,9 +176,10 @@ static void test_sibling_with_replay(const char *path)
 // Past its own deadline with nothing pending, a connection ends its client
 // in fill_pipeline() only once the client's other connections are done too
 // (siblings_done(), not all_connections_idle(), which counts pending replies
-// only): a sibling with a reconnect or slot map refresh due at the deadline
-// must still get to run it, so a rejected setup there fails the run (#630)
-// and a one-off slot error is retried (#666).
+// only): a sibling with a reconnect or slot map refresh due at the deadline,
+// or whose connect is still in progress, must still get to send its setup,
+// so a rejected setup there fails the run (#630) and a one-off slot error is
+// retried (#666).
 static void test_deadline_end_waits_for_busy_sibling(const char *path)
 {
 #ifndef _WIN32
@@ -247,6 +248,18 @@ static void test_deadline_end_waits_for_busy_sibling(const char *path)
         deferred_fill_pipeline_cb(-1, 0, &first);
         check(!manager.end_time_set(), "an idle connection past the deadline waits for a busy sibling");
         check(second.is_reconnect_pending(), "the sibling's reconnect is left alone");
+
+        // The reconnect timer fires: connect() clears the pending reconnect,
+        // and the connect stays in progress until the event loop delivers it
+        // (a slow TCP or TLS handshake). Nothing is pending or held.
+        second.set_address_port("127.0.0.1", "0");
+        check(second.connect(&endpoint) == 0, "the sibling's reconnect starts its connect");
+        check(!second.is_reconnect_pending() && second.get_connection_state() == conn_in_progress &&
+                  second.get_pending_resp() == 0,
+              "the sibling's connect is in progress, with no reconnect pending");
+        deferred_fill_pipeline_cb(-1, 0, &first);
+        check(!manager.end_time_set(), "an idle connection past the deadline waits for a sibling still connecting");
+        check(second.get_connection_state() == conn_in_progress, "the sibling's connect is left alone");
 
         second.disconnect();
         deferred_fill_pipeline_cb(-1, 0, &first);
