@@ -589,7 +589,7 @@ primary, preserving the key and letting Redis return its routing response.
 policy; they also trigger a topology refresh, including when a previously full
 map has become stale. Each client refreshes at most once per second, and while
 it receives only `CLUSTERDOWN` replies the gap between its refreshes doubles
-from 1 to 8 seconds; any other reply resets it to 1 second. Each client
+from 1 to 8 seconds; a successful reply resets it to 1 second. Each client
 maintains its own topology: for example, during sustained `CLUSTERDOWN`,
 `-t 8 -c 50` sends 400 refreshes when the outage starts and 400 more at 1, 3
 and 7 seconds, then 400 every 8 seconds (50 per second), in addition to initial

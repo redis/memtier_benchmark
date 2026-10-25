@@ -25,6 +25,16 @@
 
 static int failures = 0;
 
+// timeval's member types differ by platform (long on Windows, no
+// suseconds_t there), so build it by assignment rather than braces.
+static struct timeval tv(long long sec, long long usec)
+{
+    struct timeval t;
+    t.tv_sec = sec;
+    t.tv_usec = usec;
+    return t;
+}
+
 #define CHECK_MS(actual, expected)                                                                                     \
     do {                                                                                                               \
         double value = (actual);                                                                                       \
@@ -83,7 +93,7 @@ int main(void)
     // CLUSTERDOWN topology refreshes back off from 1 s to 8 s (#834).
     {
         clusterdown_refresh_backoff b;
-        struct timeval t = {1000, 0};
+        struct timeval t = tv(1000, 0);
         CHECK_MS(b.gap_us(), 1000000.0);
         CHECK_MS(b.due(t), 1.0); // the first refresh is immediate
         // Gaps after each refresh of a run: 1 s, 2 s, 4 s, then 8 s.
@@ -91,7 +101,7 @@ int main(void)
         for (unsigned int i = 0; i < sizeof(gaps) / sizeof(gaps[0]); i++) {
             b.refreshed(t);
             CHECK_MS(b.gap_us(), (double) gaps[i]);
-            struct timeval early = {t.tv_sec + (time_t) (gaps[i] / 1000000) - 1, 999999};
+            struct timeval early = tv(t.tv_sec + gaps[i] / 1000000 - 1, 999999);
             CHECK_MS(b.due(early), 0.0);
             t.tv_sec += (time_t) (gaps[i] / 1000000);
             CHECK_MS(b.due(t), 1.0);
@@ -104,9 +114,9 @@ int main(void)
         // Another reply ends the run, but the 1 s floor stays.
         b.reset();
         CHECK_MS(b.gap_us(), 1000000.0);
-        struct timeval soon = {t.tv_sec, 999999};
+        struct timeval soon = tv(t.tv_sec, 999999);
         CHECK_MS(b.due(soon), 0.0);
-        struct timeval later = {t.tv_sec + 1, 0};
+        struct timeval later = tv(t.tv_sec + 1, 0);
         CHECK_MS(b.due(later), 1.0);
         b.refreshed(later);
         CHECK_MS(b.gap_us(), 1000000.0);
@@ -119,7 +129,7 @@ int main(void)
         clusterdown_refresh_backoff b;
         int refreshes = 0;
         for (long long us = 0; us <= 60000000LL; us += 10000) {
-            struct timeval now = {(time_t) (100 + us / 1000000), (suseconds_t) (us % 1000000)};
+            struct timeval now = tv(100 + us / 1000000, us % 1000000);
             if (b.due(now)) {
                 b.refreshed(now);
                 refreshes++;

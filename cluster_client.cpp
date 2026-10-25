@@ -3288,13 +3288,14 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
     // CLUSTERDOWN has no MOVED destination. Even a previously full map can be
     // stale. Poll with a 1 s to 8 s backoff (#834), without flushing any staged
     // keys. Only workload replies get here, so the refresh's own CLUSTER SLOTS
-    // reply does not end the backoff; any other workload reply does. The setup
+    // reply does not end the backoff; a successful workload reply does (other
+    // errors, e.g. TRYAGAIN or LOADING during a failover, do not). The setup
     // ladder defers SLOTS while MULTI is open. Like READONLY below, this
     // recognizes Redis's simple-error form.
     static const char CLUSTERDOWN_MSG_PREFIX[] = "-CLUSTERDOWN ";
     const bool clusterdown = response->is_error() && strncmp(response->get_status(), CLUSTERDOWN_MSG_PREFIX,
                                                              sizeof(CLUSTERDOWN_MSG_PREFIX) - 1) == 0;
-    if (!clusterdown) m_clusterdown_refresh.reset();
+    if (!response->is_error()) m_clusterdown_refresh.reset();
 
     if (response->is_error()) {
         benchmark_debug_log("server %s handle response: %s\n", m_connections[conn_id]->get_readable_id(),

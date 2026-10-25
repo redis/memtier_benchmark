@@ -95,7 +95,7 @@ struct clusterdown_refresh_backoff
         if (streak < UINT_MAX) streak++;
     }
 
-    // Any other reply shows the cluster serves requests again.
+    // A successful reply shows the cluster serves requests again.
     void reset() { streak = 0; }
 };
 
