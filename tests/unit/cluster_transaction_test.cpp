@@ -34,9 +34,11 @@
 
 void benchmark_log_file_line(int, const char *, unsigned int, const char *, ...) {}
 void benchmark_log(int, const char *, ...) {}
+// check_refresh_reply_reroutes() lets a seed's SLOTS reply be rejected.
+static bool g_slots_rejection_expected = false;
 void report_connection_stage_failure(const char *)
 {
-    abort();
+    if (!g_slots_rejection_expected) abort();
 }
 void report_connection_stage_success()
 {
@@ -44,6 +46,7 @@ void report_connection_stage_success()
 }
 bool connection_stage_steady_state_reached()
 {
+    if (g_slots_rejection_expected) return false;
     abort();
 }
 
@@ -205,7 +208,11 @@ public:
         handle_connection_given_up(conn_id);
         m_parsing_slot_map = false;
     }
-    void own_slot(unsigned int slot, unsigned int group) { m_slot_to_shard_group[slot] = group; }
+    void pump()
+    {
+        event_base_loop(m_event_base, EVLOOP_NONBLOCK);
+        usleep(1000);
+    }
     // Run the event loop until conn_id's dial completes, then until its
     // deferred fill, if one was armed, has run.
     void finish_dial(unsigned int conn_id)
@@ -658,21 +665,28 @@ static void check_repin_routes_to_staged_owner(unsigned long long first_key)
     evutil_closesocket(listener);
 }
 
-// A dropped staged line is uncounted, so a producer that paused at the
-// --requests cap may produce again. Nothing else wakes it: its replies are in,
-// and a primary given up on wakes no peer.
-static void check_drop_wakes_producers(bool through_give_up_hook)
+static evutil_socket_t listen_any(std::string &port)
 {
     evutil_socket_t listener = socket(AF_INET, SOCK_STREAM, 0);
-    check(listener != static_cast<evutil_socket_t>(-1), "wake listener socket");
+    check(listener != static_cast<evutil_socket_t>(-1), "listener socket");
     sockaddr_in address = {};
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     socklen_t address_len = sizeof(address);
     check(bind(listener, (sockaddr *) &address, sizeof(address)) == 0 && listen(listener, 4) == 0 &&
               getsockname(listener, (sockaddr *) &address, &address_len) == 0,
-          "wake listener bound");
-    const std::string port = std::to_string(ntohs(address.sin_port));
+          "listener bound");
+    port = std::to_string(ntohs(address.sin_port));
+    return listener;
+}
+
+// A dropped staged line is uncounted, so a producer that paused at the
+// --requests cap may produce again. Nothing else wakes it: its replies are in,
+// and a primary given up on wakes no peer.
+static void check_drop_wakes_producers(bool through_give_up_hook)
+{
+    std::string port;
+    evutil_socket_t listener = listen_any(port);
 
     arbitrary_command_list commands;
     abstract_protocol *protocol = protocol_factory(PROTOCOL_REDIS_DEFAULT);
@@ -719,16 +733,8 @@ static void check_drop_wakes_producers(bool through_give_up_hook)
 // follow the reply's map, not the one it replaces.
 static void check_give_up_during_slots_parse()
 {
-    evutil_socket_t listener = socket(AF_INET, SOCK_STREAM, 0);
-    check(listener != static_cast<evutil_socket_t>(-1), "parse listener socket");
-    sockaddr_in address = {};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    socklen_t address_len = sizeof(address);
-    check(bind(listener, (sockaddr *) &address, sizeof(address)) == 0 && listen(listener, 4) == 0 &&
-              getsockname(listener, (sockaddr *) &address, &address_len) == 0,
-          "parse listener bound");
-    const std::string port = std::to_string(ntohs(address.sin_port));
+    std::string port;
+    evutil_socket_t listener = listen_any(port);
 
     arbitrary_command_list commands;
     abstract_protocol *protocol = protocol_factory(PROTOCOL_REDIS_DEFAULT);
@@ -786,18 +792,19 @@ static void check_give_up_during_slots_parse()
               "moved line stays counted and is not an error");
     }
 #endif
-    // The same without a real dial: the hook defers to the commit, which
-    // moves the line to the slot's new owner.
+    // A reply another connection asked for (after -MOVED) is parsed with no
+    // refresh of the main connection in flight: only the parse window keeps
+    // the give-up from re-routing by the map being replaced.
     {
         client_group group(&config, protocol, &generator);
         transaction_client client(&group);
-        given_up_owner(client);
+        client.route_slot_to_second_shard(protocol, staged_slot, port.c_str());
+        client.get_connections()[1]->disconnect();
+        client.stage_line(1, staged_slot);
+        check(client.get_connections()[0]->get_connection_state() == conn_disconnected,
+              "no main connection refresh is in flight");
         client.give_up_while_parsing(1);
         check(client.staged_monitor_count(1) == 1, "hook leaves lines to the commit while a reply is parsed");
-        client.own_slot(staged_slot, 0);
-        client.reroute_staged_monitor_commands();
-        check(client.staged_monitor_count(1) == 0 && client.staged_monitor_count(0) == 1,
-              "the commit moves the deferred line");
     }
     // A reply with no usable shard dials nothing and commits nothing; a
     // give-up after it re-routes once the rejection is handled.
@@ -807,9 +814,9 @@ static void check_give_up_during_slots_parse()
         given_up_owner(client);
         check(!client.handle_cluster_slots(0, parse("*1\r\n*1\r\n:0\r\n")), "malformed reply ignored");
         client.handle_connection_given_up(1);
-        client.handle_cluster_slots_rejected();
+        client.handle_cluster_slots_rejected(0);
         check(client.staged_monitor_count(1) == 0 && client.staged_monitor_count(0) == 0,
-              "hook re-routes after an uncommitted reply");
+              "the rejection re-routes a give-up left to it");
     }
     config.read_preference = rp_primary;
     delete reply;
@@ -817,21 +824,6 @@ static void check_give_up_during_slots_parse()
     evbuffer_free(output);
     delete protocol;
     evutil_closesocket(listener);
-}
-
-static evutil_socket_t listen_any(std::string &port)
-{
-    evutil_socket_t listener = socket(AF_INET, SOCK_STREAM, 0);
-    check(listener != static_cast<evutil_socket_t>(-1), "listener socket");
-    sockaddr_in address = {};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    socklen_t address_len = sizeof(address);
-    check(bind(listener, (sockaddr *) &address, sizeof(address)) == 0 && listen(listener, 4) == 0 &&
-              getsockname(listener, (sockaddr *) &address, &address_len) == 0,
-          "listener bound");
-    port = std::to_string(ntohs(address.sin_port));
-    return listener;
 }
 
 // A primary whose reconnect timer handed its redial to a SLOTS refresh is
@@ -864,11 +856,10 @@ static void check_give_up_during_refresh()
     // Slot 0 to the seed, every other slot to connection 1's node.
     const std::string slots = "*2\r\n*3\r\n:0\r\n:0\r\n*2\r\n$9\r\n127.0.0.1\r\n:" + seed_port +
                               "\r\n*3\r\n:1\r\n:16383\r\n*2\r\n$9\r\n127.0.0.1\r\n:" + owner_port + "\r\n";
-    {
-        client_group group(&config, protocol, &generator);
-        transaction_client client(&group);
-        // Connection 1 owns staged_slot and waits for the seed's refresh to
-        // redial it; connection 2 holds a line for the same slot.
+    // Connection 1 owns staged_slot and waits for the seed's refresh to
+    // redial it; connection 2 holds a line for the same slot and, if
+    // give_up, is given up on.
+    auto wait_on_refresh = [&](transaction_client &client, bool give_up) {
         client.route_slot_to_second_shard(protocol, staged_slot, owner_port.c_str());
         client.dial_peer(protocol, seed_port.c_str());
         client.refresh_over_seed(seed_port.c_str());
@@ -876,9 +867,14 @@ static void check_give_up_during_refresh()
         client.stage_line(1, staged_slot);
         client.stage_line(2, staged_slot);
         client.get_connections()[2]->disconnect();
-        const unsigned long long generated = client.get_reqs_generated();
+        if (give_up) client.handle_connection_given_up(2);
+    };
+    {
+        client_group group(&config, protocol, &generator);
+        transaction_client client(&group);
         const unsigned long long errors = client.get_stats()->get_total_errors();
-        client.handle_connection_given_up(2);
+        wait_on_refresh(client, true);
+        const unsigned long long generated = client.get_reqs_generated();
         check(client.staged_monitor_count(1) + client.staged_monitor_count(2) == 2,
               "a give-up during a refresh leaves lines for the commit");
         evbuffer_add(input, slots.data(), slots.size());
@@ -889,44 +885,67 @@ static void check_give_up_during_refresh()
         check(client.staged_monitor_count(1) == 2, "both lines wait on the redialed owner");
         check(client.get_reqs_generated() == generated && client.get_stats()->get_total_errors() == errors,
               "lines stay counted and are not errors");
+        // A stale flag would re-route here and drop them.
+        client.get_connections()[1]->disconnect();
+        client.handle_cluster_slots_rejected(0);
+        check(client.staged_monitor_count(1) == 2, "the commit used up the deferred re-route");
     }
     // If the refresh is rejected, nothing redials the owner: the lines are
     // dropped then, as the give-up would have dropped them.
     {
         client_group group(&config, protocol, &generator);
         transaction_client client(&group);
-        client.route_slot_to_second_shard(protocol, staged_slot, owner_port.c_str());
-        client.dial_peer(protocol, seed_port.c_str());
-        client.refresh_over_seed(seed_port.c_str());
-        client.get_connections()[1]->disconnect();
-        client.stage_line(1, staged_slot);
-        client.stage_line(2, staged_slot);
-        client.get_connections()[2]->disconnect();
+        wait_on_refresh(client, true);
         const unsigned long long generated = client.get_reqs_generated();
-        client.handle_connection_given_up(2);
-        client.handle_cluster_slots_rejected();
+        client.handle_cluster_slots_rejected(0);
         check(client.staged_monitor_count(1) + client.staged_monitor_count(2) == 0,
               "a rejected refresh drops the lines it left");
         check(client.get_reqs_generated() == generated - 2, "dropped lines are uncounted");
+        client.stage_line(1, staged_slot);
+        client.handle_cluster_slots_rejected(0);
+        check(client.staged_monitor_count(1) == 1, "the rejection used up the deferred re-route");
     }
-    // If the main connection is lost with the request, its own give-up, with
-    // nothing staged on it, runs the re-route left to the refresh.
+    // Another connection's rejected refresh (after -MOVED or CLUSTERDOWN)
+    // does not end the main connection's, which may still redial the owner.
     {
         client_group group(&config, protocol, &generator);
         transaction_client client(&group);
-        client.route_slot_to_second_shard(protocol, staged_slot, owner_port.c_str());
-        client.dial_peer(protocol, seed_port.c_str());
-        client.refresh_over_seed(seed_port.c_str());
-        client.get_connections()[1]->disconnect();
-        client.stage_line(1, staged_slot);
-        client.stage_line(2, staged_slot);
-        client.get_connections()[2]->disconnect();
-        client.handle_connection_given_up(2);
+        wait_on_refresh(client, true);
+        client.handle_cluster_slots_rejected(2);
+        check(client.staged_monitor_count(1) + client.staged_monitor_count(2) == 2,
+              "another connection's rejection leaves the lines to the main refresh");
+        client.handle_cluster_slots_rejected(0);
+        check(client.staged_monitor_count(1) + client.staged_monitor_count(2) == 0,
+              "the main connection's rejection still re-routes");
+    }
+    // A rejection with no give-up left to it re-routes nothing.
+    {
+        client_group group(&config, protocol, &generator);
+        transaction_client client(&group);
+        wait_on_refresh(client, false);
+        client.handle_cluster_slots_rejected(0);
+        check(client.staged_monitor_count(1) + client.staged_monitor_count(2) == 2,
+              "a rejection with nothing left to it keeps the lines");
+    }
+    // If the main connection is lost with the request, the next give-up runs
+    // the re-route left to the refresh, even with nothing staged on it (the
+    // main connection's own), and so does any connection's rejection.
+    for (int by_rejection = 0; by_rejection < 2; by_rejection++) {
+        client_group group(&config, protocol, &generator);
+        transaction_client client(&group);
+        wait_on_refresh(client, true);
         client.get_connections()[0]->disconnect();
         check(client.staged_monitor_count(0) == 0, "main connection holds no line");
-        client.handle_connection_given_up(0);
+        if (by_rejection) {
+            client.handle_cluster_slots_rejected(2);
+        } else {
+            client.handle_connection_given_up(0);
+        }
         check(client.staged_monitor_count(1) + client.staged_monitor_count(2) == 0,
-              "the main connection's give-up runs the re-route left to its refresh");
+              "a re-route left to a lost refresh runs at the next give-up or rejection");
+        client.stage_line(1, staged_slot);
+        client.handle_cluster_slots_rejected(2);
+        check(client.staged_monitor_count(1) == 1, "running it used up the deferred re-route");
     }
     delete reply;
     evbuffer_free(input);
@@ -935,6 +954,67 @@ static void check_give_up_during_refresh()
     evutil_closesocket(owner_listener);
     evutil_closesocket(seed_listener);
 }
+
+#ifndef _WIN32
+// The seed's real SLOTS reply is empty (`bad` "*0") or has no usable shard:
+// shard_connection hands either rejection to the re-route left to it.
+static void check_refresh_reply_reroutes(const std::string &bad)
+{
+    std::string seed_port, owner_port;
+    evutil_socket_t seed_listener = listen_any(seed_port);
+    evutil_socket_t owner_listener = listen_any(owner_port);
+    arbitrary_command_list commands;
+    abstract_protocol *protocol = protocol_factory(PROTOCOL_REDIS_DEFAULT);
+    make_transaction_commands(commands, protocol);
+    benchmark_config config = {};
+    make_transaction_config(config, commands);
+    config.transaction = false;
+    object_generator generator(commands.size());
+    generator.set_data_size_fixed(1);
+    generator.set_key_prefix("key-");
+    generator.set_key_range(1, 10);
+    const unsigned int staged_slot = key_slot("key-1");
+    {
+        client_group group(&config, protocol, &generator);
+        transaction_client client(&group);
+        client.route_slot_to_second_shard(protocol, staged_slot, owner_port.c_str());
+        client.dial_peer(protocol, seed_port.c_str());
+        client.refresh_over_seed(seed_port.c_str());
+        client.get_connections()[1]->disconnect();
+        client.stage_line(1, staged_slot);
+        client.stage_line(2, staged_slot);
+        client.get_connections()[2]->disconnect();
+        client.handle_connection_given_up(2);
+        client.finish_dial(0);
+        check(client.get_connections()[0]->get_cluster_slots_state() == setup_sent, "seed sent CLUSTER SLOTS");
+        // The first queued connection is connection 2's, closed above.
+        evutil_closesocket(accept(seed_listener, NULL, NULL));
+        evutil_socket_t peer = accept(seed_listener, NULL, NULL);
+        check(peer != static_cast<evutil_socket_t>(-1), "seed connection accepted");
+        std::string request;
+        for (int i = 0; i < 200 && request.find("SLOTS") == std::string::npos; i++) {
+            client.pump();
+            char buf[256];
+            const ssize_t got = recv(peer, buf, sizeof(buf), MSG_DONTWAIT);
+            if (got > 0) request.append(buf, got);
+        }
+        check(request.find("SLOTS") != std::string::npos, "seed's CLUSTER SLOTS arrived");
+        g_slots_rejection_expected = true;
+        check(send(peer, bad.data(), bad.size(), 0) == (ssize_t) bad.size(), "rejected reply sent");
+        for (int i = 0; i < 500 && client.staged_monitor_count(1) + client.staged_monitor_count(2) != 0; i++) {
+            client.pump();
+        }
+        check(client.staged_monitor_count(1) + client.staged_monitor_count(2) == 0,
+              "the seed's rejected reply runs the re-route left to it");
+        check(client.get_connections()[0]->get_cluster_slots_state() == setup_sent, "the seed asks again");
+        g_slots_rejection_expected = false;
+        evutil_closesocket(peer);
+    }
+    delete protocol;
+    evutil_closesocket(owner_listener);
+    evutil_closesocket(seed_listener);
+}
+#endif
 
 int main()
 {
@@ -951,6 +1031,10 @@ int main()
     check_drop_wakes_producers(true);
     check_give_up_during_slots_parse();
     check_give_up_during_refresh();
+#ifndef _WIN32
+    check_refresh_reply_reroutes("*0\r\n");
+    check_refresh_reply_reroutes("*1\r\n*1\r\n:0\r\n");
+#endif
     puts("transaction pin release tests passed");
     return 0;
 }

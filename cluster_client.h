@@ -148,7 +148,8 @@ protected:
     // committed yet; the commit re-routes staged monitor lines itself.
     bool m_parsing_slot_map;
     // Set when a connection was given up on while a SLOTS refresh was in
-    // flight; the refresh's commit, or its rejection, re-routes then.
+    // flight. The refresh's commit or its rejection re-routes then, or the
+    // next give-up once the main connection is gone.
     bool m_reroute_after_refresh;
     // Monotonic timestamp (CLOCK_MONOTONIC seconds) of the last "all replicas
     // unreachable under read-only workload" warning emitted from
@@ -335,7 +336,7 @@ public:
     virtual void handle_rate_limit_refill(unsigned int conn_id);
     virtual void handle_connection_disconnect(unsigned int conn_id);
     virtual void handle_connection_given_up(unsigned int conn_id);
-    virtual void handle_cluster_slots_rejected();
+    virtual void handle_cluster_slots_rejected(unsigned int conn_id);
     virtual bool is_transaction_pinned(unsigned int conn_id)
     {
         return m_config->transaction && m_txn_pinned_conn_id == (int) conn_id;

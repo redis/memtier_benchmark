@@ -509,7 +509,8 @@ bool cluster_client::slot_is_unowned(unsigned int slot) const
 bool cluster_client::slots_refresh_in_flight() const
 {
     // A shard reconnect timer hands the redial to a SLOTS refresh over the
-    // seed. The timer is already cleared while that reply is in flight.
+    // seed. The shard's reconnect timer is already freed while that reply is
+    // in flight.
     return MAIN_CONNECTION->get_connection_state() != conn_disconnected &&
            MAIN_CONNECTION->get_cluster_slots_state() != setup_done;
 }
@@ -3350,8 +3351,8 @@ void cluster_client::handle_connection_given_up(unsigned int conn_id)
     if (m_parsing_slot_map) return;
     // A re-route left to a refresh that was lost with the main connection
     // runs at the next give-up, which may be the main connection's own.
-    if (m_reroute_after_refresh ||
-        (conn_id < m_staged_monitor_commands.size() && !m_staged_monitor_commands[conn_id].empty())) {
+    const bool has_staged = conn_id < m_staged_monitor_commands.size() && !m_staged_monitor_commands[conn_id].empty();
+    if (m_reroute_after_refresh || has_staged) {
         // A primary whose reconnect timer handed its redial to the refresh in
         // flight looks given up on until that reply comes: wait for it.
         if (slots_refresh_in_flight()) {
@@ -3363,10 +3364,13 @@ void cluster_client::handle_connection_given_up(unsigned int conn_id)
     }
 }
 
-void cluster_client::handle_cluster_slots_rejected()
+void cluster_client::handle_cluster_slots_rejected(unsigned int conn_id)
 {
-    // No map came to redial anyone: re-route as the give-up would have.
+    // No map came to redial anyone: re-route as the give-up would have. A
+    // refresh another connection asked for does not end the main
+    // connection's, which may still redial the waiting primaries.
     if (!m_reroute_after_refresh) return;
+    if (conn_id != MAIN_CONNECTION->get_id() && slots_refresh_in_flight()) return;
     m_reroute_after_refresh = false;
     reroute_staged_monitor_commands();
 }
