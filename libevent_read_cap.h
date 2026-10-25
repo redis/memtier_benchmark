@@ -101,6 +101,9 @@ static inline void read_past_libevent_cap(struct evbuffer *input, evutil_socket_
     // it reads into it (bufferevent_readcb); do the same around this read.
     evbuffer_unfreeze(input, 0);
     if (evbuffer_reserve_space(input, queued, &vec, 1) == 1) {
+        // FIONREAD reported queued data, which a socket returns before any
+        // pending error; should recv() still fail, commit nothing and leave
+        // the error for libevent's next read.
         ssize_t n = recv(fd, vec.iov_base, queued, 0);
         vec.iov_len = n > 0 ? (size_t) n : 0;
         // Committing the single vector just reserved cannot fail. If it
