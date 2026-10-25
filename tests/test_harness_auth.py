@@ -2,7 +2,6 @@
 from types import SimpleNamespace
 
 import redis
-from RLTest import loader
 
 from include import (allow_noauth, bounded_client, env_password, memtier_auth_args,
                      noauth_guard, shutdown_nosave)
@@ -192,12 +191,15 @@ def test_noauth_guard_wraps_tests_whose_first_parameter_is_env(env):
     env.assertTrue(noauth_guard(no_env) is no_env)
 
 
-def test_guard_is_installed_in_loader(env):
-    """RLTest's loader wraps every test it resolves (the guard is really on)."""
-    env.assertTrue(getattr(loader.TestFunction, "_noauth_guard", False))
-    test = loader.TestFunction(__file__, "test_guard_is_installed_in_loader", "test_harness_auth")
-    test.initialize()
-    env.assertTrue(getattr(test.target, "_noauth_guarded", False))
+def test_guard_is_installed_in_rltest(env):
+    """RLTest runs every function test through the guard (it is really on)."""
+    from RLTest.test_hooks import run_with_hooks
+
+    def leaves_noauth(fake):
+        fake.envRunner.shards[0].noauth += 1
+    fake = _Env(_PW, [_Server()])
+    run_with_hooks(leaves_noauth, fake)
+    env.assertEqual(len(fake.failures), 1, message=repr(fake.failures))
 
 
 class _ShutdownConn:

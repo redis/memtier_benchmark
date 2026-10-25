@@ -1,3 +1,4 @@
+import contextlib
 import functools
 import glob
 import inspect
@@ -204,13 +205,40 @@ def _check_noauth(env, before):
             ).format(label, new))
 
 
+@contextlib.contextmanager
+def noauth_check(env, test):
+    """
+    RLTest test hook: fail `test` if any of the env's servers answered a
+    request -NOAUTH while it ran, unless the env has no password or the test
+    is marked @allow_noauth.
+    """
+    if getattr(test, NOAUTH_GUARD_ATTR, None) or not env_password(env):
+        yield
+        return
+    before, errors = _read_noauth(env)
+    # Never pass without checking: no readable server means the guard
+    # cannot see NOAUTH at all (RLTest drift, or a password mismatch).
+    if not before:
+        env.assertTrue(False, message=(
+            "NOAUTH guard: could not read INFO errorstats from any of the env's "
+            "servers before the test, so NOAUTH replies would go unseen (#842): "
+            "{}".format("; ".join("{}: {}".format(label, error)
+                                  for label, error in sorted(errors.items())) or "no servers")))
+    try:
+        yield
+    finally:
+        if before:
+            _check_noauth(env, before)
+
+
 def noauth_guard(test):
     """
-    Wrap an RLTest function test that takes the env in the NOAUTH check. As
-    RLTest does, any test with a positional parameter gets the env as its
-    first argument, whatever the name; extra parameters keep their defaults.
+    Wrap an RLTest function test that takes the env in noauth_check, as the
+    RLTest hook does. As RLTest does, any test with a positional parameter
+    gets the env as its first argument, whatever the name; extra parameters
+    keep their defaults.
     """
-    if getattr(test, NOAUTH_GUARD_ATTR, None) or getattr(test, "_noauth_guarded", False):
+    if getattr(test, NOAUTH_GUARD_ATTR, None):
         return test
     try:
         args = inspect.getfullargspec(test).args
@@ -221,45 +249,19 @@ def noauth_guard(test):
 
     @functools.wraps(test)
     def guarded(env):
-        if not env_password(env):
+        with noauth_check(env, test):
             return test(env)
-        before, errors = _read_noauth(env)
-        # Never pass without checking: no readable server means the guard
-        # cannot see NOAUTH at all (RLTest drift, or a password mismatch).
-        if not before:
-            env.assertTrue(False, message=(
-                "NOAUTH guard: could not read INFO errorstats from any of the env's "
-                "servers before the test, so NOAUTH replies would go unseen (#842): "
-                "{}".format("; ".join("{}: {}".format(label, error)
-                                      for label, error in sorted(errors.items())) or "no servers")))
-        try:
-            return test(env)
-        finally:
-            if before:
-                _check_noauth(env, before)
-    guarded._noauth_guarded = True
     return guarded
 
 
 def _install_noauth_guard():
-    # RLTest has no per-test hook for function tests, so wrap the target that
-    # its loader resolves just before each test runs. include.py is imported
-    # while RLTest discovers the test files, before any test starts, and
-    # RLTest forks its --parallelism workers after that.
+    # include.py is imported while RLTest loads the test files, before any
+    # test starts; add_test_hook ignores a hook it already has.
     try:
-        from RLTest import loader
+        from RLTest import add_test_hook
     except ImportError:
         return
-    test_function = loader.TestFunction
-    if getattr(test_function, "_noauth_guard", False):
-        return
-    initialize = test_function.initialize
-
-    def guarded_initialize(self):
-        initialize(self)
-        self.target = noauth_guard(self.target)
-    test_function.initialize = guarded_initialize
-    test_function._noauth_guard = True
+    add_test_hook(noauth_check)
 
 
 _install_noauth_guard()
