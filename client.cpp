@@ -390,7 +390,24 @@ void client::set_end_time()
     if (!m_end_set) {
         benchmark_debug_log("nothing else to do, test is finished.\n");
 
-        set_end_time_at(NULL);
+        // A --test-time client that sent workload but never had a reply takes
+        // part in the duration average (#819), yet has no op past its
+        // deadline to account for: end it there, not at a post-deadline
+        // reconnect or at its thread's end (#867). A client with replies ends
+        // now, as the time past its deadline may cover replies it drained.
+        struct timeval now, deadline;
+        gettimeofday(&now, NULL);
+        if (m_config->test_time > 0 && m_reqs_answered == 0 && has_submitted_workload() && m_stats.has_started()) {
+            deadline = m_stats.get_start_time();
+            // As in set_end_time_interrupted(): only construct a deadline
+            // that lies before now, so a large test time cannot overflow.
+            if (ts_diff(deadline, now) > (long long) m_config->test_time * 1000000) {
+                deadline.tv_sec = (long long) deadline.tv_sec + m_config->test_time;
+                set_end_time_at(&deadline);
+                return;
+            }
+        }
+        set_end_time_at(&now);
     }
 }
 
