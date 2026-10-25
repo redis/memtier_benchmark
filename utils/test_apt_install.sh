@@ -60,6 +60,7 @@ run() {
     echo "deb https://packages.redis.io/deb noble main" > "$work/sources/redis.list"
     if [ "${WITH_DEB822:-0}" = 1 ]; then
         echo "URIs: https://packages.microsoft.com/ubuntu/24.04/prod" > "$work/sources/microsoft-prod.sources"
+        printf 'Types: deb\nURIs: https://packages.microsoft.com/repos/azure-cli/\nSuites: noble\n' > "$work/sources/azure-cli.sources"
     fi
     [ "${READONLY_SOURCES:-0}" = 1 ] && chmod a-w "$work/sources"
     : > "$work/calls"
@@ -123,10 +124,12 @@ unset STUB_UPDATE_FAILS_FROM
 STUB_INSTALL_FAILS=0
 
 WITH_DEB822=1
-run "a deb822 microsoft-prod.sources is disabled too" 0 -y pkg-a
+run "deb822 and differently named Microsoft sources are disabled too" 0 -y pkg-a
 expect_disabled
 [ ! -e "$work/sources/microsoft-prod.sources" ] && [ -e "$work/sources/microsoft-prod.sources.disabled" ] ||
     fail "microsoft-prod.sources was not disabled"
+[ ! -e "$work/sources/azure-cli.sources" ] && [ -e "$work/sources/azure-cli.sources.disabled" ] ||
+    fail "azure-cli.sources, another packages.microsoft.com source, was not disabled"
 WITH_DEB822=0
 
 # Root ignores the directory's permissions, so this case needs a normal user.

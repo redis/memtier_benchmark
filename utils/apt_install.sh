@@ -3,7 +3,7 @@
 #
 #   utils/apt_install.sh [--no-update] [apt-get install options] package...
 #
-# 1. Disable the GitHub runner's packages.microsoft.com source, which memtier
+# 1. Disable the GitHub runner's packages.microsoft.com sources, which memtier
 #    never installs from: when it answers 403, apt-get update exits 100 and
 #    fails the job (#866). Other sources, such as packages.redis.io, stay.
 # 2. Run apt-get -qq update (skipped with --no-update), then apt-get install
@@ -38,10 +38,11 @@ if [ $# -eq 0 ]; then
 fi
 
 # packages-microsoft-prod.deb installs microsoft-prod.list on the Ubuntu
-# 22.04 and 24.04 images; also cover a deb822 .sources variant. apt skips
-# *.disabled files without a warning.
-for f in "$sources_dir/microsoft-prod.list" "$sources_dir/microsoft-prod.sources"; do
-    if [ -e "$f" ]; then
+# 22.04 and 24.04 images. Disable every one-line (.list) or deb822 (.sources)
+# file that names packages.microsoft.com, whatever its name, such as one an
+# azure-cli install leaves. apt skips *.disabled files without a warning.
+for f in "$sources_dir"/*.list "$sources_dir"/*.sources; do
+    if [ -f "$f" ] && grep -q 'packages\.microsoft\.com' "$f"; then
         $sudo mv "$f" "$f.disabled" || exit 1
         echo "apt_install: disabled unused source $f" >&2
     fi
