@@ -30,6 +30,7 @@
 #include <string>
 #include <event2/buffer.h>
 #include "cluster_client.h"
+#include "retry_policy.h"
 
 void benchmark_log_file_line(int, const char *, unsigned int, const char *, ...) {}
 void benchmark_log(int, const char *, ...) {}
@@ -479,7 +480,8 @@ static void check_repin_routes_to_staged_owner(unsigned long long first_key)
               "disconnected seed is not a pending topology refresh");
     }
     // A staged line whose slot moved to a primary that was given up on is
-    // dropped and uncounted when the map is committed.
+    // dropped when the map is committed: uncounted, counted as an error and
+    // logged to --failed-keys-file.
     {
         client_group group(&config, protocol, &generator);
         transaction_client client(&group);
@@ -487,11 +489,24 @@ static void check_repin_routes_to_staged_owner(unsigned long long first_key)
         client.get_connections()[1]->disconnect();
         check(!client.get_connections()[1]->is_reconnect_pending(), "second shard was given up on");
         const unsigned long long generated = client.get_reqs_generated();
+        const unsigned long long errors = client.get_stats()->get_total_errors();
+        const std::string failed_keys = "cluster_transaction_failed_keys." + std::to_string(getpid()) + ".csv";
+        check(global_failed_keys_logger().open(failed_keys.c_str()), "open failed-keys file");
         client.stage_line(0, staged_slot);
         client.reroute_staged_monitor_commands();
+        check(global_failed_keys_logger().close() == 0, "close failed-keys file");
+        char header[64] = "", record[256] = "";
+        FILE *fp = fopen(failed_keys.c_str(), "r");
+        const bool logged = fp != NULL && fgets(header, sizeof(header), fp) && fgets(record, sizeof(record), fp);
+        if (fp != NULL) fclose(fp);
+        unlink(failed_keys.c_str());
         check(client.staged_monitor_count(0) == 0 && client.staged_monitor_count(1) == 0,
               "line for a given-up primary is dropped");
         check(client.get_reqs_generated() == generated, "dropped line is uncounted");
+        check(client.get_stats()->get_total_errors() == errors + 1, "dropped line counts as an error");
+        check(logged, "failed-keys file has a record");
+        check(strstr(record, ",ARBITRARY,\"unit-key\",\"slot-owner-down-for-monitor-line\",0\n") != NULL,
+              "dropped line is logged to --failed-keys-file");
     }
     delete protocol;
     evutil_closesocket(listener);

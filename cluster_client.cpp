@@ -2953,7 +2953,9 @@ void cluster_client::reroute_staged_monitor_commands()
                     const std::string key = args.size() >= 2 ? args[1].data : std::string();
                     struct timeval now;
                     gettimeofday(&now, NULL);
-                    global_failed_keys_logger().log_failure(now, "MONITOR", key.c_str(), key.size(), drop_reason, 0);
+                    // Labeled like the same line failing after it is sent.
+                    global_failed_keys_logger().log_failure(now, request_type_to_name(rt_arbitrary), key.c_str(),
+                                                            key.size(), drop_reason, 0);
                     dropped++;
                     continue;
                 }
@@ -2965,7 +2967,9 @@ void cluster_client::reroute_staged_monitor_commands()
     // Dropped lines are never sent: uncount them and count them as errors,
     // as hand_off_replay_requests() does.
     if (dropped) {
-        benchmark_error_log("warning: dropped %llu staged monitor line(s) that no primary can send.\n", dropped);
+        benchmark_error_log("warning: dropped %llu staged monitor line(s): their slot's primary was given up on or "
+                            "its queue is full.\n",
+                            dropped);
         abandon_requests(dropped);
     }
     for (unsigned int target : woken) {
