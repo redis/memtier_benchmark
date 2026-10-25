@@ -309,6 +309,8 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_setup_failed_since_reply(false),
         m_slots_rejected(false),
         m_slots_retried_after_run_over(false),
+        m_reconnect_deadline(),
+        m_fired_reconnect_deadline(),
         m_connection_timeout_timer(NULL),
         m_unix_connect_timer(NULL),
 #ifdef _WIN32
@@ -2322,10 +2324,14 @@ bool shard_connection::run_deadline(struct timeval *deadline)
 // Within 1 ms of the deadline counts as passed: the reconnect timer armed for
 // it runs on libevent's monotonic clock and can fire a hair early by this wall
 // clock, which would otherwise re-arm near-zero delays until it catches up.
+// On Linux libevent times it with a coarse clock, so it can fire a whole tick
+// (1-4 ms) early: once a reconnect armed for the deadline has fired, that
+// deadline has passed, whatever this wall clock says (#852).
 bool shard_connection::run_deadline_passed(void)
 {
     struct timeval deadline, now, slack = {0, 1000};
     if (!run_deadline(&deadline)) return false;
+    if (m_fired_reconnect_deadline.tv_sec && !timercmp(&m_fired_reconnect_deadline, &deadline, <)) return true;
     gettimeofday(&now, NULL);
     evutil_timeradd(&now, &slack, &now);
     return !timercmp(&now, &deadline, <);
@@ -2353,6 +2359,7 @@ double shard_connection::next_reconnect_delay(void)
 {
     double delay = m_current_backoff_delay;
     struct timeval deadline, now;
+    m_reconnect_deadline.tv_sec = m_reconnect_deadline.tv_usec = 0;
     // Only with unlimited attempts: a finite --max-reconnect-attempts keeps
     // its backoff schedule, which bounds the run as before (#656).
     if (stops_at_deadline() && run_deadline(&deadline)) {
@@ -2362,7 +2369,12 @@ double shard_connection::next_reconnect_delay(void)
         if (event_base_gettimeofday_cached(m_event_base, &now) < 0) gettimeofday(&now, NULL);
         double left = (deadline.tv_sec - now.tv_sec) + (deadline.tv_usec - now.tv_usec) / 1000000.0;
         if (left < 0) left = 0;
-        if (left < delay) delay = left;
+        // The caller arms the reconnect timer with this delay: remember the
+        // deadline it is due at (run_deadline_passed()).
+        if (left < delay) {
+            delay = left;
+            m_reconnect_deadline = deadline;
+        }
     }
     return delay;
 }
@@ -2621,6 +2633,7 @@ void shard_connection::handle_reconnect_timer_event()
     }
 
     m_reconnecting = false;
+    if (m_reconnect_deadline.tv_sec) m_fired_reconnect_deadline = m_reconnect_deadline;
 
     // The server rejected a setup step on the last connection and the run's
     // time is up: stop retrying. With unlimited attempts the setup would keep
