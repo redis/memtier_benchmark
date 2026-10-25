@@ -2247,6 +2247,7 @@ void shard_connection::attempt_reconnect(const char *error_context)
         m_reconnect_timer = event_new(m_event_base, -1, 0, cluster_client_reconnect_timer_handler, (void *) this);
         if (m_reconnect_timer == NULL) {
             benchmark_error_log("error: event_new failed in attempt_reconnect\n");
+            m_reconnect_deadline.tv_sec = m_reconnect_deadline.tv_usec = 0;
             // Roll back the bookkeeping so the next attempt does not
             // count an attempt that never armed, and leave m_reconnecting
             // false so a subsequent error can re-enter this path. Break
@@ -2707,6 +2708,7 @@ void shard_connection::handle_reconnect_timer_event()
             m_reconnect_timer = event_new(m_event_base, -1, 0, cluster_client_reconnect_timer_handler, (void *) this);
             if (m_reconnect_timer == NULL) {
                 benchmark_error_log("error: event_new failed in handle_reconnect_timer_event retry path\n");
+                m_reconnect_deadline.tv_sec = m_reconnect_deadline.tv_usec = 0;
                 // Roll back the bookkeeping so the next attempt does not
                 // count an attempt that never armed, and leave m_reconnecting
                 // false so a subsequent error can re-enter this path. Break
