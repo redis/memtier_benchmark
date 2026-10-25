@@ -17,12 +17,12 @@ a reply; this covers the one that had some.
 - "late": with --pipeline=2, B's held SET is answered past its deadline, then
   the one behind it is held and B is closed. B ends at that late reply: the
   time spent draining it counts, the idle time after it does not.
-- "split": two shards, with B's keys alternating between them. The first
-  shard's connection is closed and its reconnect's AUTH held past the
-  deadline, while B's next SET on the second shard is answered past the
-  deadline. B ends from the first shard once its setup completes, at the late
-  reply on the second: the last reply is the client's, whichever shard it came
-  on, and a setup reply is not one.
+- "split": two shards, with B's keys alternating between them. B's next SET
+  on the first shard closes that connection, and its reconnect's AUTH is held
+  past the deadline. Only then is B's next SET on the second shard held, and
+  answered past the deadline. B ends from the first shard once its setup
+  completes, at the late reply on the second: the last reply is the client's,
+  whichever shard it came on, and a setup reply is not one.
 
 The peer sets the pace: it holds and closes B relative to A's close, so the
 timing is past the deadline however slowly memtier starts. No SIGINT is sent.
@@ -158,7 +158,13 @@ class _Handler(socketserver.StreamRequestHandler):
                         if port == peer.ports[0] or peer.b_late:
                             peer.b_dropped = True
                             return
-                        peer.answer_late()
+                        # Hold nothing on the second shard before the first is
+                        # closed: the held SET and a key queued behind it can
+                        # fill B's in-flight budget (--pipeline times its 2
+                        # connections), and B then sends nothing more on the
+                        # first shard before its deadline.
+                        if peer.b_dropped:
+                            peer.answer_late()
                     elif peer.mode in ("stalled", "late") and peer.b_replies >= _ANSWERED:
                         if peer.mode == "late" and peer.b_late == 0:
                             peer.answer_late()
