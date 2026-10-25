@@ -497,5 +497,6 @@ def test_transaction_moved_warning_printed_once(env):
     returncode, stderr, _ = _run(node, ["--transaction", "--command=MULTI", "--command=SET __key__ __data__",
                                         "--command=EXEC", "--requests=300"])
     env.assertEqual(node.errors, [])
+    env.assertEqual(returncode, 0, message=stderr[-2000:])
     env.assertGreater(node.data_requests, 30, message=stderr[-2000:])
     env.assertEqual(stderr.count("received MOVED mid-rotation"), 1, message=stderr[-2000:])

@@ -121,10 +121,12 @@ uint32_t calc_hslot_crc16_cluster(const char *str, size_t length)
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// The --transaction pin warnings below are printed once per process: a slot
+// Each --transaction pin warning below is printed once per process: a slot
 // migration interrupts a rotation every few milliseconds, and the MOVED and
-// ASK counts are already in the stats (#649).
-static std::atomic<bool> g_txn_pin_warned(false);
+// ASK counts are already in the stats (#649). Only the message is limited.
+static std::atomic<bool> g_txn_pin_disconnect_warned(false);
+static std::atomic<bool> g_txn_pin_moved_warned(false);
+static std::atomic<bool> g_txn_pin_ask_warned(false);
 
 cluster_client::cluster_client(client_group *group) :
         client(group),
@@ -1603,12 +1605,13 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
     if (run_failed()) return true;
 
     if (m_connections[conn_id]->get_connection_state() == conn_disconnected) {
-        if (m_config->transaction && m_txn_pinned_conn_id == (int) conn_id && !m_txn_pin_lost_warned &&
-            !g_txn_pin_warned.exchange(true)) {
+        if (m_config->transaction && m_txn_pinned_conn_id == (int) conn_id && !m_txn_pin_lost_warned) {
             m_txn_pin_lost_warned = true;
-            benchmark_error_log("warning: --transaction pin connection (id=%u) disconnected mid-rotation; "
-                                "transaction stats for the interrupted rotation will be inaccurate (reported once).\n",
-                                conn_id);
+            if (!g_txn_pin_disconnect_warned.exchange(true))
+                benchmark_error_log("warning: --transaction pin connection (id=%u) disconnected mid-rotation; "
+                                    "transaction stats for interrupted rotations will be inaccurate (reported "
+                                    "once).\n",
+                                    conn_id);
             // Release the pin so non-pin connections can resume the rotation.
             txn_release_pin();
             for (size_t i = 0; i < m_connections.size(); i++) {
@@ -3415,11 +3418,10 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
             // dropped command is never retried elsewhere (no block split).
             if (m_config->transaction) {
                 if ((int) conn_id == m_txn_pinned_conn_id) {
-                    if (!m_txn_pin_lost_warned && !g_txn_pin_warned.exchange(true)) {
-                        m_txn_pin_lost_warned = true;
+                    if (!g_txn_pin_moved_warned.exchange(true)) {
                         benchmark_error_log("warning: --transaction pin connection (id=%u) received MOVED "
                                             "mid-rotation; topology changed; transaction stats for the "
-                                            "interrupted rotation will be inaccurate (reported once).\n",
+                                            "interrupted rotations will be inaccurate (reported once).\n",
                                             conn_id);
                     }
                     // Inside an open MULTI the server rejected the command
@@ -3458,11 +3460,10 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
             bool retried = false;
             if (m_config->transaction) {
                 if ((int) conn_id == m_txn_pinned_conn_id) {
-                    if (!m_txn_pin_lost_warned && !g_txn_pin_warned.exchange(true)) {
-                        m_txn_pin_lost_warned = true;
+                    if (!g_txn_pin_ask_warned.exchange(true)) {
                         benchmark_error_log("warning: --transaction pin connection (id=%u) received ASK "
                                             "mid-rotation; topology changed; transaction stats for the "
-                                            "interrupted rotation will be inaccurate (reported once).\n",
+                                            "interrupted rotations will be inaccurate (reported once).\n",
                                             conn_id);
                     }
                     // Inside an open MULTI the server rejected the command
