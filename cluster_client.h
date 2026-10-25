@@ -144,6 +144,9 @@ protected:
     // attempt fails because no replica is available yet.
     unsigned int m_strict_no_route_attempts;
     struct timeval m_last_clusterdown_refresh;
+    // Set while handle_cluster_slots() dials the nodes of a reply it has not
+    // committed yet; the commit re-routes staged monitor lines itself.
+    bool m_parsing_slot_map;
     // Monotonic timestamp (CLOCK_MONOTONIC seconds) of the last "all replicas
     // unreachable under read-only workload" warning emitted from
     // hold_pipeline. Rate-limited to once per 60s so a stalled benchmark

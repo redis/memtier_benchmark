@@ -197,6 +197,15 @@ public:
         m_reqs_generated++;
     }
     size_t staged_monitor_count(unsigned int conn_id) const { return m_staged_monitor_commands[conn_id].size(); }
+    // Run the give-up hook as it runs when a dial fails while
+    // handle_cluster_slots() parses a reply.
+    void give_up_while_parsing(unsigned int conn_id)
+    {
+        m_parsing_slot_map = true;
+        handle_connection_given_up(conn_id);
+        m_parsing_slot_map = false;
+    }
+    void own_slot(unsigned int slot, unsigned int group) { m_slot_to_shard_group[slot] = group; }
     // Run the event loop until conn_id's dial completes, then until its
     // deferred fill, if one was armed, has run.
     void finish_dial(unsigned int conn_id)
@@ -705,6 +714,110 @@ static void check_drop_wakes_producers(bool through_give_up_hook)
     evutil_closesocket(listener);
 }
 
+// A dial that fails while handle_cluster_slots() parses a reply gives its
+// connection up before the reply is committed. The staged lines it holds
+// follow the reply's map, not the one it replaces.
+static void check_give_up_during_slots_parse()
+{
+    evutil_socket_t listener = socket(AF_INET, SOCK_STREAM, 0);
+    check(listener != static_cast<evutil_socket_t>(-1), "parse listener socket");
+    sockaddr_in address = {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t address_len = sizeof(address);
+    check(bind(listener, (sockaddr *) &address, sizeof(address)) == 0 && listen(listener, 4) == 0 &&
+              getsockname(listener, (sockaddr *) &address, &address_len) == 0,
+          "parse listener bound");
+    const std::string port = std::to_string(ntohs(address.sin_port));
+
+    arbitrary_command_list commands;
+    abstract_protocol *protocol = protocol_factory(PROTOCOL_REDIS_DEFAULT);
+    make_transaction_commands(commands, protocol);
+    benchmark_config config = {};
+    make_transaction_config(config, commands);
+    config.transaction = false;
+    config.reconnect_on_error = false;
+    object_generator generator(commands.size());
+    generator.set_data_size_fixed(1);
+    generator.set_key_prefix("key-");
+    generator.set_key_range(1, 10);
+    const unsigned int staged_slot = key_slot("key-1");
+    check(staged_slot != 0, "parse fixture leaves slot 0 to the dead node");
+    // Connection 1 owns staged_slot and was given up on; the seed dials and
+    // is in setup, so a primary that fails to dial is left dead.
+    auto given_up_owner = [&](transaction_client &client) {
+        client.route_slot_to_second_shard(protocol, staged_slot, port.c_str());
+        client.refresh_over_seed(port.c_str());
+        client.get_connections()[1]->disconnect();
+        client.get_connections()[1]->set_address_port("224.0.0.1", "7000");
+        client.stage_line(1, staged_slot);
+    };
+    // Slot 0 to connection 1's node, every other slot to the seed.
+    const std::string slots = "*2\r\n*3\r\n:0\r\n:0\r\n*2\r\n$9\r\n224.0.0.1\r\n:7000\r\n"
+                              "*3\r\n:1\r\n:16383\r\n*2\r\n$9\r\n127.0.0.1\r\n:" +
+                              port + "\r\n";
+    evbuffer *input = evbuffer_new();
+    evbuffer *output = evbuffer_new();
+    abstract_protocol *reply = protocol_factory(PROTOCOL_REDIS_DEFAULT);
+    reply->set_buffers(input, output);
+    reply->set_keep_value(true);
+    auto parse = [&](const std::string &resp) {
+        evbuffer_add(input, resp.data(), resp.size());
+        check(reply->parse_response() == 1, "SLOTS reply parsed");
+        return reply->get_response();
+    };
+    config.read_preference = rp_secondary_preferred;
+#ifdef __linux__
+    // Linux fails a TCP connect to a multicast address at once, so the
+    // redial below gives connection 1 up inside handle_cluster_slots().
+    {
+        client_group group(&config, protocol, &generator);
+        transaction_client client(&group);
+        given_up_owner(client);
+        const unsigned long long generated = client.get_reqs_generated();
+        const unsigned long long errors = client.get_stats()->get_total_errors();
+        check(client.handle_cluster_slots(0, parse(slots)), "SLOTS reply committed");
+        check(client.get_connections()[1]->get_connection_state() == conn_disconnected &&
+                  !client.get_connections()[1]->is_reconnect_pending() && !client.run_failed(),
+              "failed redial left the primary dead");
+        check(client.staged_monitor_count(1) == 0 && client.staged_monitor_count(0) == 1,
+              "line given up on mid-parse moves to its slot's new primary");
+        check(client.get_reqs_generated() == generated && client.get_stats()->get_total_errors() == errors,
+              "moved line stays counted and is not an error");
+    }
+#endif
+    // The same without a real dial: the hook defers to the commit, which
+    // moves the line to the slot's new owner.
+    {
+        client_group group(&config, protocol, &generator);
+        transaction_client client(&group);
+        given_up_owner(client);
+        client.give_up_while_parsing(1);
+        check(client.staged_monitor_count(1) == 1, "hook leaves lines to the commit while a reply is parsed");
+        client.own_slot(staged_slot, 0);
+        client.reroute_staged_monitor_commands();
+        check(client.staged_monitor_count(1) == 0 && client.staged_monitor_count(0) == 1,
+              "the commit moves the deferred line");
+    }
+    // A reply with no usable shard dials nothing and commits nothing; the
+    // hook re-routes again afterwards.
+    {
+        client_group group(&config, protocol, &generator);
+        transaction_client client(&group);
+        given_up_owner(client);
+        check(!client.handle_cluster_slots(0, parse("*1\r\n*1\r\n:0\r\n")), "malformed reply ignored");
+        client.handle_connection_given_up(1);
+        check(client.staged_monitor_count(1) == 0 && client.staged_monitor_count(0) == 0,
+              "hook re-routes after an uncommitted reply");
+    }
+    config.read_preference = rp_primary;
+    delete reply;
+    evbuffer_free(input);
+    evbuffer_free(output);
+    delete protocol;
+    evutil_closesocket(listener);
+}
+
 int main()
 {
 #ifdef _WIN32
@@ -718,6 +831,7 @@ int main()
     check_repin_routes_to_staged_owner(1221322);
     check_drop_wakes_producers(false);
     check_drop_wakes_producers(true);
+    check_give_up_during_slots_parse();
     puts("transaction pin release tests passed");
     return 0;
 }

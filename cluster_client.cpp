@@ -134,6 +134,7 @@ cluster_client::cluster_client(client_group *group) :
         m_txn_multi_conn_id(-1),
         m_strict_no_route_attempts(0),
         m_last_clusterdown_refresh(),
+        m_parsing_slot_map(false),
         m_last_no_replica_warning_ts(0)
 {
     // Initialize slot map to the UINT_MAX sentinel; m_shard_groups starts empty
@@ -1113,6 +1114,7 @@ bool cluster_client::handle_cluster_slots(unsigned int conn_id, protocol_respons
     }
 
     // run over response and create connections
+    m_parsing_slot_map = true;
     for (unsigned int i = 0; i < r->get_mbulk_value()->mbulks_elements.size(); i++) {
         mbulk_element *shard_el = r->get_mbulk_value()->mbulks_elements[i];
         if (shard_el == NULL || !shard_el->is_mbulk_size()) {
@@ -1495,6 +1497,10 @@ bool cluster_client::handle_cluster_slots(unsigned int conn_id, protocol_respons
     // fix for the eager-reset bug: commit 994e9ad wiped m_slot_to_shard_group
     // and m_shard_groups before parsing, leaving all slots unmapped if parsing
     // produced no valid shard. Cursor bugbot HIGH.)
+    //
+    // Every shard that dials a node sets any_valid_shard, so a hook skipped
+    // above always has the commit below to re-route its lines.
+    m_parsing_slot_map = false;
     if (!any_valid_shard) {
         benchmark_error_log("warning: CLUSTER SLOTS: every shard in the reply was malformed; "
                             "leaving existing connections in service\n");
@@ -3331,7 +3337,10 @@ void cluster_client::handle_connection_given_up(unsigned int conn_id)
 {
     // No commit may come to move this connection's staged monitor lines, and
     // nothing sends from it now. The re-route drops those of its own slots
-    // and moves the rest, so they don't keep a --requests run open.
+    // and moves the rest, so they don't keep a --requests run open. A dial
+    // failing while handle_cluster_slots() parses a reply leaves that to its
+    // commit: the map in place is about to be replaced.
+    if (m_parsing_slot_map) return;
     if (conn_id < m_staged_monitor_commands.size() && !m_staged_monitor_commands[conn_id].empty()) {
         reroute_staged_monitor_commands();
     }
