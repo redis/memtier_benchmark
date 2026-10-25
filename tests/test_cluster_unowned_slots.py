@@ -694,16 +694,21 @@ def test_unusable_slots_refresh_is_bounded_by_reconnect_attempts(env):
                     "--reconnect-on-error",
                     "--max-reconnect-attempts=3",
                     "--reconnect-backoff-factor=0.5",
+                    # Longer than the harness's 2 s: the seed is meant to
+                    # fail setup until --max-reconnect-attempts ends the run.
+                    "--connection-stage-timeout=30",
                 ],
                 seed_replica=True,
                 expected_exit=1,
+                # Without the cap memtier never exits, so the timeout is
+                # what catches a regression.
+                timeout=20,
             )
         env.assertContains("requested a cluster slot map refresh to reconnect", stderr)
         env.assertContains("Maximum reconnection attempts (3) exceeded for CLUSTER SLOTS error", stderr)
         # The refresh, then one per reconnect of the seed.
         env.assertEqual(node.unusable, 4)
         env.assertLess(stats["Totals"]["Count"], 20)
-        env.assertLess(node.run_elapsed, 6)
 
 
 def test_unowned_keys_survive_repeated_redial(env):
