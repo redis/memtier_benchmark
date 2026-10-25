@@ -155,6 +155,8 @@ def bounded_client(conn, timeout=5.0):
 
 def _read_noauth(env):
     """({label: errorstat_NOAUTH}, {label: error}) for each server of the env."""
+    import redis
+
     counts, errors = {}, {}
     for label, connect in _noauth_nodes(env):
         conn = None
@@ -162,7 +164,9 @@ def _read_noauth(env):
             conn = bounded_client(connect())
             stats = conn.info("errorstats").get("errorstat_NOAUTH", {})
             counts[label] = int(stats.get("count", 0))
-        except Exception as error:
+        except (redis.exceptions.RedisError, OSError) as error:
+            # A server that is down or refuses us. Anything else, such as an
+            # RLTest API change, raises rather than leave a server unchecked.
             errors[label] = error
         finally:
             if conn is not None:

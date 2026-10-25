@@ -250,3 +250,19 @@ def test_bounded_client_turns_off_retries_on_open_connections(env):
     env.assertEqual(pool.connection_kwargs["socket_timeout"], 2.0)
     # A connection made afterwards has retries off too.
     env.assertEqual(pool.make_connection().retry.get_retries(), 0)
+
+
+def test_noauth_guard_raises_on_an_unexpected_error(env):
+    # An RLTest whose getSlaveConnection takes no index: the guard must not
+    # quietly leave the replicas unchecked.
+    class _NoIndexServer(_Server):
+        def getSlaveConnection(self):
+            return self._conn(self.replicas[0])
+
+    fake = _Env(_PW, [_NoIndexServer(replicas=[_Server()])])
+    try:
+        _run_guarded(lambda fake: None, fake)
+    except TypeError:
+        pass
+    else:
+        env.assertTrue(False, message="the guard swallowed a TypeError")
