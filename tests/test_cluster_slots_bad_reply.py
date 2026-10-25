@@ -486,3 +486,16 @@ def test_rejected_auth_once_at_deadline_fails_the_run(env):
     env.assertEqual(returncode, 1, message=stderr[-2000:])
     env.assertContains("Connection setup failed and the run is over", stderr)
     env.assertLess(elapsed, 10)
+
+
+def test_transaction_moved_warning_printed_once(env):
+    """--transaction: every rotation interrupted by a MOVED on the pin used to
+    print its own warning, hundreds of lines during a slot migration (#649).
+    Every 3rd SET here gets -MOVED (back to the same node); the warning is
+    printed once per process."""
+    node = _Node(0, moved_every=3)
+    returncode, stderr, _ = _run(node, ["--transaction", "--command=MULTI", "--command=SET __key__ __data__",
+                                        "--command=EXEC", "--requests=300"])
+    env.assertEqual(node.errors, [])
+    env.assertGreater(node.data_requests, 30, message=stderr[-2000:])
+    env.assertEqual(stderr.count("received MOVED mid-rotation"), 1, message=stderr[-2000:])
