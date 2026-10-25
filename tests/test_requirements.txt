@@ -1,4 +1,6 @@
-redis>=3.0.0
+# include.py's bounded_client() and its test use Retry.get_retries() and
+# ConnectionPool.set_retry(), which redis-py 6.0 has.
+redis>=6.0.0
 # TEMPORARY: pinned to a fork commit that teaches RLTest's ClusterEnv to add
 # replica shards to the OSS cluster (CLUSTER MEET + CLUSTER REPLICATE) instead
 # of merely wiring them with --slaveof. Without this, --use-slaves replicas are
@@ -9,7 +11,12 @@ redis>=3.0.0
 # actually installed out from under CI (or a stale local checkout) without a
 # visible diff here. Revert to
 # git+https://github.com/RedisLabsModules/RLTest.git@master once upstream PR
-# https://github.com/RedisLabsModules/RLTest/pull/253 merges.
+# https://github.com/RedisLabsModules/RLTest/pull/253 merges. When moving the
+# pin, check the NOAUTH guard in include.py still applies: it wraps
+# RLTest.loader.TestFunction.initialize/target and calls the shards'
+# getSlaveConnection(index); test_harness_auth.py's
+# test_guard_is_installed_in_loader and
+# test_noauth_guard_raises_on_an_unexpected_error fail if either changes.
 git+https://github.com/fcostaoliveira/RLTest.git@4808b5f63f55788c094b111e1adecd00b9716a00
 # pytest + hypothesis power the CLI argument fuzzer (tests/test_cli_fuzz.py,
 # issue #410). The fuzzer is gated by MEMTIER_FUZZ=1 so it's only pulled in
