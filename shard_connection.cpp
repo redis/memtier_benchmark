@@ -1985,14 +1985,15 @@ void shard_connection::fill_pipeline(void)
         if ((m_pending_resp == 0) && (evbuffer_get_length(bufferevent_get_output(m_bev)) == 0)) {
             benchmark_debug_log("%s Done, no requests to send no response to wait for\n", get_readable_id());
 
-            // Past the deadline by now, a client whose setup is done ends
-            // here even if no reply moved the run's clock past it (#879),
-            // unless another connection is still busy (a reconnect or slot
-            // map refresh due at the deadline, see above) or it holds
-            // retries: those are still resent until the drain grace (#715).
+            // Past the deadline by now, a client ends here even if no reply
+            // moved the run's clock past it (#879), unless another connection
+            // is still busy (a reconnect or slot map refresh due at the
+            // deadline, see above) or it holds retries: those are still
+            // resent until the drain grace (#715). A setup still pending here
+            // is a refresh held for an open --transaction MULTI, which is not
+            // closed past the deadline: it must not keep the client going.
             if ((m_conns_manager->finished() && m_conns_manager->all_connections_idle()) ||
-                (deadline_passed && is_conn_setup_done() && siblings_done() &&
-                 !static_cast<client *>(m_conns_manager)->holds_retries())) {
+                (deadline_passed && siblings_done() && !static_cast<client *>(m_conns_manager)->holds_retries())) {
                 m_conns_manager->set_end_time();
                 m_conns_manager->disconnect_all();
             } else if (!m_config->request_rate) {
