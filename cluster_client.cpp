@@ -1678,6 +1678,8 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         m_key_index_pools[conn_id]->empty() && m_staged_monitor_commands[conn_id].empty()) {
         const arbitrary_command &cmd = get_arbitrary_command(m_executed_command_index);
         const bool monitor = cmd.command_args.size() == 1 && cmd.command_args[0].type == monitor_random_type;
+        // keys_count, not has_keys(): a literal key (no __key__) is not
+        // routed by slot either, so it must stay off replicas too.
         if (cmd.keys_count == 0 && !monitor &&
             !(m_config->read_preference != rp_primary && is_read_command_index(m_executed_command_index))) {
             return true;
