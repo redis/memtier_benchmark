@@ -6670,6 +6670,7 @@ int main(int argc, char *argv[])
     }
 
     delete obj_gen;
+    obj_gen = NULL; // g_obj_gen is file-scope; do not leave it dangling
     if (keylist != NULL) delete keylist;
 
     if (cfg.scan_continuation_command != NULL) {
