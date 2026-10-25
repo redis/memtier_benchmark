@@ -1,4 +1,6 @@
+import functools
 import glob
+import inspect
 import os
 import re
 import logging
@@ -55,6 +57,15 @@ def _option_values(args, short, long):
     return values
 
 
+def env_password(env):
+    """
+    The password the env's servers require (run_tests.sh REDIS_PASSWORD,
+    RLTest --oss_password), or None. Read it here rather than from a redis-py
+    connection's kwargs, so every test agrees on where it comes from.
+    """
+    return env.getMasterNodesList()[0].get("password") or None
+
+
 def memtier_auth_args(env, args=()):
     """
     --authenticate with the env's password (run_tests.sh REDIS_PASSWORD), for
@@ -63,7 +74,7 @@ def memtier_auth_args(env, args=()):
     with userinfo, or when args select a memcache protocol (which cannot AUTH
     as a Redis client). As in memtier, the last --uri and --protocol win.
     """
-    password = env.getMasterNodesList()[0].get("password")
+    password = env_password(env)
     args = [str(arg) for arg in args]
     if not password or _option_values(args, "-a", "--authenticate"):
         return []
@@ -74,6 +85,128 @@ def memtier_auth_args(env, args=()):
     if protocols and protocols[-1].startswith("memcache"):
         return []
     return ["--authenticate", password]
+
+
+# NOAUTH guard (#842). memtier counts error replies as completed requests and
+# exits 0, so a test whose memtier command line forgets --authenticate still
+# passes on a password-protected env while every request is answered -NOAUTH.
+# When the env has a password, every RLTest function test that takes an env is
+# wrapped: it snapshots errorstat_NOAUTH on each of the env's servers (all
+# shards, and replicas) before the test and fails the test if any count grew.
+# Checking the servers catches every client (Benchmark, hand-built Popen
+# command lines, redis-py), not only the runs that go through mb.py.
+NOAUTH_GUARD_ATTR = "allow_noauth"
+
+
+def allow_noauth(reason):
+    """
+    Opt a test out of the NOAUTH guard because it is unauthenticated against
+    the env's servers on purpose (memcache protocols, missing or wrong
+    credentials under test). The reason is required and shows in the code.
+    """
+    if not reason:
+        raise ValueError("allow_noauth needs a reason")
+
+    def mark(test):
+        setattr(test, NOAUTH_GUARD_ATTR, reason)
+        return test
+    return mark
+
+
+def _noauth_nodes(env):
+    """(label, connect) for each server of the env: every shard's master and replicas."""
+    runner = getattr(env, "envRunner", None)
+    shards = getattr(runner, "shards", None) or [runner]
+    nodes = []
+    for index, shard in enumerate(shards, 1):
+        nodes.append(("shard {} master".format(index), shard.getConnection))
+        if getattr(shard, "useSlaves", False):
+            for replica in range(len(getattr(shard, "slavePorts", None) or [])):
+                nodes.append(("shard {} replica {}".format(index, replica + 1),
+                              functools.partial(shard.getSlaveConnection, replica)))
+    return nodes
+
+
+def noauth_counts(env):
+    """
+    errorstat_NOAUTH per server of the env. A server the env's password
+    cannot reach (stopped, or requirepass changed by the test) is left out.
+    """
+    counts = {}
+    for label, connect in _noauth_nodes(env):
+        conn = None
+        try:
+            conn = connect()
+            stats = conn.info("errorstats").get("errorstat_NOAUTH", {})
+            counts[label] = int(stats.get("count", 0))
+        except Exception:
+            pass
+        finally:
+            if conn is not None:
+                conn.close()
+    return counts
+
+
+def _check_noauth(env, before):
+    after = noauth_counts(env)
+    for label, count in sorted(after.items()):
+        start = before.get(label, 0)
+        # A server restarted during the test starts counting from zero.
+        new = count - start if count >= start else count
+        env.assertEqual(new, 0, message=(
+            "{} answered {} request(s) -NOAUTH, but the env has a password "
+            "(REDIS_PASSWORD): authenticate memtier with memtier_auth_args(env) "
+            "or add_required_env_arguments(), or mark the test "
+            "@allow_noauth(reason) if it is unauthenticated on purpose (#842)"
+        ).format(label, new))
+
+
+def noauth_guard(test):
+    """Wrap an RLTest function test (test(env)) in the NOAUTH check."""
+    if getattr(test, NOAUTH_GUARD_ATTR, None) or getattr(test, "_noauth_guarded", False):
+        return test
+    try:
+        args = inspect.getfullargspec(test).args
+    except TypeError:
+        return test
+    if len(args) != 1:
+        return test
+
+    @functools.wraps(test)
+    def guarded(env):
+        if not env_password(env):
+            return test(env)
+        before = noauth_counts(env)
+        try:
+            return test(env)
+        finally:
+            _check_noauth(env, before)
+    guarded._noauth_guarded = True
+    return guarded
+
+
+def _install_noauth_guard():
+    # RLTest has no per-test hook for function tests, so wrap the target that
+    # its loader resolves just before each test runs. include.py is imported
+    # while RLTest discovers the test files, before any test starts, and
+    # RLTest forks its --parallelism workers after that.
+    try:
+        from RLTest import loader
+    except ImportError:
+        return
+    test_function = loader.TestFunction
+    if getattr(test_function, "_noauth_guard", False):
+        return
+    initialize = test_function.initialize
+
+    def guarded_initialize(self):
+        initialize(self)
+        self.target = noauth_guard(self.target)
+    test_function.initialize = guarded_initialize
+    test_function._noauth_guard = True
+
+
+_install_noauth_guard()
 
 
 def add_required_env_arguments(benchmark_specs, config, env, master_nodes_list):
@@ -269,6 +402,7 @@ def get_cluster_replica_connections(env):
             _redis.Redis(
                 host=host,
                 port=port,
+                password=env_password(env),
                 decode_responses=True,
                 socket_connect_timeout=5,
             )
@@ -298,6 +432,37 @@ def get_cluster_replica_connections(env):
             )
             sys.stderr.flush()
     return conns
+
+
+def shutdown_nosave(conn, timeout=5.0):
+    """
+    SHUTDOWN NOSAVE the server behind a redis-py connection. True only once
+    the server stopped answering: a refused SHUTDOWN (NOAUTH, for example)
+    leaves it running, and redis-py raises NOAUTH as a ConnectionError, so
+    the closed connection alone does not prove the shutdown.
+    """
+    import redis as _redis
+
+    try:
+        conn.execute_command("SHUTDOWN", "NOSAVE")
+    except _redis.exceptions.AuthenticationError:
+        return False
+    except _redis.exceptions.ConnectionError:
+        pass  # the server closes the connection as it exits
+    except _redis.exceptions.RedisError:
+        return False
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            conn.ping()
+        except _redis.exceptions.AuthenticationError:
+            pass  # still running
+        except _redis.exceptions.ConnectionError:
+            return True
+        except _redis.exceptions.RedisError:
+            pass
+        time.sleep(0.1)
+    return False
 
 
 def harness_client_ids(connections):
