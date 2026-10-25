@@ -17,6 +17,7 @@ from include import (
     debugPrintMemtierOnError,
     ensure_clean_benchmark_folder,
     get_default_memtier_config,
+    server_supports_resp3,
 )
 from mb import Benchmark, RunConfig
 
@@ -449,29 +450,16 @@ def test_arbitrary_xread_keyword_spec_evaluates_correctly(env):
                    message="expected XREAD misses on missing streams")
 
 
-def _server_supports_resp3(env):
-    """Return True if the Redis server accepts HELLO 3 (Redis 6+)."""
-    try:
-        conn = env.getConnection()
-        # HELLO 3 switches the connection to RESP3 and returns a server map.
-        # Older servers return an error.  We reset back to RESP2 afterwards.
-        resp = conn.execute_command("HELLO", "3")
-        conn.execute_command("HELLO", "2")
-        return resp is not None
-    except Exception:
-        return False
-
-
 def test_arbitrary_get_resp3_nil_counted_as_miss(env):
     """GET under --protocol=resp3 returns '_\\r\\n' (RESP3 null) for missing
     keys.  Before the fix the SingleNullBulk sentinel did not include '_' so
     every RESP3 nil was counted as a hit, silently understating the miss rate.
 
-    Gated by capability detection: the test is skipped when the test Redis
-    does not support HELLO 3 (Redis < 6).
+    Gated by capability detection: the test is skipped only when the test
+    Redis predates RESP3 (Redis < 6).
     """
     env.skipOnCluster()
-    if not _server_supports_resp3(env):
+    if not server_supports_resp3(env):
         env.skip()
         return
 
@@ -576,7 +564,7 @@ def test_arbitrary_get_resp3_literal_underscore_not_counted_as_miss(env):
     least the pre-populated keys are counted as hits, not as nulls).
     """
     env.skipOnCluster()
-    if not _server_supports_resp3(env):
+    if not server_supports_resp3(env):
         env.skip()
         return
 
