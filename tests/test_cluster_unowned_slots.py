@@ -12,11 +12,13 @@ import threading
 import time
 from include import MEMTIER_BINARY
 
-# memtier asks for CLUSTER SLOTS after -CLUSTERDOWN at most this often.
-with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cluster_client.h")) as _header:
-    CLUSTERDOWN_REFRESH_INTERVAL = (
-        int(re.search(r"#define CLUSTERDOWN_REFRESH_INTERVAL_USEC (\d+)", _header.read()).group(1)) / 1e6
-    )
+def _clusterdown_refresh_interval():
+    """How often memtier at most asks for CLUSTER SLOTS after -CLUSTERDOWN, in seconds."""
+    header = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cluster_client.h")
+    with open(header) as source:
+        match = re.search(r"#define CLUSTERDOWN_REFRESH_INTERVAL_USEC (\d+)", source.read())
+    assert match, "CLUSTERDOWN_REFRESH_INTERVAL_USEC is not defined in %s" % header
+    return int(match.group(1)) / 1e6
 
 
 def _slot(key):
@@ -653,6 +655,57 @@ def test_unowned_monitor_disconnected_primary(env):
             env.assertContains("no reachable primary", stderr)
 
 
+def test_unusable_slots_refresh_is_bounded_by_reconnect_attempts(env):
+    """A seed that keeps answering CLUSTER SLOTS unusably doesn't strand a --requests run.
+
+    The primary drops its third SET, so its redial is left to the seed's
+    refresh, and from then on the seed answers every CLUSTER SLOTS with an
+    empty or an all-malformed map. Each such reply reconnects the seed, so
+    --max-reconnect-attempts ends the run, as on master.
+    """
+    for unusable in (b"*0\r\n", b"*1\r\n*1\r\n:0\r\n"):
+        node = _Node([(0, 16383)], replica=True)
+        node.unusable = 0
+        node.drop_request = lambda args, node=node: len(node.requests) == 3
+        healthy = node.replica.topology
+
+        def topology(node=node, unusable=unusable, healthy=healthy):
+            with node.lock:
+                dropped = len(node.requests) >= 3
+                node.unusable += dropped
+            return unusable if dropped else healthy()
+
+        node.replica.topology = topology
+        with tempfile.TemporaryDirectory() as directory:
+            monitor = os.path.join(directory, "monitor.txt")
+            with open(monitor, "w") as target:
+                for index in range(10):
+                    target.write(f'1.000000 [0 127.0.0.1:12345] "SET" "memtier-1" "value-{index}"\n')
+            stats, _, stderr = _run(
+                env,
+                node,
+                [
+                    "--requests=20",
+                    "--read-preference=secondaryPreferred",
+                    "--monitor-input=" + monitor,
+                    "--monitor-pattern=S",
+                    "--command=PING",
+                    "--command=__monitor_line@__",
+                    "--reconnect-on-error",
+                    "--max-reconnect-attempts=3",
+                    "--reconnect-backoff-factor=0.5",
+                ],
+                seed_replica=True,
+                expected_exit=1,
+            )
+        env.assertContains("requested a cluster slot map refresh to reconnect", stderr)
+        env.assertContains("Maximum reconnection attempts (3) exceeded for CLUSTER SLOTS error", stderr)
+        # The refresh, then one per reconnect of the seed.
+        env.assertEqual(node.unusable, 4)
+        env.assertLess(stats["Totals"]["Count"], 20)
+        env.assertLess(node.run_elapsed, 6)
+
+
 def test_unowned_keys_survive_repeated_redial(env):
     # The same queue-reset bug affects ordinary routed key indices: dropping
     # them and decrementing the count silently substitutes later keys.
@@ -1040,10 +1093,10 @@ class _Failover(_Node):
             self.cond.notify_all()
         self.closed.wait(10)
         # memtier acts on CLUSTERDOWN at most once per
-        # CLUSTERDOWN_REFRESH_INTERVAL (cluster_client::handle_response()).
+        # CLUSTERDOWN_REFRESH_INTERVAL_USEC (cluster_client::handle_response()).
         # Its last poll was A's, before A sent the SLOTS request seen at
         # refreshed_at.
-        time.sleep(max(0.0, self.refreshed_at + CLUSTERDOWN_REFRESH_INTERVAL + 0.05 - time.monotonic()))
+        time.sleep(max(0.0, self.refreshed_at + _clusterdown_refresh_interval() + 0.05 - time.monotonic()))
         return b"-CLUSTERDOWN The cluster is down\r\n"
 
 
