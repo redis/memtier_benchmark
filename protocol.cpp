@@ -762,7 +762,6 @@ int redis_protocol::parse_response(void)
                         }
                         m_push_nested = true;
                         m_push_outer_bulks = m_total_bulks_count;
-                        m_attribute = false;
                         m_total_bulks_count = 0;
                     }
                     m_push = true;

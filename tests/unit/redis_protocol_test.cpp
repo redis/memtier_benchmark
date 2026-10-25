@@ -239,10 +239,20 @@ static void check_attribute_frames()
         // An error inside an attribute is not the reply's error; one after it is.
         check_reply_pair("|1 +k -ERR x +OK", "|1\r\n+k\r\n-ERR x\r\n+OK\r\n", "+OK\r\n", 0, false, keep);
         check_reply_pair("|1 +k +v -ERR x", "|1\r\n+k\r\n+v\r\n-ERR x\r\n", "+OK\r\n", 0, true, keep);
+        // An attribute inside a push takes none of the push's slots.
+        check_reply_pair("*2 >2 +a |1 +k +v +b +c", "*2\r\n>2\r\n+a\r\n|1\r\n+k\r\n+v\r\n+b\r\n+c\r\n", "+OK\r\n", 0,
+                         false, keep);
     }
 
     evbuffer *input = evbuffer_new();
-    abstract_protocol *protocol = parse_one_resp3("|0\r\n*1\r\n+a\r\n", true, false, input);
+    // A top-level push holding an attribute is drained whole: +b is part of
+    // it, so the reply is +OK.
+    abstract_protocol *protocol = parse_one_resp3(">2\r\n+a\r\n|1\r\n+k\r\n+v\r\n+b\r\n+OK\r\n", false, false, input);
+    check(strcmp(protocol->get_response()->get_status(), "+OK") == 0,
+          "attribute inside a top-level push is drained with it: reply is +OK");
+    delete protocol;
+
+    protocol = parse_one_resp3("|0\r\n*1\r\n+a\r\n", true, false, input);
     mbulk_size_el *root = protocol->get_response()->get_mbulk_value();
     check(root && root->upper_level == NULL && root->mbulks_elements.size() == 1 && kept_status(root, 0, "+a"),
           "top-level attribute is not kept: |0 *1 +a keeps [+a]");
