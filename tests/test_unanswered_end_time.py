@@ -12,6 +12,16 @@ Total duration past --test-time and deflated Ops/sec.
 The peer sets the pace: it closes B only once A has ended and closed its own
 connection, plus _OVERRUN_S, so B's drop is always past the deadline however
 slowly memtier starts. No SIGINT is sent.
+
+Three variations pin the rest of the rule:
+- "late": B's first connection is closed on AUTH, before any workload, so its
+  clock starts at its reconnect, about 1 s late. Its end must be capped at its
+  own start plus --test-time, not at the benchmark's start plus --test-time.
+- "drain": B is answered, but one SET is held until past the deadline. A client
+  with replies ends when its last reply is drained, so that time still counts.
+- "early": B's SET is dropped and its reconnect is closed on AUTH, so B gives
+  up before the deadline and the run fails. Its end is when it gave up, not a
+  deadline that has not come yet.
 """
 import json
 import os
@@ -33,14 +43,24 @@ _OVERRUN_S = 2.0
 # (10 ms), so a few ms are expected; 300 ms leaves room for a loaded host's
 # scheduling delays and is still far below the >= 1000 ms the bug adds.
 _TOLERANCE_MS = 300
+# In "drain" mode, the number of B's SETs answered before the one held past
+# the deadline (0.5 s at _RATE), so B has replies when that one is drained.
+_DRAIN_AFTER = 50
+# In "early" mode, Total duration is a mean of client intervals, which lie
+# inside the worker thread's wall time that memtier reports (CPU
+# cpu_wall_seconds, taken around the thread's whole run). So it cannot exceed
+# that wall time; the margin covers rounding only.
+_WALL_MARGIN_MS = 50
 
 
 class _Peer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, cluster):
+    def __init__(self, mode, cluster):
         super().__init__(("127.0.0.1", 0), _Handler)
+        # "held", "late", "drain" or "early": see the module docstring.
+        self.mode = mode
         self.cluster = cluster
         self.lock = threading.Lock()
         self.stop = threading.Event()
@@ -48,6 +68,7 @@ class _Peer(socketserver.ThreadingTCPServer):
         self.roles = []
         self.b_sets = 0
         self.a_replies = 0
+        self.b_replies = 0
         self.errors = []
 
 
@@ -72,6 +93,11 @@ class _Handler(socketserver.StreamRequestHandler):
                     with peer.lock:
                         role = "B" if "A" in peer.roles else "A"
                         peer.roles.append(role)
+                        b_connections = peer.roles.count("B")
+                    if role == "B" and peer.mode == "late" and b_connections == 1:
+                        return  # Closed before workload: B's clock restarts.
+                    if role == "B" and peer.mode == "early" and b_connections > 1:
+                        return  # Every reconnect fails, so B gives up.
                     reply = b"+OK\r\n"
                 elif args == [b"CLUSTER", b"SLOTS"]:
                     assert peer.cluster and role is not None, args
@@ -79,17 +105,27 @@ class _Handler(socketserver.StreamRequestHandler):
                              + str(peer.server_address[1]).encode() + b"\r\n")
                 else:
                     assert args[0] == b"SET" and role is not None, args
-                    if role == "B":
+                    if role == "B" and peer.mode == "drain":
+                        if peer.b_replies == _DRAIN_AFTER and peer.a_closed.wait(30):
+                            # Answered, but only past the deadline.
+                            peer.stop.wait(_OVERRUN_S)
+                        with peer.lock:
+                            peer.b_replies += 1
+                        reply = b"+OK\r\n"
+                    elif role == "B":
                         with peer.lock:
                             peer.b_sets += 1
+                        if peer.mode == "early":
+                            return  # Dropped before the deadline, unanswered.
                         # Received, never answered: held until A has ended
                         # (so past the deadline), then some more, then closed.
                         if peer.a_closed.wait(30):
                             peer.stop.wait(_OVERRUN_S)
                         return
-                    with peer.lock:
-                        peer.a_replies += 1
-                    reply = b"+OK\r\n"
+                    else:
+                        with peer.lock:
+                            peer.a_replies += 1
+                        reply = b"+OK\r\n"
                 self.wfile.write(reply)
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
@@ -101,9 +137,9 @@ class _Handler(socketserver.StreamRequestHandler):
                 peer.a_closed.set()
 
 
-def _scenario(cluster, extra, binary=MEMTIER_BINARY):
+def _scenario(cluster, extra, mode="held", binary=MEMTIER_BINARY):
     """Run one scenario. Returns (stats, peer counters, output)."""
-    with _Peer(cluster) as peer, tempfile.TemporaryDirectory() as directory:
+    with _Peer(mode, cluster) as peer, tempfile.TemporaryDirectory() as directory:
         thread = threading.Thread(target=peer.serve_forever)
         thread.start()
         child = None
@@ -120,7 +156,7 @@ def _scenario(cluster, extra, binary=MEMTIER_BINARY):
             with open(path) as source:
                 stats = json.load(source)["ALL STATS"]
             counters = {"returncode": child.returncode, "errors": list(peer.errors), "b_sets": peer.b_sets,
-                        "a_replies": peer.a_replies, "roles": list(peer.roles),
+                        "a_replies": peer.a_replies, "b_replies": peer.b_replies, "roles": list(peer.roles),
                         "a_closed": peer.a_closed.is_set()}
             return stats, counters, stdout + stderr
         finally:
@@ -132,19 +168,26 @@ def _scenario(cluster, extra, binary=MEMTIER_BINARY):
             thread.join(timeout=3)
 
 
-def _check(env, cluster, extra):
-    stats, peer, output = _scenario(cluster, extra)
+def _check(env, cluster, extra, mode="held"):
+    stats, peer, output = _scenario(cluster, extra, mode)
     env.assertEqual(peer["returncode"], 0, message=output[-2000:])
     env.assertEqual(peer["errors"], [])
     env.assertEqual(stats["Runtime"]["Interrupted"], "false")
     env.assertTrue(peer["a_closed"])
     # B sent its first SET (so it takes part in the average) and nothing more.
     env.assertEqual(peer["b_sets"], 1)
-    env.assertEqual(peer["roles"][:2], ["A", "B"])
+    if mode == "late":
+        # B's first connection was closed on AUTH, and it then sent its SET.
+        env.assertEqual(peer["roles"][:3], ["A", "B", "B"])
+    else:
+        env.assertEqual(peer["roles"][:2], ["A", "B"])
     env.assertContains("connection dropped", output)
     duration = stats["Runtime"]["Total duration"]
     expected_ms = _TEST_TIME * 1000
     # Before #867 this was >= 4000 ms (>= 4500 ms with finite reconnect attempts).
+    # In "late" mode B's drop is still ~1 s past its own deadline, so it was
+    # >= 3500 ms; a deadline from the benchmark's start cuts B's interval by
+    # its ~1 s late start instead, to ~2500 ms.
     env.assertLess(abs(duration - expected_ms), _TOLERANCE_MS, message="duration %s ms" % duration)
     # Only A completes work, so the rate is A's Count over --test-time.
     count = stats["Totals"]["Count"]
@@ -169,3 +212,41 @@ def test_cluster_unanswered_client_end_capped_unlimited_reconnects(env):
 
 def test_cluster_unanswered_client_end_capped_finite_reconnects(env):
     _check(env, True, ["--max-reconnect-attempts=5"])
+
+
+def test_late_started_unanswered_client_end_capped_at_own_deadline(env):
+    _check(env, False, [], "late")
+
+
+def test_answered_client_end_includes_drain_past_deadline(env):
+    stats, peer, output = _scenario(False, [], "drain")
+    env.assertEqual(peer["returncode"], 0, message=output[-2000:])
+    env.assertEqual(peer["errors"], [])
+    env.assertTrue(peer["a_closed"])
+    # B had replies before the held one, and the held one was answered too.
+    env.assertGreater(peer["b_replies"], _DRAIN_AFTER)
+    env.assertEqual(stats["Totals"]["Count"], peer["a_replies"] + peer["b_replies"])
+    # B's last reply came _OVERRUN_S past A's end, so B's interval is about
+    # --test-time + _OVERRUN_S and Total duration about _OVERRUN_S / 2 (1000
+    # ms) above --test-time. Capping B at its deadline gives ~3000 ms, so the
+    # same _TOLERANCE_MS above --test-time separates the two.
+    duration = stats["Runtime"]["Total duration"]
+    env.assertGreater(duration, _TEST_TIME * 1000 + _TOLERANCE_MS, message="duration %s ms" % duration)
+
+
+def test_unanswered_client_giving_up_before_deadline_ends_then(env):
+    stats, peer, output = _scenario(False, ["--max-reconnect-attempts=1"], "early")
+    # B's reconnect failed before the deadline, so the run fails.
+    env.assertEqual(peer["returncode"], 1, message=output[-2000:])
+    env.assertEqual(peer["errors"], [])
+    env.assertEqual(peer["b_sets"], 1)
+    env.assertEqual(peer["roles"][:3], ["A", "B", "B"])
+    duration = stats["Runtime"]["Total duration"]
+    wall_ms = float(stats["CPU"]["cpu_wall_seconds"]) * 1000
+    message = "duration %s ms, wall %.0f ms" % (duration, wall_ms)
+    # Both clients end when B gives up, about 1 s in, so Total duration is
+    # about that wall time: the clients connect a few ms after the thread
+    # starts. A deadline stamped in the future puts B at --test-time instead,
+    # and Total duration ~1000 ms above the wall time.
+    env.assertLess(duration, wall_ms + _WALL_MARGIN_MS, message=message)
+    env.assertGreater(duration, wall_ms - _TOLERANCE_MS, message=message)

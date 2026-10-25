@@ -395,10 +395,14 @@ void client::set_end_time()
         // deadline to account for: end it there, not at a post-deadline
         // reconnect or at its thread's end (#867). A client with replies ends
         // now, as the time past its deadline may cover replies it drained.
-        struct timeval now, deadline;
+        // The deadline is the client's own start plus --test-time, not
+        // run_deadline(): that times an unanswered client from the
+        // benchmark's start, which would shorten the interval of a client
+        // that started late and inflate Ops/sec.
+        struct timeval now;
         gettimeofday(&now, NULL);
         if (m_config->test_time > 0 && m_reqs_answered == 0 && has_submitted_workload() && m_stats.has_started()) {
-            deadline = m_stats.get_start_time();
+            struct timeval deadline = m_stats.get_start_time();
             // As in set_end_time_interrupted(): only construct a deadline
             // that lies before now, so a large test time cannot overflow.
             if (ts_diff(deadline, now) > (long long) m_config->test_time * 1000000) {

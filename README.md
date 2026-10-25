@@ -679,8 +679,10 @@ run's stop condition:
     reconnect fails or is dropped again, the run ends. So a peer that accepts
     connections and closes them after a delay can extend the run by up to
     about twice that delay past `--test-time`. A client that sent requests
-    but never got a reply is still timed to the deadline, so that extra time
-    is not in the report's duration.
+    but never got a reply ends at its deadline, so that extra time is not in
+    its share of the report's duration. A client with replies still includes
+    its time past the deadline, which can cover replies it drained (see
+    #870).
   - In cluster mode this holds for the main connection only: another shard's
     connection is reconnected through a slot map refresh. Once the run is
     over, a refresh still redials it; if that dial fails, the connection is
