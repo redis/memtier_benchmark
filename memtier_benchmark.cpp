@@ -276,6 +276,11 @@ static bool g_output_failed = false;
 // content already emitted, without assuming which output stage was reached.
 static json_handler *g_json_out_file = NULL;
 
+// main owns the object generator. The option checks after it is created exit
+// through usage(); a file-scope root keeps it (and the key-prefix buffer it
+// owns) reachable for LeakSanitizer then, whatever registers main used.
+static object_generator *g_obj_gen = NULL;
+
 static void close_json_out_file_at_exit(void)
 {
     if (g_json_out_file != NULL) {
@@ -6156,7 +6161,7 @@ int main(int argc, char *argv[])
 #endif
 
     // create and configure object generator
-    object_generator *obj_gen = NULL;
+    object_generator *&obj_gen = g_obj_gen;
     imported_keylist *keylist = NULL;
     if (!cfg.data_import) {
         if (cfg.data_verify) {
