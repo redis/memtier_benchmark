@@ -27,6 +27,11 @@
 // same amount of data on both series. TLS bufferevents read whole records
 // and are left alone. Windows keeps libevent's reads: the Winsock version
 // (ioctlsocket(), and IOCP bufferevents) is neither written nor tested.
+// This relies on two libevent 2.1 details: a capped read adds exactly
+// EVBUFFER_MAX_READ (4096) bytes, and the input's end is frozen outside
+// libevent's own read. With a libevent built with a different
+// EVBUFFER_MAX_READ, a read adds exactly 4096 bytes only by coincidence, finds
+// nothing more queued, and memtier keeps libevent's reads, as before.
 
 #include <stddef.h>
 #include <stdio.h>
@@ -73,27 +78,24 @@ static inline void track_libevent_reads(struct evbuffer *input, size_t *last_add
 // with track_libevent_reads(). When libevent's read filled the cap, more data
 // is usually queued: read on, up to libevent_2_2_read_size in all. A read that
 // added exactly the cap without being capped finds nothing more queued.
-// Returns the bytes added.
-static inline size_t read_past_libevent_cap(struct evbuffer *input, evutil_socket_t fd, size_t *last_added)
+static inline void read_past_libevent_cap(struct evbuffer *input, evutil_socket_t fd, size_t *last_added)
 {
 #ifdef _WIN32
     (void) input;
     (void) fd;
     (void) last_added;
-    return 0;
 #else
-    if (*last_added != libevent_read_cap) return 0;
+    if (*last_added != libevent_read_cap) return;
     *last_added = 0;
 
     // Read only what is already queued, as libevent does, so that a pending
     // EOF or socket error is left for libevent's next read to report.
     int queued = 0;
-    if (ioctl(fd, FIONREAD, &queued) < 0 || queued <= 0) return 0;
+    if (ioctl(fd, FIONREAD, &queued) < 0 || queued <= 0) return;
     if ((size_t) queued > libevent_2_2_read_size - libevent_read_cap) {
         queued = (int) (libevent_2_2_read_size - libevent_read_cap);
     }
 
-    size_t added = 0;
     struct evbuffer_iovec vec;
     // The socket bufferevent keeps the end of its input frozen except while
     // it reads into it (bufferevent_readcb); do the same around this read.
@@ -108,10 +110,8 @@ static inline size_t read_past_libevent_cap(struct evbuffer *input, evutil_socke
             fprintf(stderr, "error: evbuffer_commit_space failed after reading %zu bytes\n", vec.iov_len);
             abort();
         }
-        added = vec.iov_len;
     }
     evbuffer_freeze(input, 0);
-    return added;
 #endif
 }
 
