@@ -1201,3 +1201,23 @@ def test_read_preference_keyless_hold_keeps_traffic_flowing(env):
         env.assertEqual(a_replica.commands[reads] + b_replica.commands[reads], half, message=message)
         env.assertEqual(a.commands[reads] + b.commands[reads] + a_replica.commands[writes] +
                         b_replica.commands[writes], 0, message=message)
+
+
+def test_read_preference_keyless_write_with_unreachable_primary_is_reported(env):
+    """With the only primary unreachable, a held keyless write must not turn
+    into a short run that looks successful: the run fails and says so, as a
+    keyed write does. The replica is the seed; the primary's port refuses."""
+    for command in ("--command=FLUSHDB", "--command=SET __key__ v"):
+        seed = _Node(0)
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        dead_port = probe.getsockname()[1]
+        probe.close()
+        endpoints = [b"*2\r\n$9\r\n127.0.0.1\r\n:%d\r\n" % port for port in (dead_port, seed.server_address[1])]
+        reply = b"*1\r\n*4\r\n:0\r\n:16383\r\n" + b"".join(endpoints)
+        seed.slots_fn = lambda _n: reply
+        rc, stderr, _ = _run(seed, [command, "--read-preference=secondaryPreferred", "--requests=20"])
+        message = "{}: rc={} replica={}\n{}".format(command, rc, dict(seed.commands), stderr[-2000:])
+        env.assertEqual(rc, 1, message=message)
+        env.assertEqual(seed.commands[b"FLUSHDB"] + seed.commands[b"SET"], 0, message=message)
+        env.assertContains("ended before the requested request count was reached", stderr, message=message)

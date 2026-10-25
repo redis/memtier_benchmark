@@ -1684,7 +1684,9 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         const bool may_write = !is_read_command_index(m_executed_command_index) &&
                                (cmd.spec == NULL || cmd.spec->may_write || replica_rejects);
         // keys_count, not has_keys(): a literal key (no __key__) is not
-        // routed by slot either, so it must stay off replicas too.
+        // routed by slot either, so the hold covers it as well. Like any
+        // keyless command it is held only as described above: a literal-key
+        // read such as "GET foo" under secondary still goes to a replica.
         if (cmd.keys_count == 0 && !monitor && (m_config->read_preference == rp_primary || may_write)) {
             // A primary may itself be parked (e.g. by the in-flight budget
             // above) with nothing in flight; this replica no longer produces,
