@@ -244,10 +244,9 @@ arbitrary_request::arbitrary_request(size_t request_index, request_type type, un
                 // spec-resolved positions when available so per-key totals match
                 // what the parser will see; otherwise fall back to the user's
                 // __key__ placeholder count, then 1 as a conservative default.
-                (cmd_meta != NULL && !cmd_meta->spec_key_positions.empty())
-                    ? (unsigned int) cmd_meta->spec_key_positions.size()
-                : (cmd_meta != NULL && cmd_meta->keys_count > 0) ? cmd_meta->keys_count
-                                                                 : 1),
+                (cmd_meta == NULL || !cmd_meta->has_keys()) ? 1
+                : !cmd_meta->spec_key_positions.empty()     ? (unsigned int) cmd_meta->spec_key_positions.size()
+                                                            : cmd_meta->keys_count),
         index(request_index),
         m_cmd_meta(cmd_meta)
 {

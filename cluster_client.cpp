@@ -3249,13 +3249,17 @@ void cluster_client::handle_connection_disconnect(unsigned int conn_id)
 // Whether a successful reply to this request shows the cluster serves keys.
 // During CLUSTERDOWN Redis still answers keyless commands (PING, MULTI, WAIT).
 // m_keys does not tell: arbitrary_request sets it to 1 for keyless commands.
+// __monitor_line@__ replay sends a line with the stats-only slot of its
+// command type, which has no argv: that slot's command spec tells.
 static bool request_carries_key(const request *req)
 {
     if (req == NULL) return false;
     if (req->m_type == rt_set || req->m_type == rt_get) return true;
     if (req->m_type != rt_arbitrary) return false;
     const arbitrary_command *meta = static_cast<const arbitrary_request *>(req)->m_cmd_meta;
-    return meta != NULL && (!meta->spec_key_positions.empty() || meta->keys_count > 0);
+    if (meta == NULL) return false;
+    if (meta->has_keys()) return true;
+    return meta->stats_only && meta->spec != NULL && (meta->spec->num_key_specs > 0 || meta->spec->movable_keys);
 }
 
 void cluster_client::handle_response(unsigned int conn_id, struct timeval timestamp, request *request,

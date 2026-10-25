@@ -57,8 +57,8 @@ static inline double retry_backoff_delay_ms(unsigned int base_ms, double factor,
 
 // A -CLUSTERDOWN reply refreshes the topology with CLUSTER SLOTS. Each client
 // keeps its own map, so a fixed 1 s interval meant -t 8 -c 50 sent up to 400
-// refreshes per second for the whole outage (#834). Within a run of
-// CLUSTERDOWN replies, the gap between refreshes doubles from 1 s up to 8 s.
+// refreshes per second for the whole outage (#834). Until a successful reply
+// to a keyed request, the gap between refreshes doubles from 1 s up to 8 s.
 // At 8 s, -t 8 -c 50 sends at most 50 refreshes per second, and a new map is
 // seen at most 8 s after it is published, less than the cluster's own failure
 // detection (cluster-node-timeout, 15 s by default) takes.
@@ -68,7 +68,7 @@ static const long long MEMTIER_CLUSTERDOWN_REFRESH_CAP_US = 8000000LL;
 struct clusterdown_refresh_backoff
 {
     struct timeval last; // last CLUSTERDOWN-triggered refresh; tv_sec 0 = never
-    unsigned int streak; // refreshes since the last non-CLUSTERDOWN reply
+    unsigned int streak; // refreshes since a keyed request last succeeded
 
     clusterdown_refresh_backoff() : streak(0) { last.tv_sec = last.tv_usec = 0; }
 
@@ -95,7 +95,7 @@ struct clusterdown_refresh_backoff
         if (streak < UINT_MAX) streak++;
     }
 
-    // A successful reply shows the cluster serves requests again.
+    // A successful reply to a keyed request shows the cluster serves keys again.
     void reset() { streak = 0; }
 };
 
