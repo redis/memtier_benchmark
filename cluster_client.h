@@ -147,10 +147,6 @@ protected:
     // Set while handle_cluster_slots() dials the nodes of a reply it has not
     // committed yet; the commit re-routes staged monitor lines itself.
     bool m_parsing_slot_map;
-    // Set when a connection was given up on while a SLOTS refresh was in
-    // flight. The refresh's commit or its rejection re-routes then, or the
-    // next give-up once the main connection is gone.
-    bool m_reroute_after_refresh;
     // Monotonic timestamp (CLOCK_MONOTONIC seconds) of the last "all replicas
     // unreachable under read-only workload" warning emitted from
     // hold_pipeline. Rate-limited to once per 60s so a stalled benchmark
@@ -216,9 +212,6 @@ protected:
     unsigned int select_target_conn(unsigned int slot, bool is_read);
     bool slot_is_unowned(unsigned int slot) const;
     unsigned int fallback_primary_conn_id() const;
-    // The main connection is asking for CLUSTER SLOTS; its commit redials
-    // every primary of the map that is disconnected with no reconnect timer.
-    bool slots_refresh_in_flight() const;
     bool check_unowned_slot(unsigned int slot, bool is_read);
     bool requires_replica(bool is_read) const;
 
@@ -336,7 +329,6 @@ public:
     virtual void handle_rate_limit_refill(unsigned int conn_id);
     virtual void handle_connection_disconnect(unsigned int conn_id);
     virtual void handle_connection_given_up(unsigned int conn_id);
-    virtual void handle_cluster_slots_rejected(unsigned int conn_id);
     virtual bool is_transaction_pinned(unsigned int conn_id)
     {
         return m_config->transaction && m_txn_pinned_conn_id == (int) conn_id;

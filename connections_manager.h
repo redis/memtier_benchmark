@@ -73,9 +73,6 @@ public:
     virtual void handle_connection_disconnect(unsigned int) {}
     // A connection was given up on (no reconnect timer) while the thread goes on.
     virtual void handle_connection_given_up(unsigned int) {}
-    // conn_id's CLUSTER SLOTS reply was empty, an error or rejected, so no
-    // map was committed. Any connection can ask, not only the main one.
-    virtual void handle_cluster_slots_rejected(unsigned int) {}
 
     virtual int connect(void) = 0;
     // Reconnect one dropped connection: returns 0 once a connect is issued,

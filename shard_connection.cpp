@@ -300,6 +300,7 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_current_backoff_delay(1.0),
         m_reconnect_timer(NULL),
         m_reconnecting(false),
+        m_awaiting_slots_redial(false),
         m_setup_rejected(false),
         m_setup_rejected_replica(false),
         m_setup_rejected_context(NULL),
@@ -1617,7 +1618,6 @@ void shard_connection::process_response(void)
                 report_connection_stage_failure("CLUSTER SLOTS failed (server returned empty or non-cluster reply; "
                                                 "is the server actually cluster-enabled?)");
                 restore_cluster_slots_value_policy();
-                m_conns_manager->handle_cluster_slots_rejected(m_id);
                 retry_cluster_slots_after_error();
                 error = true;
             } else {
@@ -1660,7 +1660,6 @@ void shard_connection::process_response(void)
                     // rejecting the map at startup. Then handle it like an
                     // empty reply: ask again, reconnect, or end the thread.
                     report_connection_stage_failure("CLUSTER SLOTS reply rejected (every shard malformed)");
-                    m_conns_manager->handle_cluster_slots_rejected(m_id);
                     retry_cluster_slots_after_error();
                     error = true;
                 }

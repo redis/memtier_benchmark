@@ -135,7 +135,6 @@ cluster_client::cluster_client(client_group *group) :
         m_strict_no_route_attempts(0),
         m_last_clusterdown_refresh(),
         m_parsing_slot_map(false),
-        m_reroute_after_refresh(false),
         m_last_no_replica_warning_ts(0)
 {
     // Initialize slot map to the UINT_MAX sentinel; m_shard_groups starts empty
@@ -268,7 +267,11 @@ int cluster_client::reconnect(unsigned int conn_id)
     if (sc == MAIN_CONNECTION) return connect();
     // Reconnecting the main connection refreshes the slot map, which then
     // reconnects this one.
-    if (MAIN_CONNECTION->get_connection_state() == conn_disconnected) return connect() < 0 ? -1 : 1;
+    if (MAIN_CONNECTION->get_connection_state() == conn_disconnected) {
+        if (connect() < 0) return -1;
+        sc->set_awaiting_slots_redial(true);
+        return 1;
+    }
 
     // Leave reconnecting this shard connection to a CLUSTER SLOTS refresh
     // over the main connection, which reconnects it with its current role,
@@ -281,6 +284,10 @@ int cluster_client::reconnect(unsigned int conn_id)
     // CLUSTER SLOTS before the first reply is handled.
     if (MAIN_CONNECTION->get_cluster_slots_state() == setup_done) MAIN_CONNECTION->set_cluster_slots();
     MAIN_CONNECTION->schedule_fill();
+    // Until a committed map redials or retires it, or the main connection is
+    // given up on, it has no timer but is not given up on: the re-route keeps
+    // its staged monitor lines.
+    sc->set_awaiting_slots_redial(true);
     return 1;
 }
 
@@ -335,6 +342,8 @@ void cluster_client::set_shard_role(shard_connection *sc, enum shard_role role)
 
 bool cluster_client::connect_shard_connection(shard_connection *sc, char *address, char *port)
 {
+    // Redialed: from now on its own reconnect attempts decide.
+    sc->set_awaiting_slots_redial(false);
     // Routed keys and monitor lines have already been selected and counted,
     // but have not reached the wire. Redialing the same primary retains them:
     // clearing and compensating would replace the selected identities.
@@ -506,21 +515,15 @@ bool cluster_client::slot_is_unowned(unsigned int slot) const
            m_slot_to_shard_group[slot] >= m_shard_groups.size();
 }
 
-bool cluster_client::slots_refresh_in_flight() const
-{
-    // A shard reconnect timer hands the redial to a SLOTS refresh over the
-    // seed. The shard's reconnect timer is already freed while that reply is
-    // in flight.
-    return MAIN_CONNECTION->get_connection_state() != conn_disconnected &&
-           MAIN_CONNECTION->get_cluster_slots_state() != setup_done;
-}
-
 unsigned int cluster_client::fallback_primary_conn_id() const
 {
     // Deliberately use the first connected primary: there is no owner to hash
     // to, and the server supplies the authoritative routing response.
     unsigned int pending = UINT_MAX;
-    const bool refreshing = slots_refresh_in_flight();
+    // A shard reconnect timer hands the redial to a SLOTS refresh over the
+    // seed. The timer is already cleared while that reply is in flight.
+    const bool refreshing = MAIN_CONNECTION->get_connection_state() != conn_disconnected &&
+                            MAIN_CONNECTION->get_cluster_slots_state() != setup_done;
     for (const shard_group &group : m_shard_groups) {
         if (group.primary == NULL) continue;
         if (group.primary->get_connection_state() == conn_connected) return group.primary->get_id();
@@ -1528,7 +1531,6 @@ bool cluster_client::handle_cluster_slots(unsigned int conn_id, protocol_respons
     print_topology_summary();
 
     // Before retiring connections: their staged lines move too.
-    m_reroute_after_refresh = false;
     reroute_staged_monitor_commands();
 
     // check if some connections left with no slots, and need to be closed
@@ -1554,6 +1556,7 @@ bool cluster_client::handle_cluster_slots(unsigned int conn_id, protocol_respons
                     m_reqs_generated -= (m_reqs_generated >= n) ? n : m_reqs_generated;
                 }
             }
+            m_connections[i]->set_awaiting_slots_redial(false);
             if (m_connections[i]->get_connection_state() != conn_disconnected) {
                 // This can be the connection whose CLUSTER SLOTS reply is
                 // being handled: its process_response() stops parsing once
@@ -2940,11 +2943,12 @@ void cluster_client::reroute_staged_monitor_commands()
     }
     // A primary left disconnected without a reconnect timer was given up on
     // (see hand_off_replay_requests()): nothing would send a line there, not
-    // even one already queued on it.
+    // even one already queued on it. One whose redial was left to a SLOTS
+    // refresh is not: that refresh's map redials or retires it.
     auto given_up = [this](unsigned int conn_id) {
         return conn_id >= m_connections.size() ||
                (m_connections[conn_id]->get_connection_state() == conn_disconnected &&
-                !m_connections[conn_id]->is_reconnect_pending());
+                !m_connections[conn_id]->is_reconnect_pending() && !m_connections[conn_id]->is_awaiting_slots_redial());
     };
     // An unowned line goes to a primary of this map that will send it:
     // connected first, then dialing or reconnect-pending. Not by
@@ -3349,30 +3353,18 @@ void cluster_client::handle_connection_given_up(unsigned int conn_id)
     // failing while handle_cluster_slots() parses a reply leaves that to its
     // commit: the map in place is about to be replaced.
     if (m_parsing_slot_map) return;
-    // A re-route left to a refresh that was lost with the main connection
-    // runs at the next give-up, which may be the main connection's own.
-    const bool has_staged = conn_id < m_staged_monitor_commands.size() && !m_staged_monitor_commands[conn_id].empty();
-    if (m_reroute_after_refresh || has_staged) {
-        // A primary whose reconnect timer handed its redial to the refresh in
-        // flight looks given up on until that reply comes: wait for it.
-        if (slots_refresh_in_flight()) {
-            m_reroute_after_refresh = true;
-            return;
+    if (conn_id < m_connections.size()) m_connections[conn_id]->set_awaiting_slots_redial(false);
+    bool reroute = conn_id < m_staged_monitor_commands.size() && !m_staged_monitor_commands[conn_id].empty();
+    if (conn_id == MAIN_CONNECTION->get_id()) {
+        // No SLOTS refresh comes from it now: the shards that left their
+        // redial to one are given up on too, even with nothing staged here.
+        for (shard_connection *sc : m_connections) {
+            if (!sc->is_awaiting_slots_redial()) continue;
+            sc->set_awaiting_slots_redial(false);
+            reroute = true;
         }
-        m_reroute_after_refresh = false;
-        reroute_staged_monitor_commands();
     }
-}
-
-void cluster_client::handle_cluster_slots_rejected(unsigned int conn_id)
-{
-    // No map came to redial anyone: re-route as the give-up would have. A
-    // refresh another connection asked for does not end the main
-    // connection's, which may still redial the waiting primaries.
-    if (!m_reroute_after_refresh) return;
-    if (conn_id != MAIN_CONNECTION->get_id() && slots_refresh_in_flight()) return;
-    m_reroute_after_refresh = false;
-    reroute_staged_monitor_commands();
+    if (reroute) reroute_staged_monitor_commands();
 }
 
 void cluster_client::handle_response(unsigned int conn_id, struct timeval timestamp, request *request,
