@@ -28,8 +28,9 @@
 // and are left alone. Windows keeps libevent's reads: the Winsock version
 // (ioctlsocket(), and IOCP bufferevents) is neither written nor tested.
 
-#include <assert.h>
 #include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <event2/buffer.h>
 #include <event2/event.h>
 #include <event2/util.h>
@@ -100,9 +101,13 @@ static inline size_t read_past_libevent_cap(struct evbuffer *input, evutil_socke
     if (evbuffer_reserve_space(input, queued, &vec, 1) == 1) {
         ssize_t n = recv(fd, vec.iov_base, queued, 0);
         vec.iov_len = n > 0 ? (size_t) n : 0;
-        int committed = evbuffer_commit_space(input, &vec, 1);
-        assert(committed == 0);
-        (void) committed;
+        // Committing the single vector just reserved cannot fail. If it
+        // ever did, bytes already taken from the socket would be lost and
+        // the parser would wait for them forever, so stop instead.
+        if (evbuffer_commit_space(input, &vec, 1) != 0) {
+            fprintf(stderr, "error: evbuffer_commit_space failed after reading %zu bytes\n", vec.iov_len);
+            abort();
+        }
         added = vec.iov_len;
     }
     evbuffer_freeze(input, 0);
