@@ -1594,12 +1594,15 @@ void shard_connection::process_response(void)
         // or MULTI inside MULTI) leave the transaction open.
         if (!m_pipeline->empty()) {
             unsigned int replies = m_pipeline->front()->m_replies;
-            if (m_front_replies == 0) {
+            // An aggregate holding an error element (an EXEC) is not an error reply.
+            const bool top_error = r->is_error() && r->get_top_array_len() < 0;
+            const bool first = m_front_replies == 0;
+            if (first) {
                 const char *status = r->get_status();
                 if (status != NULL && strcmp(status, "+QUEUED") == 0) {
                     m_queued_replies += replies - 1;
                     replies = 1;
-                } else if (!r->is_error()) {
+                } else if (!top_error) {
                     if (m_config->protocol != PROTOCOL_RESP3 && r->get_top_array_len() > 0)
                         m_front_extra_replies = m_queued_replies;
                     m_queued_replies = 0;
@@ -1607,7 +1610,7 @@ void shard_connection::process_response(void)
                     m_queued_replies = 0;
                 }
             }
-            if (++m_front_replies < replies + m_front_extra_replies && !r->is_error()) {
+            if (++m_front_replies < replies + m_front_extra_replies && !(first && top_error)) {
                 m_front_bytes += r->get_total_len();
                 continue;
             }

@@ -1658,6 +1658,13 @@ def test_multi_channel_subscribe_replies(env):
     # map refresh on a connection that is subscribed or inside the MULTI.
     if not env.isCluster():
         runs.append((["--command=WATCH w515", "--command=SET w515 v"] + sub + ["--command=EXEC"], 20, 1))
+        # A failing queued command: its error is an element of the EXEC
+        # array (not an error reply), and an owed confirmation can be
+        # followed by an error reply that still belongs to the EXEC.
+        runs.append((["--command=SET s515 x", "--command=MULTI", "--command=INCR s515",
+                      "--command=SUBSCRIBE c515a c515b", "--command=EXEC"], 20, 1))
+        runs.append((["--command=SET s515 x", "--command=MULTI", "--command=SUBSCRIBE c515a c515b c515c",
+                      "--command=INCR s515", "--command=GET s515", "--command=EXEC"], 24, 1))
     for txn, requests, pipeline in runs:
         memtier_ok, stderr, count = _pubsub_run(env, txn, requests=requests, pipeline=pipeline)
         what = "{} -n {} --pipeline={}".format(" ".join(a.split("=", 1)[1] for a in txn), requests, pipeline)
