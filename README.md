@@ -593,7 +593,7 @@ closed and left closed because it is not needed. With `--reconnect-on-error`,
 failing the run; reads can fall back to the primary. A replica that refuses
 the connection (`-ERR max number of clients`, ...) before its first reply is
 handled the same way, and with `--retry-on-error` the reads it held for resend
-are handed to the primary. Without that flag,
+are handed to the primary. Without `--reconnect-on-error`,
 `secondaryPreferred` keeps the existing setup-failure handling. `secondary`
 and `nearest` do not use this optional-replica exception: although routing
 may allow a primary fallback, an unrecovered setup rejection can still fail
