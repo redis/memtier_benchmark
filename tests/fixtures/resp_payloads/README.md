@@ -33,9 +33,9 @@ to regenerate, see the generator script described in PR #409.
 |---|---------|-------|-----------------|
 | 1 | `bulk_huge_length.bin` | `$1000000000\r\nABCD` then EOF | `rs_read_bulk` length-vs-content desync (`protocol.cpp:642`). Parser must wait for `m_bulk_len + 2` bytes without wrapping the unsigned-long cast. |
 | 2 | `bulk_neg_other.bin` | `$-2\r\n` | `m_bulk_len < 0` branch (`protocol.cpp:600`) with a non-`-1` negative length. Per RESP, only `$-1` is legal; the client treats any negative value as null-bulk but should not assert. |
-| 3 | `bulk_int_overflow.bin` | `$99999999999999999999\r\n` | `strtol` ERANGE at `protocol.cpp:591`; `errno` is not checked, value clamps to `LONG_MAX`, downstream `+2` cast then needs a `MEMTIER_MAX_BULK_LEN` ceiling. |
+| 3 | `bulk_int_overflow.bin` | `$99999999999999999999\r\n` | `strtol` ERANGE in the bulk-length branch of `parse_response`; the value clamps to `LONG_MAX`, so `m_bulk_len + 2` would overflow. Lengths above `LONG_MAX - 2` are rejected as a protocol error. |
 | 4 | `mbulk_deep_nest.bin` | `*1\r\n` x10000 + `+OK\r\n` | Nested-array destructor recursion when `m_last_response` tears down its tree; also `m_total_bulks_count` accounting under deep nesting. |
-| 5 | `mbulk_count_overflow.bin` | `*4294967295\r\n` | `m_total_bulks_count` is `unsigned int`; reaching `UINT_MAX` and then adding to it would wrap. |
+| 5 | `mbulk_count_overflow.bin` | `*4294967295\r\n` | Aggregate count above `INT_MAX` (previously truncated to `int` and read as a null array). Counts whose elements, plus the ones still outstanding, exceed `INT_MAX` are rejected as a protocol error. That bound keeps the RESP3 map doubling and the miss-tracking bookkeeping (both `int`) from overflowing, and keeps the `unsigned int` `m_total_bulks_count` within `int` range. |
 | 6 | `integer_overflow.bin` | `:99999999999999999999\r\n` | RESP integer line, `strtoll` overflow. The line is consumed via `evbuffer_readln`; the question is whether any consumer of the integer value (e.g. as a count) handles ERANGE. |
 | 7 | `resp3_verbatim_bad_prefix.bin` | `=15\r\nxxx:hello world\r\n` | RESP3 verbatim string with an invalid 3-char encoding prefix. The colon is at offset 3 but `xxx` is not a known encoding tag (`txt`, `mkd`, ...). |
 | 8 | `resp3_map_odd.bin` | `%3\r\n+k\r\n+v\r\n+k\r\n` | RESP3 map count `3` is doubled to `6` expected items, but only `3` follow. Tests the `*=2` desync on odd map counts and the EOF-before-end behavior. |
@@ -51,8 +51,8 @@ For every fixture, memtier_benchmark must:
 1. Exit on a non-fatal signal (no `SIGSEGV`, `SIGABRT`, `SIGBUS`, `SIGFPE`,
    `SIGILL`).
 2. Not print any of `Aborted`, `Segmentation fault`, `AddressSanitizer`,
-   `UndefinedBehaviorSanitizer`, `stack smashing detected`, `assertion
-   failed` to stderr.
+   `LeakSanitizer`, `UndefinedBehaviorSanitizer`, `runtime error:`,
+   `stack smashing detected`, `assertion failed` to stderr.
 3. Either exit on its own or be terminated cleanly by the harness within a
    15 s budget per fixture (hangs / spin loops are failures).
 

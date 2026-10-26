@@ -61,7 +61,7 @@ memtier_benchmark_CPPFLAGS = \
 	$(LIBSSL_CFLAGS)
 memtier_benchmark_SOURCES = \
 	platform_compat.h \
-	memtier_benchmark.cpp memtier_benchmark.h crash_report.h \
+	memtier_benchmark.cpp memtier_benchmark.h crash_report.h library_versions.h \
 	client.cpp client.h \
 	cluster_client.cpp cluster_client.h \
 	shard_connection.cpp shard_connection.h libevent_read_cap.h connections_manager.h \
@@ -174,7 +174,8 @@ reconnect_siblings_test_SOURCES = tests/unit/reconnect_siblings_test.cpp
 reconnect_siblings_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
 reconnect_siblings_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 reconnect_siblings_test_LDADD = $(filter-out memtier_benchmark-memtier_benchmark.$(OBJEXT),$(memtier_benchmark_OBJECTS)) $(memtier_benchmark_LDADD)
-# Restore parser value retention when a topology refresh completes or disconnects.
+# Restore parser value retention when a topology refresh completes or disconnects,
+# and keep a submitting client's start time on a refresh retry (#833).
 cluster_slots_retention_test_SOURCES = tests/unit/cluster_slots_retention_test.cpp
 cluster_slots_retention_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
 cluster_slots_retention_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
@@ -196,6 +197,11 @@ run_stats_merge_test_SOURCES = tests/unit/run_stats_merge_test.cpp
 run_stats_merge_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
 run_stats_merge_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 run_stats_merge_test_LDADD = $(filter-out memtier_benchmark-memtier_benchmark.$(OBJEXT),$(memtier_benchmark_OBJECTS)) $(memtier_benchmark_LDADD)
+# Build vs runtime libevent/OpenSSL series comparison.
+check_PROGRAMS += library_versions_test
+library_versions_test_SOURCES = tests/unit/library_versions_test.cpp library_versions.h
+library_versions_test_CPPFLAGS = -I$(srcdir)
+library_versions_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 # Crash report timestamp formatting and UTC offset (#681), against libc.
 crash_report_test_SOURCES = tests/unit/crash_report_test.cpp crash_report.h
 crash_report_test_CPPFLAGS = -I$(srcdir)
