@@ -42,6 +42,7 @@ from include import (
     TLS_CACERT,
     TLS_CERT,
     TLS_KEY,
+    env_password,
     memtier_auth_args,
     prom_scrape,
     wait_for_prometheus_url,
@@ -151,7 +152,7 @@ def _set_password(env, password):
 
 def _clear_password(env, password):
     # Restore the env's own password (REDIS_PASSWORD), if it has one.
-    original = _master(env).get("password") or ""
+    original = env_password(env) or ""
     try:
         for conn in _master_conns(env, password=password):
             conn.execute_command("CONFIG", "SET", "requirepass", original)

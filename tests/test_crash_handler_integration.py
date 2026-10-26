@@ -110,6 +110,28 @@ def test_crash_handler_with_active_connections(env):
         errors.append("Missing client list output section")
     if "=== MEMTIER_BENCHMARK BUG REPORT END" not in crash_output:
         errors.append("Missing bug report end marker")
+    # Library provenance: runtime and build-time versions.
+    for field in ("libevent_version:", "libevent_build_version:"):
+        if "# " + field not in crash_output:
+            errors.append(f"Missing {field} in info output")
+    version = subprocess.run([MEMTIER_BINARY, "--version"], capture_output=True, text=True, timeout=30).stdout
+    if " openssl=" in version:
+        for field in ("openssl_version:", "openssl_runtime_version:"):
+            if "# " + field not in crash_output:
+                errors.append(f"Missing {field} in info output")
+
+    # --version's libevent= is the runtime library and openssl= the build
+    # headers, the same as the INFO lines that existed before.
+    def info_value(field):
+        match = re.search(r"# " + field + r":(.*)$", crash_output, re.MULTILINE)
+        return match.group(1).strip() if match else None
+    version_line = version.splitlines()[0] if version else ""
+    libevent = re.search(r" libevent=(\S+)", version_line)
+    if libevent and info_value("libevent_version") != libevent.group(1):
+        errors.append(f"libevent_version is {info_value('libevent_version')!r}, --version says {libevent.group(1)!r}")
+    openssl = re.search(r" openssl=(.*?) prometheus=", version_line)
+    if openssl and info_value("openssl_version") != openssl.group(1):
+        errors.append(f"openssl_version is {info_value('openssl_version')!r}, --version says {openssl.group(1)!r}")
 
     # Verify CLIENT LIST OUTPUT contains expected information
     # Should have 2 threads with 2 clients each = 4 total client entries
@@ -428,21 +450,43 @@ def _tgkill(pid, tid, sig):
 _SYS_SLEEP = {"x86_64": (35, 230), "aarch64": (101, 115)}
 
 
-def _main_thread_sleeping(pid):
+def _main_thread_syscall(pid):
     """
-    True when the main thread of stopped process pid is in a nanosleep or
-    clock_nanosleep call made from libc. The sanitizer runtime makes its own
-    raw system calls, so the call must come from libc's code.
+    (system call number, pc) of the main thread of pid, from
+    /proc/<pid>/task/<pid>/syscall; None while it runs. The number is -1
+    when it is not in a system call.
     """
     try:
         with open(f"/proc/{pid}/task/{pid}/syscall") as f:
             fields = f.read().split()
-        number, pc = int(fields[0]), int(fields[-1], 16)
+        return int(fields[0]), int(fields[-1], 16)
     except PermissionError as e:
         # Reading it needs ptrace access; retrying would only time out.
         raise RuntimeError(f"cannot read the main thread's system call: {e}") from e
     except (OSError, ValueError, IndexError):
-        return False  # "running", or not in a system call ("-1 sp pc")
+        return None  # "running"
+
+
+def _main_thread_sleeping(pid, before=None):
+    """
+    True when the main thread of stopped process pid is in a nanosleep or
+    clock_nanosleep call made from libc. The sanitizer runtime makes its own
+    raw system calls, so the call must come from libc's code.
+
+    before is what _main_thread_syscall() read just before the SIGSTOP. arm64
+    clears the system call number before a group stop (do_signal() calls
+    forget_syscall() before get_signal()), so a thread stopped in a sleep
+    reads "-1 sp pc", with pc moved back to its svc instruction to restart
+    the call. So on arm64 a stop at the svc that before saw in a sleep
+    counts as that sleep.
+    """
+    current = _main_thread_syscall(pid)
+    if current is None:
+        return False
+    number, pc = current
+    if (number == -1 and platform.machine() == "aarch64" and before is not None
+            and pc == before[1] - 4):
+        number = before[0]
     if number not in _SYS_SLEEP.get(platform.machine(), ()):
         return False
     with open(f"/proc/{pid}/maps") as maps:
@@ -491,8 +535,9 @@ def _signal_tsan_main(pid, sig, timeout=10.0, while_stopped=None):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
+            before = _main_thread_syscall(pid)
             os.kill(pid, signal.SIGSTOP)
-            if _wait_stopped(pid) and _main_thread_sleeping(pid):
+            if _wait_stopped(pid) and _main_thread_sleeping(pid, before):
                 if while_stopped is not None:
                     while_stopped()
                 if not _tgkill(pid, pid, sig):

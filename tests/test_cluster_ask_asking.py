@@ -147,11 +147,8 @@ def _run(env, label, extra_args, pipeline, transaction=False, kill=False, reques
     addTLSArgs(benchmark_specs, env)
     config = get_default_memtier_config(threads=threads, clients=clients, requests=requests)
     config["memtier_benchmark"]["pipeline"] = pipeline
+    # Also forwards --oss_password: resends after a reconnect must follow AUTH (#527).
     add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
-    password = env.getOSSMasterNodesConnectionList()[0].connection_pool.connection_kwargs.get("password")
-    if password:
-        # e.g. --oss_password: resends after a reconnect must follow AUTH (#527).
-        benchmark_specs["args"].append("--authenticate=" + password)
     run_config = RunConfig(tempfile.mkdtemp(), env.testName, config, {})
     ensure_clean_benchmark_folder(run_config.results_dir)
     failed_keys = os.path.join(run_config.results_dir, "failed-keys.csv")
