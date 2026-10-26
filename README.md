@@ -305,6 +305,15 @@ error reply counts as connection progress, so `--connection-stage-timeout`
 does not bound these retries. Use a finite `--max-retries` or `--test-time`
 to bound such a workload; requests still count only on success or exhaustion.
 
+These three replies are not workload errors but connection rejections:
+`-ERR Protocol error:`, `-ERR max number of clients` and `-DENIED Redis is
+running in protected mode`. Redis closes the connection after sending them. They
+are not counted as ops and cannot complete `--requests` or `--test-time`, and
+they do not count as connection progress. memtier handles them as a dropped
+connection: without `--reconnect-on-error` the thread ends and the run fails
+(exit code 1). With it, memtier reconnects (see Reconnecting after connection
+errors).
+
 With `--retry-on-error`, JSON `Totals` includes integer `Errors`, `Retry Attempts`
 and `Retried Ops` counters, including zeros. `Errors` exposes logical failures
 recorded by retry handling, including terminal errors, retry exhaustion and
@@ -313,6 +322,10 @@ abandoned replays; it is distinct from `Connection Errors`.
 and `Retried Ops` counts requests queued for retry at least once. These counters
 are totals for the run, without per-command attribution. They do not change
 request completion or exit-code behavior.
+A connection rejection (see above) is not a retried error reply. The request
+it arrived for is held for replay on the reconnect, as on any dropped
+connection, so it adds to neither `Retry Attempts` nor `Retried Ops`. It counts
+in `Connection Errors`, and in `Errors` if it is abandoned, never resent.
 
 ### Repeated runs (`--run-count`)
 
@@ -577,7 +590,10 @@ Replica setup rejection (AUTH, SELECT or HELLO) has a separate policy from
 routing around an unavailable node. Under `primary`, a rejected replica is
 closed and left closed because it is not needed. With `--reconnect-on-error`,
 `secondaryPreferred` also closes such a replica without redialing it or
-failing the run; reads can fall back to the primary. Without that flag,
+failing the run; reads can fall back to the primary. A replica that refuses
+the connection (`-ERR max number of clients`, ...) before its first reply is
+handled the same way, and with `--retry-on-error` the reads it held for resend
+are handed to the primary. Without `--reconnect-on-error`,
 `secondaryPreferred` keeps the existing setup-failure handling. `secondary`
 and `nearest` do not use this optional-replica exception: although routing
 may allow a primary fallback, an unrecovered setup rejection can still fail
@@ -674,7 +690,13 @@ run's stop condition:
   - A required connection whose setup step (AUTH, SELECT, HELLO) was rejected
     since its last reply fails the run instead (exit code 1), as when setup
     keeps failing at the deadline. The optional-replica exceptions are
-    described under Read Preference above.
+    described under Read Preference above. A connection refused with
+    `-ERR max number of clients` or `-DENIED Redis is running in protected
+    mode` before its first reply counts as such a rejected setup; after a
+    reply it is a dropped connection. `-ERR Protocol error:` is caused by the
+    request (e.g. a value above `proto-max-bulk-len`), so it is a dropped
+    connection once the client got any reply, and a rejected setup only for a
+    client that never got one.
   - A connection that a live server drops around the deadline is still
     reconnected once, so requests held for replay are resent; if that
     reconnect fails or is dropped again, the run ends. So a peer that accepts

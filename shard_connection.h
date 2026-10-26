@@ -171,6 +171,7 @@ public:
     void disconnect_after_error();
     void end_thread(const char *reason, const char *thread_end_reason);
     void reconnect_after_setup_error(const char *error_context, bool setup_step = true);
+    void handle_connection_rejection(request *req, const char *status);
     // Reconnects stop at the --test-time deadline (#656) only with
     // --reconnect-on-error and unlimited --max-reconnect-attempts; a finite
     // bound keeps master's behaviour.
@@ -384,6 +385,7 @@ public:
     bool retry_queue_holds_new_work() const;
 
 private:
+    void drop_unanswered_request(request *req, unsigned long long *dropped, unsigned long long *abandoned);
     // request::m_key is read by --failed-keys-file and, under --retry-on-error,
     // by cluster MOVED/ASK retry, replay and -READONLY routing; skip the copy
     // when neither is on.
@@ -528,6 +530,12 @@ private:
     // reply (errors included): a failed connect after the run is over then
     // fails the run (#630).
     bool m_setup_failed_since_reply;
+    // A workload reply arrived since this connection was established, so a
+    // later connection rejection is a drop, not a setup failure. It cannot be
+    // !m_setup_failed_since_reply: that one starts false and carries across
+    // reconnects until the next reply (#630), while this one must start false
+    // on every new connection (cleared in disconnect()).
+    bool m_reply_since_connect;
     // The pending rejected-setup reconnect follows an empty or error CLUSTER
     // SLOTS reply (with m_setup_rejected), and whether this connection already
     // got its one refresh after the run was over (never cleared).

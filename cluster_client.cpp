@@ -1516,49 +1516,7 @@ bool cluster_client::handle_cluster_slots(unsigned int conn_id, protocol_respons
             // pipeline, replays hand_off_replay_requests() can't place) frees
             // --requests and in-flight budget, so wake the producers below.
             retired_any = true;
-            // Flush staged monitor commands unconditionally for any retired shard,
-            // regardless of its connection state. A shard can be already disconnected
-            // (TCP dropped mid-run) while still holding staged commands that were
-            // counted in m_reqs_generated at staging time. hold_pipeline() returns
-            // true for disconnected connections so those entries would never self-drain;
-            // compensate m_reqs_generated now to prevent a --requests hang.
-            if (!m_staged_monitor_commands[i].empty()) {
-                std::queue<staged_monitor_cmd> empty_staged;
-                std::swap(m_staged_monitor_commands[i], empty_staged);
-                // Defensive clamp: entries in empty_staged are popped before
-                // m_reqs_generated is decremented so underflow cannot occur today,
-                // but guard explicitly so a future refactor does not silently wrap
-                // to 2^64.  Matches the pattern at hold_pipeline.
-                {
-                    const size_t n = empty_staged.size();
-                    m_reqs_generated -= (m_reqs_generated >= n) ? n : m_reqs_generated;
-                }
-            }
-            // Same hang for the cross-shard read queue: get_key_for_conn ->
-            // create_request_for_other pushes (cmd_idx, key_idx) pairs onto
-            // m_key_index_pools[i] AFTER m_reqs_generated was incremented
-            // (client.cpp:656). A retired shard's pool would otherwise be
-            // discarded by the connection's destructor without compensating
-            // the counter, stranding the run. Pair semantics -> divide by 2.
-            if (!m_key_index_pools[i]->empty()) {
-                key_index_pool empty_queue;
-                std::swap(*m_key_index_pools[i], empty_queue);
-                {
-                    const size_t n = empty_queue.size() / 2;
-                    m_reqs_generated -= (m_reqs_generated >= n) ? n : m_reqs_generated;
-                }
-            }
-            if (m_connections[i]->get_connection_state() != conn_disconnected) {
-                // This can be the connection whose CLUSTER SLOTS reply is
-                // being handled: its process_response() stops parsing once
-                // it sees the disconnect.
-                m_connections[i]->disconnect();
-            }
-            // With --retry-on-error, disconnect() kept the in-flight and
-            // retry-queued requests for resend after a reconnect, still
-            // counted as generated. A retired connection doesn't reconnect,
-            // so without this a --requests run ends short of its count.
-            hand_off_replay_requests(i);
+            release_retired_connection(i);
         }
     }
 
@@ -3118,6 +3076,71 @@ bool cluster_client::retry_after_moved(unsigned int conn_id, request *req, proto
     // not own.
     req->m_asking = false;
     return enqueue_redirect_retry(target, req);
+}
+
+// Release what a connection closed for good still holds: staged monitor
+// commands and the cross-shard read queue (both already counted as
+// generated), its pipeline, and the requests held for resend, which go to
+// the connections that now own their slots.
+void cluster_client::release_retired_connection(unsigned int conn_id)
+{
+    // Flush staged monitor commands unconditionally for any retired shard,
+    // regardless of its connection state. A shard can be already disconnected
+    // (TCP dropped mid-run) while still holding staged commands that were
+    // counted in m_reqs_generated at staging time. hold_pipeline() returns
+    // true for disconnected connections so those entries would never self-drain;
+    // compensate m_reqs_generated now to prevent a --requests hang.
+    if (!m_staged_monitor_commands[conn_id].empty()) {
+        std::queue<staged_monitor_cmd> empty_staged;
+        std::swap(m_staged_monitor_commands[conn_id], empty_staged);
+        // Defensive clamp: entries in empty_staged are popped before
+        // m_reqs_generated is decremented so underflow cannot occur today,
+        // but guard explicitly so a future refactor does not silently wrap
+        // to 2^64.  Matches the pattern at hold_pipeline.
+        {
+            const size_t n = empty_staged.size();
+            m_reqs_generated -= (m_reqs_generated >= n) ? n : m_reqs_generated;
+        }
+    }
+    // Same hang for the cross-shard read queue: get_key_for_conn ->
+    // create_request_for_other pushes (cmd_idx, key_idx) pairs onto
+    // m_key_index_pools[conn_id] AFTER m_reqs_generated was incremented
+    // (client.cpp:656). A retired shard's pool would otherwise be
+    // discarded by the connection's destructor without compensating
+    // the counter, stranding the run. Pair semantics -> divide by 2.
+    if (!m_key_index_pools[conn_id]->empty()) {
+        key_index_pool empty_queue;
+        std::swap(*m_key_index_pools[conn_id], empty_queue);
+        {
+            const size_t n = empty_queue.size() / 2;
+            m_reqs_generated -= (m_reqs_generated >= n) ? n : m_reqs_generated;
+        }
+    }
+    if (m_connections[conn_id]->get_connection_state() != conn_disconnected) {
+        // This can be the connection whose CLUSTER SLOTS reply is
+        // being handled: its process_response() stops parsing once
+        // it sees the disconnect.
+        m_connections[conn_id]->disconnect();
+    }
+    // With --retry-on-error, disconnect() kept the in-flight and
+    // retry-queued requests for resend after a reconnect, still
+    // counted as generated. A retired connection doesn't reconnect,
+    // so without this a --requests run ends short of its count.
+    hand_off_replay_requests(conn_id);
+}
+
+// A replica connection closed as not needed (shard_connection::
+// reconnect_after_setup_error()). It stays in the topology but is never
+// redialled, so release what it holds as for a connection a slot map refresh
+// retires, and wake the producers, as handle_cluster_slots() does then.
+void cluster_client::handle_connection_retired(unsigned int conn_id)
+{
+    release_retired_connection(conn_id);
+    for (size_t i = 0; i < m_connections.size(); i++) {
+        if (i != conn_id && m_connections[i]->get_connection_state() != conn_disconnected) {
+            m_connections[i]->schedule_fill();
+        }
+    }
 }
 
 void cluster_client::hand_off_replay_requests(unsigned int conn_id)
