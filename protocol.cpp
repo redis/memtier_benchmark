@@ -732,9 +732,9 @@ int redis_protocol::parse_response(void)
                 // parent.
                 long long outstanding = m_total_bulks_count > 0 ? (long long) m_total_bulks_count - 1 : 0;
                 // A tracked nested aggregate also adds count - 1 to
-                // m_nested_remaining. That is not always bounded by
-                // m_total_bulks_count: a nested attribute takes a parent slot
-                // without being tracked. Bound it directly.
+                // m_nested_remaining. Don't rely on m_total_bulks_count to
+                // bound it (an attribute, drained in its own scope, takes no
+                // parent slot); bound it directly.
                 bool tracked_nested = m_track_elem_misses && m_tracking && m_nested_remaining > 0 &&
                                       m_total_bulks_count > 0 && !m_push && line[0] != '|' && line[0] != '>';
                 if (tracked_nested && (long long) m_nested_remaining - 1 > outstanding) {

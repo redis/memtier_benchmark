@@ -476,8 +476,8 @@ static void check_length_limits()
           "nested counts up to INT_MAX outstanding wait");
     check(parse_reply(PROTOCOL_RESP2, "*2\r\n*2147483646\r\n*3\r\n", true) == -1,
           "reject nested counts above INT_MAX outstanding");
-    // A nested attribute takes a parent slot without being tracked, so the
-    // tracked nested bookkeeping can exceed the outstanding element count.
+    // A nested attribute takes no parent slot and is not tracked (#458); the
+    // tracked nested bookkeeping is still bounded.
     check(parse_reply(PROTOCOL_RESP3, "*1\r\n*2\r\n|0\r\n*2147483647\r\n", true) == -1,
           "reject nested count overflowing tracked elements after a nested attribute");
     check(parse_reply(PROTOCOL_RESP3, "*1\r\n*2\r\n|0\r\n*2147483646\r\n", true) == 0,
