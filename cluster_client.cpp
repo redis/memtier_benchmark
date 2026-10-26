@@ -1625,6 +1625,36 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         }
     }
 
+    /* A keyless --command has no slot, so create_arbitrary_request() sends it
+     * on the connection that produces it. Under rp_primary nothing goes to a
+     * replica; under the other preferences a replica may produce any keyless
+     * command except one that may write (or is unknown), which the replica
+     * would reject with -READONLY. Leave those to the primaries, as 2.4 did
+     * (#676). Pooled keys and staged monitor commands are still drained, and
+     * --monitor-input lines route themselves. */
+    if (m_connections[conn_id]->is_replica() && m_config->arbitrary_commands->is_defined() &&
+        m_key_index_pools[conn_id]->empty() && m_staged_monitor_commands[conn_id].empty()) {
+        const arbitrary_command &cmd = get_arbitrary_command(m_executed_command_index);
+        const bool monitor = cmd.command_args.size() == 1 && cmd.command_args[0].type == monitor_random_type;
+        // WAIT/WAITAOF carry no write flag, but a replica rejects them too.
+        const bool replica_rejects =
+            cmd.spec != NULL && (strcmp(cmd.spec->name, "WAIT") == 0 || strcmp(cmd.spec->name, "WAITAOF") == 0);
+        const bool may_write = !is_read_command_index(m_executed_command_index) &&
+                               (cmd.spec == NULL || cmd.spec->may_write || replica_rejects);
+        // keys_count, not has_keys(): a literal key (no __key__) is not
+        // routed by slot either, so the hold covers it as well. Like any
+        // keyless command it is held only as described above: a literal-key
+        // read such as "GET foo" under secondary still goes to a replica.
+        if (cmd.keys_count == 0 && !monitor && (m_config->read_preference == rp_primary || may_write)) {
+            // A primary may itself be parked (e.g. by the in-flight budget
+            // above) with nothing in flight; this replica no longer produces,
+            // so wake one, or the event loop runs dry and the thread ends.
+            unsigned int primary = fallback_primary_conn_id();
+            if (primary < m_connections.size()) m_connections[primary]->schedule_fill();
+            return true;
+        }
+    }
+
     /* In GET-only MGET mode, a connection whose slots own no keys in the
      * configured key range can never generate a request.  Returning true here
      * breaks the fill_pipeline while-loop for that connection so it does not
@@ -2448,6 +2478,10 @@ bool cluster_client::create_arbitrary_request(unsigned int command_index, struct
             return false;
         }
         client::create_arbitrary_request(command_index, timestamp, send_conn_id);
+        // The destination may be paused (bufferevent disabled when it went
+        // idle, e.g. a replica held for a keyless write): re-enable it so the
+        // request is flushed, as the keyed path does after pushing to a pool.
+        if (send_conn_id != conn_id) m_connections[send_conn_id]->schedule_fill();
         if (is_read) {
             m_strict_no_route_attempts = 0;
             record_read_routing(command_index, m_connections[send_conn_id]->is_replica());

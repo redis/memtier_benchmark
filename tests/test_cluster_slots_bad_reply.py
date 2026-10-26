@@ -10,6 +10,7 @@ must reconnect with --reconnect-on-error, or else fail the run.
 
 test_connection_setup_rejected reuses the scripted _Node and _run().
 """
+import collections
 import socketserver
 import subprocess
 import threading
@@ -81,6 +82,8 @@ class _Node(socketserver.ThreadingTCPServer):
         self.readonly_requests = 0
         self.slots_requests = 0
         self.data_requests = 0
+        # Requests received, by command name.
+        self.commands = collections.Counter()
         self.errors = []
 
     def slots_reply(self):
@@ -125,6 +128,8 @@ class _Handler(socketserver.StreamRequestHandler):
                     size = self.rfile.readline()
                     args.append(self.rfile.read(int(size[1:]) + 2)[:-2])
                 verb = args[0].upper()
+                with node.lock:
+                    node.commands[verb] += 1
                 if verb == b"CLUSTER":
                     reply = node.slots_reply()
                 elif verb == b"SELECT" and node.select_error:
