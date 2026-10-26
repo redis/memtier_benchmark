@@ -16,9 +16,6 @@ def _run(env, extra, seconds=None, requests=None):
     addTLSArgs(specs, env)
     config = get_default_memtier_config(threads=1, clients=1, requests=requests, test_time=seconds)
     add_required_env_arguments(specs, config, env, env.getMasterNodesList())
-    password = env.getConnection().connection_pool.connection_kwargs.get("password")
-    if password:
-        specs["args"].append("--authenticate=" + password)
     with tempfile.TemporaryDirectory() as directory:
         config = RunConfig(directory, env.testName, config, {})
         os.makedirs(config.results_dir)

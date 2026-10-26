@@ -171,6 +171,7 @@ public:
     void disconnect_after_error();
     void end_thread(const char *reason, const char *thread_end_reason);
     void reconnect_after_setup_error(const char *error_context, bool setup_step = true);
+    void handle_connection_rejection(request *req, const char *status);
     // Reconnects stop at the --test-time deadline (#656) only with
     // --reconnect-on-error and unlimited --max-reconnect-attempts; a finite
     // bound keeps master's behaviour.
@@ -186,8 +187,10 @@ public:
     double next_reconnect_delay(void);
     bool stop_reconnecting_if_run_over(void);
     // siblings_done() and end_client_after_run() are public only for
-    // tests/unit/reconnect_siblings_test.cpp.
+    // tests/unit/reconnect_siblings_test.cpp; may_send_again() is also used by
+    // client::idle_connection_waits_for_connect().
     bool siblings_done(void);
+    bool may_send_again(void);
     void end_client_after_run(bool end_stats);
     void warn_reconnecting_indefinitely(void);
 
@@ -383,6 +386,7 @@ public:
     bool retry_queue_holds_new_work() const;
 
 private:
+    void drop_unanswered_request(request *req, unsigned long long *dropped, unsigned long long *abandoned);
     // request::m_key is read by --failed-keys-file and, under --retry-on-error,
     // by cluster MOVED/ASK retry, replay and -READONLY routing; skip the copy
     // when neither is on.
@@ -392,7 +396,7 @@ private:
     static void deferred_connect_error_handler(evutil_socket_t, short, void *);
     void cancel_deferred_connect_error();
 #endif
-    void setup_event(evutil_socket_t sockfd);
+    bool setup_event(evutil_socket_t sockfd);
     evutil_socket_t setup_socket(struct connect_info *addr);
     void set_readable_id();
 
@@ -406,6 +410,8 @@ private:
     // True while a CLUSTER SLOTS refresh must wait for the pinned
     // --transaction rotation this connection drives to close its MULTI.
     bool setup_held_for_transaction();
+    // Whether fill_pipeline() would send a setup step now.
+    bool setup_step_sendable();
     void send_conn_setup_commands(struct timeval timestamp);
     void restore_cluster_slots_value_policy();
     // Schedule a fill on every other connected connection of this client, so
@@ -525,6 +531,12 @@ private:
     // reply (errors included): a failed connect after the run is over then
     // fails the run (#630).
     bool m_setup_failed_since_reply;
+    // A workload reply arrived since this connection was established, so a
+    // later connection rejection is a drop, not a setup failure. It cannot be
+    // !m_setup_failed_since_reply: that one starts false and carries across
+    // reconnects until the next reply (#630), while this one must start false
+    // on every new connection (cleared in disconnect()).
+    bool m_reply_since_connect;
     // The pending rejected-setup reconnect follows an empty or error CLUSTER
     // SLOTS reply (with m_setup_rejected), and whether this connection already
     // got its one refresh after the run was over (never cleared).

@@ -1069,8 +1069,8 @@ def _run_transaction_with_kills(env, extra_args, requests=None, test_time=None, 
                                 set_ratio=1, max_waves=None, until_dropped=False):
     """Run a MULTI/SET/EXEC --transaction rotation while memtier's clients on
     every primary are killed every kill_interval seconds, at most max_waves
-    times. Each wave waits until memtier has sent a MULTI since the last one,
-    so no wave lands while every connection is still reconnecting. With
+    times. Each wave holds memtier's writes (CLIENT PAUSE WRITE) and goes in
+    once a server holds one, so it always finds a request in flight. With
     until_dropped, the waves stop once a kill has dropped an in-flight
     request (a transaction-not-replayed row in --failed-keys-file).
 
@@ -1111,16 +1111,18 @@ def _run_transaction_with_kills(env, extra_args, requests=None, test_time=None, 
 
     poll_errors = []
 
-    def multi_calls():
-        try:
-            return sum(conn.execute_command("INFO", "commandstats").get("cmdstat_multi", {}).get("calls", 0)
-                       for conn in conns)
-        except Exception as e:
-            # Polled every 1ms: log the first failure only.
-            if not poll_errors:
-                env.debugPrint("INFO commandstats failed: {}".format(e), True)
-            poll_errors.append(e)
-            return -1
+    def blocked():
+        """Whether a server holds a write of one of memtier's connections."""
+        for conn, ids in zip(conns, harness):
+            try:
+                if any(int(c["id"]) not in ids and "b" in c["flags"] for c in conn.client_list(_type="normal")):
+                    return True
+            except Exception as e:
+                # Polled every 1ms: log the first failure only.
+                if not poll_errors:
+                    env.debugPrint("CLIENT LIST failed: {}".format(e), True)
+                poll_errors.append(e)
+        return False
 
     def dropped():
         try:
@@ -1129,26 +1131,51 @@ def _run_transaction_with_kills(env, extra_args, requests=None, test_time=None, 
         except OSError:
             return False
 
+    def kill_wave(proc, end):
+        """Kill memtier's clients once the servers hold one of its requests.
+
+        CLIENT PAUSE WRITE holds the next SET (or EXEC of a queued write)
+        each running client sends, unanswered, so every kill drops a request.
+        Returns how many clients were killed, or None if memtier exited or
+        nothing was held by end.
+        """
+        try:
+            # Hold writes for as long as this wave may wait; the finally
+            # unpauses as soon as it is done.
+            pause_ms = max(1000, int((end - time.time() + 1) * 1000))
+            for conn in conns:
+                conn.execute_command("CLIENT", "PAUSE", pause_ms, "WRITE")
+            while not blocked():
+                if proc.poll() is not None or time.time() >= end:
+                    return None
+                time.sleep(0.001)
+            return kill_memtier_clients(env, conns, harness)
+        finally:
+            # Unpause every primary, also the ones after one that fails.
+            for conn in conns:
+                try:
+                    conn.execute_command("CLIENT", "UNPAUSE")
+                except Exception as e:
+                    env.debugPrint("CLIENT UNPAUSE failed: {}".format(e), True)
+
     def kill_loop(proc):
         end = time.time() + (test_time - 1 if test_time else 60)
-        last = 0
-        while time.time() < end and proc.poll() is None and (max_waves is None or len(kills) < max_waves):
+        # The first wave may wait through a slow connect, but not forever.
+        first_end = end + 30
+        while proc.poll() is None and (max_waves is None or len(kills) < max_waves):
             # memtier logs a dropped request once it handles the kill, so look
             # for it after kill_interval, not right after the kill.
-            if until_dropped and dropped():
+            if (until_dropped and dropped()) or (kills and time.time() >= end):
                 break
-            # Each wave goes in as soon as memtier has sent a MULTI since the
-            # last one. The first one is not one kill_interval in: a fast
-            # runner can finish a --requests run within kill_interval, and
-            # nothing is killed (#682).
-            calls = multi_calls()
-            while calls <= last and time.time() < end and proc.poll() is None:
-                time.sleep(0.001)
-                calls = multi_calls()
-            if calls <= last:
+            # Each wave goes in as soon as memtier has a request held. The
+            # first one is not one kill_interval in: a fast runner can finish a
+            # --requests run within kill_interval, and nothing is killed
+            # (#682). It gets until first_end, not end: a slow runner can take
+            # most of the run to connect.
+            killed = kill_wave(proc, end if kills else first_end)
+            if killed is None:
                 break
-            last = calls
-            kills.append(kill_memtier_clients(env, conns, harness))
+            kills.append(killed)
             time.sleep(kill_interval)
 
     rc, stderr_content = _run_with_background(env, benchmark, config, kill_loop, timeout=(test_time or 60) + 30)
@@ -1237,7 +1264,8 @@ def test_transaction_lost_multi_is_not_continued(env):
         env.skip()
         return
     # Long blocks, so most kills land inside one; a --pipeline that does not
-    # divide the rotation, so the kill does not always find it at a boundary.
+    # divide the rotation, so the clients killed along with the held one are
+    # caught at different points of it.
     get_ratio, pipeline = 50, 7
     rc, stderr_content, killed, errors, _ = _run_transaction_with_kills(
         env, ["--command=GET __key__", "--command-ratio={}".format(get_ratio)], test_time=6, kill_interval=0.3,
@@ -1319,8 +1347,7 @@ def _replay_churn_run(env, extra_args, password=None):
     finally:
         if password is not None:
             # Restore the env's own password (REDIS_PASSWORD), if it has one.
-            admin.execute_command("CONFIG", "SET", "requirepass",
-                                  admin.connection_pool.connection_kwargs.get("password") or "")
+            admin.execute_command("CONFIG", "SET", "requirepass", env_password(env) or "")
 
     env.assertGreaterEqual(sum(kills), 1, message="no CLIENT KILL wave found a memtier connection")
     env.assertGreaterEqual(stderr_content.count("Reconnection successful"), 1,
