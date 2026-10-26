@@ -372,6 +372,12 @@ jobs:
     # Only publish on actual releases (not prereleases or workflow_dispatch)
     if: github.event_name == 'release' && github.event.release.prerelease == false
     steps:
+    - name: Checkout the apt helper
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      with:
+        sparse-checkout: utils/apt_install.sh
+        sparse-checkout-cone-mode: false
+
     - name: Setup RPM Signing key
       # Same key used for the DEB pipeline (APT_SIGNING_KEY); name retained
       # for parity with existing secret naming.
@@ -390,11 +396,10 @@ jobs:
 
     - name: Install createrepo and verify AWS CLI
       run: |
-        sudo apt-get update
         # awscli is no longer in apt on Ubuntu 24.04 (noble); the GitHub-hosted
         # ubuntu-latest runner ships AWS CLI v2 pre-installed at
         # /usr/local/bin/aws, so we only need to install the rpm tooling here.
-        sudo apt-get install -y createrepo-c rpm
+        ./utils/apt_install.sh -y createrepo-c rpm
         aws --version
 
     - name: Sign RPMs

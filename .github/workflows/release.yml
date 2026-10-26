@@ -74,8 +74,7 @@ jobs:
         fi
     - name: Install dependencies
       run: |
-          sudo apt-get update && \
-          sudo apt-get install \
+          repo/utils/apt_install.sh \
             build-essential autoconf automake libevent-dev \
             pkg-config zlib1g-dev libssl-dev libboost-all-dev cmake flex \
             debhelper dput
@@ -135,8 +134,7 @@ jobs:
         APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
     - name: Install dependencies
       run: |
-          sudo apt-get update && \
-          sudo apt-get install \
+          ./utils/apt_install.sh \
             sbuild debhelper
           sudo sbuild-adduser $USER
     - name: Prepare sbuild environment

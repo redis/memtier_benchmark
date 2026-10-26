@@ -1347,8 +1347,7 @@ def _replay_churn_run(env, extra_args, password=None):
     finally:
         if password is not None:
             # Restore the env's own password (REDIS_PASSWORD), if it has one.
-            admin.execute_command("CONFIG", "SET", "requirepass",
-                                  admin.connection_pool.connection_kwargs.get("password") or "")
+            admin.execute_command("CONFIG", "SET", "requirepass", env_password(env) or "")
 
     env.assertGreaterEqual(sum(kills), 1, message="no CLIENT KILL wave found a memtier connection")
     env.assertGreaterEqual(stderr_content.count("Reconnection successful"), 1,

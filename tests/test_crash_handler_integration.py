@@ -110,6 +110,28 @@ def test_crash_handler_with_active_connections(env):
         errors.append("Missing client list output section")
     if "=== MEMTIER_BENCHMARK BUG REPORT END" not in crash_output:
         errors.append("Missing bug report end marker")
+    # Library provenance: runtime and build-time versions.
+    for field in ("libevent_version:", "libevent_build_version:"):
+        if "# " + field not in crash_output:
+            errors.append(f"Missing {field} in info output")
+    version = subprocess.run([MEMTIER_BINARY, "--version"], capture_output=True, text=True, timeout=30).stdout
+    if " openssl=" in version:
+        for field in ("openssl_version:", "openssl_runtime_version:"):
+            if "# " + field not in crash_output:
+                errors.append(f"Missing {field} in info output")
+
+    # --version's libevent= is the runtime library and openssl= the build
+    # headers, the same as the INFO lines that existed before.
+    def info_value(field):
+        match = re.search(r"# " + field + r":(.*)$", crash_output, re.MULTILINE)
+        return match.group(1).strip() if match else None
+    version_line = version.splitlines()[0] if version else ""
+    libevent = re.search(r" libevent=(\S+)", version_line)
+    if libevent and info_value("libevent_version") != libevent.group(1):
+        errors.append(f"libevent_version is {info_value('libevent_version')!r}, --version says {libevent.group(1)!r}")
+    openssl = re.search(r" openssl=(.*?) prometheus=", version_line)
+    if openssl and info_value("openssl_version") != openssl.group(1):
+        errors.append(f"openssl_version is {info_value('openssl_version')!r}, --version says {openssl.group(1)!r}")
 
     # Verify CLIENT LIST OUTPUT contains expected information
     # Should have 2 threads with 2 clients each = 4 total client entries

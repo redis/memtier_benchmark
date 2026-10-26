@@ -4,6 +4,7 @@ import binascii
 import csv
 import json
 import os
+import re
 import socketserver
 import subprocess
 import tempfile
@@ -178,7 +179,7 @@ class _Handler(socketserver.StreamRequestHandler):
             node.errors.append(repr(error))
 
 
-def _run(env, node, args, expected_exit=0, timeout=8, seed_replica=False):
+def _run(env, node, args, expected_exit=0, timeout=8, seed_replica=False, watch=None):
     if env.isCluster() or env.useTLS:
         node.server_close()
         if node.replica:
@@ -218,7 +219,24 @@ def _run(env, node, args, expected_exit=0, timeout=8, seed_replica=False):
                 command.extend(["--ratio=1:0", "--key-pattern=S:S"])
             command += args
             started = time.monotonic()
-            result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+            if watch is None:
+                result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+            else:
+                # Hand each stderr line to watch while memtier runs.
+                with subprocess.Popen(
+                    command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
+                ) as process:
+                    lines = []
+                    deadline = threading.Timer(timeout, process.kill)
+                    deadline.start()
+                    try:
+                        for line in process.stderr:
+                            lines.append(line)
+                            watch(line)
+                        process.wait()
+                    finally:
+                        deadline.cancel()
+                result = subprocess.CompletedProcess(command, process.returncode, "", "".join(lines))
             node.run_elapsed = time.monotonic() - started
             env.assertEqual(result.returncode, expected_exit, message=result.stderr[-3000:])
             with open(path) as source:
@@ -727,3 +745,150 @@ def test_owned_monitor_waits_for_primary_refresh(env):
         env.assertEqual(node.replica.requests, [])
         env.assertEqual(stats["Totals"]["Count"], 40)
         env.assertEqual([command for command in node.workload if command[0] == b"SET"], expected)
+
+
+class _HealingPrimaries(_Node):
+    """Primary A advertises only 0-8191. Once allow_heal is set and a request
+    has hit an unowned slot, the next CLUSTER SLOTS adds primary B for
+    8192-16383 (#825)."""
+
+    def __init__(self):
+        super().__init__([(0, 8191)])
+        self.second = _Node([(0, 16383)])
+        self.second.root = self
+        self.second.topology = self.topology
+        self.extra = [self.second]
+        self.allow_heal = threading.Event()
+
+    def topology(self):
+        with self.lock:
+            self.slots_calls += 1
+            if self.error_keys and self.allow_heal.is_set():
+                self.ranges = [(0, 16383)]
+            healed = len(self.ranges) == 1 and self.ranges[0] == (0, 16383)
+        owners = [(0, 8191, self)] + ([(8192, 16383, self.second)] if healed else [])
+        reply = b"*" + str(len(owners)).encode() + b"\r\n"
+        for low, high, owner in owners:
+            reply += (
+                b"*3\r\n:"
+                + str(low).encode()
+                + b"\r\n:"
+                + str(high).encode()
+                + b"\r\n*2\r\n$9\r\n127.0.0.1\r\n:"
+                + str(owner.server_address[1]).encode()
+                + b"\r\n"
+            )
+        return reply
+
+
+def test_percentile_bound_follows_healed_topology(env):
+    """The percentile warning's bound must cover connections opened when a
+    partial map heals (#825). At 100 req/s (burst 2) for 6s a connection
+    sends at most 100 x 6 + 2 x 2 = 604 requests, and at most 100 x 2 + 2 =
+    202 in a 1s window. The run starts on one primary (604, window 202) and,
+    once the first warnings are printed, heals to two (1208, window 404):
+    p99.7 (needs 334) loses its window warning, p99.9 (needs 1000) trades
+    its run warning for a window one, and p99.95 (needs 2000) stays
+    unresolved with the raised bound. Each is updated exactly once, every
+    win1s row still marks the percentiles warned about, and p50 never
+    warns."""
+    node = _HealingPrimaries()
+
+    def watch(line):
+        if line.startswith("warning: p99.95 needs"):
+            node.allow_heal.set()
+
+    stats, _, stderr = _run(
+        env,
+        node,
+        [
+            "--test-time=6",
+            "--rate-limiting=100",
+            "--key-maximum=1000",
+            "--realtime-latencies",
+            "--latency-window=1",
+            "--print-percentiles=50,99.7,99.9,99.95",
+        ],
+        timeout=30,
+        watch=watch,
+    )
+    # B served traffic, and the run stays within the last stated bound (it
+    # usually exceeds the first one, but how far depends on when it heals).
+    env.assertGreater(len(node.second.requests), 0, message=stderr[-3000:])
+    env.assertLessEqual(stats["Totals"]["Count"], 1208, message=stderr[-3000:])
+    first = [
+        "warning: p99.7 needs at least 334 latency samples, but the 1s latency window holds at most about 202; "
+        "the win1s row marks it with '*'.",
+        "warning: p99.9 needs at least 1000 latency samples, but this run records at most about 604, "
+        "so it will not be resolved.",
+        "warning: p99.95 needs at least 2000 latency samples, but this run records at most about 604, "
+        "so it will not be resolved.",
+    ]
+    update = [
+        "warning: the cluster topology grew to 2 rate-limited connections, so the percentile sample bounds "
+        "above are raised:",
+        "note: p99.7 needs at least 334 latency samples and the 1s latency window may now hold up to about 404, "
+        "so the win1s row may resolve it.",
+        "note: p99.9 needs at least 1000 latency samples and this run may now record up to about 1208, "
+        "so it may be resolved.",
+        "warning: p99.9 needs at least 1000 latency samples, but the 1s latency window holds at most about 404; "
+        "the win1s row marks it with '*'.",
+        "warning: p99.95 needs at least 2000 latency samples, but this run records at most about 1208, "
+        "so it will not be resolved.",
+    ]
+    lines = [line for line in stderr.splitlines() if line.startswith(("warning: p", "warning: the cluster", "note: p"))]
+    env.assertEqual(lines, first + update, message=stderr[-3000:])
+    # Rows wrap into continuation lines; a value of "-" means no samples.
+    marks = [
+        (pct, mark)
+        for line in stderr.splitlines()
+        if "latency [win1s" in line
+        for pct, _, mark in re.findall(r"p([\d.]+)\s+(\d+\.\d+)(\*?)", line)
+    ]
+    env.assertGreater(len(marks), 0, message=stderr[-3000:])
+    for pct, mark in marks:
+        if pct in ("99.9", "99.95"):
+            env.assertEqual(mark, "*", message="win1s p%s unmarked" % pct)
+
+
+def test_percentile_requests_bound_is_not_repeated_on_growth(env):
+    """--requests=500 is an exact run bound that a healed map does not raise,
+    so the p99.9 warning (needs 1000) is not repeated; the 1s window bound of
+    p99.8 (needs 500) rises from 202 to 404 and is updated (#825)."""
+    node = _HealingPrimaries()
+
+    def watch(line):
+        if line.startswith("warning: p99.9 needs"):
+            node.allow_heal.set()
+
+    stats, _, stderr = _run(
+        env,
+        node,
+        [
+            "--requests=500",
+            "--rate-limiting=100",
+            "--key-maximum=1000",
+            "--realtime-latencies",
+            "--latency-window=1",
+            "--print-percentiles=50,99.8,99.9",
+        ],
+        timeout=30,
+        watch=watch,
+    )
+    env.assertEqual(stats["Totals"]["Count"], 500)
+    env.assertGreater(len(node.second.requests), 0, message=stderr[-3000:])
+    lines = [line for line in stderr.splitlines() if line.startswith(("warning: p", "warning: the cluster", "note: p"))]
+    env.assertEqual(
+        lines,
+        [
+            "warning: p99.8 needs at least 500 latency samples, but the 1s latency window holds at most about 202; "
+            "the win1s row marks it with '*'.",
+            "warning: p99.9 needs at least 1000 latency samples, but this run records at most 500, "
+            "so it will not be resolved.",
+            "warning: the cluster topology grew to 2 rate-limited connections, so the percentile sample bounds "
+            "above are raised:",
+            "warning: p99.8 needs at least 500 latency samples, but the 1s latency window holds at most about 404; "
+            "the win1s row marks it with '*'.",
+        ],
+        message=stderr[-3000:],
+    )

@@ -61,10 +61,10 @@ memtier_benchmark_CPPFLAGS = \
 	$(LIBSSL_CFLAGS)
 memtier_benchmark_SOURCES = \
 	platform_compat.h \
-	memtier_benchmark.cpp memtier_benchmark.h crash_report.h \
+	memtier_benchmark.cpp memtier_benchmark.h crash_report.h library_versions.h \
 	client.cpp client.h \
 	cluster_client.cpp cluster_client.h \
-	shard_connection.cpp shard_connection.h connections_manager.h \
+	shard_connection.cpp shard_connection.h libevent_read_cap.h connections_manager.h \
 	run_stats_types.cpp run_stats_types.h latency_percentiles.h \
 	run_stats.cpp run_stats.h latency_histogram.h \
 	JSON_handler.cpp JSON_handler.h utf8.cpp utf8.h \
@@ -110,6 +110,13 @@ if MEMTIER_WINDOWS
 # and only under this feature macro. That is enough for this test's use of it.
 prometheus_metrics_test_CPPFLAGS += -D_POSIX_THREAD_SAFE_FUNCTIONS
 endif
+
+# One socket read event takes 16 KiB on every libevent series (#535).
+check_PROGRAMS += libevent_read_cap_test
+libevent_read_cap_test_SOURCES = tests/unit/libevent_read_cap_test.cpp libevent_read_cap.h
+libevent_read_cap_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
+libevent_read_cap_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+libevent_read_cap_test_LDADD = $(memtier_benchmark_LDADD)
 
 # Exact Redis command framing through the production serializer.
 check_PROGRAMS += redis_protocol_test
@@ -197,6 +204,11 @@ run_stats_merge_test_SOURCES = tests/unit/run_stats_merge_test.cpp
 run_stats_merge_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
 run_stats_merge_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 run_stats_merge_test_LDADD = $(filter-out memtier_benchmark-memtier_benchmark.$(OBJEXT),$(memtier_benchmark_OBJECTS)) $(memtier_benchmark_LDADD)
+# Build vs runtime libevent/OpenSSL series comparison.
+check_PROGRAMS += library_versions_test
+library_versions_test_SOURCES = tests/unit/library_versions_test.cpp library_versions.h
+library_versions_test_CPPFLAGS = -I$(srcdir)
+library_versions_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 # Crash report timestamp formatting and UTC offset (#681), against libc.
 crash_report_test_SOURCES = tests/unit/crash_report_test.cpp crash_report.h
 crash_report_test_CPPFLAGS = -I$(srcdir)

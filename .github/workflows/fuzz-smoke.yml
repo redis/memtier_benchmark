@@ -35,8 +35,7 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          sudo apt-get -qq update
-          sudo apt-get install -y \
+          ./utils/apt_install.sh -y \
             build-essential \
             autoconf \
             automake \

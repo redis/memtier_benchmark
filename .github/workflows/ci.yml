@@ -27,10 +27,11 @@ jobs:
     name: Non-root prefix install and distcheck
     steps:
     - uses: actions/checkout@v6
+    - name: Self-test the apt helper
+      run: ./utils/test_apt_install.sh
     - name: Install build dependencies and bash-completion metadata
       run: |
-        sudo apt-get update -qq
-        sudo apt-get install -y build-essential autoconf automake pkg-config \
+        ./utils/apt_install.sh -y build-essential autoconf automake pkg-config \
           libevent-dev libssl-dev zlib1g-dev bash-completion
     - name: Check completion options and non-root installation
       run: |
@@ -95,8 +96,7 @@ jobs:
 
     - name: Install dependencies
       run: |
-        apt-get -qq update -y
-        apt-get install -y \
+        ./utils/apt_install.sh -y \
         build-essential autoconf automake libevent-dev \
         pkg-config zlib1g-dev libssl-dev libboost-all-dev cmake flex
 
@@ -147,8 +147,7 @@ jobs:
 
     - name: Install build dependencies
       run: |
-        apt-get update -qq
-        apt-get install -y \
+        ./utils/apt_install.sh -y \
           build-essential \
           autoconf \
           automake \
@@ -166,14 +165,67 @@ jobs:
         ldd ./memtier_benchmark | grep libevent
         ldd ./memtier_benchmark | grep ssl
 
+  # RHEL 8 ships libevent 2.1.8, with OpenSSL 1.1.1 and GCC 8: the oldest
+  # libevent in a supported distribution. 2.1.8 behaves differently from
+  # 2.1.9+ in ways memtier must handle (a failing bufferevent_socket_connect()
+  # runs the error callback before it returns), so run the suite against it.
+  test-rockylinux-8:
+    runs-on: ubuntu-latest
+    container: rockylinux:8
+    strategy:
+      fail-fast: false
+      matrix:
+        tls: ["0", "1"]
+    name: Test Rocky Linux 8 (libevent 2.1.8, TLS=${{ matrix.tls }})
+    steps:
+    - name: Install dependencies
+      run: |
+        dnf -y -q module enable redis:6
+        dnf -y -q install git gcc-c++ make autoconf automake libtool pkgconf-pkg-config \
+          libevent-devel openssl-devel zlib-devel openssl procps-ng python3.11 python3.11-pip redis
+        # The tests need Python 3.10 or newer; EL8's default python3 is 3.6.
+        ln -sf /usr/bin/python3.11 /usr/local/bin/python3
+
+    - name: Checkout code
+      uses: actions/checkout@v6
+
+    - name: Build
+      run: |
+        git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        autoreconf -ivf && ./configure && make -j"$(nproc)"
+
+    - name: Verify libevent 2.1.8
+      run: |
+        ./memtier_benchmark --version
+        ./memtier_benchmark --version | grep -q 'libevent=2.1.8-stable'
+
+    - name: Unit tests
+      run: make check
+
+    - name: Install Python dependencies
+      run: python3 -m pip install -r ./tests/test_requirements.txt
+
+    - name: Generate TLS test certificates
+      if: matrix.tls == '1'
+      run: ./tests/gen-test-certs.sh
+
+    - name: Run tests
+      timeout-minutes: 40
+      env:
+        OSS_STANDALONE: "1"
+        OSS_CLUSTER: "0"
+        TLS: ${{ matrix.tls }}
+        VERBOSE: "1"
+        PARALLELISM: "2"
+      run: ./tests/run_tests.sh
+
   build-notls:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v6
     - name: Install dependencies
       run: |
-        sudo apt-get -qq update
-        sudo apt-get install lcov autoconf automake pkg-config libevent-dev
+        ./utils/apt_install.sh lcov autoconf automake pkg-config libevent-dev
 
     - name: Build without TLS (prometheus default-on)
       run: autoreconf -ivf && ./configure --disable-tls && make -j
@@ -221,8 +273,7 @@ jobs:
     - uses: actions/checkout@v6
     - name: Install dependencies
       run: |
-        sudo apt-get -qq update
-        sudo apt-get install lcov autoconf automake pkg-config libevent-dev
+        ./utils/apt_install.sh lcov autoconf automake pkg-config libevent-dev
 
     - name: Build without TLS
       run: autoreconf -ivf && ./configure --disable-tls && make -j
@@ -241,8 +292,7 @@ jobs:
     - uses: actions/checkout@v6
     - name: Install dependencies
       run: |
-        sudo apt-get -qq update
-        sudo apt-get install lcov autoconf automake pkg-config libevent-dev libssl-dev
+        ./utils/apt_install.sh lcov autoconf automake pkg-config libevent-dev libssl-dev
 
     - name: Build
       run: autoreconf -ivf && ./configure --enable-code-coverage && make -j
@@ -283,11 +333,23 @@ jobs:
           - name: "OSS TCP TLS v1.3"
             env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", TLS_PROTOCOLS: "TLSv1.3", VERBOSE: "1", PARALLELISM: "2" }
             tls: true
-          - name: "OSS-CLUSTER API: TCP Plaintext"
+          # The full cluster suite reached the 40-minute limit (#898), so each
+          # cluster cell runs it as two file shards, as the sanitizer cells do.
+          - name: "OSS-CLUSTER API: TCP Plaintext (shard 1/2)"
             env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", VERBOSE: "1", PARALLELISM: "2" }
+            shard: 1
             tls: false
-          - name: "OSS-CLUSTER API: TCP TLS"
+          - name: "OSS-CLUSTER API: TCP Plaintext (shard 2/2)"
+            env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", VERBOSE: "1", PARALLELISM: "2" }
+            shard: 2
+            tls: false
+          - name: "OSS-CLUSTER API: TCP TLS (shard 1/2)"
             env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", TLS: "1", VERBOSE: "1", PARALLELISM: "2" }
+            shard: 1
+            tls: true
+          - name: "OSS-CLUSTER API: TCP TLS (shard 2/2)"
+            env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", TLS: "1", VERBOSE: "1", PARALLELISM: "2" }
+            shard: 2
             tls: true
           - name: "OSS-CLUSTER API 49 shards: TCP TLS"
             env: { RLTEST_DEBUG: "1", LOG_LEVEL: "notice", OSS_STANDALONE: "0", OSS_CLUSTER: "1", TLS: "1", VERBOSE: "1", SHARDS: "49", TEST: "tests_oss_simple_flow:test_rate_limited_completion_no_hang" }
@@ -342,8 +404,7 @@ jobs:
 
     - name: Install dependencies
       run: |
-        sudo apt-get -qq update
-        sudo apt-get install lcov autoconf automake pkg-config libevent-dev libssl-dev
+        ./utils/apt_install.sh lcov autoconf automake pkg-config libevent-dev libssl-dev
 
     - name: Setup Python
       uses: actions/setup-python@v6
@@ -358,8 +419,7 @@ jobs:
       run: |
         curl -fsSL https://packages.redis.io/gpg | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
         echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/redis.list
-        sudo apt-get -qq update
-        sudo apt-get install redis
+        ./utils/apt_install.sh redis
         sudo service redis-server stop
 
     - name: Increase connection limit
@@ -373,10 +433,20 @@ jobs:
       run: |
           ./tests/gen-test-certs.sh
 
+    - name: Validate cluster shard coverage
+      if: matrix.test-config.shard == 1
+      run: python3 utils/check_test_shards.py 2
+
+    - name: Select cluster test shard
+      if: matrix.test-config.shard
+      run: |
+        test_files="$(python3 utils/select_test_shard.py ${{ matrix.test-config.shard }} 2)"
+        echo "TEST=$test_files" >> "$GITHUB_ENV"
+
     - name: Run tests
-      # The standalone and main cluster cells run the whole suite, so the
-      # standalone cells use PARALLELISM=2 like the cluster ones; the limit
-      # (shared by all cells) leaves headroom for slow runners. See #679.
+      # The standalone cells run the whole suite and the main cluster cells
+      # half of it each, all with PARALLELISM=2; the limit (shared by all
+      # cells) leaves headroom for slow runners. See #679 and #898.
       timeout-minutes: 40
       env: ${{ matrix.test-config.env }}
       run: |
@@ -420,8 +490,7 @@ jobs:
 
     - name: Install runtime dependencies
       run: |
-        sudo apt-get -qq update
-        sudo apt-get install -y libevent-dev libssl-dev
+        ./utils/apt_install.sh -y libevent-dev libssl-dev
 
     - name: Setup Python
       uses: actions/setup-python@v6
@@ -436,8 +505,7 @@ jobs:
       run: |
         curl -fsSL https://packages.redis.io/gpg | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
         echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/redis.list
-        sudo apt-get -qq update
-        sudo apt-get install redis
+        ./utils/apt_install.sh redis
         sudo service redis-server stop
 
     - name: Wait for Graphite to be ready
@@ -482,10 +550,9 @@ jobs:
     - uses: actions/checkout@v6
     - name: Install dependencies
       run: |
-        sudo apt-get -qq update
-        sudo apt-get install lcov autoconf automake pkg-config libevent-dev libssl-dev
+        ./utils/apt_install.sh lcov autoconf automake pkg-config libevent-dev libssl-dev
         if [ "${{ matrix.compiler }}" = clang ]; then
-          sudo apt-get install clang llvm libclang-rt-dev
+          ./utils/apt_install.sh --no-update clang llvm libclang-rt-dev
         fi
     - name: Configure coverage build
       env:
@@ -518,8 +585,7 @@ jobs:
 
     - name: Install dependencies
       run: |
-        sudo apt-get -qq update
-        sudo apt-get install lcov autoconf automake pkg-config libevent-dev libssl-dev
+        ./utils/apt_install.sh lcov autoconf automake pkg-config libevent-dev libssl-dev
 
     - name: Build with coverage
       run: autoreconf -ivf && ./configure --enable-code-coverage && make -j
@@ -543,8 +609,7 @@ jobs:
       run: |
         curl -fsSL https://packages.redis.io/gpg | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
         echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/redis.list
-        sudo apt-get -qq update
-        sudo apt-get install redis
+        ./utils/apt_install.sh redis
         sudo service redis-server stop
 
     - name: Increase connection limit
@@ -608,8 +673,7 @@ jobs:
     - name: Merge code coverage
       timeout-minutes: 6
       run: |
-        sudo apt-get -qq update
-        sudo apt-get install -y lcov
+        ./utils/apt_install.sh -y lcov
         reports=()
         for shard in 1 2 3 4 5 6 7 8; do
           report="coverage/coverage-shard-${shard}.info"
@@ -690,7 +754,7 @@ jobs:
     steps:
     - uses: actions/checkout@v6
     - name: Install dependencies
-      run: brew install autoconf automake pkg-config openssl@${{ matrix.openssl }}
+      run: brew install autoconf automake pkg-config cmake openssl@${{ matrix.openssl }}
     - name: Build libevent against the selected OpenSSL
       run: bash scripts/build-macos-libevent.sh "$(brew --prefix openssl@${{ matrix.openssl }})"
     - name: Build
@@ -750,7 +814,7 @@ jobs:
     steps:
     - uses: actions/checkout@v6
     - name: Install dependencies
-      run: brew install autoconf automake pkg-config openssl@1.1
+      run: brew install autoconf automake pkg-config cmake openssl@1.1
     - name: Build libevent against the selected OpenSSL
       run: bash scripts/build-macos-libevent.sh "$(brew --prefix openssl@1.1)"
     - name: Build
@@ -820,8 +884,7 @@ jobs:
     - uses: actions/checkout@v6
     - name: Install dependencies
       run: |
-        sudo apt-get -qq update
-        sudo apt-get install -y autoconf automake pkg-config libevent-dev libssl-dev redis-server
+        ./utils/apt_install.sh -y autoconf automake pkg-config libevent-dev libssl-dev redis-server
         sudo service redis-server stop || true
 
     - name: Build (prometheus default-on)

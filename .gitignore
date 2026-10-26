@@ -33,6 +33,8 @@ version.h
 /build-noprom/
 /build-asan/
 /build-tsan/
+/build-libevent-*/
+/.local/libevent-*/
 /.venv/
 
 # tls helper related files
@@ -86,6 +88,7 @@ tests/.env/
 /cluster_slots_retention_test
 /memcache_meta_test
 /redis_protocol_test
+/libevent_read_cap_test
 /memcache_text_test
 tests/unit/prometheus_metrics_test
 *.log
