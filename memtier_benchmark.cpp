@@ -65,6 +65,7 @@
 #endif
 #include <dirent.h>
 #include "platform_compat.h"
+#include "library_versions.h"
 #include <event2/event.h>
 #include <event2/thread.h>
 
@@ -91,7 +92,47 @@
 static bool bitmask_is_contiguous(unsigned int mask);
 #endif
 
+// The OpenSSL library actually loaded; OPENSSL_VERSION_* are the headers'.
+static const char *openssl_runtime_version_text(void)
+{
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+    return OpenSSL_version(OPENSSL_VERSION);
+#else
+    return SSLeay_version(SSLEAY_VERSION);
 #endif
+}
+
+static unsigned long openssl_runtime_version_number(void)
+{
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+    return OpenSSL_version_num();
+#else
+    return SSLeay();
+#endif
+}
+
+#endif
+
+// Warn (stderr only) when the libevent or OpenSSL library loaded at run time
+// is from another release series than the headers memtier was compiled
+// with, e.g. headers of one installation and the library of another.
+static void warn_on_library_version_mismatch(void)
+{
+    if (libevent_series_differs(LIBEVENT_VERSION_NUMBER, event_get_version_number())) {
+        fprintf(stderr,
+                "warning: memtier_benchmark was built with libevent %s headers but is running with libevent %s; "
+                "rebuild it against the libevent it runs with.\n",
+                LIBEVENT_VERSION, event_get_version());
+    }
+#ifdef USE_TLS
+    if (openssl_series_differs(OPENSSL_VERSION_NUMBER, openssl_runtime_version_number())) {
+        fprintf(stderr,
+                "warning: memtier_benchmark was built with %s headers but is running with %s; "
+                "rebuild it against the OpenSSL it runs with.\n",
+                OPENSSL_VERSION_TEXT, openssl_runtime_version_text());
+    }
+#endif
+}
 
 #include <cfloat>
 #include <cmath>
@@ -151,6 +192,7 @@ static int getrusage(int who, struct rusage *ru)
 #include "file_io.h"
 #include "obj_gen.h"
 #include "memtier_benchmark.h"
+#include "connection_stage_clock.h"
 #include "run_stats_types.h"
 #include "latency_percentiles.h"
 #include "retry_policy.h"
@@ -320,27 +362,33 @@ static prometheus_exporter *g_prom_exporter = NULL;
 //   - reset by connection_stage_supervisor_reset() at the start of every
 //     run_benchmark() invocation; --run-count > 1 must restart the policy
 //     because a previous run's success latch is meaningless for the next.
-//   - g_conn_stage_run_start tracks the time of that reset; we measure
+//   - g_conn_stage_run_start_usec tracks the time of that reset; we measure
 //     "elapsed in setup phase" from there, NOT from each individual
 //     failure, so a single late failure can still trigger the timeout.
 static std::atomic<bool> g_conn_stage_steady_state{false};
-static std::atomic<long> g_conn_stage_streak_start_sec{0}; // 0 = no failure yet
-static std::atomic<long> g_conn_stage_run_start_sec{0};
+// Wall-clock microseconds (see connection_stage_timed_out()).
+static std::atomic<long long> g_conn_stage_streak_start_usec{0}; // 0 = no failure yet
+static std::atomic<long long> g_conn_stage_run_start_usec{0};
+
+static long long conn_stage_now_usec(void)
+{
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    return (long long) now.tv_sec * 1000000 + now.tv_usec;
+}
 static pthread_mutex_t g_conn_stage_err_mutex = PTHREAD_MUTEX_INITIALIZER;
 static std::string g_conn_stage_last_err; // guarded by g_conn_stage_err_mutex
 
 void connection_stage_supervisor_reset(void)
 {
     g_conn_stage_steady_state.store(false, std::memory_order_release);
-    g_conn_stage_streak_start_sec.store(0, std::memory_order_release);
+    g_conn_stage_streak_start_usec.store(0, std::memory_order_release);
     // Must reset g_connection_stage_aborted as well: with --run-count > 1, a
     // run-1 abort would otherwise leave the flag latched into run 2,
     // suppressing the worker-failure report in cg_thread_start(). The exit
     // code uses g_any_run_connection_stage_aborted, which is not reset.
     g_connection_stage_aborted.store(false, std::memory_order_release);
-    struct timeval now;
-    gettimeofday(&now, NULL);
-    g_conn_stage_run_start_sec.store(now.tv_sec, std::memory_order_release);
+    g_conn_stage_run_start_usec.store(conn_stage_now_usec(), std::memory_order_release);
     pthread_mutex_lock(&g_conn_stage_err_mutex);
     g_conn_stage_last_err.clear();
     pthread_mutex_unlock(&g_conn_stage_err_mutex);
@@ -353,14 +401,11 @@ void report_connection_stage_failure(const char *err)
     // cycle must not bring the run down.
     if (g_conn_stage_steady_state.load(std::memory_order_acquire)) return;
 
-    struct timeval now;
-    gettimeofday(&now, NULL);
-
     // First failure in a streak: stamp the wall-clock start. Subsequent
     // failures only update the last-error string. CAS on 0 keeps this
     // race-free without a mutex.
-    long zero = 0;
-    g_conn_stage_streak_start_sec.compare_exchange_strong(zero, now.tv_sec, std::memory_order_acq_rel);
+    long long zero = 0;
+    g_conn_stage_streak_start_usec.compare_exchange_strong(zero, conn_stage_now_usec(), std::memory_order_acq_rel);
 
     if (err != NULL && *err != '\0') {
         pthread_mutex_lock(&g_conn_stage_err_mutex);
@@ -376,7 +421,7 @@ void report_connection_stage_success(void)
     // and can be useful for post-mortem diagnostics.
     bool expected = false;
     if (g_conn_stage_steady_state.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-        g_conn_stage_streak_start_sec.store(0, std::memory_order_release);
+        g_conn_stage_streak_start_usec.store(0, std::memory_order_release);
     }
 }
 
@@ -395,11 +440,9 @@ bool connection_stage_should_abort(unsigned int timeout_secs, std::string *out_l
     if (timeout_secs == 0) return false; // operator opt-out
     if (g_conn_stage_steady_state.load(std::memory_order_acquire)) return false;
 
-    struct timeval now;
-    gettimeofday(&now, NULL);
-
-    long streak_start = g_conn_stage_streak_start_sec.load(std::memory_order_acquire);
-    long run_start = g_conn_stage_run_start_sec.load(std::memory_order_acquire);
+    long long now = conn_stage_now_usec();
+    long long streak_start = g_conn_stage_streak_start_usec.load(std::memory_order_acquire);
+    long long run_start = g_conn_stage_run_start_usec.load(std::memory_order_acquire);
 
     // Two trip conditions:
     //   (a) a failure streak has been live for >= timeout_secs (covers
@@ -409,15 +452,13 @@ bool connection_stage_should_abort(unsigned int timeout_secs, std::string *out_l
     //       for >= timeout_secs without anyone reaching steady state
     //       (covers --wait-ratio 0:1 with no slaves — the connection
     //       handshakes but the very first WAIT command never returns).
-    long elapsed_streak = (streak_start > 0) ? (now.tv_sec - streak_start) : 0;
-    long elapsed_run = (run_start > 0) ? (now.tv_sec - run_start) : 0;
-
-    bool trip_streak = (streak_start > 0 && elapsed_streak >= (long) timeout_secs);
-    bool trip_run = (run_start > 0 && elapsed_run >= (long) timeout_secs);
+    unsigned int elapsed_streak = 0, elapsed_run = 0;
+    bool trip_streak = connection_stage_timed_out(streak_start, now, timeout_secs, &elapsed_streak);
+    bool trip_run = connection_stage_timed_out(run_start, now, timeout_secs, &elapsed_run);
     if (!trip_streak && !trip_run) return false;
 
     if (out_elapsed != NULL) {
-        *out_elapsed = (unsigned int) (trip_streak ? elapsed_streak : elapsed_run);
+        *out_elapsed = trip_streak ? elapsed_streak : elapsed_run;
     }
     if (out_last_err != NULL) {
         pthread_mutex_lock(&g_conn_stage_err_mutex);
@@ -558,9 +599,11 @@ static void print_crash_report_tail(const char *timestr)
 #endif
 
     fprintf(stderr, "[%d] %s # libevent_version:%s\n", getpid(), timestr, event_get_version());
+    fprintf(stderr, "[%d] %s # libevent_build_version:%s\n", getpid(), timestr, LIBEVENT_VERSION);
 
 #ifdef USE_TLS
     fprintf(stderr, "[%d] %s # openssl_version:%s\n", getpid(), timestr, OPENSSL_VERSION_TEXT);
+    fprintf(stderr, "[%d] %s # openssl_runtime_version:%s\n", getpid(), timestr, openssl_runtime_version_text());
 #endif
 
     // Print client connection information
@@ -727,7 +770,7 @@ static void crash_handler(int sig, siginfo_t *info, void *secret)
     // - print_client_list() reads the worker's client and connection
     //   vectors without synchronization; a torn vector can fault or hang.
     // uname(), getpid(), sigaction() and raise() are async-signal-safe, and
-    // event_get_version() only returns a constant string.
+    // event_get_version() and OpenSSL_version() only return constant strings.
 
     // Print stack trace for all threads
     print_all_threads_stack_trace(stderr, getpid(), timestr);
@@ -766,6 +809,9 @@ static void prewarm_crash_handler(void)
     fflush(stderr);
     // Resolve event_get_version too — used in the INFO section.
     (void) event_get_version();
+#ifdef USE_TLS
+    (void) openssl_runtime_version_text();
+#endif
 
     // The handler formats its timestamp by hand from this offset, and this
     // first localtime_r() call also loads the time zone data.
@@ -4153,15 +4199,31 @@ static void format_sample_count(unsigned long long n, char *buf, size_t len)
         snprintf(buf, len, "%.2fG", (double) (n / 10000000) / 100.0);
 }
 
+// What warn_unresolvable_percentiles last said about a percentile.
+enum percentile_warning
+{
+    pw_none,
+    pw_run,
+    pw_window
+};
+
 // Warn up front about --print-percentiles values a bounded run can never
 // resolve (see percentile_min_samples). Only --requests and --rate-limiting
 // bound the sample count; otherwise the realtime rows flag them live.
 // rate_conns is the number of request-generating connections, each limited to
 // --rate-limiting: clients x threads, times the traffic endpoints in cluster
-// mode, which is only known once the first topology is committed. The check
-// runs once per process, so a later topology with more endpoints can exceed
-// the bound it reported.
-static void warn_unresolvable_percentiles(const benchmark_config *cfg, unsigned long long rate_conns)
+// mode, which is only known once the first topology is committed.
+//
+// issued holds what was said about each percentile. When it is empty this is
+// the first check and it is filled in. Otherwise rate_conns has grown (a
+// cluster run that started on a partial slot map opened more endpoint
+// connections), which only raises the bounds: each percentile warned about
+// before is warned about again with the new bound, or the warning is
+// withdrawn, so the bound stated last always holds for the whole run.
+// end_line ends a '\r'-terminated progress line before the first output.
+// Returns whether anything was printed.
+static bool warn_unresolvable_percentiles(const benchmark_config *cfg, unsigned long long rate_conns,
+                                          std::vector<percentile_warning> &issued, bool end_line)
 {
     // Upper bounds on recorded latency samples; 0 means unbounded. A
     // rate-limited connection sends at most rate x T plus the burst of
@@ -4180,21 +4242,55 @@ static void warn_unresolvable_percentiles(const benchmark_config *cfg, unsigned 
     if (window && run_max && (!window_max || run_max < window_max)) window_max = run_max;
 
     const std::vector<double> &quantiles = cfg->print_percentiles.quantile_list;
+    const bool update = !issued.empty();
+    if (!update) issued.assign(quantiles.size(), pw_none);
+    bool printed = false;
     for (size_t i = 0; i < quantiles.size(); i++) {
         unsigned long long need = percentile_min_samples(quantiles[i]);
-        if (run_max && run_max < need) {
+        percentile_warning now = pw_none;
+        if (run_max && run_max < need)
+            now = pw_run;
+        else if (window_max && window_max < need)
+            now = pw_window;
+        // A raised bound never adds a warning, so an update only revisits
+        // the percentiles already warned about. The --requests bound does not
+        // depend on the connections, so its warning stands as printed.
+        if (update && (issued[i] == pw_none || (now == pw_run && cfg->requests))) continue;
+        if (!update && now == pw_none) continue;
+        if (!printed) {
+            if (end_line) fputc('\n', stderr);
+            if (update)
+                fprintf(stderr,
+                        "warning: the cluster topology grew to %llu rate-limited connections, so the percentile "
+                        "sample bounds above are raised:\n",
+                        rate_conns);
+            printed = true;
+        }
+        if (update && issued[i] == pw_run && now != pw_run)
+            fprintf(stderr,
+                    "note: p%.15g needs at least %llu latency samples and this run may now record up to about "
+                    "%.0f, so it may be resolved.\n",
+                    quantiles[i], need, run_max);
+        if (now == pw_run) {
             // --requests is an exact bound; the rate-limit bound is approximate.
             fprintf(stderr,
                     "warning: p%.15g needs at least %llu latency samples, but this run records at most %s%.0f, "
                     "so it will not be resolved.\n",
                     quantiles[i], need, cfg->requests ? "" : "about ", run_max);
-        } else if (window_max && window_max < need) {
+        } else if (now == pw_window) {
             fprintf(stderr,
                     "warning: p%.15g needs at least %llu latency samples, but the %us latency window holds at "
                     "most about %.0f; the win%us row marks it with '*'.\n",
                     quantiles[i], need, window, window_max, window);
+        } else if (update && issued[i] == pw_window) {
+            fprintf(stderr,
+                    "note: p%.15g needs at least %llu latency samples and the %us latency window may now hold up "
+                    "to about %.0f, so the win%us row may resolve it.\n",
+                    quantiles[i], need, window, window_max, window);
         }
+        issued[i] = now;
     }
+    return printed;
 }
 
 // ---------------------------------------------------------------------------
@@ -4476,7 +4572,19 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         // --connection-stage-timeout seconds, abort the run rather than
         // letting the reconnect / "stuck WAIT" loop ignore --test-time.
         // 0 = supervisor disabled.
-        {
+        //
+        // Workers that have all ended leave nothing to bound: the loop below
+        // then sees no active thread and the run reports how they ended. A
+        // worker that failed during the sleep above would otherwise also be
+        // reported as an abort, and memtier would exit 2 instead of 1.
+        bool any_thread_running = false;
+        for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
+            if (!(*i)->m_finished) {
+                any_thread_running = true;
+                break;
+            }
+        }
+        if (any_thread_running) {
             std::string last_err;
             unsigned int elapsed = 0;
             if (connection_stage_should_abort(cfg->connection_stage_timeout, &last_err, &elapsed)) {
@@ -4628,16 +4736,21 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         const std::vector<int64_t> &inst_values = inst_percentiles.values();
 
         // Cluster mode knows its rate-limited connection fan-out only after
-        // the first topology commit, so check the percentile bounds here,
-        // once per process. Restart the realtime frame so the warning is not
+        // the first topology commit, so check the percentile bounds here:
+        // once per process, and again each time the fan-out grows (a partial
+        // slot map healed), which happens at most once per topology change.
+        // The last tick runs after every worker has finished, so it sees the
+        // final fan-out. Restart the realtime frame so the warning is not
         // overwritten by the TTY redraw.
-        static bool cluster_percentiles_checked = false;
-        if (cfg->cluster_mode && !cluster_percentiles_checked && cluster_client::rate_limited_connections() > 0) {
-            cluster_percentiles_checked = true;
+        static unsigned long long cluster_percentiles_conns = 0;
+        static std::vector<percentile_warning> cluster_percentiles_issued;
+        const unsigned long long rate_conns = cfg->cluster_mode ? cluster_client::rate_limited_connections() : 0;
+        if (rate_conns > cluster_percentiles_conns) {
+            cluster_percentiles_conns = rate_conns;
             // The single-line progress display ends with '\r'.
-            if (progress_printed && !cfg->realtime_latencies) fputc('\n', stderr);
-            warn_unresolvable_percentiles(cfg, cluster_client::rate_limited_connections());
-            first_rtl_frame = true;
+            if (warn_unresolvable_percentiles(cfg, rate_conns, cluster_percentiles_issued,
+                                              progress_printed && !cfg->realtime_latencies))
+                first_rtl_frame = true;
         }
 
         // Drain the seconds completed since the previous tick, once, for both
@@ -5479,14 +5592,12 @@ int main(int argc, char *argv[])
     // --connection-stage-timeout abort (Phase 1 of #426) or a Ctrl+C.
     // Must run before any event_base is created so the locking callbacks
     // are installed for every subsequent base.
+    // Without them a shutdown or timeout could hang, so a failure is fatal,
+    // but only once options are parsed: --help and --version still work.
 #ifdef _WIN32
-    if (evthread_use_windows_threads() < 0) {
-        fprintf(stderr, "warning: evthread_use_windows_threads() failed; cross-thread loop wakeups may stall.\n");
-    }
+    const bool evthread_failed = evthread_use_windows_threads() < 0;
 #else
-    if (evthread_use_pthreads() < 0) {
-        fprintf(stderr, "warning: evthread_use_pthreads() failed; cross-thread loop wakeups may stall.\n");
-    }
+    const bool evthread_failed = evthread_use_pthreads() < 0;
 #endif
 
     // Install signal handler for Ctrl+C. SIGTERM (kill, timeout, docker stop,
@@ -5551,6 +5662,17 @@ int main(int argc, char *argv[])
     if (config_parse_args(argc, argv, &cfg) < 0) {
         usage();
     }
+    if (evthread_failed) {
+#ifdef _WIN32
+        fprintf(stderr, "error: evthread_use_windows_threads() failed; libevent's Windows threading support is "
+                        "required to stop worker threads.\n");
+#else
+        fprintf(stderr, "error: evthread_use_pthreads() failed; libevent's pthreads support (libevent_pthreads) "
+                        "is required to stop worker threads.\n");
+#endif
+        exit(1);
+    }
+    warn_on_library_version_mismatch();
 
     // An fd 0-2 was closed at startup and reopened on /dev/null (see
     // reopen_closed_std_fds()). A path option that names that fd would now
@@ -6410,7 +6532,10 @@ int main(int argc, char *argv[])
         if (cfg.latency_window_set && !cfg.realtime_latencies)
             fprintf(stderr, "warning: --latency-window only applies to --realtime-latencies.\n");
         // Cluster mode checks once the topology gives its connection fan-out.
-        if (!cfg.cluster_mode) warn_unresolvable_percentiles(&cfg, (unsigned long long) cfg.clients * cfg.threads);
+        if (!cfg.cluster_mode) {
+            std::vector<percentile_warning> issued;
+            warn_unresolvable_percentiles(&cfg, (unsigned long long) cfg.clients * cfg.threads, issued, false);
+        }
         for (unsigned int run_id = 1; run_id <= cfg.run_count; run_id++) {
             if (run_id > 1) {
                 if (g_interrupted) break;
@@ -6504,6 +6629,13 @@ int main(int argc, char *argv[])
                                    cfg.requests > 0 ? cfg.requests : (unsigned long long) cfg.test_time);
             jsonhandler->write_obj("Runs completed", "%zu", all_stats.size());
             jsonhandler->write_obj("Format version", "%d", 2);
+            // Library provenance: the run-time library and the build headers.
+            jsonhandler->write_obj("libevent runtime version", "\"%s\"", event_get_version());
+            jsonhandler->write_obj("libevent build version", "\"%s\"", LIBEVENT_VERSION);
+#ifdef USE_TLS
+            jsonhandler->write_obj("OpenSSL runtime version", "\"%s\"", openssl_runtime_version_text());
+            jsonhandler->write_obj("OpenSSL build version", "\"%s\"", OPENSSL_VERSION_TEXT);
+#endif
             jsonhandler->close_nesting();
         }
 
