@@ -698,7 +698,10 @@ run's stop condition:
     prevented from starting by repeated TLS-handshake failures. One whose
     first connection only completes after the deadline (e.g. a server killing
     connections before their first reply) is timed from the start of the run,
-    so it ends at once instead of running a whole `--test-time`.
+    so it ends at once instead of running a whole `--test-time`. It sends no
+    request then: if it sent none before either, it does not count toward
+    `Total duration` or `Count` at all, like a client that only ran its
+    setup.
   - The deadline is measured from the start of the run, so it does not cover
     a server that is gone before any connection got a reply: that startup
     phase is bounded by `--connection-stage-timeout` (default 30 s), which

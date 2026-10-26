@@ -305,25 +305,29 @@ def test_standalone_auth_rejected_on_some_connections_fails_run(env):
     env.assertLess(elapsed, 8)
 
 
-class _SlowRedialNode:
-    """One of two scripted cluster nodes (port 0) that RESP-serves every
-    connection it accepts. With a listen backlog of 0, pause() stops accepting
-    and fills the accept queue, so a new connect's SYN is dropped by the
-    kernel and that connect stays in progress until release()."""
+class _RedialNode:
+    """A scripted cluster node (port 0) that RESP-serves every connection it
+    accepts. With a listen backlog of 0, pause_and_drop() stops accepting,
+    fills the accept queue and closes the open connections: a redial's SYN is
+    then dropped by the kernel, so that connect stays in progress (with no
+    reply pending) until release() and the SYN's next retransmit."""
 
-    def __init__(self, backlog, reject_auth_after_first=False):
+    def __init__(self, backlog, on_command=None, reject_redial_auth=False):
         self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.listener.bind(("127.0.0.1", 0))
         self.listener.listen(backlog)
         self.listener.settimeout(0.05)
         self.port = self.listener.getsockname()[1]
-        self.reject_auth_after_first = reject_auth_after_first
+        self.on_command = on_command
+        self.reject_redial_auth = reject_redial_auth
         self.slots = b""
         self.lock = threading.Lock()
-        self.accepted = 0
-        self.auths_after_first = 0
+        self.accepted = []
+        self.redial_auths = 0
+        self.answered = 0
         self.conns = []
         self.fillers = []
+        self.filler_ports = set()
         self.paused = threading.Event()
         self.stop = threading.Event()
         self.thread = threading.Thread(target=self._accept, daemon=True)
@@ -335,18 +339,21 @@ class _SlowRedialNode:
                 time.sleep(0.01)
                 continue
             try:
-                conn, _ = self.listener.accept()
+                conn, address = self.listener.accept()
             except socket.timeout:
                 continue
             except OSError:
                 return
+            if address[1] in self.filler_ports:
+                conn.close()
+                continue
             with self.lock:
-                self.accepted += 1
+                self.accepted.append(time.monotonic())
                 self.conns.append(conn)
-                index = self.accepted
-            threading.Thread(target=self._serve, args=(conn, index), daemon=True).start()
+                redial = len(self.accepted) > 1
+            threading.Thread(target=self._serve, args=(conn, redial), daemon=True).start()
 
-    def _serve(self, conn, index):
+    def _serve(self, conn, redial):
         reader = conn.makefile("rb")
         try:
             while True:
@@ -358,21 +365,25 @@ class _SlowRedialNode:
                     length = int(reader.readline()[1:])
                     args.append(reader.read(length + 2)[:-2])
                 verb = args[0].upper()
+                if self.on_command is not None:
+                    self.on_command(verb)  # may hold this reply
                 if verb == b"CLUSTER":
                     reply = self.slots
-                elif verb == b"AUTH" and index > 1 and self.reject_auth_after_first:
+                elif verb == b"AUTH" and redial and self.reject_redial_auth:
                     with self.lock:
-                        self.auths_after_first += 1
+                        self.redial_auths += 1
                     reply = b"-WRONGPASS invalid username-password pair or user is disabled.\r\n"
                 else:
                     reply = b"+OK\r\n"
                 conn.sendall(reply)
+                with self.lock:
+                    self.answered += 1
         except (OSError, ValueError):
             pass
 
     def pause_and_drop(self):
         self.paused.set()
-        time.sleep(0.1)
+        time.sleep(0.1)  # let a pending accept() return
         for _ in range(2):  # a backlog of 0 queues one connect: fill it
             filler = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             filler.setblocking(False)
@@ -380,6 +391,7 @@ class _SlowRedialNode:
                 filler.connect(("127.0.0.1", self.port))
             except BlockingIOError:
                 pass
+            self.filler_ports.add(filler.getsockname()[1])
             self.fillers.append(filler)
         time.sleep(0.1)
         with self.lock:
@@ -391,12 +403,7 @@ class _SlowRedialNode:
                 conn.close()
 
     def release(self):
-        while True:  # drain the fillers, so memtier's retransmitted SYN gets in
-            try:
-                conn, _ = self.listener.accept()
-            except (socket.timeout, OSError):
-                break
-            conn.close()
+        # The fillers are closed as they are accepted.
         self.paused.clear()
 
     def close(self):
@@ -406,44 +413,128 @@ class _SlowRedialNode:
             sock.close()
 
 
+class _SlowRedialScript:
+    """Drives the slow-redial test below from what the nodes see, not from
+    wall-clock timers, so a slow or starved memtier (ASAN, TSAN) shifts the
+    whole script. The deadline is taken as the first SET plus --test-time:
+    memtier started just before it, so its own deadline is no later."""
+
+    def __init__(self, test_time, drop_after):
+        self.test_time = test_time
+        self.drop_after = drop_after
+        self.lock = threading.Lock()
+        self.sets = 0
+        self.first_set = None
+        self.last_set = None
+        self.dropped_at = None
+        self.dropping = False
+        self.refresh_after_drop = None
+        self.released_at = None
+        self.second = None
+        self.done = threading.Event()
+
+    def deadline(self):
+        return self.first_set + self.test_time
+
+    def on_command(self, verb):
+        now = time.monotonic()
+        drop = False
+        with self.lock:
+            if verb == b"CLUSTER" and self.dropped_at is not None and self.refresh_after_drop is None:
+                self.refresh_after_drop = now
+            if verb != b"SET":
+                return
+            self.sets += 1
+            self.last_set = now
+            if self.first_set is None:
+                self.first_set = now
+            # Drop only a connection the second node has served.
+            if self.dropped_at is None and not self.dropping and self.sets >= self.drop_after and \
+                    self.second.answered > 0:
+                self.dropping = drop = True
+        if drop:
+            self.second.pause_and_drop()
+            with self.lock:
+                self.dropped_at = time.monotonic()
+
+    def run(self):
+        """Release the second node once the redial has started (its slot map
+        refresh came 0.2 s ago) and the deadline has passed by 0.3 s, with no
+        SET for 0.3 s."""
+        while not self.done.wait(0.02):
+            with self.lock:
+                if self.first_set is None or self.refresh_after_drop is None:
+                    continue
+                now = time.monotonic()
+                if now < self.deadline() + 0.3 or now - self.last_set < 0.3 or now - self.refresh_after_drop < 0.2:
+                    continue
+                self.released_at = now
+            self.second.release()
+            return
+
+
 def test_rejected_setup_after_slow_redial_past_deadline_fails_run(env):
-    # Two primaries, each with half the slots. The second drops its
-    # connection at 1 s of a 3 s run, and its listen queue is then kept full
-    # until 3.5 s, so memtier's redial (connect() cleared the pending
-    # reconnect) is still in progress at the deadline, with nothing pending.
-    # The first connection, idle past its deadline, must not end the client
-    # then: once the connect completes, the redial's AUTH goes out, is
-    # rejected, and fails the run (#630).
+    # Two primaries; the second's connection drops early in a 4 s run and
+    # its redial is still connecting at the deadline (connect() cleared its
+    # pending reconnect), with nothing pending. The first connection, idle
+    # past its deadline, must not end the client: once the connect completes,
+    # the redial's AUTH goes out, is rejected, and fails the run (#630).
     if sys.platform != "linux":
         env.skip()  # relies on Linux dropping the SYN when the accept queue is full
-    first = _SlowRedialNode(16)
-    second = _SlowRedialNode(0, reject_auth_after_first=True)
+    # A test time well past the drop leaves room for a starved peer.
+    test_time, rate = 4, 50
+    # Drop the second node's connection early, once the first has had 10
+    # SETs, however slowly memtier runs: its redial (1 s later, capped at the
+    # deadline) then connects before the deadline, and that connect is held
+    # in progress until the script releases the node.
+    script = _SlowRedialScript(test_time, drop_after=10)
+    first = _RedialNode(16, on_command=script.on_command)
+    second = _RedialNode(0, reject_redial_auth=True)
+    script.second = second
+    # Each node has half the slots. Once the second node's connection drops,
+    # the first one goes idle at the first key for the second: no reply can
+    # move the run's clock past the deadline (finished()), as a SET answered
+    # just after it would. Once finished(), a connection that then completes
+    # its connect sends no setup at all (fill_pipeline()), on master too.
     slots = b"*2\r\n"
     for node, low, high in ((first, 0, 8191), (second, 8192, 16383)):
         slots += b"*3\r\n:%d\r\n:%d\r\n*2\r\n$9\r\n127.0.0.1\r\n:%d\r\n" % (low, high, node.port)
     first.slots = second.slots = slots
-    timer = threading.Timer(1.0, second.pause_and_drop)
-    releaser = threading.Timer(3.5, second.release)
+    driver = threading.Thread(target=script.run, daemon=True)
+    driver.start()
     args = [MEMTIER_BINARY, "--server=127.0.0.1", "--port={}".format(first.port), "--cluster-mode",
-            "--authenticate=pw", "--threads=1", "--clients=1", "--test-time=3", "--rate-limiting=50",
-            "--ratio=1:0", "--key-maximum=1000", "--reconnect-on-error", "--hide-histogram"]
-    start = time.time()
-    timer.start()
-    releaser.start()
+            "--authenticate=pw", "--threads=1", "--clients=1", "--test-time={}".format(test_time),
+            "--rate-limiting={}".format(rate), "--ratio=1:0", "--key-maximum=1000",
+            "--reconnect-on-error", "--hide-histogram"]
+    start = time.monotonic()
     try:
-        result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20, text=True)
+        result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=50, text=True)
         returncode, stderr = result.returncode, result.stderr
     except subprocess.TimeoutExpired as expired:
         returncode, stderr = "timeout", expired.stderr or ""
         if isinstance(stderr, bytes):
             stderr = stderr.decode(errors="replace")
     finally:
-        elapsed = time.time() - start
-        timer.cancel()
-        releaser.cancel()
+        elapsed = time.monotonic() - start
+        script.done.set()
+        driver.join(timeout=5)
         first.close()
         second.close()
-    env.assertEqual(second.auths_after_first, 1, message=stderr[-2000:])
+    # The script ran as intended: the redial was requested after the drop
+    # and connected only once the deadline had passed.
+    env.assertIsNotNone(script.dropped_at, message=stderr[-2000:])
+    if script.dropped_at is not None:
+        env.assertLess(script.dropped_at, script.deadline() - 1)
+    env.assertContains("connection dropped", stderr)
+    env.assertIsNotNone(script.refresh_after_drop, message=stderr[-2000:])
+    env.assertIsNotNone(script.released_at, message=stderr[-2000:])
+    if script.released_at is not None:
+        env.assertGreater(script.released_at, script.deadline())
+        env.assertTrue(all(t > script.released_at for t in second.accepted[1:]))
+    # Its AUTH went out and was rejected: the run fails (#630).
+    env.assertEqual(second.redial_auths, 1, message=stderr[-2000:])
     env.assertEqual(returncode, 1, message=stderr[-2000:])
     env.assertContains("authentication failed", stderr)
-    env.assertLess(elapsed, 10)
+    # The redial gets in on its SYN's next retransmit after the release.
+    env.assertLess(elapsed, 35)
+
