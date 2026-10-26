@@ -198,6 +198,7 @@ public:
         m_reqs_generated++;
     }
     size_t staged_monitor_count(unsigned int conn_id) const { return m_staged_monitor_commands[conn_id].size(); }
+    void set_staged_monitor_queue_max(size_t max) { m_staged_monitor_queue_max = max; }
     // Run the give-up hook as it runs when a dial fails while
     // handle_cluster_slots() parses a reply.
     void give_up_while_parsing(unsigned int conn_id)
@@ -572,6 +573,23 @@ static void check_repin_routes_to_staged_owner(unsigned long long first_key)
         check(logged, "failed-keys file has a record");
         check(strstr(record, ",ARBITRARY,\"unit-key\",\"slot-owner-down-for-monitor-line\",0\n") != NULL,
               "dropped line is logged to --failed-keys-file");
+    }
+    // A moved line is never dropped for the staging cap: it is already
+    // selected and counted, and moving it allocates nothing.
+    {
+        client_group group(&config, protocol, &generator);
+        transaction_client client(&group);
+        client.route_slot_to_second_shard(protocol, staged_slot, port.c_str());
+        client.set_staged_monitor_queue_max(1);
+        const unsigned long long generated = client.get_reqs_generated();
+        const unsigned long long errors = client.get_stats()->get_total_errors();
+        client.stage_line(1, staged_slot);
+        client.stage_line(0, staged_slot);
+        client.reroute_staged_monitor_commands();
+        check(client.staged_monitor_count(0) == 0 && client.staged_monitor_count(1) == 2,
+              "line moves onto a queue at the cap");
+        check(client.get_reqs_generated() == generated + 2 && client.get_stats()->get_total_errors() == errors,
+              "line moved past the cap stays counted and is not an error");
     }
     // The same, for a line already on that primary: nothing would send it or
     // uncount it, so it would hold a --requests run open.

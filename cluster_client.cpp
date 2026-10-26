@@ -56,7 +56,6 @@
 #include "shard_connection.h"
 
 #define KEY_INDEX_QUEUE_MAX_SIZE 1000000
-#define STAGED_MONITOR_QUEUE_MAX_SIZE 1000000
 
 // After this many consecutive read-routing failures under strict rp_secondary
 // (select_target_conn returning UINT_MAX for reads), hold_pipeline yields the
@@ -528,6 +527,10 @@ bool cluster_client::primary_given_up(unsigned int conn_id) const
 {
     if (conn_id >= m_connections.size()) return true;
     const shard_connection *sc = m_connections[conn_id];
+    // The mark is set only on a connection that is down with no timer, and
+    // the redial that arms one clears it first (connect_shard_connection()).
+    assert(!sc->is_awaiting_slots_redial() ||
+           (sc->get_connection_state() == conn_disconnected && !sc->is_reconnect_pending()));
     return sc->get_connection_state() == conn_disconnected && !sc->is_reconnect_pending() &&
            !sc->is_awaiting_slots_redial();
 }
@@ -2883,7 +2886,7 @@ bool cluster_client::create_monitor_request_cluster(unsigned int command_index, 
         // format_arbitrary_command is intentionally deferred to drain: it mutates arg->data
         // in-place with RESP framing and must be called per-connection at send time.
         // Cap the queue to prevent unbounded memory growth under skewed workloads.
-        if (m_staged_monitor_commands[target_conn].size() < STAGED_MONITOR_QUEUE_MAX_SIZE) {
+        if (m_staged_monitor_commands[target_conn].size() < m_staged_monitor_queue_max) {
             staged_monitor_cmd staged{std::move(temp_cmd), stats_index, timestamp, selected_index + 1, slot};
             m_staged_monitor_commands[target_conn].push(std::move(staged));
             m_connections[target_conn]->schedule_fill();
@@ -2992,12 +2995,17 @@ void cluster_client::reroute_staged_monitor_commands()
         std::queue<staged_monitor_cmd> staged;
         std::swap(m_staged_monitor_commands[i], staged);
         // A line moved to a later connection is seen again when the loop gets
-        // there. That second pass is idempotent: the map is the same, and the
-        // line stays (target == i is never queue-full).
+        // there. That second pass is idempotent: the map is the same, so the
+        // line stays.
+        //
+        // A move may take a queue past m_staged_monitor_queue_max: the line
+        // is already selected and counted, and moving it allocates nothing.
+        // Producers don't stage on a queue at the cap.
         for (; !staged.empty(); staged.pop()) {
             const unsigned int slot = staged.front().slot;
             // Only keyed lines are staged (create_monitor_request_cluster()), so
             // the keyless UINT_MAX slot never gets here.
+            // The branch below handles it when asserts are compiled out.
             assert(slot != UINT_MAX);
             unsigned int target = UINT_MAX;
             const char *drop_reason = NULL;
@@ -3008,11 +3016,7 @@ void cluster_client::reroute_staged_monitor_commands()
                 // An unowned slot can go to any primary: it gives the
                 // server's routing response.
                 target = slot_is_unowned(slot) ? (keeps ? i : fallback) : slot_primary_conn_id(slot);
-                if (primary_given_up(target)) {
-                    drop_reason = "slot-owner-down-for-monitor-line";
-                } else if (target != i && m_staged_monitor_commands[target].size() >= STAGED_MONITOR_QUEUE_MAX_SIZE) {
-                    drop_reason = "staged-monitor-queue-full";
-                }
+                if (primary_given_up(target)) drop_reason = "slot-owner-down-for-monitor-line";
             }
             if (drop_reason != NULL) {
                 const std::vector<command_arg> &args = staged.front().parsed_cmd.command_args;
@@ -3032,8 +3036,7 @@ void cluster_client::reroute_staged_monitor_commands()
     // Dropped lines are never sent: uncount them and count them as errors,
     // as hand_off_replay_requests() does.
     if (dropped) {
-        benchmark_error_log("warning: dropped %llu staged monitor line(s): their slot's primary was given up on or "
-                            "its queue is full.\n",
+        benchmark_error_log("warning: dropped %llu staged monitor line(s): their slot's primary was given up on.\n",
                             dropped);
         abandon_requests(dropped);
     }

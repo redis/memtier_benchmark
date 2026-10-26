@@ -95,6 +95,10 @@ public:
 protected:
     std::vector<key_index_pool *> m_key_index_pools;
     std::vector<std::queue<staged_monitor_cmd> > m_staged_monitor_commands;
+    // Most lines a producer stages on one connection: a memory bound on new
+    // staging. A re-route only moves lines already staged, so it may go past
+    // it. A member so unit tests can lower it.
+    size_t m_staged_monitor_queue_max = 1000000;
     // Per-slot map to the owning shard group. m_shard_groups[m_slot_to_shard_group[s]].primary
     // is the connection that owns slot s; replicas are reachable via the same group's
     // replicas vector. Replaces the old `unsigned int m_slot_to_shard[16384]` (which only
