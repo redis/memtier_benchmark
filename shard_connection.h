@@ -501,6 +501,12 @@ private:
     double m_current_backoff_delay;
     struct event *m_reconnect_timer;
     bool m_reconnecting;
+    // Only cluster_client sets or clears it. Set by reconnect() when it
+    // leaves this redial to the main connection's refresh (both branches).
+    // Cleared by connect_shard_connection() (redialed), the retire loop of
+    // handle_cluster_slots() (left the map), and handle_connection_given_up()
+    // for this connection, or for every connection when the main one is
+    // given up on.
     bool m_awaiting_slots_redial;
     // The pending reconnect follows a rejected setup step (AUTH/SELECT/HELLO).
     // Cleared when its timer fires. reconnect_after_setup_error() also sets it

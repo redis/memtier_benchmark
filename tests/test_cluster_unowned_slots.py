@@ -694,14 +694,15 @@ def test_unusable_slots_refresh_is_bounded_by_reconnect_attempts(env):
                     "--reconnect-on-error",
                     "--max-reconnect-attempts=3",
                     "--reconnect-backoff-factor=0.5",
-                    # Longer than the harness's 2 s: the seed is meant to
-                    # fail setup until --max-reconnect-attempts ends the run.
+                    # The seed fails setup on every reconnect. With the
+                    # harness's 2 s, a loaded host can let the stage
+                    # supervisor end the run before --max-reconnect-attempts
+                    # does, and this test checks the cap.
                     "--connection-stage-timeout=30",
                 ],
                 seed_replica=True,
                 expected_exit=1,
-                # Without the cap memtier never exits, so the timeout is
-                # what catches a regression.
+                # Without the cap the run outlives this timeout.
                 timeout=20,
             )
         env.assertContains("requested a cluster slot map refresh to reconnect", stderr)

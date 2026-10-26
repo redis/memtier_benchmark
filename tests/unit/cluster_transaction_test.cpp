@@ -986,6 +986,49 @@ static void check_awaiting_slots_redial()
               "the seed's give-up drops lines waiting on its refresh");
         check(client.get_reqs_generated() == generated - 2, "dropped lines are uncounted");
     }
+#ifndef _WIN32
+    // The seed is down when the shard's timer fires, and redialing it fails
+    // at once, inside reconnect(): libevent 2.0 reports it from connect(),
+    // and 2.1 leaves reconnect() to retry it. Either way the seed, out of
+    // attempts, is given up on there, which must not leave the shard
+    // waiting on a refresh that will never come. (Windows defers the error
+    // to the event loop.)
+    {
+        client_group group(&config, protocol, &generator);
+        transaction_client client(&group);
+        client.route_slot_to_second_shard(protocol, staged_slot, owner_port.c_str());
+        client.dial_peer(protocol, seed_port.c_str());
+        client.refresh_over_seed(seed_port.c_str());
+        config.reconnect_on_error = true;
+        config.max_reconnect_attempts = 1;
+        client.get_connections()[0]->attempt_reconnect("unit-test seed drop");
+        // Cancels the timer: the seed has used its one attempt.
+        client.get_connections()[0]->disconnect();
+        client.get_connections()[1]->disconnect();
+        client.stage_line(1, staged_slot);
+        const unsigned long long generated = client.get_reqs_generated();
+        // TCP connect() to the limited broadcast address fails at once.
+        server_addr unreachable("255.255.255.255", atoi(seed_port.c_str()), AF_INET);
+        config.server_addr = &unreachable;
+        config.port = atoi(seed_port.c_str());
+        // Connection 2 is still dialing, so the seed is left dead, not the
+        // thread ended.
+        config.read_preference = rp_secondary_preferred;
+        client.reconnect(1);
+        config.read_preference = rp_primary;
+        config.server_addr = NULL;
+        config.port = 0;
+        config.reconnect_on_error = false;
+        config.max_reconnect_attempts = 0;
+        check(client.get_connections()[0]->get_connection_state() == conn_disconnected &&
+                  !client.get_connections()[0]->is_reconnect_pending() && !client.run_failed(),
+              "unreachable seed: given up inside reconnect()");
+        check(!client.get_connections()[1]->is_awaiting_slots_redial(),
+              "unreachable seed: the shard is not left waiting on its refresh");
+        check(client.staged_monitor_count(1) == 0 && client.get_reqs_generated() == generated - 1,
+              "unreachable seed: the shard's line is dropped and uncounted");
+    }
+#endif
     delete reply;
     evbuffer_free(input);
     evbuffer_free(output);

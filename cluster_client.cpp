@@ -268,8 +268,21 @@ int cluster_client::reconnect(unsigned int conn_id)
     // Reconnecting the main connection refreshes the slot map, which then
     // reconnects this one.
     if (MAIN_CONNECTION->get_connection_state() == conn_disconnected) {
-        if (connect() < 0) return -1;
+        // Mark first: the main connection can be given up on inside
+        // connect() (libevent 2.0 reports a dial that fails at once from
+        // there), and that give-up must see this mark to end the wait.
         sc->set_awaiting_slots_redial(true);
+        if (connect() < 0) {
+            sc->set_awaiting_slots_redial(false);
+            return -1;
+        }
+        // A dial that failed before reaching the event loop (libevent 2.1)
+        // leaves the main connection with no timer. Retry it as
+        // connect_shard_connection() does, so --max-reconnect-attempts
+        // bounds it and its give-up ends this wait.
+        if (sc->is_awaiting_slots_redial() && MAIN_CONNECTION->get_connection_state() == conn_disconnected &&
+            !MAIN_CONNECTION->is_reconnect_pending())
+            MAIN_CONNECTION->attempt_reconnect("Connection failed");
         return 1;
     }
 
