@@ -23,16 +23,27 @@ a reply; this covers the one that had some.
   answered past the deadline. B ends from the first shard once its setup
   completes, at the late reply on the second: the last reply is the client's,
   whichever shard it came on, and a setup reply is not one.
+- "setup": B is answered _ANSWERED times and closed right after the last
+  reply, with nothing in flight. Its reconnect's AUTH is held past the
+  deadline. B must send no new SET once that setup completes, though no reply
+  has moved the run's clock past the deadline (#879): it ends at its deadline.
+- "late-gone", "late-grace": "late", but B's second held SET is not answered:
+  the peer stops listening and closes B, so the reconnect is refused and the
+  run ends there (#666), or it is never answered and the drain grace abandons
+  it (#669). B still ends at its late reply (#880), as does "late" with a
+  SIGINT during B's idle time after that reply (#747).
 
 The peer sets the pace: it holds and closes B relative to A's close, so the
-timing is past the deadline however slowly memtier starts. No SIGINT is sent.
+timing is past the deadline however slowly memtier starts.
 """
 import json
 import os
+import signal
 import socketserver
 import subprocess
 import tempfile
 import threading
+import time
 
 from include import MEMTIER_BINARY
 
@@ -71,7 +82,7 @@ class _Peer:
         self.a_closed = threading.Event()
         # Cluster mode: A's connection to the second shard authenticated.
         self.a_second = threading.Event()
-        self.servers = [_Server(self) for _ in range(1 if mode in ("stalled", "late") else 2)]
+        self.servers = [_Server(self) for _ in range(2 if mode in ("cluster", "split") else 1)]
         self.ports = [server.server_address[1] for server in self.servers]
         self.auths = {port: 0 for port in self.ports}
         self.a_open = 0
@@ -80,8 +91,10 @@ class _Peer:
         self.b_held = 0
         self.b_late = 0
         self.b_connections = 0
-        # "split": B's connection to the first shard was closed.
+        # "split", "setup": B's connection to the first shard was closed.
         self.b_dropped = False
+        # "setup": B's SETs after its reconnect.
+        self.b_after_setup = 0
         self.errors = []
 
     def slots(self):
@@ -136,7 +149,7 @@ class _Handler(socketserver.StreamRequestHandler):
                         else:
                             peer.b_connections += 1
                     if peer.b_dropped and port == peer.ports[0]:
-                        # "split": B's reconnect to the first shard.
+                        # "split", "setup": B's reconnect to the first shard.
                         peer.hold()
                     reply = b"+OK\r\n"
                 elif args == [b"CLUSTER", b"SLOTS"]:
@@ -165,11 +178,23 @@ class _Handler(socketserver.StreamRequestHandler):
                         # first shard before its deadline.
                         if peer.b_dropped:
                             peer.answer_late()
-                    elif peer.mode in ("stalled", "late") and peer.b_replies >= _ANSWERED:
-                        if peer.mode == "late" and peer.b_late == 0:
+                    elif peer.mode == "setup" and peer.b_dropped:
+                        with peer.lock:
+                            peer.b_after_setup += 1
+                    elif peer.mode != "setup" and peer.b_replies >= _ANSWERED:
+                        if peer.mode.startswith("late") and peer.b_late == 0:
                             peer.answer_late()
+                        elif peer.mode == "late-grace":
+                            with peer.lock:
+                                peer.b_held += 1
+                            peer.stop.wait(30)
+                            return
                         else:
                             peer.hold()
+                            if peer.mode == "late-gone":
+                                for server in peer.servers:
+                                    server.shutdown()
+                                    server.server_close()
                             return
                     if role == "B":
                         with peer.lock:
@@ -177,6 +202,9 @@ class _Handler(socketserver.StreamRequestHandler):
                     reply = b"+OK\r\n"
                 self.wfile.write(reply)
                 self.wfile.flush()
+                if peer.mode == "setup" and role == "B" and not peer.b_dropped and peer.b_replies >= _ANSWERED:
+                    peer.b_dropped = True
+                    return
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as error:
@@ -189,8 +217,9 @@ class _Handler(socketserver.StreamRequestHandler):
                         peer.a_closed.set()
 
 
-def _scenario(mode, extra, binary=MEMTIER_BINARY):
-    """Run one scenario. Returns (stats, peer counters, output)."""
+def _scenario(mode, extra, binary=MEMTIER_BINARY, sigint_s=None):
+    """Run one scenario, with a SIGINT sigint_s past A's close if given.
+    Returns (stats, peer counters, output)."""
     peer = _Peer(mode)
     threads = [threading.Thread(target=server.serve_forever) for server in peer.servers]
     for thread in threads:
@@ -201,18 +230,23 @@ def _scenario(mode, extra, binary=MEMTIER_BINARY):
             path = os.path.join(directory, "stats.json")
             args = [binary, "-s", "127.0.0.1", "-p", str(peer.ports[0]),
                     "--authenticate=dummy-870", "-t", "1", "-c", "2", "--test-time=" + str(_TEST_TIME),
-                    "--pipeline=" + ("2" if mode == "late" else "1"), "--ratio=1:0",
+                    "--pipeline=" + ("2" if mode.startswith("late") else "1"), "--ratio=1:0",
                     "--rate-limiting=" + str(_RATE), "--reconnect-on-error", "--hide-histogram",
                     "--json-out-file=" + path] + extra
             if len(peer.ports) == 2:
                 args.append("--cluster-mode")
             child = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if sigint_s is not None:
+                assert peer.a_closed.wait(30), "A never closed"
+                time.sleep(sigint_s)
+                child.send_signal(signal.SIGINT)
             stdout, stderr = child.communicate(timeout=30)
             with open(path) as source:
                 stats = json.load(source)["ALL STATS"]
         counters = {"returncode": child.returncode, "errors": list(peer.errors), "a_replies": peer.a_replies,
                     "b_replies": peer.b_replies, "b_held": peer.b_held, "b_late": peer.b_late,
-                    "b_connections": peer.b_connections, "a_closed": peer.a_closed.is_set()}
+                    "b_connections": peer.b_connections, "b_after_setup": peer.b_after_setup,
+                    "a_closed": peer.a_closed.is_set()}
         return stats, counters, stdout + stderr
     finally:
         if child is not None and child.poll() is None:
@@ -226,16 +260,20 @@ def _scenario(mode, extra, binary=MEMTIER_BINARY):
             thread.join(timeout=3)
 
 
-def _check(env, mode, extra, expected_ms):
-    stats, peer, output = _scenario(mode, extra)
+def _check(env, mode, extra, expected_ms, sigint_s=None, unanswered=0):
+    stats, peer, output = _scenario(mode, extra, sigint_s=sigint_s)
     env.assertEqual(peer["returncode"], 0, message=output[-2000:])
     env.assertEqual(peer["errors"], [])
-    env.assertEqual(stats["Runtime"]["Interrupted"], "false")
+    env.assertEqual(stats["Runtime"]["Interrupted"], "false" if sigint_s is None else "true")
+    env.assertEqual(stats["Runtime"]["Unanswered requests"], unanswered)
     env.assertTrue(peer["a_closed"])
-    # B was answered, then one SET was held and B's connection closed.
+    # B was answered, then one SET (or setup reply) was held and B's
+    # connection closed, unless the held SET is never answered or memtier is
+    # interrupted first.
     env.assertGreater(peer["b_replies"], 0)
     env.assertEqual(peer["b_held"], 1)
-    env.assertContains("connection dropped", output)
+    if not unanswered and sigint_s is None:
+        env.assertContains("connection dropped", output)
     # Every reply counts, B's included.
     count = stats["Totals"]["Count"]
     env.assertEqual(count, peer["a_replies"] + peer["b_replies"])
@@ -284,3 +322,34 @@ def test_cluster_answered_client_ends_at_last_reply_on_another_shard(env):
     peer = _check(env, "split", ["--key-pattern=S:S", "--key-minimum=1", "--key-maximum=2"],
                   _TEST_TIME * 1000 + _LATE_S * 1000 / 2)
     env.assertEqual(peer["b_late"], 1)
+
+
+def test_answered_client_sends_nothing_after_setup_stalled_past_deadline(env):
+    # B's last reply was at ~0.2 s, so it ends at its deadline: ~3000 ms.
+    # Sending a SET once its setup completed gave ~4000 ms (#879).
+    peer = _check(env, "setup", [], _TEST_TIME * 1000)
+    env.assertEqual(peer["b_after_setup"], 0)
+    env.assertEqual(peer["b_replies"], _ANSWERED)
+
+
+def _check_late(env, mode, sigint_s=None, unanswered=0):
+    # As in "late": B ends at its late reply, about 3500 ms. A cap at the
+    # deadline gives ~3000 ms (#880).
+    peer = _check(env, mode, [], _TEST_TIME * 1000 + _LATE_S * 1000 / 2, sigint_s=sigint_s, unanswered=unanswered)
+    env.assertEqual(peer["b_late"], 1)
+
+
+def test_interrupted_answered_client_ends_at_last_reply_past_deadline(env):
+    if os.name == "nt":
+        # Popen.send_signal(SIGINT) is not a Windows console Ctrl+C event.
+        env.skip()
+    # SIGINT during B's idle time after its late reply, before its close.
+    _check_late(env, "late", sigint_s=_LATE_S + _OVERRUN_S / 2)
+
+
+def test_answered_client_ends_at_last_reply_when_reconnect_refused(env):
+    _check_late(env, "late-gone")
+
+
+def test_answered_client_ends_at_last_reply_when_drain_grace_abandons(env):
+    _check_late(env, "late-grace", unanswered=1)

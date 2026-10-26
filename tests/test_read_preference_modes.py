@@ -18,8 +18,8 @@ The --read-preference flag controls which cluster nodes receive GET traffic:
   nearest           - reads go to any node (lowest latency); no strict assertion
 
 These tests require a cluster started with replicas (useSlaves=True).  They
-are skipped automatically when not in cluster mode or when no replicas are
-advertised.
+are skipped when not in cluster mode or on a cluster started without
+replicas, and fail on one started with replicas that advertises none.
 
 Test matrix
 -----------

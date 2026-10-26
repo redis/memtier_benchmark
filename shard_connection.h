@@ -97,6 +97,9 @@ struct request
     // by ASKING, or that node, importing the slot, answers -MOVED back to the
     // migrating node. Cleared when the request is routed by the slot map.
     bool m_asking;
+    // Replies the server sends for this request (several for a multi-channel
+    // SUBSCRIBE); it is popped at the last one.
+    unsigned int m_replies;
 
     // Captured serialized command bytes for resend. Owned; freed in dtor.
     // NULL/0 when retry is disabled or capture failed. Stored as opaque protocol
@@ -171,6 +174,7 @@ public:
     void disconnect_after_error();
     void end_thread(const char *reason, const char *thread_end_reason);
     void reconnect_after_setup_error(const char *error_context, bool setup_step = true);
+    void handle_connection_rejection(request *req, const char *status);
     // Reconnects stop at the --test-time deadline (#656) only with
     // --reconnect-on-error and unlimited --max-reconnect-attempts; a finite
     // bound keeps master's behaviour.
@@ -186,8 +190,10 @@ public:
     double next_reconnect_delay(void);
     bool stop_reconnecting_if_run_over(void);
     // siblings_done() and end_client_after_run() are public only for
-    // tests/unit/reconnect_siblings_test.cpp.
+    // tests/unit/reconnect_siblings_test.cpp; may_send_again() is also used by
+    // client::idle_connection_waits_for_connect().
     bool siblings_done(void);
+    bool may_send_again(void);
     void end_client_after_run(bool end_stats);
     void warn_reconnecting_indefinitely(void);
 
@@ -204,7 +210,8 @@ public:
     // argument (__monitor_line@__); like a key_type argument, the first one
     // wins and send_arbitrary_command_end() attaches it to the request.
     void set_arbitrary_command_key(const char *key, unsigned int key_len);
-    void send_arbitrary_command_end(size_t command_index, struct timeval *sent_time, int cmd_size);
+    void send_arbitrary_command_end(size_t command_index, struct timeval *sent_time, int cmd_size,
+                                    unsigned int replies = 1);
 
     // Request a CLUSTER SLOTS refresh. A refresh already in flight (setup_sent)
     // will update the slot map anyway: sending a second one would leave two
@@ -333,6 +340,7 @@ public:
     void handle_reconnect_timer_event();
     void handle_connection_timeout_event();
     void handle_unix_connect_retry();
+    int socket_connect(struct sockaddr *sa, int socklen);
 
     // Retry / replay machinery.
     void handle_retry_drain_event();
@@ -382,6 +390,7 @@ public:
     bool retry_queue_holds_new_work() const;
 
 private:
+    void drop_unanswered_request(request *req, unsigned long long *dropped, unsigned long long *abandoned);
     // request::m_key is read by --failed-keys-file and, under --retry-on-error,
     // by cluster MOVED/ASK retry, replay and -READONLY routing; skip the copy
     // when neither is on.
@@ -391,7 +400,7 @@ private:
     static void deferred_connect_error_handler(evutil_socket_t, short, void *);
     void cancel_deferred_connect_error();
 #endif
-    void setup_event(evutil_socket_t sockfd);
+    bool setup_event(evutil_socket_t sockfd);
     evutil_socket_t setup_socket(struct connect_info *addr);
     void set_readable_id();
 
@@ -405,6 +414,8 @@ private:
     // True while a CLUSTER SLOTS refresh must wait for the pinned
     // --transaction rotation this connection drives to close its MULTI.
     bool setup_held_for_transaction();
+    // Whether fill_pipeline() would send a setup step now.
+    bool setup_step_sendable();
     void send_conn_setup_commands(struct timeval timestamp);
     void restore_cluster_slots_value_policy();
     // Schedule a fill on every other connected connection of this client, so
@@ -424,6 +435,10 @@ private:
     void push_req(request *req);
 
     void process_response(void);
+    // Whether this plaintext connection's reads are tracked with
+    // track_libevent_reads() (libevent_read_cap.h).
+    bool tracks_libevent_reads(void) const { return m_tracks_libevent_reads; }
+    size_t *last_input_added(void) { return &m_last_input_added; }
     void process_subsequent_requests(void);
     void process_first_request();
     void fill_pipeline(void);
@@ -458,6 +473,15 @@ private:
     // platform std::atomic<int> is lock-free and the loads/stores are
     // async-signal-safe.
     std::atomic<int> m_pending_resp;
+    // Replies already received for the pipeline front, when it expects
+    // several (request::m_replies), the replies its EXEC adds from queued
+    // commands, and the bytes of those already received. Reset by pop_req().
+    unsigned int m_front_replies;
+    unsigned int m_front_extra_replies;
+    unsigned int m_front_bytes;
+    // Replies still due from commands answered +QUEUED in an open MULTI,
+    // owed to the EXEC that runs them.
+    unsigned int m_queued_replies;
 
     // Snapshot of the most recently pushed request's type. Updated on every
     // push_req() and read by get_last_request_type() from the crash-handler
@@ -524,11 +548,24 @@ private:
     // reply (errors included): a failed connect after the run is over then
     // fails the run (#630).
     bool m_setup_failed_since_reply;
+    // A workload reply arrived since this connection was established, so a
+    // later connection rejection is a drop, not a setup failure. It cannot be
+    // !m_setup_failed_since_reply: that one starts false and carries across
+    // reconnects until the next reply (#630), while this one must start false
+    // on every new connection (cleared in disconnect()).
+    bool m_reply_since_connect;
     // The pending rejected-setup reconnect follows an empty or error CLUSTER
     // SLOTS reply (with m_setup_rejected), and whether this connection already
     // got its one refresh after the run was over (never cleared).
     bool m_slots_rejected;
     bool m_slots_retried_after_run_over;
+    // The --test-time deadline the pending reconnect timer was clamped to
+    // (next_reconnect_delay()), zero if none, and the latest such deadline
+    // whose timer fired: it has passed, see run_deadline_passed(). The fired
+    // deadline is never cleared, on purpose: a run's deadline only moves
+    // later, and a later one is again decided by the clock.
+    struct timeval m_reconnect_deadline;
+    struct timeval m_fired_reconnect_deadline;
 
     // Connection timeout tracking
     struct event *m_connection_timeout_timer;
@@ -572,6 +609,16 @@ private:
     // conditional. Invariant: m_bev_paused == true iff m_bev is currently in
     // the EV_READ|EV_WRITE-disabled state.
     bool m_bev_paused;
+
+    // Set when libevent caps socket reads and m_bev is a plaintext socket
+    // bufferevent; m_last_input_added is then what its last read added.
+    bool m_tracks_libevent_reads;
+    size_t m_last_input_added;
+    // Set while socket_connect() is inside bufferevent_socket_connect(); the
+    // error libevent before 2.1.9 reports from there through handle_event()
+    // is kept in m_socket_connect_error.
+    bool m_in_socket_connect;
+    int m_socket_connect_error;
 
     // Bumped by every disconnect(). process_response() compares it against
     // the value it started with and stops parsing once the connection was

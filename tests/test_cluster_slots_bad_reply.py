@@ -26,7 +26,7 @@ class _Node(socketserver.ThreadingTCPServer):
     def __init__(self, bad_slots_replies, moved_after=0, bad_reply=b"*0\r\n", replica=None, readonly_delay=0,
                  first_good=False, bad_delay=0, auth_error=None, auth_error_with_next=False, select_error=None,
                  moved_every=0, auth_reject_first=0, first_data_delay=0, gone_after_bad=False, bad_for=None,
-                 drop_after=0, reject_auth=0, host="127.0.0.1"):
+                 drop_after=0, reject_auth=0, reject_data=None, host="127.0.0.1", hello_error=None):
         super().__init__((host, 0), _Handler)
         self.lock = threading.Lock()
         # CLUSTER SLOTS requests answered with bad_reply: the ones after the
@@ -51,6 +51,8 @@ class _Node(socketserver.ThreadingTCPServer):
         self.extra = []
         # Reply to SELECT, if not +OK.
         self.select_error = select_error
+        # Reply to HELLO, if not +OK.
+        self.hello_error = hello_error
         # Answer every moved_every-th data command with -MOVED to moved_to
         # (this node if None), so memtier refreshes the slot map again and again.
         self.moved_every = moved_every
@@ -69,6 +71,9 @@ class _Node(socketserver.ThreadingTCPServer):
         # this AUTH (counting from 1) with -WRONGPASS.
         self.drop_after = drop_after
         self.reject_auth = reject_auth
+        # Answer every data command with this error, then close (a server
+        # refusing the connection, e.g. -ERR max number of clients).
+        self.reject_data = reject_data
         self.auth_requests = 0
         # A node listed as this node's replica in a good reply, and how long
         # a node waits before answering READONLY.
@@ -129,6 +134,8 @@ class _Handler(socketserver.StreamRequestHandler):
                     reply = node.slots_reply()
                 elif verb == b"SELECT" and node.select_error:
                     reply = node.select_error
+                elif verb == b"HELLO" and node.hello_error:
+                    reply = node.hello_error
                 elif verb == b"AUTH" and node.auth_error:
                     with node.lock:
                         node.auth_requests += 1
@@ -159,7 +166,10 @@ class _Handler(socketserver.StreamRequestHandler):
                         first = node.data_requests == 1
                     if first:
                         time.sleep(node.first_data_delay)
-                    if moved:
+                    if node.reject_data:
+                        reply = node.reject_data
+                        dropped = True
+                    elif moved:
                         target = node.moved_to or node
                         reply = "-MOVED 0 {}:{}\r\n".format(*target.server_address).encode()
                     else:

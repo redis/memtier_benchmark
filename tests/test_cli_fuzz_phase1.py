@@ -234,8 +234,8 @@ def test_426_3_memcache_binary_against_redis(env):
 # ---------------------------------------------------------------------------
 def test_426_8_data_size_range_too_large(env):
     # Serializing the oversized SET can exceed a one-second test window on
-    # sanitizer builds. Keep work unfinished when Redis rejects that request,
-    # even though the error reply itself counts as a completed operation.
+    # sanitizer builds. Keep work unfinished when Redis rejects that request
+    # (the rejection is not counted as a completed operation, #894).
     args = _base_args(env, requests=100)
     if args is None:
         return
