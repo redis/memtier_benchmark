@@ -831,7 +831,7 @@ For detailed setup instructions, dashboard usage, and troubleshooting, see [Real
 
 memtier_benchmark can also expose live metrics as a Prometheus `/metrics`
 endpoint, scrapable by Prometheus or any OpenMetrics-compatible collector. The
-exporter is built in by default (it requires libevent 2.1.1 or newer; see
+exporter is built in by default (it requires libevent 2.1.4 or newer; see
 [DEVELOPMENT.md](DEVELOPMENT.md) for the `--disable-prometheus` build flavor).
 It is **off at runtime** until you pass `--prometheus-port`:
 

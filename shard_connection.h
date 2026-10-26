@@ -395,7 +395,7 @@ private:
     static void deferred_connect_error_handler(evutil_socket_t, short, void *);
     void cancel_deferred_connect_error();
 #endif
-    void setup_event(evutil_socket_t sockfd);
+    bool setup_event(evutil_socket_t sockfd);
     evutil_socket_t setup_socket(struct connect_info *addr);
     void set_readable_id();
 

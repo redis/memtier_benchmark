@@ -47,6 +47,7 @@
 #include "client.h"
 #include "retry_policy.h"
 #include "retry_backoff.h"
+#include "library_versions.h"
 #include "event2/bufferevent.h"
 
 // Maximum reconnect delay enforced after every exponential-backoff
@@ -491,23 +492,33 @@ void shard_connection::deferred_connect_error_handler(evutil_socket_t, short, vo
 }
 #endif
 
-void shard_connection::setup_event(evutil_socket_t sockfd)
+bool shard_connection::setup_event(evutil_socket_t sockfd)
 {
 #ifdef _WIN32
     cancel_deferred_connect_error();
 #endif
     if (m_bev) {
         bufferevent_free(m_bev);
+        m_bev = NULL;
     }
+    // Until a new bufferevent exists the protocol has no buffers, rather than
+    // the freed ones (also after disconnect()), should creation fail below.
+    if (m_protocol != NULL) m_protocol->set_buffers(NULL, NULL);
     // Fresh bufferevent below starts enabled by default (after we call
     // bufferevent_enable in handle_event on BEV_EVENT_CONNECTED); reset the
     // pause flag so we don't carry stale state from a prior socket.
     m_bev_paused = false;
 
+    // On failure the caller fails this connect attempt like a socket setup
+    // failure; its connect/reconnect error handling applies unchanged.
 #ifdef USE_TLS
     if (m_config->openssl_ctx) {
         SSL *ctx = SSL_new(m_config->openssl_ctx);
-        assert(ctx != NULL);
+        if (ctx == NULL) {
+            benchmark_error_log("error: SSL_new() failed; cannot create the TLS connection.\n");
+            evutil_closesocket(sockfd);
+            return false;
+        }
 
         if (m_config->tls_sni) {
             SSL_set_tlsext_host_name(ctx, m_config->tls_sni);
@@ -515,16 +526,37 @@ void shard_connection::setup_event(evutil_socket_t sockfd)
 
         m_bev = bufferevent_openssl_socket_new(m_event_base, sockfd, ctx, BUFFEREVENT_SSL_CONNECTING,
                                                BEV_OPT_CLOSE_ON_FREE);
+        if (m_bev == NULL) {
+            // Do not free the SSL: libevent >= 2.1.9 already has
+            // (BEV_OPT_CLOSE_ON_FREE). Who owns the SSL and the socket on
+            // older libevent: see libevent_ssl_failure_socket_is_ours().
+            benchmark_error_log("error: bufferevent_openssl_socket_new() failed; cannot create the TLS "
+                                "connection.\n");
+            // The loaded library does the cleanup, so ask its (runtime)
+            // version, not LIBEVENT_VERSION_NUMBER from the headers.
+            if (libevent_ssl_failure_socket_is_ours(event_get_version_number())) {
+                evutil_closesocket(sockfd);
+            } else {
+                benchmark_error_log("error: socket %d left open on purpose: libevent %s may already have closed it.\n",
+                                    (int) sockfd, event_get_version());
+            }
+            return false;
+        }
     } else {
 #endif
         m_bev = bufferevent_socket_new(m_event_base, sockfd, BEV_OPT_CLOSE_ON_FREE);
+        if (m_bev == NULL) {
+            benchmark_error_log("error: bufferevent_socket_new() failed; cannot create the connection.\n");
+            evutil_closesocket(sockfd);
+            return false;
+        }
 #ifdef USE_TLS
     }
 #endif
 
-    assert(m_bev != NULL);
     bufferevent_setcb(m_bev, cluster_client_read_handler, NULL, cluster_client_event_handler, (void *) this);
     m_protocol->set_buffers(bufferevent_get_input(m_bev), bufferevent_get_output(m_bev));
+    return true;
 }
 
 evutil_socket_t shard_connection::setup_socket(struct connect_info *addr)
@@ -647,8 +679,9 @@ int shard_connection::connect(struct connect_info *addr)
         return -1;
     }
 
-    // set up bufferevent
-    setup_event(sockfd);
+    // set up bufferevent (on failure it has reported the error and released
+    // the socket)
+    if (!setup_event(sockfd)) return -1;
 
     // set readable id
     set_readable_id();
@@ -804,6 +837,7 @@ void shard_connection::disconnect()
     if (m_bev) {
         bufferevent_free(m_bev);
         m_bev = NULL;
+        if (m_protocol != NULL) m_protocol->set_buffers(NULL, NULL);
     }
     // After free, any future bufferevent starts in the default (enabled) state.
     m_bev_paused = false;
@@ -1461,16 +1495,14 @@ void shard_connection::send_conn_setup_commands(struct timeval timestamp)
     // into reads).
     if (m_readonly_state == setup_none) {
         benchmark_debug_log("sending READONLY command (replica connection).\n");
-        // Use bufferevent_write rather than going through protocol::write_command_readonly
-        // which adds to the bufferevent's output evbuffer directly. For a connection whose
-        // FD was attached to the bufferevent via bufferevent_socket_new + a subsequent
-        // bufferevent_socket_connect (the path A1 uses for replicas discovered through
-        // CLUSTER SLOTS), the evbuffer notify callback does not re-arm EPOLLOUT on the
-        // first user-level send, so the bytes sit in the output buffer forever and the
-        // connect-callback handle_event path has no chance to flush them. bufferevent_write
-        // routes through bufferevent_trigger_nolock_ which forces the EPOLLOUT registration.
-        // Primaries don't hit this because all setup states default to setup_done, so
-        // send_conn_setup_commands is a no-op for them.
+        // bufferevent_write() is only evbuffer_add() on the bufferevent's output
+        // buffer (libevent 2.1.x and 2.2.x alike), the same path the protocol
+        // writers use, so this write is flushed exactly like AUTH/SELECT/HELLO:
+        // the output buffer's callback arms the write event because handle_event
+        // enabled EV_WRITE at BEV_EVENT_CONNECTED. It does not go through
+        // bufferevent_trigger_nolock_(). Whether a dedicated write is needed here
+        // at all is tracked in #532. Primaries skip this step: their setup state
+        // defaults to setup_done.
         static const char READONLY_CMD[] = "*1\r\n$8\r\nREADONLY\r\n";
         bufferevent_write(m_bev, READONLY_CMD, sizeof(READONLY_CMD) - 1);
         push_req(new request(rt_readonly, 0, &timestamp, 0));
