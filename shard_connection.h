@@ -336,6 +336,7 @@ public:
     void handle_reconnect_timer_event();
     void handle_connection_timeout_event();
     void handle_unix_connect_retry();
+    int socket_connect(struct sockaddr *sa, int socklen);
 
     // Retry / replay machinery.
     void handle_retry_drain_event();
@@ -584,6 +585,12 @@ private:
     // conditional. Invariant: m_bev_paused == true iff m_bev is currently in
     // the EV_READ|EV_WRITE-disabled state.
     bool m_bev_paused;
+
+    // Set while socket_connect() is inside bufferevent_socket_connect(); the
+    // error libevent before 2.1.9 reports from there through handle_event()
+    // is kept in m_socket_connect_error.
+    bool m_in_socket_connect;
+    int m_socket_connect_error;
 
     // Bumped by every disconnect(). process_response() compares it against
     // the value it started with and stops parsing once the connection was
