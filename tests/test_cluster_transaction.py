@@ -18,11 +18,14 @@ broken-transaction error (`unwatch inside MULTI`, `EXEC without MULTI`,
 
 import json
 import os
+import socketserver
 import subprocess
 import tempfile
+import threading
 import time
 
 from include import (
+    MEMTIER_BINARY,
     add_required_env_arguments,
     addTLSArgs,
     debugPrintMemtierOnError,
@@ -1102,3 +1105,95 @@ def test_transaction_lost_multi_is_not_continued(env):
     finally:
         if env.getNumberOfFailedAssertion() > failed:
             debugPrintMemtierOnError(run_config, env)
+
+
+class _HeldRefreshNode(socketserver.ThreadingTCPServer):
+    """A scripted one-node cluster that answers the first SET inside a MULTI
+    with -MOVED to itself, so a slot map refresh is due while the MULTI is
+    open, and held for the rotation's EXEC."""
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self):
+        super().__init__(("127.0.0.1", 0), _HeldRefreshHandler)
+        self.lock = threading.Lock()
+        self.moved = 0
+        self.execs = 0
+        self.errors = []
+
+
+class _HeldRefreshHandler(socketserver.StreamRequestHandler):
+    def handle(self):
+        node = self.server
+        port = node.server_address[1]
+        in_multi = False
+        try:
+            while True:
+                line = self.rfile.readline()
+                if not line:
+                    return
+                args = []
+                for _ in range(int(line[1:])):
+                    size = int(self.rfile.readline()[1:])
+                    args.append(self.rfile.read(size + 2)[:-2])
+                verb = args[0].upper()
+                if verb == b"CLUSTER":
+                    reply = b"*1\r\n*3\r\n:0\r\n:16383\r\n*2\r\n$9\r\n127.0.0.1\r\n:%d\r\n" % port
+                elif verb == b"MULTI":
+                    in_multi = True
+                    reply = b"+OK\r\n"
+                elif verb in (b"EXEC", b"DISCARD"):
+                    with node.lock:
+                        node.execs += 1
+                    in_multi = False
+                    reply = b"-EXECABORT Transaction discarded because of previous errors.\r\n"
+                elif verb == b"SET" and in_multi:
+                    with node.lock:
+                        node.moved += 1
+                        moved = node.moved == 1
+                    reply = b"-MOVED 0 127.0.0.1:%d\r\n" % port if moved else b"+QUEUED\r\n"
+                else:
+                    reply = b"+OK\r\n"
+                self.wfile.write(reply)
+                self.wfile.flush()
+        except (ConnectionResetError, BrokenPipeError):
+            pass
+        except Exception as error:
+            node.errors.append(repr(error))
+
+
+def test_transaction_deadline_mid_multi_with_held_refresh_ends(env):
+    """A --test-time deadline that lands inside a MULTI, while a slot map
+    refresh is held for that MULTI's EXEC (#569), must still end the run. No
+    new workload goes out past the deadline (#879), EXEC included, so the
+    held refresh never goes out; the client must not wait for it.
+    The rotation (MULTI, 10 SETs, EXEC at 5 commands/s) outlasts the 2 s
+    --test-time, and --rate-limiting keeps the worker's loop alive, so
+    waiting for the refresh hung the run."""
+    node = _HeldRefreshNode()
+    thread = threading.Thread(target=node.serve_forever, daemon=True)
+    thread.start()
+    test_time = 2
+    args = [MEMTIER_BINARY, "-s", "127.0.0.1", "-p", str(node.server_address[1]), "--cluster-mode",
+            "--transaction", "-t", "1", "-c", "1", "--test-time={}".format(test_time), "--rate-limiting=5",
+            "--hide-histogram", "--command=MULTI"] + ["--command=SET __key__ __data__"] * 10 + ["--command=EXEC"]
+    start = time.monotonic()
+    try:
+        result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                timeout=test_time + 10)
+        returncode, stderr = result.returncode, result.stderr
+    except subprocess.TimeoutExpired:
+        returncode, stderr = "timeout", ""
+    finally:
+        node.shutdown()
+        node.server_close()
+        thread.join(timeout=5)
+    elapsed = time.monotonic() - start
+    env.assertEqual(node.errors, [])
+    env.assertEqual(returncode, 0, message=stderr[-2000:])
+    # The refresh was due inside the MULTI, whose EXEC never went out.
+    env.assertGreater(node.moved, 1)
+    env.assertEqual(node.execs, 0)
+    # Ends at the deadline: well under the 10 s drain grace, with headroom
+    # for the sanitizer runners.
+    env.assertLess(elapsed, test_time + 6, message="run took {:.1f}s".format(elapsed))

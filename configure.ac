@@ -178,12 +178,13 @@ AS_IF([test "x$memtier_windows" = "xyes"], [
 # Prometheus exporter (evhttp) is optional, default ON. PKG check = non-fatal hygiene;
 # the LINK test is the real gate (bare AC_CHECK_HEADERS mis-detects on keg-only Homebrew
 # arm64). Link test deliberately uses the NEWEST evhttp symbol the exporter calls
-# (>= 2.1.1) so old libevent fails here, loudly.
+# (evhttp_request_set_on_complete_cb, new in libevent 2.1.4-alpha) so old
+# libevent fails here, loudly.
 AC_ARG_ENABLE([prometheus],
   [AS_HELP_STRING([--disable-prometheus],
                   [Disable the Prometheus /metrics HTTP exporter])])
 AS_IF([test "x$enable_prometheus" != "xno"], [
-       PKG_CHECK_MODULES([LIBEVENT_EXTRA], [libevent_extra >= 2.1.1],
+       PKG_CHECK_MODULES([LIBEVENT_EXTRA], [libevent_extra >= 2.1.4],
                          [AC_SUBST(LIBEVENT_EXTRA_CFLAGS) AC_SUBST(LIBEVENT_EXTRA_LIBS)],
                          [LIBEVENT_EXTRA_CFLAGS="" LIBEVENT_EXTRA_LIBS=""])
        memtier_saved_CFLAGS="$CFLAGS"; memtier_saved_LIBS="$LIBS"
@@ -202,7 +203,7 @@ static void mt_done_cb(struct evhttp_request *r, void *a) { (void)r; (void)a; }]
          [AC_MSG_RESULT([yes])
           AC_DEFINE([HAVE_EVHTTP], [1], [define to enable the Prometheus /metrics exporter])],
          [AC_MSG_RESULT([no])
-          AC_MSG_ERROR([libevent evhttp >= 2.1.1 is required for the Prometheus exporter.
+          AC_MSG_ERROR([libevent evhttp >= 2.1.4 is required for the Prometheus exporter.
 Install libevent development packages (libevent-dev / libevent-devel),
 or configure with --disable-prometheus.])])
        CFLAGS="$memtier_saved_CFLAGS"; LIBS="$memtier_saved_LIBS"
