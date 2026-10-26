@@ -41,12 +41,14 @@
 #endif
 
 #include "shard_connection.h"
+#include "libevent_read_cap.h"
 #include "obj_gen.h"
 #include "memtier_benchmark.h"
 #include "connections_manager.h"
 #include "client.h"
 #include "retry_policy.h"
 #include "retry_backoff.h"
+#include "library_versions.h"
 #include "event2/bufferevent.h"
 
 // Maximum reconnect delay enforced after every exponential-backoff
@@ -164,6 +166,8 @@ void cluster_client_read_handler(bufferevent *bev, void *ctx)
 {
     shard_connection *sc = (shard_connection *) ctx;
     assert(sc != NULL);
+    if (sc->tracks_libevent_reads())
+        read_past_libevent_cap(bufferevent_get_input(bev), bufferevent_getfd(bev), sc->last_input_added());
     sc->process_response();
 }
 
@@ -311,6 +315,8 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_reply_since_connect(false),
         m_slots_rejected(false),
         m_slots_retried_after_run_over(false),
+        m_reconnect_deadline(),
+        m_fired_reconnect_deadline(),
         m_connection_timeout_timer(NULL),
         m_unix_connect_timer(NULL),
 #ifdef _WIN32
@@ -322,7 +328,11 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_deferred_fill_timer(NULL),
         m_cluster_slots_retry_timer(NULL),
         m_setup_rejected_timer(NULL),
-        m_bev_paused(false)
+        m_bev_paused(false),
+        m_tracks_libevent_reads(false),
+        m_last_input_added(0),
+        m_in_socket_connect(false),
+        m_socket_connect_error(0)
 {
     m_id = id;
     m_conns_manager = conns_man;
@@ -492,23 +502,37 @@ void shard_connection::deferred_connect_error_handler(evutil_socket_t, short, vo
 }
 #endif
 
-void shard_connection::setup_event(evutil_socket_t sockfd)
+bool shard_connection::setup_event(evutil_socket_t sockfd)
 {
 #ifdef _WIN32
     cancel_deferred_connect_error();
 #endif
     if (m_bev) {
         bufferevent_free(m_bev);
+        m_bev = NULL;
     }
+    // Until a new bufferevent exists the protocol has no buffers, rather than
+    // the freed ones (also after disconnect()), should creation fail below.
+    if (m_protocol != NULL) m_protocol->set_buffers(NULL, NULL);
     // Fresh bufferevent below starts enabled by default (after we call
     // bufferevent_enable in handle_event on BEV_EVENT_CONNECTED); reset the
     // pause flag so we don't carry stale state from a prior socket.
     m_bev_paused = false;
+    m_tracks_libevent_reads = false;
 
+    // On failure the caller fails this connect attempt like a socket setup
+    // failure; its connect/reconnect error handling applies unchanged.
+    // No BEV_OPT_DEFER_CALLBACKS on either bufferevent: socket_connect()
+    // relies on libevent before 2.1.9 calling the error callback from inside
+    // a failing bufferevent_socket_connect(), not later from the loop.
 #ifdef USE_TLS
     if (m_config->openssl_ctx) {
         SSL *ctx = SSL_new(m_config->openssl_ctx);
-        assert(ctx != NULL);
+        if (ctx == NULL) {
+            benchmark_error_log("error: SSL_new() failed; cannot create the TLS connection.\n");
+            evutil_closesocket(sockfd);
+            return false;
+        }
 
         if (m_config->tls_sni) {
             SSL_set_tlsext_host_name(ctx, m_config->tls_sni);
@@ -516,16 +540,41 @@ void shard_connection::setup_event(evutil_socket_t sockfd)
 
         m_bev = bufferevent_openssl_socket_new(m_event_base, sockfd, ctx, BUFFEREVENT_SSL_CONNECTING,
                                                BEV_OPT_CLOSE_ON_FREE);
+        if (m_bev == NULL) {
+            // Do not free the SSL: libevent >= 2.1.9 already has
+            // (BEV_OPT_CLOSE_ON_FREE). Who owns the SSL and the socket on
+            // older libevent: see libevent_ssl_failure_socket_is_ours().
+            benchmark_error_log("error: bufferevent_openssl_socket_new() failed; cannot create the TLS "
+                                "connection.\n");
+            // The loaded library does the cleanup, so ask its (runtime)
+            // version, not LIBEVENT_VERSION_NUMBER from the headers.
+            if (libevent_ssl_failure_socket_is_ours(event_get_version_number())) {
+                evutil_closesocket(sockfd);
+            } else {
+                benchmark_error_log("error: socket %d left open on purpose: libevent %s may already have closed it.\n",
+                                    (int) sockfd, event_get_version());
+            }
+            return false;
+        }
     } else {
 #endif
         m_bev = bufferevent_socket_new(m_event_base, sockfd, BEV_OPT_CLOSE_ON_FREE);
+        if (m_bev == NULL) {
+            benchmark_error_log("error: bufferevent_socket_new() failed; cannot create the connection.\n");
+            evutil_closesocket(sockfd);
+            return false;
+        }
+        if (libevent_caps_reads()) {
+            track_libevent_reads(bufferevent_get_input(m_bev), &m_last_input_added);
+            m_tracks_libevent_reads = true;
+        }
 #ifdef USE_TLS
     }
 #endif
 
-    assert(m_bev != NULL);
     bufferevent_setcb(m_bev, cluster_client_read_handler, NULL, cluster_client_event_handler, (void *) this);
     m_protocol->set_buffers(bufferevent_get_input(m_bev), bufferevent_get_output(m_bev));
+    return true;
 }
 
 evutil_socket_t shard_connection::setup_socket(struct connect_info *addr)
@@ -618,6 +667,18 @@ static int bufferevent_connect_nonblocking(struct bufferevent *bev, evutil_socke
 }
 #endif
 
+// bufferevent_socket_connect() on m_bev. A failure that libevent before
+// 2.1.9 reports through handle_event() from inside the call is kept in
+// m_socket_connect_error for the caller instead (see handle_event()).
+int shard_connection::socket_connect(struct sockaddr *sa, int socklen)
+{
+    m_in_socket_connect = true;
+    m_socket_connect_error = 0;
+    int ret = bufferevent_socket_connect(m_bev, sa, socklen);
+    m_in_socket_connect = false;
+    return ret;
+}
+
 int shard_connection::connect(struct connect_info *addr)
 {
     // Belt-and-suspenders: disconnect() already calls reset_state(), but if
@@ -648,8 +709,9 @@ int shard_connection::connect(struct connect_info *addr)
         return -1;
     }
 
-    // set up bufferevent
-    setup_event(sockfd);
+    // set up bufferevent (on failure it has reported the error and released
+    // the socket)
+    if (!setup_event(sockfd)) return -1;
 
     // set readable id
     set_readable_id();
@@ -660,6 +722,9 @@ int shard_connection::connect(struct connect_info *addr)
     struct sockaddr *sa = m_unix_sockaddr ? (struct sockaddr *) m_unix_sockaddr : addr->ci_addr;
     int socklen = m_unix_sockaddr ? m_unix_sockaddrlen : addr->ci_addrlen;
 #ifdef _WIN32
+    // bufferevent_connect_nonblocking() connects the socket itself and passes
+    // libevent no address, so libevent cannot fail the connect synchronously.
+    m_socket_connect_error = 0;
     int ret = bufferevent_connect_nonblocking(m_bev, sockfd, sa, socklen);
     if (ret == 1) {
         // Do not enter the error callback during client preparation. This
@@ -677,10 +742,10 @@ int shard_connection::connect(struct connect_info *addr)
         }
     }
 #else
-    int ret = bufferevent_socket_connect(m_bev, sa, socklen);
+    int ret = socket_connect(sa, socklen);
 #endif
     if (ret == -1) {
-        const int error = EVUTIL_SOCKET_ERROR();
+        const int error = m_socket_connect_error != 0 ? m_socket_connect_error : EVUTIL_SOCKET_ERROR();
         // A full Unix listener backlog returns EAGAIN without starting a
         // connection. Wait between attempts so the worker and supervisor can
         // still run. TCP EINPROGRESS is already handled by libevent.
@@ -718,6 +783,7 @@ int shard_connection::connect(struct connect_info *addr)
     if (m_reconnect_timer != NULL) {
         event_free(m_reconnect_timer);
         m_reconnect_timer = NULL;
+        m_reconnect_deadline.tv_sec = m_reconnect_deadline.tv_usec = 0;
     }
     m_reconnecting = false;
     m_setup_rejected = false;
@@ -746,13 +812,13 @@ void shard_connection::handle_unix_connect_retry()
         attempt_reconnect("Unix socket listen queue still full at run deadline");
         return;
     }
-    if (bufferevent_socket_connect(m_bev, (struct sockaddr *) m_unix_sockaddr, m_unix_sockaddrlen) == 0) {
+    if (socket_connect((struct sockaddr *) m_unix_sockaddr, m_unix_sockaddrlen) == 0) {
         event_free(m_unix_connect_timer);
         m_unix_connect_timer = NULL;
         bufferevent_enable(m_bev, EV_READ | EV_WRITE);
         return;
     }
-    const int error = errno;
+    const int error = m_socket_connect_error != 0 ? m_socket_connect_error : errno;
     if (error == EAGAIN || error == EWOULDBLOCK) return;
 
     event_free(m_unix_connect_timer);
@@ -805,6 +871,7 @@ void shard_connection::disconnect()
     if (m_bev) {
         bufferevent_free(m_bev);
         m_bev = NULL;
+        if (m_protocol != NULL) m_protocol->set_buffers(NULL, NULL);
     }
     // After free, any future bufferevent starts in the default (enabled) state.
     m_bev_paused = false;
@@ -817,6 +884,7 @@ void shard_connection::disconnect()
     if (m_reconnect_timer != NULL) {
         event_free(m_reconnect_timer);
         m_reconnect_timer = NULL;
+        m_reconnect_deadline.tv_sec = m_reconnect_deadline.tv_usec = 0;
     }
 
     if (m_connection_timeout_timer != NULL) {
@@ -1462,16 +1530,14 @@ void shard_connection::send_conn_setup_commands(struct timeval timestamp)
     // into reads).
     if (m_readonly_state == setup_none) {
         benchmark_debug_log("sending READONLY command (replica connection).\n");
-        // Use bufferevent_write rather than going through protocol::write_command_readonly
-        // which adds to the bufferevent's output evbuffer directly. For a connection whose
-        // FD was attached to the bufferevent via bufferevent_socket_new + a subsequent
-        // bufferevent_socket_connect (the path A1 uses for replicas discovered through
-        // CLUSTER SLOTS), the evbuffer notify callback does not re-arm EPOLLOUT on the
-        // first user-level send, so the bytes sit in the output buffer forever and the
-        // connect-callback handle_event path has no chance to flush them. bufferevent_write
-        // routes through bufferevent_trigger_nolock_ which forces the EPOLLOUT registration.
-        // Primaries don't hit this because all setup states default to setup_done, so
-        // send_conn_setup_commands is a no-op for them.
+        // bufferevent_write() is only evbuffer_add() on the bufferevent's output
+        // buffer (libevent 2.1.x and 2.2.x alike), the same path the protocol
+        // writers use, so this write is flushed exactly like AUTH/SELECT/HELLO:
+        // the output buffer's callback arms the write event because handle_event
+        // enabled EV_WRITE at BEV_EVENT_CONNECTED. It does not go through
+        // bufferevent_trigger_nolock_(). Whether a dedicated write is needed here
+        // at all is tracked in #532. Primaries skip this step: their setup state
+        // defaults to setup_done.
         static const char READONLY_CMD[] = "*1\r\n$8\r\nREADONLY\r\n";
         bufferevent_write(m_bev, READONLY_CMD, sizeof(READONLY_CMD) - 1);
         push_req(new request(rt_readonly, 0, &timestamp, 0));
@@ -2029,6 +2095,15 @@ void shard_connection::fill_pipeline(void)
 
 void shard_connection::handle_event(short events)
 {
+    // libevent before 2.1.9 runs the error callback from inside a failing
+    // bufferevent_socket_connect(), before it returns -1. The caller of
+    // socket_connect() handles that failure itself, as with newer libevent,
+    // which does not call back: just keep the error for it.
+    if (m_in_socket_connect && (events & BEV_EVENT_ERROR)) {
+        m_socket_connect_error = EVUTIL_SOCKET_ERROR();
+        return;
+    }
+
     // connect() returning to us?  normally we expect EV_WRITE, but for UNIX domain
     // sockets we workaround since connect() returned immediately, but we don't want
     // to do any I/O from the client::connect() call...
@@ -2113,15 +2188,53 @@ void shard_connection::handle_event(short events)
 
     if (events & BEV_EVENT_ERROR) {
         bool ssl_error = false;
+        // Read the socket error before logging anything: logging may change
+        // it, and the Windows deferred refusal reports through it.
+        int socket_error = EVUTIL_SOCKET_ERROR();
 #ifdef USE_TLS
-        unsigned long sslerr;
-        while ((sslerr = bufferevent_get_openssl_error(m_bev))) {
-            ssl_error = true;
-            benchmark_error_log("TLS connection error: %s\n", ERR_reason_error_string(sslerr));
+        // Only TLS connections have an OpenSSL bufferevent (see setup_event()).
+        // libevent 2.2.2 asserts that type in its accessor and, when built with
+        // NDEBUG, reads and writes past a plain socket bufferevent instead.
+        if (m_config->openssl_ctx != NULL) {
+            unsigned long sslerr;
+            while ((sslerr = bufferevent_get_openssl_error(m_bev))) {
+                // libevent also queues the SSL_get_error() code of the failed
+                // call (e.g. SSL_ERROR_SYSCALL), which is not an OpenSSL error
+                // code and has no reason string. The socket error and the
+                // queued OpenSSL errors describe the failure instead.
+                if (ERR_GET_LIB(sslerr) == 0) continue;
+                const char *reason = ERR_reason_error_string(sslerr);
+                char error_text[256];
+                if (reason == NULL) {
+                    ERR_error_string_n(sslerr, error_text, sizeof(error_text));
+                    reason = error_text;
+                }
+                ssl_error = true;
+                benchmark_error_log("TLS connection error: %s\n", reason);
+            }
+            // libevent 2.2.2 drains the OpenSSL queue into the bufferevent but
+            // its accessor returns nothing for a TLS bufferevent
+            // (https://github.com/libevent/libevent/issues/1935). Recover what
+            // the SSL object still holds so a rejected certificate is reported.
+            if (!ssl_error) {
+                SSL *ssl = bufferevent_openssl_get_ssl(m_bev);
+                long verify_result = X509_V_OK;
+                // With --tls-skip-verify OpenSSL still records a result, but
+                // it did not cause the failure.
+                if (ssl != NULL && !m_config->tls_skip_verify) verify_result = SSL_get_verify_result(ssl);
+                if (verify_result != X509_V_OK) {
+                    ssl_error = true;
+                    benchmark_error_log("TLS connection error: certificate verify failed: %s\n",
+                                        X509_verify_cert_error_string(verify_result));
+                } else if (!socket_error) {
+                    benchmark_error_log("TLS connection error: no OpenSSL reason reported (libevent %s)\n",
+                                        event_get_version());
+                }
+            }
         }
 #endif
-        if (!ssl_error && EVUTIL_SOCKET_ERROR()) {
-            benchmark_error_log("Connection error: %s\n", evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR()));
+        if (!ssl_error && socket_error) {
+            benchmark_error_log("Connection error: %s\n", evutil_socket_error_to_string(socket_error));
         }
 
         attempt_reconnect("Connection error");
@@ -2282,6 +2395,7 @@ void shard_connection::attempt_reconnect(const char *error_context)
         m_reconnect_timer = event_new(m_event_base, -1, 0, cluster_client_reconnect_timer_handler, (void *) this);
         if (m_reconnect_timer == NULL) {
             benchmark_error_log("error: event_new failed in attempt_reconnect\n");
+            m_reconnect_deadline.tv_sec = m_reconnect_deadline.tv_usec = 0;
             // Roll back the bookkeeping so the next attempt does not
             // count an attempt that never armed, and leave m_reconnecting
             // false so a subsequent error can re-enter this path. Break
@@ -2362,10 +2476,14 @@ bool shard_connection::run_deadline(struct timeval *deadline)
 // Within 1 ms of the deadline counts as passed: the reconnect timer armed for
 // it runs on libevent's monotonic clock and can fire a hair early by this wall
 // clock, which would otherwise re-arm near-zero delays until it catches up.
+// On Linux libevent times it with a coarse clock, so it can fire a whole tick
+// (1-4 ms) early: once a reconnect armed for the deadline has fired, that
+// deadline has passed, whatever this wall clock says (#852).
 bool shard_connection::run_deadline_passed(void)
 {
     struct timeval deadline, now, slack = {0, 1000};
     if (!run_deadline(&deadline)) return false;
+    if (m_fired_reconnect_deadline.tv_sec && !timercmp(&m_fired_reconnect_deadline, &deadline, <)) return true;
     gettimeofday(&now, NULL);
     evutil_timeradd(&now, &slack, &now);
     return !timercmp(&now, &deadline, <);
@@ -2393,6 +2511,7 @@ double shard_connection::next_reconnect_delay(void)
 {
     double delay = m_current_backoff_delay;
     struct timeval deadline, now;
+    m_reconnect_deadline.tv_sec = m_reconnect_deadline.tv_usec = 0;
     // Only with unlimited attempts: a finite --max-reconnect-attempts keeps
     // its backoff schedule, which bounds the run as before (#656).
     if (stops_at_deadline() && run_deadline(&deadline)) {
@@ -2402,7 +2521,12 @@ double shard_connection::next_reconnect_delay(void)
         if (event_base_gettimeofday_cached(m_event_base, &now) < 0) gettimeofday(&now, NULL);
         double left = (deadline.tv_sec - now.tv_sec) + (deadline.tv_usec - now.tv_usec) / 1000000.0;
         if (left < 0) left = 0;
-        if (left < delay) delay = left;
+        // The caller arms the reconnect timer with this delay: remember the
+        // deadline it is due at (run_deadline_passed()).
+        if (left < delay) {
+            delay = left;
+            m_reconnect_deadline = deadline;
+        }
     }
     return delay;
 }
@@ -2728,6 +2852,8 @@ void shard_connection::handle_reconnect_timer_event()
     }
 
     m_reconnecting = false;
+    if (m_reconnect_deadline.tv_sec) m_fired_reconnect_deadline = m_reconnect_deadline;
+    m_reconnect_deadline.tv_sec = m_reconnect_deadline.tv_usec = 0;
 
     // The server rejected a setup step on the last connection and the run's
     // time is up: stop retrying. With unlimited attempts the setup would keep
@@ -2798,6 +2924,7 @@ void shard_connection::handle_reconnect_timer_event()
             m_reconnect_timer = event_new(m_event_base, -1, 0, cluster_client_reconnect_timer_handler, (void *) this);
             if (m_reconnect_timer == NULL) {
                 benchmark_error_log("error: event_new failed in handle_reconnect_timer_event retry path\n");
+                m_reconnect_deadline.tv_sec = m_reconnect_deadline.tv_usec = 0;
                 // Roll back the bookkeeping so the next attempt does not
                 // count an attempt that never armed, and leave m_reconnecting
                 // false so a subsequent error can re-enter this path. Break

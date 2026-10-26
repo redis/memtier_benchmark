@@ -165,6 +165,60 @@ jobs:
         ldd ./memtier_benchmark | grep libevent
         ldd ./memtier_benchmark | grep ssl
 
+  # RHEL 8 ships libevent 2.1.8, with OpenSSL 1.1.1 and GCC 8: the oldest
+  # libevent in a supported distribution. 2.1.8 behaves differently from
+  # 2.1.9+ in ways memtier must handle (a failing bufferevent_socket_connect()
+  # runs the error callback before it returns), so run the suite against it.
+  test-rockylinux-8:
+    runs-on: ubuntu-latest
+    container: rockylinux:8
+    strategy:
+      fail-fast: false
+      matrix:
+        tls: ["0", "1"]
+    name: Test Rocky Linux 8 (libevent 2.1.8, TLS=${{ matrix.tls }})
+    steps:
+    - name: Install dependencies
+      run: |
+        dnf -y -q module enable redis:6
+        dnf -y -q install git gcc-c++ make autoconf automake libtool pkgconf-pkg-config \
+          libevent-devel openssl-devel zlib-devel openssl procps-ng python3.11 python3.11-pip redis
+        # The tests need Python 3.10 or newer; EL8's default python3 is 3.6.
+        ln -sf /usr/bin/python3.11 /usr/local/bin/python3
+
+    - name: Checkout code
+      uses: actions/checkout@v6
+
+    - name: Build
+      run: |
+        git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        autoreconf -ivf && ./configure && make -j"$(nproc)"
+
+    - name: Verify libevent 2.1.8
+      run: |
+        ./memtier_benchmark --version
+        ./memtier_benchmark --version | grep -q 'libevent=2.1.8-stable'
+
+    - name: Unit tests
+      run: make check
+
+    - name: Install Python dependencies
+      run: python3 -m pip install -r ./tests/test_requirements.txt
+
+    - name: Generate TLS test certificates
+      if: matrix.tls == '1'
+      run: ./tests/gen-test-certs.sh
+
+    - name: Run tests
+      timeout-minutes: 40
+      env:
+        OSS_STANDALONE: "1"
+        OSS_CLUSTER: "0"
+        TLS: ${{ matrix.tls }}
+        VERBOSE: "1"
+        PARALLELISM: "2"
+      run: ./tests/run_tests.sh
+
   build-notls:
     runs-on: ubuntu-latest
     steps:
@@ -700,7 +754,7 @@ jobs:
     steps:
     - uses: actions/checkout@v6
     - name: Install dependencies
-      run: brew install autoconf automake pkg-config openssl@${{ matrix.openssl }}
+      run: brew install autoconf automake pkg-config cmake openssl@${{ matrix.openssl }}
     - name: Build libevent against the selected OpenSSL
       run: bash scripts/build-macos-libevent.sh "$(brew --prefix openssl@${{ matrix.openssl }})"
     - name: Build
@@ -760,7 +814,7 @@ jobs:
     steps:
     - uses: actions/checkout@v6
     - name: Install dependencies
-      run: brew install autoconf automake pkg-config openssl@1.1
+      run: brew install autoconf automake pkg-config cmake openssl@1.1
     - name: Build libevent against the selected OpenSSL
       run: bash scripts/build-macos-libevent.sh "$(brew --prefix openssl@1.1)"
     - name: Build

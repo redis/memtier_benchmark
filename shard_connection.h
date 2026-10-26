@@ -340,6 +340,7 @@ public:
     void handle_reconnect_timer_event();
     void handle_connection_timeout_event();
     void handle_unix_connect_retry();
+    int socket_connect(struct sockaddr *sa, int socklen);
 
     // Retry / replay machinery.
     void handle_retry_drain_event();
@@ -399,7 +400,7 @@ private:
     static void deferred_connect_error_handler(evutil_socket_t, short, void *);
     void cancel_deferred_connect_error();
 #endif
-    void setup_event(evutil_socket_t sockfd);
+    bool setup_event(evutil_socket_t sockfd);
     evutil_socket_t setup_socket(struct connect_info *addr);
     void set_readable_id();
 
@@ -434,6 +435,10 @@ private:
     void push_req(request *req);
 
     void process_response(void);
+    // Whether this plaintext connection's reads are tracked with
+    // track_libevent_reads() (libevent_read_cap.h).
+    bool tracks_libevent_reads(void) const { return m_tracks_libevent_reads; }
+    size_t *last_input_added(void) { return &m_last_input_added; }
     void process_subsequent_requests(void);
     void process_first_request();
     void fill_pipeline(void);
@@ -552,6 +557,13 @@ private:
     // got its one refresh after the run was over (never cleared).
     bool m_slots_rejected;
     bool m_slots_retried_after_run_over;
+    // The --test-time deadline the pending reconnect timer was clamped to
+    // (next_reconnect_delay()), zero if none, and the latest such deadline
+    // whose timer fired: it has passed, see run_deadline_passed(). The fired
+    // deadline is never cleared, on purpose: a run's deadline only moves
+    // later, and a later one is again decided by the clock.
+    struct timeval m_reconnect_deadline;
+    struct timeval m_fired_reconnect_deadline;
 
     // Connection timeout tracking
     struct event *m_connection_timeout_timer;
@@ -595,6 +607,16 @@ private:
     // conditional. Invariant: m_bev_paused == true iff m_bev is currently in
     // the EV_READ|EV_WRITE-disabled state.
     bool m_bev_paused;
+
+    // Set when libevent caps socket reads and m_bev is a plaintext socket
+    // bufferevent; m_last_input_added is then what its last read added.
+    bool m_tracks_libevent_reads;
+    size_t m_last_input_added;
+    // Set while socket_connect() is inside bufferevent_socket_connect(); the
+    // error libevent before 2.1.9 reports from there through handle_event()
+    // is kept in m_socket_connect_error.
+    bool m_in_socket_connect;
+    int m_socket_connect_error;
 
     // Bumped by every disconnect(). process_response() compares it against
     // the value it started with and stops parsing once the connection was

@@ -602,6 +602,75 @@ static void test_connection_rejection_is_not_a_reply(event_base *base, abstract_
     check(connection.get_thread_end_reason() != NULL, "without --reconnect-on-error a rejection ends the thread");
 }
 
+// A client whose reconnects never succeed, and that counts them.
+class counting_reconnect_client : public client
+{
+public:
+    counting_reconnect_client(event_base *base, benchmark_config *config, abstract_protocol *protocol,
+                              object_generator *generator) :
+            client(base, config, protocol, generator), reconnects(0)
+    {
+    }
+    int reconnect(unsigned int) { return ++reconnects, -1; }
+    unsigned int reconnects;
+};
+
+// #852: a never-started client whose CLUSTER SLOTS retry is clamped to the
+// --test-time deadline must fail the run when that retry fires. On Linux
+// libevent times it with a coarse clock, so it can fire a few ms before the
+// wall-clock deadline; firing it at once stages that skew. Without the fix the
+// early retry reconnects, which in a real run completes setup and lets the
+// client end normally (exit 0).
+void cluster_client_reconnect_timer_handler(evutil_socket_t fd, short what, void *ctx);
+static void test_deadline_retry_fires_early()
+{
+    arbitrary_command_list commands;
+    benchmark_config config = {};
+    config.arbitrary_commands = &commands;
+    config.clients = config.threads = 1;
+    config.key_pattern = "S:S";
+    config.protocol = PROTOCOL_REDIS_DEFAULT;
+    config.test_time = 2;
+    config.reconnect_on_error = true;
+    event_base *base = event_base_new();
+    abstract_protocol *protocol = protocol_factory(config.protocol);
+    steady_state = true;
+    {
+        object_generator generator;
+        counting_reconnect_client manager(base, &config, protocol, &generator);
+        shard_connection &connection = *manager.get_connections()[0];
+        // The deadline is 500 ms away: the 1 s backoff is clamped to it, with
+        // room for a slow (sanitized, loaded) runner to reach the handler.
+        timeval now, ahead = {0, 500000};
+        gettimeofday(&now, NULL);
+        now.tv_sec -= config.test_time;
+        evutil_timeradd(&now, &ahead, &config.benchmark_start_time);
+        connection.reconnect_after_setup_error("CLUSTER SLOTS error", false);
+        check(connection.is_reconnect_pending(), "the CLUSTER SLOTS retry is armed");
+        check(!connection.run_is_over(), "the deadline has not passed by the wall clock");
+        cluster_client_reconnect_timer_handler(-1, EV_TIMEOUT, &connection);
+        event_base_dispatch(base);
+        check(manager.reconnects == 0, "a retry due at the deadline does not reconnect");
+        check(manager.run_failed(), "a never-started client fails the run at the deadline");
+        check(!connection.is_reconnect_pending(), "no retry is armed after the deadline");
+    }
+    {
+        // A retry well before the deadline still reconnects.
+        object_generator generator;
+        counting_reconnect_client manager(base, &config, protocol, &generator);
+        shard_connection &connection = *manager.get_connections()[0];
+        gettimeofday(&config.benchmark_start_time, NULL);
+        connection.reconnect_after_setup_error("CLUSTER SLOTS error", false);
+        check(connection.next_reconnect_delay() == 1.0, "a retry before the deadline keeps its backoff");
+        cluster_client_reconnect_timer_handler(-1, EV_TIMEOUT, &connection);
+        check(manager.reconnects == 1 && !manager.run_failed(), "a retry before the deadline reconnects");
+        check(!connection.run_is_over(), "the run is not over before the deadline");
+    }
+    steady_state = false;
+    delete protocol;
+    event_base_free(base);
+}
+
 int main()
 {
 #ifdef _WIN32
@@ -623,6 +692,7 @@ int main()
     rmdir(directory);
 #endif
     test_interrupted_deadline();
+    test_deadline_retry_fires_early();
     event_base *clock_base = event_base_new();
     timeval immediately = {0, 0};
     reconnect_clock_context clock_context = {clock_base, {0, 0}};
