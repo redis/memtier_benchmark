@@ -2,6 +2,7 @@
 
 import binascii
 import csv
+import errno
 import json
 import os
 import re
@@ -1363,3 +1364,60 @@ def test_staged_monitor_leaves_demoted_primary(env):
     # Unowned lines leave A while its reconnect timer is pending too. At
     # pipeline=1 no unowned line is staged on A before it closes.
     _check_failover_replay(env, "demote-hole", 4, pending=True)
+
+
+def test_cluster_startup_dial_failing_at_once_aborts(env):
+    """A --cluster-mode seed whose dial fails at once aborts the run at startup.
+
+    connect() to the broadcast address without SO_BROADCAST fails before the
+    event loop (ENETUNREACH or EACCES on Linux), and libevent returns -1 from
+    bufferevent_socket_connect(). cluster_client::connect() now passes that
+    on, so prepare aborts. Master returned 0, launched the thread and ended
+    it with no request sent.
+    """
+    if env.isCluster() or env.useTLS:
+        env.skip()  # The seed is a fixed address, not the env's servers.
+    seed = "255.255.255.255"
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.setblocking(False)
+    try:
+        code = probe.connect_ex((seed, 29971))
+    finally:
+        probe.close()
+    # libevent treats EINPROGRESS (and, in 2.1, ECONNREFUSED) as a dial in
+    # progress, reported through the event loop.
+    if code in (0, errno.EINPROGRESS, errno.ECONNREFUSED, errno.EWOULDBLOCK):
+        env.debugPrint(
+            "skip: connect() to %s does not fail at once here (%s)" % (seed, errno.errorcode.get(code, code)),
+            force=True,
+        )
+        env.skip()
+    started = time.monotonic()
+    try:
+        result = subprocess.run(
+            [
+                MEMTIER_BINARY,
+                "--cluster-mode",
+                "-s",
+                seed,
+                "-p",
+                "29971",
+                "-t",
+                "1",
+                "-c",
+                "1",
+                "--requests=10",
+                "--hide-histogram",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        env.assertTrue(False, message="memtier did not exit within 10s")
+        return
+    elapsed = time.monotonic() - started
+    env.assertEqual(result.returncode, 1, message=result.stderr)
+    env.assertContains("prepare: failed to connect, test aborted.", result.stderr)
+    env.assertLess(elapsed, 10)
