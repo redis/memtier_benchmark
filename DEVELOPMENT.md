@@ -21,6 +21,9 @@ The following libraries are required for building:
 | 2.1.13 | Current stable release, with security fixes (RHEL 9/10, Debian 13, Fedora, Alpine, Homebrew, MSYS2). |
 | 2.2.2-alpha | Supported experimentally. 2.2 is not a stable series yet. |
 
+Which CI jobs build and test each version is listed under
+[Libevent versions](#libevent-versions).
+
 `configure` itself accepts older releases: the Prometheus exporter needs
 libevent_extra 2.1.4 or newer (`evhttp_request_set_on_complete_cb()`), and
 `./configure --disable-prometheus` accepts the minimum checked in
@@ -257,7 +260,8 @@ This disables optimizations (`-O0`), making it easier to step through code in a 
 
 ### Libevent versions
 
-memtier uses whichever libevent `pkg-config` finds. These versions are tested
+memtier uses whichever libevent `pkg-config` finds (support status per version:
+[Supported libevent versions](#supported-libevent-versions)). These versions are tested
 in CI (`.github/workflows/libevent-compat.yml` for the source-built ones):
 
 | libevent | How CI gets it | Coverage |
