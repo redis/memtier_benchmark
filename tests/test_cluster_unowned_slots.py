@@ -721,7 +721,29 @@ def test_given_up_primary_monitor_drops_are_reported(env):
     slowly. X is still in setup when A runs out of attempts, so A is given up
     on while the thread goes on, and the monitor lines staged on A are dropped
     as slot-owner-down-for-monitor-line.
+
+    Whether a line is staged on A before it is given up on still depends on
+    scheduling: the client stages one only while A is in setup, and it can't
+    be held there on evidence, since a line staged on A stalls the client
+    (pipeline 1) and no peer sees it. So A's redial stays in setup for two
+    seconds, and the scenario is run up to 3 times, until memtier reports the
+    drop ("dropped N staged monitor line(s)"). The PR base never reports it.
     """
+    for tries in range(1, 4):
+        stats, rows, stderr = _given_up_primary_with_replica_in_setup(env)
+        if re.search(r"dropped \d+ staged monitor line", stderr):
+            break
+    env.debugPrint("runs: %d" % tries, force=True)
+    env.assertContains("leaving conn 1 dead and continuing while peers are still mid-setup", stderr)
+    dropped = [row for row in rows if row["status"] == "slot-owner-down-for-monitor-line"]
+    env.assertGreater(len(dropped), 0, message=str(rows))
+    env.assertEqual([(row["command"], row["key"]) for row in dropped], [("ARBITRARY", "memtier-1")] * len(dropped))
+    # Every error in ALL STATS has its failed-keys record: the drops and the
+    # requests held for resend when the thread ends.
+    env.assertEqual(stats["Totals"]["Errors"], len(rows), message=str(rows))
+
+
+def _given_up_primary_with_replica_in_setup(env):
     node = _Node([(0, 16383)], replica=True)
     x = _Node([])
     x.root = node
@@ -750,12 +772,15 @@ def test_given_up_primary_monitor_drops_are_reported(env):
     def drop(args):
         if len(node.requests) != 3:
             return False
-        x.auth_delay = 3
+        x.auth_delay = 5
         for request in x.sockets:
             try:
                 request.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
+        # A's redial is in setup for two seconds before it is refused: a line
+        # selected then is staged on A.
+        node.auth_delay = 2
         node.auth_closes = 100
         return True
 
@@ -788,12 +813,7 @@ def test_given_up_primary_monitor_drops_are_reported(env):
             expected_exit=1,
             timeout=20,
         )
-    env.assertContains("leaving conn 1 dead and continuing while peers are still mid-setup", stderr)
-    dropped = [row for row in rows if row["status"] == "slot-owner-down-for-monitor-line"]
-    env.assertGreater(len(dropped), 0, message=str(rows))
-    env.assertEqual([(row["command"], row["key"]) for row in dropped], [("ARBITRARY", "memtier-1")] * len(dropped))
-    # Each error in ALL STATS has its failed-keys record, the drops included.
-    env.assertEqual(stats["Totals"]["Errors"], len(rows), message=str(rows))
+    return stats, rows, stderr
 
 
 def test_unowned_keys_survive_repeated_redial(env):
