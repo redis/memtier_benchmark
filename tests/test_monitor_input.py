@@ -1592,3 +1592,84 @@ def test_monitor_input_scan_cursor_literal_is_sent(env):
         env.assertTrue(memtier_ok == True, message="{} with a literal __scan_cursor__ failed or hung".format(command))
         env.assertEqual(_scan_cursor_literal_values(env, "sc663:mon"), [b"__scan_cursor__"],
                         message="{} did not write the literal value".format(command))
+
+
+def _pubsub_run(env, args, requests=20, pipeline=4):
+    """Run memtier with a hard timeout; return (ok, stderr, answered requests)."""
+    benchmark_specs = {"name": env.testName, "args": args + ["--hide-histogram", "--pipeline={}".format(pipeline)]}
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=1, clients=1, requests=requests)
+    add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+    config = RunConfig(tempfile.mkdtemp(), env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    memtier_ok = benchmark.run(timeout=30)
+    debugPrintMemtierOnError(config, env)
+    stderr, count = "", None
+    stderr_path = os.path.join(config.results_dir, "mb.stderr")
+    if os.path.isfile(stderr_path):
+        with open(stderr_path) as f:
+            stderr = f.read()
+    json_path = os.path.join(config.results_dir, "mb.json")
+    if memtier_ok and os.path.isfile(json_path):
+        with open(json_path) as f:
+            count = json.load(f)["ALL STATS"]["Totals"]["Count"]
+    return memtier_ok, stderr, count
+
+
+def test_multi_channel_subscribe_replies(env):
+    """
+    Regression test for #515: Redis answers SUBSCRIBE / PSUBSCRIBE /
+    UNSUBSCRIBE / PUNSUBSCRIBE once per channel or pattern. Each reply popped
+    a request, so with two channels the second reply popped one that was
+    never sent and memtier aborted on the m_pending_resp >= 0 assert. The
+    replies to one request now complete that request, through --command and
+    --monitor-input. Queued in a MULTI, the SUBSCRIBE is answered +QUEUED
+    and its second confirmation follows the EXEC reply, so it belongs to the
+    EXEC: expecting it on the SUBSCRIBE hung the run at --pipeline=1 before
+    EXEC was sent. RESP2 only: under RESP3 the confirmations are push
+    frames, which memtier drops.
+    """
+    commands = ["SUBSCRIBE c515a c515b", "PSUBSCRIBE p515a* p515b*", "UNSUBSCRIBE c515a c515b",
+                "PUNSUBSCRIBE p515a* p515b*"]
+    for command in commands:
+        memtier_ok, stderr, count = _pubsub_run(env, ["--command={}".format(command)])
+        env.assertTrue(memtier_ok == True, message="{} failed: {}".format(command, stderr[-500:]))
+        env.assertEqual(count, 20, message="{}: answered requests".format(command))
+
+    monitor_file = os.path.join(tempfile.mkdtemp(), "monitor_pubsub.txt")
+    with open(monitor_file, "w") as f:
+        for command in commands:
+            f.write('[ proxy ] 1764031576.604009 [0 127.0.0.1:5000] {}\n'.format(
+                " ".join('"{}"'.format(a) for a in command.split())))
+    for command in ("__monitor_line1__", "__monitor_line@__"):
+        memtier_ok, stderr, count = _pubsub_run(
+            env, ["--monitor-input={}".format(monitor_file), "--command={}".format(command)])
+        env.assertTrue(memtier_ok == True, message="{} failed: {}".format(command, stderr[-500:]))
+        env.assertEqual(count, 20, message="{}: answered requests".format(command))
+
+    # After the first EXEC the connection is in subscribed mode: MULTI and
+    # EXEC are rejected and the SUBSCRIBE is answered twice.
+    # DISCARD, and an EXEC failed by WATCH (a null array), run no SUBSCRIBE.
+    sub = ["--command=MULTI", "--command=SUBSCRIBE c515a c515b"]
+    runs = [(sub + ["--command=EXEC"], 3, 1), (sub + ["--command=EXEC"], 20, 1), (sub + ["--command=EXEC"], 20, 4),
+            (sub + ["--command=DISCARD"], 20, 1)]
+    # Standalone only: in cluster mode the keyed WATCH/SET can trigger a slot
+    # map refresh on a connection that is subscribed or inside the MULTI.
+    if not env.isCluster():
+        runs.append((["--command=WATCH w515", "--command=SET w515 v"] + sub + ["--command=EXEC"], 20, 1))
+        # A failing queued command: its error is an element of the EXEC
+        # array (not an error reply), and an owed confirmation can be
+        # followed by an error reply that still belongs to the EXEC.
+        runs.append((["--command=SET s515 x", "--command=MULTI", "--command=INCR s515",
+                      "--command=SUBSCRIBE c515a c515b", "--command=EXEC"], 20, 1))
+        runs.append((["--command=SET s515 x", "--command=MULTI", "--command=SUBSCRIBE c515a c515b c515c",
+                      "--command=INCR s515", "--command=GET s515", "--command=EXEC"], 24, 1))
+    for txn, requests, pipeline in runs:
+        memtier_ok, stderr, count = _pubsub_run(env, txn, requests=requests, pipeline=pipeline)
+        what = "{} -n {} --pipeline={}".format(" ".join(a.split("=", 1)[1] for a in txn), requests, pipeline)
+        env.assertTrue(memtier_ok == True, message="{} failed or hung: {}".format(what, stderr[-500:]))
+        env.assertEqual(count, requests, message="{}: answered requests".format(what))
+    # The rejected MULTI/EXEC/DISCARD replies above are counted in the
+    # server's errorstats, which later tests on this server expect clean.
+    reset_commandstats(env.getOSSMasterNodesConnectionList())

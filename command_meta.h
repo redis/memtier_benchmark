@@ -82,6 +82,7 @@ struct CommandSpec
     uint8_t num_key_specs; // Length of key_specs array.
     const KeySpec *key_specs;
     ReplyShape reply_shape;
+    bool may_write; // True if command_flags contains WRITE or MAY_REPLICATE (e.g. EVAL): a replica may reject it.
 };
 
 // Case-insensitive lookup over the static command table. Returns nullptr if

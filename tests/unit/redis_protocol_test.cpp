@@ -20,6 +20,7 @@
 #include "config.h"
 #endif
 #include <assert.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -407,12 +408,89 @@ static void check_nested_push_keep_value()
     evbuffer_free(input);
 }
 
+// Feed one reply to a fresh parser and return parse_response()'s result:
+// 1 complete, 0 waiting for more bytes, -1 protocol error.
+static int parse_reply(PROTOCOL_TYPE mode, const char *wire, bool track_misses = false)
+{
+    abstract_protocol *protocol = protocol_factory(mode);
+    evbuffer *input = evbuffer_new();
+    evbuffer *output = evbuffer_new();
+    if (!protocol || !input || !output) {
+        fprintf(stderr, "FAIL: cannot allocate protocol fixture\n");
+        exit(1);
+    }
+    protocol->set_buffers(input, output);
+    check(protocol->configure_protocol(mode) >= 0, "configure requested Redis mode");
+    protocol->set_track_elem_misses(track_misses);
+    evbuffer_add(input, wire, strlen(wire));
+    int rc = protocol->parse_response();
+    delete protocol;
+    evbuffer_free(input);
+    evbuffer_free(output);
+    return rc;
+}
+
+static void check_length_limits()
+{
+    // Bulk lengths whose payload plus CRLF (len + 2) cannot be represented
+    // are protocol errors; strtol clamps the out-of-range one to LONG_MAX.
+    // long is 64-bit on LP64 and 32-bit on Windows; build the boundaries from LONG_MAX.
+    char wire[64];
+    snprintf(wire, sizeof(wire), "$%ld\r\n", LONG_MAX);
+    check(parse_reply(PROTOCOL_RESP2, wire) == -1, "reject LONG_MAX bulk length");
+    snprintf(wire, sizeof(wire), "$%ld\r\n", LONG_MAX - 1);
+    check(parse_reply(PROTOCOL_RESP2, wire) == -1, "reject LONG_MAX - 1 bulk length");
+    snprintf(wire, sizeof(wire), "$%ld\r\n", LONG_MAX - 2);
+    check(parse_reply(PROTOCOL_RESP2, wire) == 0, "LONG_MAX - 2 bulk length waits for data");
+    snprintf(wire, sizeof(wire), "!%ld\r\n", LONG_MAX);
+    check(parse_reply(PROTOCOL_RESP3, wire) == -1, "reject LONG_MAX blob error length");
+    snprintf(wire, sizeof(wire), "=%ld\r\n", LONG_MAX);
+    check(parse_reply(PROTOCOL_RESP3, wire) == -1, "reject LONG_MAX verbatim length");
+    snprintf(wire, sizeof(wire), "*1\r\n$%ld\r\n", LONG_MAX);
+    check(parse_reply(PROTOCOL_RESP2, wire) == -1, "reject LONG_MAX nested bulk length");
+    check(parse_reply(PROTOCOL_RESP2, "$99999999999999999999\r\n") == -1, "reject out-of-range bulk length");
+    check(parse_reply(PROTOCOL_RESP2, "$3\r\nfoo\r\n") == 1, "regular bulk completes");
+    check(parse_reply(PROTOCOL_RESP2, "$0\r\n\r\n") == 1, "empty bulk completes");
+    check(parse_reply(PROTOCOL_RESP2, "$-1\r\n") == 1, "null bulk completes");
+
+    // Aggregate counts are tracked as int; reject what cannot be represented.
+    check(parse_reply(PROTOCOL_RESP2, "*2147483647\r\n") == 0, "INT_MAX array count waits for elements");
+    check(parse_reply(PROTOCOL_RESP2, "*2147483648\r\n") == -1, "reject array count above INT_MAX");
+    check(parse_reply(PROTOCOL_RESP2, "*99999999999999999999\r\n") == -1, "reject out-of-range array count");
+    check(parse_reply(PROTOCOL_RESP2, "*-1\r\n") == 1, "null array completes");
+    check(parse_reply(PROTOCOL_RESP3, "%1073741823\r\n") == 0, "largest representable map count waits");
+    check(parse_reply(PROTOCOL_RESP3, "%1073741824\r\n") == -1, "reject map count whose doubling overflows");
+    check(parse_reply(PROTOCOL_RESP3, "|1073741824\r\n") == -1, "reject attribute count whose doubling overflows");
+    check(parse_reply(PROTOCOL_RESP3, "%1\r\n+k\r\n+v\r\n") == 1, "regular map completes");
+    // A map nested under outstanding elements: both the doubling and the
+    // parent's remaining slots count toward the bound.
+    check(parse_reply(PROTOCOL_RESP3, "*2\r\n%1073741823\r\n") == 0, "nested map at the bound waits");
+    check(parse_reply(PROTOCOL_RESP3, "*2\r\n%1073741824\r\n") == -1, "reject nested map above the bound");
+    check(parse_reply(PROTOCOL_RESP3, "*3\r\n%1073741823\r\n") == -1,
+          "reject nested map above the bound with two outstanding");
+    check(parse_reply(PROTOCOL_RESP2, "*2\r\n*1\r\n+a\r\n$1\r\nb\r\n", true) == 1, "nested array completes");
+
+    // Nested counts add to the outstanding elements; with miss tracking the
+    // nested bookkeeping is int arithmetic too.
+    check(parse_reply(PROTOCOL_RESP2, "*2\r\n*2147483646\r\n*1\r\n", true) == 0,
+          "nested counts up to INT_MAX outstanding wait");
+    check(parse_reply(PROTOCOL_RESP2, "*2\r\n*2147483646\r\n*3\r\n", true) == -1,
+          "reject nested counts above INT_MAX outstanding");
+    // A nested attribute takes a parent slot without being tracked, so the
+    // tracked nested bookkeeping can exceed the outstanding element count.
+    check(parse_reply(PROTOCOL_RESP3, "*1\r\n*2\r\n|0\r\n*2147483647\r\n", true) == -1,
+          "reject nested count overflowing tracked elements after a nested attribute");
+    check(parse_reply(PROTOCOL_RESP3, "*1\r\n*2\r\n|0\r\n*2147483646\r\n", true) == 0,
+          "nested count at the tracked bound after a nested attribute waits");
+}
+
 int main()
 {
     check_elem_hits_reserve_cap();
     check_readonly(PROTOCOL_REDIS_DEFAULT);
     check_readonly(PROTOCOL_RESP2);
     check_readonly(PROTOCOL_RESP3);
+    check_length_limits();
     check_nested_push_keep_value();
     check_nested_push_framing();
     check_attribute_frames();

@@ -18,8 +18,8 @@ The --read-preference flag controls which cluster nodes receive GET traffic:
   nearest           - reads go to any node (lowest latency); no strict assertion
 
 These tests require a cluster started with replicas (useSlaves=True).  They
-are skipped automatically when not in cluster mode or when no replicas are
-advertised.
+are skipped when not in cluster mode or on a cluster started without
+replicas, and fail on one started with replicas that advertises none.
 
 Test matrix
 -----------
@@ -57,6 +57,7 @@ from include import (
     reset_commandstats,
 )
 from mb import Benchmark, RunConfig
+from test_cluster_slots_bad_reply import _Node, _run
 
 # ---------------------------------------------------------------------------
 # Env override: every test in this module needs replicas
@@ -1092,3 +1093,131 @@ def test_read_preference_replica_disconnect_wakes_peers(env):
         proxy.close()
         if not _announce_port(env, replica, node_id, 0, real_port):
             env.debugPrint("could not restore the cluster-announce-port of replica {}".format(real_port), True)
+
+
+def test_read_preference_keyless_commands_skip_replicas(env):
+    """A keyless --command (no __key__) goes out on the connection that
+    produces it. Replica connections must not send one under rp_primary, nor
+    one that may write under any preference (#676): a replica rejects it with
+    -READONLY. Other keyless commands may still use replicas under a
+    replica-allowing preference. Scripted one-shard cluster (primary +
+    replica) that counts commands."""
+    cases = [
+        (["--command=PING"], b"PING", False),
+        (["--command=PING", "--command-is-read", "--read-preference=primary"], b"PING", False),
+        (["--command=DBSIZE", "--read-preference=primary"], b"DBSIZE", False),
+        (["--command=FLUSHDB", "--read-preference=secondary"], b"FLUSHDB", False),
+        (["--command=FLUSHDB", "--read-preference=secondaryPreferred"], b"FLUSHDB", False),
+        # MAY_REPLICATE, not WRITE: a script can write.
+        (["--command=EVAL return 0", "--read-preference=secondary"], b"EVAL", False),
+        (["--command=EVAL return 0", "--command-is-read", "--read-preference=secondary"], b"EVAL", True),
+        # No write flag, but a replica rejects WAIT.
+        (["--command=WAIT 0 0", "--read-preference=secondary"], b"WAIT", False),
+        (["--command=WAITAOF 0 0 0", "--read-preference=secondary"], b"WAITAOF", False),
+        (["--command=PING", "--read-preference=secondaryPreferred"], b"PING", True),
+        (["--command=PING", "--command-is-read", "--read-preference=secondaryPreferred"], b"PING", True),
+        (["--command=DBSIZE", "--read-preference=secondary"], b"DBSIZE", True),
+    ]
+    for args, verb, replica_reads in cases:
+        replica = _Node(0)
+        node = _Node(0, replica=replica)
+        rc, stderr, _ = _run(node, args + ["--requests=200", "--pipeline=4"], workers=2, clients=2)
+        message = "{}: primary={} replica={}\n{}".format(" ".join(args), node.commands[verb],
+                                                        replica.commands[verb], stderr[-2000:])
+        env.assertEqual(rc, 0, message=message)
+        env.assertEqual(node.errors + replica.errors, [], message=message)
+        env.assertEqual(node.commands[verb] + replica.commands[verb], 2 * 2 * 200, message=message)
+        if replica_reads:
+            env.assertGreater(replica.commands[verb], 0, message=message)
+        else:
+            env.assertEqual(replica.commands[verb], 0, message=message)
+
+
+def test_read_preference_keyless_hold_keeps_traffic_flowing(env):
+    """A replica held off a keyless command (#676) must not stall the run:
+    a keyless read routed onto the idle replica must still be flushed, and
+    keyed reads queued for the replica must keep flowing while the primary
+    produces the keyless writes. A stall ends the thread before --requests."""
+    cases = [
+        # (args, workers, clients, requests, primary counts, replica counts)
+        (["--command=FLUSHDB", "--command=DBSIZE", "--read-preference=secondary"], 1, 1, 2,
+         {b"FLUSHDB": 1}, {b"DBSIZE": 1}),
+        (["--command=FLUSHDB", "--command=DBSIZE", "--read-preference=secondary"], 1, 1, 100,
+         {b"FLUSHDB": 50}, {b"DBSIZE": 50}),
+        (["--command=FLUSHDB", "--command=PING", "--command-is-read", "--read-preference=nearest"], 2, 2, 100,
+         {b"FLUSHDB": 200}, {b"PING": 200}),
+        (["--command=GET __key__", "--command=FLUSHDB", "--read-preference=secondary"], 2, 2, 200,
+         {b"FLUSHDB": 400}, {b"GET": 400}),
+        (["--command=SET __key__ v", "--command=GET __key__", "--command=FLUSHDB",
+          "--read-preference=secondaryPreferred"], 2, 2, 300,
+         {b"SET": 400, b"FLUSHDB": 400}, {b"GET": 400}),
+        (["--command=SET __key__ v", "--command=GET __key__", "--command=PING",
+          "--read-preference=primary"], 2, 2, 300,
+         {b"SET": 400, b"GET": 400, b"PING": 400}, {}),
+    ]
+    data = (b"FLUSHDB", b"DBSIZE", b"PING", b"GET", b"SET")
+    for args, workers, clients, requests, want_primary, want_replica in cases:
+        replica = _Node(0)
+        node = _Node(0, replica=replica)
+        # The default --pipeline=1: deeper pipelines can hide a parked primary.
+        rc, stderr, _ = _run(node, args + ["--requests={}".format(requests)], workers=workers, clients=clients)
+        got_primary = {v: n for v, n in node.commands.items() if v in data}
+        got_replica = {v: n for v, n in replica.commands.items() if v in data}
+        message = "{}: primary={} replica={}\n{}".format(" ".join(args), got_primary, got_replica, stderr[-2000:])
+        env.assertEqual(rc, 0, message=message)
+        env.assertEqual(node.errors + replica.errors, [], message=message)
+        env.assertEqual(got_primary, want_primary, message=message)
+        env.assertEqual(got_replica, want_replica, message=message)
+
+    # Two shards: a held replica wakes one primary, which can produce the
+    # rotation on its own (the other primary sends some of it too), and keyed
+    # work for the other shard reaches its pool with a fill scheduled, so no
+    # primary is left waiting to be woken.
+    def endpoint(n):
+        return b"*2\r\n$9\r\n127.0.0.1\r\n:%d\r\n" % n.server_address[1]
+
+    for args, workers, clients, verbs in [
+        (["--command=GET __key__", "--command=FLUSHDB", "--read-preference=secondary"], 2, 2,
+         (b"FLUSHDB", b"GET")),
+        (["--command=FLUSHDB", "--command=DBSIZE", "--read-preference=secondaryPreferred"], 1, 4,
+         (b"FLUSHDB", b"DBSIZE")),
+    ]:
+        a, a_replica, b, b_replica = _Node(0), _Node(0), _Node(0), _Node(0)
+        a.replica = a_replica
+        a.extra = [b, b_replica]
+        reply = (b"*2\r\n*4\r\n:0\r\n:8191\r\n" + endpoint(a) + endpoint(a_replica) +
+                 b"*4\r\n:8192\r\n:16383\r\n" + endpoint(b) + endpoint(b_replica))
+        for n in (a, a_replica, b, b_replica):
+            n.slots_fn = lambda _n: reply
+        rc, stderr, _ = _run(a, args + ["--requests=200"], workers=workers, clients=clients)
+        message = "{}: A={} A'={} B={} B'={}\n{}".format(
+            " ".join(args), *[{v: n.commands[v] for v in verbs} for n in (a, a_replica, b, b_replica)],
+            stderr[-2000:])
+        env.assertEqual(rc, 0, message=message)
+        env.assertEqual(a.errors + a_replica.errors + b.errors + b_replica.errors, [], message=message)
+        writes, reads = verbs
+        half = workers * clients * 100
+        env.assertEqual(a.commands[writes] + b.commands[writes], half, message=message)
+        env.assertEqual(a_replica.commands[reads] + b_replica.commands[reads], half, message=message)
+        env.assertEqual(a.commands[reads] + b.commands[reads] + a_replica.commands[writes] +
+                        b_replica.commands[writes], 0, message=message)
+
+
+def test_read_preference_keyless_write_with_unreachable_primary_is_reported(env):
+    """With the only primary unreachable, a held keyless write must not turn
+    into a short run that looks successful: the run fails and says so, as a
+    keyed write does. The replica is the seed; the primary's port refuses."""
+    for command in ("--command=FLUSHDB", "--command=SET __key__ v"):
+        seed = _Node(0)
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        dead_port = probe.getsockname()[1]
+        probe.close()
+        endpoints = [b"*2\r\n$9\r\n127.0.0.1\r\n:%d\r\n" % port for port in (dead_port, seed.server_address[1])]
+        reply = b"*1\r\n*4\r\n:0\r\n:16383\r\n" + b"".join(endpoints)
+        seed.slots_fn = lambda _n: reply
+        rc, stderr, _ = _run(seed, [command, "--read-preference=secondaryPreferred", "--requests=20"])
+        message = "{}: rc={} replica={}\n{}".format(command, rc, dict(seed.commands), stderr[-2000:])
+        env.assertEqual(rc, 1, message=message)
+        env.assertEqual(seed.commands[b"FLUSHDB"] + seed.commands[b"SET"], 0, message=message)
+        env.assertContains("ended before the requested request count was reached", stderr, message=message)

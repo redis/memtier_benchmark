@@ -24,6 +24,7 @@
 #include <string>
 #include <vector>
 #include "client.h"
+#include "retry_backoff.h"
 
 typedef std::queue<unsigned long long> key_index_pool;
 
@@ -142,7 +143,7 @@ protected:
     // workloads where writes succeed (primary is live) but every GET routing
     // attempt fails because no replica is available yet.
     unsigned int m_strict_no_route_attempts;
-    struct timeval m_last_clusterdown_refresh;
+    clusterdown_refresh_backoff m_clusterdown_refresh;
     // Monotonic timestamp (CLOCK_MONOTONIC seconds) of the last "all replicas
     // unreachable under read-only workload" warning emitted from
     // hold_pipeline. Rate-limited to once per 60s so a stalled benchmark
@@ -263,6 +264,8 @@ protected:
     // Hand the requests a retired connection holds for resend to the
     // connections that now own their slots, so they still complete.
     void hand_off_replay_requests(unsigned int conn_id);
+    // Everything a retired connection still holds (see the definition).
+    void release_retired_connection(unsigned int conn_id);
     // Release the transaction pin, retaining any unconsumed lookahead key so
     // re-pinning can resolve its owner again without burning a key index.
     void txn_release_pin();
@@ -318,6 +321,7 @@ public:
     virtual bool hold_pipeline(unsigned int conn_id);
     virtual void handle_rate_limit_refill(unsigned int conn_id);
     virtual void handle_connection_disconnect(unsigned int conn_id);
+    virtual void handle_connection_retired(unsigned int conn_id);
     virtual bool is_transaction_pinned(unsigned int conn_id)
     {
         return m_config->transaction && m_txn_pinned_conn_id == (int) conn_id;
