@@ -163,6 +163,7 @@ client::client(client_group *group) :
         m_initialized(false),
         m_end_set(false),
         m_run_failed(false),
+        m_end_waits_for_siblings(false),
         m_config(NULL),
         m_obj_gen(NULL),
         m_stats(group->get_config()),
@@ -203,6 +204,7 @@ client::client(struct event_base *event_base, benchmark_config *config, abstract
         m_initialized(false),
         m_end_set(false),
         m_run_failed(false),
+        m_end_waits_for_siblings(false),
         m_config(NULL),
         m_obj_gen(NULL),
         m_stats(config),
@@ -360,6 +362,49 @@ bool client::finished(void)
     return false;
 }
 
+bool client::deadline_passed_by(const struct timeval &now)
+{
+    // Staircase mode's finished() already reads the wall clock.
+    return m_config->test_time > 0 && m_config->clients_start == 0 && m_stats.has_started() &&
+           ts_diff(m_stats.get_start_time(), now) >= (long long) m_config->test_time * 1000000;
+}
+
+bool client::holds_retries(void)
+{
+    for (unsigned int i = 0; i < m_connections.size(); i++) {
+        if (m_connections[i] != NULL && m_connections[i]->holds_retries()) return true;
+    }
+    return false;
+}
+
+bool client::idle_connection_waits_for_connect(void)
+{
+    bool idle = false, connecting = false;
+    for (unsigned int i = 0; i < m_connections.size(); i++) {
+        shard_connection *sc = m_connections[i];
+        if (sc == NULL) continue;
+        if (sc->get_connection_state() == conn_in_progress) {
+            connecting = true;
+        } else if (sc->get_connection_state() == conn_connected && !sc->may_send_again()) {
+            idle = true;
+        }
+    }
+    return idle && connecting;
+}
+
+bool client::test_time_end(const struct timeval &now, struct timeval *end)
+{
+    if (m_config->test_time == 0 || !m_stats.has_started()) return false;
+    *end = m_stats.get_start_time();
+    // Only construct a deadline that lies before now, so a large test time
+    // cannot overflow Winsock's 32-bit timeval seconds.
+    if (ts_diff(*end, now) <= (long long) m_config->test_time * 1000000) return false;
+    end->tv_sec = (long long) end->tv_sec + m_config->test_time;
+    if (m_reqs_answered && timercmp(&m_last_reply_time, end, >)) *end = m_last_reply_time;
+    if (timercmp(end, &now, >)) *end = now;
+    return true;
+}
+
 bool client::all_connections_idle(void)
 {
     for (unsigned int i = 0; i < m_connections.size(); i++) {
@@ -390,28 +435,12 @@ void client::set_end_time()
     if (!m_end_set) {
         benchmark_debug_log("nothing else to do, test is finished.\n");
 
-        // A --test-time client that sent workload but never had a reply takes
-        // part in the duration average (#819), yet has no op past its
-        // deadline to account for: end it there, not at a post-deadline
-        // reconnect or at its thread's end (#867). A client with replies ends
-        // now, as the time past its deadline may cover replies it drained.
-        // The deadline is the client's own start plus --test-time, not
-        // run_deadline(): that times an unanswered client from the
-        // benchmark's start, which would shorten the interval of a client
-        // that started late and inflate Ops/sec.
-        struct timeval now;
+        // A --test-time client that sent workload ends as test_time_end()
+        // says (#867, #870). One that never had a reply takes part in the
+        // duration average (#819) and ends at its deadline.
+        struct timeval now, end;
         gettimeofday(&now, NULL);
-        if (m_config->test_time > 0 && m_reqs_answered == 0 && has_submitted_workload() && m_stats.has_started()) {
-            struct timeval deadline = m_stats.get_start_time();
-            // As in set_end_time_interrupted(): only construct a deadline
-            // that lies before now, so a large test time cannot overflow.
-            if (ts_diff(deadline, now) > (long long) m_config->test_time * 1000000) {
-                deadline.tv_sec = (long long) deadline.tv_sec + m_config->test_time;
-                set_end_time_at(&deadline);
-                return;
-            }
-        }
-        set_end_time_at(&now);
+        set_end_time_at(has_submitted_workload() && test_time_end(now, &end) ? &end : &now);
     }
 }
 
@@ -422,16 +451,10 @@ void client::set_end_time_interrupted(struct timeval *end_time)
     // interrupt ended may have started after the interrupt time.
     struct timeval start_time = m_stats.get_start_time();
     if (m_stats.has_started() && timercmp(end_time, &start_time, <)) end_time = &start_time;
-    // Interrupting the drain after a timed run must not include the drain
-    // in its throughput denominator, just as normal deadline finalization.
-    struct timeval deadline = start_time;
-    if (m_stats.has_started() && m_config->test_time > 0 &&
-        ts_diff(start_time, *end_time) > (long long) m_config->test_time * 1000000) {
-        // Only construct a deadline within the captured time interval. A large
-        // test time can otherwise overflow Winsock's 32-bit timeval seconds.
-        deadline.tv_sec = (long long) start_time.tv_sec + m_config->test_time;
-        end_time = &deadline;
-    }
+    // Interrupting the drain after a timed run ends it as set_end_time()
+    // does: the idle time after the last reply is not in its duration.
+    struct timeval end;
+    if (test_time_end(*end_time, &end)) end_time = &end;
     m_stats.set_end_time(end_time);
     m_end_set = true;
 }
@@ -445,14 +468,15 @@ bool client::abandon_unanswered_requests(unsigned long long *unanswered, unsigne
     // Only a client that is waiting for replies, or that keeps resending
     // --retry-on-error retries that never succeed (#715): one with nothing
     // in flight ends by itself, or is waiting for a reconnect. A retry held
-    // for its backoff is not pending.
-    if (all_connections_idle()) {
-        bool holds_retries = false;
-        for (unsigned int i = 0; i < m_connections.size() && !holds_retries; i++) {
-            holds_retries = m_connections[i] != NULL && m_connections[i]->holds_retries();
-        }
-        if (!holds_retries) return false;
-    }
+    // for its backoff is not pending. Also one that waits for a sibling that
+    // may still send: a connection already tried to end it once the run was
+    // over (shard_connection::end_client_after_run()), or one is up and idle
+    // past the deadline while another is connecting
+    // (idle_connection_waits_for_connect()). Without
+    // --connection-timeout, a redial whose SYN is dropped would keep it
+    // waiting for the kernel's connect timeout (about 2 minutes).
+    if (all_connections_idle() && !holds_retries() && !m_end_waits_for_siblings && !idle_connection_waits_for_connect())
+        return false;
 
     // Drop them before disconnecting, so --retry-on-error does not hold them
     // for a resend that will never come (they would then be counted a
@@ -466,10 +490,11 @@ bool client::abandon_unanswered_requests(unsigned long long *unanswered, unsigne
     m_stats.add_unanswered_requests(abandoned);
     *unanswered += abandoned;
 
-    // The run measured --test-time, not the grace period spent waiting.
-    struct timeval end_time = m_stats.get_start_time();
-    end_time.tv_sec += m_config->test_time;
-    set_end_time_at(&end_time);
+    // The run measured --test-time and the replies drained after it, not
+    // the grace period spent waiting.
+    struct timeval now, end;
+    gettimeofday(&now, NULL);
+    set_end_time_at(test_time_end(now, &end) ? &end : &now);
     // The caller reports the requests held for retry with the others.
     *held += disconnect_and_abandon_held();
     return true;
@@ -1668,16 +1693,20 @@ void client_group::handle_end_stalled_clients(void)
 {
     // A client is reported as waiting for replies if it was (even if only
     // for setup commands, which are not counted), and as retrying if it
-    // held requests for retry; one that had both is in both lines.
+    // held requests for retry; one that had both is in both lines. One that
+    // only waited for a sibling (wait_for_siblings()) is reported as such.
     unsigned long long unanswered = 0, held = 0;
-    unsigned int no_reply = 0, retrying = 0, ended = 0;
+    unsigned int no_reply = 0, retrying = 0, waiting = 0, ended = 0;
     unsigned int count = active_client_count();
     for (unsigned int i = 0; i < count && i < m_clients.size(); i++) {
         if (m_clients[i]->end_time_set()) continue;
         unsigned long long client_unanswered = 0, client_held = 0;
+        const bool only_waiting = m_clients[i]->all_connections_idle() && !m_clients[i]->holds_retries();
         if (!m_clients[i]->abandon_unanswered_requests(&client_unanswered, &client_held)) continue;
         ended++;
-        if (client_unanswered > 0 || client_held == 0) {
+        if (only_waiting) {
+            waiting++;
+        } else if (client_unanswered > 0 || client_held == 0) {
             no_reply++;
             unanswered += client_unanswered;
         }
@@ -1701,6 +1730,11 @@ void client_group::handle_end_stalled_clients(void)
             benchmark_error_log("warning: %u client(s) were still retrying %llu request(s) %u seconds after the test "
                                 "time ended; ended them (counted as errors, not resent).\n",
                                 retrying, held, TEST_TIME_DRAIN_GRACE_SECS);
+        }
+        if (waiting > 0) {
+            benchmark_error_log("warning: %u client(s) were still waiting for a connection to connect or set up %u "
+                                "seconds after the test time ended; ended them.\n",
+                                waiting, TEST_TIME_DRAIN_GRACE_SECS);
         }
     }
 }

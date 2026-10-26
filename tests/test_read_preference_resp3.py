@@ -14,7 +14,8 @@ The tests are gated by three capability probes so they degrade gracefully on
 environments that do not support the matrix cell:
 
   - env.isCluster()           - cluster topology required
-  - get_cluster_replica_connections(env) - at least one replica advertised
+  - get_cluster_replica_connections(env) - at least one replica advertised;
+    on a cluster started with replicas, finding none fails the test
   - server_supports_resp3(env)            - Redis 6+ HELLO 3 support
 
 Test matrix
@@ -166,7 +167,9 @@ def _capability_gates(env):
 
     Mirrors the three-gate skip pattern recommended by round-14 reviewers:
     cluster mode + replicas advertised + HELLO 3 supported.  Each gate calls
-    env.skip() and returns ok=False so the caller can early-return.
+    env.skip() and returns ok=False so the caller can early-return, except
+    that get_cluster_replica_connections() raises, failing the test, when
+    the cluster was started with replicas and has none.
     """
     if not env.isCluster():
         env.skip()

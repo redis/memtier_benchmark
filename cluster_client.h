@@ -285,6 +285,8 @@ protected:
     // Hand the requests a retired connection holds for resend to the
     // connections that now own their slots, so they still complete.
     void hand_off_replay_requests(unsigned int conn_id);
+    // Everything a retired connection still holds (see the definition).
+    void release_retired_connection(unsigned int conn_id);
     // Release the transaction pin, retaining any unconsumed lookahead key so
     // re-pinning can resolve its owner again without burning a key index.
     void txn_release_pin();
@@ -341,6 +343,7 @@ public:
     virtual void handle_rate_limit_refill(unsigned int conn_id);
     virtual void handle_connection_disconnect(unsigned int conn_id);
     virtual void handle_connection_given_up(unsigned int conn_id);
+    virtual void handle_connection_retired(unsigned int conn_id);
     virtual bool is_transaction_pinned(unsigned int conn_id)
     {
         return m_config->transaction && m_txn_pinned_conn_id == (int) conn_id;

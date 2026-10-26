@@ -36,7 +36,10 @@ public:
     virtual unsigned long long get_reqs_processed(void) = 0;
     virtual void inc_reqs_processed(void) = 0;
     virtual unsigned long long get_reqs_answered(void) = 0;
-    virtual void inc_reqs_answered(void) = 0;
+    // timestamp: when the reply was read, as passed to handle_response().
+    // A reply whose request was claimed for retry (--retry-on-error) is not
+    // final, so it is not the last reply that ends a --test-time client.
+    virtual void inc_reqs_answered(const struct timeval &timestamp, bool is_final) = 0;
     virtual unsigned long long get_reqs_generated(void) = 0;
     virtual void inc_reqs_generated(void) = 0;
     virtual void dec_reqs_generated(unsigned long long count) = 0;
@@ -44,7 +47,13 @@ public:
     // resent, never answered): uncount them and count each as an error.
     virtual void abandon_requests(unsigned long long count) = 0;
     virtual bool finished(void) = 0;
+    // Whether a started client's --test-time deadline has passed by now,
+    // which finished() may not show yet: its clock only moves with replies
+    // and connection errors. Checked before workload is issued.
+    virtual bool deadline_passed_by(const struct timeval &now) = 0;
     virtual bool all_connections_idle(void) = 0;
+    // Whether a connection holds --retry-on-error retries for their backoff.
+    virtual bool holds_retries(void) = 0;
 
     virtual void set_start_time(void) = 0;
     virtual void set_end_time(void) = 0;
@@ -73,6 +82,9 @@ public:
     virtual void handle_connection_disconnect(unsigned int) {}
     // A connection was given up on (no reconnect timer) while the thread goes on.
     virtual void handle_connection_given_up(unsigned int) {}
+    // A connection was closed for good (a replica not needed): hand off the
+    // requests it holds for resend. Only cluster clients have replicas.
+    virtual void handle_connection_retired(unsigned int) {}
 
     virtual int connect(void) = 0;
     // Reconnect one dropped connection: returns 0 once a connect is issued,
