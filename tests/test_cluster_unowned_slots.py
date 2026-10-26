@@ -5,6 +5,7 @@ import csv
 import json
 import os
 import re
+import socket
 import socketserver
 import subprocess
 import tempfile
@@ -16,7 +17,7 @@ def _clusterdown_refresh_interval():
     """How often memtier at most asks for CLUSTER SLOTS after -CLUSTERDOWN, in seconds."""
     header = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cluster_client.h")
     with open(header) as source:
-        match = re.search(r"#define CLUSTERDOWN_REFRESH_INTERVAL_USEC (\d+)", source.read())
+        match = re.search(r"#define\s+CLUSTERDOWN_REFRESH_INTERVAL_USEC\s+(\d+)", source.read())
     assert match, "CLUSTERDOWN_REFRESH_INTERVAL_USEC is not defined in %s" % header
     return int(match.group(1)) / 1e6
 
@@ -710,6 +711,89 @@ def test_unusable_slots_refresh_is_bounded_by_reconnect_attempts(env):
         # The refresh, then one per reconnect of the seed.
         env.assertEqual(node.unusable, 4)
         env.assertLess(stats["Totals"]["Count"], 20)
+
+
+def test_given_up_primary_monitor_drops_are_reported(env):
+    """Lines dropped with a given-up primary are errors in the JSON and in --failed-keys-file.
+
+    A primary A with replicas R (the seed) and X. A drops its third SET and
+    refuses its redial, and X is dropped at the same moment and redials
+    slowly. X is still in setup when A runs out of attempts, so A is given up
+    on while the thread goes on, and the monitor lines staged on A are dropped
+    as slot-owner-down-for-monitor-line.
+    """
+    node = _Node([(0, 16383)], replica=True)
+    x = _Node([])
+    x.root = node
+    node.extra = [x]
+    x.sockets = []
+    accept = x.process_request
+
+    def process_request(request, address):
+        x.sockets.append(request)
+        accept(request, address)
+
+    x.process_request = process_request
+    nodes = [node, node.replica, x]
+
+    def topology():
+        with node.lock:
+            node.slots_calls += 1
+        reply = b"*1\r\n*%d\r\n:0\r\n:16383\r\n" % (2 + len(nodes))
+        for server in nodes:
+            reply += b"*2\r\n$9\r\n127.0.0.1\r\n:%d\r\n" % server.server_address[1]
+        return reply
+
+    for server in nodes:
+        server.topology = topology
+
+    def drop(args):
+        if len(node.requests) != 3:
+            return False
+        x.auth_delay = 3
+        for request in x.sockets:
+            try:
+                request.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        node.auth_closes = 100
+        return True
+
+    node.drop_request = drop
+    with tempfile.TemporaryDirectory() as directory:
+        monitor = os.path.join(directory, "monitor.txt")
+        with open(monitor, "w") as target:
+            for index in range(10):
+                target.write(f'1.000000 [0 127.0.0.1:12345] "SET" "memtier-1" "value-{index}"\n')
+        stats, rows, stderr = _run(
+            env,
+            node,
+            [
+                "--requests=20",
+                "--read-preference=secondaryPreferred",
+                "--monitor-input=" + monitor,
+                "--monitor-pattern=S",
+                "--command=PING",
+                "--command=__monitor_line@__",
+                "--reconnect-on-error",
+                "--max-reconnect-attempts=1",
+                "--reconnect-backoff-factor=0.5",
+                # The JSON reports Errors only with it.
+                "--retry-on-error",
+                # X's slow redial must not end the run as a stage failure.
+                "--connection-stage-timeout=30",
+            ],
+            seed_replica=True,
+            # A is given up on, so the run can't reach --requests.
+            expected_exit=1,
+            timeout=20,
+        )
+    env.assertContains("leaving conn 1 dead and continuing while peers are still mid-setup", stderr)
+    dropped = [row for row in rows if row["status"] == "slot-owner-down-for-monitor-line"]
+    env.assertGreater(len(dropped), 0, message=str(rows))
+    env.assertEqual([(row["command"], row["key"]) for row in dropped], [("ARBITRARY", "memtier-1")] * len(dropped))
+    # Each error in ALL STATS has its failed-keys record, the drops included.
+    env.assertEqual(stats["Totals"]["Errors"], len(rows), message=str(rows))
 
 
 def test_unowned_keys_survive_repeated_redial(env):

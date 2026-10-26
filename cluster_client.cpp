@@ -2966,17 +2966,18 @@ void cluster_client::reroute_staged_monitor_commands()
     for (const shard_group &group : m_shard_groups) {
         if (group.primary != NULL && group.primary->get_id() < primary.size()) primary[group.primary->get_id()] = true;
     }
-    // Nothing would send a line on a primary given up on, not even one
-    // already queued on it. One whose redial was left to a SLOTS refresh is
-    // not given up on: that refresh's map redials or retires it.
-    auto given_up = [this](unsigned int conn_id) { return primary_given_up(conn_id); };
+    // Nothing would send a line on a primary given up on (primary_given_up()),
+    // not even one already queued on it. One whose redial was left to a
+    // SLOTS refresh is not given up on: that refresh's map redials or
+    // retires it.
+    //
     // An unowned line goes to a primary of this map that will send it:
     // connected first, then dialing or reconnect-pending. Not by
     // fallback_primary_conn_id(), which while the seed refreshes SLOTS also
     // counts a primary given up on and can return it ahead of a live one.
     unsigned int fallback = UINT_MAX;
     for (const shard_group &group : m_shard_groups) {
-        if (group.primary == NULL || given_up(group.primary->get_id())) continue;
+        if (group.primary == NULL || primary_given_up(group.primary->get_id())) continue;
         if (group.primary->get_connection_state() == conn_connected) {
             fallback = group.primary->get_id();
             break;
@@ -2987,7 +2988,7 @@ void cluster_client::reroute_staged_monitor_commands()
     unsigned long long dropped = 0;
     for (unsigned int i = 0; i < m_staged_monitor_commands.size(); i++) {
         if (m_staged_monitor_commands[i].empty()) continue;
-        const bool keeps = i < primary.size() && primary[i] && !given_up(i);
+        const bool keeps = i < primary.size() && primary[i] && !primary_given_up(i);
         std::queue<staged_monitor_cmd> staged;
         std::swap(m_staged_monitor_commands[i], staged);
         // A line moved to a later connection is seen again when the loop gets
@@ -3007,7 +3008,7 @@ void cluster_client::reroute_staged_monitor_commands()
                 // An unowned slot can go to any primary: it gives the
                 // server's routing response.
                 target = slot_is_unowned(slot) ? (keeps ? i : fallback) : slot_primary_conn_id(slot);
-                if (given_up(target)) {
+                if (primary_given_up(target)) {
                     drop_reason = "slot-owner-down-for-monitor-line";
                 } else if (target != i && m_staged_monitor_commands[target].size() >= STAGED_MONITOR_QUEUE_MAX_SIZE) {
                     drop_reason = "staged-monitor-queue-full";
