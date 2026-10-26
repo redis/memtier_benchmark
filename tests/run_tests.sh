@@ -70,7 +70,7 @@ run_tests() {
 	[[ -n "$REDIS_PORT" ]] && connection_args+=(-p "$REDIS_PORT")
 	[[ -n "$REDIS_PASSWORD" ]] && connection_args+=(--oss_password "$REDIS_PASSWORD")
 	local E=0 out ran
-	out=$(mktemp) || return 1
+	out=$(mktemp /tmp/memtier-rltest.XXXXXX) || return 1
 	{
 		$OP python3 -m RLTest $RLTEST_ARGS "${connection_args[@]}" | tee "$out"
 		((E |= ${PIPESTATUS[0]}))
@@ -80,9 +80,12 @@ run_tests() {
 	# fail when the summary is missing or reports zero tests run.
 	ran=$(grep -ao 'Total Tests Run: [0-9]*' "$out" | tail -1 | grep -o '[0-9]*$')
 	rm -f "$out"
-	if [[ -z $ran || $ran == 0 ]]; then
-		echo "RLTest ran no tests (Total Tests Run: ${ran:-missing})" >&2
-		E=1
+	if [[ -z $ran ]]; then
+		echo "RLTest printed no Total Tests Run summary" >&2
+		((E |= 1))
+	elif [[ $ran == 0 ]]; then
+		echo "RLTest ran no tests (Total Tests Run: 0)" >&2
+		((E |= 1))
 	fi
 
 	return $E
