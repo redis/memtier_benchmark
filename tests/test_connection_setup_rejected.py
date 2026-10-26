@@ -297,3 +297,25 @@ def test_standalone_auth_rejected_on_some_connections_fails_run(env):
     env.assertEqual(returncode, 1, message=stderr[-2000:])
     env.assertContains("AUTH error and --reconnect-on-error is not set, ending this thread", stderr)
     env.assertLess(elapsed, 8)
+
+
+def test_replica_rejecting_its_first_read_hands_off_held_requests(env):
+    # Under secondaryPreferred with --reconnect-on-error, a replica that
+    # refuses the connection before its first reply (#894) is closed as not
+    # needed. With --retry-on-error, the read it refused is held for resend:
+    # it must be handed off to the primary, as when a slot map refresh
+    # retires a connection, or the --requests run never completes.
+    replica = _Node(bad_slots_replies=0, reject_data=b"-ERR max number of clients reached\r\n")
+    node = _Node(bad_slots_replies=0, replica=replica)
+    returncode, stderr, elapsed, stats = _run_json(env, node, ["--requests=50", "--ratio=0:1",
+                                                               "--read-preference=secondaryPreferred",
+                                                               "--reconnect-on-error", "--retry-on-error",
+                                                               "--connection-stage-timeout=5"])
+    env.assertEqual(node.errors + replica.errors, [])
+    env.assertEqual(returncode, 0, message=stderr[-2000:])
+    env.assertContains("rejected the connection", stderr)
+    env.assertContains("not needed under --read-preference secondaryPreferred, closing it", stderr)
+    env.assertGreaterEqual(replica.data_requests, 1)
+    env.assertEqual(node.data_requests, 50)
+    env.assertEqual(stats.get("Count"), 50)
+    env.assertLess(elapsed, 10)

@@ -2514,6 +2514,9 @@ void shard_connection::reconnect_after_setup_error(const char *error_context, bo
                             m_config->read_preference == rp_primary ? "primary" : "secondaryPreferred");
         disconnect();
         m_setup_rejected_replica = true;
+        // It is not redialled, so what it holds for resend (--retry-on-error),
+        // e.g. the read a rejection (#894) refused, goes to the primary.
+        m_conns_manager->handle_connection_retired(m_id);
         return;
     }
     if (m_config->reconnect_on_error) {

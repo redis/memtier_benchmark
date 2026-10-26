@@ -527,7 +527,10 @@ private:
     // fails the run (#630).
     bool m_setup_failed_since_reply;
     // A workload reply arrived since this connection was established, so a
-    // later connection rejection is a drop, not a setup failure.
+    // later connection rejection is a drop, not a setup failure. It cannot be
+    // !m_setup_failed_since_reply: that one starts false and carries across
+    // reconnects until the next reply (#630), while this one must start false
+    // on every new connection (cleared in disconnect()).
     bool m_reply_since_connect;
     // The pending rejected-setup reconnect follows an empty or error CLUSTER
     // SLOTS reply (with m_setup_rejected), and whether this connection already

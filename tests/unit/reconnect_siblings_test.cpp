@@ -356,6 +356,25 @@ static void test_connection_rejection_is_not_a_reply(event_base *base, abstract_
         check(connection.setup_failed_since_reply(), "the rejection is a setup failure since the last reply");
         connection.disconnect();
     }
+    // Without --reconnect-on-error the connection is dropped, not redialled,
+    // and its thread ends (the event loop is not run here).
+    arbitrary_command_list commands;
+    benchmark_config config = {};
+    config.arbitrary_commands = &commands;
+    config.clients = config.threads = 1;
+    config.key_pattern = "S:S";
+    config.protocol = PROTOCOL_REDIS_DEFAULT;
+    config.requests = 1;
+    object_generator generator;
+    generator.set_data_size_fixed(1);
+    client manager(base, &config, protocol, &generator);
+    shard_connection &connection = *manager.get_connections()[0];
+    manager.inc_reqs_generated();
+    connection.handle_connection_rejection(new request(rt_set, 0, NULL, 1), "-ERR max number of clients reached");
+    check(manager.get_reqs_processed() == 0 && manager.get_reqs_generated() == 0,
+          "without --reconnect-on-error the rejected request is uncounted");
+    check(!connection.is_reconnect_pending(), "without --reconnect-on-error a rejection is not redialled");
+    check(connection.get_thread_end_reason() != NULL, "without --reconnect-on-error a rejection ends the thread");
 }
 
 int main()
