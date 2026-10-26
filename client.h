@@ -242,6 +242,13 @@ public:
     virtual bool deadline_passed_by(const struct timeval &now);
     virtual bool all_connections_idle(void);
     virtual bool holds_retries(void);
+    // Whether a connection is up with nothing left to send
+    // (shard_connection::may_send_again()) while another one's connect is in
+    // progress: past the deadline, the idle one waits for that sibling to end
+    // the client (shard_connection::fill_pipeline()), paused without
+    // --rate-limiting. A sibling waiting for its reconnect timer, or a client
+    // whose connections are all down, is left to the reconnect logic (#669).
+    bool idle_connection_waits_for_connect(void);
     // The end of a started --test-time client whose deadline, its own start
     // plus --test-time, lies before now: the deadline or its last reply,
     // whichever is later, and no later than now. Replies drained after the

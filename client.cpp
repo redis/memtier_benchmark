@@ -377,6 +377,21 @@ bool client::holds_retries(void)
     return false;
 }
 
+bool client::idle_connection_waits_for_connect(void)
+{
+    bool idle = false, connecting = false;
+    for (unsigned int i = 0; i < m_connections.size(); i++) {
+        shard_connection *sc = m_connections[i];
+        if (sc == NULL) continue;
+        if (sc->get_connection_state() == conn_in_progress) {
+            connecting = true;
+        } else if (sc->get_connection_state() == conn_connected && !sc->may_send_again()) {
+            idle = true;
+        }
+    }
+    return idle && connecting;
+}
+
 bool client::test_time_end(const struct timeval &now, struct timeval *end)
 {
     if (m_config->test_time == 0 || !m_stats.has_started()) return false;
@@ -453,12 +468,15 @@ bool client::abandon_unanswered_requests(unsigned long long *unanswered, unsigne
     // Only a client that is waiting for replies, or that keeps resending
     // --retry-on-error retries that never succeed (#715): one with nothing
     // in flight ends by itself, or is waiting for a reconnect. A retry held
-    // for its backoff is not pending. Also one that a connection already
-    // tried to end once the run was over, waiting for a sibling that may
-    // still send (shard_connection::end_client_after_run()): without
+    // for its backoff is not pending. Also one that waits for a sibling that
+    // may still send: a connection already tried to end it once the run was
+    // over (shard_connection::end_client_after_run()), or one is up and idle
+    // past the deadline while another is connecting
+    // (idle_connection_waits_for_connect()). Without
     // --connection-timeout, a redial whose SYN is dropped would keep it
     // waiting for the kernel's connect timeout (about 2 minutes).
-    if (all_connections_idle() && !holds_retries() && !m_end_waits_for_siblings) return false;
+    if (all_connections_idle() && !holds_retries() && !m_end_waits_for_siblings && !idle_connection_waits_for_connect())
+        return false;
 
     // Drop them before disconnecting, so --retry-on-error does not hold them
     // for a resend that will never come (they would then be counted a

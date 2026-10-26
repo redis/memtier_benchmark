@@ -583,14 +583,16 @@ def test_slow_redial_without_rate_limit_ends_once_set_up(env):
     _check_slow_redial(env, None, reject_auth=False)
 
 
-def test_blackholed_redial_is_ended_at_drain_grace(env):
+def _check_blackholed_redial(env, rate, first_goes_away):
     """As above, but the second node's redial is never let in (a firewalled
-    or dead node, whose SYNs are dropped), and once the deadline has passed
-    the first node goes away too: the main connection's redial is refused,
-    so it is done and would end the client, but the second connection is
-    still connecting. Without --connection-timeout that connect lasts until
-    the kernel gives up (about 2 minutes with the default tcp_syn_retries);
-    the drain grace ends the client instead, at the deadline plus 10 s."""
+    or dead node, whose SYNs are dropped). Without --connection-timeout that
+    connect lasts until the kernel gives up (about 2 minutes with the default
+    tcp_syn_retries); the drain grace ends the client instead, at the
+    deadline plus 10 s. With first_goes_away, the first node goes away once
+    the deadline has passed: the main connection's redial is refused, so it
+    is done and would end the client (end_client_after_run()). Otherwise
+    the first connection stays up, idle past its deadline (fill_pipeline()'s
+    deadline end); without --rate-limiting (rate None) it is paused."""
     if sys.platform != "linux":
         env.skip()  # relies on Linux dropping the SYN when the accept queue is full
     test_time = 4
@@ -598,7 +600,7 @@ def test_blackholed_redial_is_ended_at_drain_grace(env):
     first = _RedialNode(16, on_command=script.on_command)
     second = _RedialNode(0)
     script.second = second
-    script.on_release = first.go_away
+    script.on_release = first.go_away if first_goes_away else (lambda: None)
     slots = b"*2\r\n"
     for node, low, high in ((first, 0, 8191), (second, 8192, 16383)):
         slots += b"*3\r\n:%d\r\n:%d\r\n*2\r\n$9\r\n127.0.0.1\r\n:%d\r\n" % (low, high, node.port)
@@ -607,7 +609,9 @@ def test_blackholed_redial_is_ended_at_drain_grace(env):
     driver.start()
     args = [MEMTIER_BINARY, "--server=127.0.0.1", "--port={}".format(first.port), "--cluster-mode",
             "--authenticate=pw", "--threads=1", "--clients=1", "--test-time={}".format(test_time),
-            "--ratio=1:0", "--key-maximum=1000", "--reconnect-on-error", "--hide-histogram", "--rate-limiting=50"]
+            "--ratio=1:0", "--key-maximum=1000", "--reconnect-on-error", "--hide-histogram"]
+    if rate is not None:
+        args.append("--rate-limiting={}".format(rate))
     start = time.monotonic()
     try:
         result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=50, text=True)
@@ -626,9 +630,26 @@ def test_blackholed_redial_is_ended_at_drain_grace(env):
     # The second node never accepted the redial.
     env.assertEqual(len(second.accepted), 1, message=stderr[-2000:])
     env.assertEqual(returncode, 0, message=stderr[-2000:])
-    env.assertContains("Connection failed and the run is over, not reconnecting", stderr)
+    if first_goes_away:
+        env.assertContains("Connection failed and the run is over, not reconnecting", stderr)
     env.assertContains("were still waiting for a connection to connect or set up 10 seconds after the test time ended",
-                       stderr)
+                       stderr[-4000:])
     env.assertContains("Totals", stdout)
     env.assertGreater(elapsed, test_time + 9, message="run took {:.1f}s".format(elapsed))
     env.assertLess(elapsed, test_time + 25, message="run took {:.1f}s".format(elapsed))
+
+
+def test_blackholed_redial_is_ended_at_drain_grace(env):
+    _check_blackholed_redial(env, 50, first_goes_away=True)
+
+
+def test_blackholed_redial_with_idle_first_connection_is_ended_at_drain_grace(env):
+    # The first node stays up: its idle connection's deadline end waits for
+    # the redial, as on master, until the drain grace.
+    _check_blackholed_redial(env, 50, first_goes_away=False)
+
+
+def test_blackholed_redial_with_paused_first_connection_is_ended_at_drain_grace(env):
+    # Same without --rate-limiting: the first connection is paused, with no
+    # timer left to end the client.
+    _check_blackholed_redial(env, None, first_goes_away=False)

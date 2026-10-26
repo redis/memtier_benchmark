@@ -2496,7 +2496,8 @@ bool shard_connection::may_send_again(void)
 // be retried, and the requests it was to resend would not be sent. Such a
 // sibling ends the client itself, on its last reply or through this check
 // when its connect fails (or times out, with --connection-timeout); if it
-// never does, end_client_after_run() leaves it to the drain grace.
+// never does, the drain grace ends the client
+// (client::abandon_unanswered_requests()).
 bool shard_connection::siblings_done(void)
 {
     std::vector<shard_connection *> &conns = m_conns_manager->get_connections();

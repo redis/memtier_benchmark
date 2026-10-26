@@ -291,13 +291,13 @@ test time ended`. They are not part of `"Unanswered requests"`, which only
 counts requests that were waiting for a reply.
 
 In cluster mode, a client whose connection to one node is done once the run is
-over (its redial failed) still waits for its other connections that may send
-again, such as a redial to another node still connecting, so that a setup the
-server rejects there fails the run. If that connect never completes (a node
-whose SYNs are dropped, without `--connection-timeout`), the client is ended
-when the grace period is over, and stderr shows `warning: N client(s) were
-still waiting for a connection to connect or set up 10 seconds after the test
-time ended`.
+over (idle, or its redial failed) still waits for its other connections that
+may send again, such as a redial to another node still connecting, so that a
+setup the server rejects there fails the run. If that connect never completes
+(a node whose SYNs are dropped, without `--connection-timeout`), the client is
+ended when the grace period is over, and stderr shows `warning: N client(s)
+were still waiting for a connection to connect or set up 10 seconds after the
+test time ended`.
 
 With a request-count workload (`--requests`), unlimited retries can run
 indefinitely if the server keeps rejecting every attempt. A valid workload

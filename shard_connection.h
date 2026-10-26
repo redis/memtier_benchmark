@@ -186,7 +186,8 @@ public:
     double next_reconnect_delay(void);
     bool stop_reconnecting_if_run_over(void);
     // siblings_done() and end_client_after_run() are public only for
-    // tests/unit/reconnect_siblings_test.cpp.
+    // tests/unit/reconnect_siblings_test.cpp; may_send_again() is also used by
+    // client::idle_connection_waits_for_connect().
     bool siblings_done(void);
     bool may_send_again(void);
     void end_client_after_run(bool end_stats);
