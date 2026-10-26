@@ -1566,15 +1566,21 @@ void shard_connection::rearm_readonly()
     m_readonly_state = setup_sent;
 }
 
+// Redis replies with this to a request it cannot parse (e.g. a value above
+// proto-max-bulk-len), then closes the connection.
+static bool is_redis_protocol_error(const char *status)
+{
+    static const char protocol[] = "-ERR Protocol error:";
+    return status && strncmp(status, protocol, sizeof(protocol) - 1) == 0;
+}
+
 // Redis can send these errors before accepting workload, then close the
 // connection. They are not workload replies (see handle_connection_rejection()).
 static bool is_redis_connection_rejection(const char *status)
 {
-    static const char protocol[] = "-ERR Protocol error:";
     static const char maxclients[] = "-ERR max number of clients ";
     static const char protected_mode[] = "-DENIED Redis is running in protected mode ";
-    return status && (strncmp(status, protocol, sizeof(protocol) - 1) == 0 ||
-                      strncmp(status, maxclients, sizeof(maxclients) - 1) == 0 ||
+    return status && (is_redis_protocol_error(status) || strncmp(status, maxclients, sizeof(maxclients) - 1) == 0 ||
                       strncmp(status, protected_mode, sizeof(protected_mode) - 1) == 0);
 }
 
@@ -2598,12 +2604,15 @@ void shard_connection::reconnect_after_setup_error(const char *error_context, bo
 // Redis closes the connection after these replies, so it is handled as a drop
 // (attempt_reconnect()): without --reconnect-on-error the thread ends and the
 // run fails. Like a rejected setup step, it does not disarm
-// --connection-stage-timeout or reset the reconnect budget. If the connection
-// served no workload reply since it was established, with --reconnect-on-error
-// it is handled as a rejected setup step (reconnect_after_setup_error()), so a
-// run that is over before the server accepts the connection fails. A rejection
-// after a reply (e.g. -ERR Protocol error for an oversized value) is only a
-// drop.
+// --connection-stage-timeout or reset the reconnect budget. With
+// --reconnect-on-error, -ERR max number of clients or -DENIED before the
+// connection's first workload reply refuses the connection itself: it is
+// handled as a rejected setup step (reconnect_after_setup_error()), so a run
+// that is over before the server accepts the connection fails. After a reply
+// it is only a drop. So is -ERR Protocol error once the client got any reply:
+// the request caused it (e.g. a value above proto-max-bulk-len), not the
+// connection, even when it is the first request on a new connection. A client
+// that never got a reply measured nothing, so there it is a setup failure too.
 void shard_connection::handle_connection_rejection(request *req, const char *status)
 {
     static const char context[] = "Connection rejected by the server";
@@ -2616,7 +2625,12 @@ void shard_connection::handle_connection_rejection(request *req, const char *sta
     drop_unanswered_request(req, &dropped, &abandoned);
     if (dropped) m_conns_manager->dec_reqs_generated(dropped);
     if (abandoned) m_conns_manager->abandon_requests(abandoned);
-    if (m_config->reconnect_on_error && !m_reply_since_connect) {
+    // -ERR Protocol error is caused by the request (e.g. a value above
+    // proto-max-bulk-len): once this client got a reply, it says nothing about
+    // whether the server accepts its connections.
+    const bool refused =
+        !m_reply_since_connect && (!is_redis_protocol_error(status) || !m_conns_manager->get_reqs_answered());
+    if (m_config->reconnect_on_error && refused) {
         reconnect_after_setup_error(context);
     } else {
         attempt_reconnect(context);

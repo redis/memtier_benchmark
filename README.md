@@ -691,9 +691,12 @@ run's stop condition:
     since its last reply fails the run instead (exit code 1), as when setup
     keeps failing at the deadline. The optional-replica exceptions are
     described under Read Preference above. A connection refused with
-    `-ERR Protocol error:`, `-ERR max number of clients` or `-DENIED Redis is
-    running in protected mode` before its first reply counts as such a
-    rejected setup; after a reply it is a dropped connection.
+    `-ERR max number of clients` or `-DENIED Redis is running in protected
+    mode` before its first reply counts as such a rejected setup; after a
+    reply it is a dropped connection. `-ERR Protocol error:` is caused by the
+    request (e.g. a value above `proto-max-bulk-len`), so it is a dropped
+    connection once the client got any reply, and a rejected setup only for a
+    client that never got one.
   - A connection that a live server drops around the deadline is still
     reconnected once, so requests held for replay are resent; if that
     reconnect fails or is dropped again, the run ends. So a peer that accepts
