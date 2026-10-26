@@ -305,6 +305,7 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_current_backoff_delay(1.0),
         m_reconnect_timer(NULL),
         m_reconnecting(false),
+        m_awaiting_slots_redial(false),
         m_setup_rejected(false),
         m_setup_rejected_replica(false),
         m_setup_rejected_context(NULL),
@@ -2464,6 +2465,7 @@ void shard_connection::attempt_reconnect(const char *error_context)
             benchmark_error_log("%s; leaving conn %u dead and continuing while peers are still mid-setup.\n", reason,
                                 m_id);
             disconnect();
+            m_conns_manager->handle_connection_given_up(m_id);
             return;
         }
         end_thread(reason,
@@ -2969,6 +2971,7 @@ void shard_connection::handle_reconnect_timer_event()
                 // disconnect() already ran when the prior attempt failed;
                 // m_connection_state is conn_disconnected and routing will
                 // skip it. Just return — no loopbreak, no further retries.
+                m_conns_manager->handle_connection_given_up(m_id);
                 return;
             }
             benchmark_error_log("Maximum reconnection attempts (%u) exceeded, ending this thread.\n",

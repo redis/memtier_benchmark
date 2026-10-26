@@ -80,6 +80,8 @@ public:
     // Routed requests can be waiting on another connection's rate budget.
     virtual void handle_rate_limit_refill(unsigned int) {}
     virtual void handle_connection_disconnect(unsigned int) {}
+    // A connection was given up on (no reconnect timer) while the thread goes on.
+    virtual void handle_connection_given_up(unsigned int) {}
     // A connection was closed for good (a replica not needed): hand off the
     // requests it holds for resend. Only cluster clients have replicas.
     virtual void handle_connection_retired(unsigned int) {}

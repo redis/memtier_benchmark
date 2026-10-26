@@ -33,6 +33,7 @@ struct staged_monitor_cmd
     size_t stats_index;
     struct timeval enqueue_time; // latency measured from selection, not drain
     size_t source_line;          // original monitor file line (1-based) for error messages
+    unsigned int slot;           // hash slot of the first key; re-routes the line when the map changes
 };
 
 // forward decleration
@@ -72,6 +73,10 @@ struct cluster_endpoint_info
     std::vector<std::pair<int, int> > slot_ranges; // contiguous [start,end] runs, primary-owned
 };
 
+// cluster_client::handle_response() asks for CLUSTER SLOTS after -CLUSTERDOWN
+// at most this often. tests/test_cluster_unowned_slots.py reads it.
+#define CLUSTERDOWN_REFRESH_INTERVAL_USEC 1000000
+
 class cluster_client : public client
 {
 public:
@@ -90,6 +95,10 @@ public:
 protected:
     std::vector<key_index_pool *> m_key_index_pools;
     std::vector<std::queue<staged_monitor_cmd> > m_staged_monitor_commands;
+    // Most lines a producer stages on one connection: a memory bound on new
+    // staging. A re-route only moves lines already staged, so it may go past
+    // it. A member so unit tests can lower it.
+    size_t m_staged_monitor_queue_max = 1000000;
     // Per-slot map to the owning shard group. m_shard_groups[m_slot_to_shard_group[s]].primary
     // is the connection that owns slot s; replicas are reachable via the same group's
     // replicas vector. Replaces the old `unsigned int m_slot_to_shard[16384]` (which only
@@ -143,6 +152,9 @@ protected:
     // attempt fails because no replica is available yet.
     unsigned int m_strict_no_route_attempts;
     struct timeval m_last_clusterdown_refresh;
+    // Set while handle_cluster_slots() dials the nodes of a reply it has not
+    // committed yet; the commit re-routes staged monitor lines itself.
+    bool m_parsing_slot_map;
     // Monotonic timestamp (CLOCK_MONOTONIC seconds) of the last "all replicas
     // unreachable under read-only workload" warning emitted from
     // hold_pipeline. Rate-limited to once per 60s so a stalled benchmark
@@ -208,6 +220,10 @@ protected:
     unsigned int select_target_conn(unsigned int slot, bool is_read);
     bool slot_is_unowned(unsigned int slot) const;
     unsigned int fallback_primary_conn_id() const;
+    // Nothing will dial conn_id again: it is disconnected with no reconnect
+    // timer (attempt_reconnect() gave up on it), and its redial was not left
+    // to a SLOTS refresh (reconnect()). Out-of-range ids count as given up.
+    bool primary_given_up(unsigned int conn_id) const;
     bool check_unowned_slot(unsigned int slot, bool is_read);
     bool requires_replica(bool is_read) const;
 
@@ -229,10 +245,16 @@ protected:
     void record_builtin_read_routing(request_type rt, bool from_replica);
 
     shard_connection *create_shard_connection(abstract_protocol *abs_protocol);
-    void reset_shard_queues(unsigned int conn_id);
+    // Clear and uncount the routed keys of conn_id, and its staged monitor
+    // lines too when `staged` is set.
+    void reset_shard_queues(unsigned int conn_id, bool staged);
     void set_shard_role(shard_connection *sc, enum shard_role role);
     bool connect_shard_connection(shard_connection *sc, char *address, char *port);
     void handle_moved(unsigned int conn_id);
+    // Move staged monitor lines to the primary that owns their slot in the
+    // map just committed, keeping the selection order of each slot that had
+    // an owner whenever its lines were staged.
+    void reroute_staged_monitor_commands();
     void update_redirect_stats(struct timeval timestamp, request *req, protocol_response *response, bool moved,
                                bool completed);
     bool create_monitor_request_cluster(unsigned int command_index, struct timeval &timestamp, unsigned int conn_id);
@@ -320,6 +342,7 @@ public:
     virtual bool hold_pipeline(unsigned int conn_id);
     virtual void handle_rate_limit_refill(unsigned int conn_id);
     virtual void handle_connection_disconnect(unsigned int conn_id);
+    virtual void handle_connection_given_up(unsigned int conn_id);
     virtual void handle_connection_retired(unsigned int conn_id);
     virtual bool is_transaction_pinned(unsigned int conn_id)
     {

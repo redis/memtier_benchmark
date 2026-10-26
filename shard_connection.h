@@ -231,8 +231,12 @@ public:
 
     const char *get_port() { return m_port; }
 
-    enum connection_state get_connection_state() { return m_connection_state; }
+    enum connection_state get_connection_state() const { return m_connection_state; }
     bool is_reconnect_pending() const { return m_reconnecting; }
+    // cluster_client::reconnect() left this connection's redial to a SLOTS
+    // refresh, so it has no reconnect timer but is not given up on.
+    bool is_awaiting_slots_redial() const { return m_awaiting_slots_redial; }
+    void set_awaiting_slots_redial(bool awaiting) { m_awaiting_slots_redial = awaiting; }
     // A replica connection closed because the server rejected its setup
     // under --read-preference primary (or secondaryPreferred with
     // --reconnect-on-error). The replica path of a slot map refresh
@@ -508,6 +512,13 @@ private:
     double m_current_backoff_delay;
     struct event *m_reconnect_timer;
     bool m_reconnecting;
+    // Only cluster_client sets or clears it. Set by reconnect() when it
+    // leaves this redial to the main connection's refresh (both branches).
+    // Cleared by connect_shard_connection() (redialed), the retire loop of
+    // handle_cluster_slots() (left the map), and handle_connection_given_up()
+    // for this connection, or for every connection when the main one is
+    // given up on.
+    bool m_awaiting_slots_redial;
     // The pending reconnect follows a rejected setup step (AUTH/SELECT/HELLO).
     // Cleared when its timer fires. reconnect_after_setup_error() also sets it
     // before calling attempt_reconnect(), so stop_reconnecting_if_run_over()
