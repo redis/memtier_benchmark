@@ -641,7 +641,6 @@ def test_key_minimum_zero_matches_default(env):
     """Explicit zero uses the same key range as the documented default (#776)."""
     env.skipOnCluster()
     conn = env.getConnection()
-    password = conn.connection_pool.connection_kwargs.get("password")
     for pattern, threads, clients, requests, maximum in (
             ("S:S", 1, 1, 10, 9), ("R:R", 1, 1, 100, 1), ("P:P", 2, 2, 10, 39)):
         for minimum in (None, 0, 1):
@@ -653,8 +652,6 @@ def test_key_minimum_zero_matches_default(env):
                 "--key-maximum=" + str(upper), "--hide-histogram"]}
             if minimum is not None:
                 specs["args"].append("--key-minimum=" + str(minimum))
-            if password:
-                specs["args"].append("--authenticate=" + password)
             addTLSArgs(specs, env)
             config = get_default_memtier_config(threads=threads, clients=clients, requests=requests)
             add_required_env_arguments(specs, config, env, env.getMasterNodesList())
