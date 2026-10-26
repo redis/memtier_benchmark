@@ -62,6 +62,8 @@ class _Node(socketserver.ThreadingTCPServer):
 
     # Reply hooks, overridden by _Failover; set_reply=None takes the default path.
     set_reply = None
+    # Called with each SET/GET/MGET before the lock is taken, so it may wait.
+    before_request = None
 
     def ping_reply(self, server):
         return b"+PONG\r\n"
@@ -156,6 +158,8 @@ class _Handler(socketserver.StreamRequestHandler):
                         reply = root.set_reply(node, args)
                     else:
                         assert verb in (b"SET", b"GET", b"MGET"), args
+                        if node.before_request is not None:
+                            node.before_request(args)
                         keys = args[1:] if verb == b"MGET" else args[1:2]
                         with root.lock:
                             node.requests.append((verb, tuple(keys)))
@@ -716,18 +720,23 @@ def test_unusable_slots_refresh_is_bounded_by_reconnect_attempts(env):
 def test_given_up_primary_monitor_drops_are_reported(env):
     """Lines dropped with a given-up primary are errors in the JSON and in --failed-keys-file.
 
-    A primary A with replicas R (the seed) and X. A drops its third SET and
-    refuses its redial, and X is dropped at the same moment and redials
+    A primary A with replicas R (the seed) and X. A drops a SET and refuses
+    its redial. X is dropped once A's redial is accepted, and it redials
     slowly. X is still in setup when A runs out of attempts, so A is given up
     on while the thread goes on, and the monitor lines staged on A are dropped
     as slot-owner-down-for-monitor-line.
 
-    Whether a line is staged on A before it is given up on still depends on
-    scheduling: the client stages one only while A is in setup, and it can't
-    be held there on evidence, since a line staged on A stalls the client
-    (pipeline 1) and no peer sees it. So A's redial stays in setup for two
-    seconds, and the scenario is run up to 3 times, until memtier reports the
-    drop ("dropped N staged monitor line(s)"). The PR base never reports it.
+    A line is staged on A only while A is in setup, and only if a peer is
+    woken then: a producer selects no line while A is disconnected, and
+    nothing wakes it when A moves into setup. So X's first PONG is held, which
+    makes X see its drop at once (an idle connection only sees a drop on its
+    next send). Dropping X after A's redial is accepted makes X's SLOTS
+    refresh land while A is in setup, and it wakes R, whose next line is
+    staged on A. A's AUTH is held two seconds before it is refused.
+
+    The run is tried up to 3 times, until memtier reports the drop ("dropped N
+    staged monitor line(s)"), as a margin for a host that stalls the client
+    past A's two seconds. The PR base never reports it.
     """
     for tries in range(1, 4):
         stats, rows, stderr = _given_up_primary_with_replica_in_setup(env)
@@ -756,6 +765,36 @@ def _given_up_primary_with_replica_in_setup(env):
         accept(request, address)
 
     x.process_request = process_request
+    accept_a = node.process_request
+    holding, redialing, released = threading.Event(), threading.Event(), threading.Event()
+
+    def ping_reply(server):
+        # X's first PONG is held, so X has a request in flight and sees its
+        # drop at once (an idle connection only sees it on its next send).
+        if server is x and not released.is_set():
+            holding.set()
+            released.wait(10)
+        return b"+PONG\r\n"
+
+    node.ping_reply = ping_reply
+
+    def process_a(request, address):
+        # A's redial is accepted, so A is in setup: drop X now. X's redial
+        # asks for a SLOTS refresh after its 0.5s backoff, and the refresh
+        # reply wakes R, whose next line is staged on A (A's AUTH is held two
+        # seconds, then refused). X redials slowly, so it's still in setup
+        # when A runs out of attempts.
+        if redialing.is_set() and not released.is_set():
+            x.auth_delay = 5
+            for sock in x.sockets:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            released.set()
+        accept_a(request, address)
+
+    node.process_request = process_a
     nodes = [node, node.replica, x]
 
     def topology():
@@ -770,20 +809,21 @@ def _given_up_primary_with_replica_in_setup(env):
         server.topology = topology
 
     def drop(args):
-        if len(node.requests) != 3:
+        # A drops a SET once it has served two and X holds its PING.
+        if len(node.requests) < 3 or not holding.is_set() or redialing.is_set():
             return False
-        x.auth_delay = 5
-        for request in x.sockets:
-            try:
-                request.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-        # A's redial is in setup for two seconds before it is refused: a line
-        # selected then is staged on A.
         node.auth_delay = 2
         node.auth_closes = 100
+        redialing.set()
         return True
 
+    def before_request(args):
+        # X's PING went out before A's first SETs; on a starved host its
+        # handler may not have run yet.
+        if len(node.requests) == 2:
+            holding.wait(5)
+
+    node.before_request = before_request
     node.drop_request = drop
     with tempfile.TemporaryDirectory() as directory:
         monitor = os.path.join(directory, "monitor.txt")
