@@ -187,8 +187,10 @@ public:
     double next_reconnect_delay(void);
     bool stop_reconnecting_if_run_over(void);
     // siblings_done() and end_client_after_run() are public only for
-    // tests/unit/reconnect_siblings_test.cpp.
+    // tests/unit/reconnect_siblings_test.cpp; may_send_again() is also used by
+    // client::idle_connection_waits_for_connect().
     bool siblings_done(void);
+    bool may_send_again(void);
     void end_client_after_run(bool end_stats);
     void warn_reconnecting_indefinitely(void);
 
@@ -407,6 +409,8 @@ private:
     // True while a CLUSTER SLOTS refresh must wait for the pinned
     // --transaction rotation this connection drives to close its MULTI.
     bool setup_held_for_transaction();
+    // Whether fill_pipeline() would send a setup step now.
+    bool setup_step_sendable();
     void send_conn_setup_commands(struct timeval timestamp);
     void restore_cluster_slots_value_policy();
     // Schedule a fill on every other connected connection of this client, so

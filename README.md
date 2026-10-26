@@ -290,6 +290,15 @@ for retry are not resent, are counted as errors and written to
 test time ended`. They are not part of `"Unanswered requests"`, which only
 counts requests that were waiting for a reply.
 
+In cluster mode, a client whose connection to one node is done once the run is
+over (idle, or its redial failed) still waits for its other connections that
+may send again, such as a redial to another node still connecting, so that a
+setup the server rejects there fails the run. If that connect never completes
+(a node whose SYNs are dropped, without `--connection-timeout`), the client is
+ended when the grace period is over, and stderr shows `warning: N client(s)
+were still waiting for a connection to connect or set up 10 seconds after the
+test time ended`.
+
 With a request-count workload (`--requests`), unlimited retries can run
 indefinitely if the server keeps rejecting every attempt. A valid workload
 error reply counts as connection progress, so `--connection-stage-timeout`
@@ -692,13 +701,13 @@ run's stop condition:
     about twice that delay past `--test-time`. In the report's duration, a
     client that sent requests ends at its own deadline (its start plus
     `--test-time`) or at its last reply, whichever is later: replies drained
-    after the deadline count, and the idle time after the last one does not
-    (a failed reconnect, Ctrl+C or the drain grace still end it at its
-    deadline, #880).
-    With `--retry-on-error`, a resent request answered after the reconnect
-    is such a reply, so the end moves to it. A client whose reconnect setup
-    (AUTH, say) stalls past its deadline can still send new requests once
-    the setup completes, and their replies extend its end (#879).
+    after the deadline count, and the idle time after the last one does not.
+    This holds whether the run ends normally, at a failed reconnect, at
+    Ctrl+C or at the drain grace. With `--retry-on-error`, a resent request
+    answered after the reconnect is such a reply; an error reply that is
+    retried is not. No new request is sent past the deadline, also when a
+    reconnect's setup (AUTH, say) completes only then; the setup itself
+    still goes out, so a rejected one still fails the run.
   - In cluster mode this holds for the main connection only: another shard's
     connection is reconnected through a slot map refresh. Once the run is
     over, a refresh still redials it; if that dial fails, the connection is
@@ -709,7 +718,10 @@ run's stop condition:
     prevented from starting by repeated TLS-handshake failures. One whose
     first connection only completes after the deadline (e.g. a server killing
     connections before their first reply) is timed from the start of the run,
-    so it ends at its first reply instead of running a whole `--test-time`.
+    so it ends at once instead of running a whole `--test-time`. It sends no
+    request then: if it sent none before either, it does not count toward
+    `Total duration` or `Count` at all, like a client that only ran its
+    setup.
   - The deadline is measured from the start of the run, so it does not cover
     a server that is gone before any connection got a reply: that startup
     phase is bounded by `--connection-stage-timeout` (default 30 s), which
