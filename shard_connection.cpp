@@ -2451,21 +2451,25 @@ void shard_connection::end_client_after_run(bool end_stats)
 
 // Whether this client's other connections are done too, so it can be ended:
 // none has a reply pending, a connect in progress, a reconnect pending, a
-// setup step still to send while connected, or requests held for replay on a
-// live connection. all_connections_idle() only checks the first: a sibling
-// (e.g. another cluster shard) whose own reconnect is due, whose connect has
-// started (connect() clears the pending reconnect) but not completed, or
-// whose CLUSTER SLOTS refresh is due (requested for a shard's reconnect and
-// sent from a deferred fill, or waiting for its retry timer) would be torn
-// down before sending it, so neither a rejected setup would fail the run
-// (#630) nor a slot error be retried, nor the requests it was to resend be
-// sent. Such a sibling ends the client itself, on its last reply or through
-// this check when its connect fails (or times out, with
-// --connection-timeout). A refresh held for an open --transaction MULTI is
-// not sent past the deadline (EXEC is not), so it does not keep the client
-// going. Nor does a disconnected sibling with no reconnect pending: it will
-// never resend what it holds. A connected sibling's retry queue
-// (--retry-on-error backoff) is not checked either: if the client ends
+// setup step it can still send, or requests held for replay on a live
+// connection. all_connections_idle() only checks the first.
+//
+// A sibling (e.g. another cluster shard) whose reconnect is due, whose
+// connect has started (connect() clears the pending reconnect) but not
+// completed, or whose CLUSTER SLOTS refresh is due (requested for a shard's
+// reconnect and sent from a deferred fill, or waiting for its retry timer)
+// would otherwise be torn down before sending it: a rejected setup would not
+// fail the run (#630), a slot error would not be retried, and the requests it
+// was to resend would not be sent. Such a sibling ends the client itself, on
+// its last reply or through this check when its connect fails (or times out,
+// with --connection-timeout).
+//
+// A setup step does not keep the client going once it can no longer be sent:
+// once finished(), fill_pipeline() sends none with nothing pending (as on
+// master), nor, past the deadline, a refresh held for an open --transaction
+// MULTI (EXEC is not sent). Nor does a disconnected sibling with no reconnect
+// pending: it will never resend what it holds. A connected sibling's retry
+// queue (--retry-on-error backoff) is not checked either: if the client ends
 // first, those requests are counted as abandoned by disconnect_all().
 bool shard_connection::siblings_done(void)
 {
@@ -2476,7 +2480,7 @@ bool shard_connection::siblings_done(void)
         if (sc->get_pending_resp() > 0 || sc->is_reconnect_pending() || sc->get_connection_state() == conn_in_progress)
             return false;
         if (sc->get_connection_state() == conn_connected && !sc->is_conn_setup_done() &&
-            !sc->setup_held_for_transaction())
+            !sc->setup_held_for_transaction() && !m_conns_manager->finished())
             return false;
         if (sc->get_connection_state() != conn_disconnected && sc->has_requests_to_replay()) return false;
     }

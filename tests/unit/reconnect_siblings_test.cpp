@@ -242,8 +242,23 @@ static void test_sibling_with_setup_due(const char *path)
         check(manager.all_connections_idle(), "no reply is pending anywhere");
         check(!first.siblings_done(), "a connected sibling with a refresh still to send keeps the client going");
 
+        // Once the run is finished(), fill_pipeline() no longer sends a setup
+        // step with nothing pending: the refresh can never go out, so it must
+        // not keep the client going (end_client_after_run() would never end
+        // it). Finished here by --test-time: started 11 s ago, with a reply
+        // now.
+        config.test_time = 10;
+        struct timeval start, now;
+        gettimeofday(&now, NULL);
+        start = now;
+        start.tv_sec -= config.test_time + 1;
+        manager.mark_started(&start);
+        manager.get_stats()->update_set_op(&now, 1, 1, 1);
+        check(manager.finished(), "the run is finished()");
+        check(first.siblings_done(), "once finished(), a refresh that can no longer be sent does not keep it going");
+
         second.disconnect();
-        check(first.siblings_done(), "once disconnected (setup reset), it does not");
+        check(first.siblings_done(), "a disconnected sibling (its setup reset) does not keep it going");
         event_base_loop(base, EVLOOP_NONBLOCK);
     }
     delete protocol;
