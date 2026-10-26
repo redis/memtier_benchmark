@@ -125,6 +125,13 @@ redis_protocol_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
 redis_protocol_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 redis_protocol_test_LDADD = $(memtier_benchmark_LDADD)
 
+# memcache text replies, including lines shorter than the parser's keywords.
+check_PROGRAMS += memcache_text_test
+memcache_text_test_SOURCES = tests/unit/memcache_text_test.cpp protocol.cpp protocol.h
+memcache_text_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
+memcache_text_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+memcache_text_test_LDADD = $(memtier_benchmark_LDADD)
+
 memcache_meta_test_SOURCES = tests/unit/memcache_meta_test.cpp protocol.cpp protocol.h
 memcache_meta_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
 memcache_meta_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g

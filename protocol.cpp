@@ -1267,7 +1267,8 @@ int memcache_text_protocol::parse_response(void)
             }
             m_last_response.set_total_len((unsigned int) m_response_len); // for now...
 
-            if (memcmp(line, "VALUE", 5) == 0) {
+            // Compare only within the line: "END" is shorter than "VALUE".
+            if (tmplen >= 5 && memcmp(line, "VALUE", 5) == 0) {
                 char prefix[50];
                 char key[256];
                 unsigned int flags;
@@ -1285,15 +1286,19 @@ int memcache_text_protocol::parse_response(void)
                     return -1;
                 }
 
+                // Only the first line is kept, as the status.
+                if (m_last_response.get_status() != line) free(line);
                 m_response_state = rs_read_value;
                 continue;
-            } else if (memcmp(line, "END", 3) == 0 || memcmp(line, "STORED", 6) == 0) {
+            } else if ((tmplen >= 3 && memcmp(line, "END", 3) == 0) ||
+                       (tmplen >= 6 && memcmp(line, "STORED", 6) == 0)) {
                 if (m_last_response.get_status() != line) free(line);
                 m_response_state = rs_read_end;
                 break;
             } else {
                 m_last_response.set_error();
                 benchmark_debug_log("unknown response: %s\n", line);
+                if (m_last_response.get_status() != line) free(line);
                 return -1;
             }
             break;
