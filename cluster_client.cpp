@@ -176,10 +176,10 @@ int cluster_client::connect(void)
     assert(m_connections.size() == m_key_index_pools.size());
     assert(m_connections.size() == m_staged_monitor_commands.size());
 
-    // continue with base class
-    client::connect();
-
-    return 0;
+    // continue with base class. A dial that fails before reaching the event
+    // loop (resolve error, socket setup, a connect() error libevent 2.1 does
+    // not report) is returned, so a reconnect timer counts and retries it.
+    return client::connect();
 }
 
 void cluster_client::txn_release_pin()
@@ -268,20 +268,16 @@ int cluster_client::reconnect(unsigned int conn_id)
     // Reconnecting the main connection refreshes the slot map, which then
     // reconnects this one.
     if (MAIN_CONNECTION->get_connection_state() == conn_disconnected) {
-        // Mark first: the main connection can be given up on inside
-        // connect() (libevent 2.0 reports a dial that fails at once from
-        // there), and that give-up must see this mark to end the wait.
+        // Mark first: the main connection can be given up on during this
+        // dial, and that give-up must see this mark to end the wait.
         sc->set_awaiting_slots_redial(true);
-        if (connect() < 0) {
-            sc->set_awaiting_slots_redial(false);
-            return -1;
-        }
-        // A dial that failed before reaching the event loop (libevent 2.1)
-        // leaves the main connection with no timer. Retry it as
-        // connect_shard_connection() does, so --max-reconnect-attempts
-        // bounds it and its give-up ends this wait.
-        if (sc->is_awaiting_slots_redial() && MAIN_CONNECTION->get_connection_state() == conn_disconnected &&
-            !MAIN_CONNECTION->is_reconnect_pending())
+        // A dial that failed before reaching the event loop leaves the main
+        // connection with no timer (libevent 2.0 may have armed one from
+        // inside connect(), but connect() then cancels it). Retry it as
+        // connect_shard_connection() does: from then on its own timer
+        // retries it, --max-reconnect-attempts bounds that, and its give-up
+        // ends this wait. A give-up inside connect() already ended it.
+        if (connect() < 0 && sc->is_awaiting_slots_redial() && !MAIN_CONNECTION->is_reconnect_pending())
             MAIN_CONNECTION->attempt_reconnect("Connection failed");
         return 1;
     }
