@@ -226,10 +226,12 @@ def test_command_errors_remain_eligible(env):
 
 def test_worker_failure_after_timed_deadline_is_partial(env):
     # The existing worker lifecycle still classifies a dropped pending reply
-    # as failure after the timer expired. Do not infer validity from duration.
+    # as failure after the timer expired. Do not infer validity from duration:
+    # the run ends at its deadline, not at the drop 1.3 s in (#870).
     results, stdout = _run(env, ["late-drop", "slow"], expected_exit=1)
     failed = results["RUN #1 RESULTS"]
-    env.assertGreater(failed["Runtime"]["Total duration"], 1000)
+    env.assertGreaterEqual(failed["Runtime"]["Total duration"], 1000)
+    env.assertLess(failed["Runtime"]["Total duration"], 1200)
     env.assertEqual(failed["Totals"]["Count"], 3)
     env.assertEqual(failed["Runtime"]["Interrupted"], "true")
     env.assertEqual(results["RUN #2 RESULTS"]["Runtime"]["Interrupted"], "false")

@@ -192,10 +192,17 @@ bool prometheus_exporter::start()
     m_max_inflight = resolve_max_inflight();
 
     // 4. bind.
+    // Clear the error first: a getaddrinfo() failure inside evhttp (e.g.
+    // AI_ADDRCONFIG rejecting ::1) sets none, and a stale or zero errno would
+    // print as "Success" (#856).
+    EVUTIL_SET_SOCKET_ERROR(0);
     m_bound = evhttp_bind_socket_with_handle(m_http, m_opts.bind_addr.c_str(), (ev_uint16_t) m_opts.port);
     if (m_bound == NULL) {
-        fprintf(stderr, "error: prometheus exporter: failed to bind %s:%d: %s\n", m_opts.bind_addr.c_str(), m_opts.port,
-                evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR()));
+        int err = EVUTIL_SOCKET_ERROR();
+        bool v6 = m_opts.bind_addr.find(':') != std::string::npos;
+        fprintf(stderr, "error: prometheus exporter: failed to bind %s%s%s:%d: %s\n", v6 ? "[" : "",
+                m_opts.bind_addr.c_str(), v6 ? "]" : "", m_opts.port,
+                err != 0 ? evutil_socket_error_to_string(err) : "address could not be resolved or used");
         free_libevent_state();
         return false;
     }
