@@ -227,7 +227,7 @@ grep -nE '#include[[:space:]]*[<"](event2/|event\.h|evhttp)|#include[[:space:]]*
   prometheus_metrics.cpp prometheus_metrics.h utf8.cpp utf8.h tests/unit/prometheus_metrics_test.cpp \
   && fail "purity breach: config/version/libevent reference in the unconditional metrics layer" || true
 grep -q -- '--disable-prometheus' DEVELOPMENT.md || fail "DEVELOPMENT.md missing --disable-prometheus"
-grep -qE 'evhttp >= 2\.1\.1|libevent 2\.1\.1' DEVELOPMENT.md || fail "DEVELOPMENT.md missing the 2.1.1 floor"
+grep -qE 'evhttp >= 2\.1\.4|libevent 2\.1\.4' DEVELOPMENT.md || fail "DEVELOPMENT.md missing the 2.1.4 floor"
 grep -q 'make gate' DEVELOPMENT.md || fail "DEVELOPMENT.md missing make gate"
 n=$(grep -c '1e6' prometheus_metrics.cpp prometheus_metrics.h | awk -F: '{s+=$2} END{print s}')
 [ "$n" -eq 1 ] || fail "1e6 literal count != 1 (only the USECS_PER_SEC definition)"

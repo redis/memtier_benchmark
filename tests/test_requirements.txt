@@ -1,16 +1,25 @@
-redis>=3.0.0
-# TEMPORARY: pinned to a fork commit that teaches RLTest's ClusterEnv to add
-# replica shards to the OSS cluster (CLUSTER MEET + CLUSTER REPLICATE) instead
-# of merely wiring them with --slaveof. Without this, --use-slaves replicas are
-# invisible to cluster gossip and the read-preference matrix cell that
-# exercises OSS-CLUSTER + replicas silently degenerates into a master-only
-# topology. Pinned to a commit SHA rather than the fix/cluster-aware-replicas
-# branch name so a force-push/rename/delete on that branch can't move what's
-# actually installed out from under CI (or a stale local checkout) without a
-# visible diff here. Revert to
-# git+https://github.com/RedisLabsModules/RLTest.git@master once upstream PR
-# https://github.com/RedisLabsModules/RLTest/pull/253 merges.
-git+https://github.com/fcostaoliveira/RLTest.git@4808b5f63f55788c094b111e1adecd00b9716a00
+# include.py's bounded_client() and its test use Retry.get_retries() and
+# ConnectionPool.set_retry(), which redis-py 6.0 has.
+redis>=6.0.0
+# TEMPORARY: pinned to a fork commit with three changes not yet upstream:
+# - ClusterEnv adds replica shards to the OSS cluster (CLUSTER MEET + CLUSTER
+#   REPLICATE) instead of merely wiring them with --slaveof, so --use-slaves
+#   replicas are visible to cluster gossip and the OSS-CLUSTER + replicas
+#   read-preference cell really has replicas
+#   (https://github.com/RedisLabsModules/RLTest/pull/253);
+# - add_test_hook(), which include.py's NOAUTH guard uses to check every
+#   function test (https://github.com/RedisLabsModules/RLTest/pull/262);
+# - the serial runner no longer reads tests back from a multiprocessing.Queue
+#   with a 0.1 s timeout, which could run zero tests and exit 0 on a loaded
+#   runner (https://github.com/RedisLabsModules/RLTest/pull/263).
+# Pinned to a commit SHA so a branch move can't change what CI installs
+# without a visible diff here. Revert to
+# git+https://github.com/RedisLabsModules/RLTest.git@master once all three merge.
+# The guard also reads replicas with getSlaveConnection(index), from #253;
+# test_harness_auth.py's test_guard_is_installed_in_rltest and
+# test_noauth_guard_raises_on_an_unexpected_error fail if a pin move drops
+# either API.
+git+https://github.com/fcostaoliveira/RLTest.git@a6d741eb1a9ad82557618bb5624281da46cee7b3
 # pytest + hypothesis power the CLI argument fuzzer (tests/test_cli_fuzz.py,
 # issue #410). The fuzzer is gated by MEMTIER_FUZZ=1 so it's only pulled in
 # on demand; pinning them here keeps the bootstrap reproducible.
