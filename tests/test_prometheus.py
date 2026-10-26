@@ -979,6 +979,40 @@ def test_F16_ipv6(env):
         _kill(proc)
 
 
+def test_F16b_bind_failure_message(env):
+    """A failed bind names the address (IPv6 bracketed) and a real reason (#856).
+
+    2001:db8::1 (RFC 3849 documentation prefix) is never a local address, so
+    the bind fails on every host: via bind() EADDRNOTAVAIL where IPv6 is
+    configured (GitHub runners), or via getaddrinfo() AI_ADDRCONFIG where it
+    is not (containers). The getaddrinfo path sets no errno and used to print
+    "...: Success". ::1 may bind; if it does not, the same rules apply."""
+    for addr in ("2001:db8::1", "::1"):
+        rd = _new_results_dir()
+        proc, out_path, err_path = _popen_memtier(
+            env,
+            ["--test-time=2", "--prometheus-port=0",
+             "--prometheus-bind-addr={}".format(addr)],
+            rd,
+        )
+        try:
+            proc.wait(timeout=30)
+        finally:
+            _kill(proc)
+        err = _drain(err_path)
+        shutil.rmtree(rd, ignore_errors=True)
+        lines = [l for l in err.splitlines() if "failed to bind" in l]
+        if addr == "::1" and not lines:
+            continue  # ::1 bound on this host; nothing to check
+        env.assertEqual(proc.returncode, 1, message="{}: {}".format(addr, err))
+        env.assertEqual(len(lines), 1, message="{}: {}".format(addr, err))
+        line = lines[0] if lines else ""
+        env.assertTrue("failed to bind [{}]:0: ".format(addr) in line,
+                       message="IPv6 bind address not bracketed: {!r}".format(line))
+        env.assertFalse(line.rstrip().endswith("Success"),
+                        message="bind failure reported as Success: {!r}".format(line))
+
+
 # ---------------------------------------------------------------------------
 # F17 -- monotonicity under connection churn (CLIENT KILL)
 # ---------------------------------------------------------------------------
