@@ -409,31 +409,38 @@ def agg_keyspace_range(master_nodes_connections):
     return overall_keyspace_range
 
 
+def cluster_replicas_expected(env):
+    """True when RLTest started this cluster with replicas (--use-slaves,
+    which tests/run_tests.sh passes when OSS_CLUSTER_REPLICAS=1)."""
+    return env.isCluster() and bool(getattr(env, "useSlaves", False))
+
+
 def get_cluster_replica_connections(env):
     """Return List[redis.Redis] for every replica advertised by CLUSTER NODES.
 
-    Cluster-mode only.  Requires the env was started with useSlaves=True.
-    Returns an empty list when not in cluster mode or when no replicas are
-    found (so callers can gracefully skip rather than crash).
+    Outside cluster mode, or on a cluster started without replicas, returns
+    an empty list so callers can skip.
 
-    When the env was started with ``--use-slaves`` (RLTest's useSlaves=True)
-    but CLUSTER NODES advertises no replicas, this helper emits a loud
-    stderr warning before returning an empty list.  This is the known
-    RLTest harness gap: ``--use-slaves`` starts replicas via ``--slaveof``
-    *without* ``--cluster-enabled yes``, so the slave processes are
-    standalone and never join cluster gossip.  See the
-    ``Read Preference -> Testing limitations`` section in README.md for
-    the full background.
+    On a cluster started with replicas (see cluster_replicas_expected()),
+    the pinned RLTest fork adds them to the cluster with CLUSTER MEET and
+    CLUSTER REPLICATE, so CLUSTER NODES lists them. Finding none there, or
+    failing to read CLUSTER NODES, is then a broken environment: this
+    raises AssertionError, which fails the test instead of letting it skip
+    as a pass (#462).
     """
-    import sys
     import redis as _redis
 
     if not env.isCluster():
         return []
+    expected = cluster_replicas_expected(env)
     try:
         any_conn = env.getOSSMasterNodesConnectionList()[0]
         raw = any_conn.execute_command("CLUSTER", "NODES")
-    except Exception:
+    except Exception as error:
+        if expected:
+            raise AssertionError(
+                "the cluster was started with replicas (--use-slaves), but "
+                "reading CLUSTER NODES to find them failed: {!r}".format(error)) from error
         return []
 
     # raw may be a bytes string or a plain str depending on the redis-py version
@@ -466,29 +473,10 @@ def get_cluster_replica_connections(env):
             )
         )
 
-    # If RLTest was launched with useSlaves=True but CLUSTER NODES
-    # advertises zero replicas, emit a loud warning so the silent skip
-    # is at least visible in test output.  Use getattr() chains because
-    # RLTest's env.envRunner shape varies across versions.
-    if not conns:
-        use_slaves = False
-        runner = getattr(env, "envRunner", None)
-        if runner is not None:
-            use_slaves = bool(
-                getattr(runner, "useSlaves", False)
-                or getattr(runner, "use_slaves", False)
-            )
-        if use_slaves:
-            sys.stderr.write(
-                "warning: OSS_CLUSTER_REPLICAS=1 is set and RLTest started "
-                "slave nodes,\nbut CLUSTER NODES shows zero replicas "
-                "(slaves were started with --slaveof\nand not "
-                "--cluster-enabled yes, so they are not in cluster "
-                "gossip).\nThe read-preference tests will skip. See README "
-                "\"Read Preference -\ntesting limitations\" for the known "
-                "harness gap.\n"
-            )
-            sys.stderr.flush()
+    if not conns and expected:
+        raise AssertionError(
+            "the cluster was started with replicas (--use-slaves), but CLUSTER "
+            "NODES lists none:\n" + raw)
     return conns
 
 

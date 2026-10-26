@@ -61,10 +61,10 @@ memtier_benchmark_CPPFLAGS = \
 	$(LIBSSL_CFLAGS)
 memtier_benchmark_SOURCES = \
 	platform_compat.h \
-	memtier_benchmark.cpp memtier_benchmark.h crash_report.h \
+	memtier_benchmark.cpp memtier_benchmark.h connection_stage_clock.h crash_report.h library_versions.h \
 	client.cpp client.h \
 	cluster_client.cpp cluster_client.h \
-	shard_connection.cpp shard_connection.h connections_manager.h \
+	shard_connection.cpp shard_connection.h libevent_read_cap.h connections_manager.h \
 	run_stats_types.cpp run_stats_types.h latency_percentiles.h \
 	run_stats.cpp run_stats.h latency_histogram.h \
 	JSON_handler.cpp JSON_handler.h utf8.cpp utf8.h \
@@ -111,12 +111,32 @@ if MEMTIER_WINDOWS
 prometheus_metrics_test_CPPFLAGS += -D_POSIX_THREAD_SAFE_FUNCTIONS
 endif
 
+# --connection-stage-timeout compares microseconds, not whole seconds.
+check_PROGRAMS += connection_stage_clock_test
+connection_stage_clock_test_SOURCES = tests/unit/connection_stage_clock_test.cpp connection_stage_clock.h
+connection_stage_clock_test_CPPFLAGS = -I$(srcdir)
+connection_stage_clock_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+
+# One socket read event takes 16 KiB on every libevent series (#535).
+check_PROGRAMS += libevent_read_cap_test
+libevent_read_cap_test_SOURCES = tests/unit/libevent_read_cap_test.cpp libevent_read_cap.h
+libevent_read_cap_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
+libevent_read_cap_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+libevent_read_cap_test_LDADD = $(memtier_benchmark_LDADD)
+
 # Exact Redis command framing through the production serializer.
 check_PROGRAMS += redis_protocol_test
 redis_protocol_test_SOURCES = tests/unit/redis_protocol_test.cpp protocol.cpp protocol.h
 redis_protocol_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
 redis_protocol_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 redis_protocol_test_LDADD = $(memtier_benchmark_LDADD)
+
+# memcache text replies, including lines shorter than the parser's keywords.
+check_PROGRAMS += memcache_text_test
+memcache_text_test_SOURCES = tests/unit/memcache_text_test.cpp protocol.cpp protocol.h
+memcache_text_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
+memcache_text_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
+memcache_text_test_LDADD = $(memtier_benchmark_LDADD)
 
 memcache_meta_test_SOURCES = tests/unit/memcache_meta_test.cpp protocol.cpp protocol.h
 memcache_meta_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
@@ -190,6 +210,11 @@ run_stats_merge_test_SOURCES = tests/unit/run_stats_merge_test.cpp
 run_stats_merge_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
 run_stats_merge_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 run_stats_merge_test_LDADD = $(filter-out memtier_benchmark-memtier_benchmark.$(OBJEXT),$(memtier_benchmark_OBJECTS)) $(memtier_benchmark_LDADD)
+# Build vs runtime libevent/OpenSSL series comparison.
+check_PROGRAMS += library_versions_test
+library_versions_test_SOURCES = tests/unit/library_versions_test.cpp library_versions.h
+library_versions_test_CPPFLAGS = -I$(srcdir)
+library_versions_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 # Crash report timestamp formatting and UTC offset (#681), against libc.
 crash_report_test_SOURCES = tests/unit/crash_report_test.cpp crash_report.h
 crash_report_test_CPPFLAGS = -I$(srcdir)
