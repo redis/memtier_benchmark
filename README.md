@@ -611,10 +611,14 @@ A partial `CLUSTER SLOTS` map is accepted. If a generated key has no slot
 owner, writes and reads that permit primary routing are sent to an available
 primary, preserving the key and letting Redis return its routing response.
 `CLUSTERDOWN` replies count as workload errors and follow the usual retry
-policy; they also trigger a topology refresh at most once per second per
-client, including when a previously full map has become stale. Each client
-maintains its own topology: for example, `-t 8 -c 50` permits up to 400 refreshes
-per second during sustained `CLUSTERDOWN`, in addition to initial discovery.
+policy; they also trigger a topology refresh, including when a previously full
+map has become stale. Each client refreshes at most once per second, and the
+gap between its refreshes doubles from 1 to 8 seconds until a successful reply
+to a keyed request resets it to 1 second; keyless replies such as `PING` or
+`MULTI` do not. Each client maintains its own topology: for example, during
+sustained `CLUSTERDOWN`, `-t 8 -c 50` sends 400 refreshes when the outage
+starts and 400 more at 1, 3 and 7 seconds, then 400 every 8 seconds (50 per
+second), in addition to initial discovery.
 Refreshes also occur when retries are disabled. Missing-owner requests use the
 first available primary, so this error traffic can concentrate on one node.
 The missing-owner warning prints once per process, including across `--run-count` runs.

@@ -198,6 +198,9 @@ struct arbitrary_command
     // module commands) - in that case spec stays nullptr.
     void resolve_command_meta();
 
+    // Whether the command names a key, by its spec or its __key__ placeholders.
+    bool has_keys() const { return !spec_key_positions.empty() || keys_count > 0; }
+
     // Number of user-supplied __key__ placeholders, by direct scan over args.
     // Stable regardless of whether format_arbitrary_command has been called yet.
     unsigned int count_user_key_placeholders() const;
