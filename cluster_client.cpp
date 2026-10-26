@@ -2730,7 +2730,8 @@ void cluster_client::process_staged_monitor_command(struct timeval /*timestamp*/
         return;
     }
     // Use the enqueue timestamp so latency reflects selection→response, not drain→response.
-    m_connections[conn_id]->send_arbitrary_command_end(staged.stats_index, &staged.enqueue_time, cmd_size);
+    m_connections[conn_id]->send_arbitrary_command_end(staged.stats_index, &staged.enqueue_time, cmd_size,
+                                                       staged.parsed_cmd.replies);
 }
 
 // Select a monitor command, extract its first key to compute the target shard slot, and either
@@ -2832,7 +2833,7 @@ bool cluster_client::create_monitor_request_cluster(unsigned int command_index, 
         // to the socket so no response will arrive. Don't count as a generated request.
         return false;
     }
-    m_connections[conn_id]->send_arbitrary_command_end(stats_index, &timestamp, cmd_size);
+    m_connections[conn_id]->send_arbitrary_command_end(stats_index, &timestamp, cmd_size, temp_cmd.replies);
     return true;
 }
 

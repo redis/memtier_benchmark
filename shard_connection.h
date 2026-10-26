@@ -97,6 +97,9 @@ struct request
     // by ASKING, or that node, importing the slot, answers -MOVED back to the
     // migrating node. Cleared when the request is routed by the slot map.
     bool m_asking;
+    // Replies the server sends for this request (several for a multi-channel
+    // SUBSCRIBE); it is popped at the last one.
+    unsigned int m_replies;
 
     // Captured serialized command bytes for resend. Owned; freed in dtor.
     // NULL/0 when retry is disabled or capture failed. Stored as opaque protocol
@@ -207,7 +210,8 @@ public:
     // argument (__monitor_line@__); like a key_type argument, the first one
     // wins and send_arbitrary_command_end() attaches it to the request.
     void set_arbitrary_command_key(const char *key, unsigned int key_len);
-    void send_arbitrary_command_end(size_t command_index, struct timeval *sent_time, int cmd_size);
+    void send_arbitrary_command_end(size_t command_index, struct timeval *sent_time, int cmd_size,
+                                    unsigned int replies = 1);
 
     // Request a CLUSTER SLOTS refresh. A refresh already in flight (setup_sent)
     // will update the slot map anyway: sending a second one would leave two
@@ -469,6 +473,15 @@ private:
     // platform std::atomic<int> is lock-free and the loads/stores are
     // async-signal-safe.
     std::atomic<int> m_pending_resp;
+    // Replies already received for the pipeline front, when it expects
+    // several (request::m_replies), the replies its EXEC adds from queued
+    // commands, and the bytes of those already received. Reset by pop_req().
+    unsigned int m_front_replies;
+    unsigned int m_front_extra_replies;
+    unsigned int m_front_bytes;
+    // Replies still due from commands answered +QUEUED in an open MULTI,
+    // owed to the EXEC that runs them.
+    unsigned int m_queued_replies;
 
     // Snapshot of the most recently pushed request's type. Updated on every
     // push_req() and read by get_last_request_type() from the crash-handler

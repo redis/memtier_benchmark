@@ -716,7 +716,7 @@ bool client::create_arbitrary_request(unsigned int command_index, struct timeval
         // Get the stats index for the actual command type (e.g., SET, GET)
         // instead of using the placeholder's index
         size_t stats_index = m_config->monitor_commands->get_stats_index(selected_index);
-        m_connections[conn_id]->send_arbitrary_command_end(stats_index, &timestamp, cmd_size);
+        m_connections[conn_id]->send_arbitrary_command_end(stats_index, &timestamp, cmd_size, temp_cmd.replies);
         return true;
     }
 
@@ -823,7 +823,7 @@ bool client::create_arbitrary_request(unsigned int command_index, struct timeval
         }
     }
 
-    m_connections[conn_id]->send_arbitrary_command_end(command_index, &timestamp, cmd_size);
+    m_connections[conn_id]->send_arbitrary_command_end(command_index, &timestamp, cmd_size, cmd.replies);
     return true;
 }
 

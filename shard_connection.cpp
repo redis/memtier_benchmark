@@ -186,6 +186,7 @@ request::request(request_type type, unsigned int size, struct timeval *sent_time
         m_retries(0),
         m_claimed_by_retry(false),
         m_asking(false),
+        m_replies(1),
         m_serialized(NULL),
         m_serialized_len(0),
         m_key(NULL),
@@ -290,6 +291,10 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_request_rate_phase_microsecond(request_rate_phase_microsecond),
         m_request_rate_phase_pending(request_rate_phase_microsecond > 0),
         m_pending_resp(0),
+        m_front_replies(0),
+        m_front_extra_replies(0),
+        m_front_bytes(0),
+        m_queued_replies(0),
         m_last_pushed_req_type(-1),
         m_connection_state(conn_disconnected),
         m_role(role_primary),
@@ -701,6 +706,7 @@ int shard_connection::connect(struct connect_info *addr)
                            ? setup_none
                            : setup_done;
     m_multi_open = false;
+    m_queued_replies = 0;
 
     // setup socket
     evutil_socket_t sockfd = setup_socket(addr);
@@ -979,6 +985,7 @@ void shard_connection::disconnect()
     m_hello = setup_done;
     m_readonly_state = setup_done;
     m_multi_open = false;
+    m_queued_replies = 0;
 
     // Drop any partial RESP parser state. A TCP RST received mid-bulk
     // (especially while draining a RESP3 push frame) would otherwise leave
@@ -1096,6 +1103,9 @@ request *shard_connection::pop_req()
 {
     request *req = m_pipeline->front();
     m_pipeline->pop();
+    m_front_replies = 0;
+    m_front_extra_replies = 0;
+    m_front_bytes = 0;
 
     // Worker-thread mutation; relaxed is sufficient because all mutations
     // happen on the connection's owning event-loop thread. The signal-handler
@@ -1673,6 +1683,38 @@ void shard_connection::process_response(void)
     while ((ret = m_protocol->parse_response()) > 0) {
         bool error = false;
         protocol_response *r = m_protocol->get_response();
+
+        // A request answered several times (a multi-channel SUBSCRIBE) is
+        // completed by its last reply. An error is its only reply. Queued in a
+        // MULTI it is answered +QUEUED, and under RESP2 its other replies
+        // follow the array that answers EXEC (RESP3 sends them as pushes). A
+        // DISCARD, an aborted or WATCH-failed EXEC, or any other reply that is
+        // not an error ends the transaction without them. Other errors (WATCH
+        // or MULTI inside MULTI) leave the transaction open.
+        if (!m_pipeline->empty()) {
+            unsigned int replies = m_pipeline->front()->m_replies;
+            // An aggregate holding an error element (an EXEC) is not an error reply.
+            const bool top_error = r->is_error() && r->get_top_array_len() < 0;
+            const bool first = m_front_replies == 0;
+            if (first) {
+                const char *status = r->get_status();
+                if (status != NULL && strcmp(status, "+QUEUED") == 0) {
+                    m_queued_replies += replies - 1;
+                    replies = 1;
+                } else if (!top_error) {
+                    if (m_config->protocol != PROTOCOL_RESP3 && r->get_top_array_len() > 0)
+                        m_front_extra_replies = m_queued_replies;
+                    m_queued_replies = 0;
+                } else if (status != NULL && strncmp(status, "-EXECABORT", 10) == 0) {
+                    m_queued_replies = 0;
+                }
+            }
+            if (++m_front_replies < replies + m_front_extra_replies && !(first && top_error)) {
+                m_front_bytes += r->get_total_len();
+                continue;
+            }
+            r->set_total_len(r->get_total_len() + m_front_bytes);
+        }
 
         request *req = pop_req();
         switch (req->m_type) {
@@ -3131,7 +3173,8 @@ void shard_connection::set_arbitrary_command_key(const char *key, unsigned int k
     if (wants_request_key() && key_len > 0 && m_arbitrary_log_key.empty()) m_arbitrary_log_key.assign(key, key_len);
 }
 
-void shard_connection::send_arbitrary_command_end(size_t command_index, struct timeval *sent_time, int cmd_size)
+void shard_connection::send_arbitrary_command_end(size_t command_index, struct timeval *sent_time, int cmd_size,
+                                                  unsigned int replies)
 {
     // Look up the source command's metadata so the reply handler can route
     // per-key miss accounting. Safe to be NULL (we tolerate it downstream).
@@ -3148,6 +3191,7 @@ void shard_connection::send_arbitrary_command_end(size_t command_index, struct t
         }
     }
     arbitrary_request *req = new arbitrary_request(command_index, rt_arbitrary, cmd_size, sent_time, meta);
+    req->m_replies = replies;
     if (!m_arbitrary_log_key.empty()) {
         req->set_key_for_log(m_arbitrary_log_key.data(), (unsigned int) m_arbitrary_log_key.size());
         m_arbitrary_log_key.clear();
