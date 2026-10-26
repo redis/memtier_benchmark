@@ -296,6 +296,15 @@ error reply counts as connection progress, so `--connection-stage-timeout`
 does not bound these retries. Use a finite `--max-retries` or `--test-time`
 to bound such a workload; requests still count only on success or exhaustion.
 
+These three replies are not workload errors but connection rejections:
+`-ERR Protocol error:`, `-ERR max number of clients` and `-DENIED Redis is
+running in protected mode`. Redis closes the connection after sending them. They
+are not counted as ops and cannot complete `--requests` or `--test-time`, and
+they do not count as connection progress. memtier handles them as a dropped
+connection: without `--reconnect-on-error` the thread ends and the run fails
+(exit code 1). With it, memtier reconnects (see Reconnecting after connection
+errors).
+
 With `--retry-on-error`, JSON `Totals` includes integer `Errors`, `Retry Attempts`
 and `Retried Ops` counters, including zeros. `Errors` exposes logical failures
 recorded by retry handling, including terminal errors, retry exhaustion and
@@ -665,7 +674,10 @@ run's stop condition:
   - A required connection whose setup step (AUTH, SELECT, HELLO) was rejected
     since its last reply fails the run instead (exit code 1), as when setup
     keeps failing at the deadline. The optional-replica exceptions are
-    described under Read Preference above.
+    described under Read Preference above. A connection refused with
+    `-ERR Protocol error:`, `-ERR max number of clients` or `-DENIED Redis is
+    running in protected mode` before its first reply counts as such a
+    rejected setup; after a reply it is a dropped connection.
   - A connection that a live server drops around the deadline is still
     reconnected once, so requests held for replay are resent; if that
     reconnect fails or is dropped again, the run ends. So a peer that accepts

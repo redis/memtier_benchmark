@@ -307,6 +307,7 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_connect_failed(false),
         m_dropped_after_run_over(false),
         m_setup_failed_since_reply(false),
+        m_reply_since_connect(false),
         m_slots_rejected(false),
         m_slots_retried_after_run_over(false),
         m_connection_timeout_timer(NULL),
@@ -900,6 +901,7 @@ void shard_connection::disconnect()
     // true would make every future attempt_reconnect call no-op silently.
     m_reconnecting = false;
     m_setup_rejected = false;
+    m_reply_since_connect = false;
 
     // by default no need to send any setup request
     m_authentication = setup_done;
@@ -1748,7 +1750,8 @@ void shard_connection::process_response(void)
         default:
             // Redis protocol and accept-time rejections refuse the connection,
             // not the command: the server closes after replying.
-            if (r->is_error() && is_redis_protocol(m_config->protocol) &&
+            // Only a top-level error: an array's status is its last element.
+            if (r->is_error() && r->get_top_array_len() < 0 && is_redis_protocol(m_config->protocol) &&
                 is_redis_connection_rejection(r->get_status())) {
                 handle_connection_rejection(req, r->get_status());
                 req = NULL;
@@ -1763,6 +1766,7 @@ void shard_connection::process_response(void)
             // Any workload reply, even an error, shows the connection serves
             // requests again: a setup rejected before it no longer counts.
             m_setup_failed_since_reply = false;
+            m_reply_since_connect = true;
             // A request claimed for retry is still outstanding: it is counted
             // as processed once, when its final attempt completes. Only counted
             // responses move processed, so only they can reach a
@@ -2533,14 +2537,19 @@ void shard_connection::reconnect_after_setup_error(const char *error_context, bo
 // The server refused this connection with a reply to a workload request
 // (is_redis_connection_rejection()). It did not serve the request, so the reply
 // is not answered or processed and cannot complete --requests or --test-time:
-// the request is resent after a reconnect or dropped, as on a disconnect. Like
-// a rejected setup step, it does not disarm --connection-stage-timeout or reset
-// the reconnect budget. Redis closes the connection after these replies, so it
-// is handled as a drop: with --reconnect-on-error, reconnect as after a rejected
-// setup step; otherwise end this thread, so the run fails (exit 1) at once,
-// without waiting for --connection-stage-timeout.
+// the request is resent after a reconnect or dropped, as on a disconnect.
+// Redis closes the connection after these replies, so it is handled as a drop
+// (attempt_reconnect()): without --reconnect-on-error the thread ends and the
+// run fails. Like a rejected setup step, it does not disarm
+// --connection-stage-timeout or reset the reconnect budget. If the connection
+// served no workload reply since it was established, with --reconnect-on-error
+// it is handled as a rejected setup step (reconnect_after_setup_error()), so a
+// run that is over before the server accepts the connection fails. A rejection
+// after a reply (e.g. -ERR Protocol error for an oversized value) is only a
+// drop.
 void shard_connection::handle_connection_rejection(request *req, const char *status)
 {
+    static const char context[] = "Connection rejected by the server";
     benchmark_error_log("error: server %s rejected the connection: %s\n", get_readable_id(), status ? status : "");
     char buf[256];
     snprintf(buf, sizeof(buf), "server error: %s", status ? status : "");
@@ -2550,10 +2559,10 @@ void shard_connection::handle_connection_rejection(request *req, const char *sta
     drop_unanswered_request(req, &dropped, &abandoned);
     if (dropped) m_conns_manager->dec_reqs_generated(dropped);
     if (abandoned) m_conns_manager->abandon_requests(abandoned);
-    if (m_config->reconnect_on_error) {
-        reconnect_after_setup_error("Connection rejected by the server");
+    if (m_config->reconnect_on_error && !m_reply_since_connect) {
+        reconnect_after_setup_error(context);
     } else {
-        attempt_reconnect("Connection rejected by the server");
+        attempt_reconnect(context);
     }
 }
 

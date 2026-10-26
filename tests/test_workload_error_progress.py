@@ -38,6 +38,8 @@ class _Handler(socketserver.StreamRequestHandler):
             if peer.mode == 'greeting':
                 self.wfile.write(peer.reply)
                 return
+            if peer.mode == 'late-reject' and connection > 1:
+                return  # the server is gone after the rejection
             while not peer.stop.is_set():
                 line = self.rfile.readline()
                 if not line:
@@ -68,6 +70,8 @@ class _Handler(socketserver.StreamRequestHandler):
                 if peer.mode == 'drop' and connection <= 2 and local == 2:
                     return
                 response = peer.reply
+                if peer.mode == 'late-reject' and local == 20:
+                    response = b'-ERR Protocol error: invalid bulk length\r\n'
                 if peer.mode == 'recover' and elapsed >= 3:
                     response = b'+OK\r\n'
                     with peer.lock:
@@ -77,7 +81,7 @@ class _Handler(socketserver.StreamRequestHandler):
                 with peer.lock:
                     peer.replies += 1
                     peer.errors += int(response.startswith(b'-'))
-                if peer.mode == 'close':
+                if peer.mode == 'close' or response.startswith(b'-ERR Protocol error'):
                     return
         except OSError:
             pass  # the benchmark may close while a response is being written
@@ -261,17 +265,37 @@ def test_connection_rejections_do_not_complete_the_run(env):
             env.assertContains('rejected the connection', result.stderr, message=label)
             env.assertFalse('connection-stage failures' in result.stderr, message=label)
             env.assertEqual(stats['ALL STATS']['Totals']['Count'], 0, message=label)
+            env.assertEqual(stats['ALL STATS']['Runtime']['Interrupted'], 'true', message=label)
+            env.assertEqual(stats['ALL STATS']['Totals']['Connection Errors'], 1, message=label)
             env.assertEqual(peer.connections, 1, message=label)
             env.assertEqual(peer.replies, 1, message=label)
             env.assertEqual(failures, [])
             env.assertLess(elapsed, 8, message=label)
     # With --reconnect-on-error the rejection is retried, bounded by
-    # --max-reconnect-attempts, and still never completes the run.
+    # --max-reconnect-attempts, and still never completes the run: three
+    # rejections do not complete --requests=1.
     peer = _Peer(b'-ERR max number of clients reached\r\n')
-    result, stats, _failures, _ = _run(env, peer, ['--requests=5', '--reconnect-on-error',
-                                                '--max-reconnect-attempts=1', '--connection-stage-timeout=0'],
+    result, stats, _failures, _ = _run(env, peer, ['--requests=1', '--reconnect-on-error',
+                                                '--max-reconnect-attempts=2', '--connection-stage-timeout=0'],
                                        duration=None)
     env.assertEqual(result.returncode, 1, message=result.stderr[-2000:])
-    env.assertContains('Maximum reconnection attempts (1) exceeded', result.stderr)
+    env.assertContains('Maximum reconnection attempts (2) exceeded', result.stderr)
     env.assertEqual(stats['ALL STATS']['Totals']['Count'], 0)
-    env.assertEqual(peer.connections, 2)
+    env.assertEqual(stats['ALL STATS']['Runtime']['Interrupted'], 'true')
+    env.assertEqual(peer.connections, 3)
+
+
+def test_rejection_after_replies_is_a_drop(env):
+    # A connection that served replies, then gets -ERR Protocol error (e.g. for
+    # an oversized value), was not refused at setup: it is a dropped
+    # connection. Here the server is then gone, so the reconnects fail until
+    # the --test-time deadline, which ends the run normally, as for any drop.
+    # It is not a setup rejection that fails the run once it is over.
+    peer = _Peer(b'+OK\r\n', mode='late-reject')
+    result, stats, _failures, _ = _run(env, peer, ['--reconnect-on-error', '--connection-stage-timeout=0'])
+    env.assertEqual(result.returncode, 0, message=result.stderr[-2000:])
+    env.assertContains('rejected the connection', result.stderr)
+    env.assertFalse('setup failed' in result.stderr, message=result.stderr[-2000:])
+    env.assertEqual(peer.replies, 20)
+    env.assertEqual(stats['ALL STATS']['Totals']['Count'], 19)
+    env.assertGreater(peer.connections, 1)

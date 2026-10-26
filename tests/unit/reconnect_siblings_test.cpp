@@ -323,7 +323,8 @@ static void test_cached_reconnect_deadline(evutil_socket_t, short, void *context
 // reconnects, still marked as rejected since its last reply.
 static void test_connection_rejection_is_not_a_reply(event_base *base, abstract_protocol *protocol)
 {
-    for (int retry = 0; retry < 2; ++retry) {
+    for (int pass = 0; pass < 2; ++pass) {
+        const bool retry = pass != 0;
         arbitrary_command_list commands;
         benchmark_config config = {};
         config.arbitrary_commands = &commands;
@@ -332,7 +333,7 @@ static void test_connection_rejection_is_not_a_reply(event_base *base, abstract_
         config.protocol = PROTOCOL_REDIS_DEFAULT;
         config.requests = 1;
         config.reconnect_on_error = true;
-        config.retry_on_error = retry != 0;
+        config.retry_on_error = retry;
         config.max_retry_queue = 10;
         config.max_retries = 5;
         config.retry_backoff_ms = 100;
@@ -350,7 +351,7 @@ static void test_connection_rejection_is_not_a_reply(event_base *base, abstract_
         check(!manager.finished(), "a rejection does not complete --requests");
         check(manager.get_reqs_generated() == (retry ? 1u : 0u),
               "the rejected request is uncounted, or kept for replay with --retry-on-error");
-        check(connection.has_requests_to_replay() == (retry != 0), "--retry-on-error keeps the request for replay");
+        check(connection.has_requests_to_replay() == retry, "--retry-on-error keeps the request for replay");
         check(connection.is_reconnect_pending(), "--reconnect-on-error reconnects after a rejection");
         check(connection.setup_failed_since_reply(), "the rejection is a setup failure since the last reply");
         connection.disconnect();
