@@ -39,9 +39,10 @@ version or an older minor version than the headers). Other differences, such
 as patch levels, are compatible and are not reported. The JSON
 `run information` section records `libevent runtime version` and
 `libevent build version` (and `OpenSSL runtime version` and
-`OpenSSL build version` when TLS is compiled in). Results from different
-libevent series are not directly comparable: 2.1 reads at most 4 KiB per
-socket read, 2.2 up to 16 KiB (#535).
+`OpenSSL build version` when TLS is compiled in). On plaintext connections
+memtier reads up to 16 KiB per read event on both 2.1 and 2.2 (on 2.1 it reads
+past libevent's 4 KiB cap; not on Windows, #535), but TLS reads still differ by
+series, so compare TLS results only on the same libevent series.
 
 The following tools are required:
 * autoconf
@@ -320,11 +321,11 @@ checks to `check-macos-tls-links.sh`).
 #### Behaviour differences between 2.1 and 2.2
 
 * **Socket read size** ([#535](https://github.com/redis/memtier_benchmark/issues/535)).
-  libevent 2.1 reads at most 4 KiB (`EVBUFFER_MAX_READ`) from a plaintext
-  socket per read event; 2.2 reads up to 16 KiB. With deep pipelines and
-  large replies the same memtier source then takes more event-loop passes on
-  2.1, so throughput can differ by libevent series alone. TLS bufferevents
-  differ too: 2.1 reads about one TLS record per read event (4 KiB, then what
+  libevent 2.1 reads at most 4 KiB (`EVBUFFER_MAX_READ`) from a socket per
+  read event; 2.2 reads up to 16 KiB. On plaintext connections memtier reads
+  on past the 2.1 cap, up to 16 KiB as 2.2 does (not on Windows), so deep
+  pipelines with large replies take the same event-loop passes on both
+  series. TLS bufferevents still differ: 2.1 reads about one TLS record per read event (4 KiB, then what
   OpenSSL already holds decrypted), while 2.2 keeps reading records until 16
   KiB or the socket is drained. Record the libevent version that `--version`
   reports with results and compare runs only on the same libevent build.

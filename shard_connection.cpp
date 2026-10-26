@@ -41,6 +41,7 @@
 #endif
 
 #include "shard_connection.h"
+#include "libevent_read_cap.h"
 #include "obj_gen.h"
 #include "memtier_benchmark.h"
 #include "connections_manager.h"
@@ -165,6 +166,8 @@ void cluster_client_read_handler(bufferevent *bev, void *ctx)
 {
     shard_connection *sc = (shard_connection *) ctx;
     assert(sc != NULL);
+    if (sc->tracks_libevent_reads())
+        read_past_libevent_cap(bufferevent_get_input(bev), bufferevent_getfd(bev), sc->last_input_added());
     sc->process_response();
 }
 
@@ -323,6 +326,8 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_cluster_slots_retry_timer(NULL),
         m_setup_rejected_timer(NULL),
         m_bev_paused(false),
+        m_tracks_libevent_reads(false),
+        m_last_input_added(0),
         m_in_socket_connect(false),
         m_socket_connect_error(0)
 {
@@ -510,6 +515,7 @@ bool shard_connection::setup_event(evutil_socket_t sockfd)
     // bufferevent_enable in handle_event on BEV_EVENT_CONNECTED); reset the
     // pause flag so we don't carry stale state from a prior socket.
     m_bev_paused = false;
+    m_tracks_libevent_reads = false;
 
     // On failure the caller fails this connect attempt like a socket setup
     // failure; its connect/reconnect error handling applies unchanged.
@@ -554,6 +560,10 @@ bool shard_connection::setup_event(evutil_socket_t sockfd)
             benchmark_error_log("error: bufferevent_socket_new() failed; cannot create the connection.\n");
             evutil_closesocket(sockfd);
             return false;
+        }
+        if (libevent_caps_reads()) {
+            track_libevent_reads(bufferevent_get_input(m_bev), &m_last_input_added);
+            m_tracks_libevent_reads = true;
         }
 #ifdef USE_TLS
     }
