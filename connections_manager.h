@@ -52,6 +52,8 @@ public:
     // and connection errors. Checked before workload is issued.
     virtual bool deadline_passed_by(const struct timeval &now) = 0;
     virtual bool all_connections_idle(void) = 0;
+    // Whether a connection holds --retry-on-error retries for their backoff.
+    virtual bool holds_retries(void) = 0;
 
     virtual void set_start_time(void) = 0;
     virtual void set_end_time(void) = 0;

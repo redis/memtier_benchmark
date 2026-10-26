@@ -188,6 +188,7 @@ public:
     // siblings_done() and end_client_after_run() are public only for
     // tests/unit/reconnect_siblings_test.cpp.
     bool siblings_done(void);
+    bool may_send_again(void);
     void end_client_after_run(bool end_stats);
     void warn_reconnecting_indefinitely(void);
 

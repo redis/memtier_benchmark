@@ -369,10 +369,11 @@ class _RedialNode:
                     self.on_command(verb)  # may hold this reply
                 if verb == b"CLUSTER":
                     reply = self.slots
-                elif verb == b"AUTH" and redial and self.reject_redial_auth:
+                elif verb == b"AUTH" and redial:
                     with self.lock:
                         self.redial_auths += 1
-                    reply = b"-WRONGPASS invalid username-password pair or user is disabled.\r\n"
+                    reply = b"-WRONGPASS invalid username-password pair or user is disabled.\r\n" \
+                        if self.reject_redial_auth else b"+OK\r\n"
                 else:
                     reply = b"+OK\r\n"
                 conn.sendall(reply)
@@ -473,23 +474,26 @@ class _SlowRedialScript:
             return
 
 
-def test_rejected_setup_after_slow_redial_past_deadline_fails_run(env):
-    # Two primaries; the second's connection drops early in a 4 s run and
-    # its redial is still connecting at the deadline (connect() cleared its
-    # pending reconnect), with nothing pending. The first connection, idle
-    # past its deadline, must not end the client: once the connect completes,
-    # the redial's AUTH goes out, is rejected, and fails the run (#630).
+def _check_slow_redial(env, rate, reject_auth):
+    """Two primaries; the second's connection drops early in a 4 s run and
+    its redial is still connecting at the deadline (connect() cleared its
+    pending reconnect), with nothing pending. The first connection, idle
+    past its deadline, must not end the client: once the connect completes,
+    the redial's AUTH goes out. If it is rejected, the run fails (#630);
+    otherwise the redial, once set up, ends the client. Without
+    --rate-limiting (rate None) the first connection is paused, and only the
+    redial can end the client."""
     if sys.platform != "linux":
         env.skip()  # relies on Linux dropping the SYN when the accept queue is full
     # A test time well past the drop leaves room for a starved peer.
-    test_time, rate = 4, 50
+    test_time = 4
     # Drop the second node's connection early, once the first has had 10
     # SETs, however slowly memtier runs: its redial (1 s later, capped at the
     # deadline) then connects before the deadline, and that connect is held
     # in progress until the script releases the node.
     script = _SlowRedialScript(test_time, drop_after=10)
     first = _RedialNode(16, on_command=script.on_command)
-    second = _RedialNode(0, reject_redial_auth=True)
+    second = _RedialNode(0, reject_redial_auth=reject_auth)
     script.second = second
     # Each node has half the slots. Once the second node's connection drops,
     # the first one goes idle at the first key for the second: no reply can
@@ -504,8 +508,9 @@ def test_rejected_setup_after_slow_redial_past_deadline_fails_run(env):
     driver.start()
     args = [MEMTIER_BINARY, "--server=127.0.0.1", "--port={}".format(first.port), "--cluster-mode",
             "--authenticate=pw", "--threads=1", "--clients=1", "--test-time={}".format(test_time),
-            "--rate-limiting={}".format(rate), "--ratio=1:0", "--key-maximum=1000",
-            "--reconnect-on-error", "--hide-histogram"]
+            "--ratio=1:0", "--key-maximum=1000", "--reconnect-on-error", "--hide-histogram"]
+    if rate is not None:
+        args.append("--rate-limiting={}".format(rate))
     start = time.monotonic()
     try:
         result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=50, text=True)
@@ -531,10 +536,31 @@ def test_rejected_setup_after_slow_redial_past_deadline_fails_run(env):
     if script.released_at is not None:
         env.assertGreater(script.released_at, script.deadline())
         env.assertTrue(all(t > script.released_at for t in second.accepted[1:]))
-    # Its AUTH went out and was rejected: the run fails (#630).
+    # Its AUTH went out. Rejected, it fails the run (#630); accepted, the
+    # run ends normally.
     env.assertEqual(second.redial_auths, 1, message=stderr[-2000:])
-    env.assertEqual(returncode, 1, message=stderr[-2000:])
-    env.assertContains("authentication failed", stderr)
+    if reject_auth:
+        env.assertEqual(returncode, 1, message=stderr[-2000:])
+        env.assertContains("authentication failed", stderr)
+    else:
+        env.assertEqual(returncode, 0, message=stderr[-2000:])
     # The redial gets in on its SYN's next retransmit after the release.
     env.assertLess(elapsed, 35)
 
+
+
+def test_rejected_setup_after_slow_redial_past_deadline_fails_run(env):
+    _check_slow_redial(env, 50, reject_auth=True)
+
+
+def test_rejected_setup_after_slow_redial_without_rate_limit_fails_run(env):
+    # No refill timer calls the first connection's fill_pipeline() past the
+    # deadline: it is paused, and the redial's setup reply ends the run.
+    _check_slow_redial(env, None, reject_auth=True)
+
+
+def test_slow_redial_without_rate_limit_ends_once_set_up(env):
+    # As above, but the redial's AUTH is accepted: the redial, once set up,
+    # finds the paused first connection idle and ends the client, with no
+    # timer left to do it.
+    _check_slow_redial(env, None, reject_auth=False)

@@ -233,8 +233,7 @@ public:
     virtual bool finished(void);
     virtual bool deadline_passed_by(const struct timeval &now);
     virtual bool all_connections_idle(void);
-    // Whether a connection holds --retry-on-error retries for their backoff.
-    bool holds_retries(void);
+    virtual bool holds_retries(void);
     // The end of a started --test-time client whose deadline, its own start
     // plus --test-time, lies before now: the deadline or its last reply,
     // whichever is later, and no later than now. Replies drained after the
