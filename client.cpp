@@ -163,6 +163,7 @@ client::client(client_group *group) :
         m_initialized(false),
         m_end_set(false),
         m_run_failed(false),
+        m_end_waits_for_siblings(false),
         m_config(NULL),
         m_obj_gen(NULL),
         m_stats(group->get_config()),
@@ -203,6 +204,7 @@ client::client(struct event_base *event_base, benchmark_config *config, abstract
         m_initialized(false),
         m_end_set(false),
         m_run_failed(false),
+        m_end_waits_for_siblings(false),
         m_config(NULL),
         m_obj_gen(NULL),
         m_stats(config),
@@ -451,8 +453,12 @@ bool client::abandon_unanswered_requests(unsigned long long *unanswered, unsigne
     // Only a client that is waiting for replies, or that keeps resending
     // --retry-on-error retries that never succeed (#715): one with nothing
     // in flight ends by itself, or is waiting for a reconnect. A retry held
-    // for its backoff is not pending.
-    if (all_connections_idle() && !holds_retries()) return false;
+    // for its backoff is not pending. Also one that a connection already
+    // tried to end once the run was over, waiting for a sibling that may
+    // still send (shard_connection::end_client_after_run()): without
+    // --connection-timeout, a redial whose SYN is dropped would keep it
+    // waiting for the kernel's connect timeout (about 2 minutes).
+    if (all_connections_idle() && !holds_retries() && !m_end_waits_for_siblings) return false;
 
     // Drop them before disconnecting, so --retry-on-error does not hold them
     // for a resend that will never come (they would then be counted a
@@ -1669,16 +1675,20 @@ void client_group::handle_end_stalled_clients(void)
 {
     // A client is reported as waiting for replies if it was (even if only
     // for setup commands, which are not counted), and as retrying if it
-    // held requests for retry; one that had both is in both lines.
+    // held requests for retry; one that had both is in both lines. One that
+    // only waited for a sibling (wait_for_siblings()) is reported as such.
     unsigned long long unanswered = 0, held = 0;
-    unsigned int no_reply = 0, retrying = 0, ended = 0;
+    unsigned int no_reply = 0, retrying = 0, waiting = 0, ended = 0;
     unsigned int count = active_client_count();
     for (unsigned int i = 0; i < count && i < m_clients.size(); i++) {
         if (m_clients[i]->end_time_set()) continue;
         unsigned long long client_unanswered = 0, client_held = 0;
+        const bool only_waiting = m_clients[i]->all_connections_idle() && !m_clients[i]->holds_retries();
         if (!m_clients[i]->abandon_unanswered_requests(&client_unanswered, &client_held)) continue;
         ended++;
-        if (client_unanswered > 0 || client_held == 0) {
+        if (only_waiting) {
+            waiting++;
+        } else if (client_unanswered > 0 || client_held == 0) {
             no_reply++;
             unanswered += client_unanswered;
         }
@@ -1702,6 +1712,11 @@ void client_group::handle_end_stalled_clients(void)
             benchmark_error_log("warning: %u client(s) were still retrying %llu request(s) %u seconds after the test "
                                 "time ended; ended them (counted as errors, not resent).\n",
                                 retrying, held, TEST_TIME_DRAIN_GRACE_SECS);
+        }
+        if (waiting > 0) {
+            benchmark_error_log("warning: %u client(s) were still waiting for a connection to connect or set up %u "
+                                "seconds after the test time ended; ended them.\n",
+                                waiting, TEST_TIME_DRAIN_GRACE_SECS);
         }
     }
 }

@@ -1194,4 +1194,6 @@ def test_transaction_deadline_mid_multi_with_held_refresh_ends(env):
     # The refresh was due inside the MULTI, whose EXEC never went out.
     env.assertGreater(node.moved, 1)
     env.assertEqual(node.execs, 0)
-    env.assertLess(elapsed, test_time + 3, message="run took {:.1f}s".format(elapsed))
+    # Ends at the deadline: well under the 10 s drain grace, with headroom
+    # for the sanitizer runners.
+    env.assertLess(elapsed, test_time + 6, message="run took {:.1f}s".format(elapsed))

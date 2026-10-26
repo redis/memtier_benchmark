@@ -78,6 +78,9 @@ protected:
     bool m_end_set;
     // A connection ended the run as failed (see fail_run()).
     bool m_run_failed;
+    // A connection tried to end the client after the run, but a sibling was
+    // still busy (see wait_for_siblings()).
+    bool m_end_waits_for_siblings;
 
     // test related
     benchmark_config *m_config;
@@ -173,11 +176,16 @@ public:
     // one may still end the client normally, so the failure is recorded here.
     void fail_run(void) { m_run_failed = true; }
     bool run_failed(void) const { return m_run_failed; }
+    // A connection is done after the run and would end the client, but
+    // another connection may still send (a redial still connecting, say):
+    // that one ends the client itself, or the drain grace does.
+    void wait_for_siblings(void) { m_end_waits_for_siblings = true; }
     // Ends a client whose --test-time deadline passed TEST_TIME_DRAIN_GRACE_SECS
-    // ago with replies still pending, or with --retry-on-error retries it
-    // keeps resending; returns whether it did. Adds the workload requests
-    // that got no reply to *unanswered (setup commands are dropped but not
-    // counted) and the requests held for retry to *held.
+    // ago with replies still pending, with --retry-on-error retries it keeps
+    // resending, or whose end waits for a sibling (wait_for_siblings()), such
+    // as a redial whose SYN is dropped; returns whether it did. Adds the
+    // workload requests that got no reply to *unanswered (setup commands are
+    // dropped but not counted) and the requests held for retry to *held.
     bool abandon_unanswered_requests(unsigned long long *unanswered, unsigned long long *held);
 
     virtual get_key_response get_key_for_conn(unsigned int command_index, unsigned int conn_id,

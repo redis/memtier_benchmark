@@ -407,6 +407,21 @@ class _RedialNode:
         # The fillers are closed as they are accepted.
         self.paused.clear()
 
+    def go_away(self):
+        """Close the listener and the open connections: a redial is refused."""
+        try:
+            self.listener.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.listener.close()
+        with self.lock:
+            for conn in self.conns:
+                try:
+                    conn.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                conn.close()
+
     def close(self):
         self.stop.set()
         self.thread.join(timeout=5)
@@ -432,6 +447,9 @@ class _SlowRedialScript:
         self.refresh_after_drop = None
         self.released_at = None
         self.second = None
+        # What the script does once the redial is in progress past the
+        # deadline; by default, let it connect.
+        self.on_release = None
         self.done = threading.Event()
 
     def deadline(self):
@@ -470,7 +488,7 @@ class _SlowRedialScript:
                 if now < self.deadline() + 0.3 or now - self.last_set < 0.3 or now - self.refresh_after_drop < 0.2:
                     continue
                 self.released_at = now
-            self.second.release()
+            (self.on_release or self.second.release)()
             return
 
 
@@ -563,3 +581,54 @@ def test_slow_redial_without_rate_limit_ends_once_set_up(env):
     # finds the paused first connection idle and ends the client, with no
     # timer left to do it.
     _check_slow_redial(env, None, reject_auth=False)
+
+
+def test_blackholed_redial_is_ended_at_drain_grace(env):
+    """As above, but the second node's redial is never let in (a firewalled
+    or dead node, whose SYNs are dropped), and once the deadline has passed
+    the first node goes away too: the main connection's redial is refused,
+    so it is done and would end the client, but the second connection is
+    still connecting. Without --connection-timeout that connect lasts until
+    the kernel gives up (about 2 minutes with the default tcp_syn_retries);
+    the drain grace ends the client instead, at the deadline plus 10 s."""
+    if sys.platform != "linux":
+        env.skip()  # relies on Linux dropping the SYN when the accept queue is full
+    test_time = 4
+    script = _SlowRedialScript(test_time, drop_after=10)
+    first = _RedialNode(16, on_command=script.on_command)
+    second = _RedialNode(0)
+    script.second = second
+    script.on_release = first.go_away
+    slots = b"*2\r\n"
+    for node, low, high in ((first, 0, 8191), (second, 8192, 16383)):
+        slots += b"*3\r\n:%d\r\n:%d\r\n*2\r\n$9\r\n127.0.0.1\r\n:%d\r\n" % (low, high, node.port)
+    first.slots = second.slots = slots
+    driver = threading.Thread(target=script.run, daemon=True)
+    driver.start()
+    args = [MEMTIER_BINARY, "--server=127.0.0.1", "--port={}".format(first.port), "--cluster-mode",
+            "--authenticate=pw", "--threads=1", "--clients=1", "--test-time={}".format(test_time),
+            "--ratio=1:0", "--key-maximum=1000", "--reconnect-on-error", "--hide-histogram", "--rate-limiting=50"]
+    start = time.monotonic()
+    try:
+        result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=50, text=True)
+        returncode, stdout, stderr = result.returncode, result.stdout, result.stderr
+    except subprocess.TimeoutExpired as expired:
+        returncode, stdout, stderr = "timeout", "", expired.stderr or ""
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors="replace")
+    finally:
+        elapsed = time.monotonic() - start
+        script.done.set()
+        driver.join(timeout=5)
+        first.close()
+        second.close()
+    env.assertIsNotNone(script.released_at, message=stderr[-2000:])
+    # The second node never accepted the redial.
+    env.assertEqual(len(second.accepted), 1, message=stderr[-2000:])
+    env.assertEqual(returncode, 0, message=stderr[-2000:])
+    env.assertContains("Connection failed and the run is over, not reconnecting", stderr)
+    env.assertContains("were still waiting for a connection to connect or set up 10 seconds after the test time ended",
+                       stderr)
+    env.assertContains("Totals", stdout)
+    env.assertGreater(elapsed, test_time + 9, message="run took {:.1f}s".format(elapsed))
+    env.assertLess(elapsed, test_time + 25, message="run took {:.1f}s".format(elapsed))

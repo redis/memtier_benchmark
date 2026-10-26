@@ -2449,7 +2449,13 @@ void shard_connection::end_client_after_run(bool end_stats)
     // Without end_stats the run failed: record it, as a busy sibling may still
     // end the client normally.
     if (!end_stats) static_cast<client *>(m_conns_manager)->fail_run();
-    if (!siblings_done()) return;
+    if (!siblings_done()) {
+        // The sibling ends the client itself; if it never does (a redial
+        // whose SYN is dropped, without --connection-timeout), the drain
+        // grace ends it (client::abandon_unanswered_requests()).
+        static_cast<client *>(m_conns_manager)->wait_for_siblings();
+        return;
+    }
     // A client that never started has no stats to end.
     if (end_stats && m_conns_manager->get_reqs_answered()) {
         client *c = static_cast<client *>(m_conns_manager);
@@ -2489,7 +2495,8 @@ bool shard_connection::may_send_again(void)
 // so a rejected setup would not fail the run (#630), a slot error would not
 // be retried, and the requests it was to resend would not be sent. Such a
 // sibling ends the client itself, on its last reply or through this check
-// when its connect fails (or times out, with --connection-timeout).
+// when its connect fails (or times out, with --connection-timeout); if it
+// never does, end_client_after_run() leaves it to the drain grace.
 bool shard_connection::siblings_done(void)
 {
     std::vector<shard_connection *> &conns = m_conns_manager->get_connections();
