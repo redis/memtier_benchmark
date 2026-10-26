@@ -88,6 +88,7 @@ tests/.env/
 /cluster_slots_retention_test
 /memcache_meta_test
 /redis_protocol_test
+/connection_stage_clock_test
 /libevent_read_cap_test
 /memcache_text_test
 tests/unit/prometheus_metrics_test

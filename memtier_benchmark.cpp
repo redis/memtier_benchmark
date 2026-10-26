@@ -192,6 +192,7 @@ static int getrusage(int who, struct rusage *ru)
 #include "file_io.h"
 #include "obj_gen.h"
 #include "memtier_benchmark.h"
+#include "connection_stage_clock.h"
 #include "run_stats_types.h"
 #include "latency_percentiles.h"
 #include "retry_policy.h"
@@ -354,27 +355,33 @@ static prometheus_exporter *g_prom_exporter = NULL;
 //   - reset by connection_stage_supervisor_reset() at the start of every
 //     run_benchmark() invocation; --run-count > 1 must restart the policy
 //     because a previous run's success latch is meaningless for the next.
-//   - g_conn_stage_run_start tracks the time of that reset; we measure
+//   - g_conn_stage_run_start_usec tracks the time of that reset; we measure
 //     "elapsed in setup phase" from there, NOT from each individual
 //     failure, so a single late failure can still trigger the timeout.
 static std::atomic<bool> g_conn_stage_steady_state{false};
-static std::atomic<long> g_conn_stage_streak_start_sec{0}; // 0 = no failure yet
-static std::atomic<long> g_conn_stage_run_start_sec{0};
+// Wall-clock microseconds (see connection_stage_timed_out()).
+static std::atomic<long long> g_conn_stage_streak_start_usec{0}; // 0 = no failure yet
+static std::atomic<long long> g_conn_stage_run_start_usec{0};
+
+static long long conn_stage_now_usec(void)
+{
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    return (long long) now.tv_sec * 1000000 + now.tv_usec;
+}
 static pthread_mutex_t g_conn_stage_err_mutex = PTHREAD_MUTEX_INITIALIZER;
 static std::string g_conn_stage_last_err; // guarded by g_conn_stage_err_mutex
 
 void connection_stage_supervisor_reset(void)
 {
     g_conn_stage_steady_state.store(false, std::memory_order_release);
-    g_conn_stage_streak_start_sec.store(0, std::memory_order_release);
+    g_conn_stage_streak_start_usec.store(0, std::memory_order_release);
     // Must reset g_connection_stage_aborted as well: with --run-count > 1, a
     // run-1 abort would otherwise leave the flag latched into run 2,
     // suppressing the worker-failure report in cg_thread_start(). The exit
     // code uses g_any_run_connection_stage_aborted, which is not reset.
     g_connection_stage_aborted.store(false, std::memory_order_release);
-    struct timeval now;
-    gettimeofday(&now, NULL);
-    g_conn_stage_run_start_sec.store(now.tv_sec, std::memory_order_release);
+    g_conn_stage_run_start_usec.store(conn_stage_now_usec(), std::memory_order_release);
     pthread_mutex_lock(&g_conn_stage_err_mutex);
     g_conn_stage_last_err.clear();
     pthread_mutex_unlock(&g_conn_stage_err_mutex);
@@ -387,14 +394,11 @@ void report_connection_stage_failure(const char *err)
     // cycle must not bring the run down.
     if (g_conn_stage_steady_state.load(std::memory_order_acquire)) return;
 
-    struct timeval now;
-    gettimeofday(&now, NULL);
-
     // First failure in a streak: stamp the wall-clock start. Subsequent
     // failures only update the last-error string. CAS on 0 keeps this
     // race-free without a mutex.
-    long zero = 0;
-    g_conn_stage_streak_start_sec.compare_exchange_strong(zero, now.tv_sec, std::memory_order_acq_rel);
+    long long zero = 0;
+    g_conn_stage_streak_start_usec.compare_exchange_strong(zero, conn_stage_now_usec(), std::memory_order_acq_rel);
 
     if (err != NULL && *err != '\0') {
         pthread_mutex_lock(&g_conn_stage_err_mutex);
@@ -410,7 +414,7 @@ void report_connection_stage_success(void)
     // and can be useful for post-mortem diagnostics.
     bool expected = false;
     if (g_conn_stage_steady_state.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-        g_conn_stage_streak_start_sec.store(0, std::memory_order_release);
+        g_conn_stage_streak_start_usec.store(0, std::memory_order_release);
     }
 }
 
@@ -429,11 +433,9 @@ bool connection_stage_should_abort(unsigned int timeout_secs, std::string *out_l
     if (timeout_secs == 0) return false; // operator opt-out
     if (g_conn_stage_steady_state.load(std::memory_order_acquire)) return false;
 
-    struct timeval now;
-    gettimeofday(&now, NULL);
-
-    long streak_start = g_conn_stage_streak_start_sec.load(std::memory_order_acquire);
-    long run_start = g_conn_stage_run_start_sec.load(std::memory_order_acquire);
+    long long now = conn_stage_now_usec();
+    long long streak_start = g_conn_stage_streak_start_usec.load(std::memory_order_acquire);
+    long long run_start = g_conn_stage_run_start_usec.load(std::memory_order_acquire);
 
     // Two trip conditions:
     //   (a) a failure streak has been live for >= timeout_secs (covers
@@ -443,15 +445,13 @@ bool connection_stage_should_abort(unsigned int timeout_secs, std::string *out_l
     //       for >= timeout_secs without anyone reaching steady state
     //       (covers --wait-ratio 0:1 with no slaves — the connection
     //       handshakes but the very first WAIT command never returns).
-    long elapsed_streak = (streak_start > 0) ? (now.tv_sec - streak_start) : 0;
-    long elapsed_run = (run_start > 0) ? (now.tv_sec - run_start) : 0;
-
-    bool trip_streak = (streak_start > 0 && elapsed_streak >= (long) timeout_secs);
-    bool trip_run = (run_start > 0 && elapsed_run >= (long) timeout_secs);
+    unsigned int elapsed_streak = 0, elapsed_run = 0;
+    bool trip_streak = connection_stage_timed_out(streak_start, now, timeout_secs, &elapsed_streak);
+    bool trip_run = connection_stage_timed_out(run_start, now, timeout_secs, &elapsed_run);
     if (!trip_streak && !trip_run) return false;
 
     if (out_elapsed != NULL) {
-        *out_elapsed = (unsigned int) (trip_streak ? elapsed_streak : elapsed_run);
+        *out_elapsed = trip_streak ? elapsed_streak : elapsed_run;
     }
     if (out_last_err != NULL) {
         pthread_mutex_lock(&g_conn_stage_err_mutex);
