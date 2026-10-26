@@ -318,6 +318,13 @@ static bool g_output_failed = false;
 // content already emitted, without assuming which output stage was reached.
 static json_handler *g_json_out_file = NULL;
 
+// main owns the object generator and the imported keylist. Option checks
+// after they are created exit through usage() or exit(); file-scope roots
+// keep them (and the buffers they own) reachable for LeakSanitizer then,
+// whatever registers main used.
+static object_generator *g_obj_gen = NULL;
+static imported_keylist *g_keylist = NULL;
+
 static void close_json_out_file_at_exit(void)
 {
     if (g_json_out_file != NULL) {
@@ -6278,8 +6285,8 @@ int main(int argc, char *argv[])
 #endif
 
     // create and configure object generator
-    object_generator *obj_gen = NULL;
-    imported_keylist *keylist = NULL;
+    object_generator *&obj_gen = g_obj_gen;
+    imported_keylist *&keylist = g_keylist;
     if (!cfg.data_import) {
         if (cfg.data_verify) {
             fprintf(stderr, "error: use data-verify only with data-import\n");
@@ -6797,7 +6804,9 @@ int main(int argc, char *argv[])
     }
 
     delete obj_gen;
+    obj_gen = NULL; // g_obj_gen is file-scope; do not leave it dangling
     if (keylist != NULL) delete keylist;
+    keylist = NULL;
 
     if (cfg.scan_continuation_command != NULL) {
         delete cfg.scan_continuation_command;
