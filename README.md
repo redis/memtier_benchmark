@@ -313,6 +313,10 @@ abandoned replays; it is distinct from `Connection Errors`.
 and `Retried Ops` counts requests queued for retry at least once. These counters
 are totals for the run, without per-command attribution. They do not change
 request completion or exit-code behavior.
+A connection rejection (see above) is not a retried error reply. The request
+it arrived for is held for replay on the reconnect, as on any dropped
+connection, so it adds to neither `Retry Attempts` nor `Retried Ops`. It counts
+in `Connection Errors`, and in `Errors` if it is abandoned, never resent.
 
 ### Repeated runs (`--run-count`)
 
