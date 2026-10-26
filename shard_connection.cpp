@@ -26,6 +26,7 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <errno.h>
 #include "platform_compat.h"
 #include <time.h>
@@ -1650,6 +1651,15 @@ static bool is_redis_connection_rejection(const char *status)
                       strncmp(status, protected_mode, sizeof(protected_mode) - 1) == 0);
 }
 
+// A server without HELLO (Redis < 6.0, or another RESP server) answers it as
+// an unknown command. The reply is to our own HELLO, so the command name it
+// quotes (' in Redis 6+, ` in 5.x, or none) does not need checking.
+static bool is_unknown_hello_error(const char *status)
+{
+    static const char prefix[] = "-ERR unknown command";
+    return status && strncasecmp(status, prefix, sizeof(prefix) - 1) == 0;
+}
+
 void shard_connection::process_response(void)
 {
     int ret;
@@ -1765,7 +1775,18 @@ void shard_connection::process_response(void)
             benchmark_debug_log("ASKING reply: %s\n", r->get_status() ? r->get_status() : "");
             break;
         case rt_hello:
-            if (r->is_error()) {
+            if (r->is_error() && m_config->protocol == PROTOCOL_RESP2 && is_unknown_hello_error(r->get_status())) {
+                // RESP2 is the wire default, so the connection can go on
+                // without HELLO 2 (#488).
+                static std::atomic<bool> warned(false);
+                if (!warned.exchange(true))
+                    benchmark_error_log("warning: server does not support HELLO, so RESP2 was assumed [%s]\n",
+                                        r->get_status());
+                m_hello = setup_done;
+            } else if (r->is_error()) {
+                if (m_config->protocol == PROTOCOL_RESP3 && is_unknown_hello_error(r->get_status()))
+                    benchmark_error_log("error: server does not support HELLO, so RESP3 is unavailable "
+                                        "(Redis added HELLO in 6.0)\n");
                 benchmark_error_log("error: HELLO failed [%s]\n", r->get_status());
                 {
                     char buf[256];
