@@ -406,6 +406,8 @@ private:
     // True while a CLUSTER SLOTS refresh must wait for the pinned
     // --transaction rotation this connection drives to close its MULTI.
     bool setup_held_for_transaction();
+    // Whether fill_pipeline() would send a setup step now.
+    bool setup_step_sendable();
     void send_conn_setup_commands(struct timeval timestamp);
     void restore_cluster_slots_value_policy();
     // Schedule a fill on every other connected connection of this client, so

@@ -548,7 +548,6 @@ def _check_slow_redial(env, rate, reject_auth):
     env.assertLess(elapsed, 35)
 
 
-
 def test_rejected_setup_after_slow_redial_past_deadline_fails_run(env):
     _check_slow_redial(env, 50, reject_auth=True)
 

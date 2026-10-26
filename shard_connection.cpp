@@ -1378,6 +1378,20 @@ bool shard_connection::is_conn_setup_done()
            m_hello == setup_done && m_readonly_state == setup_done;
 }
 
+// Whether fill_pipeline() would send a setup step now: one is due, it is not
+// held for an open --transaction MULTI, and fill_pipeline() gets to it,
+// either for requests to replay on this live connection, or in its loop. Once
+// finished(), the loop only runs to finish a setup ladder with replies
+// pending (as on master), so a step due with nothing pending and nothing to
+// replay is never sent. Past the deadline a held refresh is not sent either,
+// as its MULTI's EXEC is not.
+bool shard_connection::setup_step_sendable()
+{
+    if (is_conn_setup_done() || setup_held_for_transaction()) return false;
+    if (has_requests_to_replay() && m_connection_state == conn_connected) return true;
+    return !m_conns_manager->finished() || get_pending_resp() > 0;
+}
+
 bool shard_connection::setup_held_for_transaction()
 {
     // Sent inside the MULTI, CLUSTER SLOTS would only be queued (#569).
@@ -1916,7 +1930,7 @@ void shard_connection::fill_pipeline(void)
     if (m_replay_queue != NULL && !m_replay_queue->empty() && get_connection_state() == conn_connected) {
         if (is_conn_setup_done()) {
             drain_replay_queue_after_reconnect();
-        } else if (!setup_held_for_transaction()) {
+        } else if (setup_step_sendable()) {
             send_conn_setup_commands(now);
             return;
         }
@@ -1943,10 +1957,7 @@ void shard_connection::fill_pipeline(void)
     // so this is checked once.
     const bool deadline_passed = m_conns_manager->deadline_passed_by(now);
     while (!m_conns_manager->finished() || (!is_conn_setup_done() && get_pending_resp() > 0)) {
-        // A CLUSTER SLOTS refresh requested while this connection drives
-        // the pinned --transaction rotation inside an open MULTI waits for
-        // the rotation's EXEC/DISCARD: sent now it would only be queued.
-        if (!is_conn_setup_done() && !setup_held_for_transaction()) {
+        if (setup_step_sendable()) {
             send_conn_setup_commands(now);
             return;
         }
@@ -2455,11 +2466,9 @@ void shard_connection::end_client_after_run(bool end_stats)
 // - A reply pending: its handling runs fill_pipeline().
 // - A reconnect due, or a connect in progress (connect() clears the pending
 //   reconnect): the connect sends the setup ladder.
-// - Connected with a setup step due (a CLUSTER SLOTS refresh requested for a
-//   shard's reconnect and sent from a deferred fill, or waiting for its retry
-//   timer), unless fill_pipeline() will not send it: once finished() it sends
-//   no setup step with nothing pending (as on master), and past the deadline
-//   it holds a refresh for an open --transaction MULTI (EXEC is not sent).
+// - Connected with a setup step that fill_pipeline() would send
+//   (setup_step_sendable()): a CLUSTER SLOTS refresh requested for a shard's
+//   reconnect and sent from a deferred fill, or waiting for its retry timer.
 // - Requests held for replay on a live connection: resent once it is set up.
 //   Disconnected with no reconnect due, it never resends them.
 // Not counted: the retry queue (--retry-on-error backoff), which the client
@@ -2469,9 +2478,7 @@ void shard_connection::end_client_after_run(bool end_stats)
 bool shard_connection::may_send_again(void)
 {
     if (get_pending_resp() > 0 || is_reconnect_pending() || m_connection_state == conn_in_progress) return true;
-    if (m_connection_state == conn_connected && !is_conn_setup_done() && !setup_held_for_transaction() &&
-        !m_conns_manager->finished())
-        return true;
+    if (m_connection_state == conn_connected && setup_step_sendable()) return true;
     return m_connection_state != conn_disconnected && has_requests_to_replay();
 }
 
