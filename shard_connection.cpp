@@ -314,6 +314,8 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_reply_since_connect(false),
         m_slots_rejected(false),
         m_slots_retried_after_run_over(false),
+        m_reconnect_deadline(),
+        m_fired_reconnect_deadline(),
         m_connection_timeout_timer(NULL),
         m_unix_connect_timer(NULL),
 #ifdef _WIN32
@@ -780,6 +782,7 @@ int shard_connection::connect(struct connect_info *addr)
     if (m_reconnect_timer != NULL) {
         event_free(m_reconnect_timer);
         m_reconnect_timer = NULL;
+        m_reconnect_deadline.tv_sec = m_reconnect_deadline.tv_usec = 0;
     }
     m_reconnecting = false;
     m_setup_rejected = false;
@@ -880,6 +883,7 @@ void shard_connection::disconnect()
     if (m_reconnect_timer != NULL) {
         event_free(m_reconnect_timer);
         m_reconnect_timer = NULL;
+        m_reconnect_deadline.tv_sec = m_reconnect_deadline.tv_usec = 0;
     }
 
     if (m_connection_timeout_timer != NULL) {
@@ -2390,6 +2394,7 @@ void shard_connection::attempt_reconnect(const char *error_context)
         m_reconnect_timer = event_new(m_event_base, -1, 0, cluster_client_reconnect_timer_handler, (void *) this);
         if (m_reconnect_timer == NULL) {
             benchmark_error_log("error: event_new failed in attempt_reconnect\n");
+            m_reconnect_deadline.tv_sec = m_reconnect_deadline.tv_usec = 0;
             // Roll back the bookkeeping so the next attempt does not
             // count an attempt that never armed, and leave m_reconnecting
             // false so a subsequent error can re-enter this path. Break
@@ -2469,10 +2474,14 @@ bool shard_connection::run_deadline(struct timeval *deadline)
 // Within 1 ms of the deadline counts as passed: the reconnect timer armed for
 // it runs on libevent's monotonic clock and can fire a hair early by this wall
 // clock, which would otherwise re-arm near-zero delays until it catches up.
+// On Linux libevent times it with a coarse clock, so it can fire a whole tick
+// (1-4 ms) early: once a reconnect armed for the deadline has fired, that
+// deadline has passed, whatever this wall clock says (#852).
 bool shard_connection::run_deadline_passed(void)
 {
     struct timeval deadline, now, slack = {0, 1000};
     if (!run_deadline(&deadline)) return false;
+    if (m_fired_reconnect_deadline.tv_sec && !timercmp(&m_fired_reconnect_deadline, &deadline, <)) return true;
     gettimeofday(&now, NULL);
     evutil_timeradd(&now, &slack, &now);
     return !timercmp(&now, &deadline, <);
@@ -2500,6 +2509,7 @@ double shard_connection::next_reconnect_delay(void)
 {
     double delay = m_current_backoff_delay;
     struct timeval deadline, now;
+    m_reconnect_deadline.tv_sec = m_reconnect_deadline.tv_usec = 0;
     // Only with unlimited attempts: a finite --max-reconnect-attempts keeps
     // its backoff schedule, which bounds the run as before (#656).
     if (stops_at_deadline() && run_deadline(&deadline)) {
@@ -2509,7 +2519,12 @@ double shard_connection::next_reconnect_delay(void)
         if (event_base_gettimeofday_cached(m_event_base, &now) < 0) gettimeofday(&now, NULL);
         double left = (deadline.tv_sec - now.tv_sec) + (deadline.tv_usec - now.tv_usec) / 1000000.0;
         if (left < 0) left = 0;
-        if (left < delay) delay = left;
+        // The caller arms the reconnect timer with this delay: remember the
+        // deadline it is due at (run_deadline_passed()).
+        if (left < delay) {
+            delay = left;
+            m_reconnect_deadline = deadline;
+        }
     }
     return delay;
 }
@@ -2835,6 +2850,8 @@ void shard_connection::handle_reconnect_timer_event()
     }
 
     m_reconnecting = false;
+    if (m_reconnect_deadline.tv_sec) m_fired_reconnect_deadline = m_reconnect_deadline;
+    m_reconnect_deadline.tv_sec = m_reconnect_deadline.tv_usec = 0;
 
     // The server rejected a setup step on the last connection and the run's
     // time is up: stop retrying. With unlimited attempts the setup would keep
@@ -2905,6 +2922,7 @@ void shard_connection::handle_reconnect_timer_event()
             m_reconnect_timer = event_new(m_event_base, -1, 0, cluster_client_reconnect_timer_handler, (void *) this);
             if (m_reconnect_timer == NULL) {
                 benchmark_error_log("error: event_new failed in handle_reconnect_timer_event retry path\n");
+                m_reconnect_deadline.tv_sec = m_reconnect_deadline.tv_usec = 0;
                 // Roll back the bookkeeping so the next attempt does not
                 // count an attempt that never armed, and leave m_reconnecting
                 // false so a subsequent error can re-enter this path. Break

@@ -546,6 +546,13 @@ private:
     // got its one refresh after the run was over (never cleared).
     bool m_slots_rejected;
     bool m_slots_retried_after_run_over;
+    // The --test-time deadline the pending reconnect timer was clamped to
+    // (next_reconnect_delay()), zero if none, and the latest such deadline
+    // whose timer fired: it has passed, see run_deadline_passed(). The fired
+    // deadline is never cleared, on purpose: a run's deadline only moves
+    // later, and a later one is again decided by the clock.
+    struct timeval m_reconnect_deadline;
+    struct timeval m_fired_reconnect_deadline;
 
     // Connection timeout tracking
     struct event *m_connection_timeout_timer;
