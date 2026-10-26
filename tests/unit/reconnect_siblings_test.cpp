@@ -45,6 +45,10 @@
 // end_client_after_run() is the path both a failed connect after the run and
 // a rejected setup after the run take to end the client.
 
+// Defined in shard_connection.cpp: runs fill_pipeline() as its deferred-fill
+// timer does.
+void deferred_fill_pipeline_cb(evutil_socket_t, short, void *ctx);
+
 void benchmark_log_file_line(int, const char *, unsigned int, const char *, ...) {}
 void benchmark_log(int, const char *, ...) {}
 void report_connection_stage_failure(const char *) {}
@@ -85,10 +89,11 @@ public:
     {
         m_connections.push_back(new shard_connection(1, this, config, base, protocol));
     }
+    // Started, with one reply, at the start.
     void mark_started(struct timeval *start)
     {
-        m_reqs_answered = 1;
         m_stats.set_start_time(start);
+        inc_reqs_answered(*start, true);
     }
 };
 
@@ -168,6 +173,206 @@ static void test_sibling_with_replay(const char *path)
 #endif
 }
 
+// A connected sibling with a setup step still to send and nothing pending,
+// e.g. the main connection of a cluster client once a shard's reconnect has
+// asked it for a CLUSTER SLOTS refresh and before its deferred fill sends it,
+// or one waiting for its CLUSTER SLOTS retry timer: it keeps the client
+// going, so the refresh still goes out (a rejected setup then fails the run,
+// #630). Ending the client would drop it.
+static void test_sibling_with_setup_due(const char *path)
+{
+#ifndef _WIN32
+    evutil_socket_t listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    sockaddr_un address = {};
+    address.sun_family = AF_UNIX;
+    snprintf(address.sun_path, sizeof(address.sun_path), "%s", path);
+    check(listener >= 0 && bind(listener, (sockaddr *) &address, sizeof(address)) == 0 && listen(listener, 4) == 0,
+          "unix listener");
+
+    connect_info endpoint = {};
+
+#else
+    evutil_socket_t listener = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in address = {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t address_len = sizeof(address);
+    check(listener >= 0 && bind(listener, (sockaddr *) &address, sizeof(address)) == 0 && listen(listener, 4) == 0 &&
+              getsockname(listener, (sockaddr *) &address, &address_len) == 0,
+          "loopback listener");
+    connect_info endpoint = {};
+    endpoint.ci_family = AF_INET;
+    endpoint.ci_socktype = SOCK_STREAM;
+    endpoint.ci_protocol = IPPROTO_TCP;
+    endpoint.ci_addr = (sockaddr *) &address;
+    endpoint.ci_addrlen = address_len;
+
+#endif
+    arbitrary_command_list commands;
+    benchmark_config config = {};
+    config.arbitrary_commands = &commands;
+    config.clients = config.threads = 1;
+    config.key_pattern = "S:S";
+    // No workload goes out (a pipeline of 0), so the sibling stays idle.
+    config.pipeline = 0;
+    config.protocol = PROTOCOL_REDIS_DEFAULT;
+    config.unix_socket = path;
+    config.requests = 1000;
+
+    event_base *base = event_base_new();
+    abstract_protocol *protocol = protocol_factory(config.protocol);
+    {
+        object_generator generator;
+        generator.set_data_size_fixed(1);
+        two_connection_client manager(base, &config, protocol, &generator);
+        shard_connection &first = *manager.get_connections()[0];
+        shard_connection &second = *manager.get_connections()[1];
+
+        second.set_address_port("127.0.0.1", "0");
+        check(second.connect(&endpoint) == 0, "the sibling connects");
+        for (int i = 0; i < 100 && second.get_connection_state() != conn_connected; i++)
+            event_base_loop(base, EVLOOP_ONCE | EVLOOP_NONBLOCK);
+        check(second.get_connection_state() == conn_connected, "the sibling is connected");
+        check(second.get_pending_resp() == 0 && !second.is_reconnect_pending() && !second.has_requests_to_replay(),
+              "nothing is pending on the sibling");
+        check(first.siblings_done(), "a connected, set up sibling with nothing pending is done");
+
+        second.set_cluster_slots();
+        check(second.get_cluster_slots_state() == setup_none, "the sibling has a slot map refresh due");
+        check(manager.all_connections_idle(), "no reply is pending anywhere");
+        check(!first.siblings_done(), "a connected sibling with a refresh still to send keeps the client going");
+
+        // Once the run is finished(), fill_pipeline() no longer sends a setup
+        // step with nothing pending: the refresh can never go out, so it must
+        // not keep the client going (end_client_after_run() would never end
+        // it). Finished here by --test-time: started 11 s ago, with a reply
+        // now.
+        config.test_time = 10;
+        struct timeval start, now;
+        gettimeofday(&now, NULL);
+        start = now;
+        start.tv_sec -= config.test_time + 1;
+        manager.mark_started(&start);
+        manager.get_stats()->update_set_op(&now, 1, 1, 1);
+        check(manager.finished(), "the run is finished()");
+        check(first.siblings_done(), "once finished(), a refresh that can no longer be sent does not keep it going");
+
+        second.disconnect();
+        check(first.siblings_done(), "a disconnected sibling (its setup reset) does not keep it going");
+        event_base_loop(base, EVLOOP_NONBLOCK);
+    }
+    delete protocol;
+    event_base_free(base);
+    evutil_closesocket(listener);
+#ifndef _WIN32
+    unlink(path);
+#endif
+}
+
+// Past its own deadline with nothing pending, a connection ends its client
+// in fill_pipeline() only once the client's other connections are done too
+// (siblings_done(), not all_connections_idle(), which counts pending replies
+// only): a sibling with a reconnect due at the deadline, or whose connect is
+// still in progress, must still get to send its setup, so a rejected setup
+// there fails the run (#630) and a one-off slot error is retried (#666). A
+// connected sibling with a setup step still to send is
+// test_sibling_with_setup_due().
+static void test_deadline_end_waits_for_busy_sibling(const char *path)
+{
+#ifndef _WIN32
+    evutil_socket_t listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    sockaddr_un address = {};
+    address.sun_family = AF_UNIX;
+    snprintf(address.sun_path, sizeof(address.sun_path), "%s", path);
+    check(listener >= 0 && bind(listener, (sockaddr *) &address, sizeof(address)) == 0 && listen(listener, 4) == 0,
+          "unix listener");
+
+    connect_info endpoint = {};
+
+#else
+    evutil_socket_t listener = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in address = {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t address_len = sizeof(address);
+    check(listener >= 0 && bind(listener, (sockaddr *) &address, sizeof(address)) == 0 && listen(listener, 4) == 0 &&
+              getsockname(listener, (sockaddr *) &address, &address_len) == 0,
+          "loopback listener");
+    connect_info endpoint = {};
+    endpoint.ci_family = AF_INET;
+    endpoint.ci_socktype = SOCK_STREAM;
+    endpoint.ci_protocol = IPPROTO_TCP;
+    endpoint.ci_addr = (sockaddr *) &address;
+    endpoint.ci_addrlen = address_len;
+
+#endif
+    arbitrary_command_list commands;
+    benchmark_config config = {};
+    config.arbitrary_commands = &commands;
+    config.clients = config.threads = 1;
+    config.key_pattern = "S:S";
+    config.pipeline = 1;
+    config.protocol = PROTOCOL_REDIS_DEFAULT;
+    config.unix_socket = path;
+    config.test_time = 10;
+    config.reconnect_on_error = true;
+
+    event_base *base = event_base_new();
+    abstract_protocol *protocol = protocol_factory(config.protocol);
+    {
+        object_generator generator;
+        generator.set_data_size_fixed(1);
+        two_connection_client manager(base, &config, protocol, &generator);
+        shard_connection &first = *manager.get_connections()[0];
+        shard_connection &second = *manager.get_connections()[1];
+
+        first.set_address_port("127.0.0.1", "0");
+        check(first.connect(&endpoint) == 0, "the first connection connects");
+        // The sibling dropped and has a reconnect due (armed during startup,
+        // so its delay is not capped at a deadline: the timer never runs here).
+        second.attempt_reconnect("Connection dropped");
+        check(second.is_reconnect_pending(), "the sibling has a reconnect due");
+        // Started (one reply, at its start) a second past its deadline, as
+        // when no reply moved the run's clock since: finished() is false.
+        struct timeval start;
+        gettimeofday(&start, NULL);
+        start.tv_sec -= config.test_time + 1;
+        manager.mark_started(&start);
+        manager.mark_workload_submitted();
+        check(!manager.finished(), "the run's clock has not reached the deadline");
+        check(manager.all_connections_idle(), "no reply is pending anywhere");
+
+        deferred_fill_pipeline_cb(-1, 0, &first);
+        check(!manager.end_time_set(), "an idle connection past the deadline waits for a busy sibling");
+        check(second.is_reconnect_pending(), "the sibling's reconnect is left alone");
+
+        // The reconnect timer fires: connect() clears the pending reconnect,
+        // and the connect stays in progress until the event loop delivers it
+        // (a slow TCP or TLS handshake). Nothing is pending or held.
+        second.set_address_port("127.0.0.1", "0");
+        check(second.connect(&endpoint) == 0, "the sibling's reconnect starts its connect");
+        check(!second.is_reconnect_pending() && second.get_connection_state() == conn_in_progress &&
+                  second.get_pending_resp() == 0,
+              "the sibling's connect is in progress, with no reconnect pending");
+        deferred_fill_pipeline_cb(-1, 0, &first);
+        check(!manager.end_time_set(), "an idle connection past the deadline waits for a sibling still connecting");
+        check(second.get_connection_state() == conn_in_progress, "the sibling's connect is left alone");
+
+        second.disconnect();
+        deferred_fill_pipeline_cb(-1, 0, &first);
+        check(manager.end_time_set(), "past the deadline the client ends once the sibling is done");
+        check(manager.get_stats()->get_duration_usec() == config.test_time * 1000000ULL,
+              "it ends at its deadline, its last reply being before it");
+        event_base_loop(base, EVLOOP_NONBLOCK);
+    }
+    delete protocol;
+    event_base_free(base);
+    evutil_closesocket(listener);
+#ifndef _WIN32
+    unlink(path);
+#endif
+}
+
 // Interrupts finalize after the worker has joined. Use exact timestamps to
 // exercise the deadline boundary without depending on scheduler timing.
 static void test_interrupted_deadline()
@@ -218,6 +423,26 @@ static void test_interrupted_deadline()
         manager.set_end_time_at(&early);
         manager.set_end_time_interrupted(&late);
         check(manager.get_stats()->get_duration_usec() == 250000, "interrupt does not refinalize an ended client");
+    }
+    // An answered client ends at its last reply if that was drained past the
+    // deadline, but no later than the interrupt (#880).
+    struct
+    {
+        timeval reply;
+        unsigned long long duration;
+        const char *name;
+    } replies[] = {
+        {{101, 750000}, 2000000, "a reply before the deadline leaves the cap at the deadline"},
+        {{103, 750000}, 3000000, "interrupt after a drained reply ends at the reply"},
+        {{105, 500000}, 4500000, "a reply after the interrupt time is capped at the interrupt"},
+    };
+    for (unsigned int i = 0; i < sizeof(replies) / sizeof(replies[0]); ++i) {
+        object_generator generator;
+        client manager(base, &config, protocol, &generator);
+        manager.set_start_time_at(&config.benchmark_start_time);
+        manager.inc_reqs_answered(replies[i].reply, true);
+        manager.set_end_time_interrupted(&late);
+        check(manager.get_stats()->get_duration_usec() == replies[i].duration, replies[i].name);
     }
     {
         config.clients_start = 1;
@@ -316,12 +541,144 @@ static void test_cached_reconnect_deadline(evutil_socket_t, short, void *context
     delete protocol;
 }
 
+// A connection rejection (-ERR max number of clients, ...) is not a reply to
+// the request it arrives for (#894): it is neither answered nor processed, so
+// it cannot complete --requests, and the request is uncounted, or kept for
+// replay with --retry-on-error. With --reconnect-on-error the connection
+// reconnects, still marked as rejected since its last reply.
+static void test_connection_rejection_is_not_a_reply(event_base *base, abstract_protocol *protocol)
+{
+    for (int pass = 0; pass < 2; ++pass) {
+        const bool retry = pass != 0;
+        arbitrary_command_list commands;
+        benchmark_config config = {};
+        config.arbitrary_commands = &commands;
+        config.clients = config.threads = 1;
+        config.key_pattern = "S:S";
+        config.protocol = PROTOCOL_REDIS_DEFAULT;
+        config.requests = 1;
+        config.reconnect_on_error = true;
+        config.retry_on_error = retry;
+        config.max_retry_queue = 10;
+        config.max_retries = 5;
+        config.retry_backoff_ms = 100;
+        object_generator generator;
+        generator.set_data_size_fixed(1);
+        client manager(base, &config, protocol, &generator);
+        shard_connection &connection = *manager.get_connections()[0];
+        request *req = new request(rt_set, 0, NULL, 1);
+        req->m_serialized = strdup("*1\r\n$4\r\nPING\r\n");
+        req->m_serialized_len = strlen(req->m_serialized);
+        manager.inc_reqs_generated();
+        connection.handle_connection_rejection(req, "-ERR max number of clients reached");
+        check(manager.get_reqs_answered() == 0, "a rejection is not an answered request");
+        check(manager.get_reqs_processed() == 0, "a rejection is not a processed request");
+        check(!manager.finished(), "a rejection does not complete --requests");
+        check(manager.get_reqs_generated() == (retry ? 1u : 0u),
+              "the rejected request is uncounted, or kept for replay with --retry-on-error");
+        check(connection.has_requests_to_replay() == retry, "--retry-on-error keeps the request for replay");
+        check(connection.is_reconnect_pending(), "--reconnect-on-error reconnects after a rejection");
+        check(connection.setup_failed_since_reply(), "the rejection is a setup failure since the last reply");
+        connection.disconnect();
+    }
+    // Without --reconnect-on-error the connection is dropped, not redialled,
+    // and its thread ends (the event loop is not run here).
+    arbitrary_command_list commands;
+    benchmark_config config = {};
+    config.arbitrary_commands = &commands;
+    config.clients = config.threads = 1;
+    config.key_pattern = "S:S";
+    config.protocol = PROTOCOL_REDIS_DEFAULT;
+    config.requests = 1;
+    object_generator generator;
+    generator.set_data_size_fixed(1);
+    client manager(base, &config, protocol, &generator);
+    shard_connection &connection = *manager.get_connections()[0];
+    manager.inc_reqs_generated();
+    connection.handle_connection_rejection(new request(rt_set, 0, NULL, 1), "-ERR max number of clients reached");
+    check(manager.get_reqs_processed() == 0 && manager.get_reqs_generated() == 0,
+          "without --reconnect-on-error the rejected request is uncounted");
+    check(!connection.is_reconnect_pending(), "without --reconnect-on-error a rejection is not redialled");
+    check(connection.get_thread_end_reason() != NULL, "without --reconnect-on-error a rejection ends the thread");
+}
+
+// A client whose reconnects never succeed, and that counts them.
+class counting_reconnect_client : public client
+{
+public:
+    counting_reconnect_client(event_base *base, benchmark_config *config, abstract_protocol *protocol,
+                              object_generator *generator) :
+            client(base, config, protocol, generator), reconnects(0)
+    {
+    }
+    int reconnect(unsigned int) { return ++reconnects, -1; }
+    unsigned int reconnects;
+};
+
+// #852: a never-started client whose CLUSTER SLOTS retry is clamped to the
+// --test-time deadline must fail the run when that retry fires. On Linux
+// libevent times it with a coarse clock, so it can fire a few ms before the
+// wall-clock deadline; firing it at once stages that skew. Without the fix the
+// early retry reconnects, which in a real run completes setup and lets the
+// client end normally (exit 0).
+void cluster_client_reconnect_timer_handler(evutil_socket_t fd, short what, void *ctx);
+static void test_deadline_retry_fires_early()
+{
+    arbitrary_command_list commands;
+    benchmark_config config = {};
+    config.arbitrary_commands = &commands;
+    config.clients = config.threads = 1;
+    config.key_pattern = "S:S";
+    config.protocol = PROTOCOL_REDIS_DEFAULT;
+    config.test_time = 2;
+    config.reconnect_on_error = true;
+    event_base *base = event_base_new();
+    abstract_protocol *protocol = protocol_factory(config.protocol);
+    steady_state = true;
+    {
+        object_generator generator;
+        counting_reconnect_client manager(base, &config, protocol, &generator);
+        shard_connection &connection = *manager.get_connections()[0];
+        // The deadline is 500 ms away: the 1 s backoff is clamped to it, with
+        // room for a slow (sanitized, loaded) runner to reach the handler.
+        timeval now, ahead = {0, 500000};
+        gettimeofday(&now, NULL);
+        now.tv_sec -= config.test_time;
+        evutil_timeradd(&now, &ahead, &config.benchmark_start_time);
+        connection.reconnect_after_setup_error("CLUSTER SLOTS error", false);
+        check(connection.is_reconnect_pending(), "the CLUSTER SLOTS retry is armed");
+        check(!connection.run_is_over(), "the deadline has not passed by the wall clock");
+        cluster_client_reconnect_timer_handler(-1, EV_TIMEOUT, &connection);
+        event_base_dispatch(base);
+        check(manager.reconnects == 0, "a retry due at the deadline does not reconnect");
+        check(manager.run_failed(), "a never-started client fails the run at the deadline");
+        check(!connection.is_reconnect_pending(), "no retry is armed after the deadline");
+    }
+    {
+        // A retry well before the deadline still reconnects.
+        object_generator generator;
+        counting_reconnect_client manager(base, &config, protocol, &generator);
+        shard_connection &connection = *manager.get_connections()[0];
+        gettimeofday(&config.benchmark_start_time, NULL);
+        connection.reconnect_after_setup_error("CLUSTER SLOTS error", false);
+        check(connection.next_reconnect_delay() == 1.0, "a retry before the deadline keeps its backoff");
+        cluster_client_reconnect_timer_handler(-1, EV_TIMEOUT, &connection);
+        check(manager.reconnects == 1 && !manager.run_failed(), "a retry before the deadline reconnects");
+        check(!connection.run_is_over(), "the run is not over before the deadline");
+    }
+    steady_state = false;
+    delete protocol;
+    event_base_free(base);
+}
+
 int main()
 {
 #ifdef _WIN32
     WSADATA data;
     check(WSAStartup(MAKEWORD(2, 2), &data) == 0, "Winsock startup");
     test_sibling_with_replay(NULL);
+    test_sibling_with_setup_due(NULL);
+    test_deadline_end_waits_for_busy_sibling(NULL);
 #else
     char directory[] = "/tmp/memtier-reconnect-siblings-XXXXXX";
     if (mkdtemp(directory) == NULL) {
@@ -330,9 +687,12 @@ int main()
     }
     std::string path = std::string(directory) + "/socket";
     test_sibling_with_replay(path.c_str());
+    test_sibling_with_setup_due(path.c_str());
+    test_deadline_end_waits_for_busy_sibling(path.c_str());
     rmdir(directory);
 #endif
     test_interrupted_deadline();
+    test_deadline_retry_fires_early();
     event_base *clock_base = event_base_new();
     timeval immediately = {0, 0};
     reconnect_clock_context clock_context = {clock_base, {0, 0}};
@@ -357,6 +717,7 @@ int main()
     abstract_protocol *protocol = protocol_factory(config.protocol);
     check(base != NULL && protocol != NULL, "create event base and protocol");
     if (failures) return 1;
+    test_connection_rejection_is_not_a_reply(base, protocol);
     {
         object_generator generator;
         generator.set_data_size_fixed(1);
@@ -461,6 +822,37 @@ int main()
             check(manager.end_time_set(), "the client was finalized");
             check(manager.run_failed() == required, "all completion paths preserve required replica setup failure");
         }
+    }
+    // A failed connect, or drain-grace expiry, after a reply that was drained
+    // past the deadline ends the client at that reply (#880).
+    config.read_preference = rp_primary;
+    for (unsigned int end_path = 0; end_path < 2; ++end_path) {
+        object_generator generator;
+        generator.set_data_size_fixed(1);
+        two_connection_client manager(base, &config, protocol, &generator);
+        shard_connection &first = *manager.get_connections()[0];
+        // Started long enough ago for the drain grace to expire.
+        struct timeval start = config.benchmark_start_time;
+        start.tv_sec -= 30;
+        manager.mark_started(&start);
+        struct timeval reply = start;
+        reply.tv_sec += config.test_time + 1;
+        manager.inc_reqs_answered(reply, true);
+        if (end_path == 0) {
+            first.end_client_after_run(true);
+        } else {
+            request *req = new request(rt_set, 0, NULL, 1);
+            req->m_serialized = strdup("*1\r\n$4\r\nPING\r\n");
+            req->m_serialized_len = strlen(req->m_serialized);
+            bool queued = first.enqueue_retry(req);
+            check(queued, "a held retry keeps the client waiting through drain grace");
+            if (!queued) delete req;
+            unsigned long long unanswered = 0, held = 0;
+            check(manager.abandon_unanswered_requests(&unanswered, &held), "drain grace expires");
+        }
+        check(manager.end_time_set(), "the client was finalized");
+        check(manager.get_stats()->get_duration_usec() == (config.test_time + 1) * 1000000ULL,
+              "reconnect and drain-grace endings include a reply drained past the deadline");
     }
     delete protocol;
     event_base_free(base);

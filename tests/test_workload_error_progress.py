@@ -38,6 +38,8 @@ class _Handler(socketserver.StreamRequestHandler):
             if peer.mode == 'greeting':
                 self.wfile.write(peer.reply)
                 return
+            if (peer.mode == 'late-reject' and connection > 1) or (peer.mode == 'late-reject-proto' and connection > 2):
+                return  # the server is gone after the rejection
             while not peer.stop.is_set():
                 line = self.rfile.readline()
                 if not line:
@@ -68,6 +70,11 @@ class _Handler(socketserver.StreamRequestHandler):
                 if peer.mode == 'drop' and connection <= 2 and local == 2:
                     return
                 response = peer.reply
+                if (peer.mode in ('late-reject', 'late-reject-again') and local == 20) or \
+                        (peer.mode == 'late-reject-proto' and (local == 20 or connection > 1)):
+                    response = b'-ERR Protocol error: invalid bulk length\r\n'
+                elif peer.mode == 'late-reject-again' and connection > 1:
+                    response = b'-ERR max number of clients reached\r\n'
                 if peer.mode == 'recover' and elapsed >= 3:
                     response = b'+OK\r\n'
                     with peer.lock:
@@ -77,7 +84,7 @@ class _Handler(socketserver.StreamRequestHandler):
                 with peer.lock:
                     peer.replies += 1
                     peer.errors += int(response.startswith(b'-'))
-                if peer.mode == 'close':
+                if peer.mode == 'close' or response.startswith((b'-ERR Protocol error', b'-ERR max number')):
                     return
         except OSError:
             pass  # the benchmark may close while a response is being written
@@ -241,3 +248,113 @@ def test_accept_time_rejections_do_not_count_as_workload_progress(env):
                                           duration=5, authenticate=False)
         env.assertEqual(result.returncode, 1, message=result.stderr[-2000:])
         env.assertEqual(peer.connections, 2)
+
+
+def test_connection_rejections_do_not_complete_the_run(env):
+    # A rejection is not a reply to the request (#894): it must not count as
+    # an op or complete --requests or --test-time, and the run fails at once
+    # (exit 1), before --connection-stage-timeout, whether or not the peer
+    # closes the connection after it.
+    for reply in (b'-ERR Protocol error: invalid bulk length\r\n',
+                  b'-ERR max number of clients reached\r\n',
+                  b'-DENIED Redis is running in protected mode because of dummy settings\r\n'):
+        for mode, extra, duration in (('close', ['--requests=1'], None), ('', ['--requests=5'], None),
+                                      ('', [], 2)):
+            label = '{!r} {} {}'.format(reply, mode or 'open', extra or duration)
+            peer = _Peer(reply, mode=mode)
+            result, stats, failures, elapsed = _run(env, peer, ['--connection-stage-timeout=30'] + extra,
+                                                    duration=duration)
+            env.assertEqual(result.returncode, 1, message=label + ': ' + result.stderr[-2000:])
+            env.assertContains('rejected the connection', result.stderr, message=label)
+            env.assertFalse('connection-stage failures' in result.stderr, message=label)
+            env.assertEqual(stats['ALL STATS']['Totals']['Count'], 0, message=label)
+            env.assertEqual(stats['ALL STATS']['Runtime']['Interrupted'], 'true', message=label)
+            env.assertEqual(stats['ALL STATS']['Totals']['Connection Errors'], 1, message=label)
+            env.assertEqual(peer.connections, 1, message=label)
+            env.assertEqual(peer.replies, 1, message=label)
+            env.assertEqual(failures, [])
+            env.assertLess(elapsed, 8, message=label)
+    # With --reconnect-on-error the rejection is retried, bounded by
+    # --max-reconnect-attempts, and still never completes the run: three
+    # rejections do not complete --requests=1.
+    peer = _Peer(b'-ERR max number of clients reached\r\n')
+    result, stats, _failures, _ = _run(env, peer, ['--requests=1', '--reconnect-on-error',
+                                                '--max-reconnect-attempts=2', '--connection-stage-timeout=0'],
+                                       duration=None)
+    env.assertEqual(result.returncode, 1, message=result.stderr[-2000:])
+    env.assertContains('Maximum reconnection attempts (2) exceeded', result.stderr)
+    env.assertEqual(stats['ALL STATS']['Totals']['Count'], 0)
+    env.assertEqual(stats['ALL STATS']['Runtime']['Interrupted'], 'true')
+    env.assertEqual(peer.connections, 3)
+
+
+def test_rejection_after_replies_is_a_drop(env):
+    # A connection that served replies, then gets -ERR Protocol error (e.g. for
+    # an oversized value), was not refused at setup: it is a dropped
+    # connection. Here the server is then gone, so the reconnects fail until
+    # the --test-time deadline, which ends the run normally, as for any drop.
+    # It is not a setup rejection that fails the run once it is over.
+    peer = _Peer(b'+OK\r\n', mode='late-reject')
+    result, stats, _failures, _ = _run(env, peer, ['--reconnect-on-error', '--connection-stage-timeout=0'])
+    env.assertEqual(result.returncode, 0, message=result.stderr[-2000:])
+    env.assertContains('rejected the connection', result.stderr)
+    env.assertFalse('setup failed' in result.stderr, message=result.stderr[-2000:])
+    env.assertEqual(peer.replies, 20)
+    env.assertEqual(stats['ALL STATS']['Totals']['Count'], 19)
+    env.assertGreater(peer.connections, 1)
+
+
+def test_rejection_on_a_new_connection_is_a_setup_rejection(env):
+    # The connection served replies, then was rejected (a drop). Every
+    # reconnect is then refused at its first request (-ERR max number of
+    # clients): that is a rejected setup again, since disconnect() forgets the
+    # earlier replies. With
+    # unlimited reconnects the run stops at the --test-time deadline and
+    # fails, as for a rejected AUTH (#630), instead of ending normally.
+    peer = _Peer(b'+OK\r\n', mode='late-reject-again')
+    result, stats, _failures, _ = _run(env, peer, ['--reconnect-on-error', '--connection-stage-timeout=0'])
+    env.assertEqual(result.returncode, 1, message=result.stderr[-2000:])
+    env.assertContains('Connection setup failed', result.stderr)
+    env.assertGreater(peer.connections, 1)
+    env.assertEqual(stats['ALL STATS']['Totals']['Count'], 19)
+
+
+def test_array_ending_in_a_rejection_text_is_a_workload_reply(env):
+    # Only a top-level error is a connection rejection: an array's status is
+    # its last element, so this reply (e.g. from EVAL) must count as an op.
+    peer = _Peer(b'*2\r\n:1\r\n-ERR Protocol error: nested element\r\n')
+    result, stats, _failures, _ = _run(env, peer, ['--requests=5'], duration=None)
+    _assert_completed(env, result, stats, peer)
+    env.assertEqual(stats['ALL STATS']['Totals']['Count'], 5)
+    env.assertFalse('rejected the connection' in result.stderr, message=result.stderr[-2000:])
+
+
+def test_protocol_error_on_a_new_connection_is_a_drop(env):
+    # -ERR Protocol error is caused by the request (e.g. a value above
+    # proto-max-bulk-len), not by the connection. Once the client got replies,
+    # it is a dropped connection even as the first reply on a new connection.
+    # Here the reconnect gets it, then the server is gone: the run ends
+    # normally at the --test-time deadline, as for any drop, and is not
+    # failed as a rejected setup (#630).
+    peer = _Peer(b'+OK\r\n', mode='late-reject-proto')
+    result, stats, _failures, _ = _run(env, peer, ['--reconnect-on-error', '--connection-stage-timeout=0'])
+    env.assertEqual(result.returncode, 0, message=result.stderr[-2000:])
+    env.assertEqual(result.stderr.count('rejected the connection'), 2, message=result.stderr[-2000:])
+    env.assertFalse('setup failed' in result.stderr, message=result.stderr[-2000:])
+    env.assertEqual(stats['ALL STATS']['Totals']['Count'], 19)
+    env.assertGreater(peer.connections, 2)
+
+
+def test_protocol_error_before_any_reply_fails_the_run(env):
+    # Every request is answered with -ERR Protocol error (e.g. every value is
+    # above proto-max-bulk-len): the client never gets a reply, so with
+    # unlimited reconnects and the startup timeout disabled the run ends at
+    # the --test-time deadline having measured nothing. That must fail the
+    # run (#894), not end it with exit 0 and Count 0.
+    peer = _Peer(b'-ERR Protocol error: invalid bulk length\r\n', mode='close')
+    result, stats, _failures, _ = _run(env, peer, ['--reconnect-on-error', '--connection-stage-timeout=0'],
+                                       duration=2)
+    env.assertEqual(result.returncode, 1, message=result.stderr[-2000:])
+    env.assertEqual(stats['ALL STATS']['Totals']['Count'], 0)
+    env.assertEqual(stats['ALL STATS']['Runtime']['Interrupted'], 'true')
+    env.assertGreater(peer.connections, 1)

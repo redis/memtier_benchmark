@@ -281,6 +281,73 @@ def test_unowned_timed_run_ends_and_refresh_is_bounded(env):
     env.assertLessEqual(node.slots_calls, 2 + int(node.run_elapsed))
 
 
+def test_sustained_clusterdown_refresh_backs_off(env):
+    """Each client's CLUSTERDOWN refreshes back off 1, 2, 4, 8 s (#834).
+
+    Keyless replies (MULTI, PING) still succeed during CLUSTERDOWN and must
+    not reset the backoff.
+    """
+    workloads = (
+        [],
+        ["--transaction", "--command=MULTI", "--command=SET __key__ __data__", "--command=EXEC"],
+        ["--command=SET __key__ __data__", "--command=PING"],
+    )
+    for workload in workloads:
+        node = _hole()
+        clients = 2
+        stats, failures, _ = _run(
+            env,
+            node,
+            ["--test-time=6", "--rate-limiting=100", "--clients=" + str(clients)] + workload,
+            timeout=15,
+        )
+        env.assertGreater(stats["Totals"]["Count"], 0)
+        if not workload:
+            env.assertEqual(len(failures), len(node.requests))
+        # Per client: bootstrap, then refreshes at 0, 1, 3, 7, 15, ... s. A
+        # fixed 1 s interval allowed 2 + elapsed per client (14-16 here).
+        schedule = [0, 1, 3, 7, 15]
+        per_client = 1 + sum(1 for at in schedule if at <= node.run_elapsed)
+        env.assertGreaterEqual(node.slots_calls, clients * 3, message=str(workload))
+        env.assertLessEqual(node.slots_calls, clients * per_client, message=str(workload))
+
+
+def test_monitor_clusterdown_backoff_resets_on_keyed_line(env):
+    """A keyed --monitor-input line's success resets the backoff; PING's does not."""
+    owned = b"foo"
+    assert _slot(owned) != _slot(b"memtier-1")
+    for second, keyed in (('"SET" "foo" "x"', True), ('"PING"', False)):
+        node = _hole()
+        clients = 2
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "monitor.txt")
+            with open(path, "w") as output:
+                output.write('1.000000 [0 127.0.0.1:12345] "SET" "memtier-1" "x"\n')
+                output.write("1.000001 [0 127.0.0.1:12345] " + second + "\n")
+            stats, _, _ = _run(
+                env,
+                node,
+                [
+                    "--test-time=6",
+                    "--rate-limiting=100",
+                    "--clients=" + str(clients),
+                    "--monitor-input=" + path,
+                    "--command=__monitor_line@__",
+                ],
+                timeout=15,
+            )
+        env.assertGreater(stats["Totals"]["Count"], 0)
+        schedule = [0, 1, 3, 7, 15]
+        backoff = clients * (1 + sum(1 for at in schedule if at <= node.run_elapsed))
+        if keyed:
+            # SET foo succeeds between CLUSTERDOWN replies, so each client
+            # stays on the 1 s gap: bootstrap plus about one per second.
+            env.assertGreaterEqual(node.slots_calls, clients * 5, message=second)
+            env.assertGreater(node.slots_calls, backoff, message=second)
+        else:
+            env.assertLessEqual(node.slots_calls, backoff, message=second)
+
+
 def test_partial_map_preserves_sequential_key_identity(env):
     for pattern in ("S:S", "P:P"):
         node = _Node([(0, 8191)])
