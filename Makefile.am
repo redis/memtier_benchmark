@@ -167,7 +167,8 @@ reconnect_siblings_test_SOURCES = tests/unit/reconnect_siblings_test.cpp
 reconnect_siblings_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
 reconnect_siblings_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g
 reconnect_siblings_test_LDADD = $(filter-out memtier_benchmark-memtier_benchmark.$(OBJEXT),$(memtier_benchmark_OBJECTS)) $(memtier_benchmark_LDADD)
-# Restore parser value retention when a topology refresh completes or disconnects.
+# Restore parser value retention when a topology refresh completes or disconnects,
+# and keep a submitting client's start time on a refresh retry (#833).
 cluster_slots_retention_test_SOURCES = tests/unit/cluster_slots_retention_test.cpp
 cluster_slots_retention_test_CPPFLAGS = -I$(srcdir) $(memtier_benchmark_CPPFLAGS)
 cluster_slots_retention_test_CXXFLAGS = -std=c++11 -Wall -Werror=vla -g

@@ -51,10 +51,18 @@ jobs:
           # branch); a named branch => that maintenance branch on cron.
           ref: ${{ matrix.branch != '__default__' && matrix.branch || '' }}
 
+      # Maintenance branches checked out above may predate the apt helper,
+      # so take it from the workflow revision.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: .apt-helper
+          sparse-checkout: utils/apt_install.sh
+          sparse-checkout-cone-mode: false
+
       - name: Install build dependencies
         run: |
-          sudo apt-get -qq update
-          sudo apt-get install -y \
+          ./.apt-helper/utils/apt_install.sh -y \
             build-essential autoconf automake pkg-config \
             libevent-dev libssl-dev zlib1g-dev
 
@@ -72,7 +80,13 @@ jobs:
           python-version: '3.10'
 
       - name: Install Python test dependencies
-        run: pip install -r ./tests/test_requirements.txt
+        # Release branches checked out above may predate the helper.
+        run: |
+          if [ -x ./utils/install_test_requirements.sh ]; then
+            ./utils/install_test_requirements.sh
+          else
+            pip install -r ./tests/test_requirements.txt
+          fi
 
       - name: Install Redis
         run: |
@@ -81,8 +95,7 @@ jobs:
           echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] \
             https://packages.redis.io/deb $(lsb_release -cs) main" | \
             sudo tee /etc/apt/sources.list.d/redis.list
-          sudo apt-get -qq update
-          sudo apt-get install -y redis
+          ./.apt-helper/utils/apt_install.sh -y redis
           sudo service redis-server stop || true
 
       - name: Start local Redis

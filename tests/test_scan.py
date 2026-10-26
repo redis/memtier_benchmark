@@ -8,10 +8,14 @@ options, including error validation for invalid configurations.
 """
 import json
 import os
+import socketserver
+import subprocess
 import tempfile
+import threading
 import logging
 
 from include import (
+    MEMTIER_BINARY,
     get_default_memtier_config,
     add_required_env_arguments,
     addTLSArgs,
@@ -863,3 +867,66 @@ def test_scan_incremental_request_count(env):
                 debugPrintMemtierOnError(run_config, env)
     finally:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Test: aggregate cursor element in the SCAN reply (#848)
+# ---------------------------------------------------------------------------
+
+class _ScanPeer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, replies):
+        super().__init__(("127.0.0.1", 0), _ScanHandler)
+        # SCAN replies in order; the last one repeats.
+        self.replies = replies
+        self.cursors = []
+        self.lock = threading.Lock()
+
+
+class _ScanHandler(socketserver.StreamRequestHandler):
+    def handle(self):
+        peer = self.server
+        try:
+            while True:
+                line = self.rfile.readline()
+                if not line:
+                    return
+                args = []
+                for _ in range(int(line[1:])):
+                    size = self.rfile.readline()
+                    args.append(self.rfile.read(int(size[1:]) + 2)[:-2])
+                if args[0].upper() == b"SCAN":
+                    with peer.lock:
+                        peer.cursors.append(args[1])
+                        reply = peer.replies[min(len(peer.cursors), len(peer.replies)) - 1]
+                else:
+                    reply = b"+OK\r\n"
+                self.wfile.write(reply)
+                self.wfile.flush()
+        except (ConnectionResetError, BrokenPipeError):
+            pass
+
+
+def test_scan_incremental_aggregate_cursor(env):
+    """A SCAN reply whose cursor element is an array restarts at cursor 0.
+
+    memtier used to call as_bulk() on it and abort on its assert (#848).
+    """
+    replies = [b"*2\r\n$2\r\n17\r\n*0\r\n",  # cursor 17
+               b"*2\r\n*0\r\n*0\r\n",          # cursor is an empty array
+               b"*2\r\n$1\r\n0\r\n*0\r\n"]   # cursor 0
+    with _ScanPeer(replies) as peer:
+        serving = threading.Thread(target=peer.serve_forever, daemon=True)
+        serving.start()
+        args = [MEMTIER_BINARY, "-s", "127.0.0.1", "-p", str(peer.server_address[1]),
+                "--command=SCAN 0 COUNT 10", "--scan-incremental-iteration",
+                "-n", "4", "-c", "1", "-t", "1", "--hide-histogram"]
+        try:
+            process = subprocess.run(args, capture_output=True, text=True, timeout=30)
+        finally:
+            peer.shutdown()
+            serving.join(timeout=5)
+    env.assertEqual(process.returncode, 0, message=process.stderr[-3000:])
+    env.assertEqual(peer.cursors, [b"0", b"17", b"0", b"0"])

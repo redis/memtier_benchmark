@@ -4,8 +4,8 @@ name: TSAN (ThreadSanitizer)
 # This workflow builds memtier_benchmark with TSAN enabled and runs
 # tests to detect data races and threading issues.
 #
-# NOTE: TSAN currently detects known data races in the codebase.
-# This workflow is informational and will not fail the build.
+# Known benign races are suppressed in tsan_suppressions.txt; any other TSAN
+# report or test failure fails the workflow.
 # See: https://github.com/google/sanitizers/issues/1716 for TSAN/ASLR issues
 
 on:
@@ -45,8 +45,7 @@ jobs:
 
     - name: Install build dependencies
       run: |
-        sudo apt-get -qq update
-        sudo apt-get install -y \
+        ./utils/apt_install.sh -y \
           build-essential \
           autoconf \
           automake \
@@ -69,6 +68,28 @@ jobs:
     # A linked runtime alone does not prove C translation units were instrumented.
     - name: Verify HDR C instrumentation
       run: nm -u deps/hdr_histogram/memtier_benchmark-hdr_histogram.o | grep -E '__tsan_(read|write)'
+
+    # Unit tests inherit the sanitizer CXXFLAGS/LDFLAGS set by configure.
+    # Same ASLR workaround and suppressions as the RLTest jobs.
+    - name: Run unit tests
+      timeout-minutes: 15
+      run: |
+        export TSAN_OPTIONS="suppressions=$(pwd)/tsan_suppressions.txt"
+        if ! setarch `uname -m` -R make -j check; then
+          cat test-suite.log
+          exit 1
+        fi
+
+    - name: Upload unit test logs
+      if: failure()
+      uses: actions/upload-artifact@v5
+      with:
+        name: memtier-tsan-unit-test-logs
+        path: |
+          test-suite.log
+          *_test.log
+        if-no-files-found: ignore
+        retention-days: 7
 
     - name: Upload build artifact
       uses: actions/upload-artifact@v5
@@ -114,7 +135,7 @@ jobs:
             tls: true
           - name: "Single Endpoint: TCP TLS (misc)"
             env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", VERBOSE: "1",
-                   TEST: "test_arbitrary_command_misses.py test_crash_handler_integration.py test_json_output_integrity.py test_large_key_prefix.py test_miss_rate_tracking.py test_realtime_latencies.py test_resp_response_fuzzer.py test_retry_on_error.py test_cluster_redirect_stats.py test_sigpipe_immunity.py test_sigpipe_tls_rst.py test_statsd.py test_tls_logging.py test_prometheus.py test_prometheus_redaction.py test_config_password_redaction.py test_data_size_pattern_command.py test_closed_std_fds.py" }
+                   TEST: "test_arbitrary_command_misses.py test_crash_handler_integration.py test_json_output_integrity.py test_large_key_prefix.py test_miss_rate_tracking.py test_realtime_latencies.py test_resp_response_fuzzer.py test_retry_on_error.py test_cluster_redirect_stats.py test_sigpipe_immunity.py test_sigpipe_tls_rst.py test_statsd.py test_tls_logging.py test_connection_error_types.py test_prometheus.py test_prometheus_redaction.py test_config_password_redaction.py test_data_size_pattern_command.py test_closed_std_fds.py" }
             tls: true
           # TODO: v1.2 coverage deferred to nightly when schedule added
           # "OSS TCP TLS v1.3" was split into per-test-file cells (round-37).
@@ -136,7 +157,7 @@ jobs:
             tls: true
           - name: "OSS TCP TLS v1.3 (misc)"
             env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "1", TLS_PROTOCOLS: "TLSv1.3", VERBOSE: "1",
-                   TEST: "test_arbitrary_command_misses.py test_crash_handler_integration.py test_json_output_integrity.py test_large_key_prefix.py test_miss_rate_tracking.py test_realtime_latencies.py test_resp_response_fuzzer.py test_retry_on_error.py test_cluster_redirect_stats.py test_sigpipe_immunity.py test_sigpipe_tls_rst.py test_statsd.py test_tls_logging.py test_prometheus.py test_prometheus_redaction.py test_config_password_redaction.py test_data_size_pattern_command.py test_closed_std_fds.py" }
+                   TEST: "test_arbitrary_command_misses.py test_crash_handler_integration.py test_json_output_integrity.py test_large_key_prefix.py test_miss_rate_tracking.py test_realtime_latencies.py test_resp_response_fuzzer.py test_retry_on_error.py test_cluster_redirect_stats.py test_sigpipe_immunity.py test_sigpipe_tls_rst.py test_statsd.py test_tls_logging.py test_connection_error_types.py test_prometheus.py test_prometheus_redaction.py test_config_password_redaction.py test_data_size_pattern_command.py test_closed_std_fds.py" }
             tls: true
           - name: "OSS-CLUSTER API: TCP Plaintext (shard 1/2)"
             env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", VERBOSE: "1", PARALLELISM: "2" }
@@ -161,7 +182,7 @@ jobs:
             tls: true
           - name: "OSS-CLUSTER API: TCP TLS (misc)"
             env: { OSS_STANDALONE: "0", OSS_CLUSTER: "1", TLS: "1", VERBOSE: "1", PARALLELISM: "2",
-                   TEST: "test_monitor_cluster.py test_monitor_cluster_backpressure.py test_cli_fuzz_phase1.py test_cli_validation_command.py test_cli_validation_count_flags.py test_cli_validation_read_preference.py test_cli_validation_reconnect_backoff.py test_cli_validation_retry_backoff.py test_cli_validation_run_count.py test_cli_validation_size.py test_crash_handler_integration.py test_json_output_integrity.py test_realtime_latencies.py test_resp_response_fuzzer.py test_retry_on_error.py test_cluster_redirect_stats.py test_sigpipe_immunity.py test_sigpipe_tls_rst.py test_statsd.py test_tls_logging.py test_prometheus.py" }
+                   TEST: "test_monitor_cluster.py test_monitor_cluster_backpressure.py test_cli_fuzz_phase1.py test_cli_validation_command.py test_cli_validation_count_flags.py test_cli_validation_read_preference.py test_cli_validation_reconnect_backoff.py test_cli_validation_retry_backoff.py test_cli_validation_run_count.py test_cli_validation_size.py test_crash_handler_integration.py test_json_output_integrity.py test_realtime_latencies.py test_resp_response_fuzzer.py test_retry_on_error.py test_cluster_redirect_stats.py test_sigpipe_immunity.py test_sigpipe_tls_rst.py test_statsd.py test_tls_logging.py test_connection_error_types.py test_prometheus.py" }
             tls: true
           - name: "STRESS: Standalone TCP Plaintext"
             env: { OSS_STANDALONE: "1", OSS_CLUSTER: "0", TLS: "0", VERBOSE: "1", STRESS: "1" }
@@ -171,7 +192,6 @@ jobs:
             tls: false
     runs-on: ubuntu-latest
     name: TSAN ${{ matrix.test-config.name }}
-    continue-on-error: true  # Don't fail build on known races
     steps:
     - uses: actions/checkout@v5
 
@@ -185,8 +205,7 @@ jobs:
 
     - name: Install dependencies
       run: |
-        sudo apt-get -qq update
-        sudo apt-get install -y pkg-config libevent-dev libssl-dev
+        ./utils/apt_install.sh -y pkg-config libevent-dev libssl-dev
 
     - name: Setup Python
       uses: actions/setup-python@v6
@@ -195,14 +214,13 @@ jobs:
         architecture: x64
 
     - name: Install Python test dependencies
-      run: pip install -r ./tests/test_requirements.txt
+      run: ./utils/install_test_requirements.sh
 
     - name: Install Redis
       run: |
         curl -fsSL https://packages.redis.io/gpg | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
         echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/redis.list
-        sudo apt-get -qq update
-        sudo apt-get install redis
+        ./utils/apt_install.sh redis
         sudo service redis-server stop
 
     - name: Increase connection limit
