@@ -222,10 +222,12 @@ protected:
     mbulk_size_el *m_current_mbulk;
     bool m_resp3;
     bool m_attribute;
-    // Drain mode for RESP3 server-pushed frames ('>'). Pushes are
+    // Drain mode for RESP3 server-pushed frames ('>') and attributes ('|',
+    // always nested, with m_attribute set; #458). Pushes are
     // out-of-band (pubsub, keyspace notifications, client tracking
     // invalidations) and must not be delivered as a reply to any
-    // in-flight command. While true the parser still walks the frame
+    // in-flight command; attributes only decorate the element after them.
+    // While true the parser still walks the frame
     // to advance the read buffer, but suppresses all writes into
     // m_last_response (status, mbulk tree, value, hits).
     // TODO: full out-of-band routing — surface push frames to a
@@ -233,10 +235,10 @@ protected:
     bool m_push;
     // A push nested in an aggregate (not valid RESP3, which only sends pushes
     // at top level) fills one slot of the enclosing aggregate and is drained
-    // in its own scope: the enclosing slot count and attribute flag are saved
-    // here and restored when the push ends (#847).
+    // in its own scope: the enclosing slot count is saved here and restored
+    // when the push ends (#847). An attribute is drained the same way (#458),
+    // so no attribute can enclose a nested scope.
     bool m_push_nested;
-    bool m_push_outer_attribute;
     unsigned int m_push_outer_bulks;
     // Per-response state for alloc-free ArrayPerElementNulls miss tracking
     // (m_track_elem_misses). m_tracking turns true once the reply's top-level
@@ -276,7 +278,6 @@ public:
             m_attribute(false),
             m_push(false),
             m_push_nested(false),
-            m_push_outer_attribute(false),
             m_push_outer_bulks(0),
             m_tracking(false),
             m_nested_remaining(0)
@@ -326,7 +327,6 @@ void redis_protocol::reset_state()
     m_attribute = false;
     m_push = false;
     m_push_nested = false;
-    m_push_outer_attribute = false;
     m_push_outer_bulks = 0;
     m_bulk_len = 0;
     m_response_len = 0;
@@ -650,29 +650,28 @@ bool redis_protocol::response_ended()
     if (m_push && m_push_nested) {
         // A nested push ended: resume the enclosing aggregate. Its bytes are
         // part of this reply, so m_response_len is kept.
+        // An attribute ended the same way: it only prefixes the element that
+        // follows, so the reply goes on even at top level.
+        bool was_attribute = m_attribute;
         m_push = false;
         m_push_nested = false;
-        m_attribute = m_push_outer_attribute;
+        m_attribute = false;
         m_total_bulks_count = m_push_outer_bulks;
-        if (m_total_bulks_count != 0) return false;
+        if (m_total_bulks_count != 0 || was_attribute) return false;
     }
 
     bool was_push = m_push;
-    bool was_attribute = m_attribute;
 
-    if (was_attribute) m_attribute = false;
     // A RESP3 push frame just finished draining. The actual reply to
     // the in-flight command (if any) is still pending — keep reading
-    // and do NOT signal a complete reply for the push.
-    // Also handles the case where an attribute (|) is nested inside a
-    // push frame (>) and both complete at the same call: clear BOTH
-    // flags together so m_push does not remain set and eat the next reply.
+    // and do NOT signal a complete reply for the push. (An attribute is
+    // always drained in a nested scope, handled above.)
     if (was_push) {
         m_push = false;
         m_response_len = 0; // reset: push bytes don't count toward the next reply
     }
 
-    if (was_push || was_attribute) return false;
+    if (was_push) return false;
     return true;
 }
 
@@ -733,9 +732,9 @@ int redis_protocol::parse_response(void)
                 // parent.
                 long long outstanding = m_total_bulks_count > 0 ? (long long) m_total_bulks_count - 1 : 0;
                 // A tracked nested aggregate also adds count - 1 to
-                // m_nested_remaining. That is not always bounded by
-                // m_total_bulks_count: a nested attribute takes a parent slot
-                // without being tracked. Bound it directly.
+                // m_nested_remaining. Don't rely on m_total_bulks_count to
+                // bound it (an attribute, drained in its own scope, takes no
+                // parent slot); bound it directly.
                 bool tracked_nested = m_track_elem_misses && m_tracking && m_nested_remaining > 0 &&
                                       m_total_bulks_count > 0 && !m_push && line[0] != '|' && line[0] != '>';
                 if (tracked_nested && (long long) m_nested_remaining - 1 > outstanding) {
@@ -757,16 +756,25 @@ int redis_protocol::parse_response(void)
                 // a reply at all.
                 bool top_level_aggregate = (m_total_bulks_count == 0);
 
-                // in case of nested mbulk, the mbulk is one of the total bulks
-                if (m_total_bulks_count > 0) {
+                // in case of nested mbulk, the mbulk is one of the total bulks.
+                // An attribute (|) is not: it decorates the element after it.
+                if (m_total_bulks_count > 0 && line[0] != '|') {
                     m_total_bulks_count--;
                 }
 
                 if (line[0] == '|') {
-                    // Nested attribute?
-                    assert(!m_attribute);
-
-                    m_attribute = true;
+                    // Attribute: drain it like a nested push, in its own scope,
+                    // so it never reaches the reply (status, kept mbulk tree,
+                    // hits, miss tracking) and the element it decorates parses
+                    // as if it were not there (#458). Anything inside it,
+                    // including another attribute or a push, is drained with it.
+                    if (!m_push) {
+                        m_attribute = true;
+                        m_push = true;
+                        m_push_nested = true;
+                        m_push_outer_bulks = m_total_bulks_count;
+                        m_total_bulks_count = 0;
+                    }
                 }
 
                 if (line[0] == '>' && !m_push) {
@@ -785,18 +793,16 @@ int redis_protocol::parse_response(void)
                             m_current_mbulk = m_current_mbulk->get_next_mbulk();
                         }
                         m_push_nested = true;
-                        m_push_outer_attribute = m_attribute;
                         m_push_outer_bulks = m_total_bulks_count;
-                        m_attribute = false;
                         m_total_bulks_count = 0;
                     }
                     m_push = true;
                 }
 
                 // Record the reply body's declared element count (count is now
-                // null-clamped to >=0 and map-doubled). '|' is the attribute
-                // prefix, not the reply body; '>' (m_push) is out-of-band.
-                if (top_level_aggregate && !m_push && line[0] != '|') {
+                // null-clamped to >=0 and map-doubled). An attribute ('|') or a
+                // push ('>') has set m_push: neither is the reply body.
+                if (top_level_aggregate && !m_push) {
                     m_last_response.set_top_array_len(count);
                 }
 
@@ -804,7 +810,7 @@ int redis_protocol::parse_response(void)
                 // The top-level array container starts tracking; a nested
                 // aggregate is itself an element -- a hit iff it is non-empty
                 // (count>0). See the m_tracking/m_nested_remaining contract.
-                if (m_track_elem_misses && !m_push && line[0] != '|') {
+                if (m_track_elem_misses && !m_push) {
                     if (top_level_aggregate) {
                         m_tracking = true;
                         m_nested_remaining = 0;

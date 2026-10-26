@@ -203,6 +203,100 @@ static void check_reply_pair(const char *name, const char *reply1, const char *r
     evbuffer_free(output);
 }
 
+// Issue #458: an attribute (|) decorates the element after it, at top level or
+// nested, and is drained without reaching the reply: not into the kept mbulk
+// tree, not into hits or miss tracking, and without taking a slot of the
+// enclosing aggregate.
+static abstract_protocol *parse_one_resp3(const char *wire, bool keep, bool track, evbuffer *input)
+{
+    abstract_protocol *protocol = protocol_factory(PROTOCOL_RESP3);
+    protocol->set_buffers(input, input);
+    protocol->configure_protocol(PROTOCOL_RESP3);
+    evbuffer_drain(input, evbuffer_get_length(input));
+    protocol->set_keep_value(keep);
+    protocol->set_track_elem_misses(track);
+    evbuffer_add(input, wire, strlen(wire));
+    check(protocol->parse_response() == 1 && evbuffer_get_length(input) == 0, "reply with attribute completes");
+    return protocol;
+}
+
+static bool kept_status(mbulk_size_el *m, size_t i, const char *value)
+{
+    return m && m->mbulks_elements.size() > i && m->mbulks_elements[i]->is_bulk() &&
+           strcmp(m->mbulks_elements[i]->as_bulk()->value, value) == 0;
+}
+
+static void check_attribute_frames()
+{
+    for (int keep = 0; keep <= 1; ++keep) {
+        check_reply_pair("|0 *1 +a", "|0\r\n*1\r\n+a\r\n", "+OK\r\n", 0, false, keep);
+        check_reply_pair("|1 |1 +k +v +k +v +OK", "|1\r\n|1\r\n+k\r\n+v\r\n+k\r\n+v\r\n+OK\r\n", "+OK\r\n", 0, false,
+                         keep);
+        check_reply_pair("*2 |1 +k +v +a *1 +b", "*2\r\n|1\r\n+k\r\n+v\r\n+a\r\n*1\r\n+b\r\n", "+OK\r\n", 0, false,
+                         keep);
+        check_reply_pair("|1 $1 k $1 v $2 hi", "|1\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nhi\r\n", "+OK\r\n", 1, false, keep);
+        check_reply_pair("%1 +key |1 +k +v +val", "%1\r\n+key\r\n|1\r\n+k\r\n+v\r\n+val\r\n", "+OK\r\n", 0, false,
+                         keep);
+        // An error inside an attribute is not the reply's error; one after it is.
+        check_reply_pair("|1 +k -ERR x +OK", "|1\r\n+k\r\n-ERR x\r\n+OK\r\n", "+OK\r\n", 0, false, keep);
+        check_reply_pair("|1 +k +v -ERR x", "|1\r\n+k\r\n+v\r\n-ERR x\r\n", "+OK\r\n", 0, true, keep);
+        // An attribute inside a push takes none of the push's slots.
+        check_reply_pair("*2 >2 +a |1 +k +v +b +c", "*2\r\n>2\r\n+a\r\n|1\r\n+k\r\n+v\r\n+b\r\n+c\r\n", "+OK\r\n", 0,
+                         false, keep);
+    }
+
+    evbuffer *input = evbuffer_new();
+    // A top-level push holding an attribute is drained whole: +b is part of
+    // it, so the reply is +OK.
+    abstract_protocol *protocol = parse_one_resp3(">2\r\n+a\r\n|1\r\n+k\r\n+v\r\n+b\r\n+OK\r\n", false, false, input);
+    check(strcmp(protocol->get_response()->get_status(), "+OK") == 0,
+          "attribute inside a top-level push is drained with it: reply is +OK");
+    delete protocol;
+
+    protocol = parse_one_resp3("|0\r\n*1\r\n+a\r\n", true, false, input);
+    mbulk_size_el *root = protocol->get_response()->get_mbulk_value();
+    check(root && root->upper_level == NULL && root->mbulks_elements.size() == 1 && kept_status(root, 0, "+a"),
+          "top-level attribute is not kept: |0 *1 +a keeps [+a]");
+    delete protocol;
+
+    protocol = parse_one_resp3("|1\r\n|1\r\n+k\r\n+v\r\n+k\r\n+v\r\n+OK\r\n", true, false, input);
+    check(protocol->get_response()->get_mbulk_value() == NULL &&
+              strcmp(protocol->get_response()->get_status(), "+OK") == 0,
+          "attribute inside an attribute is drained with it");
+    delete protocol;
+
+    protocol = parse_one_resp3("*2\r\n|1\r\n+k\r\n+v\r\n+a\r\n*1\r\n+b\r\n", true, false, input);
+    root = protocol->get_response()->get_mbulk_value();
+    check(root && root->mbulks_elements.size() == 2 && kept_status(root, 0, "+a") &&
+              root->mbulks_elements[1]->is_mbulk_size() &&
+              kept_status(root->mbulks_elements[1]->as_mbulk_size(), 0, "+b"),
+          "attribute on an array element is not kept: keeps [+a, [+b]]");
+    delete protocol;
+
+    protocol = parse_one_resp3("%1\r\n+key\r\n|1\r\n+k\r\n+v\r\n+val\r\n", true, false, input);
+    root = protocol->get_response()->get_mbulk_value();
+    check(root && root->mbulks_elements.size() == 2 && kept_status(root, 0, "+key") && kept_status(root, 1, "+val"),
+          "attribute inside a map is not kept: keeps {+key: +val}");
+    delete protocol;
+
+    // EmptyCollection: an attributed empty array is still empty.
+    for (int keep = 0; keep <= 1; ++keep) {
+        protocol = parse_one_resp3("|1\r\n+k\r\n+v\r\n*0\r\n", keep, false, input);
+        root = protocol->get_response()->get_mbulk_value();
+        check(protocol->get_response()->get_top_array_len() == 0, "attribute before *0 still has top array length 0");
+        check(!keep || (root && root->mbulks_elements.empty()), "attribute before *0 keeps an empty array");
+        delete protocol;
+    }
+
+    // ArrayPerElementNulls: attribute pairs are not elements.
+    protocol = parse_one_resp3("*2\r\n|1\r\n+k\r\n+v\r\n$-1\r\n$1\r\nx\r\n", false, true, input);
+    const std::vector<uint8_t> &hits = protocol->get_response()->get_elem_hits();
+    check(protocol->get_response()->get_top_array_len() == 2 && hits.size() == 2 && hits[0] == 0 && hits[1] == 1,
+          "attribute on an array element is not tracked: miss, hit");
+    delete protocol;
+    evbuffer_free(input);
+}
+
 // Issue #847: a push frame nested in an aggregate (not valid RESP3, which only
 // sends pushes at top level) fills one slot of the enclosing aggregate and is
 // drained without touching that aggregate's counters, so reply/request
@@ -382,8 +476,8 @@ static void check_length_limits()
           "nested counts up to INT_MAX outstanding wait");
     check(parse_reply(PROTOCOL_RESP2, "*2\r\n*2147483646\r\n*3\r\n", true) == -1,
           "reject nested counts above INT_MAX outstanding");
-    // A nested attribute takes a parent slot without being tracked, so the
-    // tracked nested bookkeeping can exceed the outstanding element count.
+    // A nested attribute takes no parent slot and is not tracked (#458); the
+    // tracked nested bookkeeping is still bounded.
     check(parse_reply(PROTOCOL_RESP3, "*1\r\n*2\r\n|0\r\n*2147483647\r\n", true) == -1,
           "reject nested count overflowing tracked elements after a nested attribute");
     check(parse_reply(PROTOCOL_RESP3, "*1\r\n*2\r\n|0\r\n*2147483646\r\n", true) == 0,
@@ -399,5 +493,6 @@ int main()
     check_length_limits();
     check_nested_push_keep_value();
     check_nested_push_framing();
+    check_attribute_frames();
     return failures ? 1 : 0;
 }
