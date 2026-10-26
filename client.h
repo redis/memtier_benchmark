@@ -78,6 +78,9 @@ protected:
     bool m_end_set;
     // A connection ended the run as failed (see fail_run()).
     bool m_run_failed;
+    // A connection tried to end the client after the run, but a sibling was
+    // still busy (see wait_for_siblings()).
+    bool m_end_waits_for_siblings;
 
     // test related
     benchmark_config *m_config;
@@ -86,6 +89,7 @@ protected:
 
     unsigned long long m_reqs_processed;          // requests processed (final responses received)
     unsigned long long m_reqs_answered;           // responses received, including ones retried
+    struct timeval m_last_reply_time = {0, 0};    // when the last final one was read
     unsigned long long m_reqs_generated;          // requests generated (wait for responses)
     unsigned int m_set_ratio_count;               // number of sets counter (overlaps on ratio)
     unsigned int m_get_ratio_count;               // number of gets counter (overlaps on ratio)
@@ -172,11 +176,16 @@ public:
     // one may still end the client normally, so the failure is recorded here.
     void fail_run(void) { m_run_failed = true; }
     bool run_failed(void) const { return m_run_failed; }
+    // A connection is done after the run and would end the client, but
+    // another connection may still send (a redial still connecting, say):
+    // that one ends the client itself, or the drain grace does.
+    void wait_for_siblings(void) { m_end_waits_for_siblings = true; }
     // Ends a client whose --test-time deadline passed TEST_TIME_DRAIN_GRACE_SECS
-    // ago with replies still pending, or with --retry-on-error retries it
-    // keeps resending; returns whether it did. Adds the workload requests
-    // that got no reply to *unanswered (setup commands are dropped but not
-    // counted) and the requests held for retry to *held.
+    // ago with replies still pending, with --retry-on-error retries it keeps
+    // resending, or whose end waits for a sibling (wait_for_siblings()), such
+    // as a redial whose SYN is dropped; returns whether it did. Adds the
+    // workload requests that got no reply to *unanswered (setup commands are
+    // dropped but not counted) and the requests held for retry to *held.
     bool abandon_unanswered_requests(unsigned long long *unanswered, unsigned long long *held);
 
     virtual get_key_response get_key_for_conn(unsigned int command_index, unsigned int conn_id,
@@ -198,7 +207,11 @@ public:
 
     unsigned long long get_reqs_answered() { return m_reqs_answered; }
 
-    void inc_reqs_answered() { m_reqs_answered++; }
+    void inc_reqs_answered(const struct timeval &timestamp, bool is_final)
+    {
+        m_reqs_answered++;
+        if (is_final) m_last_reply_time = timestamp;
+    }
 
     unsigned long long get_reqs_generated() { return m_reqs_generated; }
 
@@ -226,7 +239,24 @@ public:
     virtual void handle_response(unsigned int conn_id, struct timeval timestamp, request *request,
                                  protocol_response *response);
     virtual bool finished(void);
+    virtual bool deadline_passed_by(const struct timeval &now);
     virtual bool all_connections_idle(void);
+    virtual bool holds_retries(void);
+    // Whether a connection is up with nothing left to send
+    // (shard_connection::may_send_again()) while another one's connect is in
+    // progress: past the deadline, the idle one waits for that sibling to end
+    // the client (shard_connection::fill_pipeline()), paused without
+    // --rate-limiting. A sibling waiting for its reconnect timer, or a client
+    // whose connections are all down, is left to the reconnect logic (#669).
+    bool idle_connection_waits_for_connect(void);
+    // The end of a started --test-time client whose deadline, its own start
+    // plus --test-time, lies before now: the deadline or its last reply,
+    // whichever is later, and no later than now. Replies drained after the
+    // deadline count; the idle time after the last one does not. False if
+    // the deadline has not passed by now. (run_deadline() times a client
+    // with no reply from the benchmark's start: a client that started late
+    // would get a shorter interval and an inflated Ops/sec.)
+    bool test_time_end(const struct timeval &now, struct timeval *end);
     virtual void set_start_time();
     // set_start_time() at a given time, e.g. the benchmark's start.
     void set_start_time_at(struct timeval *start_time) { m_stats.set_start_time(start_time); }

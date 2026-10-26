@@ -1,4 +1,7 @@
+import contextlib
+import functools
 import glob
+import inspect
 import os
 import re
 import logging
@@ -55,6 +58,15 @@ def _option_values(args, short, long):
     return values
 
 
+def env_password(env):
+    """
+    The password the env's servers require (run_tests.sh REDIS_PASSWORD,
+    RLTest --oss_password), or None. Read it here rather than from a redis-py
+    connection's kwargs, so every test agrees on where it comes from.
+    """
+    return env.getMasterNodesList()[0].get("password") or None
+
+
 def memtier_auth_args(env, args=()):
     """
     --authenticate with the env's password (run_tests.sh REDIS_PASSWORD), for
@@ -63,7 +75,7 @@ def memtier_auth_args(env, args=()):
     with userinfo, or when args select a memcache protocol (which cannot AUTH
     as a Redis client). As in memtier, the last --uri and --protocol win.
     """
-    password = env.getMasterNodesList()[0].get("password")
+    password = env_password(env)
     args = [str(arg) for arg in args]
     if not password or _option_values(args, "-a", "--authenticate"):
         return []
@@ -74,6 +86,185 @@ def memtier_auth_args(env, args=()):
     if protocols and protocols[-1].startswith("memcache"):
         return []
     return ["--authenticate", password]
+
+
+# NOAUTH guard (#842). memtier counts error replies as completed requests and
+# exits 0, so a test whose memtier command line forgets --authenticate still
+# passes on a password-protected env while every request is answered -NOAUTH.
+# When the env has a password, every RLTest function test that takes an env is
+# wrapped: it snapshots errorstat_NOAUTH on each of the env's servers (all
+# shards, and replicas) before the test and fails the test if any count grew.
+# Checking the servers catches every client (Benchmark, hand-built Popen
+# command lines, redis-py), not only the runs that go through mb.py.
+NOAUTH_GUARD_ATTR = "allow_noauth"
+
+
+def allow_noauth(reason):
+    """
+    Opt a test out of the NOAUTH guard because it is unauthenticated against
+    the env's servers on purpose (memcache protocols, missing or wrong
+    credentials under test). The reason is required and shows in the code.
+    """
+    if not reason:
+        raise ValueError("allow_noauth needs a reason")
+
+    def mark(test):
+        setattr(test, NOAUTH_GUARD_ATTR, reason)
+        return test
+    return mark
+
+
+def _noauth_nodes(env):
+    """(label, connect) for each server of the env: every shard's master and replicas."""
+    runner = getattr(env, "envRunner", None)
+    shards = getattr(runner, "shards", None) or [runner]
+    nodes = []
+    for index, shard in enumerate(shards, 1):
+        nodes.append(("shard {} master".format(index), shard.getConnection))
+        if getattr(shard, "useSlaves", False):
+            for replica in range(len(getattr(shard, "slavePorts", None) or [])):
+                nodes.append(("shard {} replica {}".format(index, replica + 1),
+                              functools.partial(shard.getSlaveConnection, replica)))
+    return nodes
+
+
+def bounded_client(conn, timeout=5.0):
+    """
+    Make a redis-py client fail fast: no retries and a socket timeout, so a
+    stopped server costs one refused connect rather than redis-py's retry
+    backoff, and a hung one cannot block for longer than `timeout`. Changes
+    the client's own pool settings and drops connections it already opened
+    with the old ones, so use it on a client of your own (RLTest returns a new
+    one from every getConnection()).
+    """
+    from redis.backoff import NoBackoff
+    from redis.retry import Retry
+
+    pool = getattr(conn, "connection_pool", None)
+    if pool is not None:
+        # set_retry also reaches the pool's existing connections, which keep
+        # their own retry. Those connections keep the socket timeout they were
+        # made with (redis-py's default is 5 s, as is ours); disconnecting
+        # them still drops a socket a command may have left mid-reply.
+        pool.set_retry(Retry(NoBackoff(), 0))
+        pool.connection_kwargs["socket_timeout"] = timeout
+        if "socket_connect_timeout" in pool.connection_kwargs:
+            pool.connection_kwargs["socket_connect_timeout"] = timeout
+        pool.disconnect()
+    return conn
+
+
+def _read_noauth(env):
+    """({label: errorstat_NOAUTH}, {label: error}) for each server of the env."""
+    import redis
+
+    counts, errors = {}, {}
+    for label, connect in _noauth_nodes(env):
+        conn = None
+        try:
+            conn = bounded_client(connect())
+            stats = conn.info("errorstats").get("errorstat_NOAUTH", {})
+            counts[label] = int(stats.get("count", 0))
+        except (redis.exceptions.RedisError, OSError) as error:
+            # A server that is down or refuses us. Anything else, such as an
+            # RLTest API change, raises rather than leave a server unchecked.
+            errors[label] = error
+        finally:
+            if conn is not None:
+                conn.close()
+    return counts, errors
+
+
+def noauth_counts(env):
+    """
+    errorstat_NOAUTH per server of the env. A server the env's password
+    cannot reach (stopped, or requirepass changed by the test) is left out.
+    """
+    return _read_noauth(env)[0]
+
+
+def _check_noauth(env, before):
+    after, errors = _read_noauth(env)
+    for label in sorted(set(before) - set(after)):
+        # Stopped during the test (a replica shut down on purpose, say): its
+        # NOAUTH count is gone, so it cannot be checked.
+        env.debugPrint("NOAUTH guard: {} not checked after the test: {}".format(
+            label, errors.get(label, "not found")), force=True)
+    for label, count in sorted(after.items()):
+        # Unreadable before the test but readable after it: all of its NOAUTH
+        # replies count as new, though some may predate this test.
+        start = before.get(label, 0)
+        # A server restarted during the test starts counting from zero.
+        new = count - start if count >= start else count
+        if new:
+            env.assertEqual(new, 0, message=(
+                "{} answered {} request(s) -NOAUTH, but the env has a password "
+                "(REDIS_PASSWORD): authenticate memtier with memtier_auth_args(env) "
+                "or add_required_env_arguments(), or mark the test "
+                "@allow_noauth(reason) if it is unauthenticated on purpose (#842)"
+            ).format(label, new))
+
+
+@contextlib.contextmanager
+def noauth_check(env, test):
+    """
+    RLTest test hook: fail `test` if any of the env's servers answered a
+    request -NOAUTH while it ran, unless the env has no password or the test
+    is marked @allow_noauth.
+    """
+    if getattr(test, NOAUTH_GUARD_ATTR, None) or not env_password(env):
+        yield
+        return
+    before, errors = _read_noauth(env)
+    # Never pass without checking: no readable server means the guard
+    # cannot see NOAUTH at all (RLTest drift, or a password mismatch).
+    if not before:
+        env.assertTrue(False, message=(
+            "NOAUTH guard: could not read INFO errorstats from any of the env's "
+            "servers before the test, so NOAUTH replies would go unseen (#842): "
+            "{}".format("; ".join("{}: {}".format(label, error)
+                                  for label, error in sorted(errors.items())) or "no servers")))
+    try:
+        yield
+    finally:
+        if before:
+            _check_noauth(env, before)
+
+
+def noauth_guard(test):
+    """
+    Wrap an RLTest function test that takes the env in noauth_check, as the
+    RLTest hook does. As RLTest does, any test with a positional parameter
+    gets the env as its first argument, whatever the name; extra parameters
+    keep their defaults.
+    """
+    if getattr(test, NOAUTH_GUARD_ATTR, None):
+        return test
+    try:
+        args = inspect.getfullargspec(test).args
+    except TypeError:
+        return test
+    if not args:
+        return test
+
+    @functools.wraps(test)
+    def guarded(env):
+        with noauth_check(env, test):
+            return test(env)
+    return guarded
+
+
+def _install_noauth_guard():
+    # include.py is imported while RLTest loads the test files, before any
+    # test starts; add_test_hook keeps one copy of a hook added again.
+    try:
+        from RLTest import add_test_hook
+    except ImportError:
+        return
+    add_test_hook(noauth_check)
+
+
+_install_noauth_guard()
 
 
 def add_required_env_arguments(benchmark_specs, config, env, master_nodes_list):
@@ -218,31 +409,38 @@ def agg_keyspace_range(master_nodes_connections):
     return overall_keyspace_range
 
 
+def cluster_replicas_expected(env):
+    """True when RLTest started this cluster with replicas (--use-slaves,
+    which tests/run_tests.sh passes when OSS_CLUSTER_REPLICAS=1)."""
+    return env.isCluster() and bool(getattr(env, "useSlaves", False))
+
+
 def get_cluster_replica_connections(env):
     """Return List[redis.Redis] for every replica advertised by CLUSTER NODES.
 
-    Cluster-mode only.  Requires the env was started with useSlaves=True.
-    Returns an empty list when not in cluster mode or when no replicas are
-    found (so callers can gracefully skip rather than crash).
+    Outside cluster mode, or on a cluster started without replicas, returns
+    an empty list so callers can skip.
 
-    When the env was started with ``--use-slaves`` (RLTest's useSlaves=True)
-    but CLUSTER NODES advertises no replicas, this helper emits a loud
-    stderr warning before returning an empty list.  This is the known
-    RLTest harness gap: ``--use-slaves`` starts replicas via ``--slaveof``
-    *without* ``--cluster-enabled yes``, so the slave processes are
-    standalone and never join cluster gossip.  See the
-    ``Read Preference -> Testing limitations`` section in README.md for
-    the full background.
+    On a cluster started with replicas (see cluster_replicas_expected()),
+    the pinned RLTest fork adds them to the cluster with CLUSTER MEET and
+    CLUSTER REPLICATE, so CLUSTER NODES lists them. Finding none there, or
+    failing to read CLUSTER NODES, is then a broken environment: this
+    raises AssertionError, which fails the test instead of letting it skip
+    as a pass (#462).
     """
-    import sys
     import redis as _redis
 
     if not env.isCluster():
         return []
+    expected = cluster_replicas_expected(env)
     try:
         any_conn = env.getOSSMasterNodesConnectionList()[0]
         raw = any_conn.execute_command("CLUSTER", "NODES")
-    except Exception:
+    except Exception as error:
+        if expected:
+            raise AssertionError(
+                "the cluster was started with replicas (--use-slaves), but "
+                "reading CLUSTER NODES to find them failed: {!r}".format(error)) from error
         return []
 
     # raw may be a bytes string or a plain str depending on the redis-py version
@@ -269,35 +467,51 @@ def get_cluster_replica_connections(env):
             _redis.Redis(
                 host=host,
                 port=port,
+                password=env_password(env),
                 decode_responses=True,
                 socket_connect_timeout=5,
             )
         )
 
-    # If RLTest was launched with useSlaves=True but CLUSTER NODES
-    # advertises zero replicas, emit a loud warning so the silent skip
-    # is at least visible in test output.  Use getattr() chains because
-    # RLTest's env.envRunner shape varies across versions.
-    if not conns:
-        use_slaves = False
-        runner = getattr(env, "envRunner", None)
-        if runner is not None:
-            use_slaves = bool(
-                getattr(runner, "useSlaves", False)
-                or getattr(runner, "use_slaves", False)
-            )
-        if use_slaves:
-            sys.stderr.write(
-                "warning: OSS_CLUSTER_REPLICAS=1 is set and RLTest started "
-                "slave nodes,\nbut CLUSTER NODES shows zero replicas "
-                "(slaves were started with --slaveof\nand not "
-                "--cluster-enabled yes, so they are not in cluster "
-                "gossip).\nThe read-preference tests will skip. See README "
-                "\"Read Preference -\ntesting limitations\" for the known "
-                "harness gap.\n"
-            )
-            sys.stderr.flush()
+    if not conns and expected:
+        raise AssertionError(
+            "the cluster was started with replicas (--use-slaves), but CLUSTER "
+            "NODES lists none:\n" + raw)
     return conns
+
+
+def shutdown_nosave(conn, timeout=5.0):
+    """
+    SHUTDOWN NOSAVE the server behind a redis-py connection. True only once
+    the server stopped answering: a refused SHUTDOWN (NOAUTH, for example)
+    leaves it running, and redis-py raises NOAUTH as a ConnectionError, so
+    the closed connection alone does not prove the shutdown. The client is
+    made fail-fast (bounded_client), so redis-py does not retry, and so
+    resend, the SHUTDOWN.
+    """
+    import redis as _redis
+
+    bounded_client(conn)
+    try:
+        conn.execute_command("SHUTDOWN", "NOSAVE")
+    except _redis.exceptions.AuthenticationError:
+        return False
+    except _redis.exceptions.ConnectionError:
+        pass  # the server closes the connection as it exits
+    except _redis.exceptions.RedisError:
+        return False
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            conn.ping()
+        except _redis.exceptions.AuthenticationError:
+            pass  # still running
+        except _redis.exceptions.ConnectionError:
+            return True
+        except _redis.exceptions.RedisError:
+            pass
+        time.sleep(0.1)
+    return False
 
 
 def harness_client_ids(connections):
@@ -388,28 +602,30 @@ def server_supports_resp3(env):
     as "not supported" (R5 round-18 caused 3 RESP3 read-preference tests to
     silent-skip on Redis 6+). Parse ``redis_version`` from ``INFO server``
     instead — that reply stays RESP2 and tells us exactly what we need.
+
+    Errors are deliberately not caught: a probe that cannot decide must fail
+    the test rather than turn it into a silent skip.
     """
-    try:
-        conn = env.getConnection()
-        info = conn.execute_command("INFO", "server")
-        version = None
-        if isinstance(info, dict):
-            version = info.get("redis_version")
-        else:
-            # Raw bulk string fallback (older redis-py / decode_responses=True).
-            if isinstance(info, bytes):
-                info = info.decode("utf-8", errors="replace")
-            for line in info.splitlines():
-                line = line.strip()
-                if line.startswith("redis_version:"):
-                    version = line.split(":", 1)[1].strip()
-                    break
-        if not version:
-            return False
-        major = int(version.split(".")[0])
-        return major >= 6
-    except Exception:
-        return False
+    conn = env.getConnection()
+    info = conn.execute_command("INFO", "server")
+    version = None
+    if isinstance(info, dict):
+        version = info.get("redis_version")
+    else:
+        # Raw bulk string fallback (older redis-py / decode_responses=True).
+        if isinstance(info, bytes):
+            info = info.decode("utf-8", errors="replace")
+        for line in info.splitlines():
+            line = line.strip()
+            if line.startswith("redis_version:"):
+                version = line.split(":", 1)[1].strip()
+                break
+    if not version:
+        raise AssertionError(
+            "server_supports_resp3: no redis_version in INFO server reply: "
+            "{!r}".format(info))
+    major = int(str(version).split(".")[0])
+    return major >= 6
 
 
 def get_get_call_count(conn):

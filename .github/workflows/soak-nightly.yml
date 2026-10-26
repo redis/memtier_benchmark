@@ -43,10 +43,18 @@ jobs:
         with:
           ref: ${{ matrix.branch != '__default__' && matrix.branch || '' }}
 
+      # Maintenance branches checked out above may predate the apt helper,
+      # so take it from the workflow revision.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: .apt-helper
+          sparse-checkout: utils/apt_install.sh
+          sparse-checkout-cone-mode: false
+
       - name: Install build dependencies
         run: |
-          sudo apt-get -qq update
-          sudo apt-get install -y \
+          ./.apt-helper/utils/apt_install.sh -y \
             build-essential autoconf automake pkg-config \
             libevent-dev libssl-dev zlib1g-dev
 
@@ -90,6 +98,15 @@ jobs:
         with:
           ref: ${{ matrix.branch != '__default__' && matrix.branch || '' }}
 
+      # Maintenance branches checked out above may predate the apt helper,
+      # so take it from the workflow revision.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: .apt-helper
+          sparse-checkout: utils/apt_install.sh
+          sparse-checkout-cone-mode: false
+
       - name: Download memtier binary
         uses: actions/download-artifact@v4
         with:
@@ -100,8 +117,7 @@ jobs:
 
       - name: Install runtime dependencies
         run: |
-          sudo apt-get -qq update
-          sudo apt-get install -y \
+          ./.apt-helper/utils/apt_install.sh -y \
             libevent-dev libssl-dev iproute2
 
       - name: Setup Python
@@ -123,8 +139,7 @@ jobs:
         run: |
           curl -fsSL https://packages.redis.io/gpg | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/redis.list
-          sudo apt-get -qq update
-          sudo apt-get install -y redis
+          ./.apt-helper/utils/apt_install.sh -y redis
           sudo service redis-server stop || true
 
       - name: Tune kernel for soak workloads

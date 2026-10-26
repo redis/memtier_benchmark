@@ -14,7 +14,8 @@ The tests are gated by three capability probes so they degrade gracefully on
 environments that do not support the matrix cell:
 
   - env.isCluster()           - cluster topology required
-  - get_cluster_replica_connections(env) - at least one replica advertised
+  - get_cluster_replica_connections(env) - at least one replica advertised;
+    on a cluster started with replicas, finding none fails the test
   - server_supports_resp3(env)            - Redis 6+ HELLO 3 support
 
 Test matrix
@@ -49,6 +50,7 @@ from include import (
     get_default_memtier_config,
     reset_commandstats,
     server_supports_resp3,
+    shutdown_nosave,
 )
 from mb import Benchmark, RunConfig
 
@@ -165,7 +167,9 @@ def _capability_gates(env):
 
     Mirrors the three-gate skip pattern recommended by round-14 reviewers:
     cluster mode + replicas advertised + HELLO 3 supported.  Each gate calls
-    env.skip() and returns ok=False so the caller can early-return.
+    env.skip() and returns ok=False so the caller can early-return, except
+    that get_cluster_replica_connections() raises, failing the test, when
+    the cluster was started with replicas and has none.
     """
     if not env.isCluster():
         env.skip()
@@ -359,20 +363,18 @@ def _mark_dead_in_rltest(env, killed_ports):
 
 
 def _stop_one_replica(env, replica_conns):
-    """Best-effort: SHUTDOWN NOSAVE the first reachable replica.  Returns
-    True if at least one replica was sent the shutdown.
+    """SHUTDOWN NOSAVE the first replica that accepts it.  Returns True
+    once that replica stopped answering, False if none did.
 
     Also notifies RLTest that the killed replica was an expected death so
     teardown does not flag it as a crash in checkExitCode.
     """
     for conn in replica_conns:
         killed_port = _conn_port(conn)
-        try:
-            conn.execute_command("SHUTDOWN", "NOSAVE")
-        except Exception:
-            # SHUTDOWN closes the connection; expected.
-            pass
-        time.sleep(0.5)
+        # Mark only a replica that really stopped: RLTest does not stop the
+        # ones marked dead, so a refused SHUTDOWN would leak the process.
+        if not shutdown_nosave(conn):
+            continue
         if killed_port is not None:
             _mark_dead_in_rltest(env, {killed_port})
         return True

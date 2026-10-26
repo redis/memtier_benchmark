@@ -290,11 +290,29 @@ for retry are not resent, are counted as errors and written to
 test time ended`. They are not part of `"Unanswered requests"`, which only
 counts requests that were waiting for a reply.
 
+In cluster mode, a client whose connection to one node is done once the run is
+over (idle, or its redial failed) still waits for its other connections that
+may send again, such as a redial to another node still connecting, so that a
+setup the server rejects there fails the run. If that connect never completes
+(a node whose SYNs are dropped, without `--connection-timeout`), the client is
+ended when the grace period is over, and stderr shows `warning: N client(s)
+were still waiting for a connection to connect or set up 10 seconds after the
+test time ended`.
+
 With a request-count workload (`--requests`), unlimited retries can run
 indefinitely if the server keeps rejecting every attempt. A valid workload
 error reply counts as connection progress, so `--connection-stage-timeout`
 does not bound these retries. Use a finite `--max-retries` or `--test-time`
 to bound such a workload; requests still count only on success or exhaustion.
+
+These three replies are not workload errors but connection rejections:
+`-ERR Protocol error:`, `-ERR max number of clients` and `-DENIED Redis is
+running in protected mode`. Redis closes the connection after sending them. They
+are not counted as ops and cannot complete `--requests` or `--test-time`, and
+they do not count as connection progress. memtier handles them as a dropped
+connection: without `--reconnect-on-error` the thread ends and the run fails
+(exit code 1). With it, memtier reconnects (see Reconnecting after connection
+errors).
 
 With `--retry-on-error`, JSON `Totals` includes integer `Errors`, `Retry Attempts`
 and `Retried Ops` counters, including zeros. `Errors` exposes logical failures
@@ -304,6 +322,10 @@ abandoned replays; it is distinct from `Connection Errors`.
 and `Retried Ops` counts requests queued for retry at least once. These counters
 are totals for the run, without per-command attribution. They do not change
 request completion or exit-code behavior.
+A connection rejection (see above) is not a retried error reply. The request
+it arrived for is held for replay on the reconnect, as on any dropped
+connection, so it adds to neither `Retry Attempts` nor `Retried Ops`. It counts
+in `Connection Errors`, and in `Errors` if it is abandoned, never resent.
 
 ### Repeated runs (`--run-count`)
 
@@ -568,7 +590,10 @@ Replica setup rejection (AUTH, SELECT or HELLO) has a separate policy from
 routing around an unavailable node. Under `primary`, a rejected replica is
 closed and left closed because it is not needed. With `--reconnect-on-error`,
 `secondaryPreferred` also closes such a replica without redialing it or
-failing the run; reads can fall back to the primary. Without that flag,
+failing the run; reads can fall back to the primary. A replica that refuses
+the connection (`-ERR max number of clients`, ...) before its first reply is
+handled the same way, and with `--retry-on-error` the reads it held for resend
+are handed to the primary. Without `--reconnect-on-error`,
 `secondaryPreferred` keeps the existing setup-failure handling. `secondary`
 and `nearest` do not use this optional-replica exception: although routing
 may allow a primary fallback, an unrecovered setup rejection can still fail
@@ -635,24 +660,16 @@ new top-level blocks (emitted only when `--cluster-mode` is on AND
   `Latency Samples`. `conn_id` is the shard_connection vector index
   (NOT a stable cluster shard identity).
 
-### Testing limitations
+### Testing with replicas
 
-The `OSS-CLUSTER + replicas: read-preference` CI matrix cell exercises the
-RLTest harness with `--use-slaves`, which starts replicas using `--slaveof`
-without `--cluster-enabled yes`. The resulting slave nodes are not part of
-cluster gossip - `CLUSTER SLOTS` returns empty replica arrays from each
-master, so memtier_benchmark cannot discover them. The test helper's
-`get_cluster_replica_connections()` gate detects this and skips the tests
-with a stderr warning.
-
-The production read-routing code was verified empirically against real
-`redis-cli --cluster create` clusters with cluster-aware replicas under
-both RESP2 and RESP3. See PR #456 round-18 reviewer reports for the
-measurements: all four modes (primary, secondary, secondaryPreferred,
-nearest) route reads correctly to replicas, with zero leakage to primaries.
-
-A follow-up fixture that bootstraps a real `redis-cli --cluster create`
-cluster within the test harness is tracked in issue #462 (filed by this PR).
+The `OSS-CLUSTER + replicas` CI cells start the cluster with RLTest's
+`--use-slaves`. The RLTest fork pinned in `tests/test_requirements.txt` adds
+each replica to the cluster with `CLUSTER MEET` and `CLUSTER REPLICATE`, so
+replicas are cluster members that `CLUSTER SLOTS` reports and
+memtier_benchmark can discover. On those cells, the test helper
+`get_cluster_replica_connections()` fails the test when `CLUSTER NODES`
+lists no replicas or cannot be read (#462). Cells without replicas skip the
+replica tests.
 
 ### Reconnecting after connection errors
 
@@ -673,12 +690,27 @@ run's stop condition:
   - A required connection whose setup step (AUTH, SELECT, HELLO) was rejected
     since its last reply fails the run instead (exit code 1), as when setup
     keeps failing at the deadline. The optional-replica exceptions are
-    described under Read Preference above.
+    described under Read Preference above. A connection refused with
+    `-ERR max number of clients` or `-DENIED Redis is running in protected
+    mode` before its first reply counts as such a rejected setup; after a
+    reply it is a dropped connection. `-ERR Protocol error:` is caused by the
+    request (e.g. a value above `proto-max-bulk-len`), so it is a dropped
+    connection once the client got any reply, and a rejected setup only for a
+    client that never got one.
   - A connection that a live server drops around the deadline is still
     reconnected once, so requests held for replay are resent; if that
     reconnect fails or is dropped again, the run ends. So a peer that accepts
     connections and closes them after a delay can extend the run by up to
-    about twice that delay past `--test-time`.
+    about twice that delay past `--test-time`. In the report's duration, a
+    client that sent requests ends at its own deadline (its start plus
+    `--test-time`) or at its last reply, whichever is later: replies drained
+    after the deadline count, and the idle time after the last one does not.
+    This holds whether the run ends normally, at a failed reconnect, at
+    Ctrl+C or at the drain grace. With `--retry-on-error`, a resent request
+    answered after the reconnect is such a reply; an error reply that is
+    retried is not. No new request is sent past the deadline, also when a
+    reconnect's setup (AUTH, say) completes only then; the setup itself
+    still goes out, so a rejected one still fails the run.
   - In cluster mode this holds for the main connection only: another shard's
     connection is reconnected through a slot map refresh. Once the run is
     over, a refresh still redials it; if that dial fails, the connection is
@@ -689,7 +721,10 @@ run's stop condition:
     prevented from starting by repeated TLS-handshake failures. One whose
     first connection only completes after the deadline (e.g. a server killing
     connections before their first reply) is timed from the start of the run,
-    so it ends at its first reply instead of running a whole `--test-time`.
+    so it ends at once instead of running a whole `--test-time`. It sends no
+    request then: if it sent none before either, it does not count toward
+    `Total duration` or `Count` at all, like a client that only ran its
+    setup.
   - The deadline is measured from the start of the run, so it does not cover
     a server that is gone before any connection got a reply: that startup
     phase is bounded by `--connection-stage-timeout` (default 30 s), which
@@ -796,7 +831,7 @@ For detailed setup instructions, dashboard usage, and troubleshooting, see [Real
 
 memtier_benchmark can also expose live metrics as a Prometheus `/metrics`
 endpoint, scrapable by Prometheus or any OpenMetrics-compatible collector. The
-exporter is built in by default (it requires libevent 2.1.1 or newer; see
+exporter is built in by default (it requires libevent 2.1.4 or newer; see
 [DEVELOPMENT.md](DEVELOPMENT.md) for the `--disable-prometheus` build flavor).
 It is **off at runtime** until you pass `--prometheus-port`:
 
@@ -892,7 +927,9 @@ applies to the final results table too, so it is printed with or without
 `--realtime-latencies`; it checks the total sample count, and per-command rows
 have fewer samples. In cluster mode the limit applies to each endpoint
 connection, so the check runs once the first topology is known, after the
-threads start.
+threads start. If the run then opens more endpoint connections (for example
+when a partial slot map heals), memtier prints the warnings again with the
+raised bounds, or a note when a percentile may now be resolved.
 
 The window and overall rows merge the per-second histograms each client has
 completed, so every sample is counted exactly once. A client's second is
