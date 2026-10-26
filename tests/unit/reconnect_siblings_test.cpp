@@ -173,13 +173,95 @@ static void test_sibling_with_replay(const char *path)
 #endif
 }
 
+// A connected sibling with a setup step still to send and nothing pending,
+// e.g. the main connection of a cluster client once a shard's reconnect has
+// asked it for a CLUSTER SLOTS refresh and before its deferred fill sends it,
+// or one waiting for its CLUSTER SLOTS retry timer: it keeps the client
+// going, so the refresh still goes out (a rejected setup then fails the run,
+// #630). Ending the client would drop it.
+static void test_sibling_with_setup_due(const char *path)
+{
+#ifndef _WIN32
+    evutil_socket_t listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    sockaddr_un address = {};
+    address.sun_family = AF_UNIX;
+    snprintf(address.sun_path, sizeof(address.sun_path), "%s", path);
+    check(listener >= 0 && bind(listener, (sockaddr *) &address, sizeof(address)) == 0 && listen(listener, 4) == 0,
+          "unix listener");
+
+    connect_info endpoint = {};
+
+#else
+    evutil_socket_t listener = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in address = {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t address_len = sizeof(address);
+    check(listener >= 0 && bind(listener, (sockaddr *) &address, sizeof(address)) == 0 && listen(listener, 4) == 0 &&
+              getsockname(listener, (sockaddr *) &address, &address_len) == 0,
+          "loopback listener");
+    connect_info endpoint = {};
+    endpoint.ci_family = AF_INET;
+    endpoint.ci_socktype = SOCK_STREAM;
+    endpoint.ci_protocol = IPPROTO_TCP;
+    endpoint.ci_addr = (sockaddr *) &address;
+    endpoint.ci_addrlen = address_len;
+
+#endif
+    arbitrary_command_list commands;
+    benchmark_config config = {};
+    config.arbitrary_commands = &commands;
+    config.clients = config.threads = 1;
+    config.key_pattern = "S:S";
+    // No workload goes out (a pipeline of 0), so the sibling stays idle.
+    config.pipeline = 0;
+    config.protocol = PROTOCOL_REDIS_DEFAULT;
+    config.unix_socket = path;
+    config.requests = 1000;
+
+    event_base *base = event_base_new();
+    abstract_protocol *protocol = protocol_factory(config.protocol);
+    {
+        object_generator generator;
+        generator.set_data_size_fixed(1);
+        two_connection_client manager(base, &config, protocol, &generator);
+        shard_connection &first = *manager.get_connections()[0];
+        shard_connection &second = *manager.get_connections()[1];
+
+        second.set_address_port("127.0.0.1", "0");
+        check(second.connect(&endpoint) == 0, "the sibling connects");
+        for (int i = 0; i < 100 && second.get_connection_state() != conn_connected; i++)
+            event_base_loop(base, EVLOOP_ONCE | EVLOOP_NONBLOCK);
+        check(second.get_connection_state() == conn_connected, "the sibling is connected");
+        check(second.get_pending_resp() == 0 && !second.is_reconnect_pending() && !second.has_requests_to_replay(),
+              "nothing is pending on the sibling");
+        check(first.siblings_done(), "a connected, set up sibling with nothing pending is done");
+
+        second.set_cluster_slots();
+        check(second.get_cluster_slots_state() == setup_none, "the sibling has a slot map refresh due");
+        check(manager.all_connections_idle(), "no reply is pending anywhere");
+        check(!first.siblings_done(), "a connected sibling with a refresh still to send keeps the client going");
+
+        second.disconnect();
+        check(first.siblings_done(), "once disconnected (setup reset), it does not");
+        event_base_loop(base, EVLOOP_NONBLOCK);
+    }
+    delete protocol;
+    event_base_free(base);
+    evutil_closesocket(listener);
+#ifndef _WIN32
+    unlink(path);
+#endif
+}
+
 // Past its own deadline with nothing pending, a connection ends its client
 // in fill_pipeline() only once the client's other connections are done too
 // (siblings_done(), not all_connections_idle(), which counts pending replies
-// only): a sibling with a reconnect or slot map refresh due at the deadline,
-// or whose connect is still in progress, must still get to send its setup,
-// so a rejected setup there fails the run (#630) and a one-off slot error is
-// retried (#666).
+// only): a sibling with a reconnect due at the deadline, or whose connect is
+// still in progress, must still get to send its setup, so a rejected setup
+// there fails the run (#630) and a one-off slot error is retried (#666). A
+// connected sibling with a setup step still to send is
+// test_sibling_with_setup_due().
 static void test_deadline_end_waits_for_busy_sibling(const char *path)
 {
 #ifndef _WIN32
@@ -450,6 +532,7 @@ int main()
     WSADATA data;
     check(WSAStartup(MAKEWORD(2, 2), &data) == 0, "Winsock startup");
     test_sibling_with_replay(NULL);
+    test_sibling_with_setup_due(NULL);
     test_deadline_end_waits_for_busy_sibling(NULL);
 #else
     char directory[] = "/tmp/memtier-reconnect-siblings-XXXXXX";
@@ -459,6 +542,7 @@ int main()
     }
     std::string path = std::string(directory) + "/socket";
     test_sibling_with_replay(path.c_str());
+    test_sibling_with_setup_due(path.c_str());
     test_deadline_end_waits_for_busy_sibling(path.c_str());
     rmdir(directory);
 #endif
