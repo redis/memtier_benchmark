@@ -767,6 +767,33 @@ static void log_abandoned_request(const request *req, const char *reason)
     global_failed_keys_logger().log_failure(now, "REPLAY", req->m_key, req->m_key_len, reason, req->m_retries);
 }
 
+// A request that will get no reply on this connection (see disconnect()).
+// With --retry-on-error, outside --transaction, it is queued to be resent after
+// a reconnect, or abandoned if it has no captured bytes to resend. Otherwise it
+// is dropped (abandoned under --retry-on-error --transaction). Setup commands
+// are dropped and not counted.
+void shard_connection::drop_unanswered_request(request *req, unsigned long long *dropped, unsigned long long *abandoned)
+{
+    if (!is_workload_request(req->m_type)) {
+        delete req;
+        return;
+    }
+    if (m_config->retry_on_error && m_replay_queue != NULL && !m_config->transaction) {
+        if (req->m_serialized && req->m_serialized_len > 0) {
+            m_replay_queue->push(req);
+            return;
+        }
+        log_abandoned_request(req, "not-replayable");
+        (*abandoned)++;
+    } else if (m_config->retry_on_error && m_config->transaction) {
+        log_abandoned_request(req, "transaction-not-replayed");
+        (*abandoned)++;
+    } else {
+        (*dropped)++;
+    }
+    delete req;
+}
+
 void shard_connection::disconnect()
 {
     restore_cluster_slots_value_policy();
@@ -819,23 +846,10 @@ void shard_connection::disconnect()
     // disconnect is the expected behaviour.
     unsigned long long dropped = 0;
     unsigned long long abandoned = 0;
+    while (m_pending_resp) {
+        drop_unanswered_request(pop_req(), &dropped, &abandoned);
+    }
     if (m_config->retry_on_error && m_replay_queue != NULL && !m_config->transaction) {
-        while (m_pending_resp) {
-            request *req = pop_req();
-            // Only setup commands have no serialized capture (we never attempt
-            // capture for those) — drop those.
-            if (!is_workload_request(req->m_type)) {
-                delete req;
-                continue;
-            }
-            if (req->m_serialized && req->m_serialized_len > 0) {
-                m_replay_queue->push(req);
-            } else {
-                log_abandoned_request(req, "not-replayable");
-                abandoned++;
-                delete req;
-            }
-        }
         // Also rescue requests sitting in the per-connection retry queue
         // (waiting for a backoff timer to fire). Without this, the backoff
         // timer's connection check (handle_retry_drain_event) would silently
@@ -859,19 +873,6 @@ void shard_connection::disconnect()
         // will be re-armed after reconnect by drain_replay_queue_after_reconnect.
         if (m_retry_drain_timer != NULL && evtimer_pending(m_retry_drain_timer, NULL)) {
             evtimer_del(m_retry_drain_timer);
-        }
-    } else {
-        while (m_pending_resp) {
-            request *req = pop_req();
-            if (is_workload_request(req->m_type)) {
-                if (m_config->retry_on_error && m_config->transaction) {
-                    abandoned++;
-                    log_abandoned_request(req, "transaction-not-replayed");
-                } else {
-                    dropped++;
-                }
-            }
-            delete req;
         }
     }
     if (dropped) m_conns_manager->dec_reqs_generated(dropped);
@@ -1550,7 +1551,7 @@ void shard_connection::rearm_readonly()
 }
 
 // Redis can send these errors before accepting workload, then close the
-// connection. They must not disarm startup supervision or reset retry budgets.
+// connection. They are not workload replies (see handle_connection_rejection()).
 static bool is_redis_connection_rejection(const char *status)
 {
     static const char protocol[] = "-ERR Protocol error:";
@@ -1745,6 +1746,15 @@ void shard_connection::process_response(void)
             }
             break;
         default:
+            // Redis protocol and accept-time rejections refuse the connection,
+            // not the command: the server closes after replying.
+            if (r->is_error() && is_redis_protocol(m_config->protocol) &&
+                is_redis_connection_rejection(r->get_status())) {
+                handle_connection_rejection(req, r->get_status());
+                req = NULL;
+                error = true;
+                break;
+            }
             benchmark_debug_log("server %s: handled response (first line): %s, %d hits, %d misses\n", get_readable_id(),
                                 r->get_status(), r->get_hits(), req->m_keys - r->get_hits());
 
@@ -1761,37 +1771,25 @@ void shard_connection::process_response(void)
                 m_conns_manager->inc_reqs_processed();
                 responses_handled = true;
             }
-            // A valid workload reply proves setup completed, even when the
-            // command was rejected or queued for retry. Redis protocol and
-            // accept-time rejections are different: the server closes after
-            // replying. Treating them as progress would disarm the startup
-            // supervisor and reset the reconnect budget on every attempt.
-            bool connection_rejected = r->is_error() && is_redis_protocol(m_config->protocol) &&
-                                       is_redis_connection_rejection(r->get_status());
-            if (!connection_rejected) {
-                report_connection_stage_success();
-                // Steady state reached: reset the per-connection reconnect
-                // attempts counter now (not at BEV_EVENT_CONNECTED). The
-                // READONLY-error reconnect storm completes TCP before the
-                // -NOREPLICATION lands, so resetting on connect would
-                // defeat --max-reconnect-attempts; resetting here ties the
-                // counter to setup-ladder lifetime instead. Idempotent —
-                // subsequent workload replies just re-assign 0.
-                if (m_reconnect_attempts > 0) {
-                    benchmark_error_log("Reconnection successful after %u attempts.\n", m_reconnect_attempts);
-                }
-                m_reconnect_attempts = 0;
-            } else {
-                // Forward the error so a later abort can attribute it.
-                char buf[256];
-                snprintf(buf, sizeof(buf), "server error: %s", r->get_status() ? r->get_status() : "");
-                report_connection_stage_failure(buf);
+            // A workload reply proves setup completed, even when the command
+            // was rejected or queued for retry.
+            report_connection_stage_success();
+            // Steady state reached: reset the per-connection reconnect
+            // attempts counter now (not at BEV_EVENT_CONNECTED). The
+            // READONLY-error reconnect storm completes TCP before the
+            // -NOREPLICATION lands, so resetting on connect would
+            // defeat --max-reconnect-attempts; resetting here ties the
+            // counter to setup-ladder lifetime instead. Idempotent —
+            // subsequent workload replies just re-assign 0.
+            if (m_reconnect_attempts > 0) {
+                benchmark_error_log("Reconnection successful after %u attempts.\n", m_reconnect_attempts);
             }
+            m_reconnect_attempts = 0;
             break;
         }
         // The retry path may have claimed ownership of req for resend; in that
         // case the retry queue / replay path is responsible for freeing it.
-        if (!req->m_claimed_by_retry) {
+        if (req != NULL && !req->m_claimed_by_retry) {
             delete req;
         }
         if (error) {
@@ -2530,6 +2528,33 @@ void shard_connection::reconnect_after_setup_error(const char *error_context, bo
     }
     m_setup_rejected_context = error_context;
     handle_setup_rejected_check_event();
+}
+
+// The server refused this connection with a reply to a workload request
+// (is_redis_connection_rejection()). It did not serve the request, so the reply
+// is not answered or processed and cannot complete --requests or --test-time:
+// the request is resent after a reconnect or dropped, as on a disconnect. Like
+// a rejected setup step, it does not disarm --connection-stage-timeout or reset
+// the reconnect budget. Redis closes the connection after these replies, so it
+// is handled as a drop: with --reconnect-on-error, reconnect as after a rejected
+// setup step; otherwise end this thread, so the run fails (exit 1) at once,
+// without waiting for --connection-stage-timeout.
+void shard_connection::handle_connection_rejection(request *req, const char *status)
+{
+    benchmark_error_log("error: server %s rejected the connection: %s\n", get_readable_id(), status ? status : "");
+    char buf[256];
+    snprintf(buf, sizeof(buf), "server error: %s", status ? status : "");
+    report_connection_stage_failure(buf);
+    unsigned long long dropped = 0;
+    unsigned long long abandoned = 0;
+    drop_unanswered_request(req, &dropped, &abandoned);
+    if (dropped) m_conns_manager->dec_reqs_generated(dropped);
+    if (abandoned) m_conns_manager->abandon_requests(abandoned);
+    if (m_config->reconnect_on_error) {
+        reconnect_after_setup_error("Connection rejected by the server");
+    } else {
+        attempt_reconnect("Connection rejected by the server");
+    }
 }
 
 void shard_connection::handle_setup_rejected_check_event()

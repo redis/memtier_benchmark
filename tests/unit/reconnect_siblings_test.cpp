@@ -316,6 +316,47 @@ static void test_cached_reconnect_deadline(evutil_socket_t, short, void *context
     delete protocol;
 }
 
+// A connection rejection (-ERR max number of clients, ...) is not a reply to
+// the request it arrives for (#894): it is neither answered nor processed, so
+// it cannot complete --requests, and the request is uncounted, or kept for
+// replay with --retry-on-error. With --reconnect-on-error the connection
+// reconnects, still marked as rejected since its last reply.
+static void test_connection_rejection_is_not_a_reply(event_base *base, abstract_protocol *protocol)
+{
+    for (int retry = 0; retry < 2; ++retry) {
+        arbitrary_command_list commands;
+        benchmark_config config = {};
+        config.arbitrary_commands = &commands;
+        config.clients = config.threads = 1;
+        config.key_pattern = "S:S";
+        config.protocol = PROTOCOL_REDIS_DEFAULT;
+        config.requests = 1;
+        config.reconnect_on_error = true;
+        config.retry_on_error = retry != 0;
+        config.max_retry_queue = 10;
+        config.max_retries = 5;
+        config.retry_backoff_ms = 100;
+        object_generator generator;
+        generator.set_data_size_fixed(1);
+        client manager(base, &config, protocol, &generator);
+        shard_connection &connection = *manager.get_connections()[0];
+        request *req = new request(rt_set, 0, NULL, 1);
+        req->m_serialized = strdup("*1\r\n$4\r\nPING\r\n");
+        req->m_serialized_len = strlen(req->m_serialized);
+        manager.inc_reqs_generated();
+        connection.handle_connection_rejection(req, "-ERR max number of clients reached");
+        check(manager.get_reqs_answered() == 0, "a rejection is not an answered request");
+        check(manager.get_reqs_processed() == 0, "a rejection is not a processed request");
+        check(!manager.finished(), "a rejection does not complete --requests");
+        check(manager.get_reqs_generated() == (retry ? 1u : 0u),
+              "the rejected request is uncounted, or kept for replay with --retry-on-error");
+        check(connection.has_requests_to_replay() == (retry != 0), "--retry-on-error keeps the request for replay");
+        check(connection.is_reconnect_pending(), "--reconnect-on-error reconnects after a rejection");
+        check(connection.setup_failed_since_reply(), "the rejection is a setup failure since the last reply");
+        connection.disconnect();
+    }
+}
+
 int main()
 {
 #ifdef _WIN32
@@ -357,6 +398,7 @@ int main()
     abstract_protocol *protocol = protocol_factory(config.protocol);
     check(base != NULL && protocol != NULL, "create event base and protocol");
     if (failures) return 1;
+    test_connection_rejection_is_not_a_reply(base, protocol);
     {
         object_generator generator;
         generator.set_data_size_fixed(1);

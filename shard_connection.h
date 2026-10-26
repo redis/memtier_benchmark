@@ -171,6 +171,8 @@ public:
     void disconnect_after_error();
     void end_thread(const char *reason, const char *thread_end_reason);
     void reconnect_after_setup_error(const char *error_context, bool setup_step = true);
+    void handle_connection_rejection(request *req, const char *status);
+    void drop_unanswered_request(request *req, unsigned long long *dropped, unsigned long long *abandoned);
     // Reconnects stop at the --test-time deadline (#656) only with
     // --reconnect-on-error and unlimited --max-reconnect-attempts; a finite
     // bound keeps master's behaviour.

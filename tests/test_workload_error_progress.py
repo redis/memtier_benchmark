@@ -241,3 +241,37 @@ def test_accept_time_rejections_do_not_count_as_workload_progress(env):
                                           duration=5, authenticate=False)
         env.assertEqual(result.returncode, 1, message=result.stderr[-2000:])
         env.assertEqual(peer.connections, 2)
+
+
+def test_connection_rejections_do_not_complete_the_run(env):
+    # A rejection is not a reply to the request (#894): it must not count as
+    # an op or complete --requests or --test-time, and the run fails at once
+    # (exit 1), before --connection-stage-timeout, whether or not the peer
+    # closes the connection after it.
+    for reply in (b'-ERR Protocol error: invalid bulk length\r\n',
+                  b'-ERR max number of clients reached\r\n',
+                  b'-DENIED Redis is running in protected mode because of dummy settings\r\n'):
+        for mode, extra, duration in (('close', ['--requests=1'], None), ('', ['--requests=5'], None),
+                                      ('', [], 2)):
+            label = '{!r} {} {}'.format(reply, mode or 'open', extra or duration)
+            peer = _Peer(reply, mode=mode)
+            result, stats, failures, elapsed = _run(env, peer, ['--connection-stage-timeout=30'] + extra,
+                                                    duration=duration)
+            env.assertEqual(result.returncode, 1, message=label + ': ' + result.stderr[-2000:])
+            env.assertContains('rejected the connection', result.stderr, message=label)
+            env.assertFalse('connection-stage failures' in result.stderr, message=label)
+            env.assertEqual(stats['ALL STATS']['Totals']['Count'], 0, message=label)
+            env.assertEqual(peer.connections, 1, message=label)
+            env.assertEqual(peer.replies, 1, message=label)
+            env.assertEqual(failures, [])
+            env.assertLess(elapsed, 8, message=label)
+    # With --reconnect-on-error the rejection is retried, bounded by
+    # --max-reconnect-attempts, and still never completes the run.
+    peer = _Peer(b'-ERR max number of clients reached\r\n')
+    result, stats, _failures, _ = _run(env, peer, ['--requests=5', '--reconnect-on-error',
+                                                '--max-reconnect-attempts=1', '--connection-stage-timeout=0'],
+                                       duration=None)
+    env.assertEqual(result.returncode, 1, message=result.stderr[-2000:])
+    env.assertContains('Maximum reconnection attempts (1) exceeded', result.stderr)
+    env.assertEqual(stats['ALL STATS']['Totals']['Count'], 0)
+    env.assertEqual(peer.connections, 2)
