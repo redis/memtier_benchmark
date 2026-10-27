@@ -221,8 +221,16 @@ def test_bufferevent_creation_failure_fails_connection(env):
     env.assertGreater(rc, 0, message=stderr[-2000:])
     env.assertContains("error: " + function + "() failed", stderr)
     # memtier closed the socket the failed call was given (libevent >= 2.1.9
-    # and plain bufferevents leave it to the caller).
-    env.assertTrue("socket closed" in marker, message=marker)
+    # and plain bufferevents leave it to the caller). A TLS bufferevent on a
+    # real libevent <= 2.1.8 (Rocky Linux 8) may already have closed it, so
+    # memtier leaves it open and says so.
+    runtime = _version_field(_version_line(), "libevent") or ""
+    numbers = [int(part) for part in runtime.split("-")[0].split(".")[:3] if part.isdigit()]
+    if env.useTLS and len(numbers) == 3 and tuple(numbers) < (2, 1, 9):
+        env.assertContains("left open on purpose: libevent " + runtime, stderr)
+        env.assertTrue("socket open" in marker, message=marker)
+    else:
+        env.assertTrue("socket closed" in marker, message=marker)
     # Standalone aborts the run in prepare; cluster mode retries the
     # connection and ends the run as failed.
     env.assertTrue("failed to connect" in stderr or "the results of this run are not valid" in stderr,
