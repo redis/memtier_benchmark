@@ -515,3 +515,24 @@ def test_transaction_moved_warning_printed_once(env):
     env.assertEqual(returncode, 0, message=stderr[-2000:])
     env.assertGreater(node.data_requests, 30, message=stderr[-2000:])
     env.assertEqual(stderr.count("received MOVED mid-rotation"), 1, message=stderr[-2000:])
+
+
+def test_strict_secondary_without_replicas_names_the_cause(env):
+    """--read-preference=secondary with fallback error (or queue, which acts
+    as error) can route no read when CLUSTER SLOTS lists no replicas, as right
+    after `redis-cli --cluster create`. The run ends at once with 0 ops; only
+    the built-in GET-only workload used to say why, keyless and keyed
+    --command reads ended with just "stopped before reaching their stop
+    condition" (#888)."""
+    reads = [["--command=PING", "--command-is-read"], ["--command=GET __key__"], ["--ratio=0:1"]]
+    for read in reads:
+        for fallback in ([], ["--read-preference-fallback=queue"]):
+            node = _Node(bad_slots_replies=0)
+            args = read + fallback + ["--read-preference=secondary", "--requests=200"]
+            returncode, stderr, elapsed = _run(node, args)
+            env.assertEqual(node.errors, [])
+            env.assertEqual(returncode, 1, message=" ".join(args) + "\n" + stderr[-2000:])
+            env.assertContains("--read-preference=secondary: CLUSTER SLOTS lists no replicas", stderr,
+                               message=" ".join(args))
+            env.assertEqual(node.data_requests + node.commands[b"PING"], 0, message=" ".join(args))
+            env.assertLess(elapsed, 10)
