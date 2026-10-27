@@ -1813,8 +1813,9 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
         const bool arbitrary_read = m_config->arbitrary_commands && m_config->arbitrary_commands->is_defined() &&
                                     is_read_command_index(m_executed_command_index);
         if ((m_config->ratio.a == 0 || arbitrary_read) && !any_route) {
-            // Coarse rate-limited operator signal: when ratio.a==0 + no live
-            // routing target + non-rp_primary, the benchmark stalls
+            // Coarse rate-limited operator signal: when a read (ratio.a==0, or
+            // a --command read) has no live routing target under a
+            // non-rp_primary preference, the benchmark stalls
             // indefinitely (--reconnect-on-error=off can't revive the lost
             // replicas). Emit a single warning at most every 60s so the
             // stall is visible without log spam. Use CLOCK_MONOTONIC so the
@@ -1847,16 +1848,18 @@ bool cluster_client::hold_pipeline(unsigned int conn_id)
                     // Prefix with the worker's pthread id so log readers can
                     // dedupe the N copies emitted per 60s under high thread
                     // counts (one cluster_client per worker thread).
-                    if (strict_secondary && !any_replica && !m_shard_groups.empty())
-                        benchmark_error_log("error: [thread %lu] --read-preference=secondary: CLUSTER SLOTS lists no "
-                                            "replicas, so no read can be routed; use "
-                                            "--read-preference=secondaryPreferred or "
-                                            "--read-preference-fallback=primary.\n",
-                                            (unsigned long) pthread_self());
-                    else
-                        benchmark_error_log("warning: [thread %lu] all replicas unreachable under read-only workload "
-                                            "(--read-preference=%s); benchmark stalled -- check cluster health or set "
-                                            "--reconnect-on-error.\n",
+                    // The topology is the same for every client: say it once.
+                    static std::atomic<bool> no_replicas_reported(false);
+                    if (strict_secondary && !any_replica && !m_shard_groups.empty()) {
+                        if (!no_replicas_reported.exchange(true))
+                            benchmark_error_log("error: --read-preference=secondary: CLUSTER SLOTS lists no "
+                                                "replicas, so no read can be routed; use "
+                                                "--read-preference=secondaryPreferred or "
+                                                "--read-preference-fallback=primary.\n");
+                    } else
+                        benchmark_error_log("warning: [thread %lu] all replicas unreachable for reads "
+                                            "(--read-preference=%s); benchmark stalled -- check cluster health "
+                                            "(--reconnect-on-error lets it recover when they return).\n",
                                             (unsigned long) pthread_self(), rp_str);
                     m_last_no_replica_warning_ts = now_s;
                 }
