@@ -806,9 +806,10 @@ jobs:
           cat test-suite.log
           exit 1
         fi
+
   # macos-13 has been retired as of December 2025 and the macos-14 pool is no
   # longer provisioned ("macos-14-arm64-us-default is not supported"), so use macos-15
-  # macos-14 details: https://github.com/actions/runner-images/blob/main/images/macos/macos-14-Readme.md
+  # macos-15 details: https://github.com/actions/runner-images/blob/main/images/macos/macos-15-Readme.md
   build-macos-openssl-1-1:
     runs-on: macos-15
     steps:
