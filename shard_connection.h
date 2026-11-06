@@ -339,6 +339,7 @@ public:
 
     void handle_reconnect_timer_event();
     void handle_connection_timeout_event();
+    void handle_request_timeout_event();
     void handle_unix_connect_retry();
     int socket_connect(struct sockaddr *sa, int socklen);
 
@@ -569,6 +570,13 @@ private:
 
     // Connection timeout tracking
     struct event *m_connection_timeout_timer;
+    // --request-timeout watchdog. One timer per connection, armed when a
+    // request is pushed and none is being watched; on firing it checks the
+    // oldest outstanding request, so replies cost no timer operation.
+    struct event *m_request_timeout_timer;
+    bool m_request_timeout_armed;
+    void arm_request_timeout(const struct timeval &delay);
+    void disarm_request_timeout();
     struct event *m_unix_connect_timer;
 #ifdef _WIN32
     struct event *m_deferred_connect_error;

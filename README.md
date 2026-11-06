@@ -677,6 +677,16 @@ replica tests.
 
 ### Reconnecting after connection errors
 
+A server can also accept a connection and never answer it (a proxy that stops
+calling `accept()` while throttling leaves the handshake in the kernel's listen
+backlog). Nothing errors, so `--reconnect-on-error` never fires, and
+`--connection-timeout` only bounds `connect()`. `--request-timeout=SECS` treats
+a connection whose oldest request has had no reply for SECS seconds as failed:
+memtier logs `Request timeout` and counts a connection error, and under
+`--reconnect-on-error` reconnects (otherwise the thread ends and the run fails,
+as for any lost connection). It is off by default; do not set it below the
+duration of a legitimately slow command, such as a blocking one.
+
 With `--reconnect-on-error`, a lost connection is reconnected with a delay
 (`--reconnect-backoff-factor`) instead of ending its thread.
 `--max-reconnect-attempts` bounds the consecutive failed attempts; when they

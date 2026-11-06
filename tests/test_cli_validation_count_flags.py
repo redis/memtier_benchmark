@@ -227,6 +227,7 @@ UNSIGNED_OPTIONS = {
     "--retry-backoff-ms": "retry-backoff-ms must be",
     "--max-retry-queue": "max-retry-queue must be",
     "--connection-timeout": "connection-timeout must be",
+    "--request-timeout": "request-timeout must be",
     "--connection-stage-timeout": "connection-stage-timeout must be",
 }
 
@@ -292,7 +293,7 @@ def test_unsigned_options_accept_valid_values(env):
             result = _run_memtier([option, value, "--version"])
             env.assertEqual(result.returncode, 0, message="{} {!r}: {}".format(option, value, result.stderr))
     for option, top in (("--max-reconnect-attempts", "4294967295"), ("--retry-backoff-ms", "4294967295"),
-                        ("--max-retry-queue", "4294967295"), ("--connection-timeout", "4294967295"),
+                        ("--max-retry-queue", "4294967295"), ("--connection-timeout", "4294967295"), ("--request-timeout", "4294967295"),
                         ("--connection-stage-timeout", "4294967294")):
         for value in ("0", top):
             result = _run_memtier([option, value, "--version"])

@@ -30,6 +30,7 @@
 #include <errno.h>
 #include "platform_compat.h"
 #include <time.h>
+#include <algorithm>
 #ifdef HAVE_NETINET_TCP_H
 #include <netinet/tcp.h>
 #endif
@@ -141,6 +142,13 @@ void cluster_client_connection_timeout_handler(evutil_socket_t fd, short what, v
     shard_connection *sc = (shard_connection *) ctx;
     assert(sc != NULL);
     sc->handle_connection_timeout_event();
+}
+
+void cluster_client_request_timeout_handler(evutil_socket_t fd, short what, void *ctx)
+{
+    shard_connection *sc = (shard_connection *) ctx;
+    assert(sc != NULL);
+    sc->handle_request_timeout_event();
 }
 
 // Retry due times use the monotonic clock, like libevent's timers, so a
@@ -322,6 +330,8 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_reconnect_deadline(),
         m_fired_reconnect_deadline(),
         m_connection_timeout_timer(NULL),
+        m_request_timeout_timer(NULL),
+        m_request_timeout_armed(false),
         m_unix_connect_timer(NULL),
 #ifdef _WIN32
         m_deferred_connect_error(NULL),
@@ -418,6 +428,12 @@ shard_connection::~shard_connection()
     if (m_connection_timeout_timer != NULL) {
         event_free(m_connection_timeout_timer);
         m_connection_timeout_timer = NULL;
+    }
+
+    if (m_request_timeout_timer != NULL) {
+        event_free(m_request_timeout_timer);
+        m_request_timeout_timer = NULL;
+        m_request_timeout_armed = false;
     }
 
     if (m_unix_connect_timer != NULL) {
@@ -902,6 +918,8 @@ void shard_connection::disconnect()
         m_unix_connect_timer = NULL;
     }
 
+    disarm_request_timeout();
+
     // Drain pipeline. With --retry-on-error, move in-flight requests into the
     // replay queue so they get resent after reconnect. Otherwise, discard them.
     // Discarded workload requests will never be processed, so uncount them
@@ -1119,6 +1137,12 @@ request *shard_connection::pop_req()
 void shard_connection::push_req(request *req)
 {
     m_pipeline->push(req);
+    if (m_config->request_timeout > 0 && !m_request_timeout_armed) {
+        struct timeval delay;
+        delay.tv_sec = m_config->request_timeout;
+        delay.tv_usec = 0;
+        arm_request_timeout(delay);
+    }
     // Worker-thread mutation (see pop_req comment).
     m_pending_resp.fetch_add(1, std::memory_order_relaxed);
     // Snapshot the type for the crash handler (which can't safely deref the
@@ -3046,6 +3070,53 @@ void shard_connection::handle_connection_timeout_event()
 
     benchmark_error_log("Connection timeout after %u seconds.\n", m_config->connection_timeout);
     attempt_reconnect("Connection timeout");
+}
+
+void shard_connection::arm_request_timeout(const struct timeval &delay)
+{
+    if (m_request_timeout_timer == NULL) {
+        // Allocated once and reused; like the connection timeout timer, an
+        // allocation failure here is not recoverable.
+        m_request_timeout_timer = event_new(m_event_base, -1, 0, cluster_client_request_timeout_handler, (void *) this);
+    }
+    event_add(m_request_timeout_timer, &delay);
+    m_request_timeout_armed = true;
+}
+
+void shard_connection::disarm_request_timeout()
+{
+    if (m_request_timeout_timer != NULL) event_del(m_request_timeout_timer);
+    m_request_timeout_armed = false;
+}
+
+// The watchdog fires one --request-timeout after the request it was armed
+// for. Only the oldest outstanding request matters: replies arrive in order,
+// so if it is not overdue none is. Re-arm for what is left of its wait, or
+// leave the timer off when nothing is outstanding (push_req() arms it again).
+void shard_connection::handle_request_timeout_event()
+{
+    m_request_timeout_armed = false;
+    if (m_pending_resp.load(std::memory_order_relaxed) == 0) return;
+
+    // m_sent_time is wall-clock: a step backwards must not read as a huge age.
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    const struct timeval &sent = m_pipeline->front()->m_sent_time;
+    const long long age_us =
+        std::max(0LL, (long long) (now.tv_sec - sent.tv_sec) * 1000000LL + (now.tv_usec - sent.tv_usec));
+    const long long timeout_us = (long long) m_config->request_timeout * 1000000LL;
+
+    if (age_us < timeout_us) {
+        struct timeval left;
+        left.tv_sec = (long) ((timeout_us - age_us) / 1000000LL);
+        left.tv_usec = (long) ((timeout_us - age_us) % 1000000LL);
+        arm_request_timeout(left);
+        return;
+    }
+
+    benchmark_error_log("Request timeout: no reply after %u seconds (%d requests outstanding).\n",
+                        m_config->request_timeout, m_pending_resp.load(std::memory_order_relaxed));
+    attempt_reconnect("Request timeout");
 }
 
 void shard_connection::send_wait_command(struct timeval *sent_time, unsigned int num_slaves, unsigned int timeout)

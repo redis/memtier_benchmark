@@ -27,7 +27,7 @@ _memtier_completions()
                    "--clients-start" "--clients-step" "--step-duration"\
                    "--statsd-host" "--statsd-port" "--statsd-prefix" "--statsd-run-label" "--graphite-port" "--prometheus-port" "--prometheus-bind-addr" "--prometheus-run-label" "--prometheus-latency-buckets"\
                    "--monitor-input" "--hdr-file-prefix"\
-                   "--max-reconnect-attempts" "--reconnect-backoff-factor" "--connection-timeout"\
+                   "--max-reconnect-attempts" "--reconnect-backoff-factor" "--connection-timeout" "--request-timeout"\
                    "--connection-stage-timeout" "--cpu-warn-threshold"\
                    "--max-retries" "--retry-backoff-ms" "--retry-backoff-factor" "--retry-on"\
                    "--max-retry-queue" "--failed-keys-file"\

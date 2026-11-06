@@ -242,6 +242,12 @@ Number of requests after which re\-connection is performed
 \fB\-\-reconnect\-on\-error\fR
 Enable automatic reconnection on connection errors (default: disabled).
 Without it, a lost connection ends its thread and the run exits 1.
+.TP
+\fB\-\-request\-timeout\fR=\fI\,SECS\/\fR
+Treat a connection as failed when its oldest request has had no reply for SECS seconds
+(default: 0, disabled). The timeout is logged and, with \fB\-\-reconnect\-on\-error\fR,
+the connection is reconnected; otherwise its thread ends. Do not set it below the duration
+of a legitimately slow command, such as a blocking one.
 .HP
 \fB\-\-max\-reconnect\-attempts\fR=\fI\,NUM\/\fR Maximum number of reconnection attempts (default: 0, unlimited)
 Running out of attempts fails the run.

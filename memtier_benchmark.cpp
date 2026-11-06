@@ -1086,6 +1086,7 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             "max_retry_queue = %u\n"
             "failed_keys_file = %s\n"
             "connection_timeout = %u\n"
+            "request_timeout = %u\n"
             "connection_stage_timeout = %u\n"
             "thread_conn_start_min_jitter_micros = %u\n"
             "thread_conn_start_max_jitter_micros = %u\n"
@@ -1123,11 +1124,12 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             cfg->key_prefix, cfg->key_minimum, cfg->key_maximum, cfg->key_pattern, cfg->key_stddev, cfg->key_median,
             cfg->reconnect_interval, cfg->retry_on_error ? "yes" : "no", cfg->max_retries, cfg->retry_backoff_ms,
             cfg->retry_backoff_factor, cfg->retry_on_filter ? cfg->retry_on_filter : "", cfg->max_retry_queue,
-            cfg->failed_keys_file ? cfg->failed_keys_file : "", cfg->connection_timeout, cfg->connection_stage_timeout,
-            cfg->thread_conn_start_min_jitter_micros, cfg->thread_conn_start_max_jitter_micros, cfg->multi_key_get,
-            redact_credentials(cfg->authenticate).c_str(), cfg->select_db, cfg->no_expiry ? "yes" : "no",
-            cfg->wait_ratio.a, cfg->wait_ratio.b, cfg->num_slaves.min, cfg->num_slaves.max, cfg->wait_timeout.min,
-            cfg->wait_timeout.max, cfg->json_out_file, cfg->print_all_runs ? "yes" : "no"
+            cfg->failed_keys_file ? cfg->failed_keys_file : "", cfg->connection_timeout, cfg->request_timeout,
+            cfg->connection_stage_timeout, cfg->thread_conn_start_min_jitter_micros,
+            cfg->thread_conn_start_max_jitter_micros, cfg->multi_key_get, redact_credentials(cfg->authenticate).c_str(),
+            cfg->select_db, cfg->no_expiry ? "yes" : "no", cfg->wait_ratio.a, cfg->wait_ratio.b, cfg->num_slaves.min,
+            cfg->num_slaves.max, cfg->wait_timeout.min, cfg->wait_timeout.max, cfg->json_out_file,
+            cfg->print_all_runs ? "yes" : "no"
 #ifdef HAVE_EVHTTP
             ,
             cfg->prometheus_port, cfg->prometheus_bind_addr ? cfg->prometheus_bind_addr : "127.0.0.1",
@@ -1208,6 +1210,7 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
     jsonhandler->write_obj("max_retry_queue", "%u", cfg->max_retry_queue);
     jsonhandler->write_obj("failed_keys_file", "\"%s\"", cfg->failed_keys_file ? cfg->failed_keys_file : "");
     jsonhandler->write_obj("connection_timeout", "%u", cfg->connection_timeout);
+    jsonhandler->write_obj("request_timeout", "%u", cfg->request_timeout);
     jsonhandler->write_obj("connection_stage_timeout", "%u", cfg->connection_stage_timeout);
     jsonhandler->write_obj("thread_conn_start_min_jitter_micros", "%u", cfg->thread_conn_start_min_jitter_micros);
     jsonhandler->write_obj("thread_conn_start_max_jitter_micros", "%u", cfg->thread_conn_start_max_jitter_micros);
@@ -1870,6 +1873,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_max_retry_queue,
         o_failed_keys_file,
         o_connection_timeout,
+        o_request_timeout,
         o_connection_stage_timeout,
         o_thread_conn_start_min_jitter_micros,
         o_thread_conn_start_max_jitter_micros,
@@ -1992,6 +1996,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         {"max-retry-queue", 1, 0, o_max_retry_queue},
         {"failed-keys-file", 1, 0, o_failed_keys_file},
         {"connection-timeout", 1, 0, o_connection_timeout},
+        {"request-timeout", 1, 0, o_request_timeout},
         {"connection-stage-timeout", 1, 0, o_connection_stage_timeout},
         {"thread-conn-start-min-jitter-micros", 1, 0, o_thread_conn_start_min_jitter_micros},
         {"thread-conn-start-max-jitter-micros", 1, 0, o_thread_conn_start_max_jitter_micros},
@@ -2536,6 +2541,13 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 return -1;
             }
             cfg->connection_timeout = (unsigned int) val;
+            break;
+        case o_request_timeout:
+            if (!parse_unsigned(optarg, UINT_MAX, &val)) {
+                fprintf(stderr, "error: request-timeout must be a valid number.\n");
+                return -1;
+            }
+            cfg->request_timeout = (unsigned int) val;
             break;
         case o_connection_stage_timeout:
             // 0 is allowed and disables the supervisor (opt-out for users
@@ -3467,6 +3479,10 @@ void usage()
         "                                 Off by default. Exits 1 at startup if the file cannot be opened;\n"
         "                                 a later write error stops logging and the run exits 1.\n"
         "      --connection-timeout=SECS  Connection timeout in seconds, 0 to disable (default: 0)\n"
+        "      --request-timeout=SECS     Treat a connection as failed when its oldest request has had no reply\n"
+        "                                 for SECS seconds: logged and, with --reconnect-on-error, reconnected\n"
+        "                                 (default: 0, disabled). Do not set it below the duration of a\n"
+        "                                 legitimately slow command, e.g. a blocking one.\n"
         "      --connection-stage-timeout=SECS\n"
         "                                 Abort with exit code 2 if no thread reaches steady state within\n"
         "                                 SECS, or if connection-setup failures (AUTH / HELLO / SELECT /\n"

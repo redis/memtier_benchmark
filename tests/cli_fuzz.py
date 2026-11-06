@@ -327,6 +327,7 @@ FLAG_SPECS = [
     ("--retry-on", retry_on_like),
     ("--max-retry-queue", weird_int),
     ("--connection-timeout", weird_int),
+    ("--request-timeout", weird_int),
     ("--thread-conn-start-min-jitter-micros", weird_int),
     ("--thread-conn-start-max-jitter-micros", weird_int),
     ("--multi-key-get", weird_int),
