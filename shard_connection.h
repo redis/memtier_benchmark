@@ -570,12 +570,14 @@ private:
 
     // Connection timeout tracking
     struct event *m_connection_timeout_timer;
-    // --request-timeout watchdog. One timer per connection, armed when a
-    // request is pushed and none is being watched; on firing it checks the
-    // oldest outstanding request, so replies cost no timer operation.
+    // --request-timeout watchdog. One timer per connection, armed by the push
+    // that finds it off. m_request_progress is set by anything that shows the
+    // peer is alive (reply data read, a request pushed to an idle pipeline),
+    // so the hot path costs one store and no timer operation.
     struct event *m_request_timeout_timer;
     bool m_request_timeout_armed;
-    void arm_request_timeout(const struct timeval &delay);
+    bool m_request_progress;
+    void arm_request_timeout();
     void disarm_request_timeout();
     struct event *m_unix_connect_timer;
 #ifdef _WIN32

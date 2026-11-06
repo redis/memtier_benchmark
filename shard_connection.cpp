@@ -30,7 +30,6 @@
 #include <errno.h>
 #include "platform_compat.h"
 #include <time.h>
-#include <algorithm>
 #ifdef HAVE_NETINET_TCP_H
 #include <netinet/tcp.h>
 #endif
@@ -332,6 +331,7 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_connection_timeout_timer(NULL),
         m_request_timeout_timer(NULL),
         m_request_timeout_armed(false),
+        m_request_progress(false),
         m_unix_connect_timer(NULL),
 #ifdef _WIN32
         m_deferred_connect_error(NULL),
@@ -1137,11 +1137,14 @@ request *shard_connection::pop_req()
 void shard_connection::push_req(request *req)
 {
     m_pipeline->push(req);
-    if (m_config->request_timeout > 0 && !m_request_timeout_armed) {
-        struct timeval delay;
-        delay.tv_sec = m_config->request_timeout;
-        delay.tv_usec = 0;
-        arm_request_timeout(delay);
+    if (m_config->request_timeout > 0) {
+        // A request pushed to an idle pipeline starts a wait the current
+        // window may not cover; the push that arms the window starts it.
+        if (!m_request_timeout_armed) {
+            arm_request_timeout();
+        } else if (m_pending_resp.load(std::memory_order_relaxed) == 0) {
+            m_request_progress = true;
+        }
     }
     // Worker-thread mutation (see pop_req comment).
     m_pending_resp.fetch_add(1, std::memory_order_relaxed);
@@ -1697,6 +1700,7 @@ void shard_connection::process_response(void)
 {
     int ret;
     bool responses_handled = false;
+    m_request_progress = true;
 
     struct timeval now;
     gettimeofday(&now, NULL);
@@ -3072,15 +3076,19 @@ void shard_connection::handle_connection_timeout_event()
     attempt_reconnect("Connection timeout");
 }
 
-void shard_connection::arm_request_timeout(const struct timeval &delay)
+void shard_connection::arm_request_timeout()
 {
     if (m_request_timeout_timer == NULL) {
         // Allocated once and reused; like the connection timeout timer, an
         // allocation failure here is not recoverable.
         m_request_timeout_timer = event_new(m_event_base, -1, 0, cluster_client_request_timeout_handler, (void *) this);
     }
+    struct timeval delay;
+    delay.tv_sec = (time_t) m_config->request_timeout;
+    delay.tv_usec = 0;
     event_add(m_request_timeout_timer, &delay);
     m_request_timeout_armed = true;
+    m_request_progress = false;
 }
 
 void shard_connection::disarm_request_timeout()
@@ -3089,28 +3097,20 @@ void shard_connection::disarm_request_timeout()
     m_request_timeout_armed = false;
 }
 
-// The watchdog fires one --request-timeout after the request it was armed
-// for. Only the oldest outstanding request matters: replies arrive in order,
-// so if it is not overdue none is. Re-arm for what is left of its wait, or
-// leave the timer off when nothing is outstanding (push_req() arms it again).
+// The watchdog is an idle timeout: it fires one --request-timeout after it was
+// armed, and again after each window in which the connection showed life.
+// Replies come in order, so a window with requests outstanding and neither
+// reply data nor a new request means the server is not serving this
+// connection. Nothing outstanding turns the timer off (push_req() arms it
+// again). Clocks are not involved, so a wall-clock step cannot misfire it, and
+// a slow server that keeps answering is never mistaken for a dead one.
 void shard_connection::handle_request_timeout_event()
 {
     m_request_timeout_armed = false;
     if (m_pending_resp.load(std::memory_order_relaxed) == 0) return;
 
-    // m_sent_time is wall-clock: a step backwards must not read as a huge age.
-    struct timeval now;
-    gettimeofday(&now, NULL);
-    const struct timeval &sent = m_pipeline->front()->m_sent_time;
-    const long long age_us =
-        std::max(0LL, (long long) (now.tv_sec - sent.tv_sec) * 1000000LL + (now.tv_usec - sent.tv_usec));
-    const long long timeout_us = (long long) m_config->request_timeout * 1000000LL;
-
-    if (age_us < timeout_us) {
-        struct timeval left;
-        left.tv_sec = (long) ((timeout_us - age_us) / 1000000LL);
-        left.tv_usec = (long) ((timeout_us - age_us) % 1000000LL);
-        arm_request_timeout(left);
+    if (m_request_progress) {
+        arm_request_timeout();
         return;
     }
 

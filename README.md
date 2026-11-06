@@ -681,7 +681,9 @@ A server can also accept a connection and never answer it (a proxy that stops
 calling `accept()` while throttling leaves the handshake in the kernel's listen
 backlog). Nothing errors, so `--reconnect-on-error` never fires, and
 `--connection-timeout` only bounds `connect()`. `--request-timeout=SECS` treats
-a connection whose oldest request has had no reply for SECS seconds as failed:
+a connection with requests outstanding that receives no reply data for SECS to
+2*SECS seconds as failed (a server that keeps answering, however slowly, never
+trips it; setup commands such as AUTH are covered too):
 memtier logs `Request timeout` and counts a connection error, and under
 `--reconnect-on-error` reconnects (otherwise the thread ends and the run fails,
 as for any lost connection). It is off by default; do not set it below the
