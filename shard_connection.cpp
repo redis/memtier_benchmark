@@ -143,6 +143,13 @@ void cluster_client_connection_timeout_handler(evutil_socket_t fd, short what, v
     sc->handle_connection_timeout_event();
 }
 
+void cluster_client_request_timeout_handler(evutil_socket_t fd, short what, void *ctx)
+{
+    shard_connection *sc = (shard_connection *) ctx;
+    assert(sc != NULL);
+    sc->handle_request_timeout_event();
+}
+
 // Retry due times use the monotonic clock, like libevent's timers, so a
 // wall-clock step cannot hold queued retries back or resend them early.
 static void retry_clock_now(struct timeval *tv)
@@ -322,6 +329,9 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_reconnect_deadline(),
         m_fired_reconnect_deadline(),
         m_connection_timeout_timer(NULL),
+        m_request_timeout_timer(NULL),
+        m_request_timeout_armed(false),
+        m_request_progress(false),
         m_unix_connect_timer(NULL),
 #ifdef _WIN32
         m_deferred_connect_error(NULL),
@@ -418,6 +428,12 @@ shard_connection::~shard_connection()
     if (m_connection_timeout_timer != NULL) {
         event_free(m_connection_timeout_timer);
         m_connection_timeout_timer = NULL;
+    }
+
+    if (m_request_timeout_timer != NULL) {
+        event_free(m_request_timeout_timer);
+        m_request_timeout_timer = NULL;
+        m_request_timeout_armed = false;
     }
 
     if (m_unix_connect_timer != NULL) {
@@ -902,6 +918,8 @@ void shard_connection::disconnect()
         m_unix_connect_timer = NULL;
     }
 
+    disarm_request_timeout();
+
     // Drain pipeline. With --retry-on-error, move in-flight requests into the
     // replay queue so they get resent after reconnect. Otherwise, discard them.
     // Discarded workload requests will never be processed, so uncount them
@@ -1119,6 +1137,17 @@ request *shard_connection::pop_req()
 void shard_connection::push_req(request *req)
 {
     m_pipeline->push(req);
+    if (m_config->request_timeout > 0) {
+        // The m_pending_resp check must stay before the fetch_add below: it
+        // detects a push to an idle pipeline.
+        // A request pushed to an idle pipeline starts a wait the current
+        // window may not cover; the push that arms the window starts it.
+        if (!m_request_timeout_armed) {
+            arm_request_timeout();
+        } else if (m_pending_resp.load(std::memory_order_relaxed) == 0) {
+            m_request_progress = true;
+        }
+    }
     // Worker-thread mutation (see pop_req comment).
     m_pending_resp.fetch_add(1, std::memory_order_relaxed);
     // Snapshot the type for the crash handler (which can't safely deref the
@@ -1673,6 +1702,7 @@ void shard_connection::process_response(void)
 {
     int ret;
     bool responses_handled = false;
+    m_request_progress = true;
 
     struct timeval now;
     gettimeofday(&now, NULL);
@@ -3046,6 +3076,49 @@ void shard_connection::handle_connection_timeout_event()
 
     benchmark_error_log("Connection timeout after %u seconds.\n", m_config->connection_timeout);
     attempt_reconnect("Connection timeout");
+}
+
+void shard_connection::arm_request_timeout()
+{
+    if (m_request_timeout_timer == NULL) {
+        // Allocated once and reused; like the connection timeout timer, an
+        // allocation failure here is not recoverable.
+        m_request_timeout_timer = event_new(m_event_base, -1, 0, cluster_client_request_timeout_handler, (void *) this);
+    }
+    struct timeval delay;
+    delay.tv_sec = (time_t) m_config->request_timeout;
+    delay.tv_usec = 0;
+    event_add(m_request_timeout_timer, &delay);
+    m_request_timeout_armed = true;
+    m_request_progress = false;
+}
+
+void shard_connection::disarm_request_timeout()
+{
+    if (m_request_timeout_timer != NULL) event_del(m_request_timeout_timer);
+    m_request_timeout_armed = false;
+}
+
+// The watchdog is an idle timeout: it fires one --request-timeout after it was
+// armed, and again after each window in which the connection showed life.
+// Replies come in order, so a window with requests outstanding and neither
+// reply data nor a new request means the server is not serving this
+// connection. Nothing outstanding turns the timer off (push_req() arms it
+// again). Clocks are not involved, so a wall-clock step cannot misfire it, and
+// a slow server that keeps answering is never mistaken for a dead one.
+void shard_connection::handle_request_timeout_event()
+{
+    m_request_timeout_armed = false;
+    if (m_pending_resp.load(std::memory_order_relaxed) == 0) return;
+
+    if (m_request_progress) {
+        arm_request_timeout();
+        return;
+    }
+
+    benchmark_error_log("Request timeout: no reply data for at least %u seconds (%d requests outstanding).\n",
+                        m_config->request_timeout, m_pending_resp.load(std::memory_order_relaxed));
+    attempt_reconnect("Request timeout");
 }
 
 void shard_connection::send_wait_command(struct timeval *sent_time, unsigned int num_slaves, unsigned int timeout)

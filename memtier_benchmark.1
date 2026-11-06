@@ -242,6 +242,17 @@ Number of requests after which re\-connection is performed
 \fB\-\-reconnect\-on\-error\fR
 Enable automatic reconnection on connection errors (default: disabled).
 Without it, a lost connection ends its thread and the run exits 1.
+.TP
+\fB\-\-request\-timeout\fR=\fI\,SECS\/\fR
+Stall timeout: treat a connection as failed when requests are outstanding and no reply data
+arrives for SECS to 2*SECS seconds (default: 0, disabled; at most 2147483647). It is not a
+per-request deadline: a server that keeps sending data, however slowly, never trips it.
+The timeout is logged and, with \fB\-\-reconnect\-on\-error\fR, the connection is
+reconnected (with \fB\-\-retry\-on\-error\fR its requests are resent); otherwise its thread
+ends and the run exits 1. It also covers setup commands (AUTH, HELLO, ...), and an idle
+connection (nothing outstanding) is never timed out. Do not set it below the duration of a
+legitimately long wait, such as BLPOP or WAIT. Note that the abbreviation \fB\-\-request\fR
+is ambiguous with \fB\-\-requests\fR.
 .HP
 \fB\-\-max\-reconnect\-attempts\fR=\fI\,NUM\/\fR Maximum number of reconnection attempts (default: 0, unlimited)
 Running out of attempts fails the run.

@@ -227,6 +227,7 @@ UNSIGNED_OPTIONS = {
     "--retry-backoff-ms": "retry-backoff-ms must be",
     "--max-retry-queue": "max-retry-queue must be",
     "--connection-timeout": "connection-timeout must be",
+    "--request-timeout": "request-timeout must be",
     "--connection-stage-timeout": "connection-stage-timeout must be",
 }
 
@@ -293,6 +294,7 @@ def test_unsigned_options_accept_valid_values(env):
             env.assertEqual(result.returncode, 0, message="{} {!r}: {}".format(option, value, result.stderr))
     for option, top in (("--max-reconnect-attempts", "4294967295"), ("--retry-backoff-ms", "4294967295"),
                         ("--max-retry-queue", "4294967295"), ("--connection-timeout", "4294967295"),
+                        ("--request-timeout", "2147483647"),
                         ("--connection-stage-timeout", "4294967294")):
         for value in ("0", top):
             result = _run_memtier([option, value, "--version"])
@@ -791,3 +793,10 @@ def test_print_percentiles_validation(env):
     for value in valid:
         result = _run_memtier(prefix + ["--print-percentiles=" + value, "--version"])
         env.assertEqual(result.returncode, 0, message=repr(value) + ": " + result.stderr)
+
+
+def test_request_timeout_rejects_values_above_int_max(env):
+    # The timer delay is a time_t, 32 bits on some platforms.
+    result = _run_memtier(["--request-timeout", "2147483648", "--version"])
+    env.assertEqual(result.returncode, 2, message=result.stderr)
+    env.assertContains("request-timeout must be", result.stderr)
