@@ -2543,8 +2543,9 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             cfg->connection_timeout = (unsigned int) val;
             break;
         case o_request_timeout:
-            if (!parse_unsigned(optarg, UINT_MAX, &val)) {
-                fprintf(stderr, "error: request-timeout must be a valid number.\n");
+            // Capped at INT_MAX: the timer delay is a time_t, 32 bits on some platforms.
+            if (!parse_unsigned(optarg, INT_MAX, &val)) {
+                fprintf(stderr, "error: request-timeout must be a valid number (seconds, at most %d).\n", INT_MAX);
                 return -1;
             }
             cfg->request_timeout = (unsigned int) val;
@@ -3479,11 +3480,12 @@ void usage()
         "                                 Off by default. Exits 1 at startup if the file cannot be opened;\n"
         "                                 a later write error stops logging and the run exits 1.\n"
         "      --connection-timeout=SECS  Connection timeout in seconds, 0 to disable (default: 0)\n"
-        "      --request-timeout=SECS     Treat a connection as failed when requests are outstanding and no reply\n"
-        "                                 data arrives for SECS to 2*SECS seconds: logged and, with\n"
-        "                                 --reconnect-on-error, reconnected (default: 0, disabled). Also covers\n"
-        "                                 setup commands. Do not set it below the duration of a legitimately\n"
-        "                                 slow command, e.g. a blocking one.\n"
+        "      --request-timeout=SECS     Stall timeout: treat a connection as failed when requests are outstanding\n"
+        "                                 and no reply data arrives for SECS to 2*SECS seconds: logged and, with\n"
+        "                                 --reconnect-on-error, reconnected (default: 0, disabled). Not a\n"
+        "                                 per-request deadline: a server that keeps sending data never trips it.\n"
+        "                                 Also covers setup commands. Do not set it below the duration of a\n"
+        "                                 legitimately long wait, e.g. BLPOP or WAIT.\n"
         "      --connection-stage-timeout=SECS\n"
         "                                 Abort with exit code 2 if no thread reaches steady state within\n"
         "                                 SECS, or if connection-setup failures (AUTH / HELLO / SELECT /\n"
