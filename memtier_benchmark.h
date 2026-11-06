@@ -181,9 +181,10 @@ struct benchmark_config
     // logged once and the benchmark continues.
     const char *failed_keys_file;
     unsigned int connection_timeout;
-    // --request-timeout: seconds a request may wait for its reply before the
-    // connection is treated as failed (reconnect under --reconnect-on-error).
-    // 0 disables (default).
+    // --request-timeout: seconds of silence (no reply data) with requests
+    // outstanding before the connection is treated as failed (reconnect under
+    // --reconnect-on-error); detected within one to two of these. 0 disables
+    // (default).
     unsigned int request_timeout;
     // Per-process bound on time spent in the *connection-setup* phase
     // (AUTH, HELLO, SELECT, CLUSTER SLOTS, initial probe). Once any thread

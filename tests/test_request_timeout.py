@@ -14,6 +14,7 @@ import threading
 import time
 
 from include import MEMTIER_BINARY
+from test_cluster_slots_bad_reply import _Node, _run as _run_cluster
 
 
 def _plain_standalone_only(env):
@@ -49,11 +50,11 @@ def test_unserved_connection_times_out_and_reconnects(env):
         elapsed = time.monotonic() - start
     finally:
         sock.close()
-    env.assertContains("Request timeout: no reply after 1 seconds (1 requests outstanding)", result.stderr,
+    env.assertContains("Request timeout: no reply data for at least 1 seconds (1 requests outstanding)", result.stderr,
                        message=result.stderr)
     env.assertContains("Request timeout, attempting reconnection", result.stderr, message=result.stderr)
     # The timeout fires more than once: the reconnect lands on the same dead listener.
-    env.assertGreater(result.stderr.count("Request timeout: no reply"), 1, message=result.stderr)
+    env.assertGreater(result.stderr.count("Request timeout: no reply data"), 1, message=result.stderr)
     env.assertLess(elapsed, 50)
 
 
@@ -64,7 +65,7 @@ def test_unserved_connection_without_reconnect_fails_run(env):
         result = _run(_args(port, "--test-time=30", "--request-timeout=1"))
     finally:
         sock.close()
-    env.assertContains("Request timeout: no reply after 1 seconds", result.stderr, message=result.stderr)
+    env.assertContains("Request timeout: no reply data for at least 1 seconds", result.stderr, message=result.stderr)
     env.assertContains("Request timeout and --reconnect-on-error is not set", result.stderr, message=result.stderr)
     env.assertNotEqual(result.returncode, 0, message=result.stderr)
 
@@ -163,3 +164,15 @@ def test_request_timeout_in_json_config(env):
     finally:
         server.close()
     env.assertEqual(config["request_timeout"], 7)
+
+
+def test_cluster_connection_times_out_and_reconnects(env):
+    # The node answers CLUSTER SLOTS but sits on the first data request, as a
+    # throttled proxy does; the reconnect gets served.
+    node = _Node(bad_slots_replies=0, first_data_delay=6)
+    returncode, stderr, _ = _run_cluster(node, ["--test-time=4", "--request-timeout=1", "--reconnect-on-error"])
+    env.assertEqual(node.errors, [])
+    env.assertContains("Request timeout: no reply data for at least 1 seconds", stderr, message=stderr[-2000:])
+    env.assertContains("Request timeout, attempting reconnection", stderr, message=stderr[-2000:])
+    env.assertEqual(returncode, 0, message=stderr[-2000:])
+    env.assertGreater(node.data_requests, 10)

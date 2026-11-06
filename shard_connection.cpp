@@ -1138,6 +1138,8 @@ void shard_connection::push_req(request *req)
 {
     m_pipeline->push(req);
     if (m_config->request_timeout > 0) {
+        // The m_pending_resp check must stay before the fetch_add below: it
+        // detects a push to an idle pipeline.
         // A request pushed to an idle pipeline starts a wait the current
         // window may not cover; the push that arms the window starts it.
         if (!m_request_timeout_armed) {
@@ -3114,7 +3116,7 @@ void shard_connection::handle_request_timeout_event()
         return;
     }
 
-    benchmark_error_log("Request timeout: no reply after %u seconds (%d requests outstanding).\n",
+    benchmark_error_log("Request timeout: no reply data for at least %u seconds (%d requests outstanding).\n",
                         m_config->request_timeout, m_pending_resp.load(std::memory_order_relaxed));
     attempt_reconnect("Request timeout");
 }
