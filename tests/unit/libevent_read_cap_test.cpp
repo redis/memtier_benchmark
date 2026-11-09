@@ -16,7 +16,7 @@
  * along with memtier_benchmark.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-// One read event on a plaintext socket bufferevent takes 16 KiB on every
+// One read event on a plaintext socket bufferevent takes at most 16 KiB on every
 // libevent series: 2.2 reads that much itself, and memtier reads past 2.1's
 // 4 KiB cap (libevent_read_cap.h, issue #535).
 
@@ -55,7 +55,7 @@ static int failures = 0;
 struct reader
 {
     struct event_base *base;
-    bool tracked;
+    bool read_past_cap;
     // Input length after each read event, in order.
     size_t lengths[8];
     int reads;
@@ -78,8 +78,11 @@ static void read_cb(struct bufferevent *bev, void *arg)
     reader *r = (reader *) arg;
     struct evbuffer *input = bufferevent_get_input(bev);
     int ev = r->reads;
-    if (ev < 4 && r->inject_before[ev] && write(r->peer, payload, r->inject_before[ev]) < 0) failures++;
-    if (r->tracked) read_past_libevent_cap(input, bufferevent_getfd(bev));
+    if (ev < 4 && r->inject_before[ev] && write(r->peer, payload, r->inject_before[ev]) != (ssize_t) r->inject_before[ev]) {
+        perror("write");
+        failures++;
+    }
+    if (r->read_past_cap) read_past_libevent_cap(input, bufferevent_getfd(bev));
     if (r->reads < 8) r->lengths[r->reads] = evbuffer_get_length(input);
     r->reads++;
     // libevent keeps the input's end frozen outside its own read.
@@ -88,7 +91,10 @@ static void read_cb(struct bufferevent *bev, void *arg)
     size_t len = evbuffer_get_length(input);
     size_t keep = ev < 4 ? r->keep[ev] : 0;
     evbuffer_drain(input, len > keep ? len - keep : 0);
-    if (ev < 4 && r->deliver_after[ev] && write(r->peer, payload, r->deliver_after[ev]) < 0) failures++;
+    if (ev < 4 && r->deliver_after[ev] && write(r->peer, payload, r->deliver_after[ev]) != (ssize_t) r->deliver_after[ev]) {
+        perror("write");
+        failures++;
+    }
     event_base_loopbreak(r->base);
 }
 
@@ -133,7 +139,7 @@ static void run(reader *r, size_t queued, bool close_after, int events, const re
     r->peer = fds[1];
     r->base = event_base_new();
     struct bufferevent *bev = bufferevent_socket_new(r->base, fds[0], BEV_OPT_CLOSE_ON_FREE);
-    r->tracked = libevent_caps_reads();
+    r->read_past_cap = libevent_caps_reads();
     bufferevent_setcb(bev, read_cb, NULL, event_cb, r);
     bufferevent_enable(bev, EV_READ);
     for (int i = 0; i < events; i++)
@@ -145,6 +151,8 @@ static void run(reader *r, size_t queued, bool close_after, int events, const re
 
 int main(void)
 {
+    // A missed read event would hang the loop; fail the test instead.
+    alarm(60);
     reader r;
 
     // More than 16 KiB queued: the first read event takes exactly 16 KiB.
@@ -162,6 +170,12 @@ int main(void)
     CHECK_EQ(r.lengths[0], libevent_read_cap);
     CHECK_EQ(r.input_frozen, true);
 
+    // Exactly one cap, then EOF: nothing more is read, and libevent's next
+    // read reports the EOF.
+    run(&r, libevent_read_cap, true, 2);
+    CHECK_EQ(r.lengths[0], libevent_read_cap);
+    CHECK_EQ(r.eof, true);
+
     // Data then EOF: all the data in one read event, and the EOF is still
     // reported by libevent's next read.
     run(&r, 6000, true, 2);
@@ -178,8 +192,8 @@ int main(void)
         // read: it is read on.
         memset(&cfg, 0, sizeof(cfg));
         cfg.inject_before[0] = 100;
-        run(&r, libevent_read_cap, false, 1, &cfg);
-        CHECK_EQ(r.lengths[0], libevent_read_cap + 100);
+        run(&r, 4096, false, 1, &cfg);
+        CHECK_EQ(r.lengths[0], 4096 + 100);
 
         // B: one byte under the cap: nothing is read on; the later bytes are
         // left for the next read event.

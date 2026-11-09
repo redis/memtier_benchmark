@@ -19,7 +19,7 @@
 #ifndef MEMTIER_LIBEVENT_READ_CAP_H
 #define MEMTIER_LIBEVENT_READ_CAP_H
 
-// libevent before 2.2 (2.0.11, the oldest configure accepts, to 2.1.13) reads
+// libevent before 2.2 (2.0.11, the oldest configure accepts, through 2.1.x) reads
 // at most 4 KiB (EVBUFFER_MAX_READ) from a socket per read event, so
 // pipelined replies are read and parsed 4 KiB at a time;
 // libevent 2.2 reads up to 16 KiB (issue #535). For a plaintext socket
@@ -30,9 +30,11 @@
 // nor tested.
 // This relies on two libevent 2.1 details: a capped read adds at most
 // EVBUFFER_MAX_READ (4096) bytes, and the input's end is frozen outside
-// libevent's own read. With a libevent built with a different
-// EVBUFFER_MAX_READ, memtier reads on only when more than 4096 bytes are in
-// the input and more is queued, which is harmless.
+// libevent's own read. The 16 KiB bound holds for the default 4096. A libevent
+// built with a larger EVBUFFER_MAX_READ already reads more than 4 KiB itself;
+// memtier then only reads on when at least 4096 bytes are in the input and
+// more is queued. The direct recv() bypasses libevent's read watermark and
+// rate-limit accounting, which memtier does not use on these sockets.
 
 #include <stddef.h>
 #include <stdio.h>
@@ -60,16 +62,14 @@ static inline bool libevent_caps_reads(void)
 
 // Call from the read callback of a plaintext socket bufferevent, before parsing.
 // libevent's read added at most libevent_read_cap bytes, so an input shorter
-// than the cap cannot have been capped: return at once, which is the usual
-// case for small replies and costs one length read per event. (#851 first
-// recorded each read's size with an evbuffer callback, which libevent runs on
-// every drain, that is for every reply: about 250 instructions per reply at
-// pipeline 16.) An input of at least one cap is only a hint, since it may also
-// hold unparsed bytes from earlier reads. Then FIONREAD says whether more is
-// queued: if it is, read on; if it is not (libevent's read was not capped),
-// nothing is read, at the price of one ioctl. A read event therefore takes at
-// most libevent_2_2_read_size of new data (libevent's 4 KiB plus at most the
-// rest of that size here), whatever the input already holds.
+// than the cap cannot hold a capped read: return at once, which is the usual
+// case for small replies and costs one length read per event. An input of at
+// least one cap is only a hint, since it may also hold unparsed bytes from
+// earlier reads. FIONREAD then says whether more is queued: if it is, read on;
+// if not (libevent's read was not capped), nothing is read, at the price of
+// one ioctl. A read event therefore takes at most libevent_2_2_read_size of new
+// data (libevent's 4 KiB plus at most the rest of that size here), whatever the
+// input already holds.
 static inline void read_past_libevent_cap(struct evbuffer *input, evutil_socket_t fd)
 {
 #ifdef _WIN32
