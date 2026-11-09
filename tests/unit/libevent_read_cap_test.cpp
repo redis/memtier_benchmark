@@ -55,26 +55,40 @@ static int failures = 0;
 struct reader
 {
     struct event_base *base;
-    size_t last_added;
     bool tracked;
     // Input length after each read event, in order.
     size_t lengths[8];
     int reads;
     bool input_frozen;
     bool eof;
+    // Per read event (the first four): bytes written to the peer before
+    // read_past_libevent_cap() runs (data that arrives after libevent's read),
+    // bytes of input left unparsed afterwards, and bytes written to the peer
+    // once the event is done (for the next event to read).
+    size_t inject_before[4];
+    size_t keep[4];
+    size_t deliver_after[4];
+    int peer;
 };
+
+static char payload[65536];
 
 static void read_cb(struct bufferevent *bev, void *arg)
 {
     reader *r = (reader *) arg;
     struct evbuffer *input = bufferevent_get_input(bev);
-    if (r->tracked) read_past_libevent_cap(input, bufferevent_getfd(bev), &r->last_added);
+    int ev = r->reads;
+    if (ev < 4 && r->inject_before[ev] && write(r->peer, payload, r->inject_before[ev]) < 0) failures++;
+    if (r->tracked) read_past_libevent_cap(input, bufferevent_getfd(bev));
     if (r->reads < 8) r->lengths[r->reads] = evbuffer_get_length(input);
     r->reads++;
     // libevent keeps the input's end frozen outside its own read.
     r->input_frozen = evbuffer_add(input, "x", 1) != 0;
     if (!r->input_frozen) evbuffer_drain(input, 1);
-    evbuffer_drain(input, evbuffer_get_length(input));
+    size_t len = evbuffer_get_length(input);
+    size_t keep = ev < 4 ? r->keep[ev] : 0;
+    evbuffer_drain(input, len > keep ? len - keep : 0);
+    if (ev < 4 && r->deliver_after[ev] && write(r->peer, payload, r->deliver_after[ev]) < 0) failures++;
     event_base_loopbreak(r->base);
 }
 
@@ -87,7 +101,7 @@ static void event_cb(struct bufferevent *, short events, void *arg)
 
 // Queue `queued` bytes (then EOF if `close_after`) and run the loop until
 // `events` read or EOF callbacks have run.
-static void run(reader *r, size_t queued, bool close_after, int events)
+static void run(reader *r, size_t queued, bool close_after, int events, const reader *cfg = NULL)
 {
     int fds[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
@@ -103,7 +117,6 @@ static void run(reader *r, size_t queued, bool close_after, int events)
     setsockopt(fds[1], SOL_SOCKET, SO_SNDBUF, &size, sizeof(size));
     setsockopt(fds[0], SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
     evutil_make_socket_nonblocking(fds[1]);
-    static char payload[65536];
     memset(payload, 'v', sizeof(payload));
     if (write(fds[1], payload, queued) != (ssize_t) queued) {
         perror("write");
@@ -112,10 +125,15 @@ static void run(reader *r, size_t queued, bool close_after, int events)
     if (close_after) shutdown(fds[1], SHUT_WR);
 
     memset(r, 0, sizeof(*r));
+    if (cfg) {
+        memcpy(r->inject_before, cfg->inject_before, sizeof(r->inject_before));
+        memcpy(r->keep, cfg->keep, sizeof(r->keep));
+        memcpy(r->deliver_after, cfg->deliver_after, sizeof(r->deliver_after));
+    }
+    r->peer = fds[1];
     r->base = event_base_new();
     struct bufferevent *bev = bufferevent_socket_new(r->base, fds[0], BEV_OPT_CLOSE_ON_FREE);
     r->tracked = libevent_caps_reads();
-    if (r->tracked) track_libevent_reads(bufferevent_get_input(bev), &r->last_added);
     bufferevent_setcb(bev, read_cb, NULL, event_cb, r);
     bufferevent_enable(bev, EV_READ);
     for (int i = 0; i < events; i++)
@@ -150,6 +168,66 @@ int main(void)
     CHECK_EQ(r.reads, 1);
     CHECK_EQ(r.lengths[0], 6000);
     CHECK_EQ(r.eof, true);
+
+    // The check is a hint (an input of at least one cap may hold leftover
+    // bytes), and these cases pin both of its edges. They need the read cap.
+    if (libevent_caps_reads()) {
+        reader cfg;
+
+        // A: exactly one cap in the input, and more arrives after libevent's
+        // read: it is read on.
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.inject_before[0] = 100;
+        run(&r, libevent_read_cap, false, 1, &cfg);
+        CHECK_EQ(r.lengths[0], libevent_read_cap + 100);
+
+        // B: one byte under the cap: nothing is read on; the later bytes are
+        // left for the next read event.
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.inject_before[0] = 100;
+        run(&r, libevent_read_cap - 1, false, 2, &cfg);
+        CHECK_EQ(r.lengths[0], libevent_read_cap - 1);
+        CHECK_EQ(r.lengths[1], 100);
+
+        // C: 3000 bytes left unparsed, then 1500 more arrive: the input holds
+        // more than a cap although libevent's read was not capped. Nothing is
+        // queued, so nothing more is read.
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.keep[0] = 3000;
+        cfg.deliver_after[0] = 1500;
+        run(&r, 3000, false, 2, &cfg);
+        CHECK_EQ(r.lengths[0], 3000);
+        CHECK_EQ(r.lengths[1], 4500);
+
+        // C2: the same, with 50 bytes arriving after libevent's read: they are read.
+        cfg.inject_before[1] = 50;
+        run(&r, 3000, false, 2, &cfg);
+        CHECK_EQ(r.lengths[1], 4550);
+
+        // D: 100 bytes left unparsed, then 1000 more and 50 after libevent's
+        // read: the input is under a cap, so the 50 stay for the next event.
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.keep[0] = 100;
+        cfg.deliver_after[0] = 1000;
+        cfg.inject_before[1] = 50;
+        run(&r, 100, false, 2, &cfg);
+        CHECK_EQ(r.lengths[1], 1100);
+
+        // E: 100 bytes left unparsed, then 40000 queued: libevent reads a cap,
+        // memtier at most 12 KiB more, so one event adds 16 KiB of new data.
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.keep[0] = 100;
+        cfg.deliver_after[0] = 40000;
+        run(&r, 100, false, 2, &cfg);
+        CHECK_EQ(r.lengths[1], 100 + libevent_2_2_read_size);
+
+        // F: a failing FIONREAD (bad descriptor) reads nothing.
+        struct evbuffer *buf = evbuffer_new();
+        evbuffer_add(buf, payload, 5000);
+        read_past_libevent_cap(buf, -1);
+        CHECK_EQ(evbuffer_get_length(buf), 5000);
+        evbuffer_free(buf);
+    }
 
     if (failures) {
         fprintf(stderr, "%d failure(s)\n", failures);
