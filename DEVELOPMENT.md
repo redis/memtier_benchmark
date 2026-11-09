@@ -324,8 +324,9 @@ checks to `check-macos-tls-links.sh`).
   libevent 2.1 reads at most 4 KiB (`EVBUFFER_MAX_READ`) from a socket per
   read event; 2.2 reads up to 16 KiB. On plaintext connections memtier reads
   on past the 2.1 cap, up to 16 KiB as 2.2 does (not on Windows), so deep
-  pipelines with large replies take the same event-loop passes on both
-  series. TLS bufferevents still differ: 2.1 reads about one TLS record per read event (4 KiB, then what
+  pipelines with large replies take about the same number of event-loop
+  passes on both series (memtier adds one `ioctl` and one `recv` that 2.2 does
+  not need). TLS bufferevents still differ: 2.1 reads about one TLS record per read event (4 KiB, then what
   OpenSSL already holds decrypted), while 2.2 keeps reading records until 16
   KiB or the socket is drained. Record the libevent version that `--version`
   reports with results and compare runs only on the same libevent build.

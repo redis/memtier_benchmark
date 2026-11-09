@@ -174,8 +174,7 @@ void cluster_client_read_handler(bufferevent *bev, void *ctx)
 {
     shard_connection *sc = (shard_connection *) ctx;
     assert(sc != NULL);
-    if (sc->tracks_libevent_reads())
-        read_past_libevent_cap(bufferevent_get_input(bev), bufferevent_getfd(bev), sc->last_input_added());
+    if (sc->reads_past_libevent_cap()) read_past_libevent_cap(bufferevent_get_input(bev), bufferevent_getfd(bev));
     sc->process_response();
 }
 
@@ -343,8 +342,7 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_cluster_slots_retry_timer(NULL),
         m_setup_rejected_timer(NULL),
         m_bev_paused(false),
-        m_tracks_libevent_reads(false),
-        m_last_input_added(0),
+        m_reads_past_libevent_cap(false),
         m_in_socket_connect(false),
         m_socket_connect_error(0)
 {
@@ -538,7 +536,7 @@ bool shard_connection::setup_event(evutil_socket_t sockfd)
     // bufferevent_enable in handle_event on BEV_EVENT_CONNECTED); reset the
     // pause flag so we don't carry stale state from a prior socket.
     m_bev_paused = false;
-    m_tracks_libevent_reads = false;
+    m_reads_past_libevent_cap = false;
 
     // On failure the caller fails this connect attempt like a socket setup
     // failure; its connect/reconnect error handling applies unchanged.
@@ -584,10 +582,7 @@ bool shard_connection::setup_event(evutil_socket_t sockfd)
             evutil_closesocket(sockfd);
             return false;
         }
-        if (libevent_caps_reads()) {
-            track_libevent_reads(bufferevent_get_input(m_bev), &m_last_input_added);
-            m_tracks_libevent_reads = true;
-        }
+        m_reads_past_libevent_cap = libevent_caps_reads();
 #ifdef USE_TLS
     }
 #endif

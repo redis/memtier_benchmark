@@ -19,19 +19,22 @@
 #ifndef MEMTIER_LIBEVENT_READ_CAP_H
 #define MEMTIER_LIBEVENT_READ_CAP_H
 
-// libevent before 2.2 (2.0.11, the oldest configure accepts, to 2.1.13) reads
+// libevent before 2.2 (2.0.11, the oldest configure accepts, through 2.1.x) reads
 // at most 4 KiB (EVBUFFER_MAX_READ) from a socket per read event, so
 // pipelined replies are read and parsed 4 KiB at a time;
 // libevent 2.2 reads up to 16 KiB (issue #535). For a plaintext socket
-// bufferevent, read on after a capped read so that a read event takes the
-// same amount of data on both series. TLS bufferevents read whole records
-// and are left alone. Windows keeps libevent's reads: the Winsock version
-// (ioctlsocket(), and IOCP bufferevents) is neither written nor tested.
-// This relies on two libevent 2.1 details: a capped read adds exactly
+// bufferevent, read on when the input holds a full cap, so that a read event
+// takes at most the amount of data libevent 2.2 does. TLS bufferevents read
+// whole records and are left alone. Windows keeps libevent's reads: the
+// Winsock version (ioctlsocket(), and IOCP bufferevents) is neither written
+// nor tested.
+// This relies on two libevent 2.1 details: a capped read adds at most
 // EVBUFFER_MAX_READ (4096) bytes, and the input's end is frozen outside
-// libevent's own read. With a libevent built with a different
-// EVBUFFER_MAX_READ, a read adds exactly 4096 bytes only by coincidence, finds
-// nothing more queued, and memtier keeps libevent's reads, as before.
+// libevent's own read. The 16 KiB bound holds for the default 4096. A libevent
+// built with a larger EVBUFFER_MAX_READ already reads more than 4 KiB itself;
+// memtier then only reads on when at least 4096 bytes are in the input and
+// more is queued. The direct recv() bypasses libevent's read watermark and
+// rate-limit accounting, which memtier does not use on these sockets.
 
 #include <stddef.h>
 #include <stdio.h>
@@ -57,36 +60,23 @@ static inline bool libevent_caps_reads(void)
 #endif
 }
 
-static inline void libevent_read_added_cb(struct evbuffer *, const struct evbuffer_cb_info *info, void *arg)
-{
-    if (info->n_added > 0) *(size_t *) arg = info->n_added;
-}
-
-// Record in *last_added how much each read adds to input. A callback rather
-// than comparing lengths around process_response(), which can delete the
-// connection (e.g. a cluster reconnect frees non-main connections). Our own
-// read below triggers it too; libevent's next read overwrites that value
-// before the next read callback, as long as only libevent's reads run the
-// read callback (memtier never calls bufferevent_trigger() on it).
-static inline void track_libevent_reads(struct evbuffer *input, size_t *last_added)
-{
-    *last_added = 0;
-    evbuffer_add_cb(input, libevent_read_added_cb, last_added);
-}
-
-// Call from the read callback of a socket bufferevent whose input is tracked
-// with track_libevent_reads(). When libevent's read filled the cap, more data
-// is usually queued: read on, up to libevent_2_2_read_size in all. A read that
-// added exactly the cap without being capped finds nothing more queued.
-static inline void read_past_libevent_cap(struct evbuffer *input, evutil_socket_t fd, size_t *last_added)
+// Call from the read callback of a plaintext socket bufferevent, before parsing.
+// libevent's read added at most libevent_read_cap bytes, so an input shorter
+// than the cap cannot hold a capped read: return at once, which is the usual
+// case for small replies and costs one length read per event. An input of at
+// least one cap is only a hint, since it may also hold unparsed bytes from
+// earlier reads. FIONREAD then says whether more is queued: if it is, read on;
+// if not (libevent's read was not capped), nothing is read, at the price of
+// one ioctl. A read event therefore takes at most libevent_2_2_read_size of new
+// data (libevent's 4 KiB plus at most the rest of that size here), whatever the
+// input already holds.
+static inline void read_past_libevent_cap(struct evbuffer *input, evutil_socket_t fd)
 {
 #ifdef _WIN32
     (void) input;
     (void) fd;
-    (void) last_added;
 #else
-    if (*last_added != libevent_read_cap) return;
-    *last_added = 0;
+    if (evbuffer_get_length(input) < libevent_read_cap) return;
 
     // Read only what is already queued, as libevent does, so that a pending
     // EOF or socket error is left for libevent's next read to report.
