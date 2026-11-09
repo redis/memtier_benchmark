@@ -78,7 +78,8 @@ static void read_cb(struct bufferevent *bev, void *arg)
     reader *r = (reader *) arg;
     struct evbuffer *input = bufferevent_get_input(bev);
     int ev = r->reads;
-    if (ev < 4 && r->inject_before[ev] && write(r->peer, payload, r->inject_before[ev]) != (ssize_t) r->inject_before[ev]) {
+    if (ev < 4 && r->inject_before[ev] &&
+        write(r->peer, payload, r->inject_before[ev]) != (ssize_t) r->inject_before[ev]) {
         perror("write");
         failures++;
     }
@@ -91,7 +92,8 @@ static void read_cb(struct bufferevent *bev, void *arg)
     size_t len = evbuffer_get_length(input);
     size_t keep = ev < 4 ? r->keep[ev] : 0;
     evbuffer_drain(input, len > keep ? len - keep : 0);
-    if (ev < 4 && r->deliver_after[ev] && write(r->peer, payload, r->deliver_after[ev]) != (ssize_t) r->deliver_after[ev]) {
+    if (ev < 4 && r->deliver_after[ev] &&
+        write(r->peer, payload, r->deliver_after[ev]) != (ssize_t) r->deliver_after[ev]) {
         perror("write");
         failures++;
     }
