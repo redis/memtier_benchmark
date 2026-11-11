@@ -456,6 +456,7 @@ jobs:
           verify_output=$(rpm -Kv "$rpm_file" 2>&1 || true)
           # `rpm -Kv` emits one line per signature/digest component:
           #   Header V4 RSA/SHA512 Signature, key ID xxxx: <verdict>   (signature)
+          #   (rpm >= 4.19 prints "Header OpenPGP V4 RSA/SHA512 signature ..." instead)
           #   Header SHA256 digest: <verdict>                          (header digest)
           #   Payload SHA256 digest: <verdict>                         (payload digest)
           # where <verdict> is OK, NOKEY, BAD, or NOTTRUSTED.
@@ -480,13 +481,13 @@ jobs:
             bad=$((bad + 1))
             continue
           fi
-          if ! echo "$verify_output" | grep -qE 'Header V[34] (RSA|DSA)/.*: (OK|NOKEY)'; then
+          if ! echo "$verify_output" | grep -qE 'Header (OpenPGP )?V[34] (RSA|DSA)/.*: (OK|NOKEY)'; then
             echo "::error::RPM unsigned (no V3/V4 signature header found): $rpm_file"
             echo "$verify_output"
             bad=$((bad + 1))
             continue
           fi
-          if echo "$verify_output" | grep -qE 'Header V[34] (RSA|DSA)/.*: NOKEY'; then
+          if echo "$verify_output" | grep -qE 'Header (OpenPGP )?V[34] (RSA|DSA)/.*: NOKEY'; then
             echo "::warning::RPM signed but public key not in CI keyring (NOKEY): $rpm_file"
           fi
           echo "✓ signed: $rpm_file"
