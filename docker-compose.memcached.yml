@@ -5,7 +5,8 @@ services:
     depends_on:
       - memcached
     mem_limit: ${BENCHMARK_MEMORY_LIMIT:-256M}
-    cpuset: ${CPUSET:-0}
+    # Default to a different core than Memcached so the client and server do not contend.
+    cpuset: ${BENCHMARK_CPUSET:-0}
 
   memcached:
     image: memcached
@@ -13,4 +14,4 @@ services:
     ports:
       - "${MEMCACHED_PORT:-11211}:11211"
     mem_limit: ${MEMCACHED_MEMORY_LIMIT:-128M}
-    cpuset: ${CPUSET:-0}
+    cpuset: ${MEMCACHED_CPUSET:-1}

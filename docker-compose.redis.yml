@@ -5,7 +5,8 @@ services:
     depends_on:
       - redis
     mem_limit: ${BENCHMARK_MEMORY_LIMIT:-256M}
-    cpuset: ${CPUSET:-0}
+    # Default to a different core than Redis so the client and server do not contend.
+    cpuset: ${BENCHMARK_CPUSET:-0}
 
   redis:
     image: redis
@@ -13,6 +14,6 @@ services:
     ports:
       - "${REDIS_PORT:-6379}:6379"
     mem_limit: ${REDIS_MEMORY_LIMIT:-128M}
-    cpuset: ${CPUSET:-0}
+    cpuset: ${REDIS_CPUSET:-1}
 
 
