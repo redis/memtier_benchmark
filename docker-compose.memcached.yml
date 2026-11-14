@@ -1,11 +1,16 @@
-memtier_benchmark:
-  build: .
-  command: --protocol=memcache_text --server=memcached --port=11211 --generate-keys
-  links:
-    - memcached
+services:
+  memtier_benchmark:
+    build: .
+    command: --protocol=memcache_text --server=memcached --port=11211 --generate-keys
+    depends_on:
+      - memcached
+    mem_limit: ${BENCHMARK_MEMORY_LIMIT:-256M}
+    cpuset: ${CPUSET:-0}
 
-memcached:
-  image: memcached
-  command: --verbose
-  ports:
-    - "11211:11211"
+  memcached:
+    image: memcached
+    command: --verbose
+    ports:
+      - "${MEMCACHED_PORT:-11211}:11211"
+    mem_limit: ${MEMCACHED_MEMORY_LIMIT:-128M}
+    cpuset: ${CPUSET:-0}
