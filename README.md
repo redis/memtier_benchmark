@@ -135,6 +135,8 @@ or
 $ docker-compose -f docker-compose.redis.yml up --build
 ```
 
+The benchmark client and the database are pinned to different cores by default (`BENCHMARK_CPUSET`, default `0`; `REDIS_CPUSET` or `MEMCACHED_CPUSET`, default `1`) so they do not contend for one CPU. Override those variables when the host has a single core or you want a different placement.
+
 ## Using memtier_benchmark
 
 See the included manpage or run:
