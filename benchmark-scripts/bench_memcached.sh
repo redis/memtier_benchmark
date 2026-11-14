@@ -29,7 +29,7 @@ echo "----------------------------------------"
 #   --hide-histogram
 
 # 2. Main workload
-sudo memtier_benchmark -s $HOST -p $PORT \
+memtier_benchmark -s $HOST -p $PORT \
   --protocol=$PROTOCOL \
   -t $THREADS \
   -c $CLIENTS \
